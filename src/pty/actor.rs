@@ -190,7 +190,7 @@ pub(crate) struct PtyIoActorConfig {
 
 enum PtyIoDataCommand {
     WriteUserInput(Bytes),
-    WriteTrackedInput(Bytes, crate::pty::write_receipt::WriteCompletion),
+    WriteTrackedInput(crate::pty::write_receipt::WriteCompletion),
 }
 
 struct BeginHandoffRequest {
@@ -277,9 +277,11 @@ impl PtyIoActorHandle {
     pub(crate) fn try_write_tracked_input(
         &self,
         bytes: Bytes,
+        deadline: Option<Instant>,
     ) -> Result<crate::pty::write_receipt::WriteReceipt, mpsc::error::TrySendError<Bytes>> {
-        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
-        self.try_write_command(PtyIoDataCommand::WriteTrackedInput(bytes, completion))?;
+        let (completion, receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(bytes, deadline);
+        self.try_write_command(PtyIoDataCommand::WriteTrackedInput(completion))?;
         Ok(receipt)
     }
 
@@ -288,8 +290,8 @@ impl PtyIoActorHandle {
         command: PtyIoDataCommand,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         let rejected = |command| match command {
-            PtyIoDataCommand::WriteUserInput(bytes)
-            | PtyIoDataCommand::WriteTrackedInput(bytes, _) => bytes,
+            PtyIoDataCommand::WriteUserInput(bytes) => bytes,
+            PtyIoDataCommand::WriteTrackedInput(completion) => completion.take_payload(),
         };
         if self.writer_health.is_broken() {
             self.writer_health.note_rejected();
@@ -713,7 +715,7 @@ impl PtyIoActorRunner {
     }
 
     fn handle_data_command(&mut self, command: PtyIoDataCommand) -> bool {
-        if self.state == ActorState::Running {
+        if self.state == ActorState::Running && !self.writer_health.is_broken() {
             self.enqueue_write(command);
         }
         false
@@ -833,16 +835,15 @@ impl PtyIoActorRunner {
     fn enqueue_write(&mut self, command: PtyIoDataCommand) {
         match command {
             PtyIoDataCommand::WriteUserInput(bytes) => self.push_pending(bytes),
-            PtyIoDataCommand::WriteTrackedInput(bytes, completion) => {
-                self.pending_writes.push_back((bytes, Some(completion)));
+            PtyIoDataCommand::WriteTrackedInput(completion) => {
+                self.pending_writes
+                    .push_back((Bytes::new(), Some(completion)));
             }
         }
     }
 
-    fn complete_front_write(&mut self, at: Instant) {
-        if let Some((_, Some(completion))) = self.pending_writes.pop_front() {
-            let _ = completion.send(at);
-        }
+    fn complete_front_write(&mut self) {
+        self.pending_writes.pop_front();
         self.current_write_offset = 0;
     }
 
@@ -857,7 +858,11 @@ impl PtyIoActorRunner {
     fn pending_bytes(&self) -> usize {
         self.pending_writes
             .iter()
-            .map(|(bytes, _)| bytes.len())
+            .map(|(bytes, completion)| {
+                completion
+                    .as_ref()
+                    .map_or(bytes.len(), |tx| tx.pending_bytes())
+            })
             .sum::<usize>()
             .saturating_sub(self.current_write_offset)
     }
@@ -905,30 +910,48 @@ impl PtyIoActorRunner {
 
     fn flush_pending_writes_once(&mut self) {
         while let Some(bytes) = self.pending_writes.front().map(|(bytes, _)| bytes.clone()) {
+            if let Some(completion) = self
+                .pending_writes
+                .front_mut()
+                .and_then(|(_, tx)| tx.take())
+            {
+                let result = completion.write(|chunk| self.write_chunk(chunk));
+                let pending = completion.pending_bytes();
+                if pending == 0 {
+                    self.complete_front_write();
+                } else if let Some((_, tx)) = self.pending_writes.front_mut() {
+                    *tx = Some(completion);
+                }
+                match result {
+                    Some(Ok(0)) if pending > 0 => {
+                        self.note_zero_write();
+                        return;
+                    }
+                    Some(Ok(0)) => {}
+                    Some(Ok(_)) => self.zero_write_streak = 0,
+                    Some(Err(err)) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        let _ = fd::poll_write_ready(self.file.as_raw_fd(), ACTOR_POLL_MS);
+                        return;
+                    }
+                    Some(Err(err)) if err.kind() == std::io::ErrorKind::Interrupted => return,
+                    Some(Err(err)) => {
+                        crate::logging::pty_write_failed(self.pane_id, &err.to_string());
+                        self.discard_pending_writes();
+                        return;
+                    }
+                    None => {}
+                }
+                continue;
+            }
             if self.current_write_offset >= bytes.len() {
                 // An empty entry (or a fully written one) has nothing left to
                 // write. `write(&[])` returns 0, which is how one empty payload
                 // used to pin the queue forever (#1011).
-                self.complete_front_write(Instant::now());
+                self.complete_front_write();
                 continue;
             }
-            let completion = self
-                .pending_writes
-                .front_mut()
-                .and_then(|(_, tx)| tx.take());
             let chunk = &bytes[self.current_write_offset..];
-            let result = match &completion {
-                Some(tx) => tx.write(chunk.len(), || self.write_chunk(chunk)),
-                None => Some(self.write_chunk(chunk)),
-            };
-            if let Some((_, tx)) = self.pending_writes.front_mut() {
-                *tx = completion;
-            }
-            let Some(result) = result else {
-                self.pending_writes.pop_front();
-                self.current_write_offset = 0;
-                continue;
-            };
+            let result = self.write_chunk(chunk);
             match result {
                 Ok(0) => {
                     self.note_zero_write();
@@ -938,7 +961,7 @@ impl PtyIoActorRunner {
                     self.zero_write_streak = 0;
                     self.current_write_offset += written;
                     if self.current_write_offset >= bytes.len() {
-                        self.complete_front_write(Instant::now());
+                        self.complete_front_write();
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -948,13 +971,20 @@ impl PtyIoActorRunner {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return,
                 Err(err) => {
                     crate::logging::pty_write_failed(self.pane_id, &err.to_string());
-                    self.pending_writes.clear();
-                    self.current_write_offset = 0;
+                    self.discard_pending_writes();
                     return;
                 }
             }
         }
         let _ = self.file.flush();
+    }
+
+    fn discard_pending_writes(&mut self) {
+        self.pending_writes.clear();
+        self.current_write_offset = 0;
+        for _ in 0..self.data_rx.len() {
+            drop(self.data_rx.try_recv());
+        }
     }
 
     fn write_chunk(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
@@ -1000,8 +1030,7 @@ impl PtyIoActorRunner {
         self.writer_health.set_broken(true);
         self.broken_at = Some(now);
         self.zero_write_streak = 0;
-        self.pending_writes.clear();
-        self.current_write_offset = 0;
+        self.discard_pending_writes();
     }
 
     fn maybe_rearm_writer(&mut self) {
@@ -1565,11 +1594,9 @@ mod tests {
     #[test]
     fn tracked_write_completes_only_after_the_final_partial_write() {
         let (mut runner, mut peer, _) = socket_pair_runner();
-        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
-        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(
-            Bytes::from_static(b"paste"),
-            completion,
-        ));
+        let (completion, receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(Bytes::from_static(b"paste"), None);
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(completion));
         let mut calls = 0;
         runner.write_hook = Some(Box::new(move |_| {
             calls += 1;
@@ -1580,7 +1607,7 @@ mod tests {
             }
         }));
         runner.flush_pending_writes_once();
-        assert_eq!(runner.current_write_offset, 2);
+        assert_eq!(receipt.progress().bytes_written, 2);
         assert_eq!(receipt.try_completed(), Err(std_mpsc::TryRecvError::Empty));
         runner.write_hook = None;
         let before = Instant::now();
@@ -1596,11 +1623,9 @@ mod tests {
     #[test]
     fn cancelled_stalled_paste_cannot_land_when_writer_resumes_after_deadline() {
         let (mut runner, mut peer, _) = socket_pair_runner();
-        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
-        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(
-            Bytes::from_static(b"paste"),
-            completion,
-        ));
+        let (completion, receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(Bytes::from_static(b"paste"), None);
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(completion));
         runner.write_hook = Some(Box::new(|_| Err(std::io::ErrorKind::WouldBlock.into())));
         runner.flush_pending_writes_once();
         assert_eq!(receipt.try_completed(), Err(std_mpsc::TryRecvError::Empty));
@@ -1625,49 +1650,107 @@ mod tests {
     #[test]
     fn partial_stalled_paste_cannot_be_reported_as_cancelled() {
         let (mut runner, mut peer, _) = socket_pair_runner();
-        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
-        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(
-            Bytes::from_static(b"paste"),
-            completion,
-        ));
-        let mut first_writer = runner.file.try_clone().unwrap();
-        let mut calls = 0;
-        runner.write_hook = Some(Box::new(move |chunk| {
-            calls += 1;
-            if calls == 1 {
-                first_writer.write(&chunk[..2])
-            } else {
-                Err(std::io::ErrorKind::WouldBlock.into())
-            }
-        }));
+        let payload = Bytes::from(vec![b'p'; 16 * 1024 * 1024]);
+        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel(payload, None);
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(completion));
         runner.flush_pending_writes_once();
-        assert!(
-            receipt.cancel() != crate::pty::write_receipt::WriteDisposition::Cancelled,
-            "partial writes require an uncertain outcome"
+        let prefix = receipt.progress().bytes_written;
+        assert!(prefix > 0 && prefix < receipt.progress().bytes_total);
+        assert_eq!(
+            receipt.cancel(),
+            crate::pty::write_receipt::WriteDisposition::Partial
         );
-        runner.write_hook = None;
-        runner.flush_pending_writes_once();
-        let mut observed = [0; 5];
+        let mut observed = vec![0; prefix];
         peer.read_exact(&mut observed).unwrap();
-        assert_eq!(&observed, b"paste");
-        receipt
-            .try_completed()
-            .expect("remaining bytes may still arrive");
+        assert!(observed.iter().all(|byte| *byte == b'p'));
+        runner.push_pending(Bytes::from_static(b"after"));
+        runner.flush_pending_writes_once();
+        let mut after = [0; 5];
+        peer.read_exact(&mut after).unwrap();
+        assert_eq!(&after, b"after");
+        assert_eq!(receipt.progress().bytes_written, prefix);
+        assert_eq!(
+            receipt.try_completed(),
+            Err(std_mpsc::TryRecvError::Disconnected)
+        );
     }
 
     #[test]
     fn discarded_tracked_write_does_not_acknowledge_completion() {
         let (mut runner, _, _) = socket_pair_runner();
-        let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
-        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(
-            Bytes::from_static(b"paste"),
-            completion,
-        ));
+        let (completion, receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(Bytes::from_static(b"paste"), None);
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(completion));
         runner.pending_writes.clear();
         assert_eq!(
             receipt.try_completed(),
             Err(std_mpsc::TryRecvError::Disconnected)
         );
+    }
+
+    #[test]
+    fn empty_tracked_write_does_not_claim_writer_health() {
+        let (mut runner, _, _) = socket_pair_runner();
+        let (completion, receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(Bytes::new(), None);
+        runner.zero_write_streak = 3;
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(completion));
+        runner.flush_pending_writes_once();
+        receipt
+            .try_completed()
+            .expect("empty operation completes without a syscall");
+        assert_eq!(
+            runner.zero_write_streak, 3,
+            "no successful syscall to reset the streak"
+        );
+    }
+
+    #[test]
+    fn broken_writer_retires_pending_and_channel_tickets_with_exact_counts() {
+        use crate::pty::write_receipt::{WriteFailure, WriteReceipt};
+        let (mut runner, mut peer, data_tx) = socket_pair_runner();
+        let (completed, completed_receipt) =
+            WriteReceipt::channel(Bytes::from_static(b"done"), None);
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(completed));
+        runner.flush_pending_writes_once();
+        let at = completed_receipt.try_completed().unwrap();
+        let mut observed = [0; 4];
+        peer.read_exact(&mut observed).unwrap();
+        assert_eq!(&observed, b"done");
+        let (partial, partial_receipt) = WriteReceipt::channel(Bytes::from_static(b"paste"), None);
+        let mut writer = runner.file.try_clone().unwrap();
+        partial
+            .write(|bytes| writer.write(&bytes[..2]))
+            .unwrap()
+            .unwrap();
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(partial));
+        let (queued, queued_receipt) = WriteReceipt::channel(Bytes::from_static(b"queued"), None);
+        data_tx
+            .try_send(PtyIoDataCommand::WriteTrackedInput(queued))
+            .unwrap();
+        drop(peer);
+        runner.flush_pending_writes_once();
+        assert_eq!(partial_receipt.progress().bytes_written, 2);
+        assert_eq!(
+            partial_receipt.progress().failure,
+            Some(WriteFailure::WriteFailed)
+        );
+        assert_eq!(queued_receipt.progress().bytes_written, 0);
+        assert_eq!(
+            queued_receipt.progress().failure,
+            Some(WriteFailure::WriterGone)
+        );
+        for receipt in [partial_receipt, queued_receipt] {
+            assert_eq!(
+                receipt.try_completed(),
+                Err(std_mpsc::TryRecvError::Disconnected)
+            );
+            assert!(receipt.progress().remainder_discarded);
+        }
+        assert!(runner.data_rx.is_empty());
+        assert!(runner.pending_writes.is_empty());
+        assert_eq!(completed_receipt.progress().completed_at, Some(at));
+        assert_eq!(completed_receipt.progress().failure, None);
     }
 
     #[test]
