@@ -54,6 +54,9 @@ fn contracts() -> BTreeMap<PathBuf, String> {
     collector.add::<WorkspaceInfo>();
     collector.add::<PaneInfo>();
     crate::structured::claude::ts_events(&mut collector);
+    collector.add::<crate::structured_wire::ClientFrame>();
+    collector.add::<crate::structured_wire::ServerFrame>();
+    collector.add::<crate::structured_wire::fixture::FixtureLine>();
     collector.files
 }
 

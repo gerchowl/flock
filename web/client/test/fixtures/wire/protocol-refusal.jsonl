@@ -1,0 +1,5 @@
+{"v":1,"step":"connect"}
+{"v":1,"step":"open"}
+{"v":1,"step":"expect","frame":{"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol"]}
+{"v":1,"step":"send","frame":{"t":"ping","nonce":"before-welcome"}}
+{"v":1,"step":"close","code":1002,"reason":"frame before welcome"}

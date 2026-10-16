@@ -1,0 +1,4 @@
+{"v":1,"step":"connect"}
+{"v":1,"step":"open"}
+{"v":1,"step":"expect","frame":{"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["token"]}
+{"v":1,"step":"token_refused","code":4401}

@@ -1,0 +1,7 @@
+{"v":1,"step":"connect"}
+{"v":1,"step":"open"}
+{"v":1,"step":"expect","frame":{"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol","token"]}
+{"v":1,"step":"send","frame":{"t":"welcome","protocol":1,"server_version":"fixture","capabilities":["read","send"],"principal":"fixture-principal","server_epoch":"fixture-epoch","idempotency_window_ms":86400000}}
+{"v":1,"step":"expect","frame":{"t":"sub","sub_id":"s1","stream":"agent/fixture"},"fields":["sub_id","stream"]}
+{"v":1,"step":"send","frame":{"t":"ev","sub_id":"s1","stream":"agent/fixture","seq":1,"ts_ms":1,"ev":{"type":"assistant","message":{}}}}
+{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s1","seq":1}}
