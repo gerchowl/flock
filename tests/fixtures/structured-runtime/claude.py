@@ -128,6 +128,25 @@ if mode.startswith("init-socket"):
     else:
         init["messaging_socket_path"] = 42 if mode.endswith("wrong-type") else None
 emit(init)
+if mode == "lease-calls":
+    tool = os.fork()
+    if tool == 0:
+        responses = []
+        for request in json.loads((root / "requests.json").read_text()):
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(10)
+                client.connect(str(root / "api.sock"))
+                client.sendall((json.dumps(request) + "\n").encode())
+                with client.makefile("r") as reader:
+                    responses.append(json.loads(reader.readline()))
+        (root / "tool-responses.json").write_text(json.dumps(responses))
+        os._exit(0)
+    (root / "tool.pid").write_text(str(tool))
+    _, status = os.waitpid(tool, 0)
+    assert os.waitstatus_to_exitcode(status) == 0, "tool process failed"
+    emit(find("result", "success"))
+    sys.stdin.read()
+    sys.exit(0)
 if mode == "later-lossy-result":
     emit({"type": "result", "padding": "x" * (2 * 1024 * 1024)})
     assert json.loads(sys.stdin.readline())["type"] == "user"

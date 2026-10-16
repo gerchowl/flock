@@ -101,7 +101,10 @@ impl App {
     /// only: a detached (`setsid`) child of an agent attests as the operator
     /// until uid attestation lands (ADR-0035 §6.3 points 1 and 6, O19a #1208).
     fn refuse_non_operator(&mut self, id: &str, verb: &str) -> Option<String> {
-        let agent = matches!(self.spawn_caller(), SpawnCaller::Agent { .. });
+        let agent = matches!(
+            self.spawn_caller(),
+            SpawnCaller::Agent { .. } | SpawnCaller::Structured { .. }
+        );
         (self.caller_unattested_or_relayed() || agent).then(|| {
             encode_error(
                 id.to_string(),
