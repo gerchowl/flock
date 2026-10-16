@@ -1,0 +1,10 @@
+--- restricted-init.json
++++ unrestricted-init.json
+@@ -19,5 +19,6 @@
+   "skills": [],
+   "slash_commands": [
+     "fixture-command"
+-  ]
++  ],
++  "messaging_socket_path": "<owned-private-cc-socks>/<pid>.sock"
+ }

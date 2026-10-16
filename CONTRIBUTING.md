@@ -158,6 +158,12 @@ just ci
 
 `just ci` runs `cargo fmt --check` and `cargo nextest run`.
 
+CI runs the full Linux tests plus macOS build and lint on ordinary PRs. Landing
+batch PRs (`land/*`) and pushes to `dev`/`main` also run the full macOS suite.
+Required aggregate checks remain active and fail on cancelled or missing legs.
+A macOS-only test bug can therefore surface at batch time rather than on the
+individual PR. See the [CI platform policy](docs/next/ci-platform-policy.md).
+
 Do not open a PR that bypasses failing tests, formatting, or build errors.
 
 ## Test waits and flake policy

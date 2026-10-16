@@ -199,6 +199,101 @@ fn message_ambiguity_candidates_survive_cli_json() {
     one_human_line(&output, "msg_target_ambiguous");
 }
 
+/// A registered delegate is identified by its durable id, not a coincidentally equal name.
+#[test]
+fn draft_refusal_guides_registered_delegates_after_manual_resolution() {
+    fn refused(_: &Value) -> Value {
+        json!({"error":{"code":"input_not_empty",
+            "message":"clear or submit the existing draft in the agent UI, then retry",
+            "data":{"agent_id":"agent_nodea_123abc","terminal_id":"term_fixture","pane_id":"w1:p1",
+                "composer":{"visible_bytes":17},"remedy":{"retry_when":"composer_empty"}}}})
+    }
+    let (socket, _server) = scripted_server("draft-delegate", refused);
+    let state = support::socket_dir::SocketDir::reserve("draft-state");
+    let mut socket_hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in socket.to_string_lossy().as_bytes() {
+        socket_hash ^= u64::from(*byte);
+        socket_hash = socket_hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let registry = state
+        .path()
+        .join(if cfg!(debug_assertions) {
+            "flock-dev"
+        } else {
+            "flock"
+        })
+        .join("delegates")
+        .join(format!("{socket_hash:016x}"));
+    std::fs::create_dir_all(&registry).unwrap();
+    let mut record = json!({"name":"reviewer","agent_id":"agent_nodea_123abc",
+        "terminal_id":"term_old","pane_id":"w9:p9","root_pane":"w9:p1","workspace_id":"w9",
+        "mode":"cwd","harness":"codex","round":1,"brief":"fixture-brief","submitted_at_ms":1,
+        "cursor":"0","created_at_ms":1});
+    for (agent_id, terminal_id, registered) in [
+        (Some("agent_nodea_123abc"), "term_old", true),
+        (Some("agent_nodeb_123abc"), "term_fixture", false),
+        (None, "term_fixture", true),
+        (None, "term_old", false),
+    ] {
+        record["agent_id"] = json!(agent_id);
+        record["terminal_id"] = json!(terminal_id);
+        std::fs::write(registry.join("reviewer.json"), record.to_string()).unwrap();
+        let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
+            .args([
+                "agent",
+                "send",
+                "--json",
+                "--no-submit",
+                "reviewer",
+                "extra",
+            ])
+            .env("FLOCK_SOCKET_PATH", &socket)
+            .env_remove("FLOCK_CLIENT_SOCKET_PATH")
+            .env_remove("FLOCK_ENV")
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .unwrap();
+        let value = envelope(&output, 10);
+        assert_eq!(value["error"]["code"], "input_not_empty");
+        assert_eq!(value["error"]["data"]["composer"]["visible_bytes"], 17);
+        assert!(stderr(&output).contains("agent UI"));
+        let plain = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
+            .args(["agent", "send", "--no-submit", "reviewer", "extra"])
+            .env("FLOCK_SOCKET_PATH", &socket)
+            .env_remove("FLOCK_CLIENT_SOCKET_PATH")
+            .env_remove("FLOCK_ENV")
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .unwrap();
+        assert_eq!(plain.status.code(), Some(10));
+        assert!(plain.stdout.is_empty());
+        assert!(stderr(&plain).contains("agent UI"));
+        assert_eq!(
+            stderr(&plain).contains("flk delegate send reviewer --brief FILE"),
+            registered
+        );
+        if registered {
+            assert!(
+                stderr(&output).contains("flk delegate send reviewer --brief FILE"),
+                "{}",
+                stderr(&output)
+            );
+            assert!(stderr(&output).contains("also refuses drafts"));
+            assert_eq!(
+                value["error"]["data"]["remedy"]["next_round"]["argv"],
+                json!(["flk", "delegate", "send", "reviewer", "--brief", "FILE"])
+            );
+            assert_eq!(
+                value["error"]["data"]["remedy"]["next_round"]["requires"],
+                "composer_empty"
+            );
+        } else {
+            assert!(!stderr(&output).contains("delegate send"));
+            assert!(value["error"]["data"]["remedy"].get("next_round").is_none());
+        }
+    }
+}
+
 /// A delegate usage error (`not a delegate`) is `invalid_params`, exit 2.
 #[test]
 fn delegate_not_a_delegate_is_an_envelope() {

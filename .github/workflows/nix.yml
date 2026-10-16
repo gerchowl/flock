@@ -20,6 +20,9 @@ on:
       # raises the job budget is the one that can never be verified, and the
       # gate is silently dropped from the review of the next one.
       - ".github/workflows/ci.yml"
+      - ".github/workflows/ci-leg.yml"
+      # Shard placement and nextest group/ceiling changes affect the CI checks.
+      - ".config/**"
       - "assets/**"
       - "build.rs"
       - "Cargo.lock"
