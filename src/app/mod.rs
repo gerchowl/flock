@@ -2112,6 +2112,10 @@ impl App {
         apply_host_terminal_theme: bool,
     ) {
         for event in events {
+            // An earlier event in this batch can create or remove a runtime.
+            // Refresh before each event so navigation never reuses the previous
+            // event's or frame's presence snapshot. This is O(terminals), pure
+            // metadata publication, with no PTY reads.
             self.state
                 .refresh_terminal_runtime_presence(&self.terminal_runtimes);
             let previous_mode = self.state.mode;
