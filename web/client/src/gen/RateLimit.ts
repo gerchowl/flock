@@ -5,7 +5,7 @@ import type { JsonValue } from "./serde_json/JsonValue";
 /**
  * Provider rate-limit status (A.2).
  */
-export type RateLimit = { type: "rate_limit_event", subtype?: string,
+export type RateLimit = { type: "rate_limit_event", subtype?: never,
 /**
  * Harness session identifier, if emitted on this envelope.
  */
