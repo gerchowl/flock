@@ -20,7 +20,7 @@
 //! Ownership transitions retire held/backlogged tracked requests before replaying
 //! operator bytes; they never migrate an uncorrelated write to the next owner.
 
-use crate::pty::write_receipt::WriteCompletion;
+use crate::pty::write_receipt::{WriteCompletion, WriteFailure};
 use bytes::{Bytes, BytesMut};
 use std::{cell::RefCell, collections::VecDeque, time::Instant};
 
@@ -166,20 +166,20 @@ impl InjectionLease {
         }
         None
     }
-    /// Ownership transitions cancel tracked input; operator input keeps its place.
-    /// Drop currently records WriterGone. #1638 must retire through its response
-    /// owner with owner_changed or pane_gone before calling this transport drain.
-    pub(crate) fn release_all(&self) -> Option<InputBatch> {
-        self.backlog
+    /// Retire tracked input with its transition cause; keep operator order.
+    pub(crate) fn release_all(&self, reason: WriteFailure) -> Option<InputBatch> {
+        let keep_operator = |input: &QueuedInput| match input {
+            QueuedInput::Operator(_) => true,
+            QueuedInput::Tracked(ticket) => {
+                ticket.retire(reason);
+                false
+            }
+        };
+        self.backlog.borrow_mut().retain(keep_operator);
+        self.held
             .borrow_mut()
-            .retain(|input| matches!(input, QueuedInput::Operator(_)));
-        self.held.borrow_mut().take().map(|lease| {
-            lease
-                .buffered
-                .into_iter()
-                .filter(|input| matches!(input, QueuedInput::Operator(_)))
-                .collect()
-        })
+            .take()
+            .map(|lease| lease.buffered.into_iter().filter(keep_operator).collect())
     }
     pub(crate) fn behind_backlog(&self, batch: InputBatch) -> InputBatch {
         let mut backlog = self.backlog.borrow_mut();
@@ -249,7 +249,7 @@ mod tests {
             self.0.expire(now).map(flatten)
         }
         fn release_all(&self) -> Option<Bytes> {
-            self.0.release_all().map(flatten)
+            self.0.release_all(WriteFailure::OwnerChanged).map(flatten)
         }
         fn behind_backlog(&self, bytes: Bytes) -> Bytes {
             flatten(self.0.behind_backlog([QueuedInput::Operator(bytes)].into()))
