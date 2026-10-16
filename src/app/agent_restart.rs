@@ -179,6 +179,12 @@ impl App {
             .terminals
             .get(&id)
             .ok_or_else(|| refuse("not_found", "target terminal disappeared".into()))?;
+        if self.terminal_runtimes.get(&id).is_none()
+            && (terminal.hibernated_resume_plan.is_some()
+                || terminal.pending_agent_resume_plan.is_some())
+        {
+            return Err(refuse("restart_busy", "agent is parked without a running process; use flk agent resume to resume its saved session".into()));
+        }
         if terminal.hibernated_resume_plan.is_some()
             || terminal.pending_agent_resume_plan.is_some()
             || terminal.armed_self_compact.is_some()

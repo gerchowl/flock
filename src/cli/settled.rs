@@ -378,6 +378,8 @@ pub(super) enum GoneReason {
     /// The agent was hibernated: its child is gone and a resume plan is
     /// stashed. A wait cannot observe a turn that has no process.
     Hibernated,
+    /// The retained binding has no live agent execution (ADR-0028 §1).
+    Offline,
     /// The terminal id resolved to a different child (a respawn), so the
     /// execution this cursor named is over.
     Restarted,
@@ -388,6 +390,7 @@ impl GoneReason {
         match self {
             Self::Closed => "closed",
             Self::Hibernated => "hibernated",
+            Self::Offline => "offline",
             Self::Restarted => "restarted",
         }
     }
@@ -409,6 +412,10 @@ pub(super) enum Sample {
     /// decided BEFORE the record is required to carry one, so a hibernated agent
     /// is `gone` rather than a parse error about a missing field.
     Hibernated {
+        pane_id: String,
+    },
+    /// Offline lifecycle has no live turn to wait on, even if resumable.
+    Offline {
         pane_id: String,
     },
     Gone(GoneReason),
@@ -553,6 +560,10 @@ impl SettledWait {
                 self.last = Some((pane_id, AgentStatus::Hibernated, None));
                 return Step::Gone(GoneReason::Hibernated);
             }
+            Sample::Offline { pane_id } => {
+                self.last = Some((pane_id, AgentStatus::Offline, None));
+                return Step::Gone(GoneReason::Offline);
+            }
             Sample::Gone(reason) => return Step::Gone(reason),
         };
         // Follow the pane: a terminal keeps its id when the pane moves, so the
@@ -609,7 +620,8 @@ impl SettledWait {
             // `hibernated`, it must still not become `Waiting`: that is how an
             // agent with no process behind it would settle.
             AgentStatus::Hibernated => return Step::Gone(GoneReason::Hibernated),
-            AgentStatus::Working | AgentStatus::Unknown | AgentStatus::Offline => Class::Waiting,
+            AgentStatus::Offline => return Step::Gone(GoneReason::Offline),
+            AgentStatus::Working | AgentStatus::Unknown => Class::Waiting,
         };
 
         match class {
@@ -1635,6 +1647,12 @@ fn sample_from_record(record: &serde_json::Value) -> Result<Sample, String> {
     if status == AgentStatus::Hibernated {
         return Ok(Sample::Hibernated { pane_id });
     }
+    // ADR-0028 §1: offline lifecycle outranks the stored turn. No execution
+    // exists to produce settlement, so return gone even without --timeout.
+    // This also covers failed resumes, not just cold-restored pending plans.
+    if status == AgentStatus::Offline {
+        return Ok(Sample::Offline { pane_id });
+    }
     let cursor = record
         .get("turn_cursor")
         .and_then(serde_json::Value::as_str)
@@ -1654,6 +1672,7 @@ fn parse_reported_status(value: &str) -> Result<AgentStatus, String> {
         "done" => Ok(AgentStatus::Done),
         "unknown" => Ok(AgentStatus::Unknown),
         "hibernated" => Ok(AgentStatus::Hibernated),
+        "offline" => Ok(AgentStatus::Offline),
         other => Err(format!(
             "the server reported an agent status this build does not know: {other:?}"
         )),
@@ -2914,6 +2933,49 @@ mod tests {
                 Instant::now()
             ),
             Step::Gone(GoneReason::Hibernated)
+        );
+    }
+
+    #[test]
+    fn cold_restored_offline_agent_ends_an_unbounded_wait() {
+        let agent = response(
+            r#"{"result":{"agent":{"pane_id":"w1:p1","terminal_id":"term_1f2e3",
+                "agent_status":"offline","resumable":true,
+                "turn_cursor":"term_1f2e3:0:1:7:i"}}}"#,
+        );
+        let fetched = classify_pinned(TERM, &agent, None).expect("offline record is a sample");
+        let mut settle = wait(None, 500, None);
+        assert!(matches!(
+            settle.observe(fetched, Instant::now()),
+            Step::Gone(_)
+        ));
+        assert_eq!(
+            settle.last_record().agent_status.as_deref(),
+            Some("offline")
+        );
+    }
+
+    #[test]
+    fn offline_without_cursor_is_gone() {
+        let record =
+            serde_json::json!({"pane_id":"w1:p1", "agent_status":"offline", "resumable":true});
+        let mut settle = wait(None, 500, None);
+        assert_eq!(
+            settle.observe(sample_from_record(&record).unwrap(), Instant::now()),
+            Step::Gone(GoneReason::Offline)
+        );
+        assert_eq!(settle.last_record().turn_cursor, None);
+    }
+
+    #[test]
+    fn direct_offline_record_cannot_wait_for_a_nonexistent_producer() {
+        let mut settle = wait(None, 500, None);
+        assert_eq!(
+            settle.observe(
+                sample(AgentStatus::Offline, cursor(0, 1, 7, false)),
+                Instant::now()
+            ),
+            Step::Gone(GoneReason::Offline)
         );
     }
 

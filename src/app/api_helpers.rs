@@ -1,10 +1,14 @@
-pub(super) fn tab_attention_priority(state: crate::detect::AgentState, seen: bool) -> u8 {
-    match (state, seen) {
-        (crate::detect::AgentState::Blocked, _) => 4,
-        (crate::detect::AgentState::Idle, false) => 3,
-        (crate::detect::AgentState::Working, _) => 2,
-        (crate::detect::AgentState::Idle, true) => 1,
-        (crate::detect::AgentState::Unknown, _) => 0,
+/// Attention ordering after lifecycle projection. Offline still describes a
+/// retained binding and wins over an unknown shell, but never a live turn.
+pub(super) fn agent_status_attention_priority(status: crate::api::schema::AgentStatus) -> u8 {
+    use crate::api::schema::AgentStatus;
+    match status {
+        AgentStatus::Blocked => 5,
+        AgentStatus::Done => 4,
+        AgentStatus::Working => 3,
+        AgentStatus::Idle | AgentStatus::Hibernated => 2,
+        AgentStatus::Offline => 1,
+        AgentStatus::Unknown => 0,
     }
 }
 
@@ -176,10 +180,23 @@ pub(super) fn screen_attention(
 /// Same shape as [`pane_agent_status`] but honours the terminal's
 /// `hibernated_resume_plan` — a hibernated pane always reports Hibernated
 /// regardless of the underlying detected state (which will drift to Unknown
-/// once the child exits).
+/// once the child exits). A deferred native restore without a runtime is
+/// offline, not a live idle turn (ADR-0028 §1); its resume plan stays intact.
 pub(super) fn pane_agent_status_from_terminal(
     terminal: &crate::terminal::TerminalState,
     seen: bool,
+    runtime_present: bool,
+) -> crate::api::schema::AgentStatus {
+    pane_agent_status_for_state(terminal, terminal.state, seen, runtime_present)
+}
+
+/// Project a detector transition through the terminal's current lifecycle.
+/// Lifecycle outranks both sides of a turn transition (ADR-0028 §1).
+pub(super) fn pane_agent_status_for_state(
+    terminal: &crate::terminal::TerminalState,
+    state: crate::detect::AgentState,
+    seen: bool,
+    runtime_present: bool,
 ) -> crate::api::schema::AgentStatus {
     if terminal.resume_failed {
         return crate::api::schema::AgentStatus::Offline;
@@ -187,7 +204,10 @@ pub(super) fn pane_agent_status_from_terminal(
     if terminal.hibernated_resume_plan.is_some() {
         return crate::api::schema::AgentStatus::Hibernated;
     }
-    pane_agent_status(terminal.state, seen)
+    if terminal.pending_agent_resume_plan.is_some() && !runtime_present {
+        return crate::api::schema::AgentStatus::Offline;
+    }
+    pane_agent_status(state, seen)
 }
 
 /// Cap reported prompts to a sane size and strip control characters that

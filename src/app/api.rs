@@ -1039,14 +1039,25 @@ impl App {
             });
         }
 
-        let previous_agent_status = pane_agent_status(update.previous_state, update.previous_seen);
-        let agent_status = self
+        let pane = self
             .state
             .workspaces
             .get(update.ws_idx)
-            .and_then(|ws| ws.pane_state(update.pane_id))
-            .map(|pane| pane_agent_status(update.state, pane.seen))
-            .unwrap_or_else(|| pane_agent_status(update.state, update.seen));
+            .and_then(|ws| ws.pane_state(update.pane_id));
+        let project = |state, seen| {
+            pane.and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                .map(|terminal| {
+                    super::api_helpers::pane_agent_status_for_state(
+                        terminal,
+                        state,
+                        seen,
+                        self.terminal_runtimes.get(&terminal.id).is_some(),
+                    )
+                })
+                .unwrap_or_else(|| pane_agent_status(state, seen))
+        };
+        let previous_agent_status = project(update.previous_state, update.previous_seen);
+        let agent_status = project(update.state, pane.map_or(update.seen, |pane| pane.seen));
 
         if previous_agent_status != agent_status
             || update.previous_presentation != update.presentation
