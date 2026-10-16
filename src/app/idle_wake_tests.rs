@@ -861,10 +861,9 @@ async fn guarded_submit_treats_a_paste_chip_as_the_typed_text() {
 }
 
 /// A 16-column pane shows only the wrapped tail of a long message (#1122).
-/// That tail gets the Enter and its one retry like a paste chip. A tail that
-/// does not end the sent text gets no Enter, and neither does a fully visible
-/// editor holding only the end of a text short enough to fit in it: nothing
-/// scrolled off, so the start was lost, not clipped.
+/// Only non-whitespace content exceeding the visible capacity proves clipping
+/// and gets Enter and its retry. The original whitespace-heavy capture stays
+/// uncertain, as does a changed suffix or a fully visible truncated draft.
 #[tokio::test]
 async fn guarded_submit_treats_a_wrapped_tail_as_the_typed_text() {
     use super::super::guarded_submit::{Outcome, CONFIRM_WINDOW};
@@ -877,9 +876,16 @@ async fn guarded_submit_treats_a_wrapped_tail_as_the_typed_text() {
         .concat()
         .join("\n");
     let other = sent.replace("composers.", "panes.");
+    let provably_clipped = format!("{} {sent}", "x".repeat(40 * 16));
     let not_visible = Outcome::Unconfirmed("owned_composer_not_visible");
     for (screen, text, enters, outcome) in [
-        (narrow, sent, 2, Outcome::Unconfirmed("typed_not_submitted")),
+        (
+            narrow,
+            provably_clipped.as_str(),
+            2,
+            Outcome::Unconfirmed("typed_not_submitted"),
+        ),
+        (narrow, sent, 0, not_visible),
         (narrow, other.as_str(), 0, not_visible),
         (unclipped.as_str(), "gamma delta epsilon", 0, not_visible),
     ] {
@@ -900,7 +906,10 @@ async fn guarded_submit_treats_a_wrapped_tail_as_the_typed_text() {
         let mut at = now + GAP;
         let mut result = app.advance_guarded_submit(&pane, &mut attempt, at);
         let mut sent_enters = drain(&mut pty).len();
-        while result.is_none() {
+        for _ in 0..4 {
+            if result.is_some() {
+                break;
+            }
             at += CONFIRM_WINDOW;
             result = app.advance_guarded_submit(&pane, &mut attempt, at);
             sent_enters += drain(&mut pty).len();

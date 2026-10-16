@@ -345,13 +345,18 @@ fn editor_shows_paste_chip(agent: Agent, runtime: &crate::terminal::TerminalRunt
 /// The editor must also be clipped: the sent text cannot fit in the visible
 /// rows at `row_width` columns each, so its start scrolled off. A fully visible
 /// editor that holds only the end of the text lost the start, and stays Other.
+/// The proof ignores whitespace; a truly clipped draft with many wrap spaces
+/// may therefore remain unproven and refuse Enter rather than risk a lost head.
 fn matches_wrapped_tail(rows: &[&str], text: &str, row_width: usize) -> bool {
     let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     let tail = squash(&rows.concat());
+    // Wrap whitespace cannot prove clipping: compare the same normalized
+    // content that establishes ownership (ADR-0029 §1, #1141).
+    let sent = squash(text);
     rows.len() > 1
         && !tail.is_empty()
-        && text.trim().chars().count() > rows.len() * row_width
-        && squash(text).ends_with(&tail)
+        && sent.chars().count() > rows.len() * row_width
+        && sent.ends_with(&tail)
 }
 
 fn editor_shows_wrapped_tail(
