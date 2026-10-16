@@ -878,12 +878,12 @@ or durable event replay. This is independent of ADR-0005's restart-stable `seq`.
 
 The proposed termination mapping is explicit (#1577):
 
-| Event ending a pending sample wait | Typed code | CLI exit |
-| --- | --- | --- |
-| Pane respawn replacing the runtime epoch, with the pinned pane/agent identity preserved | `observation_reset` | `REFUSED` (10) |
-| Orderly live handoff replacing the ownership epoch, with the pinned identity preserved | `observation_reset` | `REFUSED` (10) |
-| Server restart closing the in-flight wait connection before a complete reply | `server_unavailable` (normalized by the client) | `RECONNECT_GAVE_UP` (75) |
-| Replacement of the pinned pane/agent identity, including reuse of its name | `subject_replaced` | `REFUSED` (10) |
+| Event ending a pending sample wait | Typed code | Retry rule | CLI exit |
+| --- | --- | --- | --- |
+| Pane respawn replacing the runtime epoch, with the pinned pane/agent identity preserved | `observation_reset` | `after_inspecting`: re-read the subject, then re-arm with fresh cursors | `REFUSED` (10) |
+| Orderly live handoff replacing the ownership epoch, with the pinned identity preserved | `observation_reset` | `after_inspecting`: re-read the subject, then re-arm with fresh cursors | `REFUSED` (10) |
+| Server restart closing the in-flight wait connection before a complete reply | `server_unavailable` (normalized by the client) | `maybe`: continuity was lost; read current subject/cursors before a new wait | `RECONNECT_GAVE_UP` (75) |
+| Replacement of the pinned pane/agent identity, including reuse of its name | `subject_replaced` | `never`: the pinned subject never comes back; a replacement is a newly resolved subject | `REFUSED` (10) |
 
 Respawn and orderly handoff invalidate and signal pending waits at the
 replacement boundary, before retiring the old producer. The old owner returns
@@ -891,8 +891,10 @@ replacement boundary, before retiring the old producer. The old owner returns
 within the existing handoff budget; it does not transfer pending waits to the
 importer. An identity replacement uses `subject_replaced` even when it also
 changes the epoch. Epoch-only rotation on counter overflow likewise uses
-`observation_reset`. Both refusals require fresh reads and explicit new wait
-registration, not retry with the invalidated cursors.
+`observation_reset`. Its `after_inspecting` remedy is to re-read the subject
+and explicitly re-arm with fresh cursors, never retry with invalidated ones.
+`subject_replaced` is `never` for that pinned subject; a caller choosing a
+replacement must explicitly resolve a new subject and register a new wait.
 
 A restart cannot reliably send a last error frame. For this dedicated read-only
 sample-wait method, the client normalizes EOF, connection reset/abort or broken
@@ -910,8 +912,10 @@ mapping: `cli::output::io_error_code` currently maps these connection errors to
 (1). The sample-wait client must explicitly select `RECONNECT_GAVE_UP` (75)
 for `server_unavailable`, whether received in a server error or synthesized on
 connection loss. CLI machine output carries `error.code: server_unavailable`
-and `error.exit: 75` in ADR-0029 §4's error envelope; human output reports the
-same typed reason and process exit. Reuse the existing code and named exit
+and `error.exit: 75` in ADR-0029 §4's error envelope. It also prints
+`error.retry: "maybe"`: `server_unavailable`'s registered code class wins over
+exit 75's `later` class through `cli::output::retry_for`. Human output reports
+the same typed reason and process exit. Reuse the existing code and named exit
 from `src/api/error_code.rs` and `src/cli/exit.rs`; no new restart-specific code
 is needed. The existing delegate wait's `ServerUnavailable` outcome already
 uses this code/exit pairing. Do not inherit its reply grace or the TUI's
@@ -983,11 +987,17 @@ connection loss. Producer loss without a declared replacement remains
 `detection_producer_gone` / `GONE`; removal without a replacement is also
 `GONE`. Other failures are `timeout` (`TIMEOUT`), malformed cursors (`USAGE`),
 and unsupported capability/method (`PROTOCOL_GAP`). #1574 must register new
-codes, including `observation_reset` and `subject_replaced`, in
-`src/api/error_code.rs` and implement the method's exit mapping; these proposed
-codes are not yet in the registry. Reuse ADR-0029's named exits, not new numeric
-literals. An unavailable detector is not a permanent quiet wait. Epoch mismatch
-fails even if the new counter is numerically greater. An agent identity change
+codes, including `observation_reset` with retry class `after_inspecting`
+and `subject_replaced` with retry class `never`, in `src/api/error_code.rs`.
+Give both explicit `REFUSED` exit mappings before emitting them, so JSON and
+MCP agree, and implement the sample-wait `server_unavailable` exit-75 override
+above. These proposed reset/replacement codes are not yet registered. Do not
+rely on the unregistered-code fallback in `cli::output::retry_for`: exit 10's
+`later` class would wrongly invite retrying invalid cursors or a gone subject.
+The registered error code's class takes precedence over its exit's class.
+Reuse ADR-0029's named exits, not new numeric literals. An unavailable detector
+is not a permanent quiet wait. Epoch mismatch fails even if the new counter is
+numerically greater. An agent identity change
 cannot retarget an open wait.
 
 **Owner decision required — recommendation: dedicated method, no new global
@@ -1081,14 +1091,14 @@ fail before implementation. Preserve these failures once as regression evidence.
 | Real turn end | After a real completed/aborted-turn source, normal authority rules still settle; samples do not revive Working or retire a binding (§1a). Test raw Working with authoritative lifecycle idle separately. |
 | Skipped and unidentified | Blank/skipped/unidentified passes acknowledge their honest outcomes without presenting retained state as fresh classified evidence. |
 | Lifecycle boundaries | Respawn, restart and live handoff issue a new epoch, invalidate open waits, reject old cursors/late receipts and require a fresh applied pass. Rename/move within the runtime does not reset it. |
-| Pending wait / respawn | Register an unmatched wait, then respawn its runtime while preserving pane/agent identity. Receive `observation_reset` / `REFUSED` (10), release both admission counts, reject old-epoch late receipts and require a fresh applied pass before a new wait can succeed. A replacement must not race into `detection_producer_gone` or silently retarget the wait. |
-| Pending wait / orderly handoff | Register an unmatched wait, then transfer ownership. The exporter returns `observation_reset` / `REFUSED` (10) before closing the request channel, releases admission counts and transfers no pending wait. The importer has a distinct epoch and no receipt until its first applied pass. An interrupted handoff that loses the connection without a complete reply follows the connection-loss case instead. |
-| Pending wait / server restart | With a fake server, acknowledge registration of an unmatched wait and close its socket before any complete reply, then start a new owner with a different epoch. The real client returns `server_unavailable` / `RECONNECT_GAVE_UP` (75), including the code and exit in machine output, within the existing per-stage ceiling; it must not reconnect or replay the request. Repeat for a reset/partial reply, preserve a complete response received before close, and verify a live silent server instead ends at its original timeout. A generic `transport` / `FAILURE` (1), successful resume, or renewed deadline fails this case. |
-| Pre-restart cursor | Save D and O before stopping the server, restart it with counters reset, then submit a wait using those saved cursors. Return typed `observation_reset` / `REFUSED` immediately, even if new counters later exceed the old ones; never return satisfied. Repeat for respawn and handoff, and assert epochs differ across process lifetimes. |
+| Pending wait / respawn | Register an unmatched wait, then respawn its runtime while preserving pane/agent identity. Receive `observation_reset` / `REFUSED` (10) with `retry: "after_inspecting"`, release both admission counts, reject old-epoch late receipts and require a fresh applied pass before a new wait can succeed. A replacement must not race into `detection_producer_gone` or silently retarget the wait. |
+| Pending wait / orderly handoff | Register an unmatched wait, then transfer ownership. The exporter returns `observation_reset` / `REFUSED` (10) with `retry: "after_inspecting"` before closing the request channel, releases admission counts and transfers no pending wait. The importer has a distinct epoch and no receipt until its first applied pass. An interrupted handoff that loses the connection without a complete reply follows the connection-loss case instead. |
+| Pending wait / server restart | With a fake server, acknowledge registration of an unmatched wait and close its socket before any complete reply, then start a new owner with a different epoch. The real client returns `server_unavailable` / `RECONNECT_GAVE_UP` (75), including `error.code`, `error.exit: 75` and `error.retry: "maybe"` in machine output (the code class wins over the exit class), within the existing per-stage ceiling; it must not reconnect or replay the request. Repeat for a reset/partial reply, preserve a complete response received before close, and verify a live silent server instead ends at its original timeout. A generic `transport` / `FAILURE` (1), successful resume, or renewed deadline fails this case. |
+| Pre-restart cursor | Save D and O before stopping the server, restart it with counters reset, then submit a wait using those saved cursors. Return typed `observation_reset` / `REFUSED` (10) with `retry: "after_inspecting"` immediately, even if new counters later exceed the old ones; never return satisfied. Repeat for respawn and handoff, and assert epochs differ across process lifetimes. |
 | Admission / timeout bounds | Keep 8 unmatched waits open on one pane; the ninth returns `sample_wait_limit_exceeded` / `REFUSED`. Reach 256 across distinct panes; the next returns the same refusal. Repeat with unattested operator/test callers. Verify each termination path releases both counts; immediate matches consume no slot. Zero, 540001 and `u64::MAX` timeouts return `invalid_sample_timeout` / `USAGE`; 540000 is admitted when capacity exists, and tests use their smaller failure ceiling. |
 | Liveness / lost wake | Producer dies, peer/subject disappears, a live producer stays silent, caller disconnects, and commit races registration. Each fails/cancels within its existing ceiling or succeeds on an actual matching receipt; never hangs or misses a committed match. |
 | Mixed versions | New client/old server fails with protocol gap; old client/new server still parses zero legacy revision; missing fields never become success. Verify legacy filter refusal and previous-release log readability. |
-| Overflow / identity | Counter exhaustion changes epoch without wrapping and ends pending waits with `observation_reset` / `REFUSED` (10). Replacement of the pinned identity returns `subject_replaced` / `REFUSED` (10); reused pane/agent names cannot satisfy an earlier subject's wait. |
+| Overflow / identity | Counter exhaustion changes epoch without wrapping and ends pending waits with `observation_reset` / `REFUSED` (10), retry `after_inspecting`. Replacement of the pinned identity returns `subject_replaced` / `REFUSED` (10), retry `never`; reused pane/agent names cannot satisfy an earlier subject's wait. |
 | Cost / quiet state | Benchmark cadence and memory at 100 panes with and without waiters; no per-sample fsync, hub traffic, render invalidation or unbounded backlog. |
 
 ### 2. Supervisor events are derived facts, persisted once, in the existing log
