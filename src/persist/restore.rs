@@ -1391,6 +1391,31 @@ mod tests {
             .unwrap()
             .pending_agent_resume_plan
             .is_some());
+        // #1644: an isolated restored instance must draw lifecycle, not saved idle.
+        app.state.mode = crate::app::Mode::Terminal;
+        app.state.active = Some(0);
+        let area = ratatui::layout::Rect::new(0, 0, 120, 36);
+        let (restored, _) = crate::server::render_stream::render_virtual_with_runtime_registry(
+            &mut app.state,
+            &app.terminal_runtimes,
+            area,
+            false,
+            Default::default(),
+        );
+        for terminal in app.state.terminals.values_mut() {
+            terminal.state = crate::detect::AgentState::Unknown;
+        }
+        let (offline, _) = crate::server::render_stream::render_virtual_with_runtime_registry(
+            &mut app.state,
+            &app.terminal_runtimes,
+            area,
+            false,
+            Default::default(),
+        );
+        assert_eq!(
+            restored, offline,
+            "cold restore must render as offline, not saved idle"
+        );
     }
 
     #[tokio::test]

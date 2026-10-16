@@ -383,16 +383,7 @@ pub(super) fn agent_icon(
 /// icon as local ones (#62). `Done` = an unseen idle (the green ✓), `Idle` = a
 /// settled seen idle.
 pub(crate) fn remote_state(status: crate::api::schema::AgentStatus) -> (AgentState, bool) {
-    use crate::api::schema::AgentStatus;
-    match status {
-        AgentStatus::Blocked => (AgentState::Blocked, true),
-        AgentStatus::Working => (AgentState::Working, true),
-        AgentStatus::Done => (AgentState::Idle, false),
-        // #175 C3: hibernated renders as a settled seen state — the pane is
-        // idle from the fleet's perspective until the next focus/resume.
-        AgentStatus::Idle | AgentStatus::Hibernated => (AgentState::Idle, true),
-        AgentStatus::Unknown | AgentStatus::Offline => (AgentState::Unknown, true),
-    }
+    crate::terminal::lifecycle::presentation_state(status)
 }
 
 /// Agent-style icon for a remote member row, funneling through [`agent_icon`]
