@@ -954,31 +954,33 @@ impl PaneRuntimeIo {
     }
 
     fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        self.try_send_with_receipt(bytes, false).map(|_| ())
+        self.try_send_with_receipt(bytes, false, None).map(|_| ())
     }
 
     fn try_send_with_receipt(
         &self,
         bytes: Bytes,
         tracked: bool,
+        deadline: Option<std::time::Instant>,
     ) -> Result<Option<crate::pty::write_receipt::WriteReceipt>, mpsc::error::TrySendError<Bytes>>
     {
         match self {
             #[cfg(unix)]
             PaneRuntimeIo::Actor(actor) => {
                 if tracked {
-                    actor.try_write_tracked_input(bytes).map(Some)
+                    actor.try_write_tracked_input(bytes, deadline).map(Some)
                 } else {
                     actor.try_write_user_input(bytes).map(|_| None)
                 }
             }
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => {
-                sender.try_send(bytes)?;
+                sender.try_send(bytes.clone())?;
                 if tracked {
                     // The test channel models a synchronous completed write.
-                    let (completion, receipt) = crate::pty::write_receipt::WriteReceipt::channel();
-                    let _ = completion.send(std::time::Instant::now());
+                    let (completion, receipt) =
+                        crate::pty::write_receipt::WriteReceipt::channel(bytes, deadline);
+                    let _ = completion.write(|chunk| Ok(chunk.len()));
                     Ok(Some(receipt))
                 } else {
                     Ok(None)
@@ -2462,10 +2464,11 @@ impl PaneRuntime {
     pub(crate) fn try_send_flock_authored_tracked(
         &self,
         bytes: Bytes,
+        deadline: std::time::Instant,
     ) -> Result<Option<crate::pty::write_receipt::WriteReceipt>, mpsc::error::TrySendError<Bytes>>
     {
         self.has_been_typed_into.set(true);
-        self.io.try_send_with_receipt(bytes, true)
+        self.io.try_send_with_receipt(bytes, true, Some(deadline))
     }
 
     /// When operator input last reached this pane, if it ever has.
@@ -2702,11 +2705,11 @@ mod tests {
         let (runtime, mut receiver) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
         assert!(runtime
             .io
-            .try_send_with_receipt(Bytes::from_static(b"untracked"), false)
+            .try_send_with_receipt(Bytes::from_static(b"untracked"), false, None)
             .unwrap()
             .is_none());
         assert!(
-            matches!(runtime.try_send_flock_authored_tracked(Bytes::from_static(b"full")),
+            matches!(runtime.try_send_flock_authored_tracked(Bytes::from_static(b"full"), std::time::Instant::now() + std::time::Duration::from_secs(30)),
             Err(mpsc::error::TrySendError::Full(bytes)) if bytes == Bytes::from_static(b"full"))
         );
         assert_eq!(
@@ -2715,7 +2718,10 @@ mod tests {
         );
         let before = std::time::Instant::now();
         let receipt = runtime
-            .try_send_flock_authored_tracked(Bytes::from_static(b"paste"))
+            .try_send_flock_authored_tracked(
+                Bytes::from_static(b"paste"),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
             .unwrap()
             .expect("test channel must return a tracked write receipt");
         let completed = receipt
@@ -2725,7 +2731,7 @@ mod tests {
         assert_eq!(receiver.try_recv().unwrap(), Bytes::from_static(b"paste"));
         drop(receiver);
         assert!(
-            matches!(runtime.try_send_flock_authored_tracked(Bytes::from_static(b"closed")),
+            matches!(runtime.try_send_flock_authored_tracked(Bytes::from_static(b"closed"), std::time::Instant::now() + std::time::Duration::from_secs(30)),
             Err(mpsc::error::TrySendError::Closed(bytes)) if bytes == Bytes::from_static(b"closed"))
         );
     }

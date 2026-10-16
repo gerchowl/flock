@@ -2291,9 +2291,9 @@ fn assert_released_paste(
     assert_eq!(evidence.state, state);
     assert_eq!(evidence.reason.as_deref(), Some(reason));
     assert!(evidence.finished_at_ms.is_some());
-    if written == 0 {
+    if written < 5 {
         assert!(completion
-            .write(5, || panic!("released paste reached resumed writer"))
+            .write(|_| panic!("released paste reached resumed writer"))
             .is_none());
     }
 }
