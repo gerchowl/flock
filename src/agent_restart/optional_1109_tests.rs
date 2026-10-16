@@ -409,3 +409,36 @@ fn optional_1659_bare_debug_alias_is_refused() {
         launch(&["--resume", "native-fixture", "-d=fixture"])
     );
 }
+
+#[test]
+fn restart_refusals_name_options_without_their_values() {
+    let value = "fixture-sensitive-profile";
+    let mut failures = Vec::new();
+    for agent in ["hermes", "opencode", "copilot"] {
+        let session = PersistedAgentSession {
+            source: format!("flock:{agent}"),
+            agent: agent.into(),
+            session_ref: AgentSessionRef::id("native-fixture").unwrap(),
+        };
+        for (flag, args) in [
+            ("-p", vec![agent.into(), format!("-p={value}")]),
+            ("-p", vec![agent.into(), "-p".into(), value.into()]),
+            (
+                "--unverified",
+                vec![agent.into(), "--unverified".into(), value.into()],
+            ),
+        ] {
+            let error = resume_launch(&session, &args).unwrap_err();
+            if !error.contains(flag)
+                || !error.contains("unknown option arity")
+                || error.contains(value)
+            {
+                failures.push(format!("{agent}: {error}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "option values leaked or refusal changed: {failures:?}"
+    );
+}

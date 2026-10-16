@@ -354,7 +354,7 @@ pub(crate) fn resume_launch(
         }
         if flag == "-p" && !matches!(session.agent.as_str(), "claude" | "codex" | "pi") {
             return Err(format!(
-                "cannot safely preserve launch option {arg}; unknown option arity"
+                "cannot safely preserve launch option {flag}; unknown option arity"
             ));
         }
         // Claude's --plugin-dir reaches this one-value list after its missing-path
@@ -451,7 +451,7 @@ pub(crate) fn resume_launch(
             index += 2;
         } else {
             return Err(format!(
-                "cannot safely preserve launch option {arg}; unknown option arity"
+                "cannot safely preserve launch option {flag}; unknown option arity"
             ));
         }
     }
