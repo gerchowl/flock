@@ -7,6 +7,8 @@ import { Match, Switch, type JSX } from "solid-js";
 
 import { ReplayBadge } from "./components/ReplayBadge";
 import type { ConfigResult } from "./config";
+import { FIXTURE_STREAM, createFixtureTransport } from "./transport/fixture";
+import { Transcript } from "./views/Transcript";
 
 /** Props of {@link App}. */
 export type AppProps = { readonly config: ConfigResult };
@@ -33,7 +35,9 @@ export function App(props: AppProps): JSX.Element {
           return current.transport === "fixture" ? (
             <>
               <ReplayBadge source={current.source} />
-              <main class="app-main" />
+              <main class="app-main">
+                <Transcript transport={createFixtureTransport(current.fixtureJsonl)} stream={FIXTURE_STREAM} />
+              </main>
             </>
           ) : (
             <main class="state-error" role="alert" data-testid="config-error">
