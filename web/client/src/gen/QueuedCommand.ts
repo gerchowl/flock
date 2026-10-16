@@ -30,7 +30,7 @@ created_ms: number,
  * First send time, distinct from creation. Missing age after restart means
  * unknown_outcome, never a new execution (ADR-0038 §3).
  */
-first_sent_ms: number | null,
+first_sent_ms?: number | null,
 /**
  * Persisted client state determines first-send versus resume-only lookup.
  */

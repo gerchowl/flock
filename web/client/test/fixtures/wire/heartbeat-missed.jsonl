@@ -13,6 +13,6 @@
 {"v":1,"step":"send","frame":{"t":"ping","nonce":"n1"}}
 {"v":1,"step":"expect","frame":{"t":"pong","nonce":"n1"},"fields":["nonce"],"absent":[]}
 {"v":1,"step":"heartbeat_missed"}
-{"v":1,"step":"observe","connection":"Reconnecting","streams":{},"outbox":{},"connection_transitions":["Stale","Reconnecting"],"absent_streams":["s1"]}
+{"v":1,"step":"observe","connection":"Reconnecting","streams":{"s1":{"state":"Current","cursor":0}},"outbox":{},"connection_transitions":["Stale","Reconnecting"]}
 {"v":1,"step":"expect_connect","within_ms":500,"not_before_ms":250}
 {"v":1,"step":"quiet","ceiling_ms":1000}

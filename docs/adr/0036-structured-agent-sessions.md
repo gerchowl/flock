@@ -1321,6 +1321,15 @@ encodes non-JSON diagnostics as a JSON string.
   `SessionEvent::Unknown { raw, shape }`, with `raw` kept byte-for-byte. The
   parser never errors past the JSON layer; a line that is not JSON is
   `Unknown` too, with `raw` as a string.
+- **S7 wire wrapper.** On S7's `/v1/ws`, unknown, incompatible or
+  client-version-ineligible agent events are sent only as
+  `UnknownEvent = {type:"unknown", raw:string, shape:string}` inside `ev.ev`.
+  `raw` is the exact original line, including non-JSON diagnostics; `shape` is
+  the sender's canonical shape key, never recomputed by the client. The server
+  constructs this wrapper before sending. It is distinct from the internal
+  `SessionEvent::Unknown { raw, shape }` and its lossless raw serializer. The
+  legacy API keeps that existing raw JSON behavior; it does not emit this S7
+  wrapper. This is the explicit client envelope referenced by §6.
 - **Shape key.** `shape = harness + harness_version + type + subtype +
   sorted top-level keys`. A known event whose `extra` is non-empty is also a
   new shape.

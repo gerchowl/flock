@@ -29,15 +29,15 @@ outbox: Array<QueuedCommand>,
 /**
  * Durable resync markers keyed by stream, independent of sub identities.
  */
-resync: { [key in string]: ResyncMarker },
+resync?: { [key in string]: ResyncMarker },
 /**
  * Initial virtual clock, allowing expiry before a new welcome.
  */
-now_ms: number,
+now_ms?: number,
 /**
  * Last known principal window, restored independently of a connection.
  */
-idempotency_window_ms: number | null, } | { "step": "client",
+idempotency_window_ms?: number | null, } | { "step": "client",
 /**
  * Operation requested by the caller.
  */
@@ -45,28 +45,28 @@ action: ClientAction, } | { "step": "observe",
 /**
  * Optional ADR-0038 connection-state assertion.
  */
-connection: string | null,
+connection?: string | null,
 /**
  * Assert only the named subscription entries.
  */
-streams: { [key in string]: StreamObservation },
+streams?: { [key in string]: StreamObservation },
 /**
  * Assert only the named command statuses.
  */
-outbox: { [key in string]: OutboxStatus },
+outbox?: { [key in string]: OutboxStatus },
 /**
  * Stream entries whose keys must be absent, including null entries.
  */
-absent_streams: Array<string>,
+absent_streams?: Array<string>,
 /**
  * Commands whose keys must be absent (for example after principal change).
  */
-absent_outbox: Array<string>,
+absent_outbox?: Array<string>,
 /**
  * Exact transitions since previous observe, including transient Stale.
  * Every observe drains the trace, even if this selector is omitted.
  */
-connection_transitions: Array<string> | null, } | { "step": "quiet",
+connection_transitions?: Array<string> | null, } | { "step": "quiet",
 /**
  * Positive duration; JSON number, exact in JavaScript below 2^53.
  */
@@ -74,7 +74,7 @@ ceiling_ms: number, } | { "step": "expect_connect",
 /**
  * Inclusive lower bound, measured from this assertion's virtual instant.
  */
-not_before_ms: number,
+not_before_ms?: number,
 /**
  * Positive duration; JSON number, exact in JavaScript below 2^53.
  */
@@ -86,7 +86,7 @@ code: number, } | { "step": "open" } | { "step": "send",
 /**
  * Current attempt or the most recently abandoned socket generation.
  */
-socket: SocketTarget,
+socket?: SocketTarget,
 /**
  * Frame to inject; previous-socket callbacks must be ignored.
  */
@@ -102,7 +102,7 @@ fields: Array<string>,
 /**
  * Optional fields that must be absent, rather than ignored.
  */
-absent: Array<string>, } | { "step": "deadline",
+absent?: Array<string>, } | { "step": "deadline",
 /**
  * No duration override, sleep or automatic success exists.
  */

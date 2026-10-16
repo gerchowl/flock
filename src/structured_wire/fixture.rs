@@ -35,13 +35,16 @@ pub enum FixtureStep {
         outbox: Vec<QueuedCommand>,
         /// Durable resync markers keyed by stream, independent of sub identities.
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         resync: BTreeMap<String, ResyncMarker>,
         /// Initial virtual clock, allowing expiry before a new welcome.
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         now_ms: u64,
         /// Last known principal window, restored independently of a connection.
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         #[cfg_attr(feature = "ts", ts(type = "number | null"))]
         idempotency_window_ms: Option<u64>,
     },
@@ -54,22 +57,28 @@ pub enum FixtureStep {
     Observe {
         /// Optional ADR-0038 connection-state assertion.
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         connection: Option<String>,
         /// Assert only the named subscription entries.
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         streams: BTreeMap<String, StreamObservation>,
         /// Assert only the named command statuses.
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         outbox: BTreeMap<String, OutboxStatus>,
         /// Stream entries whose keys must be absent, including null entries.
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         absent_streams: Vec<String>,
         /// Commands whose keys must be absent (for example after principal change).
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         absent_outbox: Vec<String>,
         /// Exact transitions since previous observe, including transient Stale.
         /// Every observe drains the trace, even if this selector is omitted.
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         connection_transitions: Option<Vec<String>>,
     },
     /// Require no client frames or connection attempts before the virtual ceiling.
@@ -82,6 +91,7 @@ pub enum FixtureStep {
     ExpectConnect {
         /// Inclusive lower bound, measured from this assertion's virtual instant.
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         not_before_ms: u64,
         /// Positive duration; JSON number, exact in JavaScript below 2^53.
@@ -99,6 +109,7 @@ pub enum FixtureStep {
     Send {
         /// Current attempt or the most recently abandoned socket generation.
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         socket: SocketTarget,
         /// Frame to inject; previous-socket callbacks must be ignored.
         frame: ServerFrame,
@@ -111,6 +122,7 @@ pub enum FixtureStep {
         fields: Vec<String>,
         /// Optional fields that must be absent, rather than ignored.
         #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
         absent: Vec<String>,
     },
     /// Expire exactly the named stage's original virtual ceiling. Fail any
@@ -167,6 +179,7 @@ pub struct QueuedCommand {
     /// First send time, distinct from creation. Missing age after restart means
     /// unknown_outcome, never a new execution (ADR-0038 §3).
     #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
     #[cfg_attr(feature = "ts", ts(type = "number | null"))]
     pub first_sent_ms: Option<u64>,
     /// Persisted client state determines first-send versus resume-only lookup.

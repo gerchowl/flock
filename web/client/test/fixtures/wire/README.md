@@ -78,7 +78,8 @@ Round 3 runner contract (ADR-0038 §3):
   and uncertain sends use `resume_only:true`. A 30 s ack deadline with the
   socket up enters uncertain, sends nothing, and a late ack can still settle
   it. Socket loss resends it as a lookup. A `session_unconfirmed` ack enters
-  unknown_outcome. Expired entries become unknown_outcome in every connection
+  unknown_outcome. An entry expires when `now_ms - first_sent_ms >= idempotency_window_ms`.
+  Expired entries become unknown_outcome in every connection
   state and are never resent. Changing principal drops the old outbox.
 - `disconnect` closes the socket (1000), cancels reconnect and holds the outbox.
   `set_token{principal}` changes credentials and is the only exit from NeedsToken.
@@ -88,7 +89,8 @@ Round 3 runner contract (ADR-0038 §3):
   they cannot escape NeedsToken.
 - `expect_connect` matches an attempt in the inclusive interval
   `[not_before_ms,within_ms]` measured from entry to that assertion, default
-  lower bound zero. An attempt already queued at the same instant has delay zero.
+  lower bound zero. The clock rests at the actual attempt instant, never at the
+  upper bound. An attempt already queued at the same instant has delay zero.
   Explicit connect/foreground/network/token-change attempts use 0–1 ms.
   A server retry uses the full equal-jitter interval, including the 30 s cap.
 - `deadline` advances to the original named stage's ceiling, **checking the

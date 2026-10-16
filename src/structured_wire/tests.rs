@@ -234,3 +234,46 @@ fn explicit_null_results_and_details_round_trip_without_becoming_absent() {
         assert_eq!(serde_json::to_value(parsed).unwrap(), value);
     }
 }
+
+#[test]
+fn every_omitted_script_field_is_optional_in_generated_types() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/client/src/gen");
+    let fixture_ts = std::fs::read_to_string(root.join("FixtureLine.ts")).unwrap();
+    let command_ts = std::fs::read_to_string(root.join("QueuedCommand.ts")).unwrap();
+    fn check(raw: &Value, canonical: &Value, declaration: &str, location: &str) {
+        for key in canonical.as_object().unwrap().keys() {
+            if raw.get(key).is_none() {
+                assert!(
+                    declaration.contains(&format!("{key}?:")),
+                    "{location}: omitted {key} must be optional in TS"
+                );
+            }
+        }
+    }
+    for (name, content) in fixtures() {
+        for (index, line) in content.lines().enumerate() {
+            let raw: Value = serde_json::from_str(line).unwrap();
+            let canonical = serde_json::to_value(FixtureLine::parse(line).unwrap()).unwrap();
+            let tag = format!("\"step\": \"{}\"", raw["step"].as_str().unwrap());
+            let declaration = fixture_ts
+                .split_once(&tag)
+                .unwrap()
+                .1
+                .split(" | { \"step\":")
+                .next()
+                .unwrap();
+            let location = format!("{name}:{}", index + 1);
+            check(&raw, &canonical, declaration, &location);
+            if raw["step"] == "given" {
+                for (input, output) in raw["outbox"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(canonical["outbox"].as_array().unwrap())
+                {
+                    check(input, output, &command_ts, &location);
+                }
+            }
+        }
+    }
+}
