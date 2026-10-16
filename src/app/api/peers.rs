@@ -345,7 +345,7 @@ impl App {
         self.state
             .workspaces
             .iter()
-            .map(|ws| workspace_peer_summary(ws, &self.state.terminals))
+            .map(|ws| workspace_peer_summary(ws, &self.state.terminals, &self.terminal_runtimes))
             .collect()
     }
 
@@ -945,8 +945,26 @@ fn workspace_peer_summary(
         crate::terminal::TerminalId,
         crate::terminal::TerminalState,
     >,
+    runtimes: &crate::terminal::TerminalRuntimeRegistry,
 ) -> PeerWorkspaceSummary {
-    let (state, seen) = ws.aggregate_state(terminals);
+    let project = |detail: &crate::workspace::PaneDetail| {
+        ws.pane_state(detail.pane_id)
+            .and_then(|pane| terminals.get(&pane.attached_terminal_id))
+            .map(|terminal| {
+                super::super::api_helpers::pane_agent_status_from_terminal(
+                    terminal,
+                    detail.seen,
+                    runtimes.get(&terminal.id).is_some(),
+                )
+            })
+            .unwrap_or(crate::api::schema::AgentStatus::Unknown)
+    };
+    let details = ws.pane_details(terminals);
+    let status = details
+        .iter()
+        .map(&project)
+        .max_by_key(|status| super::super::api_helpers::agent_status_attention_priority(*status))
+        .unwrap_or(crate::api::schema::AgentStatus::Unknown);
     // The attention-leading pane: highest priority, oldest transition first —
     // mirrors the local focus_attention ordering. Panes without a transition
     // timestamp sort as newest.
@@ -954,7 +972,7 @@ fn workspace_peer_summary(
     let leading = ws
         .pane_details(terminals)
         .into_iter()
-        .filter(|detail| (detail.state, detail.seen) == (state, seen))
+        .filter(|detail| project(detail) == status)
         .min_by_key(|detail| detail.state_changed_at.unwrap_or(now));
     let (agent, status_age_secs, activity) = leading
         .map(|detail| {
@@ -1001,7 +1019,7 @@ fn workspace_peer_summary(
             .or_else(|| ws.worktree_space().map(|space| space.is_linked_worktree))
             .unwrap_or(false),
         agent,
-        status: super::super::api_helpers::pane_agent_status(state, seen),
+        status,
         status_age_secs,
         activity,
         // Directory rows: every agent here, by identity (ADR-0008). The
@@ -1020,7 +1038,7 @@ fn workspace_peer_summary(
                     agent_id: terminal.agent_id.to_string(),
                     pane_id: crate::workspace::public_pane_id_for_number(&ws.id, pane_number),
                     agent: Some(agent_label_on_the_wire(&detail)),
-                    status: super::super::api_helpers::pane_agent_status(detail.state, detail.seen),
+                    status: project(&detail),
                 })
             })
             .collect(),
@@ -2233,7 +2251,11 @@ mod tests {
         let mut ws = crate::workspace::Workspace::test_new("main");
         ws.identity_cwd = dir.clone();
         ws.cached_git_space = None;
-        let summary = super::workspace_peer_summary(&ws, &std::collections::HashMap::new());
+        let summary = super::workspace_peer_summary(
+            &ws,
+            &std::collections::HashMap::new(),
+            &crate::terminal::TerminalRuntimeRegistry::default(),
+        );
         assert_eq!(
             summary.project_key.as_deref(),
             Some("github.com/gerchowl/flock")

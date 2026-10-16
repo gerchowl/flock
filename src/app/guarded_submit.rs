@@ -103,6 +103,16 @@ fn composer_rows<'a>(
     screen: &'a str,
     unfaint: &'a str,
 ) -> Option<(Vec<&'a str>, usize, usize)> {
+    composer_rows_with_width(agent, screen, unfaint, None, None)
+}
+
+fn composer_rows_with_width<'a>(
+    agent: Agent,
+    screen: &'a str,
+    unfaint: &'a str,
+    cols: Option<u16>,
+    expected: Option<&str>,
+) -> Option<(Vec<&'a str>, usize, usize)> {
     let lines: Vec<_> = screen.lines().collect();
     let (rows, body_start, body_end): (Vec<&str>, usize, usize) = match agent {
         Agent::Claude => {
@@ -130,7 +140,9 @@ fn composer_rows<'a>(
             (rows, start + 1, end)
         }
         Agent::Codex => {
-            let (start, end) = crate::detect::codex_composer_region(screen)?;
+            let (start, mut end) = crate::detect::codex_composer_region_with_width(screen, cols)?;
+            let clipped_footer = cols
+                .is_some_and(|cols| crate::detect::codex_clipped_shortcut_footer(lines[end], cols));
             let mut rows = vec![lines[start].trim_start().trim_start_matches('›').trim()];
             rows.extend(lines[start + 1..end].iter().map(|line| line.trim()));
             let typed: Vec<_> = unfaint.lines().collect();
@@ -138,18 +150,77 @@ fn composer_rows<'a>(
                 return None;
             }
             // Only the known hint may disappear with faint cells blanked (#1581).
+            if let Some((status, width)) = cols.and_then(|cols| {
+                if !clipped_footer {
+                    return None;
+                }
+                (start + 1..end)
+                    .rfind(|&index| !lines[index].trim().is_empty())
+                    .filter(|&index| crate::detect::codex_clipped_model_footer(lines[index], cols))
+                    .map(|index| (index, cols))
+            }) {
+                let candidate = &rows[..status - start];
+                let clear = typed[start]
+                    .trim_start()
+                    .strip_prefix('›')?
+                    .trim()
+                    .is_empty()
+                    && typed[start + 1..status]
+                        .iter()
+                        .all(|line| line.trim().is_empty())
+                    && codex_hint_prefix(candidate);
+                let candidate: Vec<_> = candidate
+                    .iter()
+                    .copied()
+                    .filter(|row| !row.is_empty())
+                    .collect();
+                let owned = expected.is_some_and(|text| {
+                    !text.trim().is_empty()
+                        && (matches_rows(&candidate, text)
+                            || matches_wrapped_tail(
+                                &candidate,
+                                text,
+                                usize::from(width.saturating_sub(2)),
+                            )
+                            || matches!(candidate.as_slice(), [row] if is_paste_chip(agent, row)))
+                });
+                // A model-shaped draft is indistinguishable from truncated status text.
+                // Only an empty styled hint or the known injection can resolve the boundary.
+                if clear || owned {
+                    end = status;
+                    rows.truncate(status - start);
+                } else if expected.is_none() {
+                    return None;
+                }
+            }
             let prompt_clear = typed[start]
                 .trim_start()
                 .strip_prefix('›')?
                 .trim()
                 .is_empty();
-            if prompt_clear
+            let empty_hint = prompt_clear
                 && typed[start + 1..end]
                     .iter()
                     .all(|row| row.trim().is_empty())
-                && codex_hint_prefix(&rows)
-            {
+                && codex_hint_prefix(&rows);
+            if empty_hint {
                 rows.clear();
+            }
+            if clipped_footer
+                && !empty_hint
+                && (expected.is_none()
+                    || editor_rows_empty(
+                        agent,
+                        &rows
+                            .iter()
+                            .copied()
+                            .filter(|row| !row.is_empty())
+                            .collect::<Vec<_>>(),
+                    ))
+            {
+                // A draft can itself end in a right-edge shortcut fragment.
+                // Clipped controls alone cannot prove an empty editor or a stash boundary.
+                return None;
             }
             (rows, start, end)
         }
@@ -211,7 +282,13 @@ pub(crate) fn runtime_composer(
     text: &str,
 ) -> Composer {
     let (screen, unfaint) = runtime.detection_text_and_unfaint();
-    composer_unfaint(agent, &screen, &unfaint, text)
+    composer_unfaint_with_width(
+        agent,
+        &screen,
+        &unfaint,
+        text,
+        Some(runtime.current_size().1),
+    )
 }
 
 #[cfg(test)]
@@ -221,7 +298,19 @@ pub(crate) fn composer(agent: Agent, screen: &str, text: &str) -> Composer {
 
 /// `composer` with styled hints read from `unfaint` (see `composer_rows`).
 pub(crate) fn composer_unfaint(agent: Agent, screen: &str, unfaint: &str, text: &str) -> Composer {
-    let Some((rows, body_start, body_end)) = composer_rows(agent, screen, unfaint) else {
+    composer_unfaint_with_width(agent, screen, unfaint, text, None)
+}
+
+fn composer_unfaint_with_width(
+    agent: Agent,
+    screen: &str,
+    unfaint: &str,
+    text: &str,
+    cols: Option<u16>,
+) -> Composer {
+    let Some((rows, body_start, body_end)) =
+        composer_rows_with_width(agent, screen, unfaint, cols, Some(text))
+    else {
         return Composer::Unknown;
     };
     let lines: Vec<_> = screen.lines().collect();
@@ -285,8 +374,22 @@ fn editor_rows_empty(agent: Agent, nonempty: &[&str]) -> bool {
 /// The editor's rows with blanks dropped, read without the idle gates: after
 /// a submit the agent is working, and its composer still takes input.
 fn editor_rows(agent: Agent, runtime: &crate::terminal::TerminalRuntime) -> Option<Vec<String>> {
+    editor_rows_for_text(agent, runtime, None)
+}
+
+fn editor_rows_for_text(
+    agent: Agent,
+    runtime: &crate::terminal::TerminalRuntime,
+    expected: Option<&str>,
+) -> Option<Vec<String>> {
     let (screen, unfaint) = runtime.detection_text_and_unfaint();
-    let (rows, _, _) = composer_rows(agent, &screen, &unfaint)?;
+    let (rows, _, _) = composer_rows_with_width(
+        agent,
+        &screen,
+        &unfaint,
+        Some(runtime.current_size().1),
+        expected,
+    )?;
     Some(
         rows.into_iter()
             .filter(|row| !row.is_empty())
@@ -302,7 +405,7 @@ fn editor_is_empty(agent: Agent, runtime: &crate::terminal::TerminalRuntime) -> 
 }
 
 fn editor_shows(agent: Agent, runtime: &crate::terminal::TerminalRuntime, text: &str) -> bool {
-    editor_rows(agent, runtime).is_some_and(|rows| {
+    editor_rows_for_text(agent, runtime, Some(text)).is_some_and(|rows| {
         matches_rows(&rows.iter().map(String::as_str).collect::<Vec<_>>(), text)
     })
 }
@@ -332,8 +435,12 @@ fn is_paste_chip(agent: Agent, row: &str) -> bool {
 }
 
 /// The editor holds exactly one paste chip and nothing else.
-fn editor_shows_paste_chip(agent: Agent, runtime: &crate::terminal::TerminalRuntime) -> bool {
-    editor_rows(agent, runtime)
+fn editor_shows_paste_chip(
+    agent: Agent,
+    runtime: &crate::terminal::TerminalRuntime,
+    text: &str,
+) -> bool {
+    editor_rows_for_text(agent, runtime, Some(text))
         .is_some_and(|rows| matches!(rows.as_slice(), [row] if is_paste_chip(agent, row)))
 }
 
@@ -366,7 +473,7 @@ fn editor_shows_wrapped_tail(
 ) -> bool {
     // Each editor row loses at least the two-column prompt or indent.
     let row_width = usize::from(runtime.current_size().1.saturating_sub(2));
-    editor_rows(agent, runtime).is_some_and(|rows| {
+    editor_rows_for_text(agent, runtime, Some(text)).is_some_and(|rows| {
         let rows: Vec<_> = rows.iter().map(String::as_str).collect();
         matches_wrapped_tail(&rows, text, row_width)
     })
@@ -489,7 +596,7 @@ impl App {
         let (ws, pane_id) = match self.resolve_pane_target(&params.pane_id) {
             Ok(target) => target,
             Err(error) if error.code == "pane_not_found" => {
-                return encode_error(id, "pane_gone", "pane_gone")
+                return encode_error(id, "pane_gone", "pane_gone");
             }
             Err(error) => return encode_error(id, &error.code, error.message),
         };
@@ -517,6 +624,21 @@ impl App {
                 self.active_submissions.insert(params.pane_id.clone());
                 self.pending_agent_submit = Some((id.clone(), params.pane_id, attempt));
                 encode_success(id, ResponseResult::Ok {})
+            }
+            Err("unknown_composer") => {
+                if let Some(runtime) = self.lookup_runtime_sender(ws, pane_id) {
+                    let (rows, columns) = runtime.current_size();
+                    let screen = runtime.detection_text();
+                    let mut bottom_rows: Vec<_> = screen.lines().rev().take(8).collect();
+                    bottom_rows.reverse();
+                    return encode_error_with_data(
+                        id,
+                        "unknown_composer",
+                        format!("unknown_composer in {columns}-column, {rows}-row pane"),
+                        serde_json::json!({"columns":columns,"rows":rows,"bottom_rows":bottom_rows}),
+                    );
+                }
+                encode_error(id, "unknown_composer", "unknown_composer")
             }
             Err("input_not_empty") => self.input_not_empty_response(id, ws, pane_id),
             Err(reason) => encode_error(id, reason, reason),
@@ -836,7 +958,7 @@ impl App {
             // a wrapped tail for the text above it (#1122).
             let typed = terminal.effective_known_agent().is_some_and(|agent| {
                 editor_shows(agent, runtime, &reported_text)
-                    || editor_shows_paste_chip(agent, runtime)
+                    || editor_shows_paste_chip(agent, runtime, &attempt.text)
                     || editor_shows_wrapped_tail(agent, runtime, &reported_text)
             });
             return Some(Outcome::Unconfirmed(if typed {
@@ -868,7 +990,7 @@ impl App {
         // tail a narrow pane leaves visible of a long message (#1122).
         let owned = editor == Composer::Owned
             || (editor == Composer::Other
-                && (editor_shows_paste_chip(agent, runtime)
+                && (editor_shows_paste_chip(agent, runtime, &attempt.text)
                     || editor_shows_wrapped_tail(agent, runtime, &reported_text)));
         if !owned && (attempt.sent || editor != Composer::Empty) {
             // A partial paste repaint may omit the footer or still show only
@@ -1241,7 +1363,7 @@ impl App {
                 // Only a full durable registry refuses admission. Any other
                 // store failure leaves local typing to the in-memory registry.
                 Err(reason) if reason.starts_with("mail_store_full") => {
-                    return Err("delivery_attempt_capacity")
+                    return Err("delivery_attempt_capacity");
                 }
                 Err(_) => {
                     crate::logging::mesh_custody_failed("record_attempt", "mail_store_unavailable")
@@ -1536,9 +1658,17 @@ pub(super) mod tests {
             composer_unfaint(Agent::Codex, shown, "›", "brief"),
             Composer::Unknown
         );
-        for screen in ["› \x1b[2mAsk Codex\x1b[0m", "› \x1b[2mAsk Codex\x1b[0m\r\nenter to confirm", "Hooks need review\r\n› \x1b[2mAsk Codex\x1b[0m\r\n? for shortcuts\r\nenter confirm · esc skip"] {
-            let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(26, 31, screen.as_bytes());
-            assert_eq!(runtime_composer(Agent::Codex, &runtime, "brief"), Composer::Unknown);
+        for screen in [
+            "› \x1b[2mAsk Codex\x1b[0m",
+            "› \x1b[2mAsk Codex\x1b[0m\r\nenter to confirm",
+            "Hooks need review\r\n› \x1b[2mAsk Codex\x1b[0m\r\n? for shortcuts\r\nenter confirm · esc skip",
+        ] {
+            let runtime =
+                crate::terminal::TerminalRuntime::test_with_screen_bytes(26, 31, screen.as_bytes());
+            assert_eq!(
+                runtime_composer(Agent::Codex, &runtime, "brief"),
+                Composer::Unknown
+            );
         }
     }
 
@@ -1681,3 +1811,7 @@ mod paste_chip_995_tests;
 #[cfg(test)]
 #[path = "guarded_submit/wrapped_tail_1122_tests.rs"]
 mod wrapped_tail_1122_tests;
+
+#[cfg(test)]
+#[path = "guarded_submit/narrow_1315_tests.rs"]
+mod narrow_1315_tests;

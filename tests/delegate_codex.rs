@@ -1547,5 +1547,7 @@ mod geometry_1139;
 #[path = "delegate_codex/hint_1581.rs"]
 mod hint_1581;
 
+#[path = "delegate_codex/narrow_1315.rs"]
+mod narrow_1315;
 #[path = "delegate_codex/wrap_slack_1141.rs"]
 mod wrap_slack_1141;
