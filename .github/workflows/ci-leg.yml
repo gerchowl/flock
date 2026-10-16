@@ -22,6 +22,10 @@ on:
         description: Runner image, and the leg's key in .config/ci-shards.toml
         required: true
         type: string
+      run-tests:
+        description: Run test shards; ordinary macOS PRs build and lint only
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -167,6 +171,8 @@ jobs:
           compression-level: 0
 
   test:
+    # Job conditions run before matrix expansion, so false schedules no shards.
+    if: ${{ inputs.run-tests }}
     name: ${{ matrix.shard.name }} (${{ matrix.shard.label }})
     needs: build
     runs-on: ${{ inputs.leg }}
@@ -205,6 +211,7 @@ jobs:
         run: just ci-shard '${{ inputs.leg }}' '${{ matrix.shard.name }}' nextest-archive.tar.zst
 
       - name: Summarize
+        continue-on-error: true
         if: always()
         run: python3 scripts/ci_shards.py summary --title '${{ matrix.shard.name }} (${{ inputs.leg }})' '${{ matrix.shard.name }}=target/nextest/ci/junit.xml' >> "$GITHUB_STEP_SUMMARY"
 

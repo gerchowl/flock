@@ -16,7 +16,12 @@ pub(crate) struct JsonApi {
 impl JsonApi {
     /// Configure both I/O directions immediately after connecting, before send.
     pub(crate) fn connect(path: &Path, timeout: Duration) -> io::Result<Self> {
-        let stream = UnixStream::connect(path)?;
+        Self::from_stream(UnixStream::connect(path)?, timeout)
+    }
+
+    /// Configure a stream established by a separately bounded connector.
+    /// Socket options precede send, just as for the pathname constructor.
+    pub(crate) fn from_stream(stream: UnixStream, timeout: Duration) -> io::Result<Self> {
         // macOS rejects socket options once the peer has closed. Configure
         // both directions before sending anything that can trigger a reply.
         stream.set_read_timeout(Some(timeout))?;

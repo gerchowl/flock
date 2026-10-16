@@ -106,9 +106,28 @@ def serial_group_binaries(nextest_toml: Path = NEXTEST_TOML) -> set[str]:
     """Every binary `.config/nextest.toml` puts in the serial-pty group."""
     data = tomllib.loads(nextest_toml.read_text(encoding="utf-8"))
     found: set[str] = set()
-    for override in data.get("profile", {}).get("default", {}).get("overrides", []):
-        if override.get("test-group") == SERIAL_GROUP:
-            found.update(re.findall(r"binary\(([^)]+)\)", override["filter"]))
+    # A literal glob has equality semantics in nextest. Reject every other
+    # expression rather than guessing which binaries it puts in this group.
+    selector = r"binary\(\s*(=?[A-Za-z0-9_.-]+)\s*\)"
+    union = rf"\s*{selector}(?:\s*\|\s*{selector})*\s*"
+    for profile in ("default", "ci"):
+        overrides = data.get("profile", {}).get(profile, {}).get("overrides", [])
+        for index, override in enumerate(overrides):
+            if override.get("test-group") != SERIAL_GROUP:
+                continue
+            expression = override.get("filter", "")
+            if "platform" in override:
+                raise SystemExit(
+                    f"{nextest_toml}: unsupported {SERIAL_GROUP} platform condition in "
+                    f"profile.{profile}.overrides[{index}]: {override['platform']!r}"
+                )
+            if not re.fullmatch(union, expression):
+                raise SystemExit(
+                    f"{nextest_toml}: unsupported {SERIAL_GROUP} filter in "
+                    f"profile.{profile}.overrides[{index}]: {expression!r}. "
+                    "Use a union of literal binary(name) or binary(=name) selectors"
+                )
+            found.update(name.removeprefix("=") for name in re.findall(selector, expression))
     return found
 
 
@@ -189,6 +208,16 @@ def binary_names(listing: dict) -> set[str]:
     return {suite["binary-name"] for suite in listing["rust-suites"].values()}
 
 
+def matched_binary_names(listing: dict) -> set[str]:
+    """Binaries with at least one selected testcase, for truthful shard labels."""
+    return {
+        suite["binary-name"]
+        for suite in listing["rust-suites"].values()
+        if any(case.get("filter-match", {}).get("status") == "matches"
+               for case in suite.get("testcases", {}).values())
+    }
+
+
 def verify(config: Config, leg: str, archive: str) -> int:
     problems = check_assignment(config, serial_group_binaries())
     known = binary_names(nextest_list(archive, "all()"))
@@ -197,10 +226,11 @@ def verify(config: Config, leg: str, archive: str) -> int:
             problems.append(f"{binary} is named in ci-shards.toml but is not a test binary")
 
     base = matched_tests(nextest_list(archive, config.legs[leg]))
-    selected = {
-        shard.name: matched_tests(nextest_list(archive, shard_filter(config, leg, shard.name)))
+    listings = {
+        shard.name: nextest_list(archive, shard_filter(config, leg, shard.name))
         for shard in config.shards
     }
+    selected = {name: matched_tests(listing) for name, listing in listings.items()}
     problems += check_partition(base, selected)
 
     for name, tests in selected.items():
@@ -214,7 +244,12 @@ def verify(config: Config, leg: str, archive: str) -> int:
     # A shard can be empty on one leg (macOS skips live_handoff), and nextest
     # fails a run that selects nothing, so only non-empty shards get a job.
     matrix = [
-        {"name": s.name, "label": "rest" if s.rest else ", ".join(s.binaries)}
+        {
+            "name": s.name,
+            "label": "rest" if s.rest else ", ".join(
+                sorted(matched_binary_names(listings[s.name]))
+            ),
+        }
         for s in config.shards
         if selected[s.name]
     ]

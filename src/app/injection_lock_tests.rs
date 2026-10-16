@@ -931,9 +931,51 @@ async fn typing_verbs_refuse_an_operator_draft_before_typing_in_every_harness() 
                 let response = call(&mut app, method);
                 let case = format!("{:?} {verb} onto {draft:?}", harness.agent);
                 assert_eq!(response["error"]["code"], "input_not_empty", "{case}");
+                assert!(
+                    response["error"]["data"]["composer"]["visible_bytes"]
+                        .as_u64()
+                        .is_some_and(|n| n > 0),
+                    "{response}"
+                );
+                assert_eq!(
+                    response["error"]["data"]["remedy"]["retry_when"],
+                    "composer_empty"
+                );
+                assert_eq!(response["error"]["data"]["remedy"]["follow_up_issue"], 1586);
+                assert!(response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("agent UI"));
+                assert!(
+                    !response.to_string().contains(draft),
+                    "draft contents must not leak"
+                );
                 assert!(drain(&mut pty).is_empty(), "{case}: nothing typed");
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn draft_refusal_reports_visible_utf8_bytes_without_returning_content() {
+    let draft = "opaque-token-é";
+    for harness in [&CLAUDE, &CODEX, &OPENCODE] {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = lock_rig(harness);
+        paint(&app, harness, draft);
+        let (_, method) = typing_verbs(&pane, false).swap_remove(2);
+        let response = call(&mut app, method);
+        assert_eq!(
+            response["error"]["data"]["composer"]["visible_bytes"],
+            draft.len()
+        );
+        assert!(!response.to_string().contains(draft));
+        let legacy: crate::api::schema::ErrorResponse = serde_json::from_value(response).unwrap();
+        assert_eq!(legacy.error.code, "input_not_empty");
+        assert!(drain(&mut pty).is_empty());
     }
 }
 
@@ -1021,6 +1063,16 @@ async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
         paint(&app, harness, MULTI_ROW);
         let response = call(&mut app, send_submit(&pane));
         assert_eq!(response["error"]["code"], "input_not_empty", "{agent:?}");
+        assert!(
+            response["error"]["data"]["composer"]["visible_bytes"]
+                .as_u64()
+                .is_some_and(|n| n > 0),
+            "{response}"
+        );
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no safe CLI command"));
         assert!(drain(&mut pty).is_empty(), "{agent:?}: nothing typed");
 
         let Rig {
