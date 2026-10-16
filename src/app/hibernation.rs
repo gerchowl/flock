@@ -210,18 +210,21 @@ impl App {
         // refuses (e.g. no runtime area yet) the plan stays stashed for the
         // next focus.
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-            terminal.pending_agent_resume_plan = Some(plan);
+            terminal.pending_agent_resume_plan = Some(plan.clone());
             terminal.set_hibernated_resume_plan(None);
         }
         let (rows, cols) = self.state.estimate_pane_size();
         let launched = self.start_pending_agent_resume_for_terminal(&terminal_id, rows, cols, true);
         if !launched {
-            // Restore the plan to `hibernated_resume_plan` so the next focus
-            // retries — otherwise the pane would silently un-hibernate with
-            // no runtime.
+            // ADR-0028 §1: a failed launch keeps its original lifecycle and
+            // persisted plan slot, never turning a deferred restore into hibernation.
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                if let Some(plan) = terminal.pending_agent_resume_plan.take() {
+                terminal.pending_agent_resume_plan = None;
+                if was_hibernated {
                     terminal.set_hibernated_resume_plan(Some(plan));
+                } else {
+                    terminal.set_hibernated_resume_plan(None);
+                    terminal.pending_agent_resume_plan = Some(plan);
                 }
             }
             return Err(HibernationError::Unsupported {
@@ -364,6 +367,155 @@ mod tests {
             vec![crate::api::schema::EventKind::PaneAgentStatusChanged],
             "a deferred resume must emit only its live status: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_1680_resume_preserves_plan_origin_through_persistence_and_retry() {
+        use crate::api::schema::{AgentStatus, EventKind};
+        use std::os::unix::fs::PermissionsExt;
+        for (automatic, hibernated) in [(false, false), (false, true), (true, false)] {
+            let root =
+                crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+            let fake = root.path().join("opencode");
+            std::fs::write(&fake, "#!/bin/sh\nread -r fixture\n").unwrap();
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut app = test_app();
+            app.state.default_shell = root.path().join("missing-shell").display().to_string();
+            app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+            let ws = crate::workspace::Workspace::test_new("failed-resume");
+            let pane_id = ws.tabs[0].root_pane;
+            let id = ws.terminal_id(pane_id).cloned().unwrap();
+            app.state.workspaces.push(ws);
+            app.state.active = Some(0);
+            app.state.ensure_test_terminals();
+            app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
+            let terminal = app.state.terminals.get_mut(&id).unwrap();
+            terminal.set_agent_name("opencode".into());
+            terminal.set_detected_state(
+                Some(crate::detect::Agent::OpenCode),
+                crate::detect::AgentState::Idle,
+            );
+            terminal.launch_argv = Some(vec![fake.display().to_string()]);
+            terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+                source: "flock:opencode".into(),
+                agent: "opencode".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("failed-resume-fixture")
+                    .unwrap(),
+            });
+            let plan = crate::agent_resume::AgentResumePlan {
+                agent: "opencode".into(),
+                argv: vec![
+                    fake.display().to_string(),
+                    "--session".into(),
+                    "failed-resume-fixture".into(),
+                ],
+                dedupe_key: "failed-resume-fixture".into(),
+            };
+            if hibernated {
+                terminal.set_hibernated_resume_plan(Some(plan));
+            } else {
+                terminal.pending_agent_resume_plan = Some(plan);
+            }
+            let sequence = app.event_hub.current_sequence();
+            let failed = if automatic {
+                !app.start_pending_agent_resumes(true)
+            } else {
+                app.resume_hibernated_pane(0, pane_id).is_err()
+            };
+            let terminal = &app.state.terminals[&id];
+            let failed_slots = (
+                terminal.pending_agent_resume_plan.is_some(),
+                terminal.hibernated_resume_plan.is_some(),
+            );
+            let failed_status = app.pane_info(0, pane_id).unwrap().agent_status;
+            let failed_events = app.event_hub.events_after(sequence);
+            let snapshot = crate::persist::capture(
+                &app.state.workspaces,
+                &app.state.terminals,
+                &app.terminal_runtimes,
+                app.state.active,
+                app.state.selected,
+                app.state.panel_scopes(),
+                app.state.sidebar_width,
+                app.state.sidebar_section_split,
+                app.state.collapsed_space_keys.clone(),
+                Default::default(),
+            );
+            let path = root.path().join("session.json");
+            serde_json::to_writer(
+                crate::platform::structured::create_private_file(&path).unwrap(),
+                &snapshot,
+            )
+            .unwrap();
+            let saved: crate::persist::SessionSnapshot =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let saved_hibernated = saved.workspaces[0].tabs[0].panes[&pane_id.raw()]
+                .hibernated
+                .is_some();
+            let (_, restored, mut restored_runtimes) = crate::persist::restore(
+                &saved,
+                None,
+                24,
+                80,
+                app.state.pane_scrollback_limit_bytes,
+                "/bin/sh",
+                crate::config::ShellModeConfig::NonLogin,
+                true,
+                app.event_tx.clone(),
+                app.render_notify.clone(),
+                app.render_dirty.clone(),
+            );
+            let restored_terminal = restored.values().next().unwrap();
+            let restored_slots = (
+                restored_terminal.pending_agent_resume_plan.is_some(),
+                restored_terminal.hibernated_resume_plan.is_some(),
+            );
+            let restore_spawned = !restored_runtimes.is_empty();
+            for (_, runtime) in restored_runtimes.drain() {
+                runtime.shutdown();
+            }
+            app.state.default_shell = "/bin/sh".into();
+            let automatic_retry = app.start_pending_agent_resumes(true);
+            let automatic_spawned = app.terminal_runtimes.len() != 0;
+            let retried = app.resume_hibernated_pane(0, pane_id);
+            let events = app.event_hub.events_after(sequence);
+            for (_, runtime) in app.terminal_runtimes.drain() {
+                runtime.shutdown();
+            }
+            let expected_slots = (!hibernated, hibernated);
+            assert!(failed && retried.is_ok(), "failed={failed}; {retried:?}");
+            assert!(
+                !automatic_retry && !automatic_spawned,
+                "failed resumes require an explicit retry"
+            );
+            assert!(failed_events.is_empty());
+            assert_eq!(failed_status, AgentStatus::Offline);
+            assert_eq!(failed_slots, expected_slots, "retry events: {events:?}");
+            assert_eq!(saved_hibernated, hibernated);
+            assert_eq!(restored_slots, expected_slots);
+            assert!(!restore_spawned);
+            let mut expected = vec![EventKind::PaneAgentStatusChanged];
+            if hibernated {
+                expected.push(EventKind::AgentResumedFromHibernation);
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|(_, event)| event.event)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let digest =
+                crate::digest::categorize(events.iter().map(|(seq, event)| (*seq, 0, event)));
+            assert_eq!(
+                digest
+                    .green
+                    .iter()
+                    .filter(|row| row.kind == "agent_resumed_from_hibernation")
+                    .count(),
+                usize::from(hibernated)
+            );
+        }
     }
 
     #[test]

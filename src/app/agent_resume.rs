@@ -18,11 +18,12 @@ struct PendingAgentResumeCandidate {
 }
 
 impl App {
+    /// Whether a deferred plan is eligible for automatic launch; failed plans need a user retry.
     pub(crate) fn has_pending_agent_resumes(&self) -> bool {
         self.state
             .terminals
             .values()
-            .any(|terminal| terminal.pending_agent_resume_plan.is_some())
+            .any(|terminal| terminal.pending_agent_resume_plan.is_some() && !terminal.resume_failed)
     }
 
     pub(crate) fn sync_pending_agent_resume_deadline(&mut self, now: Instant) {
@@ -104,6 +105,10 @@ impl App {
                     else {
                         continue;
                     };
+                    // Failed deferred launches remain resumable, but are not auto-retried.
+                    if terminal.resume_failed {
+                        continue;
+                    }
                     let Some(plan) = terminal.pending_agent_resume_plan.clone() else {
                         continue;
                     };
@@ -259,9 +264,6 @@ impl App {
                 );
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                     terminal.resume_failed = true;
-                    if let Some(plan) = terminal.pending_agent_resume_plan.take() {
-                        terminal.set_hibernated_resume_plan(Some(plan));
-                    }
                 }
                 return false;
             }
@@ -297,9 +299,6 @@ impl App {
             runtime.shutdown();
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.resume_failed = true;
-                if let Some(plan) = terminal.pending_agent_resume_plan.take() {
-                    terminal.set_hibernated_resume_plan(Some(plan));
-                }
             }
             return false;
         }
@@ -754,8 +753,8 @@ mod tests {
             .expect("terminal should survive a failed resume");
         assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
         assert!(terminal.resume_failed);
-        assert!(terminal.pending_agent_resume_plan.is_none());
-        assert!(terminal.hibernated_resume_plan.is_some());
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        assert!(terminal.hibernated_resume_plan.is_none());
         assert!(terminal.is_agent_terminal());
         let info = app.agent_info_for_target("reviewer").unwrap();
         assert_eq!(info.agent_status, crate::api::schema::AgentStatus::Offline);
