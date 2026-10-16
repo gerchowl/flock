@@ -70,6 +70,7 @@ use std::fs;
 /// Events that the headless server event loop can process.
 enum LoopEvent {
     Timer,
+    InputWrites,
     Internal(AppEvent),
     Api(api::ApiRequestMessage),
     ServerEvent(ServerEvent),
@@ -950,11 +951,13 @@ impl HeadlessServer {
                         None => LoopEvent::Timer,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
+                    _ = self.app.input_writes.notify.notified() => LoopEvent::InputWrites,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
 
             match event {
+                LoopEvent::InputWrites => self.app.input_writes.service(),
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
                     if self.handle_internal_event_with_forwarding(ev) {
@@ -1213,8 +1216,11 @@ impl HeadlessServer {
             return Err(err.into());
         }
         // #850: a draft an injection holds goes to the stash, which the
-        // manifest carries, and held keystrokes reach the PTY before it moves
+        // manifest carries, and held operator keystrokes reach the PTY before it moves
         // to the new server, which knows nothing of the lease.
+        self.app
+            .input_writes
+            .retire_all(crate::pty::write_receipt::WriteFailure::OwnerChanged);
         self.app.settle_injections_for_exit();
         self.handoff_in_progress = true;
         self.disconnect_all_clients_for_handoff();
@@ -3748,6 +3754,7 @@ impl HeadlessServer {
     /// clients render, so a session probe that only ran in the monolithic loop
     /// would never see the fault that only the server can have.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
+        self.app.input_writes.service_due(now);
         let mut changed = false;
 
         self.app.sync_headless_animation_timer(now);
@@ -3958,6 +3965,9 @@ impl HeadlessServer {
         if self.shutting_down {
             return;
         }
+        self.app
+            .input_writes
+            .retire_all(crate::pty::write_receipt::WriteFailure::PaneGone);
         info!("server shutdown initiated");
         self.shutting_down = true;
         // #850: keep any draft an injection holds, and write any keystrokes
@@ -4691,6 +4701,79 @@ mod tests {
             server.app.session_health.probe_in_flight(),
             "the headless loop must drive the session probe"
         );
+    }
+
+    #[tokio::test]
+    async fn s3b_headless_dispatch_deadline_cancels_held_input_without_traffic() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("write-ack")];
+        server.app.state.ensure_test_terminals();
+        let pane = server.app.state.workspaces[0].tabs[0].root_pane;
+        let public = server.app.state.public_pane_id(0, pane).unwrap();
+        let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let now = Instant::now();
+        assert!(runtime.begin_injection_lease("held", now + Duration::from_secs(2), now));
+        server.app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let (respond_to, response) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true,"write_timeout_ms":200}})).unwrap(),
+            respond_to, peer_pid:None,
+        });
+        assert!(matches!(
+            response.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        server.app.next_auto_update_check = None;
+        server.app.checks_heartbeat_deadline = None;
+        assert_eq!(
+            server
+                .app
+                .next_headless_loop_deadline_with_git_refresh(now, false, false),
+            server.app.input_writes.next_deadline()
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            sleep_until_or_pending(server.app.input_writes.next_deadline()),
+        )
+        .await
+        .unwrap();
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+        let value: serde_json::Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "input_write_cancelled");
+        assert_eq!(value["error"]["data"]["input_write"]["reason"], "deadline");
+        server.app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held");
+        assert!(bytes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn s3b_headless_shutdown_answers_before_releasing_held_payload() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("write-ack")];
+        server.app.state.ensure_test_terminals();
+        let pane = server.app.state.workspaces[0].tabs[0].root_pane;
+        let public = server.app.state.public_pane_id(0, pane).unwrap();
+        let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let now = Instant::now();
+        assert!(runtime.begin_injection_lease("held", now + Duration::from_secs(2), now));
+        server.app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let (respond_to, response) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true}})).unwrap(),
+            respond_to, peer_pid:None,
+        });
+        assert!(matches!(
+            response.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        server.initiate_shutdown();
+        let value: serde_json::Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["data"]["input_write"]["reason"], "pane_gone");
+        assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
+        assert!(bytes.try_recv().is_err());
     }
 
     fn test_headless_server() -> HeadlessServer {

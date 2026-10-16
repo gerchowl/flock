@@ -3462,15 +3462,40 @@ fn live_handoff_names_undrained_pane_and_skip_undrained_proceeds() {
     support::wait_for_file(&marker, Duration::from_secs(5));
     let pid_text = fs::read_to_string(&marker).unwrap();
     let child_pid: u32 = pid_text.split_whitespace().last().unwrap().parse().unwrap();
-    thread::sleep(Duration::from_millis(200));
-    assert_ok(request(
+    // This case covers operator input, which has no API response owner to retire.
+    // The disconnect follows the paste on the same ordered client stream; EOF
+    // proves the app consumed that input before trying the handoff.
+    let protocol = request(
         &api_socket,
-        serde_json::json!({
-            "id": "test:pane:flood",
-            "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": "x".repeat(256 * 1024)}
-        }),
-    ));
+        serde_json::json!({"id":"protocol","method":"ping","params":{}}),
+    )["result"]["protocol"]
+        .as_u64()
+        .unwrap() as u32;
+    let mut client = UnixStream::connect(runtime_dir.join("flock-client.sock")).unwrap();
+    let (_, error) = client_handshake(&mut client, protocol, 80, 24).unwrap();
+    assert!(error.is_none(), "{error:?}");
+    let mut paste = b"\x1b[200~".to_vec();
+    paste.extend(vec![b'x'; 256 * 1024]);
+    paste.extend_from_slice(b"\x1b[201~");
+    send_input(&mut client, &paste).unwrap();
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut output = [0; 4096];
+    loop {
+        let remaining = until.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "client input disconnect was not processed"
+        );
+        client.set_read_timeout(Some(remaining)).unwrap();
+        if client
+            .read(&mut output)
+            .expect("client disconnect must complete")
+            == 0
+        {
+            break;
+        }
+    }
 
     let failed = request(
         &api_socket,
@@ -3514,7 +3539,6 @@ fn live_handoff_names_undrained_pane_and_skip_undrained_proceeds() {
         "skipped_undrained must list {pane_id} with its dropped bytes: {skipped}"
     );
     drop(spawned);
-    thread::sleep(Duration::from_millis(300));
     wait_for_api(&api_socket, Duration::from_secs(10));
     assert_eq!(
         unsafe { libc::kill(child_pid as libc::pid_t, 0) },
@@ -3528,6 +3552,179 @@ fn live_handoff_names_undrained_pane_and_skip_undrained_proceeds() {
     let _ = request(
         &api_socket,
         serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn s3b_live_handoff_retires_partial_api_input_before_owner_release() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _lock = test_lock();
+    let directory = SocketDir::reserve("hlh");
+    let base = directory.path().to_path_buf();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("flock.sock");
+    let script = base.join("write-reader.py");
+    let pid_file = base.join("reader.pid");
+    let first_byte = base.join("first");
+    let gate = base.join("gate");
+    let received = base.join("received");
+    fs::write(
+        &script,
+        format!(
+            r#"import os, pathlib, select, sys, tty
+
+tty.setraw(0)
+os.mkfifo({gate:?})
+sys.stdout.buffer.write(b"\x1b[<u\x1b[>4;0m\x1b[?2004l\r\nWRITE_ACK_READY\r\n")
+sys.stdout.flush()
+pathlib.Path({pid:?}).write_text(str(os.getpid()) + "\n")
+first = os.read(0, 1)
+if not first:
+    sys.exit(3)
+pathlib.Path({first:?}).write_bytes(first)
+with open({gate:?}, "rb") as gate:
+    if gate.read(1) != b"g":
+        sys.exit(4)
+data = bytearray(first)
+while not data.endswith(b"!END!"):
+    if not select.select([0], [], [], 5)[0]:
+        sys.exit(5)
+    chunk = os.read(0, 65536)
+    if not chunk:
+        sys.exit(6)
+    data.extend(chunk)
+temporary = pathlib.Path({received:?} + ".tmp")
+temporary.write_bytes(data[:-5])
+os.replace(temporary, {received:?})
+with open({gate:?}, "rb") as finish:
+    finish.read(1)
+"#,
+            gate = gate,
+            pid = pid_file,
+            first = first_byte,
+            received = received
+        ),
+    )
+    .unwrap();
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    register_runtime_dir(&runtime_dir);
+    let created = try_request_bounded(
+        &api_socket,
+        serde_json::json!({"id":"workspace","method":"workspace.create","params":{"cwd":base,"focus":true}}),
+        Some(Duration::from_secs(5)),
+    ).unwrap_or_else(|error|panic!("{}",error.message));
+    let pane = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(try_request_bounded(
+        &api_socket,
+        serde_json::json!({"id":"reader","method":"pane.send_input","params":{"pane_id":pane,"text":format!("python3 {}",script.display()),"keys":["Enter"],"write_timeout_ms":2000}}),
+        Some(Duration::from_secs(5)),
+    ).unwrap_or_else(|error|panic!("{}",error.message)));
+    let child_pid: u32 = wait_for_file_contains(&pid_file, "\n", Duration::from_secs(5))
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ok(try_request_bounded(&api_socket,serde_json::json!({"id":"ready","method":"pane.wait_for_output","params":{"pane_id":pane,"source":"recent","match":{"type":"substring","value":"WRITE_ACK_READY"},"timeout_ms":5000}}),Some(Duration::from_secs(6))).unwrap_or_else(|error|panic!("{}",error.message)));
+    let flood_socket = api_socket.clone();
+    let flood_pane = pane.clone();
+    let flood = thread::spawn(move || {
+        try_request_bounded(&flood_socket,serde_json::json!({"id":"flood","method":"pane.write_input","params":{"pane_id":flood_pane,"text":"x".repeat(256*1024),"raw":true,"write_timeout_ms":8000}}),Some(Duration::from_secs(11))).unwrap_or_else(|error|panic!("{}",error.message))
+    });
+    support::fleet::wait_until("native input prefix", Duration::from_secs(5), || {
+        assert_eq!(
+            unsafe { libc::kill(child_pid as libc::pid_t, 0) },
+            0,
+            "reader died before observing input"
+        );
+        match fs::read(&first_byte) {
+            Ok(bytes) if bytes == b"x" => Some(()),
+            Ok(bytes) if bytes.is_empty() => None,
+            Ok(bytes) => panic!("unexpected first input byte: {bytes:?}"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("prefix evidence: {error}"),
+        }
+    });
+    assert!(
+        !flood.is_finished(),
+        "a partial native write must retain its response owner"
+    );
+    assert_ok(
+        try_request_bounded(
+            &api_socket,
+            serde_json::json!({"id":"handoff","method":"server.live_handoff","params":{}}),
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message)),
+    );
+    let response = flood.join().unwrap();
+    assert_eq!(
+        response["error"]["code"], "input_write_failed",
+        "{response}"
+    );
+    let evidence = &response["error"]["data"]["input_write"];
+    assert_eq!(evidence["reason"], "owner_changed");
+    assert_eq!(evidence["bytes_total"], 256 * 1024);
+    assert_eq!(evidence["remainder_discarded"], true);
+    let written = evidence["bytes_written"].as_u64().unwrap() as usize;
+    assert!((1..256 * 1024).contains(&written), "{response}");
+    drop(spawned);
+    assert_ok(
+        try_request_bounded(
+            &api_socket,
+            serde_json::json!({"id":"imported","method":"ping","params":{}}),
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.message)),
+    );
+    let mut release = support::fleet::wait_until("reader gate", Duration::from_secs(5), || {
+        assert_eq!(
+            unsafe { libc::kill(child_pid as libc::pid_t, 0) },
+            0,
+            "reader died before release"
+        );
+        match fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&gate)
+        {
+            Ok(file) => Some(file),
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => None,
+            Err(error) => panic!("reader gate: {error}"),
+        }
+    });
+    release.write_all(b"g").unwrap();
+    drop(release);
+    assert_ok(try_request_bounded(&api_socket,serde_json::json!({"id":"later","method":"pane.write_input","params":{"pane_id":pane,"text":"!END!","raw":true,"write_timeout_ms":1500}}),Some(Duration::from_secs(3))).unwrap_or_else(|error|panic!("{}",error.message)));
+    let observed =
+        support::fleet::wait_until("retired native prefix", Duration::from_secs(5), || {
+            match fs::read(&received) {
+                Ok(bytes) if !bytes.is_empty() => Some(bytes),
+                Ok(_) => None,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    assert_eq!(
+                        unsafe { libc::kill(child_pid as libc::pid_t, 0) },
+                        0,
+                        "reader died before recording input"
+                    );
+                    None
+                }
+                Err(error) => panic!("native input evidence: {error}"),
+            }
+        });
+    assert_eq!(
+        observed.len(),
+        written,
+        "retired suffix appeared after handoff"
+    );
+    assert!(observed.iter().all(|byte| *byte == b'x'));
+    let _ = try_request_bounded(
+        &api_socket,
+        serde_json::json!({"id":"stop","method":"server.stop","params":{}}),
+        Some(Duration::from_secs(5)),
     );
     cleanup_test_base(&base);
 }

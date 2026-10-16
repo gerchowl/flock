@@ -211,6 +211,7 @@ impl App {
         let mut changed = false;
         let mut resized = false;
 
+        self.input_writes.service_due(now);
         self.sync_animation_timer(now);
         changed |= self.refresh_session_health(now);
 
@@ -717,6 +718,7 @@ impl App {
             self.idle_wake.next_deadline(),
             // ADR-0028 §5: a wait expires on time in a quiet loop.
             self.waits.next_deadline(),
+            self.input_writes.next_deadline(),
             // #540: the same, for an armed self-compaction — the Enter of a
             // typed write, a settle that lifts, or a timeout coming due.
             self.self_compact_deadline,
