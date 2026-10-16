@@ -1279,3 +1279,45 @@ async fn restart_inline_1109_drops_the_original_prompt_in_the_native_launch() {
         )
     );
 }
+
+/// The isolated fake PTY and native report feed the real restart API planner.
+#[tokio::test]
+async fn restart_1659_plugin_directory_does_not_replay_the_opening_prompt() {
+    let mut rig = rig_with_launch_options(
+        "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
+        &["--plugin-dir", "fixture-plugin", "opening prompt"],
+    );
+    let response = request(&mut rig);
+    assert!(response.get("result").is_some(), "{response}");
+    let plan = &rig.app.state.agent_restarts.pending[&rig.id].plan.argv;
+    assert_eq!(
+        &plan[1..],
+        [
+            "--resume",
+            "restart-session",
+            "--plugin-dir",
+            "fixture-plugin"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn restart_1659_claude_print_is_not_a_value_taking_option() {
+    let mut rig = rig_with_launch_options(
+        "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
+        &["-p", "--model", "fixture-model", "opening prompt"],
+    );
+    let response = request(&mut rig);
+    assert!(response.get("result").is_some(), "{response}");
+    let plan = &rig.app.state.agent_restarts.pending[&rig.id].plan.argv;
+    assert_eq!(
+        &plan[1..],
+        [
+            "--resume",
+            "restart-session",
+            "-p",
+            "--model",
+            "fixture-model"
+        ]
+    );
+}
