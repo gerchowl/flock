@@ -3368,6 +3368,16 @@ impl AppState {
                 .is_some_and(crate::pane::InputState::mouse_reporting_enabled)
     }
 
+    /// Publish runtime presence as pure, transient presentation data.
+    pub(crate) fn refresh_terminal_runtime_presence(
+        &mut self,
+        runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ) {
+        for (id, terminal) in &mut self.terminals {
+            terminal.view_runtime_present = runtimes.get(id).is_some();
+        }
+    }
+
     /// The runtime that owns terminal-mode input for the active workspace:
     /// the visible float when one is up, otherwise the focused layout pane.
     pub(crate) fn terminal_input_runtime_from<'a>(

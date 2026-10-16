@@ -129,6 +129,8 @@ pub struct TerminalStateMutation {
 /// metadata.
 pub struct TerminalState {
     pub id: TerminalId,
+    /// Transient runtime presence for pure local presentation; never persisted.
+    pub(crate) view_runtime_present: bool,
     /// Fleet-global, restart-stable identity for the agent in this pane.
     ///
     /// `id` (the `TerminalId`) survives a pane move but is RE-MINTED on every
@@ -340,6 +342,7 @@ impl TerminalState {
         Self {
             id,
             agent_id,
+            view_runtime_present: false,
             agent_identity_retired: false,
             cwd,
             detected_agent: None,
