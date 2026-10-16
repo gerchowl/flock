@@ -44,7 +44,12 @@ assert "fixture-token-not-a-credential" not in json.dumps(sys.argv), "token in a
 settings = pathlib.Path(sys.argv[sys.argv.index("--settings") + 1])
 mcp = pathlib.Path(sys.argv[sys.argv.index("--mcp-config") + 1])
 assert json.loads(settings.read_text()) == {"permissions": {"defaultMode": "default", "allow": [], "deny": []}}
-assert json.loads(mcp.read_text()) == {"mcpServers": {}}
+if case["mode"] == "mcp-config":
+    registration = json.loads(mcp.read_text())
+    assert set(registration["mcpServers"]) == {"flock"}, "missing session flock MCP"
+    (root / "observed-mcp.json").write_text(json.dumps(registration))
+else:
+    assert json.loads(mcp.read_text()) == {"mcpServers": {}}
 assert stat.S_IMODE(settings.stat().st_mode) == 0o600
 assert stat.S_IMODE(mcp.stat().st_mode) == 0o600
 assert "--no-session-persistence" not in sys.argv

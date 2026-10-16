@@ -873,3 +873,22 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
         assert!(fixture.leases.reserve(agent, session, None).is_ok());
     }
 }
+
+#[test]
+fn session_1441_fake_harness_receives_owned_flock_mcp_config() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("mcp-config", "2.1.296").expect("launch");
+    running.submit();
+    let exit = running.finish();
+    assert_eq!(
+        exit.status.expect("reaped status").code(),
+        Some(0),
+        "{exit:?}"
+    );
+    let config: Value = serde_json::from_slice(
+        &fs::read(fixture.root.path().join("observed-mcp.json")).expect("observed MCP"),
+    )
+    .unwrap();
+    assert_eq!(config["mcpServers"].as_object().unwrap().len(), 1);
+    assert!(!running.generated.exists());
+}
