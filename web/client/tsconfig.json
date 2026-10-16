@@ -17,5 +17,5 @@
     "skipLibCheck": true,
     "types": ["bun", "vite/client"]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "tests/**/*.tsx", "scripts/**/*.ts", "vite.config.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "tests/**/*.tsx", "e2e/**/*.ts", "scripts/**/*.ts", "vite.config.ts"]
 }

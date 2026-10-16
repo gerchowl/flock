@@ -73,3 +73,79 @@ body {
   padding: 1rem;
   color: var(--error);
 }
+
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.event {
+  min-width: 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.event--assistant {
+  background: var(--bg);
+}
+
+.event__label {
+  margin: 0 0 0.25rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.text {
+  margin: 0.25rem 0;
+  white-space: pre-wrap;
+}
+
+/* Collapsed blocks: the summary is the touch target (at least 44 px). */
+details > summary {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  cursor: pointer;
+  list-style: none;
+}
+
+details > summary::before {
+  content: "▸";
+  margin-right: 0.5rem;
+}
+
+details[open] > summary::before {
+  content: "▾";
+}
+
+details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.event--unknown > summary {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+}
+
+/* Code and JSON scroll inside their own block, never the page. */
+.code {
+  max-width: 100%;
+  margin: 0.25rem 0 0;
+  padding: 0.5rem 0.75rem;
+  overflow-x: auto;
+  border-radius: 6px;
+  background: var(--bg);
+  font: 0.8125rem/1.45 var(--font-mono);
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.transcript__status {
+  margin: 0.5rem 0 2rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+}

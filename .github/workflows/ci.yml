@@ -88,6 +88,14 @@ jobs:
       - name: Client check
         run: just client-check
 
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: client-screenshots
+          path: web/client/artifacts/screenshots/
+          if-no-files-found: error
+
   # Pinned to macos-15, NOT macos-latest: GitHub rotated macos-latest to the
   # macOS 26 ("Tahoe") image, whose SDK the vendored libghostty-vt zig 0.15.2
   # build can't link against (undefined libSystem symbols like
