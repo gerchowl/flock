@@ -176,6 +176,154 @@ fn large_lines_oversize_unknown_and_invalid_utf8_are_explicit() {
 }
 
 #[test]
+fn lossy_result_prefix_reopens_gate_without_claiming_turn_success() {
+    for (invalid_utf8, escaped) in [(false, false), (true, false), (false, true)] {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
+        let (transport, mut stdout, input) = start(&root);
+        transport.try_submit(&user("first")).expect("idle submit");
+        let mut input = BufReader::new(input);
+        let mut envelope = String::new();
+        input.read_line(&mut envelope).expect("first input");
+        let producer = thread::spawn(move || {
+            // Keep the harness's top-level event header before the lost body.
+            let mut raw = Vec::new();
+            raw.extend_from_slice(if escaped {
+                b"{\"type\":\"res\\u0075lt\",\"padding\":\""
+            } else {
+                b"{\"type\":\"result\",\"padding\":\""
+            });
+            raw.extend(std::iter::repeat_n(
+                b'x',
+                if invalid_utf8 { 16 } else { MAX_LINE_BYTES },
+            ));
+            if invalid_utf8 {
+                raw.push(0xff);
+            }
+            raw.extend_from_slice(b"\"}\n");
+            stdout.write_all(&raw).expect("lossy result");
+            stdout
+        });
+        let received = receive(&transport);
+        assert_eq!(received.record.origin, RecordOrigin::Flk);
+        assert_eq!(
+            serde_json::from_str::<Value>(&received.record.raw).expect("loss summary")["turn_end"],
+            "result"
+        );
+        assert!(matches!(received.event, SessionEvent::Unknown { .. }));
+        assert!(
+            received.record.result_subtype.is_none(),
+            "loss cannot claim success"
+        );
+        transport
+            .try_submit(&user("next"))
+            .expect("lossy result ends turn");
+        envelope.clear();
+        input.read_line(&mut envelope).expect("next input");
+        assert_eq!(
+            serde_json::from_str::<Value>(&envelope).expect("envelope"),
+            user("next")
+        );
+        let mut stdout = producer.join().expect("producer");
+        stdout
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n")
+            .expect("final result");
+        receive(&transport);
+        drop(stdout);
+        reader_done(&transport).expect("EOF");
+    }
+}
+
+#[test]
+fn lossy_header_never_mistakes_nested_or_truncated_types_for_result() {
+    for (prefix, expected) in [
+        (
+            b"{\"message\":{\"type\":\"result\"},\"type\":\"assistant\",\"padding\":\"".as_slice(),
+            "not_result",
+        ),
+        (
+            b"{\"message\":{\"type\":\"result\"},\"padding\":\"".as_slice(),
+            "unknown",
+        ),
+        (b"{\"type\":\"res".as_slice(), "unknown"),
+    ] {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
+        let (transport, mut stdout, input) = start(&root);
+        transport.try_submit(&user("first")).expect("input");
+        let mut input = BufReader::new(input);
+        let mut envelope = String::new();
+        input.read_line(&mut envelope).expect("first input");
+        let producer = thread::spawn(move || {
+            stdout.write_all(prefix).expect("prefix");
+            stdout
+                .write_all(&vec![b'x'; MAX_LINE_BYTES])
+                .expect("lost body");
+            stdout.write_all(b"\"}\n").expect("line end");
+            stdout
+        });
+        let loss = receive(&transport);
+        assert_eq!(
+            serde_json::from_str::<Value>(&loss.record.raw).expect("summary")["turn_end"],
+            expected
+        );
+        let error = transport
+            .try_submit(&user("unsafe steering"))
+            .expect_err("no confirmed boundary");
+        if expected == "unknown" {
+            assert!(error.to_string().contains("structured_turn_end_unknown"));
+        } else {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
+        let mut stdout = producer.join().expect("producer");
+        stdout
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n")
+            .expect("real boundary");
+        receive(&transport);
+        transport
+            .try_submit(&user("safe next"))
+            .expect("confirmed next turn");
+        envelope.clear();
+        input.read_line(&mut envelope).expect("next input");
+        drop(stdout);
+        reader_done(&transport).expect("EOF");
+    }
+}
+
+#[test]
+fn indeterminate_loss_reports_named_turn_state_until_a_real_result() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
+    let (transport, mut stdout, input) = start(&root);
+    transport.try_submit(&user("first")).expect("idle submit");
+    let mut input = BufReader::new(input);
+    let mut envelope = String::new();
+    input.read_line(&mut envelope).expect("input");
+    let producer = thread::spawn(move || {
+        stdout
+            .write_all(&vec![b'x'; MAX_LINE_BYTES + 1])
+            .expect("unidentifiable loss");
+        stdout.write_all(b"\n").expect("line end");
+        stdout
+    });
+    receive(&transport);
+    let error = transport
+        .try_submit(&user("unsafe retry"))
+        .expect_err("unknown boundary");
+    assert_ne!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(error.to_string().contains("structured_turn_end_unknown"));
+    let mut stdout = producer.join().expect("producer");
+    stdout
+        .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n")
+        .expect("confirmed boundary");
+    receive(&transport);
+    transport
+        .try_submit(&user("confirmed next"))
+        .expect("result repairs uncertainty");
+    envelope.clear();
+    input.read_line(&mut envelope).expect("next input");
+    drop(stdout);
+    reader_done(&transport).expect("EOF");
+}
+
+#[test]
 fn private_idle_gate_reopens_on_unknown_result_and_records_subtype() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
     let (transport, mut stdout, input) = start(&root);
@@ -362,6 +510,7 @@ fn failed_persistence_never_publishes_or_reopens_idle_gate() {
         "2.1.296",
         &tx,
         &busy,
+        &AtomicBool::new(false),
         &cancel
     )
     .is_err());
