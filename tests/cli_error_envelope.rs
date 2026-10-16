@@ -529,3 +529,32 @@ fn wait_park_exits_by_its_refusal_and_prints_its_wait() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["wait_id"], "w_1_1");
 }
+
+/// Restart drop reports survive both CLI output forms.
+#[test]
+fn restart_optional_1109_drop_report_schema_and_cli() {
+    fn answer(_: &Value) -> Value {
+        json!({"result":{"type":"agent_restart_queued","pane_id":"fixture-pane","session":"fixture-session","stop_only":false,"dropped_flags":[{"flag":"--worktree","reason":"existing cwd is preserved"},{"flag":"--from-pr","reason":"native resume selector determines session"}]}})
+    }
+    let (socket, _server) = scripted_server("restart-drop-report", answer);
+    for args in [
+        vec!["agent", "restart", "fixture-worker", "--reason", "reload"],
+        vec![
+            "--json",
+            "agent",
+            "restart",
+            "fixture-worker",
+            "--reason",
+            "reload",
+        ],
+    ] {
+        let output = flk(&socket, &args);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            response["result"]["dropped_flags"],
+            answer(&Value::Null)["result"]["dropped_flags"]
+        );
+        assert!(output.stderr.is_empty());
+    }
+}
