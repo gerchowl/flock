@@ -70,12 +70,17 @@ fn optional_1109_known_values_and_bare_flag_preserve_next_option() {
 
 #[test]
 fn optional_1109_unknown_and_open_values_refuse_even_equals_forms() {
-    for flag in ["--remote-control", "--debug"] {
+    {
+        let flag = "--remote-control";
         for option in [flag.to_string(), format!("{flag}=fixture")] {
             let error =
                 resume_launch(&session(), &launch(&[&option, "--model", "fixture"])).unwrap_err();
             assert!(error.contains(flag), "{error}");
         }
+    }
+    for args in [vec!["--debug"], vec!["--debug", "fixture"]] {
+        let error = resume_launch(&session(), &launch(&args)).unwrap_err();
+        assert!(error.contains("--debug"), "{error}");
     }
     let error = resume_launch(&session(), &launch(&["--prompt-suggestions=maybe"])).unwrap_err();
     assert!(error.contains("--prompt-suggestions"), "{error}");
@@ -85,7 +90,7 @@ fn optional_1109_unknown_and_open_values_refuse_even_equals_forms() {
 fn optional_1109_tools_preserve_every_value() {
     for args in [
         vec!["--tools", "Read", "Edit", "--model", "fixture"],
-        vec!["--tools=Read", "Edit", "--model", "fixture"],
+        vec!["--tools=Read", "--model", "fixture"],
         vec!["--tools", "", "--model", "fixture"],
     ] {
         let original = launch(&args);
@@ -177,12 +182,7 @@ fn optional_1109_files_preserve_every_value() {
             "--model",
             "fixture",
         ],
-        vec![
-            "--file=file_one:one.txt",
-            "file_two:two.txt",
-            "--model",
-            "fixture",
-        ],
+        vec!["--file=file_one:one.txt", "--model", "fixture"],
     ] {
         let original = launch(&args);
         let result = resume_launch(&session(), &original).unwrap();
@@ -216,4 +216,66 @@ fn optional_1109_each_dropped_selector_has_a_reason_in_all_forms() {
             assert!(!result.dropped_flags[0].reason.is_empty());
         }
     }
+}
+
+#[test]
+fn inline_1109_variadic_options_do_not_replay_the_opening_prompt() {
+    for flag in [
+        "--add-dir",
+        "--allowedTools",
+        "--allowed-tools",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--mcp-config",
+        "--plugin-dir",
+        "--betas",
+        "--tools",
+        "--file",
+    ] {
+        let inline = format!("{flag}=fixture");
+        let original = launch(&[&inline, "implement the fixture", "--model", "fixture-model"]);
+        let result = resume_launch(&session(), &original).unwrap();
+        assert_eq!(
+            result.plan.argv,
+            launch(&[
+                "--resume",
+                "native-fixture",
+                &inline,
+                "--model",
+                "fixture-model"
+            ]),
+            "{flag} replayed the opening prompt"
+        );
+    }
+}
+
+#[test]
+fn inline_1109_debug_filters_are_preserved() {
+    for arg in ["--debug=fixture", "-d=fixture"] {
+        let result = resume_launch(&session(), &launch(&[arg, "opening prompt"])).unwrap();
+        assert_eq!(
+            result.plan.argv,
+            launch(&["--resume", "native-fixture", arg])
+        );
+    }
+}
+
+#[test]
+fn inline_1109_short_resume_is_replaced_by_the_native_selector() {
+    for args in [vec!["-r", "old-session"], vec!["-r=old-session"]] {
+        let result = resume_launch(&session(), &launch(&args)).unwrap();
+        assert_eq!(result.plan.argv, launch(&["--resume", "native-fixture"]));
+    }
+    for args in [vec!["-r"], vec!["-r", "--model", "fixture"]] {
+        let error = resume_launch(&session(), &launch(&args)).unwrap_err();
+        assert!(error.contains("-r"), "{error}");
+    }
+    let mut other_session = session();
+    other_session.agent = "codex".into();
+    other_session.source = "flock:codex".into();
+    assert!(resume_launch(
+        &other_session,
+        &["codex".into(), "-r".into(), "old-session".into()]
+    )
+    .is_err());
 }

@@ -1197,7 +1197,7 @@ async fn restart_optional_1109_reports_drops_and_launches_same_session() {
         "fixture-tree",
         "-w=another-tree",
         "--from-pr=42",
-        "--resume",
+        "-r",
         "old-session",
     ];
     let mut rig = rig_with_launch_options("#!/bin/sh\nif [ \"$1\" = --resume ]; then { printf '%s\\n' \"$@\" \"${RESTART_PROFILE:-unset}\"; pwd -P; } > resumed; fi\nwhile IFS= read -r line; do :; done\n", &options);
@@ -1236,7 +1236,6 @@ async fn restart_optional_1109_reports_drops_and_launches_same_session() {
 async fn restart_optional_1109_refuses_open_or_remote_flags_without_stopping() {
     for option in [
         "--remote-control=fixture",
-        "--debug=fixture",
         "--prompt-suggestions=maybe",
         "--cloud=fixture",
         "--teleport=fixture",
@@ -1261,4 +1260,22 @@ async fn restart_optional_1109_refuses_open_or_remote_flags_without_stopping() {
         );
         assert!(rig.app.state.agent_restarts.is_empty());
     }
+}
+
+#[tokio::test]
+async fn restart_inline_1109_drops_the_original_prompt_in_the_native_launch() {
+    let mut rig = rig_with_launch_options("#!/bin/sh\nif [ \"$1\" = --resume ]; then { printf '%s\\n' \"$@\" \"${RESTART_PROFILE:-unset}\"; pwd -P; } > resumed; fi\nwhile IFS= read -r line; do :; done\n", &["--model", "fixture-model", "--tools=Read", "implement the fixture"]);
+    let (mut receiver, _sender) = launch_report(&rig);
+    let response = request(&mut rig);
+    assert!(response.get("result").is_some(), "{response}");
+    idle(&mut rig, Instant::now(), "");
+    advance_until_verifying(&mut rig).await;
+    let report = read_launch_report(&mut rig, &mut receiver, 7).await;
+    assert_eq!(
+        report,
+        format!(
+            "--resume\nrestart-session\n--model\nfixture-model\n--tools=Read\nfixture-env\n{}\n",
+            rig.directory.canonicalize().unwrap().display()
+        )
+    );
 }

@@ -216,12 +216,17 @@ pub(crate) fn resume_launch(
             .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
         if session.agent == "claude" {
             match flag {
-                "--cloud" | "--remote" | "--teleport" => {
+                "--cloud" | "--teleport" => {
                     return Err(format!(
                         "cannot safely preserve launch option {flag}: execution context cannot be changed by a local same-session restart"
                     ));
                 }
-                "--remote-control" | "--rc" | "--debug" | "-d" => {
+                "--debug" | "-d" if inline.is_some() => {
+                    plan.argv.push(arg.clone());
+                    index += 1;
+                    continue;
+                }
+                "--remote-control" | "--debug" | "-d" => {
                     return Err(format!(
                         "cannot safely preserve launch option {flag}: optional value set is open or unknown"
                     ));
@@ -271,7 +276,9 @@ pub(crate) fn resume_launch(
                 _ => {}
             }
         }
-        if matches!(arg.as_str(), "--resume" | "--session" | "--session-id") {
+        if matches!(arg.as_str(), "--resume" | "--session" | "--session-id")
+            || session.agent == "claude" && arg == "-r"
+        {
             if launch
                 .get(index + 1)
                 .is_none_or(|value| value.starts_with('-'))
@@ -286,6 +293,7 @@ pub(crate) fn resume_launch(
         if matches!(arg.as_str(), "--continue" | "-c") && session.agent == "claude"
             || arg == "--fork-session"
             || arg == "--last" && session.agent == "codex"
+            || session.agent == "claude" && arg.starts_with("-r=")
             || arg.starts_with("--resume=")
             || arg.starts_with("--session=")
             || arg.starts_with("--session-id=")
@@ -315,9 +323,12 @@ pub(crate) fn resume_launch(
         {
             let start = index;
             index += 1;
-            while launch
-                .get(index)
-                .is_some_and(|value| !value.starts_with('-'))
+            // Commander collects multiple values only after a separate option token.
+            // An inline value leaves subsequent plain tokens as the opening prompt.
+            while inline.is_none()
+                && launch
+                    .get(index)
+                    .is_some_and(|value| !value.starts_with('-'))
             {
                 index += 1;
             }
