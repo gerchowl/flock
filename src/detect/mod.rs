@@ -393,6 +393,27 @@ pub(crate) fn codex_composer_region(screen: &str) -> Option<(usize, usize)> {
     agents::codex::composer_region(screen)
 }
 
+/// Read Codex's composer with the terminal width needed to verify clipped controls.
+pub(crate) fn codex_composer_region_with_width(
+    screen: &str,
+    cols: Option<u16>,
+) -> Option<(usize, usize)> {
+    match cols {
+        Some(_) => agents::codex::composer_region_with_width(screen, cols),
+        None => codex_composer_region(screen),
+    }
+}
+
+/// A recognizable shortcut prefix, clipped precisely at the terminal edge.
+pub(crate) fn codex_clipped_shortcut_footer(line: &str, cols: u16) -> bool {
+    agents::codex::clipped_shortcut_footer(line, Some(cols))
+}
+
+/// A clipped model status is only a candidate boundary, never proof of an empty editor.
+pub(crate) fn codex_clipped_model_footer(line: &str, cols: u16) -> bool {
+    agents::codex::clipped_model_footer(line, Some(cols))
+}
+
 /// Whether this screen is Claude Code's folder-trust dialog and nothing else.
 ///
 /// The public seam for the `delegate` readiness gate (#612): a caller that has
