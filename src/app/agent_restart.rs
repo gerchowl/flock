@@ -183,7 +183,7 @@ impl App {
             && (terminal.hibernated_resume_plan.is_some()
                 || terminal.pending_agent_resume_plan.is_some())
         {
-            return Err(refuse("restart_busy", "agent is parked without a running process; use flk agent resume to resume its saved session".into()));
+            return Err(refuse("parked", "agent is parked without a running process; use flk agent resume to resume its saved session".into()));
         }
         if terminal.hibernated_resume_plan.is_some()
             || terminal.pending_agent_resume_plan.is_some()

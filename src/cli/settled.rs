@@ -1720,6 +1720,22 @@ mod tests {
     use super::*;
 
     const TERM: &str = "term_1f2e3";
+    #[test]
+    fn offline_wait_docs_cite_the_product_lifecycle_contract() {
+        let docs = include_str!("../../docs/next/website/src/content/docs/cli-reference.mdx");
+        let paragraph = docs
+            .split("\n\n")
+            .find(|paragraph| paragraph.starts_with("A restored native session"))
+            .unwrap();
+        assert!(
+            paragraph.contains("ADR-0028 §1"),
+            "offline product waits need the lifecycle authority citation"
+        );
+        assert!(
+            !paragraph.contains("ADR-0037"),
+            "test-wait policy does not govern product waits"
+        );
+    }
 
     fn cursor(epoch: u64, entries: u64, seq: u64, working: bool) -> Cursor {
         Cursor {

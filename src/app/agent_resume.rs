@@ -223,6 +223,14 @@ impl App {
             return false;
         };
 
+        // ADR-0028 §1/§3: retain the prior lifecycle before inserting a
+        // runtime, then publish the real transition in the sequenced stream.
+        // Detector updates alone cannot recover the prior Offline status.
+        let before = self.find_pane(pane_id).and_then(|(ws_idx, _)| {
+            self.pane_info(ws_idx, pane_id)
+                .map(|pane| (ws_idx, pane.agent_status))
+        });
+
         // #1179: the resumed agent keeps its question policy hint.
         let _questions = self
             .state
@@ -301,6 +309,25 @@ impl App {
             terminal.resume_failed = false;
             terminal.pending_agent_resume_plan = None;
             terminal.respawn_shell_on_exit = false;
+        }
+        if let Some((ws_idx, previous_status)) = before {
+            if let Some(pane) = self.pane_info(ws_idx, pane_id) {
+                if previous_status != pane.agent_status {
+                    self.emit_event(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+                        data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                            pane_id: pane.pane_id,
+                            workspace_id: pane.workspace_id,
+                            agent_status: pane.agent_status,
+                            agent: pane.agent,
+                            title: pane.title,
+                            display_agent: pane.display_agent,
+                            custom_status: pane.custom_status,
+                            state_labels: pane.state_labels,
+                        },
+                    });
+                }
+            }
         }
         true
     }
@@ -455,6 +482,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_resume_emits_one_live_status_event_from_either_entry_point() {
+        use crate::api::schema::{AgentStatus, EventData};
+        for explicit in [false, true] {
+            let mut app = test_app();
+            let log =
+                crate::test_support::unique_temp_path("1650-resume-event").with_extension("jsonl");
+            app.event_hub = crate::api::EventHub::with_persistence(log.clone());
+            app.state.default_shell = "/bin/sh".into();
+            app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+            app.state
+                .workspaces
+                .push(crate::workspace::Workspace::test_new("resume-event"));
+            app.state.active = Some(0);
+            app.state.ensure_test_terminals();
+            app.state.view.terminal_area = Rect::new(0, 0, 80, 24);
+            let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+            let id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+            let public_pane = app.public_pane_id(0, pane).unwrap();
+            let public_workspace = app.public_workspace_id(0);
+            let terminal = app.state.terminals.get_mut(&id).unwrap();
+            terminal.set_detected_state(
+                Some(crate::detect::Agent::OpenCode),
+                crate::detect::AgentState::Idle,
+            );
+            terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "opencode".into(),
+                argv: vec!["/bin/sh".into(), "-c".into(), "read -r fixture".into()],
+                dedupe_key: "resume-event-fixture".into(),
+            });
+            assert_eq!(
+                app.pane_info(0, pane).unwrap().agent_status,
+                AgentStatus::Offline
+            );
+            let sequence = app.event_hub.current_sequence();
+            // Theme deferral cannot claim that a live execution exists.
+            assert!(!app.start_pending_agent_resumes(false));
+            assert!(app.event_hub.events_after(sequence).is_empty());
+            let launched = if explicit {
+                app.resume_hibernated_pane(0, pane).is_ok()
+            } else {
+                app.start_pending_agent_resumes(true)
+            };
+            let live_status = app.pane_info(0, pane).unwrap().agent_status;
+            let events = app.event_hub.events_after(sequence);
+            let repeated = app.start_pending_agent_resumes(true);
+            let repeated_events = app.event_hub.events_after(sequence);
+            // Reap the owned fake shell before any assertions can panic.
+            for (_, runtime) in app.terminal_runtimes.drain() {
+                runtime.shutdown();
+            }
+            drop(app);
+            let reopened = crate::api::EventHub::with_persistence(log.clone());
+            let replayed = reopened.events_after(sequence);
+            drop(reopened);
+            std::fs::remove_file(log).unwrap();
+            assert_eq!(
+                serde_json::to_value(&events).unwrap(),
+                serde_json::to_value(replayed).unwrap()
+            );
+            assert!(launched, "explicit={explicit}");
+            assert_eq!(live_status, AgentStatus::Idle);
+            let changes: Vec<_> = events
+                .iter()
+                .filter_map(|(_, event)| match &event.data {
+                    EventData::PaneAgentStatusChanged {
+                        pane_id,
+                        workspace_id,
+                        agent_status,
+                        ..
+                    } => Some((pane_id, workspace_id, *agent_status)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                changes,
+                vec![(&public_pane, &public_workspace, AgentStatus::Idle)],
+                "explicit={explicit}: {events:?}"
+            );
+            assert!(!repeated);
+            assert_eq!(events.len(), repeated_events.len());
+        }
+    }
+
+    #[tokio::test]
     async fn pending_agent_resume_waits_for_host_theme_before_launch() {
         let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("restored");
@@ -588,7 +699,18 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
+        let sequence = app.event_hub.current_sequence();
         assert!(!app.start_pending_agent_resumes(false));
+        assert!(
+            app.event_hub
+                .events_after(sequence)
+                .iter()
+                .all(|(_, event)| !matches!(
+                    event.data,
+                    crate::api::schema::EventData::PaneAgentStatusChanged { .. }
+                )),
+            "a failed spawn cannot announce a live status"
+        );
 
         assert!(
             app.state.workspaces[0].terminal_id(pane_id).is_some(),
