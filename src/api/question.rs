@@ -32,6 +32,8 @@ use sha2::{Digest, Sha256};
 /// carry it: the form it asks, flattened, under its identity. Fields read
 /// leniently (ADR-0028 §3a).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct Question {
     pub question_id: String,
     #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
@@ -49,6 +51,7 @@ pub struct Question {
 /// its deadline (#1242). `answered { by, option_ids | text, at }` comes with
 /// `question.answer` (#1039) and reads `unknown` in this build.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionState {
     Open,
@@ -61,6 +64,8 @@ pub enum QuestionState {
 /// What a question asks, before it has an id: what a screen reads, and what
 /// a harness hook's `tool_input` maps onto (ADR-0034, #1194).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct QuestionForm {
     /// The harness's short tag for the question (`AskUserQuestion`'s
     /// `header`), when the source can say.
@@ -83,6 +88,8 @@ pub struct QuestionForm {
 /// One choice. `id` is the number the dialog draws beside it, which is also
 /// the key that selects it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct QuestionOption {
     pub id: String,
     pub label: String,
@@ -91,6 +98,7 @@ pub struct QuestionOption {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionSource {
     Screen,
@@ -101,6 +109,7 @@ pub enum QuestionSource {
 
 /// Why `agent.question_closed` closed a question (ADR-0028 §8a).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionCloseReason {
     /// The dialog left the screen without a `question.answer`. An answer

@@ -58,6 +58,7 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Optio
 
 /// A stdio permission request, including AskUserQuestion (A.6, A.12-A.13).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ToolRequest {
     /// Harness tool name; interpretation belongs to the state adapter.
     pub tool_name: String,
@@ -73,6 +74,7 @@ pub struct ToolRequest {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub display_name: Option<Option<String>>,
     /// Harness `description` metadata from Appendix A.
     #[serde(
@@ -80,6 +82,7 @@ pub struct ToolRequest {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub description: Option<Option<String>>,
     /// Harness `permission_suggestions` metadata from Appendix A.
     #[serde(
@@ -87,6 +90,7 @@ pub struct ToolRequest {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub permission_suggestions: Option<Option<Vec<Value>>>,
     /// Harness `requires_user_interaction` metadata from Appendix A.
     #[serde(
@@ -94,6 +98,7 @@ pub struct ToolRequest {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub requires_user_interaction: Option<Option<bool>>,
     /// Future control fields absent from the catalogue.
     #[serde(flatten)]
@@ -102,6 +107,7 @@ pub struct ToolRequest {
 
 /// Provider limit observation, with provider-specific details kept intact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RateLimitInfo {
     /// Provider status, observed as allowed or a limit condition.
     pub status: String,
@@ -112,6 +118,7 @@ pub struct RateLimitInfo {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub resets_at: Option<Option<Value>>,
     /// Harness `rateLimitType` metadata from Appendix A.
     #[serde(rename = "rateLimitType")]
@@ -120,59 +127,118 @@ pub struct RateLimitInfo {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub rate_limit_type: Option<Option<String>>,
     /// Future provider metadata absent from the catalogue.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
-// Preserve envelope discriminators separately from unknown fields, so extra
-// does not report a new shape solely because its wire tags are present.
-macro_rules! events {
-    ($($(#[$doc:meta])* $name:ident ($kind:literal, $path:literal, $sub:literal) {
-        $($(#[$field_doc:meta])* $field:ident: $ty:ty),* $(,)?
-    } optional {
-        $($(#[$optional_doc:meta])* $optional:ident: $optional_ty:ty),* $(,)?
-    })*) => {
-        $(
+// The top-level subtype is required only when the catalogue fixes that key.
+macro_rules! event_type {
+    ($name:ident, $kind:literal, "/subtype", $sub:literal, $($body:tt)*) => {
+        event_type!(@build $name, $kind, $sub, [#[cfg_attr(feature = "ts", ts(optional = false))]], enum, $($body)*);
+    };
+    ($name:ident, $kind:literal, $path:literal, $sub:literal, $($body:tt)*) => {
+        event_type!(@build $name, $kind, $sub, [#[cfg_attr(feature = "ts", ts(optional))]], alias, $($body)*);
+    };
+    (@subtype enum, $sub:literal) => {
+        #[cfg(feature = "ts")]
+        #[derive(ts_rs::TS)]
+        enum Subtype { #[ts(rename = $sub)] Value }
+        #[cfg(feature = "ts")]
+        const _: Subtype = Subtype::Value;
+    };
+    (@subtype alias, $sub:literal) => {
+        #[cfg(feature = "ts")]
+        type Subtype = Option<String>;
+    };
+    (@build $name:ident, $kind:literal, $sub:literal, [$($attrs:tt)*], $mode:ident,
+        $(#[$doc:meta])* { $($(#[$field_doc:meta])* $field:ident: $ty:ty),* }
+        optional { $($(#[$optional_doc:meta])* $optional:ident: $optional_ty:ty),* }
+    ) => {
+        // A separate scope gives every event its own literal discriminator.
+        #[allow(non_snake_case)] // Module and exported event share the macro name.
+        pub(super) mod $name {
+            use super::*;
+            #[cfg(feature = "ts")]
+            #[derive(ts_rs::TS)]
+            enum Kind { #[ts(rename = $kind)] Value }
+            #[cfg(feature = "ts")]
+            const _: Kind = Kind::Value;
+            event_type!(@subtype $mode, $sub);
             $(#[$doc])*
             #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+            #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
             pub struct $name {
                 #[serde(rename = "type")]
+                #[cfg_attr(feature = "ts", ts(as = "Kind", inline))]
                 kind: String,
                 #[serde(default, skip_serializing_if = "Option::is_none")]
+                #[cfg_attr(feature = "ts", ts(as = "Subtype", inline))]
+                $($attrs)*
                 subtype: Option<String>,
                 /// Harness session identifier, if emitted on this envelope.
                 #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+                #[cfg_attr(feature = "ts", ts(optional))]
                 pub session_id: Option<Option<String>>,
                 /// Transcript/event UUID, if emitted.
                 #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+                #[cfg_attr(feature = "ts", ts(optional))]
                 pub uuid: Option<Option<String>>,
                 /// Parent tool call for subagent output; explicit null is retained.
                 #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+                #[cfg_attr(feature = "ts", ts(optional))]
                 pub parent_tool_use_id: Option<Option<String>>,
                 /// Harness timestamp, in its original JSON representation.
                 #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+                #[cfg_attr(feature = "ts", ts(optional))]
                 pub timestamp: Option<Option<Value>>,
                 $($(#[$field_doc])* pub $field: $ty,)*
                 $($(#[$optional_doc])*
                     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+                    #[cfg_attr(feature = "ts", ts(optional))]
                     pub $optional: Option<Option<$optional_ty>>,)*
                 /// Fields not modelled by the Appendix A catalogue.
                 #[serde(flatten)]
                 pub extra: Map<String, Value>,
             }
-        )*
+        }
+    };
+}
+
+// Preserve envelope discriminators separately from unknown fields, so extra
+// does not report a new shape solely because its wire tags are present.
+macro_rules! events {
+    ($($(#[$doc:meta])* $name:ident ($kind:literal, $path:tt, $sub:literal) {
+        $($(#[$field_doc:meta])* $field:ident: $ty:ty),* $(,)?
+    } optional {
+        $($(#[$optional_doc:meta])* $optional:ident: $optional_ty:ty),* $(,)?
+    })*) => {
+        $(pub use event_types::$name::$name;)*
+        mod event_types {
+        use super::*;
+        $(event_type!($name, $kind, $path, $sub,
+            $(#[$doc])* { $($(#[$field_doc])* $field: $ty),* }
+            optional { $($(#[$optional_doc])* $optional: $optional_ty),* }
+        );)*
+        }
 
         /// One Claude stdout event, with lossless JSON fallback for new shapes.
         ///
         /// A known discriminator with incompatible fields also becomes Unknown.
         /// Heterogeneous API messages, SSE bodies and SDK metadata stay JSON;
         /// state interpretation belongs to S4, not this wire adapter.
+        /// Clients narrow known events on `type` and the catalogue's nested
+        /// discriminator; anything else uses ADR-0036 §8's unknown rendering.
+        /// The TS union mirrors the untagged custom serializer, including unknown JSON.
         #[derive(Debug, Clone, PartialEq)]
+        #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+        #[cfg_attr(feature = "ts", ts(untagged))]
         pub enum SessionEvent {
             $($(#[$doc])* $name(Box<$name>),)*
             /// An unrecognised or incompatible JSON shape, preserved in full.
+            #[cfg_attr(feature = "ts", ts(type = "unknown"))]
             Unknown {
                 /// Exact original input line, including whitespace and number spelling.
                 raw: String,
@@ -217,6 +283,47 @@ macro_rules! events {
             }
         }
 
+        #[cfg(all(test, feature = "ts"))]
+        /// Collect every catalogue member and the custom serialized union.
+        pub(crate) fn ts_events(collector: &mut crate::ts::Collector) {
+            $(collector.add::<$name>();)*
+            collector.add::<SessionEvent>();
+        }
+
+        #[cfg(all(test, feature = "ts"))]
+        #[test]
+        fn session_event_ts_matches_serialization() {
+            let cfg = ts_rs::Config::default();
+            let union = <SessionEvent as ts_rs::TS>::decl(&cfg);
+            assert_eq!(union, format!("type SessionEvent = {} | unknown;",
+                [$(stringify!($name)),*].join(" | ")));
+
+            let raw = "{ \"type\" : \"future\", \"counter\": 1e2 }";
+            let unknown = SessionEvent::parse(raw, "fixture");
+            assert!(matches!(unknown, SessionEvent::Unknown { .. }));
+            assert_eq!(serde_json::to_string(&unknown).unwrap(), raw);
+            for line in include_str!("../../../tests/fixtures/claude-session/events.jsonl").lines() {
+                let event = SessionEvent::parse(line, "fixture");
+                let json = serde_json::to_string(&event).unwrap();
+                let value: Value = serde_json::from_str(&json).unwrap();
+                match event {
+                    $(SessionEvent::$name(_) => {
+                        assert_eq!(value["type"], $kind);
+                        if !$path.is_empty() {
+                            assert_eq!(value.pointer($path).and_then(Value::as_str), Some($sub));
+                        }
+                        let decl = <$name as ts_rs::TS>::decl(&cfg);
+                        assert!(decl.contains(&format!("type: \"{}\"", $kind)), "{decl}");
+                        if $path == "/subtype" {
+                            assert!(decl.contains(&format!("subtype: \"{}\"", $sub)), "{decl}");
+                        }
+                        assert!(decl.contains("session_id?: string | null"), "{decl}");
+                    },)*
+                    SessionEvent::Unknown { raw, .. } => assert_eq!(json, raw),
+                }
+            }
+        }
+
         impl Serialize for SessionEvent {
             fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 match self {
@@ -249,6 +356,8 @@ events! {
         /// Harness `thinking_display` metadata from Appendix A.
         thinking_display: Value,
         /// Harness `thinking_duration_ms` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         thinking_duration_ms: u64,
         /// Harness `tool_use_meta` metadata from Appendix A.
         tool_use_meta: Value,
@@ -334,8 +443,12 @@ events! {
     /// Estimated reasoning token progress (A.2).
     ThinkingTokens("system", "/subtype", "thinking_tokens") {
         /// Estimated total thinking tokens.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "f64"))]
         estimated_tokens: u64,
         /// Change in the estimate.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "f64"))]
         estimated_tokens_delta: i64,
     } optional {
         /// Harness `user_message_uuid` metadata from Appendix A.
@@ -435,6 +548,8 @@ events! {
         /// Harness `api_message_id` metadata from Appendix A.
         api_message_id: String,
         /// Harness `ttft_ms` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         ttft_ms: u64,
         /// Harness `user_message_uuid` metadata from Appendix A.
         user_message_uuid: String,
@@ -449,6 +564,8 @@ events! {
         /// Harness `api_message_id` metadata from Appendix A.
         api_message_id: String,
         /// Harness `ttft_ms` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         ttft_ms: u64,
         /// Harness `user_message_uuid` metadata from Appendix A.
         user_message_uuid: String,
@@ -463,6 +580,8 @@ events! {
         /// Harness `api_message_id` metadata from Appendix A.
         api_message_id: String,
         /// Harness `ttft_ms` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         ttft_ms: u64,
         /// Harness `user_message_uuid` metadata from Appendix A.
         user_message_uuid: String,
@@ -477,6 +596,8 @@ events! {
         /// Harness `api_message_id` metadata from Appendix A.
         api_message_id: String,
         /// Harness `ttft_ms` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         ttft_ms: u64,
         /// Harness `user_message_uuid` metadata from Appendix A.
         user_message_uuid: String,
@@ -491,6 +612,8 @@ events! {
         /// Harness `api_message_id` metadata from Appendix A.
         api_message_id: String,
         /// Harness `ttft_ms` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         ttft_ms: u64,
         /// Harness `user_message_uuid` metadata from Appendix A.
         user_message_uuid: String,
@@ -505,6 +628,8 @@ events! {
         /// Harness `api_message_id` metadata from Appendix A.
         api_message_id: String,
         /// Harness `ttft_ms` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         ttft_ms: u64,
         /// Harness `user_message_uuid` metadata from Appendix A.
         user_message_uuid: String,
@@ -532,12 +657,18 @@ events! {
         /// Harness `total_cost_usd` metadata from Appendix A.
         total_cost_usd: f64,
         /// Harness `ttft_ms` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         ttft_ms: u64,
         /// Harness `num_turns` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         num_turns: u64,
         /// Harness `permission_denials` metadata from Appendix A.
         permission_denials: Vec<Value>,
         /// Harness `queued_turn_count` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         queued_turn_count: u64,
     }
     /// Interrupted or failed execution (A.5, A.14).
@@ -563,12 +694,18 @@ events! {
         /// Harness `total_cost_usd` metadata from Appendix A.
         total_cost_usd: f64,
         /// Harness `ttft_ms` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         ttft_ms: u64,
         /// Harness `num_turns` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         num_turns: u64,
         /// Harness `permission_denials` metadata from Appendix A.
         permission_denials: Vec<Value>,
         /// Harness `queued_turn_count` metadata from Appendix A.
+        /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+        #[cfg_attr(feature = "ts", ts(as = "Option<Option<f64>>"))]
         queued_turn_count: u64,
     }
 }
