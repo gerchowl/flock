@@ -258,6 +258,9 @@ and §7's compatibility rules. It uses the existing guarded-submit funnel in
 `src/app/guarded_submit.rs`; it does not amend the spawn permissions in
 ADR-0014. #1586 tracks implementation and every capability restriction below.
 The #1582 refusal guidance remains manual until a reviewed implementation lands.
+This proposal composes with ADR-0028 §5a's accepted completed-write contract;
+its named capability, error schema and budget details still require the owner
+rulings marked there and are not implemented by recording this amendment.
 
 #### 9.1 Explicit observation, then a conditional action
 
@@ -287,16 +290,21 @@ visible UTF-8 evidence, never an authorization check or a total for hidden
 content. No composer excerpt, content hash or draft text enters this response,
 errors, MCP metadata, audit events or diagnostic logs.
 
-The revision is an unpredictable server-issued handle into bounded, ephemeral
-server state, not a digest that reveals a guessable secret. Bind it to the
-server instance, durable agent id, pane/terminal and child launch generation,
+The revision is a cryptographically random server-issued handle with at least
+128 bits of entropy into bounded, ephemeral server state, not a digest that
+reveals a guessable secret. Fail closed if secure randomness is unavailable.
+Lookup is keyed by the resolved pane and handle together; a handle from another
+pane cannot resolve here. Bind it to the server instance, durable agent id,
+pane/terminal and child launch generation,
 harness, composer revision, screen geometry, cursor and selection state, and
 the generations of operator input and all queued pane writes. Bind any required
 session identity too. A composer revision increases on every observed change,
 including A → B → A; equal byte counts or equal final text do not revive it.
 Unrelated output outside the composer need not invalidate it unless it changes
-a guard or the visible controls. Tokens expire no later than the existing
-`INJECTION_LEASE` duration (currently seven seconds), and on restart or handoff.
+a guard or the visible controls. Propose a 60-second inspect-to-act lifetime,
+giving a human time to review and invoke the explicit action. It is separate
+from the mutation lease and grants no grace against a changed revision: every
+action compares again. Restart or handoff invalidates it immediately.
 Bound outstanding records per pane; capacity exhaustion refuses a new
 observation explicitly, and expiry or eviction invalidates the old handle.
 A token is a precondition, **never authority**. Do not persist or log it.
@@ -306,12 +314,36 @@ A token is a precondition, **never authority**. Do not persist or log it.
 Both mutations require an explicit, unexpired revision. Resolve the target,
 authorize the caller, acquire the same exclusive injection funnel as guarded
 send, then re-read the current detection buffer and all bound generations.
-Compare them immediately before the tracked PTY write under the same
-serialization that excludes competing pane writers. Pending bytes, operator
-input, a different target or any changed guard invalidate the attempt before
+Require an applied detection-sample receipt covering all PTY output received
+so far, following ADR-0028 §1b: the sampled output cursor must cover current
+parser progress, with no received output still pending parsing or detection.
+Capture text, styles, geometry and cursor together; a recent timestamp or an
+old classified status is insufficient. Pending output requires a new completed
+sample within the action budget, otherwise refuse before writing. Compare the
+receipt and bound generations immediately before the tracked PTY write under
+the same serialization that excludes competing pane writers. Pending bytes,
+operator input, a different target or any changed guard invalidate the attempt before
 keys are queued. Do not use the user's scrollable viewport. Recheck between
 stages and before Enter. Disabling the optional send injection lock must not
 disable this lease; if exclusivity cannot be established, refuse.
+
+**Proposed budget, subject to owner acceptance:** inspection tokens last at most
+60 seconds; mutation admission starts one monotonic action clock. Reserve a
+15-second caller cap, a write deadline at admission +10 seconds (including
+preflight, recovery storage, lease waiting, queues and all encoded writes),
+confirmation ending by admission +12 seconds, and a 1-second reply margin.
+The draft-specific lease ends by admission +12 seconds; do not reuse the
+existing seven-second `INJECTION_LEASE` unchanged for this operation. Each
+write uses the remaining time to the same absolute write deadline, never a
+fresh ten seconds. Confirmation has at most two seconds and still ends by
++12 seconds; clear read-back additionally keeps its existing shorter
+`DRAFT_STEP` limit. Shorter caller/transport budgets reduce the write deadline
+and confirmation allowance while reserving reply time; require the write
+budget to be strictly below the remaining caller cap minus the reply margin,
+as ADR-0028 §5a requires. Refuse before dispatch if no positive budget fits.
+No stage, handoff or retry resets a deadline. These are proposed budgets for
+new verbs, not changes to current send timeouts. Enable neither mutation until
+the §1b sample contract and the full §5a completed-write capability exist.
 
 Require the existing settled/idle, no-dialog, no-restart, recent-operator-input
 and session gates. A turn beginning, loss of composer visibility or a changed
@@ -355,8 +387,9 @@ This design PR claims no new live-harness validation or detection changes.
 For **clear**, durably secure the recoverable draft in the existing private
 stash before the first destructive key. If that fails, write nothing. Consume
 the revision at action start, send the one bounded clear sequence once, then
-read back an empty recognized composer within existing `DRAFT_STEP`/lease
-ceilings. Do not retype or automatically restore over unexpected content.
+require a timely full §5a write receipt, then read back an empty recognized
+composer within the shorter `DRAFT_STEP` and §9.2 action ceilings. Do not retype
+or automatically restore over unexpected content.
 Report `cleared` only after empty read-back, with a recovery reference and the
 existing `flk pane stash show <pane_id>` / `restore <pane_id>` commands; restore
 retains its empty-composer guard. Retain recovery data across partial writes,
@@ -364,28 +397,44 @@ server death and handoff. Existing explicit stash reads can reveal content to
 an authorized local user; count-only mutation responses must not do so.
 
 For **submit**, secure recovery data before Enter, consume the revision and
-send Enter exactly once without typing the draft. Reuse existing turn/session
-and composer-change evidence and confirmation ceiling. `accepted` or
-`observed_accepted` requires the existing acceptance evidence; an empty editor
+admit one §5a write ticket containing exactly one encoded Enter and no draft
+text. "Exactly one Enter" means one such payload, never a second dispatch or
+semantic retry; necessary partial syscalls finish only that ticket within its
+deadline. Queue admission is not delivery. Require its timely full-byte receipt
+and separate existing turn/session and composer-change evidence within §9.2's
+confirmation ceiling. This does not promise exactly-once harness execution.
+`accepted` or `observed_accepted` requires the existing acceptance evidence; an empty editor
 alone is insufficient. Do not retry Enter automatically on this path. An
 unchanged or unreadable composer without confirmed acceptance is `unconfirmed`;
 the caller must inspect and obtain a fresh revision before any later action.
 Once any bytes may have reached the PTY, never return a pre-action refusal.
+Drop the submit-only recovery copy only after a timely full write receipt and
+confirmed acceptance have both been recorded with the terminal audit outcome.
+Do not delete a pre-existing clear stash. On uncertain or failed submission,
+retain recovery until explicit operator restoration or deletion, including
+across restart/handoff; retention of data does not extend the write lease.
+Today `KeptDrafts` is memory-only with handoff export; crash durability and bounded
+recovery admission are additional #1586 requirements, not existing guarantees.
+Refuse before writing if bounded recovery storage is exhausted; never silently
+evict an unresolved draft to admit a new action.
 
 Both actions record an attempt id and action, identities, outcome/reason and
 recovery reference without draft contents. Keep crash recovery separate from
 success evidence. Before releasing the lease, account for held operator input
 using existing replay rules; held input arriving during the operation prevents
 an unconditional claim that the composer is still empty after replay. Partial
-or unobserved writes report uncertainty and retain recovery data. Fence or
-cancel unsent bytes through their owning writer before replay or admitting a
-new mutation. If queue quiescence cannot be proved, retain a recovery blocker
-even after the bounded RPC returns exit 8; lease expiry alone cannot authorize
-new writes. Report held input not written rather than replaying it into a
-potentially late clear/Enter sequence. Recovery requires the owning runtime to
-settle or fence that writer, never killing unrelated processes. All waits
-have existing bounded ceilings and terminate on producer death or unexpected
-state; this amendment does not widen any timing window.
+or unobserved writes report uncertainty and retain recovery data. Require
+ADR-0028 §5a's full `pane_input_write_ack` contract, including exactly one
+bounded terminal resolution by the owning writer. Cancellation sets the gate's
+cancelled state and discards every unsent byte before replying, including after
+a partial write; zero-byte cancellation removes live payloads from all queues.
+Resolve/cancel before held-input replay or lease release, within the absolute
+write deadline. Report held input not written if safe replay cannot be proved.
+A lost receipt returns `input_write_unknown` without a no-ghost-write claim;
+the owning writer still must resolve/cancel by its deadline. Never retain an
+open-ended recovery blocker waiting for a runtime to settle or a writer to be
+fenced. Producer death or unexpected state ends the bounded wait honestly,
+following ADR-0037 §1; data recovery is separate from mutation serialization.
 
 #### 9.4 Refusals, outcomes and mixed versions
 
@@ -405,9 +454,11 @@ preserves structured detail without overwriting its registered classification.
 | Restart/session/child change | `draft_revision_mismatch`, existing guard reason in data | `REFUSED` (10), inspect/re-resolve first |
 | Observation capacity exhausted | Proposed `draft_observation_capacity` | `REFUSED` (10), later after expiry/capacity recovery |
 | Recovery storage fails before any keys | Proposed `draft_recovery_unavailable` | `REFUSED` (10), later after storage recovery |
-| Clear observed empty; submit accepted with evidence | `cleared`; `accepted` / `observed_accepted` | `SUCCESS` (0), done |
-| Any partial/uncertain write or failed postcondition | `unconfirmed`, action-specific reason and recovery reference | `UNCONFIRMED` (8), after inspecting |
-| Transport loss without an outcome | Existing transport envelope | `FAILURE` (1), effect unknown; inspect before another mutation |
+| Timely full write receipt plus clear observed empty or submit accepted with evidence | `cleared`; `accepted` / `observed_accepted` | `SUCCESS` (0), done |
+| Zero-byte cancellation; all payloads removed and ticket irrevocably cancelled | §5a `input_write_cancelled`, exact zero count | `REFUSED` (10), later after inspection and a fresh token; nothing written |
+| Positive-byte partial write or late completion, including late full write; remainder discarded | §5a `input_write_failed`, exact count and recovery reference | `UNCONFIRMED` (8), `after_inspecting`; no automatic full/suffix retry |
+| Timely receipt `Ok` without submit acceptance evidence, or clear without empty read-back | `unconfirmed`, action-specific reason and recovery reference | `UNCONFIRMED` (8), `after_inspecting` |
+| Transport/server loss after dispatch without an authoritative outcome | Local §5a `input_write_unknown`, null counts; effect unknown | `UNCONFIRMED` (8), `after_inspecting`; never assume zero or resend automatically |
 | Server lacks these methods/capability | `server_version_gap` | `PROTOCOL_GAP` (78), after handoff |
 
 Exit 9 is reserved for an attempt whose original composer was demonstrably
@@ -416,28 +467,42 @@ Exit 124 must not disguise an uncertain mutation as a safely retryable wait.
 Use `DeliveryAttempt` evidence for submit outcomes; clear has its own `cleared`
 result, not a new send outcome that an old client might mistake for success.
 New methods require explicit capability discovery and fail closed against old
-servers; no fallback to `pane send-keys` or `send --raw`. Implement protocol
+servers. Require `pane_input_write_ack` at the destination and every forwarding
+hop, plus contract-bound draft method tags that an old owner rejects before
+writing even after a stale capability lookup. Follow §5a's single end-to-end
+deadline and disable generic transport retries. No fallback to legacy write
+methods, `pane send-keys` or `send --raw`. Implement protocol
 version policy relative to the latest release, without changing mesh VERSION 5.
 No existing request, outcome, command or refusal is reinterpreted by this PR.
 
 #### 9.5 Authority and MCP
 
-Following ADR-0014 §§1/6/7, narrow operations and server-side caller class carry
-the boundary; CLI flags and MCP builders cannot grant permission. Recommended
-initial policy: only a caller attested by peer process ancestry in an
-operator-owned, non-agent pane may clear **or submit** any agent's draft on that
-server. Deny agent panes, even the target itself, parents, registered delegates
-and lineage peers: a draft can belong to a human, and lineage is not consent.
-Deny unattested callers rather than interpreting the existing spawn classifier's
-`Operator { pane: None }` as positive human evidence. No `--operator` flag,
-claimed pane id, revision token or display name overrides this rule.
+Following ADR-0014 §§1/6/7, narrow operations and server-side authorization
+carry the policy; CLI flags and MCP builders cannot grant permission.
+Recommended initial policy: only an attested operator in an operator-owned,
+non-agent pane may clear **or submit** a draft. Deny target agents, parents,
+registered delegates and lineage peers: lineage is not consent. Deny unknown
+credentials and unattested callers rather than treating the spawn classifier's
+`Operator { pane: None }` as human evidence. No `--operator` flag, claimed pane
+id, revision token or display name grants authority.
 
-This is narrower than spawn's unattested-operator behavior and needs owner
-approval. It excludes commands from an external terminal until an explicit
-operator grant mechanism is designed and reviewed under #1586. It is a local
-cooperative-process boundary, not protection against arbitrary hostile code
-with the operator's OS credentials. Do not promise that process ancestry proves
-a human keyboard, or that a sender identity authorizes destructive actions.
+#1177 documents that agents currently run as the operator's Unix user:
+process ancestry is only cooperative attribution, not a security boundary
+today. Stronger attestation depends on #1426's session-lease caller identity
+and #1629's kernel peer-UID check with the dedicated agent user, following
+ADR-0036 §1a and #1177's isolation decision. Carry trusted peer credentials and
+lease identity through parked continuations; deny the agent UID even with
+forged operator ancestry, and never turn an unknown UID into operator authority.
+PID reuse introduces a TOCTOU risk: bind PID to process start time and pane/lease
+incarnation, then revalidate live bindings and authority before mutation
+admission, including after parking. A bare PID or cached ancestry is insufficient.
+
+This operator-pane-only recommendation is narrower than spawn's unattested
+operator behavior and still needs owner approval. Stronger identity/isolation
+must be integrated before presenting these mutations as an enforced boundary;
+ancestry alone cannot certify a human keyboard or hostile same-UID code.
+External-terminal grants and agent delegation require separate owner rulings
+under #1586, rather than inferring permission from sender identity.
 
 Propose `flock_agent_draft_inspect` as a read-only MCP tool, with the same target
 resolution and existing pane-read access rules; it returns only the count,
@@ -459,16 +524,16 @@ operator profile. No new sleeps, retries or widened deadlines.
 | Case | Required observation / failure proof |
 | --- | --- |
 | Commands and output | Today the three verbs are absent; future plain/JSON/field tests pin usage, resolver behavior, error envelope and stderr remedy |
-| Compare-and-act | Observed same-length replacement, observed A → B → A, input queued before screen paint, resize, cursor/selection change, restart, target retarget and expired/consumed token all refuse with zero keys |
+| Compare-and-act | A fresh applied sample covering all received output is required; pending parsing/detection or stale receipts cannot authorize keys. Observed same-length replacement, observed A → B → A, input queued before screen paint, resize, cursor/selection change, restart, target retarget and expired/consumed token all refuse with zero keys |
 | Serialization | A competing send, raw write, self-compact or operator input cannot slip between validation and enqueue; disabling send's optional lock cannot disable this guard |
 | Safe clear, each harness | Real event-driven fixture paints a supported row; inspection → clear removes exactly that draft, confirms empty and leaves recoverable stash data; repeat with leading spaces |
 | Safe submit, each harness | Inspection → submit emits exactly one encoded Enter and zero draft text bytes; one turn starts; no duplicate submission on swallowed Enter or lost response |
 | Unsupported editors | Wrapped/multiline/hidden/non-ASCII/chip/selection/dialog/unknown-harness cases return unsupported or existing guard refusal with zero keys; phantom faint suggestions never become drafts |
-| Authority | Attested operator succeeds; target agent, parent, same-name delegate, forged caller fields and unattested peer fail with exit 13 before recovery writes or keys |
+| Authority | Attested operator succeeds only with the stronger identity dependencies; agent UID, unknown credentials, detached agent, target/parent/delegate, forged fields, PID reuse and stale parked lease fail with exit 13 before recovery writes or keys |
 | MCP and skew | Inspect preserves count-only fields; mutation tools are absent/refused; direct socket denial holds; old server yields exit 78 with no raw-key fallback |
-| Recovery and uncertainty | Failed stash write sends zero keys; partial clear, failed empty read-back, held input replay, lost Enter acknowledgement and crash/handoff retain recovery and cannot report false success or exit 10 after bytes; late queued bytes block new writers/replay until fenced |
-| Bounded failure | A producer that stays alive but silent, dies, or emits an unexpected stage fails within the existing ceiling; deliberately inject each regression once |
-| Privacy and registries | Secret-shaped fixture contents never appear in new response/error/audit/log fields; tokens are not content hashes; code/exit drift locks and legacy send-envelope readers still pass |
+| Recovery and uncertainty | Failed stash write sends zero keys; partial clear, failed empty read-back, held input replay, lost Enter acknowledgement and crash/handoff retain recovery and cannot report false success or exit 10 after bytes; zero-byte cancellation removes all queued payloads; partial cancellation sets cancelled and discards the remainder before its single reply; late full writes and lost receipts return 8, never a safe retry |
+| Bounded failure | A producer that stays alive but silent, dies, or emits an unexpected stage fails within §9.2's absolute budget, including queue/lease time; receipt Ok without acceptance returns 8; cancellation cannot leave an open-ended blocker; deliberately inject each regression once |
+| Privacy and registries | Secret-shaped fixture contents never appear in new response/error/audit/log fields; tokens have at least 128 bits of entropy, pane-bound lookup and 60-second expiry; accepted submission drops only its recovery copy; tokens are not content hashes; code/exit drift locks and legacy send-envelope readers still pass |
 
 #### 9.7 Owner decisions pending (recommendations, not acceptance)
 
@@ -480,10 +545,23 @@ operator profile. No new sleeps, retries or widened deadlines.
 3. **MCP:** expose read-only inspect and keep clear/submit off MCP initially.
 4. **Recovery/privacy:** clear means recoverable removal, not permanent deletion;
    secure recovery for submit too, with no draft text in new diagnostics.
-5. **Support/semantics:** certify each harness separately for the narrow ASCII
-   row; accept observed-state limits, exactly one Enter, fail-closed capability
-   gating and exit 8 for uncertainty. Broader shapes require new proof under
-   #1586, not heuristics or a bypass flag.
+5. **Harness support:** certify each harness separately for the narrow ASCII
+   row; broader shapes require new proof under #1586.
+6. **Observed-state guarantee:** accept the projection's limits; require the
+   §1b receipt covering all received output, without claiming logical-buffer CAS.
+7. **Budgets:** accept the 60-second inspection TTL and §9.2's 15-second caller,
+   10-second write, 12-second lease/confirmation and 1-second reply-margin plan.
+8. **Enter semantics:** one encoded Enter ticket, a timely full §5a receipt and
+   separate acceptance evidence; never retry automatically or claim exactly-once
+   harness execution.
+9. **Uncertainty:** adopt §5a's zero-byte exit 10 and partial/late/unknown exit 8
+   distinctions, with bounded cancellation and no open-ended recovery blocker.
+10. **Capability rollout:** require the full §5a write contract and contract-bound
+    methods throughout forwarding; no legacy fallback or bypass flag.
+11. **Recovery retention:** drop only the submit recovery copy after receipt,
+    acceptance and audit completion; retain uncertain copies until explicit
+    restoration/deletion, with crash-durable bounded recovery admission under
+    #1586 and no silent eviction or extended lease.
 
 No implementation is authorized by recording these recommendations. Owner
 acceptance must be recorded here before a production implementation PR; until
