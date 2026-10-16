@@ -74,6 +74,11 @@ impl Runtime {
     pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
         self.events.try_recv()
     }
+    /// Wait for a persisted event on a worker, with a finite deadline.
+    /// Server-loop callers must use `try_receive` instead.
+    pub fn receive_timeout(&self, timeout: Duration) -> Result<Received, mpsc::RecvTimeoutError> {
+        self.events.recv_timeout(timeout)
+    }
     /// Record intent before cancellation/closure/signals; never join workers here.
     pub fn stop(&self) {
         self.stop.request();
@@ -136,8 +141,7 @@ pub fn run(
     profile.configure_environment(|key, value| {
         command.env(key, value);
     });
-    lease.spawned();
-    let (mut child, profile) = match profile.try_spawn(|| command.spawn_traced()) {
+    let (mut child, profile) = match profile.try_spawn(|| lease.spawn(|| command.spawn_traced())) {
         Ok(started) => started,
         Err(error) => {
             lease.release();

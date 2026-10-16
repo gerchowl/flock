@@ -2,7 +2,6 @@ use crate::api::schema::*;
 use crate::app::App;
 use crate::config::Config;
 use crate::structured::{lease::SessionLeases, runtime, transport::StreamLocation};
-use std::io::{BufRead, BufReader, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
@@ -116,6 +115,12 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
         worker: Some(worker),
         exit: exit_rx,
     };
+    // A separate operator ancestry must remain usable while the model lives.
+    app.current_api_peer_pid = Some(std::process::id());
+    app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
+    assert!(app.caller_is_local_operator());
+    app.current_api_peer_pid = None;
+    app.current_api_peer_birth = None;
     let runtime = &owned.runtime;
     let socket_worker = std::thread::spawn(move || {
         for _ in 0..3 {
@@ -130,25 +135,19 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
                 1,
                 "fake producer did not connect"
             );
-            let (mut stream, _) = listener.accept().unwrap();
+            let (stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
-            let peer_pid = crate::api::socket_peer_pid(&stream).expect("owned peer credentials");
-            let mut line = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut line)
-                .unwrap();
-            let (response_tx, response_rx) = mpsc::channel();
-            tx.send(crate::api::ApiRequestMessage {
-                request: serde_json::from_str(&line).unwrap(),
-                respond_to: response_tx,
-                peer_pid: Some(peer_pid),
-                peer_birth: crate::platform::process_start_time(peer_pid),
-            })
+            crate::api::server::handle_connection(
+                stream,
+                &tx,
+                &crate::api::EventHub::default(),
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                None,
+                &std::sync::Mutex::default(),
+            )
             .unwrap();
-            let response = response_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            writeln!(stream, "{response}").unwrap();
         }
     });
     runtime
@@ -165,8 +164,17 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
             .parse()
             .unwrap();
         attributed &= msg.peer_pid != Some(root_pid);
+        assert!(
+            msg.peer_birth.is_some(),
+            "production socket capture must supply birth"
+        );
+        assert_eq!(
+            msg.peer_birth,
+            msg.peer_pid.and_then(crate::platform::process_start_time)
+        );
         let caller = {
             app.current_api_peer_pid = msg.peer_pid;
+            app.current_api_peer_birth = Some(msg.peer_birth);
             app.spawn_caller()
         };
         attributed &= app.attested_sender_agent().as_deref() == Some(AGENT);
@@ -179,20 +187,14 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
     }
     socket_worker.join().unwrap();
     // The result is emitted only after all tool replies have been written.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let received = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                match runtime.try_receive() {
-                    Ok(event) => break event,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        panic!("producer disconnected")
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
-                }
-            }
-        })
-        .await
-        .expect("bounded result notification");
+        let remaining = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .expect("bounded result even if the producer floods unrelated events");
+        let received = runtime
+            .receive_timeout(remaining)
+            .expect("bounded event-driven result notification");
         if received.record.result_subtype.is_some() {
             break;
         }
@@ -250,7 +252,7 @@ fn pending_children_are_counted_for_structured_lineage() {
 }
 
 #[tokio::test]
-async fn queued_socket_requests_with_unknown_or_reused_birth_never_become_operator() {
+async fn queued_socket_requests_with_reused_birth_never_become_operator() {
     let fixture = runtime::tests::Fixture::new();
     let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(
@@ -262,7 +264,8 @@ async fn queued_socket_requests_with_unknown_or_reused_birth_never_become_operat
     );
     let pid = std::process::id();
     let birth = crate::platform::process_start_time(pid).expect("owned test process");
-    for peer_birth in [None, Some(birth.wrapping_add(1))] {
+    {
+        let peer_birth = Some(birth.wrapping_add(1));
         let (respond_to, response) = mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
             request: Request {
@@ -315,4 +318,73 @@ async fn recovery_parked_requests_preserve_original_peer_birth() {
     assert_eq!(response["error"]["code"], "operator_only", "{response}");
     assert!(app.current_api_peer_birth.is_none());
     assert!(app.current_api_peer_pid.is_none());
+}
+
+#[tokio::test]
+async fn unreadable_peer_birth_with_no_leases_preserves_operator_behavior() {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(
+        &Config::default(),
+        true,
+        None,
+        rx,
+        crate::api::EventHub::default(),
+    );
+    app.current_api_peer_pid = Some(std::process::id());
+    app.current_api_peer_birth = Some(None);
+    assert!(app.caller_is_local_operator());
+}
+
+#[tokio::test]
+async fn real_pane_ancestry_survives_an_unrelated_pending_lease() {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(
+        &Config::default(),
+        true,
+        None,
+        rx,
+        crate::api::EventHub::default(),
+    );
+    app.state.workspaces = vec![crate::workspace::Workspace::test_new("caller")];
+    app.state.ensure_test_terminals();
+    let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+    let terminal = app.state.workspaces[0]
+        .pane_state(pane)
+        .unwrap()
+        .attached_terminal_id
+        .clone();
+    app.state.terminals.get_mut(&terminal).unwrap().launch_argv = Some(vec!["claude".into()]);
+    app.test_pane_child_pids.insert(pane, std::process::id());
+    app.current_api_peer_pid = Some(std::process::id());
+    app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
+    let _pending = app.session_leases.reserve(AGENT, SESSION, None).unwrap();
+    assert_eq!(
+        app.lease_caller(),
+        crate::structured::lease::Caller::Unrelated
+    );
+    assert!(matches!(
+        app.spawn_caller(),
+        super::spawn::SpawnCaller::Agent { .. }
+    ));
+    assert!(!app.caller_is_local_operator());
+}
+
+#[tokio::test]
+async fn unreadable_peer_birth_with_active_leases_remains_uncertain() {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(
+        &Config::default(),
+        true,
+        None,
+        rx,
+        crate::api::EventHub::default(),
+    );
+    let _lease = app.session_leases.reserve(AGENT, SESSION, None).unwrap();
+    app.current_api_peer_pid = Some(std::process::id());
+    app.current_api_peer_birth = Some(None);
+    assert_eq!(
+        app.lease_caller(),
+        crate::structured::lease::Caller::Uncertain
+    );
+    assert!(!app.caller_is_local_operator());
 }

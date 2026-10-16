@@ -5,16 +5,21 @@ impl App {
     pub(super) fn lease_caller(&self) -> crate::structured::lease::Caller {
         if let Some(birth) = self.current_api_peer_birth {
             if self.current_api_peer_pid.is_some()
-                && (birth.is_none()
-                    || self
-                        .current_api_peer_pid
-                        .and_then(crate::platform::process_start_time)
-                        != birth)
+                && ((birth.is_none() && !self.session_leases.is_empty())
+                    || (birth.is_some()
+                        && self
+                            .current_api_peer_pid
+                            .and_then(crate::platform::process_start_time)
+                            != birth))
             {
                 return crate::structured::lease::Caller::Uncertain;
             }
         }
-        self.session_leases.caller(self.current_api_peer_pid)
+        self.session_leases.caller_with_pane(
+            self.current_api_peer_pid,
+            self.caller_pane()
+                .and_then(|(_, pane)| self.pane_child_pid(pane)),
+        )
     }
 
     pub(crate) fn find_pane(

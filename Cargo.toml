@@ -49,6 +49,8 @@ futures-util = { version = "0.3", optional = true }
 libc = "0.2"
 # OS entropy for mesh node keys, server-minted ULIDs and collection capabilities.
 getrandom = "0.4"
+# Timed lease-table reads: short contention must not deny all API callers.
+parking_lot = "0.12"
 portable-pty = "0.9"
 rust-embed = { version = "8", optional = true }
 png = "0.18"
@@ -79,3 +81,7 @@ rusqlite = { version = "0.40.2", features = ["hooks"] }
 
 # Parse adapter declarations for the optional-field coverage drift test.
 syn = { version = "2", features = ["full"] }
+
+[build-dependencies]
+# Use SDK declarations for Darwin kinfo_proc rather than copying its ABI.
+cc = "1"

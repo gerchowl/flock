@@ -231,7 +231,7 @@ fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
     crate::ipc::restrict_socket_permissions(path, SOCKET_PERMISSION_MODE)
 }
 
-fn handle_connection(
+pub(crate) fn handle_connection(
     mut stream: UnixStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
