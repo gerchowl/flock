@@ -488,6 +488,7 @@ impl App {
             .resolve_terminal_target(target)
             .map_err(|err| self.agent_target_error_body(err))?;
         let refuse = |code: &str, message: String| ErrorBody {
+            data: None,
             code: code.into(),
             message,
         };
@@ -632,6 +633,7 @@ impl App {
             Err(err) => encode_error_body(
                 id,
                 ErrorBody {
+                    data: None,
                     code: err.code().to_string(),
                     message: err.message(),
                 },
@@ -667,6 +669,7 @@ impl App {
             Err(err) => encode_error_body(
                 id,
                 ErrorBody {
+                    data: None,
                     code: err.code().to_string(),
                     message: err.message(),
                 },

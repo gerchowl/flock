@@ -329,6 +329,7 @@ pub(super) fn wait_for_reply(
             return Ok(Some(encode(&ErrorResponse {
                 id: request_id,
                 error: ErrorBody {
+                    data: None,
                     code: "mail_store_unavailable".into(),
                     message: reason,
                 },
@@ -343,6 +344,7 @@ pub(super) fn wait_for_reply(
         return Ok(Some(encode(&ErrorResponse {
             id: request_id,
             error: ErrorBody {
+                data: None,
                 code: "message_not_found".into(),
                 message: format!("no message with correlation id {correlation_id}"),
             },
