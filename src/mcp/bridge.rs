@@ -279,7 +279,20 @@ fn extract_flock_result(mut raw: Value, send_like: bool) -> Result<Value, McpErr
             .and_then(Value::as_str)
             .unwrap_or("flock refused the request");
         let exit = crate::cli::error_code_exit(code, send_like);
-        return Err(McpError::from_flock_error(code, message, exit));
+        let mut refusal = McpError::from_flock_error(code, message, exit);
+        if code == crate::api::error_code::ErrorCode::InputNotEmpty.as_str() {
+            if let (Some(detail), Some(data)) = (
+                error.get("data").and_then(Value::as_object),
+                refusal.data.as_mut().and_then(Value::as_object_mut),
+            ) {
+                for (key, value) in detail {
+                    if !matches!(key.as_str(), "refusal" | "retry" | "exit") {
+                        data.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        return Err(refusal);
     }
     // Take() rather than clone() — the raw envelope isn't needed again.
     let result = raw
@@ -534,6 +547,30 @@ mod tests {
             assert_eq!(err.data.as_ref().unwrap()["kind"], "msg_target_not_found");
             assert!(err.data.as_ref().unwrap()["expected"].is_array());
         }
+    }
+
+    #[test]
+    fn draft_refusal_preserves_the_server_remedy_and_registered_exit() {
+        let detail = json!({"composer":{"visible_bytes":12},"remedy":{
+            "retry_when":"composer_empty","follow_up_issue":1586,"commands":[]},
+            "exit":999,"retry":"unsafe","refusal":"wrong"});
+        let flock = MockApi::ok(json!({"error":{"code":"input_not_empty",
+            "message":"clear or submit the existing draft in the agent UI","data":detail}}));
+        let err = route(
+            "tools/call",
+            json!({"name":"flock_pane_submit","arguments":{
+            "pane_id":"w1:p1","text":"next task"}}),
+            &flock,
+            &ChannelOptions::off(),
+        )
+        .unwrap_err();
+        let data = err.data.unwrap();
+        assert_eq!(data["composer"], detail["composer"]);
+        assert_eq!(data["remedy"], detail["remedy"]);
+        assert_eq!(data["exit"], crate::cli::exit::REFUSED);
+        assert_eq!(data["retry"], "later");
+        assert_eq!(data["refusal"], "input_not_empty");
+        assert!(err.message.contains("agent UI"));
     }
 
     #[test]

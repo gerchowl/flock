@@ -700,11 +700,7 @@ impl App {
             .then(|| self.raw_text_refusal(resolved.ws_idx, resolved.pane_id))
             .flatten()
         {
-            return encode_error(
-                id,
-                reason,
-                crate::app::guarded_submit::raw_text_refusal_message(reason),
-            );
+            return self.raw_text_refusal_response(id, resolved.ws_idx, resolved.pane_id, reason);
         }
         self.begin_paste(
             id,
