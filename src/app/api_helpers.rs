@@ -80,13 +80,7 @@ pub(super) fn pane_agent_status(
     state: crate::detect::AgentState,
     seen: bool,
 ) -> crate::api::schema::AgentStatus {
-    match (state, seen) {
-        (crate::detect::AgentState::Idle, false) => crate::api::schema::AgentStatus::Done,
-        (crate::detect::AgentState::Idle, true) => crate::api::schema::AgentStatus::Idle,
-        (crate::detect::AgentState::Working, _) => crate::api::schema::AgentStatus::Working,
-        (crate::detect::AgentState::Blocked, _) => crate::api::schema::AgentStatus::Blocked,
-        (crate::detect::AgentState::Unknown, _) => crate::api::schema::AgentStatus::Unknown,
-    }
+    crate::terminal::lifecycle::detector_status(state, seen)
 }
 
 /// The ADR-0028 `state` object (#1019) from today's detectors. `background`
@@ -198,16 +192,7 @@ pub(super) fn pane_agent_status_for_state(
     seen: bool,
     runtime_present: bool,
 ) -> crate::api::schema::AgentStatus {
-    if terminal.resume_failed {
-        return crate::api::schema::AgentStatus::Offline;
-    }
-    if terminal.hibernated_resume_plan.is_some() {
-        return crate::api::schema::AgentStatus::Hibernated;
-    }
-    if terminal.pending_agent_resume_plan.is_some() && !runtime_present {
-        return crate::api::schema::AgentStatus::Offline;
-    }
-    pane_agent_status(state, seen)
+    terminal.projected_agent_status(state, seen, runtime_present)
 }
 
 /// Cap reported prompts to a sane size and strip control characters that

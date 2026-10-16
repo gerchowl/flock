@@ -1035,15 +1035,15 @@ impl AppState {
                     .or_else(|| terminal.and_then(|terminal| terminal.effective_agent_label()))
             });
             let custom_status = terminal.and_then(|terminal| terminal.effective_custom_status());
-            let state = terminal
-                .map(|terminal| terminal.state)
-                .unwrap_or(AgentState::Unknown);
+            let (state, seen) = terminal
+                .map(|terminal| terminal.presentation_state(pane.seen))
+                .unwrap_or((AgentState::Unknown, true));
             let status_label = terminal
                 .map(|terminal| terminal.effective_presentation().state_labels)
-                .and_then(|labels| labels.get(state_label_text(state, pane.seen)).cloned());
+                .and_then(|labels| labels.get(state_label_text(state, seen)).cloned());
             let status = custom_status
                 .or(status_label)
-                .or_else(|| agent_label.map(|_| state_label_text(state, pane.seen).to_string()));
+                .or_else(|| agent_label.map(|_| state_label_text(state, seen).to_string()));
             let mut meta = match (agent_label, status.as_deref()) {
                 (Some(agent_label), Some(status)) => format!("{agent_label} · {status}"),
                 (Some(agent_label), None) => agent_label.to_string(),
@@ -1072,7 +1072,7 @@ impl AppState {
                 label,
                 meta,
                 status: state,
-                seen: pane.seen,
+                seen,
                 is_current,
                 is_workspace: false,
                 is_tab: false,
@@ -1284,28 +1284,14 @@ fn tab_aggregate_state(
         crate::terminal::TerminalState,
     >,
 ) -> (AgentState, bool) {
-    let mut aggregate = AgentState::Unknown;
-    let mut seen = true;
-    for pane in tab.panes.values() {
-        let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
-            continue;
-        };
-        if state_priority(terminal.state, pane.seen) > state_priority(aggregate, seen) {
-            aggregate = terminal.state;
-            seen = pane.seen;
-        }
-    }
-    (aggregate, seen)
-}
-
-fn state_priority(state: AgentState, seen: bool) -> u8 {
-    match (state, seen) {
-        (AgentState::Blocked, _) => 5,
-        (AgentState::Working, _) => 4,
-        (AgentState::Idle, false) => 3,
-        (AgentState::Idle, true) => 2,
-        (AgentState::Unknown, _) => 1,
-    }
+    tab.pane_states(terminals)
+        .max_by_key(|(state, seen)| {
+            (
+                crate::workspace::pane_attention_priority(*state, *seen),
+                !*seen,
+            )
+        })
+        .unwrap_or((AgentState::Unknown, true))
 }
 
 fn tab_activity_summary(
@@ -1342,7 +1328,7 @@ fn activity_summary_for_panes<'a>(
         let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
             continue;
         };
-        match (terminal.state, pane.seen) {
+        match terminal.presentation_state(pane.seen) {
             (AgentState::Blocked, _) => blocked += 1,
             (AgentState::Working, _) => working += 1,
             (AgentState::Idle, false) => done += 1,
