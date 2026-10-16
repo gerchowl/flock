@@ -5479,8 +5479,8 @@ fn emit_submit(entry: &Entry, json: bool) {
         println!("delegate {}: submitted round {}", entry.name, entry.round);
         if let Some(base) = &entry.base {
             match &entry.base_sha {
-                Some(sha) => println!("  base {base} ({})", &sha[..sha.len().min(12)]),
-                None => println!("  base {base}"),
+                Some(sha) => println!("  start base {base} ({})", &sha[..sha.len().min(12)]),
+                None => println!("  start base {base}"),
             }
         }
     }
