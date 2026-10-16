@@ -28,5 +28,7 @@ import type { User } from "./User";
  * Nested switches narrow payloads; TypeScript does not correlate that
  * refinement back to the containing envelope.
  * Unknown events reach clients only through ADR-0036 §8's wrapper.
+ * Deserialization uses the adapter parser and rejects unknown payloads;
+ * those require the separate unknown wrapper, including its shape key.
  */
 export type KnownSessionEvent = Assistant | User | CommandLifecycle | Init | Status | ThinkingTokens | CompactBoundary | PermissionDenied | HookStarted | HookResponse | PeerMessageHold | RateLimit | CanUseTool | ControlSuccess | ControlError | MessageStart | ContentBlockStart | ContentBlockDelta | ContentBlockStop | MessageDelta | MessageStop | Success | ExecutionError;

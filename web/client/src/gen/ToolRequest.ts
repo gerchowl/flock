@@ -3,7 +3,7 @@ import type { JsonValue } from "./serde_json/JsonValue";
 
 /**
  * A stdio permission request, including AskUserQuestion (A.6, A.12-A.13).
- * Its TypeScript discriminator comes from the known request catalogue entry.
+ * Its Rust and TypeScript discriminator comes from the known request catalogue entry.
  */
 export type ToolRequest = {
 /**

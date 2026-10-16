@@ -37,9 +37,8 @@ test-one filter:
     cargo nextest run --locked --features ts "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
 # Run every guardrails gate over the tree (same set `nix flake check` runs).
-# Standalone, NOT chained into `lint`: the host-bound CI runners (ci.yml) skip
-# the guardrails devShell, so prek isn't on their PATH — gate enforcement in CI
-# lives in nix.yml's `flake check` (checks.gates), locally in the git hooks.
+# Standalone, NOT chained into `lint`: CI gate enforcement lives in nix.yml's
+# `flake check` (checks.gates), locally in the git hooks.
 gates:
     prek run --all-files
 
@@ -195,4 +194,5 @@ gen-ts:
 
 # Strict contract checks, including the Rust-classified recorded fixtures.
 ts-check:
+    # G1 #1593 moves the compiler pin into the workspace lockfile.
     bunx --bun --package typescript@7.0.2 tsc --noEmit -p web/client/tsconfig.json

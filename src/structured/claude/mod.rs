@@ -56,8 +56,11 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Optio
     T::deserialize(d).map(Some)
 }
 
+/// The known tool-request subtype, generated from the event catalogue.
+pub use event_types::CanUseTool::NestedKind as ToolRequestSubtype;
+
 /// A stdio permission request, including AskUserQuestion (A.6, A.12-A.13).
-/// Its TypeScript discriminator comes from the known request catalogue entry.
+/// Its Rust and TypeScript discriminator comes from the known request catalogue entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ToolRequest {
@@ -68,8 +71,8 @@ pub struct ToolRequest {
     /// Correlation with the assistant tool call.
     pub tool_use_id: String,
     /// Required control discriminator; null is an unknown wire shape (§8).
-    #[cfg_attr(feature = "ts", ts(as = "event_types::CanUseTool::NestedKind", inline))]
-    pub subtype: String,
+    #[cfg_attr(feature = "ts", ts(inline))]
+    pub subtype: ToolRequestSubtype,
     /// Harness `display_name` metadata from Appendix A.
     #[serde(
         default,
@@ -172,11 +175,14 @@ macro_rules! event_type {
         event_type!(@payload "subtype", $sub);
     };
     (@nested "/request/subtype", $sub:literal) => {
-        #[cfg(feature = "ts")]
-        #[derive(ts_rs::TS)]
-        pub(crate) enum NestedKind { #[ts(rename = $sub)] Value }
-        #[cfg(feature = "ts")]
-        const _: NestedKind = NestedKind::Value;
+        /// The request discriminator accepted by the catalogue parser.
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+        pub enum NestedKind {
+            /// The catalogue's recognized permission request.
+            #[serde(rename = $sub)]
+            Value,
+        }
     };
     (@nested $path:literal, $sub:literal) => {};
     (@payload $key:literal, $sub:literal) => {
@@ -294,12 +300,75 @@ macro_rules! events {
         /// Nested switches narrow payloads; TypeScript does not correlate that
         /// refinement back to the containing envelope.
         /// Unknown events reach clients only through ADR-0036 §8's wrapper.
-        #[cfg(feature = "ts")]
-        #[derive(ts_rs::TS)]
-        #[ts(untagged)]
-        #[allow(dead_code)] // Type-only mirrors of the custom serializer for ts-rs.
-        enum KnownSessionEvent {
+        /// Deserialization uses the adapter parser and rejects unknown payloads;
+        /// those require the separate unknown wrapper, including its shape key.
+        #[cfg(any(test, feature = "ts"))]
+        #[derive(Debug, Clone, PartialEq, Serialize)]
+        #[serde(untagged)]
+        #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+        pub(crate) enum KnownSessionEvent {
             $($(#[$doc])* $name(Box<$name>),)*
+        }
+
+        #[cfg(any(test, feature = "ts"))]
+        impl<'de> Deserialize<'de> for KnownSessionEvent {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let value = Value::deserialize(d)?;
+                match SessionEvent::parse(&value.to_string(), "wire") {
+                    $(SessionEvent::$name(event) => Ok(Self::$name(event)),)*
+                    SessionEvent::Unknown { .. } => Err(serde::de::Error::custom(
+                        "unknown agent payload requires {type:unknown,raw,shape}")),
+                }
+            }
+        }
+
+        #[cfg(test)]
+        #[test]
+        fn known_session_event_catalogue_round_trips_recorded_fixtures() {
+            let mut seen = std::collections::BTreeSet::new();
+            for line in include_str!("../../../tests/fixtures/claude-session/events.jsonl").lines() {
+                let original: Value = serde_json::from_str(line).unwrap();
+                let parsed = SessionEvent::parse(line, "wire");
+                let known: KnownSessionEvent = serde_json::from_str(line).unwrap();
+                assert_eq!(serde_json::to_value(&known).unwrap(), original);
+                assert_eq!(serde_json::to_string(&known).unwrap(),
+                    serde_json::to_string(&parsed).unwrap());
+                match parsed {
+                    $(SessionEvent::$name(_) => { seen.insert(stringify!($name)); },)*
+                    SessionEvent::Unknown { .. } => panic!("recorded fixture must remain known: {line}"),
+                }
+            }
+            assert_eq!(seen, [$(stringify!($name)),*].into_iter().collect());
+        }
+
+        #[cfg(test)]
+        #[test]
+        fn known_session_event_rejects_unknown_and_incompatible_payloads() {
+            for raw in [
+                serde_json::json!({"type":"future"}),
+                serde_json::json!({"type":"assistant", "message":{ }, "subtype":"future"}),
+                serde_json::json!({"type":"assistant"}),
+                Value::Null,
+                serde_json::json!("diagnostic"),
+            ] {
+                let error = serde_json::from_value::<KnownSessionEvent>(raw).unwrap_err();
+                assert!(error.to_string().contains(
+                    "unknown agent payload requires {type:unknown,raw,shape}"));
+            }
+        }
+
+        #[cfg(test)]
+        #[test]
+        fn tool_request_subtype_rejects_other_catalogue_values() {
+            let mut raw = include_str!("../../../tests/fixtures/claude-session/events.jsonl")
+                .lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|raw| raw["type"] == "control_request").unwrap();
+            let request: ToolRequest = serde_json::from_value(raw["request"].clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), raw["request"]);
+            raw["request"]["subtype"] = serde_json::json!("future");
+            assert!(serde_json::from_value::<ToolRequest>(raw["request"].clone()).is_err());
+            assert!(matches!(SessionEvent::parse(&raw.to_string(), "wire"),
+                SessionEvent::Unknown { .. }));
         }
 
         #[cfg(feature = "ts")]
