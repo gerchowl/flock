@@ -1368,6 +1368,20 @@ mod tests {
                 assert_eq!(record["state"]["turn"], "unknown");
             }
         }
+        for (method, pointer) in [
+            ("tab.list", "/result/tabs/0/agent_status"),
+            ("workspace.list", "/result/workspaces/0/agent_status"),
+            ("peers.summary", "/result/workspaces/0/status"),
+            ("peers.summary", "/result/workspaces/0/agents/0/status"),
+        ] {
+            let request = serde_json::from_value(
+                serde_json::json!({"id":"projection", "method":method, "params":{}}),
+            )
+            .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert_eq!(response.pointer(pointer).unwrap(), "offline", "{response}");
+        }
         assert_eq!(app.terminal_runtimes.len(), 0);
         assert!(app
             .state

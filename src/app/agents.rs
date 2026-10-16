@@ -1535,6 +1535,56 @@ mod tests {
             app.collect_agent_infos()[0].agent_status,
             AgentStatus::Offline
         );
+        assert_eq!(
+            app.tab_info(0, 0).unwrap().agent_status,
+            AgentStatus::Offline
+        );
+        assert_eq!(app.workspace_info(0).agent_status, AgentStatus::Offline);
+        assert_eq!(
+            app.terminal_target_candidate(0, pane).unwrap().agent_status,
+            AgentStatus::Offline
+        );
+        let target = app.public_pane_id(0, pane).unwrap();
+        let refusal = app
+            .queue_agent_restart(
+                crate::api::schema::AgentRestartParams {
+                    target,
+                    reason: "fixture restart".into(),
+                    continue_with: None,
+                    when: "after_turn".into(),
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(refusal.code, "restart_busy");
+        assert!(refusal.message.contains("agent resume"));
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        let presentation = terminal.effective_presentation();
+        let sequence = app.event_hub.current_sequence();
+        app.emit_pane_state_update(&crate::app::actions::PaneStateUpdate {
+            pane_id: pane,
+            ws_idx: 0,
+            previous_agent_label: Some("opencode".into()),
+            previous_known_agent: Some(crate::detect::Agent::OpenCode),
+            previous_state: crate::detect::AgentState::Working,
+            previous_seen: true,
+            previous_presentation: presentation.clone(),
+            agent_label: Some("opencode".into()),
+            known_agent: Some(crate::detect::Agent::OpenCode),
+            state: crate::detect::AgentState::Idle,
+            seen: true,
+            presentation,
+        });
+        assert!(
+            app.event_hub
+                .events_after(sequence)
+                .iter()
+                .all(|(_, event)| !matches!(
+                    event.data,
+                    crate::api::schema::EventData::PaneAgentStatusChanged { .. }
+                )),
+            "a stored turn transition cannot emit a live status for an offline binding"
+        );
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
         assert_eq!(terminal.pending_agent_resume_plan, Some(plan.clone()));
         terminal.pending_agent_resume_plan = None;
