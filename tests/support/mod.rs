@@ -15,6 +15,7 @@ pub mod json_api;
 pub mod process_table;
 pub mod readiness;
 pub mod scripted;
+pub mod server_startup;
 pub mod socket_dir;
 pub mod timing;
 
@@ -1185,6 +1186,9 @@ impl Drop for CleanupGuard {
 }
 
 fn terminate_pid(pid: u32) {
+    if server_startup::signal_owned_group(pid) {
+        return;
+    }
     let pid_t = pid as libc::pid_t;
 
     if process_exists(pid_t) {
