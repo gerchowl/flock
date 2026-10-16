@@ -1,5 +1,6 @@
 mod agent_id;
 mod id;
+pub(crate) mod lifecycle;
 mod runtime;
 mod runtime_registry;
 pub mod state;

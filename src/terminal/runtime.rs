@@ -362,6 +362,17 @@ impl TerminalRuntime {
         self.0.send_bytes(bytes).await
     }
 
+    /// Retain a write ticket through an operator lease and any channel backlog.
+    // #1638 connects this transport foundation to API response ownership.
+    #[allow(dead_code)]
+    pub(crate) fn try_send_tracked(
+        &self,
+        bytes: Bytes,
+        deadline: std::time::Instant,
+    ) -> crate::pty::write_receipt::WriteReceipt {
+        self.0.try_send_tracked(bytes, deadline)
+    }
+
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.0.try_send_bytes(bytes)
     }
