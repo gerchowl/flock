@@ -418,9 +418,10 @@ mod handler_tests {
         shutdown(app);
         let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
     }
-    const REMOTE_1114: &str = "agent_architect.example_1";
 
-    fn remote_1114_app() -> (App, String) {
+    const REMOTE_ARCHITECT: &str = "agent_architect.example_1";
+
+    fn remote_architect_app() -> (App, String) {
         let mut app = app_on(EventHub::default());
         caller_is_an_agent(&mut app);
         let (delegate, _) = start(&mut app, None);
@@ -434,7 +435,7 @@ mod handler_tests {
         let event = crate::api::schema::EventEnvelope {
             event: crate::api::schema::EventKind::AgentDelegated,
             data: crate::api::schema::EventData::AgentDelegated {
-                architect: REMOTE_1114.into(),
+                architect: REMOTE_ARCHITECT.into(),
                 delegate: delegate.clone(),
                 via: original.via,
                 workspace: original.workspace,
@@ -458,11 +459,11 @@ mod handler_tests {
         (app, delegate)
     }
 
-    fn publish_remote_1114(app: &mut App, relayed: bool, present: bool) {
+    fn publish_remote_architect(app: &mut App, relayed: bool, present: bool) {
         let workspace: crate::api::schema::PeerWorkspaceSummary =
             serde_json::from_value(serde_json::json!({
                 "workspace":"fixture", "status":"idle", "agents":[{
-                    "agent_id":REMOTE_1114, "pane_id":"w1:p1", "agent":"claude", "status":"idle"
+                    "agent_id":REMOTE_ARCHITECT, "pane_id":"w1:p1", "agent":"claude", "status":"idle"
                 }]
             }))
             .unwrap();
@@ -497,20 +498,22 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn remote_1114_direct_gossip_prevents_false_orphan_and_removal_restores_it() {
-        let (mut app, delegate) = remote_1114_app();
+    async fn direct_architect_presence_survives_unreachability_until_summary_removal() {
+        let (mut app, delegate) = remote_architect_app();
         assert_eq!(
-            list(&mut app, &["--architect", REMOTE_1114]).unwrap()[0].state,
+            list(&mut app, &["--architect", REMOTE_ARCHITECT]).unwrap()[0].state,
             "orphaned"
         );
-        publish_remote_1114(&mut app, false, true);
+        publish_remote_architect(&mut app, false, true);
         let locals = app.collect_agent_infos();
-        assert!(!locals.iter().any(|agent| agent.agent_id == REMOTE_1114));
+        assert!(!locals
+            .iter()
+            .any(|agent| agent.agent_id == REMOTE_ARCHITECT));
         assert!(app
             .collect_fleet_agents(&locals)
             .iter()
-            .any(|agent| agent.agent_id == REMOTE_1114 && !agent.local));
-        let rows = list(&mut app, &["--architect", REMOTE_1114]).unwrap();
+            .any(|agent| agent.agent_id == REMOTE_ARCHITECT && !agent.local));
+        let rows = list(&mut app, &["--architect", REMOTE_ARCHITECT]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].delegate, delegate);
         assert_eq!(rows[0].state, "live", "a gossiped architect is present");
@@ -528,7 +531,15 @@ mod handler_tests {
             "live",
             "unreachable is not removed"
         );
-        publish_remote_1114(&mut app, false, false);
+        // Direct summaries have no age-based eviction, even past the relay TTL.
+        let ttl = app.state.config.gossip.stale_after().as_secs()
+            * crate::app::state::RELAYED_ENTRY_TTL_STALE_MULTIPLE;
+        app.state.peer_summaries[0].last_ok =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(ttl + 1));
+        assert!(app.state.peer_summaries[0].last_ok.is_some());
+        app.expire_relayed_entries();
+        assert_eq!(list(&mut app, &["--all"]).unwrap()[0].state, "live");
+        publish_remote_architect(&mut app, false, false);
         assert_eq!(list(&mut app, &["--all"]).unwrap()[0].state, "orphaned");
         assert!(
             crate::cli::delegate_list::render(&list(&mut app, &["--all"]).unwrap())
@@ -538,17 +549,30 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn remote_1114_relayed_gossip_prevents_false_orphan_without_reviving_gone_delegate() {
-        let (mut app, delegate) = remote_1114_app();
-        publish_remote_1114(&mut app, true, true);
+    async fn relayed_architect_presence_expires_without_reviving_gone_delegates() {
+        let (mut app, delegate) = remote_architect_app();
+        publish_remote_architect(&mut app, true, true);
         assert!(
             !app.state.relayed_fleet_cache.is_empty(),
             "real gossip merge cached the relay"
         );
         assert_eq!(list(&mut app, &["--all"]).unwrap()[0].state, "live");
-        app.state.relayed_fleet_cache.clear();
+        let ttl = app.state.config.gossip.stale_after().as_secs()
+            * crate::app::state::RELAYED_ENTRY_TTL_STALE_MULTIPLE;
+        // Advance local dwell on the real gossiped row, without waiting or clearing it.
+        let ingested_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(ttl + 1))
+            .expect("fixture clock can represent the relay TTL");
+        for entry in app.state.relayed_fleet_cache.values_mut() {
+            entry.peer.ingested_at = Some(ingested_at);
+        }
+        app.expire_relayed_entries();
+        assert!(
+            app.state.relayed_fleet_cache.is_empty(),
+            "expiry tick evicts the relay"
+        );
         assert_eq!(list(&mut app, &["--all"]).unwrap()[0].state, "orphaned");
-        publish_remote_1114(&mut app, true, true);
+        publish_remote_architect(&mut app, true, true);
         app.delegations.mark_gone(&delegate);
         assert_eq!(list(&mut app, &["--all"]).unwrap()[0].state, "gone");
         shutdown(app);
