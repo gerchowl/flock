@@ -355,13 +355,29 @@ fn has_codex_current_prompt(content: &str) -> bool {
 
 /// Prompt and footer line indices in the live bottom-buffer composer.
 pub(in crate::detect) fn composer_region(content: &str) -> Option<(usize, usize)> {
+    composer_region_with_width(content, None)
+}
+
+/// Clipped shortcut controls must reach the actual terminal's right edge.
+/// Without geometry, retain the complete-control contract.
+pub(in crate::detect) fn composer_region_with_width(
+    content: &str,
+    cols: Option<u16>,
+) -> Option<(usize, usize)> {
     let lines: Vec<_> = content.lines().collect();
     let prompt = lines
         .iter()
         .rposition(|line| codex_prompt_line(line.trim_start()))?;
     let footer = lines[prompt + 1..]
         .iter()
-        .position(|line| composer_footer(line))?;
+        .enumerate()
+        .position(|(offset, line)| {
+            composer_footer(line)
+                || (clipped_shortcut_footer(line, cols)
+                    && lines[prompt + offset + 2..]
+                        .iter()
+                        .all(|tail| tail.trim().is_empty()))
+        })?;
     let footer = prompt + 1 + footer;
     // Bullets inside a draft are input, but output below the footer means
     // this is no longer the live composer.
@@ -372,6 +388,43 @@ pub(in crate::detect) fn composer_region(content: &str) -> Option<(usize, usize)
         return None;
     }
     Some((prompt, footer))
+}
+
+pub(in crate::detect) fn clipped_shortcut_footer(line: &str, cols: Option<u16>) -> bool {
+    const SHORTCUTS: &str = "  ? for shortcuts";
+    cols.is_some_and(|cols| {
+        line.len() == usize::from(cols)
+            && line.len() < SHORTCUTS.len()
+            && line
+                .strip_prefix("  ? for ")
+                .is_some_and(|tail| !tail.is_empty())
+            && SHORTCUTS.starts_with(line)
+    })
+}
+
+pub(in crate::detect) fn clipped_model_footer(line: &str, cols: Option<u16>) -> bool {
+    if cols.is_none_or(|cols| line.chars().count() != usize::from(cols)) {
+        return false;
+    }
+    let Some(label) = line
+        .strip_prefix("  ")
+        .and_then(|line| line.strip_suffix('…'))
+    else {
+        return false;
+    };
+    let (model, effort) = label
+        .trim_end()
+        .split_once(' ')
+        .unwrap_or((label.trim_end(), ""));
+    model.to_ascii_lowercase().starts_with("gpt-")
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        && [
+            "default", "none", "minimal", "low", "medium", "high", "xhigh",
+        ]
+        .iter()
+        .any(|known| known.starts_with(effort))
 }
 
 fn composer_footer(line: &str) -> bool {
