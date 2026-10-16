@@ -159,14 +159,14 @@ impl App {
         })
     }
 
-    /// Resume a hibernated pane: spawn its stashed argv back into the same
-    /// terminal / pane. One-shot — clears the plan on success.
+    /// Resume a hibernated or deferred pane in the same terminal / pane.
+    /// Clears the plan on success; only a hibernated plan emits the hibernation event.
     pub(crate) fn resume_hibernated_pane(
         &mut self,
         ws_idx: usize,
         pane_id: PaneId,
     ) -> Result<AgentHibernationOutcome, HibernationError> {
-        let (terminal_id, plan) = {
+        let (terminal_id, plan, was_hibernated) = {
             let ws = self
                 .state
                 .workspaces
@@ -195,7 +195,8 @@ impl App {
                 .clone()
                 .or(deferred)
                 .ok_or(HibernationError::NotHibernated)?;
-            (terminal_id, plan)
+            let was_hibernated = terminal.hibernated_resume_plan.is_some();
+            (terminal_id, plan, was_hibernated)
         };
 
         let public_pane_id = self
@@ -228,14 +229,17 @@ impl App {
             });
         }
 
-        self.event_hub.push(crate::api::schema::EventEnvelope {
-            event: crate::api::schema::EventKind::AgentResumedFromHibernation,
-            data: crate::api::schema::EventData::AgentResumedFromHibernation {
-                pane_id: public_pane_id.clone(),
-                workspace_id: workspace_id.clone(),
-                agent: agent.clone(),
-            },
-        });
+        // ADR-0028 §1 and #1680: deferred and hibernated are distinct lifecycle facts.
+        if was_hibernated {
+            self.event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::AgentResumedFromHibernation,
+                data: crate::api::schema::EventData::AgentResumedFromHibernation {
+                    pane_id: public_pane_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    agent: agent.clone(),
+                },
+            });
+        }
         Ok(AgentHibernationOutcome {
             public_pane_id,
             workspace_id,
@@ -334,6 +338,10 @@ mod tests {
         app.state.ensure_test_terminals();
         app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::OpenCode),
+            crate::detect::AgentState::Idle,
+        );
         terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
             agent: "opencode".into(),
             argv: vec!["/bin/sh".into(), "-c".into(), "read -r fixture".into()],
@@ -348,10 +356,13 @@ mod tests {
             runtime.shutdown();
         }
         assert!(result.is_ok(), "{result:?}");
-        assert!(
-            events.iter().all(|(_, envelope)| envelope.event
-                != crate::api::schema::EventKind::AgentResumedFromHibernation),
-            "a never-hibernated pane emitted a hibernation fact: {events:?}"
+        assert_eq!(
+            events
+                .iter()
+                .map(|(_, envelope)| envelope.event)
+                .collect::<Vec<_>>(),
+            vec![crate::api::schema::EventKind::PaneAgentStatusChanged],
+            "a deferred resume must emit only its live status: {events:?}"
         );
     }
 

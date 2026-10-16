@@ -1715,6 +1715,7 @@ fn sleep_bounded(requests: &mut dyn PinnedRequests, deadline: Option<Instant>) {
     };
     requests.sleep(nap);
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

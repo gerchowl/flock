@@ -569,7 +569,7 @@ mod tests {
                 vec![(&public_pane, &public_workspace, AgentStatus::Idle)],
                 "explicit={explicit}: {events:?}"
             );
-            if explicit {
+            if hibernated {
                 assert_eq!(
                     events
                         .iter()
@@ -579,7 +579,16 @@ mod tests {
                         &crate::api::schema::EventKind::PaneAgentStatusChanged,
                         &crate::api::schema::EventKind::AgentResumedFromHibernation
                     ],
-                    "live status must precede the explicit resume fact: {events:?}"
+                    "live status must precede the hibernation resume fact: {events:?}"
+                );
+            } else {
+                assert_eq!(
+                    events
+                        .iter()
+                        .map(|(_, event)| event.event)
+                        .collect::<Vec<_>>(),
+                    vec![crate::api::schema::EventKind::PaneAgentStatusChanged],
+                    "a deferred resume must emit only live status: {events:?}"
                 );
             }
             assert!(!repeated);
