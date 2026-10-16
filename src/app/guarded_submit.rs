@@ -1,7 +1,7 @@
 //! Serialized, bounded keyboard submissions. Outcomes are separate from mail receipts.
 use std::time::{Duration, Instant};
 
-use super::api::responses::{encode_error, encode_success};
+use super::api::responses::{encode_error, encode_error_with_data, encode_success};
 use crate::api::schema::{PaneSubmitParams, ResponseResult};
 use crate::app::App;
 use crate::detect::Agent;
@@ -403,7 +403,7 @@ pub(crate) fn raw_text_refusal_message(reason: &str) -> &'static str {
     if reason == "injection_pending" {
         "flock is injecting into this agent's composer; send again when it is done, or pass raw to type anyway"
     } else {
-        "the agent's composer holds a draft; nothing was typed. Send again once it is empty, or pass raw to type onto it"
+        "the agent's composer holds a draft; nothing was typed. First clear or submit the existing draft in the agent UI, then retry. There is no safe CLI command to clear or submit an existing draft yet (tracked in #1586)."
     }
 }
 
@@ -420,6 +420,54 @@ fn progress(before: &str, after: &str) -> Result<bool, &'static str> {
 }
 
 impl App {
+    /// Refuse a draft with count-only evidence and an explicit manual remedy.
+    /// Visible rows are trimmed and joined with newlines; this is not the full
+    /// draft size when content is off-screen or represented by a pasted chip.
+    /// An unreadable composer yields a null count, never guessed bytes. Counts
+    /// describe the re-read snapshot, which may differ from the refusal snapshot.
+    /// No draft text is returned. Guarded CLI draft actions are tracked in #1586.
+    pub(super) fn input_not_empty_response(
+        &self,
+        id: String,
+        ws: usize,
+        pane: crate::layout::PaneId,
+    ) -> String {
+        let terminal = self.terminal_for_pane(ws, pane);
+        let visible_bytes = terminal.and_then(|terminal| {
+            let agent = terminal.effective_known_agent()?;
+            let runtime = self.lookup_runtime_sender(ws, pane)?;
+            editor_rows(agent, runtime).map(|rows| rows.join("\n").len())
+        });
+        encode_error_with_data(
+            id,
+            crate::api::error_code::ErrorCode::InputNotEmpty.as_str(),
+            raw_text_refusal_message("input_not_empty"),
+            serde_json::json!({
+                "pane_id":self.public_pane_id(ws,pane),
+                "terminal_id":terminal.map(|terminal| terminal.id.to_string()),
+                "agent_id":terminal.map(|terminal| terminal.agent_id.to_string()),
+                "composer":{"visible_bytes":visible_bytes},
+                "remedy":{"action":"clear_or_submit_draft_in_agent_ui",
+                    "retry_when":"composer_empty","commands":[],"follow_up_issue":1586}
+            }),
+        )
+    }
+
+    /// Keep injection refusals unchanged while giving drafts structured guidance.
+    pub(super) fn raw_text_refusal_response(
+        &self,
+        id: String,
+        ws: usize,
+        pane: crate::layout::PaneId,
+        reason: &str,
+    ) -> String {
+        if reason == "input_not_empty" {
+            self.input_not_empty_response(id, ws, pane)
+        } else {
+            encode_error(id, reason, raw_text_refusal_message(reason))
+        }
+    }
+
     pub(crate) fn handle_pane_submit(&mut self, id: String, params: PaneSubmitParams) -> String {
         self.handle_guarded_submit(id, params, false)
     }
@@ -465,6 +513,7 @@ impl App {
                 self.pending_agent_submit = Some((id.clone(), params.pane_id, attempt));
                 encode_success(id, ResponseResult::Ok {})
             }
+            Err("input_not_empty") => self.input_not_empty_response(id, ws, pane_id),
             Err(reason) => encode_error(id, reason, reason),
         }
     }
