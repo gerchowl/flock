@@ -21,7 +21,7 @@ impl Fixture {
     pub(crate) fn new() -> Self {
         Self::under(&std::env::temp_dir())
     }
-    fn under(parent: &std::path::Path) -> Self {
+    pub(crate) fn under(parent: &std::path::Path) -> Self {
         let root = SessionConfigDir::create(parent).expect("fixture root");
         let path = root.path().join("lifetime");
         let name = CString::new(path.as_os_str().as_bytes()).expect("FIFO path");

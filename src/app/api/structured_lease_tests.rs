@@ -40,7 +40,8 @@ const SESSION: &str = "00000000-0000-4000-8000-000000000001";
 
 #[tokio::test]
 async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption() {
-    let fixture = runtime::tests::Fixture::new();
+    // guardrails-ok(hermetic): Unix socket fixtures require a short owned root independent of TMPDIR.
+    let fixture = runtime::tests::Fixture::under(std::path::Path::new("/tmp"));
     let root = fixture.root.path().to_owned();
     let socket = root.join("api.sock");
     assert!(socket.as_os_str().as_encoded_bytes().len() < 104);
