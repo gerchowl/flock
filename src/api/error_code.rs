@@ -47,8 +47,10 @@ impl ErrorCode {
     pub(crate) const fn exit(self) -> i32 {
         match self {
             ErrorCode::ServerVersionGap => exit::PROTOCOL_GAP,
-            // A park the caller asked for wrongly (#1031): fix the call.
-            ErrorCode::WaitPredicateInvalid
+            // ADR-0029 §2: the wrong operation requires a corrected call.
+            // A parked restart needs resume; invalid wait parks need new predicates.
+            ErrorCode::Parked
+            | ErrorCode::WaitPredicateInvalid
             | ErrorCode::WaitPredicateUnsupported
             | ErrorCode::WaitDeadlineTooLong => exit::USAGE,
             // ADR-0029 §2: code 13 covers the ADR-0014 boundary.
@@ -131,6 +133,7 @@ error_codes! {
         OwnerPolicyUnreadable = "owner_policy_unreadable",
         PaneGone = "pane_gone",
         PaneNotFound = "pane_not_found",
+        Parked = "parked",
         PromptControlBytes = "prompt_control_bytes",
         PromptEmpty = "prompt_empty",
         PromptTooLong = "prompt_too_long",
@@ -248,6 +251,21 @@ error_codes! {
 mod tests {
     use super::ErrorCode;
 
+    #[test]
+    fn parked_restart_requires_a_different_call_and_has_a_usage_exit() {
+        let code = ErrorCode::from_code("parked").expect("parked is a registered refusal");
+        assert_eq!(code.retry(), crate::cli::exit::Retry::Never);
+        assert_eq!(code.exit(), crate::cli::exit::USAGE);
+        assert_eq!(
+            crate::cli::error_code_exit("parked", false),
+            crate::cli::exit::USAGE
+        );
+        assert_eq!(
+            crate::cli::error_code_exit("parked", true),
+            crate::cli::exit::USAGE
+        );
+    }
+
     /// One line per retry class, codes sorted. Adding a code changes its line,
     /// and so does renaming, reclassifying or dropping one.
     #[test]
@@ -274,7 +292,7 @@ mod tests {
             })
             .collect();
         let expected: Vec<(&str, String)> = [
-            ("never", "agent_here_unavailable agent_name_taken agent_no_active_workspace agent_not_found agent_placement_conflict agent_placement_not_found agent_placement_required agent_profile_unresolved agent_spawn_disabled agent_target_ambiguous already_hibernated ambiguous_worktree_branch at_lineage_depth channel_not_owner channel_unauthorized check_not_found cursor_ahead dirty_worktree_requires_force goal_already_armed goal_caller_refused goal_not_armed goal_not_paused handoff_not_found handoff_too_large hibernate_unsupported hop_budget_exhausted identity_pin_conflict identity_unknown invalid_agent invalid_agent_argv invalid_agent_name invalid_custody_state invalid_envelope invalid_header_field invalid_key invalid_metadata_request invalid_params invalid_regex invalid_request invalid_session_name invalid_signature invalid_state_label lineage_not_found linked_worktree_source loop_detected mesh_collection_refused mesh_refused message_expired message_key_conflict message_not_found msg_not_allowed msg_target_ambiguous msg_target_not_found no_agent_session no_branch no_caller_pane no_checkout not_an_edge not_found not_from_a_pane not_git_worktree not_hibernated not_implemented not_linked_worktree operator_only origin_mismatch owner_policy_changed owner_policy_unreadable pane_gone pane_not_found prompt_control_bytes prompt_empty prompt_too_long questions_widening_refused recipient_gone relay_not_from_ssh relay_unattestable reply_unavailable restart_disabled restart_unsupported self_compact_instructions_unsupported self_compact_unavailable self_kill_unconfirmed self_message_forbidden sender_unresolved spawn_caller_unknown stash_empty submodule_worktree_requires_force tab_not_found target_pane_not_found too_many_header_fields transcript_not_found unknown_agent_kind unsafe_text unsupported_for_agent unsupported_in_app_mode wait_deadline_too_long wait_predicate_invalid wait_predicate_unsupported workspace_not_found worktree_not_found"),
+            ("never", "agent_here_unavailable agent_name_taken agent_no_active_workspace agent_not_found agent_placement_conflict agent_placement_not_found agent_placement_required agent_profile_unresolved agent_spawn_disabled agent_target_ambiguous already_hibernated ambiguous_worktree_branch at_lineage_depth channel_not_owner channel_unauthorized check_not_found cursor_ahead dirty_worktree_requires_force goal_already_armed goal_caller_refused goal_not_armed goal_not_paused handoff_not_found handoff_too_large hibernate_unsupported hop_budget_exhausted identity_pin_conflict identity_unknown invalid_agent invalid_agent_argv invalid_agent_name invalid_custody_state invalid_envelope invalid_header_field invalid_key invalid_metadata_request invalid_params invalid_regex invalid_request invalid_session_name invalid_signature invalid_state_label lineage_not_found linked_worktree_source loop_detected mesh_collection_refused mesh_refused message_expired message_key_conflict message_not_found msg_not_allowed msg_target_ambiguous msg_target_not_found no_agent_session no_branch no_caller_pane no_checkout not_an_edge not_found not_from_a_pane not_git_worktree not_hibernated not_implemented not_linked_worktree operator_only origin_mismatch owner_policy_changed owner_policy_unreadable pane_gone pane_not_found parked prompt_control_bytes prompt_empty prompt_too_long questions_widening_refused recipient_gone relay_not_from_ssh relay_unattestable reply_unavailable restart_disabled restart_unsupported self_compact_instructions_unsupported self_compact_unavailable self_kill_unconfirmed self_message_forbidden sender_unresolved spawn_caller_unknown stash_empty submodule_worktree_requires_force tab_not_found target_pane_not_found too_many_header_fields transcript_not_found unknown_agent_kind unsafe_text unsupported_for_agent unsupported_in_app_mode wait_deadline_too_long wait_predicate_invalid wait_predicate_unsupported workspace_not_found worktree_not_found"),
             ("maybe", "agent_fork_failed agent_start_failed checkout_prepare_failed delegate_unreachable digest_write_failed handoff_failed handoff_unreadable integration_install_failed integration_uninstall_failed internal_error mail_store_unavailable mesh_delivery_refused mesh_store_unavailable pane_move_failed pane_send_failed pane_split_failed pause_persist_failed serialization_error server_unavailable session_broken session_delete_failed session_stop_failed spawn_failed spawn_location_unresolved tab_close_failed tab_create_failed transcript_unreadable transport workspace_create_failed worktree_create_failed worktree_list_failed worktree_open_failed worktree_prune_failed worktree_remove_failed write_failed"),
             ("yes", "timeout"),
             ("later", "agent_not_ready at_agent_capacity at_fanout_limit channel_token_unavailable fleet_paused handoff_undrained injection_pending input_not_empty mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active restart_busy restart_pending restart_rate_limited session_busy session_unconfirmed too_many_waits unknown_composer worktree_merge_unknown worktree_open_pr"),
@@ -298,7 +316,8 @@ mod tests {
                 ErrorCode::OperatorOnly
                 | ErrorCode::GoalCallerRefused
                 | ErrorCode::QuestionsWideningRefused => 13,
-                ErrorCode::WaitPredicateInvalid
+                ErrorCode::Parked
+                | ErrorCode::WaitPredicateInvalid
                 | ErrorCode::WaitPredicateUnsupported
                 | ErrorCode::WaitDeadlineTooLong => 2,
                 _ => 1,

@@ -84,6 +84,74 @@ pub(crate) enum ExecCadence {
     Periodic,
 }
 
+fn read_command_pipe(
+    pipe: Option<impl std::io::Read>,
+    max_bytes: Option<usize>,
+) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    if let Some(pipe) = pipe {
+        let limit = max_bytes.map_or(u64::MAX, |max| (max as u64).saturating_add(1));
+        pipe.take(limit).read_to_end(&mut bytes)?;
+    }
+    if max_bytes.is_some_and(|max| bytes.len() > max) {
+        return Err(io::Error::other("command output exceeded its byte cap"));
+    }
+    Ok(bytes)
+}
+
+/// Own the group id only until its direct child is reaped. Keeping the leader
+/// unreaped while collecting pipes prevents its numeric id from being reused.
+struct CommandGroup<K: Fn(u32)> {
+    child: Option<Child>,
+    kill: K,
+}
+
+impl<K: Fn(u32)> CommandGroup<K> {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Err(io::Error::other("command already reaped"));
+        };
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                // No successful reap relinquished ownership. Kill and reap
+                // the direct child before propagating the polling failure.
+                if let Some(mut child) = self.child.take() {
+                    (self.kill)(child.id());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return Err(error);
+            }
+        };
+        if status.is_some() {
+            self.child = None;
+        }
+        Ok(status)
+    }
+
+    fn check_deadline(&self, deadline: Instant) -> io::Result<()> {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "process timed out"));
+        }
+        Ok(())
+    }
+}
+
+impl<K: Fn(u32)> Drop for CommandGroup<K> {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            (self.kill)(child.id());
+            let _ = child.kill();
+            // Reaping must not extend the caller's expired budget.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
 // Landing the wrapper as its own commit means every builder method looks
 // dead until the migration sweep lands next. The struct + impl carry a
 // module-scope allow rather than one #[allow] per fn — the migration commit
@@ -262,7 +330,16 @@ impl TracedCommand {
     /// someone reads, so polling `try_wait` without draining would hang until
     /// the deadline even for a child that had already finished its work.
     pub(crate) fn output_traced_with_timeout(&mut self, timeout: Duration) -> io::Result<Output> {
-        self.output_traced_with_input_and_timeout(None, timeout)
+        self.output_traced_with_input_and_timeout(None, timeout, None)
+    }
+
+    /// Bound each captured pipe independently; overflow is a read failure.
+    pub(crate) fn output_traced_with_timeout_and_limit(
+        &mut self,
+        timeout: Duration,
+        max_bytes: usize,
+    ) -> io::Result<Output> {
+        self.output_traced_with_input_and_timeout(None, timeout, Some(max_bytes))
     }
 
     pub(crate) fn output_traced_with_stdin_and_timeout(
@@ -271,16 +348,15 @@ impl TracedCommand {
         timeout: Duration,
     ) -> io::Result<Output> {
         self.inner.stdin(std::process::Stdio::piped());
-        self.output_traced_with_input_and_timeout(Some(input.to_vec()), timeout)
+        self.output_traced_with_input_and_timeout(Some(input.to_vec()), timeout, None)
     }
 
     fn output_traced_with_input_and_timeout(
         &mut self,
         input: Option<Vec<u8>>,
         timeout: Duration,
+        max_bytes: Option<usize>,
     ) -> io::Result<Output> {
-        use std::io::Read;
-
         let args = shape_args(&self.inner);
         let start = Instant::now();
         self.process_group(0);
@@ -302,64 +378,44 @@ impl TracedCommand {
             let mut stderr_pipe = child.stderr.take();
             let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(pipe) = stdout_pipe.as_mut() {
-                    let _ = pipe.read_to_end(&mut buf);
-                }
-                let _ = stdout_tx.send(buf);
+                let _ = stdout_tx.send(read_command_pipe(stdout_pipe.take(), max_bytes));
             });
             let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(pipe) = stderr_pipe.as_mut() {
-                    let _ = pipe.read_to_end(&mut buf);
-                }
-                let _ = stderr_tx.send(buf);
+                let _ = stderr_tx.send(read_command_pipe(stderr_pipe.take(), max_bytes));
             });
 
             let deadline = start + timeout;
-            let status = loop {
-                match child.try_wait()? {
-                    Some(status) => break Some(status),
-                    None if Instant::now() >= deadline => {
-                        // SIGKILL, not SIGTERM: this is a probe we already gave
-                        // its full budget, and a child ignoring TERM would just
-                        // extend the stall we are here to bound.
-                        crate::platform::kill_process_group(child.id());
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break None;
-                    }
-                    None => std::thread::sleep(TIMEOUT_POLL_INTERVAL),
-                }
+            let mut group = CommandGroup {
+                child: Some(child),
+                kill: crate::platform::kill_process_group,
             };
-
-            if status.is_none() {
-                // Descendants can escape the group and retain pipes. Never join
-                // their readers after the deadline.
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "process timed out"));
-            }
-            let read_output = |reader: std::sync::mpsc::Receiver<Vec<u8>>| {
+            // Collect both pipes before try_wait can reap the leader. Every
+            // error below drops the still-owned group and schedules its reap.
+            let read_output = |reader: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>| {
                 reader
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     .map_err(|_| {
-                        crate::platform::kill_process_group(child.id());
                         io::Error::new(io::ErrorKind::TimedOut, "output pipes timed out")
-                    })
+                    })?
             };
             let stdout = read_output(stdout_rx)?;
             let stderr = read_output(stderr_rx)?;
-            match status {
-                Some(status) => Ok(Output {
-                    status,
-                    stdout,
-                    stderr,
-                }),
-                None => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("timed out after {}s", timeout.as_secs()),
-                )),
-            }
+            let status = loop {
+                group.check_deadline(deadline)?;
+                match group.try_wait()? {
+                    Some(status) => break status,
+                    None => std::thread::sleep(TIMEOUT_POLL_INTERVAL),
+                }
+            };
+            // A completed reap relinquishes group ownership, even when the
+            // strict final deadline check fails after both pipes reached EOF.
+            group.check_deadline(deadline)?;
+            Ok(Output {
+                status,
+                stdout,
+                stderr,
+            })
         })();
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
@@ -598,6 +654,63 @@ fn shape_args(command: &Command) -> String {
 mod tests {
     use super::*;
     use crate::logging::capture_logs;
+
+    #[test]
+    fn strict_expiry_after_reap_and_pipe_eof_never_kills_the_group() {
+        let mut child = TracedCommand::new(TRUE_PROG, "test")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn_traced()
+            .unwrap();
+        assert!(read_command_pipe(child.stdout.take(), None)
+            .unwrap()
+            .is_empty());
+        assert!(read_command_pipe(child.stderr.take(), None)
+            .unwrap()
+            .is_empty());
+        child.wait().unwrap();
+        let kills = std::cell::Cell::new(0);
+        let mut group = CommandGroup {
+            child: Some(child),
+            kill: |_| kills.set(kills.get() + 1),
+        };
+        assert!(group.try_wait().unwrap().is_some());
+        assert_eq!(
+            group.check_deadline(Instant::now()).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        drop(group);
+        assert_eq!(kills.get(), 0, "reaped leader no longer owns the group id");
+    }
+
+    #[test]
+    fn capped_pipe_stops_after_the_first_overflow_byte() {
+        let mut pipe = std::io::Cursor::new(vec![b'x'; 8192]);
+        assert!(read_command_pipe(Some(&mut pipe), Some(4096)).is_err());
+        assert_eq!(pipe.position(), 4097);
+        assert_eq!(
+            read_command_pipe(Some(std::io::Cursor::new(b"1234")), Some(4)).unwrap(),
+            b"1234"
+        );
+    }
+
+    #[test]
+    fn a_pipe_error_never_returns_its_valid_looking_partial_prefix() {
+        struct FailedRead(bool);
+        impl std::io::Read for FailedRead {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("scripted pipe failure"));
+                }
+                self.0 = true;
+                let bytes = b"codex-cli 0.160.1\n";
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+        assert!(super::read_command_pipe(Some(FailedRead(false)), None).is_err());
+    }
 
     /// A cross-platform program that exits 0 without touching the environment
     /// (the shell builtin `true` on POSIX; PATH lookup is fine on macOS/Linux).
