@@ -129,6 +129,7 @@ impl App {
         forced: Option<String>,
     ) -> Result<(String, String, bool, Vec<RestartDroppedFlag>), ErrorBody> {
         let refuse = |code: &str, message: String| ErrorBody {
+            data: None,
             code: code.into(),
             message,
         };

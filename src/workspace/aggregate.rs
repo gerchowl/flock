@@ -100,14 +100,15 @@ impl Tab {
         terminals: &'a HashMap<TerminalId, TerminalState>,
     ) -> impl Iterator<Item = PaneSignal<'a>> + 'a {
         self.panes.values().filter_map(|pane| {
-            terminals
-                .get(&pane.attached_terminal_id)
-                .map(|terminal| PaneSignal {
-                    state: terminal.presentation_state(pane.seen).0,
-                    seen: terminal.presentation_state(pane.seen).1,
+            terminals.get(&pane.attached_terminal_id).map(|terminal| {
+                let (state, seen) = terminal.presentation_state(pane.seen);
+                PaneSignal {
+                    state,
+                    seen,
                     harness: terminal.effective_known_agent(),
                     label: terminal.display_agent_label(),
-                })
+                }
+            })
         })
     }
 
@@ -127,6 +128,7 @@ impl Tab {
                     .effective_display_agent()
                     .unwrap_or_else(|| fallback_agent_label.clone());
                 let presentation = terminal.effective_presentation();
+                let (state, seen) = terminal.presentation_state(pane.seen);
                 Some(PaneDetail {
                     pane_id: *id,
                     tab_idx: self.number.saturating_sub(1),
@@ -134,12 +136,12 @@ impl Tab {
                     label: agent_label.clone(),
                     agent_label,
                     agent: terminal.effective_known_agent(),
-                    state: terminal.presentation_state(pane.seen).0,
-                    seen: terminal.presentation_state(pane.seen).1,
+                    state,
+                    seen,
                     custom_status: presentation.custom_status,
                     state_labels: presentation.state_labels,
                     header_fields: terminal.active_header_fields(),
-                    live_activity: (terminal.presentation_state(true).0 == AgentState::Working)
+                    live_activity: (state == AgentState::Working)
                         .then(|| terminal.live_activity.clone())
                         .flatten(),
                     state_changed_at: terminal.state_changed_at,

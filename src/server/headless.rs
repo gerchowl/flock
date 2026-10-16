@@ -1500,6 +1500,7 @@ impl HeadlessServer {
                 clone_detection_warning: self.app.clone_detection_warning.clone(),
                 agent_start_label: true,
                 agent_questions: true,
+                pane_input_write_ack: false,
             }),
         )?;
 
@@ -2863,6 +2864,7 @@ impl HeadlessServer {
             let response = serde_json::to_string(&api::schema::ErrorResponse {
                 id: msg.request.id,
                 error: api::schema::ErrorBody {
+                    data: None,
                     code: "server_unavailable".into(),
                     message: "server is shutting down".into(),
                 },
@@ -2894,6 +2896,7 @@ impl HeadlessServer {
                     serde_json::to_string(&api::schema::ErrorResponse {
                         id: msg.request.id,
                         error: api::schema::ErrorBody {
+                            data: None,
                             code: "handoff_undrained".into(),
                             message: undrained_handoff_message(&panes),
                         },
@@ -2908,6 +2911,7 @@ impl HeadlessServer {
                     serde_json::to_string(&api::schema::ErrorResponse {
                         id: msg.request.id,
                         error: api::schema::ErrorBody {
+                            data: None,
                             code: "session_broken".into(),
                             message: crate::health::session_warning::HANDOFF_REFUSAL.into(),
                         },
@@ -2974,6 +2978,7 @@ impl HeadlessServer {
                 serde_json::to_string(&api::schema::ErrorResponse {
                     id: String::new(),
                     error: api::schema::ErrorBody {
+                        data: None,
                         code: "serialization_error".into(),
                         message: err.to_string(),
                     },
