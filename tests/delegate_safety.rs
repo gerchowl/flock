@@ -24,7 +24,6 @@
 #![allow(clippy::disallowed_methods)]
 
 mod support;
-
 use support::paths::app_dir_name;
 
 use std::fs;
@@ -520,20 +519,15 @@ fn committed_repo(server: &Server) -> PathBuf {
 /// The test needs it for one thing only: rewriting an entry so its
 /// `workspace_id`, `pane_id`, and `root_pane` name a workspace that is not the
 /// delegate's, which is what a restarted server can leave behind. The key is
-/// FNV-1a 64 over the socket path string, exactly as `support::paths::server_key`
-/// computes it.
+/// produced by `support::paths::server_key`, matching the CLI's FNV-1a 64
+/// over the socket path string.
 fn registry_entry_path(server: &Server, name: &str) -> PathBuf {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in server.socket.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
     server
         .base
         .join("state")
         .join(app_dir_name())
         .join("delegates")
-        .join(format!("{hash:016x}"))
+        .join(support::paths::server_key(&server.socket))
         .join(format!("{name}.json"))
 }
 

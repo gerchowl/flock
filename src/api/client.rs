@@ -725,4 +725,31 @@ mod tests {
         let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
         assert_eq!(client.socket_path(), path);
     }
+    #[test]
+    fn s3a_r2_malformed_optional_error_data_preserves_the_primary_error() {
+        for data in [
+            serde_json::json!(17),
+            serde_json::json!(true),
+            serde_json::json!("future data"),
+            serde_json::json!([]),
+            serde_json::json!({"input_write": []}),
+            serde_json::json!({"input_write": {"bytes_written": -1, "bytes_total": 5,
+                "reason": "deadline", "remainder_discarded": true}}),
+            serde_json::json!({"input_write": {"reason": "deadline"}}),
+        ] {
+            let raw = serde_json::json!({"id":"write", "error":{
+                "code":"input_write_failed", "message":"inspect the pane", "data":data}});
+            let Err(ApiClientError::ErrorResponse(response)) = parse_response_value(raw) else {
+                panic!("optional error data must not hide the primary refusal: {data}");
+            };
+            assert_eq!(response.id, "write");
+            assert_eq!(response.error.code, "input_write_failed");
+            assert_eq!(response.error.message, "inspect the pane");
+            assert_eq!(crate::cli::error_code_exit(&response.error.code, false), 8);
+            assert!(
+                response.error.data.is_none(),
+                "invalid detail must be ignored"
+            );
+        }
+    }
 }

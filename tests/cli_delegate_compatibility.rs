@@ -30,16 +30,11 @@ fn run(
             other => other,
         })
         .collect();
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in socket.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
     let registry = dir
         .path()
         .join(support::paths::app_dir_name())
         .join("delegates")
-        .join(format!("{hash:016x}"));
+        .join(support::paths::server_key(&socket));
     std::fs::create_dir_all(&registry).unwrap();
     let entry = serde_json::json!({
         "name":"fixture", "terminal_id":"term_fixture", "pane_id":"w1:p1",
@@ -52,7 +47,12 @@ fn run(
     listener.set_nonblocking(true).unwrap();
     let stopped = Arc::new(AtomicBool::new(false));
     let stop = Arc::clone(&stopped);
-    let version = version.map(str::to_owned);
+    let mut version = version.map(str::to_owned);
+    let mut protocol = match version.as_deref() {
+        Some("current") => support::PROTOCOL_VERSION,
+        Some("future") => support::PROTOCOL_VERSION + 1,
+        _ => 25,
+    };
     let server = std::thread::spawn(move || {
         let mut methods = Vec::new();
         while !stop.load(Ordering::SeqCst) {
@@ -80,7 +80,7 @@ fn run(
                 continue;
             }
             let response = if method == "ping" {
-                serde_json::json!({"id":request["id"],"result":{"type":"pong","version":version,"protocol":if version.as_deref() == Some("current") { support::PROTOCOL_VERSION } else if version.as_deref() == Some("future") { support::PROTOCOL_VERSION + 1 } else { 25 }}})
+                serde_json::json!({"id":request["id"],"result":{"type":"pong","version":version,"protocol":protocol}})
             } else if let Some(error) = &error {
                 serde_json::json!({"id":request["id"],"error":error})
             } else if method == "agent.get" && request["params"]["target"] == "new-fixture" {
@@ -92,6 +92,17 @@ fn run(
             } else {
                 serde_json::json!({"id":request["id"],"result":{"text":"fixture reply"}})
             };
+            if method == "server.live_handoff" {
+                // A successful scripted handoff must produce the replacement
+                // identity, rather than spend the real CLI's verification ceiling.
+                version = request["params"]["expected_version"]
+                    .as_str()
+                    .map(str::to_owned);
+                protocol = request["params"]["expected_protocol"]
+                    .as_u64()
+                    .map(|value| value as u32)
+                    .unwrap_or(support::PROTOCOL_VERSION);
+            }
             writeln!(stream, "{response}").unwrap();
         }
         methods
@@ -104,28 +115,17 @@ fn run(
         .env_remove("FLOCK_CLIENT_SOCKET_PATH")
         .env_remove("FLOCK_SESSION")
         .env_remove("FLOCK_ENV");
-    let output = if args.first() == Some(&"mcp") {
-        let mut child = command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut input = child.stdin.take().unwrap();
-        writeln!(
-            input,
-            "{}",
+    let input = (args.first() == Some(&"mcp")).then(|| {
+        format!(
+            "{}\n",
             serde_json::json!({
                 "jsonrpc":"2.0", "id":1, "method":"tools/call",
                 "params":{"name":"flock_agent_result", "arguments":{"target":"fixture"}}
             })
         )
-        .unwrap();
-        drop(input);
-        child.wait_with_output().unwrap()
-    } else {
-        command.output().unwrap()
-    };
+        .into_bytes()
+    });
+    let output = support::command::output(command, input, support::command::CLI_LIMIT).unwrap();
     stopped.store(true, Ordering::SeqCst);
     (output, server.join().unwrap())
 }
@@ -286,6 +286,7 @@ fn server_lifecycle_verbs_are_never_refused_for_skew() {
         (&["server", "stop"], "server.stop"),
     ] {
         let (output, methods) = run(args, Some("0.9.0"), None, false);
+        assert!(output.status.success(), "{args:?}: {output:?}");
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(!stderr.contains("is incompatible with client"), "{stderr}");
         // live-handoff reads the server's version before and after (#958), so
