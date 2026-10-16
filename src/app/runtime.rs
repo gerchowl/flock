@@ -1158,7 +1158,17 @@ impl App {
             let is_operator_focused = Some(idx) == active_ws_idx;
             let mut panes = Vec::new();
             for detail in ws.pane_details(&self.state.terminals) {
-                let status = super::api_helpers::pane_agent_status(detail.state, detail.seen);
+                let Some(terminal) = ws
+                    .pane_state(detail.pane_id)
+                    .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                else {
+                    continue;
+                };
+                let status = super::api_helpers::pane_agent_status_from_terminal(
+                    terminal,
+                    detail.seen,
+                    self.terminal_runtimes.get(&terminal.id).is_some(),
+                );
                 panes.push(crate::checks::ReapPaneSnapshot {
                     status,
                     seen: detail.seen,
@@ -1356,7 +1366,17 @@ impl App {
         let mut out = Vec::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
             for detail in ws.pane_details(&self.state.terminals) {
-                let status = super::api_helpers::pane_agent_status(detail.state, detail.seen);
+                let Some(terminal) = ws
+                    .pane_state(detail.pane_id)
+                    .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                else {
+                    continue;
+                };
+                let status = super::api_helpers::pane_agent_status_from_terminal(
+                    terminal,
+                    detail.seen,
+                    self.terminal_runtimes.get(&terminal.id).is_some(),
+                );
                 let Some(public_pane_id) = self.public_pane_id(ws_idx, detail.pane_id) else {
                     continue;
                 };
@@ -1429,11 +1449,14 @@ impl App {
                 let pane_state = ws.pane_state(detail.pane_id);
                 let terminal =
                     pane_state.and_then(|p| self.state.terminals.get(&p.attached_terminal_id));
-                let already_hibernated =
-                    terminal.is_some_and(|t| t.hibernated_resume_plan.is_some());
+                let Some(terminal) = terminal else {
+                    continue;
+                };
+                let already_hibernated = terminal.hibernated_resume_plan.is_some();
                 let status = super::api_helpers::pane_agent_status_from_terminal(
-                    terminal.expect("terminal for live pane"),
+                    terminal,
                     detail.seen,
+                    self.terminal_runtimes.get(&terminal.id).is_some(),
                 );
                 out.push(crate::checks::HibernationPaneSnapshot {
                     pane_id: detail.pane_id,
@@ -1884,6 +1907,73 @@ mod tests {
             project_key: "dir:elsewhere".into(),
         });
         assert!(app.collect_reap_snapshots().is_empty());
+    }
+
+    #[test]
+    fn reap_preserves_a_cold_restored_resumable_binding() {
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let mut ws = Workspace::test_new("reap-deferred");
+        let checkout = std::env::temp_dir().join(format!(
+            "flock-1423-reap-{}",
+            super::super::notifications::mint_notification_id()
+        ));
+        ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: checkout.display().to_string(),
+            label: "fixture".into(),
+            repo_root: checkout.clone(),
+            checkout_path: checkout,
+            is_linked_worktree: true,
+        });
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        let now = Instant::now();
+        let terminal = app.state.terminals.values_mut().next().unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::OpenCode),
+            crate::detect::AgentState::Idle,
+        );
+        terminal.state_changed_at = Some(now - Duration::from_secs(120));
+        let session = crate::agent_resume::AgentSessionRef::id("reap-saved-session").unwrap();
+        terminal.pending_agent_resume_plan =
+            Some(crate::agent_resume::plan("flock:opencode", "opencode", &session).unwrap());
+        for pane in app.state.workspaces[0].tabs[0].panes.values_mut() {
+            pane.seen = true;
+        }
+        let mut snapshots = app.collect_reap_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        // Isolate lifecycle protection from the independent git and focus gates.
+        snapshots[0].is_operator_focused = false;
+        snapshots[0].dirty = Some(false);
+        snapshots[0].merged = Some(true);
+        snapshots[0].live = false;
+        let config = crate::checks::config::ReapConfig {
+            enable: true,
+            idle_threshold_secs: 1,
+            ..Default::default()
+        };
+        let mut reap = crate::checks::ReapFold::default();
+        assert!(
+            reap.evaluate(now, &config, &snapshots).is_empty(),
+            "a deferred binding must never be reaped: {snapshots:?}"
+        );
+        assert_eq!(
+            snapshots[0].panes[0].status,
+            crate::api::schema::AgentStatus::Offline
+        );
+        assert!(app
+            .state
+            .terminals
+            .values()
+            .next()
+            .unwrap()
+            .pending_agent_resume_plan
+            .is_some());
     }
 
     // ---- session health projection (#426) ----
