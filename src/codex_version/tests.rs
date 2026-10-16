@@ -1,5 +1,4 @@
 use super::*;
-use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 struct TempDir(std::path::PathBuf);
@@ -83,6 +82,16 @@ fn failures_remove_writer_evidence_instead_of_authorizing_metadata() {
         ),
         ("print('unexpected banner')", ProbeFailure::InvalidOutput),
         (
+            "print('codex-cli 0.160.1', file=sys.stderr)",
+            ProbeFailure::InvalidOutput,
+        ),
+        ("pass", ProbeFailure::InvalidOutput),
+        ("sys.stdout.write('x' * 4097)", ProbeFailure::SpawnOrRead),
+        (
+            "print('codex-cli 0.160.1'); sys.stderr.write('x' * 4097)",
+            ProbeFailure::SpawnOrRead,
+        ),
+        (
             "sys.stdout.buffer.write(b'\\xff')",
             ProbeFailure::InvalidOutput,
         ),
@@ -154,26 +163,33 @@ fn timeout_fixture(inherit_stdout: bool) {
     );
     // The queued handshake proves the producer reached its silent stage. EOF
     // on the same connection proves group cleanup closed the descendant too.
-    let (stream, _) = listener.accept().unwrap();
-    stream.set_nonblocking(false).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
         .unwrap();
-    let mut reader = BufReader::new(stream);
-    let mut group = String::new();
-    reader.read_line(&mut group).unwrap();
-    struct Cleanup(u32);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            crate::platform::kill_process_group(self.0);
-        }
-    }
-    let _cleanup = Cleanup(group.trim().parse().unwrap());
-    let mut remainder = Vec::new();
-    reader
-        .read_to_end(&mut remainder)
-        .expect("probe process group must release its inherited socket");
-    assert!(remainder.is_empty());
+    runtime.block_on(async {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+            let (stream, _) = listener.accept().await.expect("producer handshake");
+            let mut reader = BufReader::new(stream);
+            let mut group = String::new();
+            reader.read_line(&mut group).await.unwrap();
+            assert!(
+                group.trim().parse::<u32>().is_ok(),
+                "producer group handshake"
+            );
+            let mut remainder = Vec::new();
+            reader
+                .read_to_end(&mut remainder)
+                .await
+                .expect("probe process group must release its inherited socket");
+            assert!(remainder.is_empty());
+        })
+        .await
+        .expect("producer handshake and EOF must meet their shared ceiling");
+    });
 }
 
 #[test]

@@ -11,6 +11,7 @@ use crate::process::TracedCommand;
 pub(crate) const TESTED_VERSION: &str = "0.160.1";
 const PROBE_DEADLINE: Duration = Duration::from_millis(5000);
 const MAX_VERSION_BYTES: usize = 256;
+const MAX_CAPTURE_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeFailure {
@@ -51,7 +52,7 @@ pub(crate) fn probe(executable: &Path, metadata_version: Option<&str>) -> Compat
         TracedCommand::new(executable, "codex-version")
             .arg("--version")
             .stdin(Stdio::null())
-            .output_traced_with_timeout(PROBE_DEADLINE)
+            .output_traced_with_timeout_and_limit(PROBE_DEADLINE, MAX_CAPTURE_BYTES)
             .map_err(|error| match error.kind() {
                 std::io::ErrorKind::TimedOut => ProbeFailure::Timeout,
                 _ => ProbeFailure::SpawnOrRead,

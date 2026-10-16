@@ -481,6 +481,7 @@ The **accepted policy** is:
   with `--version`, with one 5000 ms monotonic deadline shared by process exit
   and stdout/stderr reads, and no retry. This applies ADR-0037's principle
   (missing evidence fails, never succeeds), not its test-binary sizing rules.
+  Cap each captured pipe at 4 KiB and fail on overflow.
   Parse at most 256 bytes of UTF-8 as exactly `codex-cli MAJOR.MINOR.PATCH`,
   optionally ending in one LF or CRLF. Each component is nonempty canonical
   decimal with no leading zero except zero itself; reject extra lines/whitespace,
@@ -488,9 +489,12 @@ The **accepted policy** is:
   valid version outside the tested range is unsupported. Spawn/read failure,
   nonzero exit, unparseable output or exceeding
   the ceiling counts as a missing version: diagnose
-  `unsupported_codex_version` and select screen fallback as below. Terminate
-  the version-check process group on timeout, including a launcher descendant
-  holding stdout open; reap the direct child. Do not wait beyond the original
+  `unsupported_codex_version` and select screen fallback as below. Keep the
+  direct child unreaped while collecting both pipes, so its group id cannot
+  be reused. On timeout or read failure, terminate that owned process group,
+  including a launcher descendant holding stdout open, and reap the direct
+  child. Once reaped with both pipes at EOF, a strict deadline failure must
+  return without signaling the relinquished group id. Do not wait beyond the original
   deadline for inherited pipe EOF or retry the probe. Both metadata and writer
   versions must be covered by the tested compatibility declaration. See the pinned
   [new versus resumed recorder setup](https://github.com/openai/codex/blob/rust-v0.160.1/codex-rs/rollout/src/recorder.rs#L935-L994).
@@ -1714,9 +1718,9 @@ in ADR-0030 §8.
 Decided by the operator on 2026-10-11 (PR #1006): items 1–6 below were
 accepted as recommended. The rejected alternative is kept for the record.
 Items 7–9 are new §1b proposals and require a separate owner decision; the
-earlier acceptance does not cover them. Item 10 records the separate
-2026-10-16 option-1 acceptance. Item 10 records the #1052 architect
+earlier acceptance does not cover them. Item 10 records the #1052 architect
 decision; item 11 lists its proposed details requiring owner approval.
+Item 12 records the separate 2026-10-16 option-1 acceptance.
 
 1. **Wake follows the wait (§5).** Decided: amend ADR-0027 §3 through this
    rule, so the digest stays `fyi` and wakes only an architect that parked.
@@ -1770,8 +1774,9 @@ decision; item 11 lists its proposed details requiring owner approval.
 11. **Write-ack details (§5a). Owner decision required.** Approve the proposed
     deadline field/default/range and client reply margin, pending-request bounds,
     error codes/details/CLI exit mappings, write method names, and capability/compatibility rollout.
-    Core acceptance in item 10 does not approve these proposed schema details.
-10. **Codex rollout format/version policy (§1a). Accepted by the owner,
+    Core input-acknowledgement acceptance in item 10 does not approve these
+    proposed schema details; item 12 covers the separate rollout policy.
+12. **Codex rollout format/version policy (§1a). Accepted by the owner,
     2026-10-16, option 1** ([#1479 decision](https://github.com/gerchowl/flock/issues/1479#issuecomment-6203978023)).
     Use rollout lifecycle authority within the tested compatibility range,
     initially only 0.160.1; validate creation metadata and the resolved writer's
