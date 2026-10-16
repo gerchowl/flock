@@ -1437,6 +1437,7 @@ impl App {
                 let response = ErrorResponse {
                     id: request.id,
                     error: ErrorBody {
+                        data: None,
                         code: "unsupported_in_app_mode".into(),
                         message: "live handoff is only supported by the headless server".into(),
                     },
