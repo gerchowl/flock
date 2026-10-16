@@ -1570,7 +1570,7 @@ mod tests {
                 std::time::Instant::now(),
             )
             .unwrap_err();
-        assert_eq!(refusal.code, "restart_busy");
+        assert_eq!(refusal.code, "parked");
         assert!(refusal.message.contains("agent resume"));
         let terminal = app.state.terminals.get(&terminal_id).unwrap();
         let presentation = terminal.effective_presentation();
@@ -1606,6 +1606,19 @@ mod tests {
         let info = app.agent_info(0, pane).unwrap();
         assert_eq!(info.agent_status, AgentStatus::Hibernated);
         assert!(info.resumable);
+        let refusal = app
+            .queue_agent_restart(
+                crate::api::schema::AgentRestartParams {
+                    target: app.public_pane_id(0, pane).unwrap(),
+                    reason: "fixture restart".into(),
+                    continue_with: None,
+                    when: "after_turn".into(),
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(refusal.code, "parked");
+        assert!(refusal.message.contains("agent resume"));
     }
 
     /// Wait for the watcher's publication, with a failure ceiling for a child
