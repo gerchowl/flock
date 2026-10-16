@@ -9456,4 +9456,108 @@ mod tests {
 
         assert_eq!(leading_pane([].into_iter()), None);
     }
+    #[tokio::test]
+    async fn lifecycle_1644_sidebar_tracks_runtime_presence_and_hibernation() {
+        let mut app = space_group_app();
+        app.workspaces[0].test_add_tab(Some("other"));
+        app.ensure_test_terminals();
+        app.navigator
+            .expanded_workspaces
+            .insert(app.workspaces[0].id.clone());
+        set_pane_state(&mut app, 0, AgentState::Idle, false);
+        set_pane_state(&mut app, 1, AgentState::Working, true);
+        let id = app.workspaces[0]
+            .terminal_id(app.workspaces[0].tabs[0].root_pane)
+            .unwrap()
+            .clone();
+        app.terminals
+            .get_mut(&id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        let session = crate::agent_resume::AgentSessionRef::id("sidebar-session").unwrap();
+        let plan = crate::agent_resume::plan("flock:codex", "codex", &session).unwrap();
+        app.terminals
+            .get_mut(&id)
+            .unwrap()
+            .pending_agent_resume_plan = Some(plan.clone());
+        let mut runtimes = TerminalRuntimeRegistry::new();
+        let area = Rect::new(0, 0, 120, 36);
+        crate::ui::compute_view_without_resizing_panes(&mut app, &runtimes, area);
+        assert!(workspace_join(&app, &app.workspaces[0]).is_empty());
+        assert_eq!(space_join(&app, "grp").classes(), &[StateClass::Working]);
+        assert_eq!(local_server_tally(&app).done, 0);
+        assert_eq!(local_server_tally(&app).working, 1);
+        assert_eq!(
+            app.workspaces[0].pane_details(&app.terminals)[0].state,
+            AgentState::Unknown
+        );
+        assert!(app
+            .navigator_rows()
+            .iter()
+            .filter(|row| matches!(
+                row.target,
+                crate::app::state::NavigatorTarget::Workspace { ws_idx: 0 }
+                    | crate::app::state::NavigatorTarget::Tab { ws_idx: 0, .. }
+                    | crate::app::state::NavigatorTarget::Pane { ws_idx: 0, .. }
+            ))
+            .all(|row| row.status == AgentState::Unknown));
+
+        app.navigator.state_filter = Some(crate::app::state::NavigatorStateFilter::Done);
+        assert!(app.navigator_rows().is_empty());
+        app.navigator.state_filter = None;
+
+        // The pending plan stays live when view preparation sees its runtime.
+        runtimes.insert(
+            id.clone(),
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                80,
+                24,
+                4096,
+                b"fake harness\r\n",
+            ),
+        );
+        crate::ui::compute_view_without_resizing_panes(&mut app, &runtimes, area);
+        assert_eq!(
+            workspace_join(&app, &app.workspaces[0]).classes(),
+            &[StateClass::Done]
+        );
+        assert_eq!(
+            space_join(&app, "grp").classes(),
+            &[StateClass::Done, StateClass::Working]
+        );
+        assert_eq!(local_server_tally(&app).done, 1);
+        assert!(app.navigator_rows().iter().any(|row| matches!(
+            row.target,
+            crate::app::state::NavigatorTarget::Pane { ws_idx: 0, .. }
+        ) && row.status == AgentState::Idle
+            && !row.seen));
+
+        app.terminals
+            .get_mut(&id)
+            .unwrap()
+            .set_hibernated_resume_plan(Some(plan));
+        crate::ui::compute_view_without_resizing_panes(&mut app, &runtimes, area);
+        assert_eq!(
+            workspace_join(&app, &app.workspaces[0]).classes(),
+            &[StateClass::Idle]
+        );
+        assert_eq!(local_server_tally(&app).done, 0);
+        assert_eq!(local_server_tally(&app).idle, 1);
+        assert!(app.workspaces[0].pane_details(&app.terminals)[0].seen);
+        assert!(app.navigator_rows().iter().any(|row| matches!(
+            row.target,
+            crate::app::state::NavigatorTarget::Pane { ws_idx: 0, .. }
+        ) && row.status == AgentState::Idle
+            && row.seen));
+
+        app.terminals
+            .get_mut(&id)
+            .unwrap()
+            .set_hibernated_resume_plan(None);
+        let runtime = runtimes.remove(&id).unwrap();
+        runtime.shutdown();
+        crate::ui::compute_view_without_resizing_panes(&mut app, &runtimes, area);
+        assert!(workspace_join(&app, &app.workspaces[0]).is_empty());
+        assert_eq!(local_server_tally(&app).done, 0);
+    }
 }
