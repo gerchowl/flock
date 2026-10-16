@@ -949,13 +949,13 @@ fn workspace_peer_summary(
 ) -> PeerWorkspaceSummary {
     let project = |detail: &crate::workspace::PaneDetail| {
         ws.pane_state(detail.pane_id)
-            .and_then(|pane| terminals.get(&pane.attached_terminal_id))
-            .map(|terminal| {
-                super::super::api_helpers::pane_agent_status_from_terminal(
+            .and_then(|pane| {
+                let terminal = terminals.get(&pane.attached_terminal_id)?;
+                Some(super::super::api_helpers::pane_agent_status_from_terminal(
                     terminal,
-                    detail.seen,
+                    pane.seen,
                     runtimes.get(&terminal.id).is_some(),
-                )
+                ))
             })
             .unwrap_or(crate::api::schema::AgentStatus::Unknown)
     };
@@ -2261,5 +2261,38 @@ mod tests {
             Some("github.com/gerchowl/flock")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[tokio::test]
+    async fn peer_summary_keeps_raw_unseen_for_a_live_pending_resume_1679() {
+        use crate::api::schema::AgentStatus;
+        use crate::detect::{Agent, AgentState};
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces
+            .push(crate::workspace::Workspace::test_new("peer-projection"));
+        app.ensure_test_terminals();
+        let pane = app.workspaces[0].tabs[0].root_pane;
+        app.workspaces[0].tabs[0].panes.get_mut(&pane).unwrap().seen = false;
+        let id = app.workspaces[0].terminal_id(pane).unwrap().clone();
+        let session = crate::agent_resume::AgentSessionRef::id("peer-session").unwrap();
+        let plan = crate::agent_resume::plan("flock:codex", "codex", &session).unwrap();
+        let terminal = app.terminals.get_mut(&id).unwrap();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        terminal.pending_agent_resume_plan = Some(plan);
+        let mut runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        runtimes.insert(
+            id.clone(),
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                80,
+                24,
+                4096,
+                b"fixture harness\r\n",
+            ),
+        );
+        // No view preparation: the live registry must be authoritative even
+        // when the presentation snapshot still describes an offline restore.
+        let summary = super::workspace_peer_summary(&app.workspaces[0], &app.terminals, &runtimes);
+        assert_eq!(summary.status, AgentStatus::Done);
+        assert_eq!(summary.agents[0].status, AgentStatus::Done);
+        runtimes.remove(&id).unwrap().shutdown();
     }
 }
