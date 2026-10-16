@@ -2824,8 +2824,44 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
+    /// Additive detail; malformed shapes are ignored so the primary code survives.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_error_data"
+    )]
+    pub data: Option<Box<ErrorData>>,
     pub code: String,
     pub message: String,
+}
+
+/// Optional detail is advisory: incompatible fields must not hide a refusal.
+fn deserialize_error_data<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Box<ErrorData>>, D::Error> {
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).ok())
+}
+
+/// Structured error evidence with room for unrelated method-specific details.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_write: Option<InputWriteDetails>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Encoded-byte evidence, never an assertion about agent consumption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputWriteDetails {
+    /// Null for an unknown transport outcome; server receipts carry exact counts.
+    pub bytes_written: Option<u64>,
+    pub bytes_total: Option<u64>,
+    /// Deadline, writer_broken, owner_changed, pane_gone or admission_limit.
+    pub reason: String,
+    /// True only once remainder retirement is complete, including a late full write.
+    pub remainder_discarded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2841,6 +2877,9 @@ pub struct PeersEnrollResetParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerCapabilities {
+    /// Enabled only after the complete server and client contract (#1639) ships.
+    #[serde(default)]
+    pub pane_input_write_ack: bool,
     pub live_handoff: bool,
     /// SHA-256 of the persisted Ed25519 public key, not a mesh enrollment claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5591,6 +5630,7 @@ mod tests {
                     clone_detection_warning: None,
                     agent_start_label: true,
                     agent_questions: true,
+                    pane_input_write_ack: false,
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
@@ -6058,6 +6098,7 @@ mod tests {
         let response = ErrorResponse {
             id: "req_1".into(),
             error: ErrorBody {
+                data: None,
                 code: "pane_not_found".into(),
                 message: "pane p_1 not found".into(),
             },
@@ -6209,5 +6250,41 @@ mod pr_info_tests {
         let json = serde_json::to_string(&with_pr).expect("serialisable");
         assert!(json.contains("\"pr\""), "{json}");
         assert!(json.contains("\"merged\""), "{json}");
+    }
+
+    #[test]
+    fn s3a_error_envelopes_preserve_exact_and_unknown_input_write_details() {
+        for (written, total, discarded) in [
+            (serde_json::json!(2), serde_json::json!(5), true),
+            (serde_json::Value::Null, serde_json::Value::Null, false),
+        ] {
+            let code = if written.is_null() {
+                "input_write_unknown"
+            } else {
+                "input_write_failed"
+            };
+            let raw = serde_json::json!({"id":"same-id", "error": {
+                "code":code, "message":"inspect the pane",
+                "data":{"input_write":{"bytes_written":written,"bytes_total":total,
+                    "reason":"deadline","remainder_discarded":discarded}, "other_detail":7}
+            }});
+            let parsed: ErrorResponse = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), raw);
+        }
+        let legacy = serde_json::json!({"id":"old","error":{"code":"invalid_key","message":"key"}});
+        let parsed: ErrorResponse = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), legacy);
+    }
+    #[test]
+    fn s3a_write_capability_defaults_false_and_negative_counts_are_invalid() {
+        let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+        assert!(!old.pane_input_write_ack);
+        assert_eq!(
+            serde_json::to_value(old).unwrap()["pane_input_write_ack"],
+            false
+        );
+        let invalid = serde_json::json!({"bytes_written":-1,"bytes_total":5,
+            "reason":"deadline","remainder_discarded":true});
+        assert!(serde_json::from_value::<InputWriteDetails>(invalid).is_err());
     }
 }

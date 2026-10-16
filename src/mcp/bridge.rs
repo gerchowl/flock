@@ -280,7 +280,16 @@ fn extract_flock_result(mut raw: Value, send_like: bool) -> Result<Value, McpErr
             .unwrap_or("flock refused the request");
         let exit = crate::cli::error_code_exit(code, send_like);
         let mut refusal = McpError::from_flock_error(code, message, exit);
-        if code == crate::api::error_code::ErrorCode::InputNotEmpty.as_str() {
+        use crate::api::error_code::ErrorCode;
+        if matches!(
+            ErrorCode::from_code(code),
+            Some(
+                ErrorCode::InputNotEmpty
+                    | ErrorCode::InputWriteCancelled
+                    | ErrorCode::InputWriteFailed
+                    | ErrorCode::InputWriteUnknown
+            )
+        ) {
             if let (Some(detail), Some(data)) = (
                 error.get("data").and_then(Value::as_object),
                 refusal.data.as_mut().and_then(Value::as_object_mut),
@@ -1124,5 +1133,23 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, -32602);
         assert!(flock.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn s3a_mcp_preserves_input_write_evidence_without_overriding_retry_metadata() {
+        let raw = serde_json::json!({"id":"write","error": {
+            "code":"input_write_failed","message":"inspect the pane",
+            "data":{"input_write":{"bytes_written":2,"bytes_total":5,
+                "reason":"writer_broken","remainder_discarded":true},
+                "retry":"yes","exit":0,"refusal":"success"}
+        }});
+        for send_like in [false, true] {
+            let error = extract_flock_result(raw.clone(), send_like).unwrap_err();
+            let data = error.data.unwrap();
+            assert_eq!(data["input_write"], raw["error"]["data"]["input_write"]);
+            assert_eq!(data["refusal"], "input_write_failed");
+            assert_eq!(data["retry"], "after_inspecting");
+            assert_eq!(data["exit"], 8);
+        }
     }
 }
