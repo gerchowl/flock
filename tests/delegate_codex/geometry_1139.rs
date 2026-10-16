@@ -2,22 +2,22 @@ use super::*;
 
 #[test]
 fn background_spawn_attached_80() {
-    geometry_probe_1139(80, false);
+    eprintln!("#1608 {}", geometry_probe_1139(80, false));
 }
 #[test]
 fn background_spawn_detached_80() {
-    geometry_probe_1139(80, true);
+    eprintln!("#1608 {}", geometry_probe_1139(80, true));
 }
 #[test]
 fn background_spawn_attached_15() {
-    geometry_probe_1139(15, false);
+    eprintln!("#1608 {}", geometry_probe_1139(15, false));
 }
 #[test]
 fn background_spawn_detached_15() {
-    geometry_probe_1139(15, true);
+    eprintln!("#1608 {}", geometry_probe_1139(15, true));
 }
 
-fn geometry_probe_1139(cols: u16, detach: bool) {
+fn geometry_probe_1139(cols: u16, detach: bool) -> serde_json::Value {
     let server = start_server_with_rows(40);
     let client_path = server.socket.with_file_name("flock-client.sock");
     support::wait_for_socket(&client_path, Duration::from_secs(5));
@@ -36,15 +36,31 @@ fn geometry_probe_1139(cols: u16, detach: bool) {
         .as_str()
         .unwrap()
         .to_owned();
-    for _ in 0..2 {
+    let path = server.base.join("operator-size");
+    let observer = server.base.join("geometry-observer.py");
+    fs::write(
+        &observer,
+        include_str!("../fixtures/geometry-1608-observer.py"),
+    )
+    .unwrap();
+    let full_columns = if cols == 15 { 13 } else { 52 };
+    let command = format!(
+        "python3 '{}' '{}' {full_columns} || printf '\\106\\101\\111\\114\\061\\066\\060\\070\\012'",
+        observer.display(), path.display()
+    );
+    let sent = request(&server, &serde_json::json!({"id":"observer","method":"pane.send_text","params":{"pane_id":root,"text":command,"raw":true}}).to_string());
+    assert!(sent.get("error").is_none(), "{sent}");
+    geometry_enter_1608(&server, &root);
+    geometry_output_1608(&server, &root, "ARM1608");
+    for (stage, marker) in [("first", "SP1"), ("second", "SZA")] {
         let split = request(&server, &serde_json::json!({"id":"split","method":"pane.split","params":{"workspace_id":ws,"target_pane_id":root,"direction":"right","focus":false}}).to_string());
         assert!(split.get("error").is_none(), "{split}");
+        let measured = request(&server, &serde_json::json!({"id":"observe-split","method":"pane.send_text","params":{"pane_id":root,"text":stage,"raw":true}}).to_string());
+        assert!(measured.get("error").is_none(), "{measured}");
+        geometry_enter_1608(&server, &root);
+        geometry_output_1608(&server, &root, marker);
     }
-    let path = server.base.join("operator-size");
-    let sent = request(&server, &serde_json::json!({"id":"operator-size","method":"pane.send_text","params":{"pane_id":root,"text":format!("stty size > '{}'; printf '\\123\\132\\101\\012'\n",path.display()),"raw":true}}).to_string());
-    assert!(sent.get("error").is_none(), "{sent}");
-    probe_output_1139(&server, &root, "SZA");
-    let operator_size = fs::read_to_string(path).unwrap();
+    let operator_size = fs::read_to_string(&path).unwrap();
     if detach {
         support::send_detach(&mut client).unwrap();
         assert!(support::wait_for_disconnect(&mut client, Duration::from_secs(5)).unwrap());
@@ -79,7 +95,34 @@ fn geometry_probe_1139(cols: u16, detach: bool) {
         .unwrap();
     assert!(
         split_cols < actual_cols,
-        "new background pane must not inherit the active split width"
+        "new background pane must not inherit the active split width: client={cols}, detach={detach}, operator={operator_size:?}, birth={birth:?}, current={current:?}"
+    );
+    serde_json::json!({"client_columns":cols,"detached":detach,"operator_size":operator_size.trim(),"background_birth":birth.trim(),"background_current":current.trim(),"native_events":fs::read_to_string(path.with_file_name("operator-size.events")).unwrap()})
+}
+
+fn geometry_enter_1608(server: &Server, pane: &str) {
+    let sent = request(server, &serde_json::json!({"id":"geometry-enter","method":"pane.send_keys","params":{"pane_id":pane,"keys":["Enter"]}}).to_string());
+    assert!(sent.get("error").is_none(), "{sent}");
+}
+
+fn geometry_output_1608(server: &Server, pane: &str, marker: &str) {
+    let pattern = |text: &str| {
+        text.chars()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join("\\s*")
+    };
+    let output = request(server, &serde_json::json!({"id":"geometry-stage","method":"pane.wait_for_output","params":{"pane_id":pane,"source":"recent","match":{"type":"regex","value":format!("{}|{}", pattern(marker), pattern("FAIL1608"))},"timeout_ms":5000}}).to_string());
+    assert!(output.get("error").is_none(), "{output}; pane={}", request(server, &serde_json::json!({"id":"geometry-diagnostic","method":"pane.read","params":{"pane_id":pane,"source":"recent","format":"text"}}).to_string()));
+    let observed: String = output["result"]["read"]["text"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        !observed.contains("FAIL1608") && observed.contains(marker),
+        "observer stage {marker}: {output}"
     );
 }
 

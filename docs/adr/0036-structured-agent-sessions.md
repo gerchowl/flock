@@ -3,7 +3,11 @@
 - Status: Accepted (2026-10-13, owner decisions recorded); amended
   2026-10-14 with the S0 probe findings (#1324, "S0 findings for the
   architect" says where each landed), and with the A.13 controls, the A.16
-  login results and the owner's narrowing of decision 1 (#1404)
+  login results and the owner's narrowing of decision 1 (#1404); amended
+  2026-10-16 (#1606, ADR-0038): the Vite client build (§7), the `synced`
+  frame and the `gap` frame's `snapshot_to` (§4, §5), and the owner's
+  decision that flk's log, metric and trace output goes through vig-os/vigil,
+  which resolves #1323 so it no longer gates S7 (§5, decision 6, S7)
 - Amendment accepted by the architect, 2026-10-16 (#1546, #1641): §4/§5/§7
   define transport recovery, snapshot bootstrap and `synced` before S7a.
   Numeric parameters in §5a are proposals with rationale for review; no
@@ -30,7 +34,8 @@
 - Follow-ups: #1307 (slice tracking), #1305 (the cache tests; test 4 is
   measured in A.7.1, test 6 in A.7.2), #1308
   (TUI parity gaps P16, P17), #1309 (live Codex and opencode runs), #1323
-  (the Grafana Labs stack versus our own for the stream and history, §5).
+  (the Grafana Labs stack versus our own for the stream and history, §5;
+  resolved 2026-10-16 in favour of vig-os/vigil for telemetry, #1614).
 - Decision owner: operator.
 - Evidence: Appendix A was measured on 2026-10-13 against Claude Code
   2.1.296 (this host's `latest` channel; the fleet `stable` pin is 2.1.287,
@@ -820,12 +825,13 @@ that A authenticated, how the `ack` comes back) in #1380. Until then a
 opening a real terminal to a session, which is a `pty` agent's pane (the
 `terminal/<pane>` stream) served by the node that runs it, as today.
 
-The stream and history remain the JSONL store of §4 and endpoint below.
-The owner resolved #1323 on 2026-10-16 (ADR-0038 §11 item 5): observability
-uses vig-os/vigil's OTLP/JSON Lines files and optional signed audit trail,
-tracked by #1614. #1323 no longer gates S7; the #1546/#1641 contract and
-S7a types do. This amendment incorporates the wire prerequisites reviewed
-at #1618's head without editing ADR-0038.
+The stream and its history stay the JSONL store of §4 and the endpoint
+below. The open item of whether they should run on the Grafana Labs stack
+(#1323) was resolved by the owner on 2026-10-16 (ADR-0038 §11 item 5):
+flk's log, metric and trace output goes through vig-os/vigil's OTLP/JSON
+Lines files and its optional signed audit trail, not through Grafana and not
+through a separate pipeline. The integration is #1614. #1323 no longer gates
+S7; #1546 (liveness and recovery on unstable connections) does.
 
 One endpoint serves every frontend: `GET /v1/ws` (WebSocket) and
 `GET /v1/blob/<sha256>` (HTTP). It runs inside the flk server process,
@@ -1236,13 +1242,17 @@ files. No hand-written TS type may describe a wire shape.
   queue, questions), `src/unknown.ts` (§8). The views use Solid (owner
   decision 8): its fine-grained reactivity updates one text node or one
   queue row per streamed event without re-rendering a transcript, which is
-  the load of P1 and P9. Solid's JSX transform runs as a Bun build plugin
-  (`babel-preset-solid`), pinned in `bun.lock` like every other
-  dependency.
-- **Build.** `bun build` produces static assets that the `web` feature embeds
-  with `rust-embed`, as it embeds the terminal bridge's assets today. CI runs
-  `bun install --frozen-lockfile`, `bun test` and the build; the nix package
-  builds the assets in a fixed-output step pinned by `bun.lock`.
+  the load of P1 and P9. Solid's JSX transform runs through
+  `vite-plugin-solid` (`babel-preset-solid`), pinned in `bun.lock` like
+  every other dependency.
+- **Build.** Vite with `vite-plugin-solid` produces static assets that the
+  `web` feature embeds with `rust-embed`, as it embeds the terminal bridge's
+  assets today. Amended 2026-10-16 (owner decision, ADR-0038 §6, #1606): Vite
+  replaced `bun build` because it gives hot reload in development and is the
+  standard Tauri v2 front-end setup. Bun stays the package manager and test
+  runner. CI runs `bun install --frozen-lockfile`, `bun test` and the Vite
+  build; the nix package builds the assets in a fixed-output step pinned by
+  `bun.lock`.
 - **Release.** The assets ship inside the `flk` binary of a build with the
   `web` feature; there is no separate artefact to version.
 
@@ -1646,7 +1656,10 @@ decision by the owner.
    carries only state and messages between nodes, with no hopping between
    servers except to open a real terminal. Open item: evaluate the Grafana
    Labs stack (Loki, Tempo, Grafana Live) against our own for the stream
-   and history, filed as #1323, reporting before S7. (§5)
+   and history, filed as #1323, reporting before S7. (§5) Resolved
+   2026-10-16 by the owner (ADR-0038 §11 item 5): log, metric and trace
+   output goes through vig-os/vigil, the stream and history stay §4/§5's
+   own, and #1323 no longer gates S7 (integration: #1614).
 7. **TS generation.** As recommended: `ts-rs`. (§6)
 8. **Web client framework.** Not as recommended (none): Solid, for its
    fine-grained reactivity under streaming updates. (§7)

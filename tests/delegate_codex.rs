@@ -1546,3 +1546,6 @@ fn codex_hollow_spinner_stays_working_and_real_turn_end_settles() {
 mod geometry_1139;
 #[path = "delegate_codex/hint_1581.rs"]
 mod hint_1581;
+
+#[path = "delegate_codex/narrow_1315.rs"]
+mod narrow_1315;
