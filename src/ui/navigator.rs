@@ -413,7 +413,7 @@ fn pane_detail(
                     .get(&pane_id)
                     .map(|pane| pane.seen)
                     .unwrap_or(true);
-                let state = row_state(app, ws_idx, tab_idx, pane_id);
+                let (state, seen) = terminal.presentation_state(seen);
                 let status = presentation
                     .state_labels
                     .get(display_state(state, seen))
@@ -443,21 +443,6 @@ fn rowless_workspace_activity(app: &AppState, ws_idx: usize) -> String {
         .find(|row| matches!(row.target, NavigatorTarget::Workspace { ws_idx: row_ws_idx } if row_ws_idx == ws_idx))
         .map(|row| row.meta)
         .unwrap_or_default()
-}
-
-fn row_state(
-    app: &AppState,
-    ws_idx: usize,
-    tab_idx: usize,
-    pane_id: crate::layout::PaneId,
-) -> crate::detect::AgentState {
-    app.workspaces
-        .get(ws_idx)
-        .and_then(|ws| ws.tabs.get(tab_idx))
-        .and_then(|tab| tab.terminal_id(pane_id))
-        .and_then(|terminal_id| app.terminals.get(terminal_id))
-        .map(|terminal| terminal.state)
-        .unwrap_or(crate::detect::AgentState::Unknown)
 }
 
 fn display_state(state: crate::detect::AgentState, seen: bool) -> &'static str {
