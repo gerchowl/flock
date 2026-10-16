@@ -4107,8 +4107,8 @@ mod tests {
             runtime.end_all_injection_leases();
             assert_eq!(receipt.progress().bytes_written, 0);
             assert_eq!(
-                format!("{:?}", receipt.progress().failure),
-                "Some(OwnerChanged)"
+                receipt.progress().failure,
+                Some(crate::pty::write_receipt::WriteFailure::OwnerChanged)
             );
             assert!(receipt.progress().remainder_discarded);
             assert_eq!(receiver.try_recv().unwrap().as_ref(), b"fill");
@@ -4130,8 +4130,8 @@ mod tests {
         drop(runtime);
         assert_eq!(receipt.progress().bytes_written, 0);
         assert_eq!(
-            format!("{:?}", receipt.progress().failure),
-            "Some(PaneGone)"
+            receipt.progress().failure,
+            Some(crate::pty::write_receipt::WriteFailure::PaneGone)
         );
         assert!(receipt.progress().remainder_discarded);
         assert!(receiver.try_recv().is_err());

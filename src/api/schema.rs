@@ -2824,11 +2824,23 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
-    /// Additive detail; absent on legacy or ordinary failures.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Additive detail; malformed shapes are ignored so the primary code survives.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_error_data"
+    )]
     pub data: Option<Box<ErrorData>>,
     pub code: String,
     pub message: String,
+}
+
+/// Optional detail is advisory: incompatible fields must not hide a refusal.
+fn deserialize_error_data<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Box<ErrorData>>, D::Error> {
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).ok())
 }
 
 /// Structured error evidence with room for unrelated method-specific details.

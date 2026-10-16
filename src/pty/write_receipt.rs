@@ -231,7 +231,8 @@ impl Drop for WriteCompletion {
     fn drop(&mut self) {
         let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.progress.completed_at.is_none() {
-            state.fail(WriteFailure::WriterBroken);
+            // Losing the write owner removes this pane's remaining write authority.
+            state.fail(WriteFailure::PaneGone);
         }
     }
 }
@@ -376,7 +377,7 @@ mod tests {
             );
             let progress = receipt.progress();
             assert_eq!(progress.bytes_written, written);
-            assert_eq!(progress.failure, Some(WriteFailure::WriterBroken));
+            assert_eq!(progress.failure, Some(WriteFailure::PaneGone));
             assert!(progress.remainder_discarded);
         }
     }

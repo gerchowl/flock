@@ -315,12 +315,12 @@ impl PtyIoActorHandle {
 
     fn refusal_with_gate(&self, gate: &UserWriteGate) -> Option<WriteFailure> {
         gate.refused
+            .or_else(|| self.data_tx.is_closed().then_some(WriteFailure::PaneGone))
             .or_else(|| {
                 self.writer_health
                     .is_broken()
                     .then_some(WriteFailure::WriterBroken)
             })
-            .or_else(|| self.data_tx.is_closed().then_some(WriteFailure::PaneGone))
     }
 
     fn try_write_command(
@@ -697,6 +697,8 @@ impl PtyIoActorRunner {
             }
         }
 
+        // Close admission before draining and before callbacks can hold this runner alive.
+        self.data_rx.close();
         self.discard_pending_writes(WriteFailure::PaneGone);
         let rejected = self.writer_health.take_rejected();
         if rejected > 0 {
@@ -758,6 +760,13 @@ impl PtyIoActorRunner {
     fn handle_data_command(&mut self, command: PtyIoDataCommand) -> bool {
         if self.state == ActorState::Running && !self.writer_health.is_broken() {
             self.enqueue_write(command);
+        } else if let PtyIoDataCommand::WriteTrackedInput(ticket) = command {
+            // A reserved channel permit can arrive after the transition's discard.
+            ticket.retire(if self.state == ActorState::Running {
+                WriteFailure::WriterBroken
+            } else {
+                WriteFailure::OwnerChanged
+            });
         }
         false
     }
@@ -2202,10 +2211,7 @@ mod tests {
             .unwrap();
         runner.mark_writer_broken();
         for (receipt, count) in [(&partial_receipt, 2), (&queued_receipt, 0)] {
-            assert_eq!(
-                format!("{:?}", receipt.progress().failure),
-                "Some(WriterBroken)"
-            );
+            assert_eq!(receipt.progress().failure, Some(WriteFailure::WriterBroken));
             assert_eq!(receipt.progress().bytes_written, count);
             assert!(receipt.progress().remainder_discarded);
         }
@@ -2226,7 +2232,10 @@ mod tests {
     #[test]
     fn s3a_actor_owner_release_and_shutdown_retire_pending_and_channel_tickets() {
         use crate::pty::write_receipt::WriteReceipt;
-        for (owner_changed, reason) in [(true, "Some(OwnerChanged)"), (false, "Some(PaneGone)")] {
+        for (owner_changed, reason) in [
+            (true, WriteFailure::OwnerChanged),
+            (false, WriteFailure::PaneGone),
+        ] {
             let (mut runner, _peer, data_tx) = socket_pair_runner();
             let (pending, first) = WriteReceipt::channel(Bytes::from_static(b"pending"), None);
             let (queued, second) = WriteReceipt::channel(Bytes::from_static(b"queued"), None);
@@ -2242,7 +2251,7 @@ mod tests {
             assert!(runner.handle_control_command(command));
             drop(runner);
             for receipt in [first, second] {
-                assert_eq!(format!("{:?}", receipt.progress().failure), reason);
+                assert_eq!(receipt.progress().failure, Some(reason));
                 assert_eq!(receipt.progress().bytes_written, 0);
                 assert!(receipt.progress().remainder_discarded);
             }
@@ -2284,5 +2293,124 @@ mod tests {
         let _retained = handle.try_write_ticket(ticket);
         assert_eq!(receipt.progress().failure, Some(WriteFailure::PaneGone));
         assert!(receipt.progress().remainder_discarded);
+    }
+    #[test]
+    fn s3a_r2_reserved_ticket_arriving_after_writer_failure_keeps_the_known_cause() {
+        use crate::pty::write_receipt::WriteReceipt;
+        let (mut runner, mut peer, data_tx) = socket_pair_runner();
+        // Admission can reserve capacity before the actor publishes broken health.
+        let permit = data_tx.try_reserve().unwrap();
+        runner.mark_writer_broken();
+        let (ticket, receipt) = WriteReceipt::channel(Bytes::from_static(b"late"), None);
+        permit.send(PtyIoDataCommand::WriteTrackedInput(ticket));
+        runner.drain_data_commands();
+        assert_eq!(receipt.progress().failure, Some(WriteFailure::WriterBroken));
+        assert_eq!(receipt.progress().bytes_written, 0);
+        assert!(receipt.progress().remainder_discarded);
+        runner.rearm_writer();
+        runner.enqueue_write(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+            b"after",
+        )));
+        runner.flush_pending_writes_once();
+        let mut observed = [0; 5];
+        peer.read_exact(&mut observed).unwrap();
+        assert_eq!(&observed, b"after");
+    }
+
+    #[test]
+    fn s3a_r2_late_ticket_after_ownership_change_keeps_the_known_cause() {
+        use crate::pty::write_receipt::WriteReceipt;
+        for state in [ActorState::Quiesced, ActorState::Released] {
+            let (mut runner, _peer, data_tx) = socket_pair_runner();
+            let permit = data_tx.try_reserve().unwrap();
+            runner.state = state;
+            runner.discard_pending_writes(WriteFailure::OwnerChanged);
+            let (ticket, receipt) = WriteReceipt::channel(Bytes::from_static(b"late"), None);
+            permit.send(PtyIoDataCommand::WriteTrackedInput(ticket));
+            runner.drain_data_commands();
+            assert_eq!(receipt.progress().failure, Some(WriteFailure::OwnerChanged));
+            assert_eq!(receipt.progress().bytes_written, 0);
+            assert!(receipt.progress().remainder_discarded);
+        }
+    }
+
+    #[test]
+    fn s3a_r2_eof_closes_admission_before_the_reader_exit_callback() {
+        use crate::pty::write_receipt::WriteReceipt;
+        for (panic_in_callback, writer_was_broken) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (mut runner, peer, data_tx) = socket_pair_runner();
+            if writer_was_broken {
+                runner.mark_writer_broken();
+            }
+            let (wake, wake_read_fd) = test_wake_pair();
+            runner.wake_read_fd = wake_read_fd;
+            let (control_tx, control_rx) = std_mpsc::channel();
+            runner.control_rx = control_rx;
+            let handle = PtyIoActorHandle {
+                data_tx,
+                control_tx,
+                wake,
+                user_writes: Arc::new(Mutex::new(UserWriteGate { refused: None })),
+                controls: runner.controls.clone(),
+                writer_health: runner.writer_health.clone(),
+            };
+            let (entered_tx, entered_rx) = std_mpsc::channel();
+            let (release_tx, release_rx) = std_mpsc::channel();
+            runner.on_reader_exit = Some(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(!panic_in_callback, "controlled reader-exit panic");
+            }));
+            let worker = std::thread::spawn(move || runner.run());
+            peer.shutdown(std::net::Shutdown::Write).unwrap();
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let (ticket, receipt) = WriteReceipt::channel(Bytes::from_static(b"late"), None);
+            let outcome = handle.try_write_ticket(ticket);
+            let before_release = receipt.progress();
+            release_tx.send(()).unwrap();
+            assert_eq!(worker.join().is_err(), panic_in_callback);
+            assert!(
+                matches!(outcome, Err(mpsc::error::TrySendError::Closed(_))),
+                "EOF must reject admission while the callback is still running"
+            );
+            assert_eq!(before_release.failure, Some(WriteFailure::PaneGone));
+            assert_eq!(before_release.bytes_written, 0);
+            assert!(before_release.remainder_discarded);
+            assert_eq!(receipt.progress().failure, Some(WriteFailure::PaneGone));
+            assert!(handle.data_tx.is_closed());
+        }
+    }
+
+    #[test]
+    fn s3a_r2_actor_unwind_retires_partial_and_channel_tickets_as_pane_gone() {
+        use crate::pty::write_receipt::WriteReceipt;
+        let (mut runner, mut peer, data_tx) = socket_pair_runner();
+        let (partial, first) = WriteReceipt::channel(Bytes::from_static(b"paste"), None);
+        let mut writer = runner.file.try_clone().unwrap();
+        partial
+            .write(|bytes| writer.write(&bytes[..2]))
+            .unwrap()
+            .unwrap();
+        let mut prefix = [0; 2];
+        peer.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"pa");
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(partial));
+        let (queued, second) = WriteReceipt::channel(Bytes::from_static(b"queued"), None);
+        data_tx
+            .try_send(PtyIoDataCommand::WriteTrackedInput(queued))
+            .unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owned_runner = runner;
+            panic!("controlled actor unwind before normal exit cleanup");
+        }));
+        assert!(outcome.is_err());
+        for (receipt, written) in [(first, 2), (second, 0)] {
+            assert_eq!(receipt.progress().failure, Some(WriteFailure::PaneGone));
+            assert_eq!(receipt.progress().bytes_written, written);
+            assert!(receipt.progress().remainder_discarded);
+        }
+        assert!(data_tx.is_closed());
     }
 }
