@@ -8,7 +8,7 @@
 
 ## Summary
 
-flk keeps one logging facade (`src/logging.rs`). Behind it, vigil replaces today's hand-rolled rotating JSON writer and adds spans and metrics. Each process role writes its own OTLP/JSON Lines files under the data dir, one file per signal. Telemetry carries only typed values (ids, enums, numbers, sizes, fixed message templates, path kinds and typed errors), and never free text: no message bodies, prompts, tool or harness output, comment text or tokens. That is a schema change from today's facade, where 264 of 282 emitting functions take untyped parameters (431 in all). It is done first, on today's writer (V1a.0 to V1a.6), with no vigil needed. The flk server is the only reader the GUI uses (ADR-0038 §4a). `flk report`, `peers logs`, `tail_session_logs` and the log-budget gate are migrated in the release that switches the format, not left reading a dead file. Spans correlate with the transcript through ids the session stream already has, so the stored session stream does not change. Cross-node trace propagation waits for the next mesh protocol version.
+flk keeps one logging facade (`src/logging.rs`). Behind it, vigil replaces today's hand-rolled rotating JSON writer and adds spans and metrics. Each process role writes its own OTLP/JSON Lines files under the data dir, one file per signal. Telemetry carries only typed values (ids, enums, numbers, sizes, fixed message templates, path kinds and typed errors), and never free text: no message bodies, prompts, tool or harness output, comment text or tokens. That is a schema change from today's facade, where 269 of 287 emitting functions take untyped parameters (439 in all). It is done first, on today's writer (V1a.0 to V1a.6), with no vigil needed. The flk server is the only reader the GUI uses (ADR-0038 §4a). `flk report`, `peers logs`, `tail_session_logs` and the log-budget gate are migrated in the release that switches the format, not left reading a dead file. Spans correlate with the transcript through ids the session stream already has, so the stored session stream does not change. Cross-node trace propagation waits for the next mesh protocol version.
 
 ## Context
 
@@ -47,27 +47,28 @@ Measured in the tree on 2026-10-16 (dev at 8296d8a2):
 | the message | `body`: the facade's fixed template, never interpolated with free text (§4) |
 
 The event names and their meaning carry over unchanged. **The fields do not: this is a schema change.** Inventory of `src/logging.rs` on dev at 536f6e86 (unchanged since 8cae9299), produced by the ratchet's own counting rule (below):
-- **291 `pub` functions outside `#[cfg(test)]`. 282 of them emit** (their body calls a `tracing` event or span macro). The 9 that don't are infrastructure: `init_file_logging`, `init_mcp_file_logging`, `help_log_paths_summary`, the readers `parse_log_lines`, `tail_session_logs` and `merge_log_records`, `timed_switch_stage`, and the formatters `bounded_bytes_debug` and `shape_key_event`.
-- **264 emitting functions take at least one parameter outside the allowlist, 431 parameters under 116 distinct names.** The allowlist is the typed values of §4: integers, `bool`, `Duration`, `Option` of those, and the types V1a.0 defines (below). By type:
+- **296 `pub` functions outside `#[cfg(test)]` modules and items. 287 of them emit** (their body calls a `tracing` event or span macro). The 9 that don't are infrastructure: `init_file_logging`, `init_mcp_file_logging`, `help_log_paths_summary`, the readers `parse_log_lines`, `tail_session_logs` and `merge_log_records`, `timed_switch_stage`, and the formatters `bounded_bytes_debug` and `shape_key_event`.
+- **269 emitting functions take at least one parameter outside the allowlist, 439 parameters under 117 distinct names.** The allowlist is the typed values of §4: integers, `bool`, `Duration`, `Option` of those, and the types V1a.0 defines (below). By type:
 
   | Type | Count | Becomes |
   |---|---|---|
-  | `&str`, `Option<&str>`, `&[&str]` | 352 + 9 + 1 = 362 | id newtypes, closed enums, `TelemetryError`, or the byte length of content |
-  | `&'static str`, `Option<&'static str>` | 28 + 1 = 29 | closed enums (`method`, `outcome`, `role`, …) |
+  | `&str`, `Option<&str>`, `&[&str]` | 357 + 9 + 1 = 367 | id newtypes, closed enums, `TelemetryError`, or the byte length of content |
+  | `&'static str`, `Option<&'static str>` | 31 + 1 = 32 | closed enums (`method`, `outcome`, `role`, …) |
   | `&Path`, `&std::path::Path`, `Option<&Path>`, `Option<&std::path::Path>` | 18 + 2 + 1 + 1 = 22 | path kinds |
   | `&[u8]` | 6 | the byte length only |
   | `&crossterm::event::KeyEvent`, `&crossterm::event::KeyCode` | 5 + 1 = 6 | the key's class (character, named key, function key) and its modifiers; never the character |
   | `&io::Error` | 1 | `TelemetryError` |
   | structs and others: `&SweepEntry`, `&BridgeFailureLog`, `ExecReport`, `ExecCadence`, `Option<ExitStatus>` | 5 | allowlisted types, or a struct in the V1a.0 types module whose fields are all allowlisted |
-  | **Total** | **431** | |
+  | **Total** | **439** | |
 
-- **Why `&'static str` counts.** A static string can't carry runtime content, but it is an open vocabulary: nothing stops a new call site from passing a new value, and readers (the GUI filters, the log-budget gate) need the closed set. `Box::leak` can also turn runtime text into one. So all 29 become closed enums, and none is exempt.
+- **Why `&'static str` counts.** A static string can't carry runtime content, but it is an open vocabulary: nothing stops a new call site from passing a new value, and readers (the GUI filters, the log-budget gate) need the closed set. `Box::leak` can also turn runtime text into one. So all 32 become closed enums, and none is exempt.
 - **Raw input and keys are content.** `raw_input_*` logs up to `MAX_TRACE_BYTE_PREVIEW` bytes of what the user typed into a pane, and `terminal_key_*` logs the key code, which for a character key is the character. Both can carry passwords typed into a terminal. Debug level does not make them safe, because `[log] level` can be raised. They keep only lengths and key classes.
 - **21 raw `.display()` fields:** 14 `path =`, plus `directory` (:22), `exe` (:1720), `api_socket` and `client_socket` (:1884-1885), `socket` (:2094), `to` (:4183) and `target` (:4250).
 - **1 `error = %err` field** (:28), and 105 `err: &str` parameters.
 - **Path-valued string parameters:** `path` (10), `checkout_path` (4), `dest` (4), `repo_root` (2), `to` and `from`, `cwd`, `file_name`.
 - **Content-bearing free text, by name.** Each can carry agent-, harness-, remote- or user-written text:
   - `message` (3), including `notification_toast_forwarded(message)` (:2125), whose text agents write (via `src/server/headless.rs` :1606 and :3004);
+  - `warning` in `node_clone_detection_unavailable` (:4860), which interpolates `"{warning}"` into the message itself. It breaks the fixed-template rule (§4) as well as the parameter rule, so V1a gives it a fixed template and a closed `CloneDetectionUnavailable` reason;
   - `line` in `remote_bridge_ssh_stderr` (:1053), and `stderr_tail` (:1169);
   - `stdout`, `stderr` and `response`;
   - `args` in `process_exec_failed` and `process_spawn_failed` (:1521, :1569), and `command` and `remote_command`;
@@ -75,18 +76,18 @@ The event names and their meaning carry over unchanged. **The fields do not: thi
   - `err` (105), `reason` (14), `detail` (4), `diagnostic` (4), `diagnostics`, `content`, `context`, `note`, `notice`, `hint`, `warning`, `refusal`, `value`, `source_description`;
   - `ssh_opts`, `branch` (5, user-named), and `host` and `proxy_jump` (raw host strings).
 
-**The rule covers every parameter type outside the allowlist, not a list of bad types.** After V1a, no facade function takes `&str` (static or not), `String`, `&[&str]`, `&Path`, bytes, key events, `io::Error`, `Display`, `Debug` or a struct from outside the types module. Each of the 431 parameters becomes one of the typed values of §4:
+**The rule covers every parameter type outside the allowlist, not a list of bad types.** After V1a, no facade function takes `&str` (static or not), `String`, `&[&str]`, `&Path`, bytes, key events, `io::Error`, `Display`, `Debug` or a struct from outside the types module. Each of the 439 parameters becomes one of the typed values of §4:
 - an id newtype (`workspace_id`, `pane`, `agent`, `request_id`, `peer` as the operator's configured peer name, and so on);
 - a closed enum (`kind`, `status`, `prev_state`, `new_state`, `program` as known programs or `other`, and so on);
 - a path kind;
 - a `TelemetryError`;
 - a size or count of the text it replaces (for the content-bearing fields above, which keep only their byte length).
 
-**The ratchet test, exactly.** It parses `src/logging.rs` (and any module the facade later splits into) outside `#[cfg(test)]`:
+**The ratchet test, exactly.** It parses `src/logging.rs` (and any module the facade later splits into), skipping only `#[cfg(test)]` modules and `#[cfg(test)]` items. Production functions defined after a test helper still count:
 - **What it counts:** every parameter of every `pub` or `pub(crate)` function whose type, with whitespace removed, is not on the allowlist.
-- **The allowlist:** `u8`–`u128`, `i8`–`i128`, `usize`, `isize`, `bool`, `Duration`, `Option<T>` of an allowed `T`, and the types defined in the V1a.0 types module (id newtypes, closed enums, path kinds, `TelemetryError`, `FlkFailure`), plus flk's `ErrorCode` and `Method`. A struct from the types module is allowed only if each of its fields is also on the allowlist. The test checks that too, so a struct cannot smuggle a `String` in.
+- **The allowlist:** `u8`–`u128`, `i8`–`i128`, `usize`, `isize`, `bool`, `Duration` (written as `Duration` or `std::time::Duration`; the test resolves either spelling to the same type), `Option<T>` of an allowed `T`, and the types defined in the V1a.0 types module (id newtypes, closed enums, path kinds, `TelemetryError`, `FlkFailure`), plus flk's `ErrorCode` and `Method`. A struct from the types module is allowed only if each of its fields is also on the allowlist. The test checks that too, so a struct cannot smuggle a `String` in.
 - **Exempt functions:** the 9 non-emitting functions above, pinned by name in the test. A function on that list that starts emitting fails the test.
-- **The baseline** is 431, recorded in V1a.0. Each V1a sub-PR lowers it, and a count above the recorded number fails. V1a.6 brings it to 0.
+- **The baseline** is 439, recorded in V1a.0. Each V1a sub-PR lowers it, and a count above the recorded number fails. V1a.6 brings it to 0.
 - **`FlkFailure` is checked from the start.** Its variants' fields must all be on the allowlist, and the count for them starts and stays at 0. The canary test (§4) also drives every `FlkFailure` variant.
 
 **Spans.** Named `flk.<area>.<op>` and opened only through facade functions:
@@ -132,7 +133,7 @@ The event names and their meaning carry over unchanged. **The fields do not: thi
 - **Files, per role and signal:** `<data dir>/telemetry/<role>/{logs,metrics,traces}.jsonl`, plus rotated files. `<data dir>` is `session::data_dir()`, so a named session keeps its own.
 - **Roles:** `server` (written only by the process holding the ownership fence; see the handoff rule below), `server-<pid>` (any other server process), `client`, `cli` (today's `flock.log`, including `remote`), `relay`, and `mcp-<pid>`. Dead-pid `mcp-*` and `server-*` directories are pruned as dead-pid logs are today.
 - **One writer per file stays the rule,** even though vigil documents multi-process safety. The per-role split already exists, keeps rotation simple, and doesn't depend on an unverified property.
-- **The `server` role during a handoff.** Two server processes overlap during a handoff (ADR-0036 §5a). Only the process that holds ADR-0036 §5a's data-directory ownership fence writes `server`. A server process without the fence writes its own `server-<pid>` role instead: the importer before its ownership commit, the old server after it, and a new server whose handoff failed. These roles use the `mcp-<pid>` profile and are pruned the same way once the pid is dead. The switch happens at the fenced transfer itself. The old server closes its `server` writer before it releases the fence, and the new one opens `server` only after it has committed ownership, so the file never has two writers.
+- **The `server` role during a handoff.** Two server processes overlap during a handoff (ADR-0036 §5a). Only the process that holds ADR-0036 §5a's data-directory ownership fence writes `server`. A server process without the fence writes its own `server-<pid>` role instead: the importer before its ownership commit, the old server after it, and a new server whose handoff failed. These roles use the `mcp-<pid>` profile and are pruned the same way once the pid is dead. The switch happens at the fenced transfer itself. The old server closes its `server` writer before it releases the fence, and the new one opens `server` only after it has committed ownership, so the file never has two writers. Records still in the old server's bounded channel when the handoff starts are flushed to `server` as part of the handoff's flush step, inside ADR-0036 §5a's 10 s handoff deadline. Anything that can't be flushed in time is dropped and counted in `flk.telemetry.dropped`, as for a full channel. Records emitted after the old server closes its `server` writer go to its `server-<pid>` role.
 - **A real total bound.**
   - `[telemetry] max_total_bytes` (default 512 MiB) bounds **rotated** files across every role. When it is passed, the oldest rotated files are deleted first.
   - Active files are never deleted, but each is bounded by its per-signal cap (§3), because the writer rotates at that size. So each fixed role (`server`, `client`, `cli`, `relay`) holds at most 16 + 32 + 8 = 56 MiB of active files.
@@ -232,8 +233,8 @@ Each waits for the vigil release that ships what it uses, and codes against that
 | # | Slice | Needs |
 |---|---|---|
 | V0 | #1300 step 1: spike `vigil::init` behind a `vigil` cargo feature; confirm the file layout, rotation options and per-role init; report deviations from this record | vigil 0.1.0 |
-| V1a.0 | The types, needing no vigil: `TelemetryError` with its constructors, the path kinds, the id newtypes and enums the facade needs, the canary harness, and the ratchet test (§1), recorded at 431 | — |
-| V1a.1–V1a.6 | The rewrite of all 431 parameters outside the allowlist, with their call sites, one sub-PR per subsystem: (1) api and server; (2) client and switch; (3) peers, ssh and remote; (4) pane, terminal and UI; (5) process, spawn and platform; (6) notifications, hooks, structured and MCP. Each lowers the ratchet and stays within ~400 hand-written lines. The whole is an estimated 1,200–1,800 changed lines, which is why it is split. The last one brings the ratchet to 0 and updates `redact.rs` | V1a.0 |
+| V1a.0 | The types, needing no vigil: `TelemetryError` with its constructors, the path kinds, the id newtypes and enums the facade needs, the canary harness, and the ratchet test (§1), recorded at 439 | — |
+| V1a.1–V1a.6 | The rewrite of all 439 parameters outside the allowlist, with their call sites, one sub-PR per subsystem: (1) api and server; (2) client and switch; (3) peers, ssh and remote; (4) pane, terminal and UI; (5) process, spawn and platform; (6) notifications, hooks, structured and MCP. Each lowers the ratchet and stays within ~400 hand-written lines. The whole is an estimated 1,200–1,800 changed lines, which is why it is split. The last one brings the ratchet to 0 and updates `redact.rs` | V1a.0 |
 | V1b | The switch: logs through vigil, `[telemetry]` retention and the total bound, the non-blocking channel, and every §6 reader | V0, V1a.6 |
 | V2 | Spans: `flk.api.request`, `flk.cmd`, `flk.question`, `flk.mesh.hop`; id newtypes | V1b, vigil 0.2.0 |
 | V3 | Spans and metrics for structured agents: `flk.turn`, `flk.tool_call`, `flk.queue.deliver`, the §1 instruments | V2, ADR-0036 S4/S5 |
