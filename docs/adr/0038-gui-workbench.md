@@ -117,7 +117,7 @@ Operations, the same in every shell:
 
 ### 2a. The MVP workbench: what the person sees and does
 
-§2 defines the tile mechanics. This section defines the screen they serve. The first client preview built §2 literally: a subject/kind/placement form and per-tile buttons. The owner rejected its look and UX, and on 2026-10-17 chose the "Mission control" wireframes for the MVP (owner decision 11). The rule that follows: **the tile manager is machinery under the screen, never the screen itself.** No raw subject, kind or placement field appears in the product.
+§2 defines the tile mechanics. This section defines the screen they serve. The first client preview built §2 literally: a subject/kind/placement form and per-tile buttons. The owner rejected its look and UX, and on 2026-10-17 chose the "Mission control" wireframes for the MVP (owner decision 11: typed by the owner, relayed by the GUI architect). The rule that follows: **the tile manager is machinery under the screen, never the screen itself.** No raw subject, kind or placement field appears in the product.
 
 **Desktop: three regions.**
 
@@ -151,6 +151,23 @@ Operations, the same in every shell:
 - Light and dark themes from one token set: ground, surface, ink, muted ink, border, plus the four status colours. Text meets 4.5:1 contrast in both themes.
 - The system UI font stack and a system monospace. §6's bundle rule (no web fonts at runtime) stands. The wireframes' typeface is not a requirement.
 - 14 px body text on desktop and 15 px on the phone. Every touch target is at least 44 px.
+
+**What provides each part, and what waits.** The MVP is what S7-min (#1746), G3a (#1747) and G2 deliver. The rest of the screen is drawn now and filled later:
+
+| Part | Provided by | In the MVP |
+|---|---|---|
+| Sidebar agent rows (status, task, activity) | S7-min's fleet-lite list, live before G4. The full trees, node grouping and *Projects / Nodes* come with G4 #1596. | yes, flat list of local structured agents |
+| Focus pane transcript and composer | G3a over S7-min (`agent/<id>`, `agent.send`) | yes |
+| Inbox cards with in-place answers | G5 #1597 (inbox stream); S6-MVP for permission prompts | fixture data until G5 |
+| *Take as thread*, *Review and merge back* | #1717 (question threads) | post-MVP |
+| *Terminal* and *Diff* actions, phone *Terminal* tab | the `terminal` tile (no slice yet) and the reserved `diff` kind | post-MVP |
+| *Fork* | ADR-0036 S12 (forks at any boundary) | post-MVP |
+| Phone *PR* tab, palette search over issues and PRs | a PR/issue source (no slice yet) | post-MVP: the MVP palette searches agents only |
+| Phone *Activity* tab and *Recent* list | the `events` stream (S7-rest) | post-MVP |
+| *New agent* | ADR-0036 S17 (harness, model and effort picker) | post-MVP |
+| Node summary ("2 nodes live") | G4 #1596 and the mesh | post-MVP: the MVP shows this node only |
+
+A post-MVP part is either hidden in the MVP, or shown disabled with the name of what it waits for. It is never a button that does nothing.
 
 **Out of the MVP:** an *Agent board* (agents as cards in columns: needs you, working, idle) was the rejected alternative for the main screen. It may return later as a second view of the same data (Alternatives considered).
 
@@ -312,7 +329,7 @@ The **progress deadline** runs while a stream waits for `synced` or for a snapsh
 | `acked`, `failed` | settled by the server | none |
 
 - **State tokens.** The client-observable command states are this closed set: `pending`, `sent`, `uncertain`, `unknown_outcome`, `acked`, `failed`. Fixtures, the store and generated types use exactly these tokens. ADR-0036 §5a uses "uncertain" in two senses, neither of them a seventh state: the ack deadline passing, which is the client's `uncertain` state, and a resume-only lookup the server refuses "as uncertain" (`session_unconfirmed`, or an absent or expired key), which makes the command `unknown_outcome`, as in the `sent` row.
-- **Window expiry runs in every connection state.** For each `sent` or `uncertain` command, the client checks its age against `idempotency_window_ms` (from the last `welcome`, persisted with the outbox) in every connection state: Connecting, Hello, Syncing, Live, ReadOnly, Stale, Reconnecting, NeedsToken, and after a user `disconnect`. It does not check only when a resend would go out. A command is expired when its age is **at least** `idempotency_window_ms` (age ≥ window, where age is measured from its first send). At expiry the command becomes `unknown_outcome` at once, so the UI never shows a command as "will be resent" after its window has passed. A `pending` command has no first send, so no window applies to it. It waits for Live, unless a changed principal drops the outbox (ADR-0036 §5a). An `uncertain` command that expires while its socket is still up also becomes `unknown_outcome`, so a very late `ack` on that same socket is dropped. This is intended: the window defaults to 24 h, and the client has already told the person that the outcome is unknown.
+- **Window expiry runs in every connection state.** For each `sent` or `uncertain` command, the client checks its age against `idempotency_window_ms` (from the last `welcome`, persisted with the outbox) in every connection state: Connecting, Hello, Syncing, Live, ReadOnly, Stale, Reconnecting, NeedsToken, and after a user `disconnect`. It does not check only when a resend would go out. A command is expired when its age is **at least** `idempotency_window_ms` (age ≥ window, where age is measured from its first send). Age is evaluated at the instant of each event that could change the command, such as the actual reconnect attempt or the `welcome` that follows it, never at a deadline's upper bound. A connect attempt that happens before the window edge still resends the command, even if the connect deadline would have run past it. At expiry the command becomes `unknown_outcome` at once, so the UI never shows a command as "will be resent" after its window has passed. A `pending` command has no first send, so no window applies to it. It waits for Live, unless a changed principal drops the outbox (ADR-0036 §5a). An `uncertain` command that expires while its socket is still up also becomes `unknown_outcome`, so a very late `ack` on that same socket is dropped. This is intended: the window defaults to 24 h, and the client has already told the person that the outcome is unknown.
 - **Resend after a reconnect.** A `sent` or `uncertain` command whose socket was lost is resent when the connection is next Live, and becomes `sent` again (if that socket is lost too, it is resent again after the next reconnect, still within the window), under the same principal, with the same `cmd_id`, `verb` and `args` and `resume_only: true`, and only within the `idempotency_window_ms` that `welcome` reports, counted from the first send. The server answers with the first `ack`, or refuses the lookup when it holds no claim (`session_unconfirmed`), which makes the command `unknown_outcome`.
 - **Unknown outcome** also follows, without a resend, when the window has passed by the time the resend would go out, or when the client cannot establish a command's age after a restart. It is never resent automatically and never re-sent under a new `cmd_id`: the original may still run once, because it can arrive late on the dead socket after the lookup was refused. So the client says "unknown outcome", never "cancelled" or "not run". `session_unconfirmed`'s `retry: later` permits only the same resume-only resend, never a first send.
 - **Optimism is visual only.** A pending command marks its subject "pending" and never changes an entity. The entity changes when the server's event arrives.
@@ -586,7 +603,7 @@ The first end-to-end milestone is **"a structured agent in a browser tile"**: G1
 
 ### 11. Owner decisions (decided by the owner, 2026-10-16, recorded on #1591)
 
-Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day.
+Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day. Item 11 was added on 2026-10-17, when the owner chose between two wireframe directions after rejecting the first preview.
 
 | # | Decision | Outcome | Consequence |
 |---|---|---|---|
