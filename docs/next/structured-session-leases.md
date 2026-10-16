@@ -22,8 +22,10 @@ the human. Existing PTY callers retain their pane identity.
 
 ADR-0036 §1a attributes callers by their own ancestry. Preparation and version
 probes are scoped to the launcher's ancestry, with independently proven pane
-callers retaining their PTY identity. Spawn publishes its PID under the table lock;
-a bind failure or unconfirmed cleanup retains that root, so its descendants fail
+callers retaining their PTY identity. A launch keeps its uncertain launcher marker
+while fork/exec runs without registry locks. Binding captures process identity
+outside the locks, then publishes PID/birth before exposing a runtime handle.
+A bind failure or unconfirmed cleanup retains that root, so its descendants fail
 closed without denying unrelated operator and pane callers. If spawn panics before
 publishing a PID, its launcher ancestry remains uncertain. A proven PTY boundary
 retains today's pane identity. Registry reads wait at most 100 milliseconds for
@@ -37,8 +39,13 @@ Missing/reused process facts and ancestry cycles fail closed for affected caller
 Failed preparation or confirmed
 spawn failure releases a reservation; confirmed process-tree cleanup releases it
 on stop or crash. Panics after a spawn attempt and unconfirmed cleanup retain it,
-with a diagnostic. No time-based lease expiry grants authority or permits a
-second process.
+with a diagnostic. Reservation, spawn-marker publication, binding, release and
+Drop each wait at most 100 milliseconds per registry lock. Mutations acquire both
+the primary table and published view before changing either; contention leaves
+them unchanged. Admission reports `agent_start_failed` on contention. A release
+that cannot acquire the locks retains the reservation and logs a warning; a
+retained reservation can require a server restart after process cleanup. No
+time-based lease expiry grants authority or permits a second process.
 
 This is server-local in-memory bookkeeping. Existing S3a supervision owns process
 tree cleanup and stale-session recovery. It does not provide a persistent lease

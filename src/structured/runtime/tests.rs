@@ -476,7 +476,7 @@ fn missing_child_pipes_without_workers_allows_confirmed_cleanup() {
         .leases
         .reserve("fixture-agent", SESSION, None)
         .unwrap();
-    lease.spawned();
+    lease.spawned().unwrap();
     lease.bind(child.id()).unwrap();
     let error = startup_failed(child, files, persistent.clone(), error, true, &mut lease);
     assert!(error.to_string().contains("missing stdout pipe"));
