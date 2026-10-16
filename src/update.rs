@@ -2713,6 +2713,7 @@ mod tests {
                     clone_detection_warning: None,
                     agent_start_label: true,
                     agent_questions: true,
+                    pane_input_write_ack: false,
                 }),
                 session_health: None,
                 api_listener: None,
