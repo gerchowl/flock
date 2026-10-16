@@ -279,3 +279,98 @@ fn inline_1109_short_resume_is_replaced_by_the_native_selector() {
     )
     .is_err());
 }
+
+#[test]
+fn optional_1659_plugin_directories_are_single_valued_and_repeatable() {
+    for (args, kept) in [
+        (
+            vec![
+                "--plugin-dir",
+                "plugin with spaces",
+                "opening prompt",
+                "--plugin-dir",
+                "second.zip",
+                "another prompt",
+                "--model",
+                "fixture",
+            ],
+            vec![
+                "--plugin-dir",
+                "plugin with spaces",
+                "--plugin-dir",
+                "second.zip",
+                "--model",
+                "fixture",
+            ],
+        ),
+        (
+            vec![
+                "--plugin-dir=first",
+                "opening prompt",
+                "--plugin-dir=second.zip",
+            ],
+            vec!["--plugin-dir=first", "--plugin-dir=second.zip"],
+        ),
+    ] {
+        let result = resume_launch(&session(), &launch(&args)).unwrap();
+        assert_eq!(
+            result.plan.argv,
+            launch(&[vec!["--resume", "native-fixture"], kept].concat())
+        );
+    }
+    for args in [
+        vec!["--plugin-dir"],
+        vec!["--plugin-dir", "--model", "fixture"],
+    ] {
+        assert!(resume_launch(&session(), &launch(&args))
+            .unwrap_err()
+            .contains("missing launch value"));
+    }
+}
+
+#[test]
+fn optional_1659_print_aliases_are_boolean_only_for_claude() {
+    for flag in ["-p", "--print"] {
+        let result = resume_launch(
+            &session(),
+            &launch(&[flag, "opening prompt", "--model", "fixture"]),
+        )
+        .unwrap();
+        assert_eq!(
+            result.plan.argv,
+            launch(&["--resume", "native-fixture", flag, "--model", "fixture"])
+        );
+        assert!(resume_launch(&session(), &launch(&[flag])).is_ok());
+    }
+    let mut codex = session();
+    codex.agent = "codex".into();
+    codex.source = "flock:codex".into();
+    let result = resume_launch(
+        &codex,
+        &vec!["codex", "-p", "fixture-profile", "--model", "fixture"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(result
+        .plan
+        .argv
+        .ends_with(&["-p", "fixture-profile", "--model", "fixture"].map(String::from)));
+}
+
+#[test]
+fn optional_1659_bare_debug_alias_is_refused() {
+    for args in [vec!["-d"], vec!["-d", "fixture"]] {
+        let error = resume_launch(&session(), &launch(&args)).unwrap_err();
+        assert!(
+            error.contains("-d") && error.contains("optional value set is open or unknown"),
+            "{error}"
+        );
+    }
+    let result = resume_launch(&session(), &launch(&["-d=fixture", "opening prompt"])).unwrap();
+    assert_eq!(
+        result.plan.argv,
+        launch(&["--resume", "native-fixture", "-d=fixture"])
+    );
+}

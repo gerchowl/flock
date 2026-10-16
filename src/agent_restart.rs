@@ -306,6 +306,17 @@ pub(crate) fn resume_launch(
             index += 1;
             continue;
         }
+        // Claude's repeatable plugin directory takes exactly one path.
+        // ADR-0029 §1: a restart must not turn the opening prompt into input.
+        if session.agent == "claude"
+            && flag == "--plugin-dir"
+            && inline.is_none()
+            && launch
+                .get(index + 1)
+                .is_none_or(|value| value.starts_with('-'))
+        {
+            return Err(format!("missing launch value for {arg}"));
+        }
         if session.agent == "claude"
             && matches!(
                 flag,
@@ -316,7 +327,6 @@ pub(crate) fn resume_launch(
                     | "--disallowedTools"
                     | "--disallowed-tools"
                     | "--mcp-config"
-                    | "--plugin-dir"
                     | "--tools"
                     | "--file"
             )
@@ -367,7 +377,6 @@ pub(crate) fn resume_launch(
                 | "--ask-for-approval"
                 | "-a"
                 | "--profile"
-                | "-p"
                 | "--enable"
                 | "--disable"
                 | "--provider"
@@ -380,7 +389,8 @@ pub(crate) fn resume_launch(
                 | "--dangerously-load-development-channels"
                 | "--channels"
                 | "--effort"
-        ) || arg == "-c" && session.agent == "codex"
+        ) || arg == "-p" && session.agent != "claude"
+            || arg == "-c" && session.agent == "codex"
             || session.agent == "claude"
                 && matches!(
                     arg.as_str(),
@@ -421,7 +431,7 @@ pub(crate) fn resume_launch(
                 | "--ide"
                 | "--restricted"
                 | "--safe-mode"
-        );
+        ) || session.agent == "claude" && matches!(arg.as_str(), "-p" | "--print");
         if arg.contains('=') || boolean {
             plan.argv.push(arg.clone());
             index += 1;
