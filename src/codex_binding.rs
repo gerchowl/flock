@@ -13,26 +13,35 @@ use crate::{codex_version::Compatibility, platform};
 /// Routing identity captured from the local pane, never a display name or alias.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Owner {
+    /// Stable node identity from the local runtime.
     pub node: String,
+    /// Canonical pane/terminal identifier, independent of its label.
     pub pane: String,
 }
 
 /// A launch-attributed local writer, including PID reuse protection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Writer {
+    /// Local PID attributed to this launch.
     pub pid: u32,
+    /// Platform process start identity, protecting against PID reuse.
     pub birth: u64,
 }
 
 /// Full callback capability. Equal paths or labels do not grant this capability.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Key {
+    /// Attested node and pane route.
     pub owner: Owner,
+    /// Advances only on known launch/resume retirement.
     pub launch: u64,
+    /// Advances for every attributed SessionStart claim.
     pub binding: u64,
+    /// Opaque thread ID matched against first session metadata.
     pub thread: String,
 }
 
+/// Binding degradation facts, distinct from socket/CLI error codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
     Route,
@@ -49,20 +58,28 @@ pub(crate) enum Failure {
 /// Neither fallback case manufactures idle or waits for another SessionStart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Decision {
+    /// No claim after initial creation or known launch retirement.
     AwaitingFirstTurn,
+    /// Rejected claim before this launch ever trusted a validated binding.
     BindingValidationFailed(Failure),
+    /// Validation pending, or current-launch trust lost without retirement.
     Unknown,
+    /// Binding attribution only, never lifecycle turn authority by itself.
     Bound,
 }
 
 /// The opened file is handed to #1663, avoiding a path reopen after validation.
-/// Its cursor follows the complete first metadata line, not a turn boundary.
+/// Its cursor is reset for the reader to verify the full prefix and ordinals.
 #[derive(Debug)]
 pub(crate) struct Validated {
     key: Key,
+    /// The same regular file opened during validation, positioned at byte zero.
     pub file: File,
+    /// Resolved primary transcript path within the launch home.
     pub path: PathBuf,
+    /// Verified local launch writer identity.
     pub writer: Writer,
+    /// Version from actual first metadata, not a cached creation guess.
     pub metadata_version: String,
 }
 
@@ -83,6 +100,9 @@ pub(crate) fn validate(
         || platform::process_start_time(expected_writer.pid) != Some(expected_writer.birth)
     {
         return Err(Failure::Writer);
+    }
+    if !home.is_absolute() {
+        return Err(Failure::Path);
     }
     let home = home.canonicalize().map_err(|_| Failure::Path)?;
     let path = transcript
@@ -114,15 +134,18 @@ pub(crate) fn validate(
     let version = meta["payload"]["cli_version"]
         .as_str()
         .ok_or(Failure::Version)?;
-    if !compatibility.supports_lifecycle()
-        || compatibility.metadata_version.as_deref() != Some(version)
-    {
+    // The launch probe can precede the deferred hook and have no metadata yet.
+    let current = Compatibility {
+        metadata_version: Some(version.to_owned()),
+        writer_version: compatibility.writer_version.clone(),
+        probe_failure: compatibility.probe_failure,
+    };
+    if !current.supports_lifecycle() {
         return Err(Failure::Version);
     }
-    // BufReader may read ahead. Recover the same handle and seek only past metadata.
+    // Recover the same handle for full reader verification, including metadata.
     let mut file = reader.into_inner().into_inner();
-    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(line.len() as u64))
-        .map_err(|_| Failure::Metadata)?;
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).map_err(|_| Failure::Metadata)?;
     Ok(Validated {
         key: key.clone(),
         file,
@@ -132,25 +155,42 @@ pub(crate) fn validate(
     })
 }
 
-/// One local runtime registry, shared by all pane bindings on this node.
-/// An ownership conflict revokes both capabilities, never last-callback-wins.
+/// Known live thread claims, never display-name lookup. Node identity stays in
+/// each capability, but duplicate thread ownership is rejected across nodes too.
+/// A conflict poisons all old capabilities until fresh validation resolves it.
 #[derive(Default)]
-pub(crate) struct Ownership(HashMap<(String, String), (Key, bool)>);
+pub(crate) struct Ownership(HashMap<String, Claims>);
+struct Claims {
+    keys: Vec<Key>,
+    poisoned: bool,
+}
 
 impl Ownership {
-    fn slot(key: &Key) -> (String, String) {
-        (key.owner.node.clone(), key.thread.clone())
-    }
     fn revoke(&mut self, key: &Key) {
-        let slot = Self::slot(key);
-        if self.0.get(&slot).is_some_and(|(owner, _)| owner == key) {
-            self.0.remove(&slot);
+        if let Some(claims) = self.0.get_mut(&key.thread) {
+            claims.keys.retain(|owner| owner != key);
+            if claims.keys.is_empty() {
+                self.0.remove(&key.thread);
+            }
         }
     }
     fn owns(&self, key: &Key) -> bool {
-        self.0
-            .get(&Self::slot(key))
-            .is_some_and(|(owner, conflict)| owner == key && !conflict)
+        self.0.get(&key.thread).is_some_and(|claims| {
+            !claims.poisoned && claims.keys.len() == 1 && claims.keys.first() == Some(key)
+        })
+    }
+    fn claim(&mut self, key: &Key) -> Result<(), Failure> {
+        let claims = self.0.entry(key.thread.clone()).or_insert(Claims {
+            keys: Vec::new(),
+            poisoned: false,
+        });
+        claims.poisoned |= !claims.keys.is_empty();
+        claims.keys.push(key.clone());
+        if claims.poisoned {
+            Err(Failure::DuplicateOwner)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -162,19 +202,25 @@ pub(crate) struct Binding {
     launch: u64,
     generation: u64,
     trusted: bool,
+    pending: bool,
     key: Option<Key>,
+    known: Option<(Key, Writer)>,
     decision: Decision,
     failure: Option<Failure>,
 }
 
 impl Binding {
+    /// Create once per pane runtime, retaining this trust history across claims.
+    /// Known launch/resume changes use `retire`, never a replacement object.
     pub fn new(owner: Owner) -> Self {
         Self {
             owner,
             launch: 0,
             generation: 0,
             trusted: false,
+            pending: false,
             key: None,
+            known: None,
             failure: None,
             decision: Decision::AwaitingFirstTurn,
         }
@@ -182,20 +228,14 @@ impl Binding {
 
     /// Every attributed SessionStart, including compact and repeated IDs, revokes
     /// the previous generation immediately. A claim alone never resets trust.
-    pub fn begin(
-        &mut self,
-        route: &Owner,
-        thread: String,
-        owners: &mut Ownership,
-    ) -> Result<Key, Failure> {
+    pub fn begin(&mut self, route: &Owner, thread: String) -> Result<Key, Failure> {
         if route != &self.owner {
             return Err(Failure::Route);
         }
-        if let Some(key) = self.key.take() {
-            owners.revoke(&key);
-        }
+        self.key = None;
         self.decision = Decision::Unknown;
         self.failure = None;
+        self.pending = false;
         self.generation = self
             .generation
             .checked_add(1)
@@ -207,6 +247,7 @@ impl Binding {
             thread,
         };
         self.key = Some(key.clone());
+        self.pending = true;
         Ok(key)
     }
 
@@ -218,19 +259,17 @@ impl Binding {
         result: Result<Validated, Failure>,
         owners: &mut Ownership,
     ) -> Result<Validated, Failure> {
-        if self.key.as_ref() != Some(key) || self.decision != Decision::Unknown {
+        if self.key.as_ref() != Some(key) || !self.pending {
             return Err(Failure::Route);
         }
+        self.pending = false;
         let result = result.and_then(|value| {
             if &value.key != key {
                 return Err(Failure::Route);
             }
-            let slot = Ownership::slot(key);
-            if let Some((_, conflict)) = owners.0.get_mut(&slot) {
-                *conflict = true;
-                return Err(Failure::DuplicateOwner);
-            }
-            owners.0.insert(slot, (key.clone(), false));
+            self.revoke_known(owners);
+            self.known = Some((key.clone(), value.writer));
+            owners.claim(key)?;
             Ok(value)
         });
         match result {
@@ -240,13 +279,7 @@ impl Binding {
                 Ok(value)
             }
             Err(reason) => {
-                self.key = None;
-                self.failure = Some(reason);
-                self.decision = if self.trusted {
-                    Decision::Unknown
-                } else {
-                    Decision::BindingValidationFailed(reason)
-                };
+                self.reject(reason);
                 Err(reason)
             }
         }
@@ -257,6 +290,7 @@ impl Binding {
         self.key.as_ref() == Some(key) && self.decision == Decision::Bound && owners.owns(key)
     }
 
+    /// Read trust state, including revocation by another known live claim.
     pub fn decision(&self, owners: &Ownership) -> Decision {
         if self.decision == Decision::Bound
             && !self.key.as_ref().is_some_and(|key| owners.owns(key))
@@ -267,16 +301,45 @@ impl Binding {
         }
     }
 
-    /// Loss is sticky within this launch's trust scope. It never authorizes fallback.
-    pub fn lost(&mut self, key: &Key, owners: &mut Ownership) {
-        if self.accepts(key, owners) {
-            owners.revoke(key);
-            self.key = None;
-            self.decision = Decision::Unknown;
-            self.failure = Some(Failure::SourceLost);
+    /// File/reader loss revokes authority but does not prove writer exit. Keep
+    /// known ownership until verified exit, validated replacement or retirement.
+    pub fn lost(&mut self, key: &Key) {
+        if self.key.as_ref() == Some(key) {
+            self.reject(Failure::SourceLost);
         }
     }
 
+    /// Accept a verified local exit only for the known PID/start identity. The
+    /// reader supplies this fact in #1663, never screen evidence or silence.
+    pub fn writer_gone(&mut self, writer: Writer, owners: &mut Ownership) {
+        if self
+            .known
+            .as_ref()
+            .is_some_and(|(_, known)| *known == writer)
+        {
+            self.revoke_known(owners);
+            self.reject(Failure::Writer);
+        }
+    }
+
+    fn revoke_known(&mut self, owners: &mut Ownership) {
+        if let Some((key, _)) = self.known.take() {
+            owners.revoke(&key);
+        }
+    }
+
+    fn reject(&mut self, reason: Failure) {
+        self.key = None;
+        self.pending = false;
+        self.failure = Some(reason);
+        self.decision = if self.trusted {
+            Decision::Unknown
+        } else {
+            Decision::BindingValidationFailed(reason)
+        };
+    }
+
+    /// Current diagnostic cause, retaining a duplicate-ownership revocation.
     pub fn failure(&self, owners: &Ownership) -> Option<Failure> {
         if self.decision == Decision::Bound && self.decision(owners) == Decision::Unknown {
             Some(Failure::DuplicateOwner)
@@ -285,11 +348,13 @@ impl Binding {
         }
     }
 
+    /// Revoke before a known operator launch/resume or dropping/moving the pane.
+    /// No typed in-TUI command or screen observation authorizes this transition.
     pub fn retire(&mut self, owners: &mut Ownership) -> Result<(), Failure> {
-        if let Some(key) = self.key.take() {
-            owners.revoke(&key);
-        }
+        self.revoke_known(owners);
+        self.key = None;
         self.decision = Decision::Unknown;
+        self.pending = false;
         self.launch = self
             .launch
             .checked_add(1)

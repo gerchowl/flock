@@ -564,12 +564,15 @@ fn plan_session(
     let Some(session_id) = str_field(input, "session_id") else {
         return HookOutcome::default();
     };
-    // Only a genuine SessionStart may forward `source` (startup/resume/clear/
-    // compact); other lifecycle actions can't spoof an identity change. Claude
-    // is the only agent that reports it today.
-    let session_start_source = (matches!(agent, Agent::Claude)
+    // Only a genuine SessionStart may forward a rebind source and Codex path.
+    // Other lifecycle actions cannot spoof a replacement binding.
+    let session_start_source = (matches!(agent, Agent::Claude | Agent::Codex)
         && hook_event_name == "SessionStart")
         .then(|| str_field(input, "source"))
+        .flatten();
+
+    let agent_session_path = (matches!(agent, Agent::Codex) && hook_event_name == "SessionStart")
+        .then(|| str_field(input, "transcript_path"))
         .flatten();
 
     // Remember which account profile (CLAUDE_CONFIG_DIR) this Claude session is
@@ -589,7 +592,7 @@ fn plan_session(
                 agent: agent.agent().to_string(),
                 seq: Some(seq()),
                 agent_session_id: Some(session_id),
-                agent_session_path: None,
+                agent_session_path,
                 session_start_source,
             },
         )],
@@ -1233,7 +1236,7 @@ mod tests {
         };
         assert_eq!(params.agent_session_id.as_deref(), Some("sess-abc"));
         assert_eq!(params.source, "flock:codex");
-        // Only Claude may forward SessionStart's `source`; codex must not.
+        // Missing source/path fields are not invented by the session planner.
         assert!(params.session_start_source.is_none());
     }
 
