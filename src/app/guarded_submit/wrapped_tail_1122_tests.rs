@@ -16,7 +16,7 @@ fn editor(screen: &str) -> Vec<&str> {
 }
 
 #[test]
-fn a_captured_narrow_composer_shows_only_the_wrapped_tail() {
+fn a_captured_tail_requires_non_whitespace_evidence_of_clipping() {
     let rows = editor(CLAUDE_16_COLS);
     assert_eq!(rows.first(), Some(&"findings,"));
     assert_eq!(rows.last(), Some(&"composers."));
@@ -26,7 +26,12 @@ fn a_captured_narrow_composer_shows_only_the_wrapped_tail() {
         composer(Agent::Claude, CLAUDE_16_COLS, SENT),
         Composer::Other
     );
-    assert!(matches_wrapped_tail(&rows, SENT, ROW_WIDTH));
+    // The capture really is clipped, but its normalized text could fit in
+    // this row capacity. That uncertainty must not authorize Enter.
+    assert!(SENT.chars().filter(|c| !c.is_whitespace()).count() <= rows.len() * ROW_WIDTH);
+    assert!(!matches_wrapped_tail(&rows, SENT, ROW_WIDTH));
+    let certainly_clipped = format!("{} {SENT}", "x".repeat(rows.len() * ROW_WIDTH));
+    assert!(matches_wrapped_tail(&rows, &certainly_clipped, ROW_WIDTH));
 }
 
 #[test]
@@ -46,10 +51,12 @@ fn only_a_tail_of_the_sent_text_counts() {
     assert!(!matches_wrapped_tail(&["composers."], SENT, ROW_WIDTH));
     assert!(!matches_wrapped_tail(&["", ""], SENT, ROW_WIDTH));
     // A wrap mid-word and a wrap at a space both join back.
+    let wrapped = ["https://gith", "ub.com/x and", "more"];
+    assert!(wrapped.iter().all(|row| row.len() <= 12));
     assert!(matches_wrapped_tail(
-        &["https://gith", "ub.com/x and", "more"],
-        "see https://github.com/x and more",
-        10
+        &wrapped,
+        "ThisNonWhitespacePrefixCannotFit see https://github.com/x and more",
+        12
     ));
     // Not clipped: the whole text fits in the rows shown, so its start was
     // lost rather than scrolled off.
@@ -58,4 +65,19 @@ fn only_a_tail_of_the_sent_text_counts() {
         "gamma delta epsilon",
         ROW_WIDTH
     ));
+}
+
+#[test]
+fn packed_visible_rows_do_not_gain_clipping_slack_from_whitespace() {
+    let rows = ["aaaaaa bbbbbbb", "cccccc ddddddd"];
+    assert!(rows.iter().all(|row| row.len() == ROW_WIDTH));
+    for separator in [" ", "\n", "\t"] {
+        let text = format!("X{separator}{}{separator}{}", rows[0], rows[1]);
+        assert!(!matches_rows(&rows, &text));
+        assert!(!matches_wrapped_tail(&rows, &text, ROW_WIDTH), "{text:?}");
+    }
+    // Real clipping still qualifies once even the non-whitespace content
+    // cannot fit in the visible rows.
+    let clipped = format!("PREFIX {} {}", rows[0], rows[1]);
+    assert!(matches_wrapped_tail(&rows, &clipped, ROW_WIDTH));
 }
