@@ -761,7 +761,10 @@ back-to-back turns. For a structured agent there is no polling at all:
   Retain the latest checkpoint through the next atomic replacement; replay
   must not interleave its lines with a newer checkpoint or concurrent appends.
   Other materialized snapshot streams persist their seq high-water with their
-  checkpoint by the same atomic rule. `agent/<id>` and `events` have no
+  checkpoint by the same atomic rule. Wire journal, queue and checkpoint
+  writes obey §5a's single-writer handoff rule, including seq allocation and
+  rename-rewrite; process overlap never grants simultaneous write authority.
+  `agent/<id>` and `events` have no
   entity snapshot: a gap there reports lost history without `snapshot_to`.
 - **Two kinds of seq.** ADR-0005's `seq` stays the one total order of the
   durable event log, and the `events` wire stream uses it. A per-agent
@@ -850,6 +853,7 @@ server → client
   ping    { nonce }                          application heartbeat (§5a)
   ev      { sub_id, stream, seq, ts_ms, ev }  ev is the typed event (§6)
   synced  { sub_id, seq }                    replay barrier on every seq stream
+  subfail { sub_id, code, message }          subscription refusal (§5a)
   gap     { sub_id, from, to, snapshot_to? }  inline checkpoint (§4)
   lagged  { sub_id, skipped_to }
   ack     { cmd_id, ok, result? | error{ code, message, exit, retry } }
@@ -859,8 +863,8 @@ server → client
   `agent/<id>/live` has seqs, including `terminal/<pane>` and `events`.
   `sub` with `after` replays from the last applied cursor, then goes live.
   A first `sub` without `after` on a snapshot stream (`fleet`, `inbox`,
-  `queue/<id>`, `artifacts`, `work`) gets an inline checkpoint through the
-  same path as recovery: `gap { from:1, to:first_snapshot_seq-1,
+  `queue/<id>`, `artifacts`, `work`, `terminal/<pane>`) gets an inline checkpoint
+  through the same path as recovery: `gap { from:1, to:first_snapshot_seq-1,
   snapshot_to:last_snapshot_seq }`, or §4's empty-snapshot form. No separate
   bootstrap fetch or client reducer exists. If no checkpoint exists yet,
   create and persist one under §4's serialization rule before serving it.
@@ -925,7 +929,7 @@ server → client
 
 **Amendment accepted by the architect, 2026-10-16.** The snapshot/bootstrap,
 all-seq-stream `synced`, empty-checkpoint cursor, persisted high-water and
-secret-compression rules are decided. The values below are **proposed
+S7 no-compression rules are decided. The values below are **proposed
 parameters for review**, not measured performance claims. Keep WebSocket as
 one transport for the `-p` surface and GUI; recovery is required in S7, including
 local use, and its types precede G3 in S7a. No deployment is authorized here.
@@ -936,8 +940,8 @@ local use, and its types precede G3 in S7a. No deployment is authorized here.
 | Handshake deadline | 5 s from WebSocket open to authenticated `welcome`; server closes if valid `hello` is absent within 5 s | Hello is local validation, not model work. Neither side can hold an unauthenticated socket indefinitely. |
 | Heartbeat interval | 15 s from `welcome`, independent of other traffic | Detects suspended or half-open peers even during long quiet turns; four round trips/minute per connected client. |
 | Liveness window | 45 s | Three heartbeat intervals tolerate brief scheduling delays while bounding stale display and server resource retention. |
-| Subscription deadline | 30 s from each `sub` to its `synced`, or snapshot completion if a gap arrives while Current | A healthy heartbeat cannot hide a stuck replay; applied cursor progress survives the failed attempt. |
-| Command acknowledgement deadline | 30 s from each send | Bounds a lost/stuck ack; timeout means uncertain outcome, never success. Long work must acknowledge admission and publish completion separately. |
+| Subscription progress deadline | 30 s without a frame advancing that subscription while awaiting synced or snapshot completion | Large replays may take longer overall; unrelated traffic and heartbeats cannot hide a stalled stream. Only that stream re-subscribes. |
+| Command acknowledgement deadline | 30 s from each send | Marks that command uncertain while keeping the connection up; resend only after the next reconnect. Long work acknowledges admission and publishes completion separately. |
 | Reconnect backoff | base 500 ms, factor 2, cap 30 s, equal jitter in [base/2, base] after applying cap | Avoids fleet reconnect storms and zero-delay loops, while the first retry is quick. |
 | Stable connection before resetting backoff | 60 s continuously authenticated and live/read-only | An open socket followed by immediate failure must not reset storm protection. |
 | Resume retention | Entire session JSONL until explicit S16 retention; latest checkpoint plus later changes for materialized streams | No arbitrary time-based replay loss. Removed history uses gap, never a silent jump. |
@@ -965,11 +969,20 @@ server liveness. The server closes and releases per-client subscriptions when
 no valid pong has arrived for 45 s (initial baseline: `welcome`). The client
 enters Stale when no valid server frame, including ping, has arrived for 45 s,
 marks retained content stale, holds its outbox, closes and enters Reconnecting.
-Discard frames from the abandoned socket; old callbacks cannot advance cursors.
-A stream's independent replay/snapshot deadline still applies during traffic.
+Prioritize ping/pong ahead of queued replay/data messages in both directions.
+The writer sends bounded messages with bounded buffering, checks the priority
+queue between writes, and never enqueues an entire replay ahead of a heartbeat.
+A blocked socket write remains subject to the liveness failure ceiling; priority
+cannot cure a genuinely unusable link. This prevents a healthy slow replay from
+causing false Stale merely because the heartbeat waited behind its data backlog.
+Discard every frame from the abandoned socket, including late pings; send no
+pong for them and let no old callback advance a cursor or renew liveness.
+A stream's independent progress deadline still applies during traffic.
 
-**Reconnect.** Socket failure or any failed stage deadline closes the attempt
-and enters Reconnecting, preserving the displayed state and applied cursors.
+**Reconnect and failure scope.** Connect/handshake expiry, protocol failure,
+socket loss or heartbeat failure ends the connection attempt and enters
+Reconnecting, preserving displayed state and applied cursors. Subscription
+progress and command-ack expiry never tear down a healthy connection.
 One attempt is active at a time. Backoff attempt n waits a uniformly sampled
 value in `[min(30s,500ms*2^n)/2, min(30s,500ms*2^n)]`, n starting at zero;
 use saturating arithmetic. A network-change or foreground event cancels the
@@ -979,7 +992,10 @@ Retries of connection setup continue under the cap until user disconnects;
 each attempt ends at its deadline, with the latest failure visible and a
 user disconnect action always available. This deliberate background reconnect
 policy does not retry a condition assertion or declare a command successful.
-Auth refusal enters NeedsToken without reconnecting until a new token arrives.
+WS close **4401** means auth refused during hello; **4403** means token revoked
+mid-session. Both enter NeedsToken, holding the outbox without reconnecting until
+a new token arrives. These codes differ from protocol failures (visible error,
+capped reconnect) and network loss (reconnect).
 Protocol errors close with a visible diagnosis and capped reconnect (a server
 upgrade can cure them). A newer client follows §5's ReadOnly capabilities and
 holds commands; it can keep reading and detecting stale transport.
@@ -991,12 +1007,41 @@ concurrent with replay follow the captured barrier without a hole. `lagged`
 re-subscribes from the applied cursor, never `skipped_to`. A snapshot gap uses
 §4's inline checkpoint; no snapshot gap is allowed to omit `snapshot_to`.
 A history gap on `agent/<id>` or `events` leaves an explicit missing-range marker
-and continues from `to+1`, without implying complete history. Terminal recovery
-must supply a complete terminal frame before clearing its stale visual state;
-an incremental cell delta cannot reconstruct a missing base. Cursors and
+and continues from `to+1`, without implying complete history.
+
+`terminal/<pane>` is a **snapshot stream**, not history-only. Its snapshot
+contains the complete terminal frame and rendering state for that pane; keep its
+seq high-water and checkpoint under §4's single-writer atomic checkpoint rule.
+Initial subscription and a gap both use
+`gap { from:cursor+1, to:H, snapshot_to:H+1 }` followed by one complete frame
+at H+1 (initial `from` is 1). Subsequent deltas follow it; a missing/removed pane
+gets `subfail { code:"unknown_stream", ... }`, not a fake empty terminal.
+Do not clear stale visual state until the complete frame has been applied;
+a delta cannot reconstruct a missing base. As for other snapshots, synced
+follows its completion and never substitutes for the frame. Cursors and
 identity survive reconnect; neither a new socket nor a new server epoch resets
 seqs. A cursor ahead of the restored stream head is refused as `cursor_ahead`,
 not clamped or treated as caught up. Re-subscribe live deltas without `after`.
+
+**Subscription refusal and progress.** `subfail { sub_id, code, message }`
+ends only the named subscription and supplies these typed codes (S7a defines
+the wire enum; implementation registers any new API error codes where needed):
+
+| Code | Meaning and client action |
+| --- | --- |
+| `cursor_ahead` | Stored cursor exceeds the stream head. Clear only that stream's entities, cursor and resync marker, then re-subscribe without `after` through bootstrap; do not silently clamp. |
+| `operator_only` | Subscription requires the operator principal. Show refusal and stop that subscription until the principal changes; other streams stay up. |
+| `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
+| `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
+
+Start the 30 s progress deadline at sub registration, or when a new gap starts
+resync of a Current stream. Reset it only on a frame advancing that sub: a newly
+applied seq, an advancing gap/cursor or snapshot boundary, or its synced barrier.
+Duplicates, repeated identical gaps, unrelated streams and heartbeat frames do
+not reset it. Expiry sends unsub, then a new sub from the applied cursor and
+stored resync marker; only that stream returns to Replaying/Resyncing. Keep the
+connection and other streams up and show the affected stream's recovery state.
+A replay that keeps advancing can exceed 30 s in total. No timeout marks Current.
 
 **Commands across a drop.** Persist the client's outbox before sending, keeping
 principal, unique `cmd_id`, exact verb/args and first-send time. A reconnect may
@@ -1007,6 +1052,14 @@ uncertain delivery; exclude this delivery flag from the payload digest. A
 resume-only request whose key is absent, expired or lost is refused as uncertain
 before dispatch, even if the server restarted with an empty journal. This trades
 a possibly unexecuted original for explicit inspection, never a duplicate effect.
+There is a dead-socket race: the original `resume_only:false` command may be
+buffered on the old connection while the new connection's resume-only lookup
+finds no claim and refuses it. The original may later arrive and execute once.
+Show **unknown outcome**, not cancelled or definitely unexecuted; inspection may
+later reveal its effect. Do not create another command ID to force execution.
+On an ack deadline, mark only the command uncertain and keep the connection up.
+A late ack on that still-current socket resolves it normally; resend with
+`resume_only:true` only after the next reconnect and within the window.
 The server persists an idempotency journal at `<data dir>/wire/commands.jsonl`,
 keyed by `(principal, cmd_id)` plus a canonical payload digest and first-admission
 expiry. Claim a key durably before dispatch; concurrent duplicates join that
@@ -1018,6 +1071,10 @@ claim is uncertain: do not dispatch again. Report `session_unconfirmed` with
 CLI `UNCONFIRMED`; expose the existing subject state for inspection. A duplicate
 never creates a second execution, including after restart or handoff; an
 unresolved original is not falsely presented as a completed first ack.
+`session_unconfirmed` keeps its registered `retry:later` class. Retrying is
+harmless only with the same principal/id/payload and `resume_only:true`: an
+absent/expired claim still refuses and cannot dispatch. The class is not license
+to resend as a first send or create a new ID; the outbox/expiry rules still apply.
 
 Automatic resend is allowed for the listed §5 verbs only through this durable
 idempotency path, not based on an assumed harmless verb. Permission/question
@@ -1038,21 +1095,47 @@ for diagnosis, not as a reason to bypass dedupe. Lost/replaced journal state mus
 refuse `resume_only` commands rather than assume an empty cache permits execution.
 A revoked token stays revoked; no auth state is inherited from a dead socket.
 
-**Compression and secrets.** `permessage-deflate` may be negotiated, but `hello`
-and every frame containing a token or secret must be sent uncompressed (RSV1
-unset for that message). Apply this to fragments as one message. This includes
-credential exchange, secret-bearing args/results, transcript/tool content and
-terminal frames whose contents cannot be proven public. Default such payloads
-to uncompressed, never guess from field names alone; disable negotiation when
-the WS implementation cannot enforce per-message control. For senders that cannot suppress RSV1 per message, including browser WebSocket
-APIs, the server must decline the extension at upgrade; clients cannot assume
-that a browser exposes a compression-off switch.
-Compressing secret and attacker-influenced content together creates a compression
-oracle through observable lengths; no-context-takeover alone does not remove
-that risk. This follows [RFC 7692 framing](https://www.rfc-editor.org/rfc/rfc7692.html#section-6)
-and its [security considerations](https://www.rfc-editor.org/rfc/rfc7692.html#section-8).
-Heartbeats contain no credentials. Log neither bearer values nor raw
-secret payloads in transport diagnostics.
+**Single-writer handoff.** As in ADR-0026's ownership-transfer rule, ownership
+of `wire/commands.jsonl`, every queue/session log, checkpoints and their seq
+allocators transfers **before the new server accepts** any wire connection or
+command. The old server stops admission and command claims, closes all its
+`/v1/ws` sockets, drains or records uncertain in-flight claims, quiesces all
+append/rewrite producers, durably flushes their files, then relinquishes its
+exclusive writer ownership. Only after that transfer may the new server load
+the files, recover pending claims/high-waters, and start accepting. No old writer
+may append, rename a rewrite or mint a seq afterward; reject late callbacks by
+owner generation. Hold an exclusive data-directory writer lock/fence through
+all writes and recover ownership after a crash before loading as the new owner.
+If release cannot be proven, fail handoff rather than run two writers. This
+contract closes the wire/storage overlap gap identified in ADR-0005; it does
+not claim that the existing implementation already enforces it.
+
+**Revocation on an open socket.** Re-check the current token file/digest and
+scopes on **every cmd**, before claiming an idempotency key, returning a cached
+ack or dispatching a verb; cached hello authorization is insufficient. Serialize
+this authorization/admission boundary with operator revocation, so a command
+cannot be newly admitted after revocation. On detection of a removed/replaced
+token, close **all sockets for that token with 4403**; clients enter NeedsToken.
+Check hello against the file too, with 4401 on refusal. This command-time check
+is chosen because it does not rely on portable filesystem-watch delivery. Its
+limit is explicit: deletion alone does not proactively close a read-only idle
+socket; the next cmd or reconnect detects it. Revocation prevents subsequent
+admission, not cancellation of an already admitted command; report its outcome
+through the journal and existing state rather than implying it was rolled back.
+
+**Compression and secrets (architect decision, round 2).**
+**`permessage-deflate` is NOT negotiated in S7.** Decline the extension at
+upgrade for every client; a browser or webview GUI gets no deflate at all, and
+all data messages, including hello, have RSV1 unset. Browsers/webviews may
+compress every client message after negotiation, including hello's token, with
+no per-message application switch. Disabling compression avoids an oracle on
+mixed secret and attacker-influenced content through observable lengths;
+no-context-takeover alone does not remove that risk (see
+[RFC 7692 security considerations](https://www.rfc-editor.org/rfc/rfc7692.html#section-8)).
+A later opt-in needs a separately reviewed **native-client-only** rule decided
+at upgrade time, with uncompressed hello and secret messages enforced; it is
+not an S7 setting or a post-hello capability toggle. Log neither bearer values
+nor raw secret payloads in transport diagnostics.
 
 **Boundaries.** Mobile background suspension closes or invalidates the connection;
 foreground resumes with cursors and the same bounded outbox rules. Push wakeups
@@ -1064,8 +1147,8 @@ routing remains refused until #1380; mesh VERSION stays **5**. QUIC/WebTransport
 and SSE/long-poll are not selected: they add transport/auth/resume paths and do
 not remove the need for application cursors, snapshots or command dedupe. Revisit
 only with a filed proposal and evidence WebSocket recovery fails a requirement.
-S7 has not shipped: `ping`, `pong`, `synced`, `snapshot_to` and welcome recovery
-metadata are additions to the initial `WIRE_JSON_VERSION` contract, not a bump
+S7 has not shipped: `ping`, `pong`, `synced`, `subfail`, `snapshot_to` and
+welcome recovery metadata are additions to the initial `WIRE_JSON_VERSION` contract, not a bump
 of an implemented/released wire. The framed protocol version is unchanged.
 
 **Implementation acceptance, not tests executed by this docs PR.** S7a defines
@@ -1087,7 +1170,17 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | Permission prompt across drop | Prompt survives replay, stored answer retries once under the same request/key, closed prompt cannot receive a second answer or an answer intended for a newer prompt. |
 | Expired key / clock uncertainty / changed principal / revoked token | No automatic resend or new-id workaround; unknown outcome is visible, old-principal outbox drops, revoked token enters NeedsToken. |
 | Restart, handoff, missing journal or ahead cursor | Token scopes and stream seqs persist; no seq reset or duplicate side effect. Missing recovery state fails closed; ahead cursor is refused. |
-| Secret-bearing compressed traffic | Capture negotiated frames: hello and every secret message have RSV1 unset; unsupported per-message senders negotiate no deflate. No secret appears in diagnostics. |
+| Compression disabled | Offer permessage-deflate from browser, webview and native fixtures: every S7 upgrade declines it, all messages including hello have RSV1 unset, and no secret appears in diagnostics. |
+| Single-writer handoff overlap | Hold the old process alive with queued append/rewrite and command callbacks. New acceptance/loading waits for exclusive ownership; late old callbacks cannot write or allocate seqs. Race rewrite with append and duplicate cmd across transfer: no overwritten append, repeated seq or double effect. Failed release fails handoff. |
+| Open-session revocation | Authenticate two sockets with one token, revoke it, then send a new cmd on one and a duplicate on the other. Neither claims, returns cached ack or dispatches; both close 4403 and enter NeedsToken. Rejected hello closes 4401. An already admitted command is not claimed cancelled. |
+| Slow replay heartbeat priority | Queue replay in both directions on a constrained healthy link; ping/pong bypass waiting data and prevent false Stale from backlog. An actually blocked writer or missing pong still fails within the liveness ceiling. |
+| Terminal snapshot recovery | Lose delta history, then receive gap with snapshot_to and a full frame followed by deltas and synced. The old display remains stale until the full frame applies; a delta or early synced cannot clear it. Removed pane refuses unknown_stream. |
+| subfail cursor_ahead | A restored head below the saved cursor refuses; client clears only that stream's entities/cursor/marker and bootstraps without after. Other streams continue. |
+| subfail operator_only | Non-operator subscription refuses and stops until principal changes; no reconnect loop or blocked sibling stream. |
+| subfail unknown_stream | Unknown kind/removed subject refuses and stops until a valid selection; no fake empty success. |
+| subfail scope | Insufficient token scope refuses only that sub until authorization changes; sibling streams remain live. |
+| Per-stream progress deadline | Replay exceeds 30 s overall but progresses within each window and succeeds. A stalled sub expires despite duplicate/unrelated/heartbeat traffic: unsub/re-sub only that sub from its applied cursor, retaining resync marker and the connection. |
+| Ack timeout and delayed original | Missing ack marks only that cmd uncertain; no same-socket resend or teardown. A late current-socket ack resolves it. After reconnect, deliver resume-only lookup before buffered original: show unknown outcome while the original may later execute once; never manufacture a new ID. Verify retry:later remains harmless with resume_only. |
 | Mobile suspend and remote outage | Foreground invalidates old socket and resumes. Local heartbeat does not clear remote stale state; cross-node cmd still refuses under VERSION 5. |
 
 ### 6. One schema, generated TypeScript
@@ -1567,8 +1660,8 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S5d | System One for the queue: relatedness joins at idle and the relevance check during a turn, `[queue] relevance` (whose `force` sends through S5c's `send_now`), recorded for rating (§3, owner decisions 4 and 5) | S5, S5c | 200 |
 | S5b | Turn-end work through the queue: armed self-compact and its continuation on `result`, recap lift, wake of parked waits (§3a, #697) | S5 | 200 |
 | S6 | Control requests: `can_use_tool` → `hook.decide` and §8a questions, `AskUserQuestion` answers, `ExitPlanMode` | S4, S5 | 350 |
-| S7a | Initial wire types and scripted fault-fixture format: hello/welcome recovery metadata, sub/unsub/cmd/ev/ack, ping/pong, synced on every seq stream, gap with snapshot_to, lagged (§5/§5a); no endpoint | #1546/#1641 contract review | 200 |
-| S7 | Wire endpoint implementing S7a, §5a deadlines, heartbeat, durable command journal, resume/checkpoint rules, `/v1/blob`, client tokens and `WIRE_JSON_VERSION` gate; refuse remote-agent cmd until #1380 | S3, S7a | 400 |
+| S7a | Wire message Rust types with ts derives: hello/welcome recovery metadata, sub/unsub/cmd/ev/ack, subfail, ping/pong, synced on every seq stream, gap with snapshot_to, lagged (§5/§5a); scripted fake-server fixture format, types only with no endpoint. Before S3, as ADR-0038 §10 | #1546 settled | 200 |
+| S7 | Wire endpoint implementing S7a, §5a deadlines, heartbeat, durable command journal, resume/checkpoint and single-writer rules, `/v1/blob`, client tokens, `WIRE_JSON_VERSION` gate, `web` on in release builds; refuse remote-agent cmd until #1380 | S3 (S3a #1518/#1439, S3b #1426), S7a | 350 |
 | S8 | `ts` feature, `ts-rs` derives, generated `web/client/src/gen`, drift test, `just gen-ts` | S7 | 200 |
 | S9a | Bun reference client in Solid: connect, follow an agent from a cursor, render P1–P4, unknown JSON dump, lazy blobs | S8 | 400 (TS) |
 | S9b | Bun reference client: P12–P15, P19, P20, queue view with edit, reorder, stashes, send now and relevance marks | S9a, S5c | 400 (TS) |
