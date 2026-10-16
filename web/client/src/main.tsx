@@ -9,7 +9,8 @@
  */
 import { render } from "solid-js/web";
 
-import { App } from "./App";
+import { ClientWorkbench } from "./layout/Workbench";
+import { previewMode } from "./layout/phone";
 import { readShellConfig } from "./config";
 import "./styles.css";
 
@@ -17,4 +18,5 @@ const root = document.getElementById("root");
 if (root === null) {
   throw new Error("index.html has no #root element");
 }
-render(() => <App config={readShellConfig(globalThis)} />, root);
+// G2 mount: live configuration remains with G3 #1595.
+render(() => <ClientWorkbench config={readShellConfig(globalThis)} serverKey="fixture" mode={previewMode(window.location.search)} />, root);
