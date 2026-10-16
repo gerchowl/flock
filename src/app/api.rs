@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod structured_lease_tests;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -1398,7 +1400,11 @@ impl App {
         }
         self.pending_recovery_park = None;
         if self.waits_for_mesh_recovery(&request.method) {
-            self.pending_recovery_park = Some((request, self.current_api_peer_pid));
+            self.pending_recovery_park = Some((
+                request,
+                self.current_api_peer_pid,
+                self.current_api_peer_birth,
+            ));
             return String::new();
         }
 

@@ -873,14 +873,24 @@ pub fn process_name(pid: u32) -> Option<String> {
 
 /// The parent process id, or `None` once the process is gone.
 pub fn process_parent_id(pid: u32) -> Option<u32> {
-    Some(process_bsdinfo(pid)?.pbi_ppid)
+    process_facts(pid).map(|(parent, _)| parent)
 }
 
 /// When the process started, in microseconds since the epoch. Together with
 /// the pid it names ONE process: a reused pid has a later start time.
 pub fn process_start_time(pid: u32) -> Option<u64> {
-    let info = process_bsdinfo(pid)?;
-    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    process_facts(pid).map(|(_, birth)| birth)
+}
+
+// KERN_PROC_PID exposes parent and birth across UIDs, including login/launchd.
+fn process_facts(pid: u32) -> Option<(u32, u64)> {
+    unsafe extern "C" {
+        fn flock_process_facts(pid: libc::c_int, parent: *mut u32, birth: *mut u64) -> libc::c_int;
+    }
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let (mut parent, mut birth) = (0, 0);
+    // SAFETY: the SDK-compiled helper writes only the two live output scalars.
+    (unsafe { flock_process_facts(pid, &mut parent, &mut birth) } == 1).then_some((parent, birth))
 }
 
 /// Every live process id. Darwin has no `/proc`, so this is `proc_listallpids`
@@ -984,6 +994,18 @@ pub(crate) fn machine_identity() -> std::io::Result<String> {
 #[allow(clippy::disallowed_methods)] // Test doubles wire raw Command into the notification/clipboard closures — product code uses TracedCommand (logging redesign PR-3).
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_facts_read_root_owned_init_and_match_own_birth() {
+        assert_eq!(process_parent_id(1), Some(0));
+        assert!(process_start_time(1).is_some());
+        let pid = std::process::id();
+        let info = process_bsdinfo(pid).expect("owned process");
+        assert_eq!(
+            process_start_time(pid),
+            Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+        );
+    }
 
     #[test]
     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {

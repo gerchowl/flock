@@ -107,6 +107,8 @@ impl AgentKind {
 /// (ADR-0014 §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnRefusal {
+    /// Structured process attribution is unresolved; it grants no operator exemption.
+    CallerUnknown,
     /// Retry is safe once something exits.
     AtCapacity { current: usize, limit: usize },
     /// Retry is safe once this parent's children exit.
@@ -127,6 +129,7 @@ impl SpawnRefusal {
     /// The stable `data.refusal` tag.
     pub fn code(&self) -> &'static str {
         match self {
+            Self::CallerUnknown => "spawn_caller_unknown",
             Self::AtCapacity { .. } => "at_agent_capacity",
             Self::AtFanout { .. } => "at_fanout_limit",
             Self::AtDepth { .. } => "at_lineage_depth",
@@ -142,7 +145,7 @@ impl SpawnRefusal {
     pub fn retryable(&self) -> bool {
         match self {
             Self::AtCapacity { .. } | Self::AtFanout { .. } | Self::FleetPaused => true,
-            Self::AtDepth { .. } | Self::NotEnabled => false,
+            Self::AtDepth { .. } | Self::NotEnabled | Self::CallerUnknown => false,
             // Delegated rather than restated: whether a profile refusal can be
             // retried is a property of the profile failure, not of this enum.
             Self::ProfileUnresolved(unresolved) => unresolved.retryable(),
@@ -151,6 +154,7 @@ impl SpawnRefusal {
 
     pub fn message(&self) -> String {
         match self {
+            Self::CallerUnknown => "structured caller identity is unresolved".into(),
             Self::AtCapacity { current, limit } => format!(
                 "at agent capacity ({current}/{limit} agent-started agents live); retry when one exits"
             ),
