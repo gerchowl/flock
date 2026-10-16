@@ -24,8 +24,12 @@ impl App {
         let architect = match params.architect.trim() {
             "all" => None,
             "self" | "" => match self.spawn_caller() {
-                SpawnCaller::Agent { agent_id, .. } => Some(agent_id),
-                SpawnCaller::Operator { .. } => {
+                SpawnCaller::Agent { agent_id, .. }
+                | SpawnCaller::Structured {
+                    agent_id: Some(agent_id),
+                    ..
+                } => Some(agent_id),
+                SpawnCaller::Operator { .. } | SpawnCaller::Structured { agent_id: None, .. } => {
                     return encode_error(
                         id,
                         "no_caller_pane",

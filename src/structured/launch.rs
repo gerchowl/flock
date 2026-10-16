@@ -367,6 +367,7 @@ impl Drop for SessionConfigDir {
 /// Dropping an unarmed profile removes its session files; arm before spawning.
 #[derive(Debug)]
 pub struct LaunchProfile {
+    session_id: String,
     args: Vec<OsString>,
     binary: VerifiedBinary,
     environment: EnvironmentAllowlist,
@@ -428,12 +429,18 @@ impl LaunchProfile {
         ]);
         let environment = EnvironmentAllowlist::capture(read_env, token);
         Ok(Self {
+            session_id: session_id.into(),
             args,
             binary,
             environment,
             profile_directory,
             directory,
         })
+    }
+
+    /// Canonical session id passed to Claude, also used by the lease and stream.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Arm generated files before attempting spawn, retaining uncertain lifetimes.

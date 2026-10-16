@@ -74,6 +74,7 @@ impl Drop for HeldWait<'_> {
             },
             respond_to,
             peer_pid: None,
+            peer_birth: None,
         });
     }
 }

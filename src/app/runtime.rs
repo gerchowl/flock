@@ -64,8 +64,10 @@ impl App {
         let previous_mode = self.state.mode;
         let changed = crate::api::request_changes_ui(&msg.request);
         self.current_api_peer_pid = msg.peer_pid;
+        self.current_api_peer_birth = Some(msg.peer_birth);
         let response = self.handle_api_request(msg.request);
         self.current_api_peer_pid = None;
+        self.current_api_peer_birth = None;
         self.respond_or_park(msg.respond_to, response);
         self.sync_prefix_input_source(previous_mode);
         changed
