@@ -1,4 +1,4 @@
-use super::{api_helpers::pane_agent_status, App};
+use super::{api_helpers::pane_agent_status_from_terminal, App};
 
 // Staged for #00f: the agent CLI will use this resolver once #00e provides terminal ids.
 #[allow(dead_code)]
@@ -207,7 +207,11 @@ impl App {
             cwd: ws.tabs[tab_idx]
                 .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
-            agent_status: pane_agent_status(terminal.state, pane.seen),
+            agent_status: pane_agent_status_from_terminal(
+                terminal,
+                pane.seen,
+                self.terminal_runtimes.get(&terminal.id).is_some(),
+            ),
         })
     }
 
