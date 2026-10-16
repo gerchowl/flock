@@ -69,6 +69,8 @@ jobs:
     uses: ./.github/workflows/ci-leg.yml
     with:
       leg: macos-15
+      # Batch PRs use head_ref; ref is refs/pull/<number>/merge on PR events.
+      run-tests: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'land/') }}
 
   # The required checks. Branch protection and the landing driver wait on
   # exactly `check (macos-15)` and `check (ubuntu-latest)`, so these keep the
