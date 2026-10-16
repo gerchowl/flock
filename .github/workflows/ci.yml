@@ -61,7 +61,7 @@ jobs:
 
   # The web client (ADR-0038 G1): lockfile install, bun tests, the fixture
   # screenshots, the strict type check and the Vite build. One platform is
-  # enough: the bundle is static assets. Its result gates check (ubuntu-latest).
+  # enough: the bundle is static assets. It reports as its own `client` check.
   client:
     name: client
     runs-on: ubuntu-latest
@@ -117,7 +117,7 @@ jobs:
   # run the result gate and fail explicitly, rather than permit an untested merge.
   check-ubuntu:
     name: check (ubuntu-latest)
-    needs: [ubuntu, client]
+    needs: ubuntu
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -142,14 +142,9 @@ jobs:
         if: always()
         env:
           RESULT: ${{ needs.ubuntu.result }}
-          CLIENT_RESULT: ${{ needs.client.result }}
         run: |
           if [ "$RESULT" != success ]; then
             echo "ubuntu-latest leg ended as $RESULT" >&2
-            exit 1
-          fi
-          if [ "$CLIENT_RESULT" != success ]; then
-            echo "client job ended as $CLIENT_RESULT" >&2
             exit 1
           fi
 
