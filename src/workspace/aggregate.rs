@@ -61,15 +61,15 @@ impl Tab {
         self.panes.values().any(|pane| {
             terminals
                 .get(&pane.attached_terminal_id)
-                .is_some_and(|terminal| terminal.state == AgentState::Working)
+                .is_some_and(|terminal| terminal.presentation_state(true).0 == AgentState::Working)
         })
     }
 
     /// (state, seen) for every pane in THIS tab with a live terminal — the
     /// per-tab counterpart of [`Workspace::pane_states`] (#394). The tab
     /// strip tints a tab by its own panes' join; deriving it here, over the
-    /// same `(terminal.state, pane.seen)` pair the workspace scope reads, is
-    /// what keeps the two strips from disagreeing about the same pane.
+    /// same lifecycle-projected pair the workspace scope reads, is what keeps
+    /// the two strips from disagreeing about the same pane.
     pub fn pane_states<'a>(
         &'a self,
         terminals: &'a HashMap<TerminalId, TerminalState>,
@@ -77,7 +77,7 @@ impl Tab {
         self.panes.values().filter_map(|pane| {
             terminals
                 .get(&pane.attached_terminal_id)
-                .map(|terminal| (terminal.state, pane.seen))
+                .map(|terminal| terminal.presentation_state(pane.seen))
         })
     }
 
@@ -103,8 +103,8 @@ impl Tab {
             terminals
                 .get(&pane.attached_terminal_id)
                 .map(|terminal| PaneSignal {
-                    state: terminal.state,
-                    seen: pane.seen,
+                    state: terminal.presentation_state(pane.seen).0,
+                    seen: terminal.presentation_state(pane.seen).1,
                     harness: terminal.effective_known_agent(),
                     label: terminal.display_agent_label(),
                 })
@@ -134,12 +134,12 @@ impl Tab {
                     label: agent_label.clone(),
                     agent_label,
                     agent: terminal.effective_known_agent(),
-                    state: terminal.state,
-                    seen: pane.seen,
+                    state: terminal.presentation_state(pane.seen).0,
+                    seen: terminal.presentation_state(pane.seen).1,
                     custom_status: presentation.custom_status,
                     state_labels: presentation.state_labels,
                     header_fields: terminal.active_header_fields(),
-                    live_activity: (terminal.state == AgentState::Working)
+                    live_activity: (terminal.presentation_state(true).0 == AgentState::Working)
                         .then(|| terminal.live_activity.clone())
                         .flatten(),
                     state_changed_at: terminal.state_changed_at,

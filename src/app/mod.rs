@@ -2112,6 +2112,8 @@ impl App {
         apply_host_terminal_theme: bool,
     ) {
         for event in events {
+            self.state
+                .refresh_terminal_runtime_presence(&self.terminal_runtimes);
             let previous_mode = self.state.mode;
             match event {
                 crate::raw_input::RawInputEvent::Key(key) => {
