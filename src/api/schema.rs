@@ -1084,6 +1084,15 @@ pub struct AgentSendParams {
     pub raw: bool,
 }
 
+/// A one-time launch selector omitted from a same-session restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartDroppedFlag {
+    /// The option name or alias, without its original value.
+    pub flag: String,
+    /// Why the existing session or working directory replaces this selector.
+    pub reason: String,
+}
+
 /// Queue a server-owned restart. The caller must finish its requesting turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3166,6 +3175,10 @@ pub enum ResponseResult {
         session: String,
         #[serde(default)]
         stop_only: bool,
+        /// One-time selectors replaced by the native session and preserved cwd.
+        /// Older results omit this field; empty reports keep their existing shape.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped_flags: Vec<RestartDroppedFlag>,
     },
     AgentHistory {
         history: AgentHistoryResult,
@@ -3458,12 +3471,20 @@ pub struct RevertRepoResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct WorkspaceInfo {
     pub workspace_id: String,
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "f64"))]
     pub number: usize,
     pub label: String,
     pub focused: bool,
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "f64"))]
     pub pane_count: usize,
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "f64"))]
     pub tab_count: usize,
     pub active_tab_id: String,
     pub agent_status: AgentStatus,
@@ -3472,6 +3493,7 @@ pub struct WorkspaceInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct WorkspaceWorktreeInfo {
     pub repo_key: String,
     pub repo_name: String,
@@ -3637,6 +3659,8 @@ pub struct TabInfo {
 /// this carries only what addressing needs, and is the same shape whether the
 /// agent is here or three machines away.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct FleetAgentInfo {
     /// The address. Fleet-global and restart-stable — the ONLY target shape
     /// that means the same thing on every host, so this is what goes in a
@@ -3675,6 +3699,7 @@ pub struct FleetAgentInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentInfo {
     /// Fleet-global, restart-stable identity — the name to address this agent
     /// by. `terminal_id` names a running PTY and is re-minted every restart;
@@ -3682,12 +3707,16 @@ pub struct AgentInfo {
     pub agent_id: String,
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
     /// The cross-harness state (ADR-0028 §1, #1019): orthogonal axes with a
@@ -3699,6 +3728,7 @@ pub struct AgentInfo {
         deserialize_with = "crate::api::agent_state::lenient",
         skip_serializing_if = "Option::is_none"
     )]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub state: Option<crate::api::agent_state::AgentState>,
     /// The agent is `idle`/`done` because its turn ended (Claude's
     /// `done <time>` marker) while background shells or agents it started are
@@ -3712,22 +3742,30 @@ pub struct AgentInfo {
     pub settled_with_background_shells: bool,
     /// Provider-limit wait or `resume_failed` while a retained identity is offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub retry_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub custom_status: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent_session: Option<AgentSessionInfo>,
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
     pub focused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub foreground_cwd: Option<String>,
     /// Whether the operator has seen the agent's latest completed turn
     /// (#175 F3). `agent_status` already folds this bit (`done` is
@@ -3738,6 +3776,9 @@ pub struct AgentInfo {
     /// Seconds since the agent's semantic state last changed (#175 F3).
     /// Absent when the pane never reported a state transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub status_age_secs: Option<u64>,
     /// The run id this agent was spawned under (#332), when it was spawned
     /// by an agent or the scheduler rather than by the operator.
@@ -3747,6 +3788,7 @@ pub struct AgentInfo {
     /// `agent → commits → PR` is a lookup rather than an inference from
     /// `cwd`. `flk revert-run <id>` consumes the same value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub run_id: Option<String>,
     /// The opaque turn cursor for this agent's terminal (#553), identical to
     /// the one on the pane record.
@@ -3763,6 +3805,7 @@ pub struct AgentInfo {
     /// start work after I said so?". Absent on remote, peer and fleet
     /// summaries, and on servers predating #553.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub turn_cursor: Option<String>,
     /// The agent has a resume plan and no running process (#1010): it was
     /// hibernated, or a restart restored it and its deferred resume has not
@@ -3775,11 +3818,15 @@ pub struct AgentInfo {
     /// Where this agent's questions go (#1179, ADR-0034 §2). Absent on
     /// remote, peer and fleet summaries, and from servers predating #1179.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub questions: Option<QuestionPolicy>,
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "f64"))]
     pub revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PaneInfo {
     pub pane_id: String,
     pub terminal_id: String,
@@ -3787,23 +3834,31 @@ pub struct PaneInfo {
     pub tab_id: String,
     pub focused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub foreground_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub custom_status: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent_session: Option<AgentSessionInfo>,
     /// Whether the operator has seen the pane's latest completed turn
     /// (#175 F3). Missing on older servers ⇒ treated as seen.
@@ -3811,6 +3866,9 @@ pub struct PaneInfo {
     pub seen: bool,
     /// Seconds since the pane's semantic agent state last changed (#175 F3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub status_age_secs: Option<u64>,
     /// The opaque turn cursor for the pane's terminal (#553), the same string
     /// `agent get` reports for the agent in this pane.
@@ -3825,11 +3883,15 @@ pub struct PaneInfo {
     ///
     /// Opaque to callers; pass it to `--after` on a settled wait.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub turn_cursor: Option<String>,
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "f64"))]
     pub revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentSessionInfo {
     pub source: String,
     pub agent: String,
@@ -3995,6 +4057,7 @@ impl DelegationVia {
 /// agent record, set at start, spawn and fork and kept across a restart, a
 /// resume, a hibernation and a live handoff.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionPolicy {
     /// The harness shows its dialog to the operator watching the pane. The
@@ -5059,6 +5122,7 @@ pub struct PeerDialReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Idle,

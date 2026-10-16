@@ -18,7 +18,7 @@ export GIT_CONFIG_VALUE_0 := "main"
 
 # Run tests
 test:
-    cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
+    cargo nextest run --locked --features ts --status-level fail --final-status-level fail --failure-output final --success-output never
     just script-tests
 
 # Maintenance script tests plus the platform-coverage ratchet (#597).
@@ -34,7 +34,7 @@ test-sccache:
 
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
-    cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
+    cargo nextest run --locked --features ts "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
 # Run every guardrails gate over the tree (same set `nix flake check` runs).
 # Standalone, NOT chained into `lint`: the host-bound CI runners (ci.yml) skip
@@ -54,7 +54,7 @@ log-budget seconds='60':
 # Run fast local lint checks
 lint:
     cargo fmt --check
-    cargo clippy --all-targets --locked -- -D warnings
+    cargo clippy --all-targets --locked --features ts -- -D warnings
 
 # Build internal API docs and reject broken links, markup and other warnings.
 doc-check:
@@ -62,13 +62,13 @@ doc-check:
 
 # Run PR CI checks
 ci filter='all()': lint
-    cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+    cargo nextest run --locked --features ts -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
 
 # Build every test binary once into a nextest archive for CI's shard jobs, then
 # fail unless the shards in .config/ci-shards.toml partition `leg`'s tests
 # exactly (#991). Writes the shard matrix to $GITHUB_OUTPUT when set.
 ci-archive leg archive:
-    cargo nextest archive --locked --archive-file "{{archive}}"
+    cargo nextest archive --locked --features ts --archive-file "{{archive}}"
     python3 scripts/ci_shards.py verify --leg "{{leg}}" --archive-file "{{archive}}"
 
 # Run one CI shard, named in .config/ci-shards.toml, from an
@@ -187,3 +187,7 @@ release version='':
 # Print default config
 default-config:
     cargo run --release --locked -- --default-config
+
+# Rewrite the Rust-derived client contracts (ADR-0036 §6).
+gen-ts:
+    cargo nextest run --locked --features ts --run-ignored ignored-only generate_wire_ts_types
