@@ -1277,6 +1277,7 @@ fn state_label_text(state: AgentState, seen: bool) -> &'static str {
     }
 }
 
+// Tabs share workspace attention ordering: unseen done precedes Working (#1679).
 fn tab_aggregate_state(
     tab: &crate::workspace::Tab,
     terminals: &std::collections::HashMap<
@@ -5549,6 +5550,58 @@ mod tests {
             (pos(0) as isize - pos(2) as isize).abs(),
             1,
             "the two checkouts of one project are contiguous: {order:?}"
+        );
+    }
+
+    #[test]
+    fn navigator_tab_done_outranks_working_1679() {
+        let mut state = app_with_workspaces(&["attention"]);
+        let done = state.workspaces[0].tabs[0].root_pane;
+        let working = state.workspaces[0].test_split(Direction::Horizontal);
+        state.workspaces[0].test_add_tab(Some("other"));
+        state.ensure_test_terminals();
+        for (pane, agent_state, seen) in [
+            (done, AgentState::Idle, false),
+            (working, AgentState::Working, true),
+        ] {
+            let id = state.workspaces[0].terminal_id(pane).unwrap().clone();
+            state
+                .terminals
+                .get_mut(&id)
+                .unwrap()
+                .set_detected_state(Some(Agent::Codex), agent_state);
+            state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane)
+                .unwrap()
+                .seen = seen;
+        }
+        state.open_navigator();
+        state
+            .navigator
+            .expanded_workspaces
+            .insert(state.workspaces[0].id.clone());
+        let rows = state.navigator_rows();
+        let tab = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.target,
+                    NavigatorTarget::Tab {
+                        ws_idx: 0,
+                        tab_idx: 0
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            (tab.status, tab.seen),
+            (AgentState::Idle, false),
+            "an unseen finished pane needs attention before a working pane"
+        );
+        assert_eq!(
+            state.workspaces[0].aggregate_state(&state.terminals),
+            (tab.status, tab.seen)
         );
     }
 
