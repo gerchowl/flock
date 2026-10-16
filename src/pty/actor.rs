@@ -285,6 +285,27 @@ impl PtyIoActorHandle {
         Ok(receipt)
     }
 
+    pub(crate) fn try_write_ticket(
+        &self,
+        ticket: crate::pty::write_receipt::WriteCompletion,
+    ) -> Result<(), mpsc::error::TrySendError<crate::pty::write_receipt::WriteCompletion>> {
+        let gate = self.user_writes.lock().unwrap_or_else(|p| p.into_inner());
+        if !gate.accepting || self.writer_health.is_broken() {
+            return Err(mpsc::error::TrySendError::Closed(ticket));
+        }
+        match self.data_tx.try_reserve() {
+            Ok(permit) => {
+                permit.send(PtyIoDataCommand::WriteTrackedInput(ticket));
+                self.wake_actor();
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(mpsc::error::TrySendError::Full(ticket)),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(mpsc::error::TrySendError::Closed(ticket))
+            }
+        }
+    }
+
     fn try_write_command(
         &self,
         command: PtyIoDataCommand,
@@ -936,7 +957,7 @@ impl PtyIoActorRunner {
                     Some(Err(err)) if err.kind() == std::io::ErrorKind::Interrupted => return,
                     Some(Err(err)) => {
                         crate::logging::pty_write_failed(self.pane_id, &err.to_string());
-                        self.discard_pending_writes();
+                        self.retire_tracked_writes();
                         return;
                     }
                     None => {}
@@ -971,12 +992,35 @@ impl PtyIoActorRunner {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return,
                 Err(err) => {
                     crate::logging::pty_write_failed(self.pane_id, &err.to_string());
-                    self.discard_pending_writes();
+                    self.complete_front_write();
+                    self.retire_tracked_writes();
                     return;
                 }
             }
         }
         let _ = self.file.flush();
+    }
+
+    /// A hard error retires tracked requests, retaining later operator keystrokes FIFO.
+    fn retire_tracked_writes(&mut self) {
+        use crate::pty::write_receipt::WriteFailure;
+        self.pending_writes.retain(|(_, ticket)| {
+            if let Some(ticket) = ticket {
+                ticket.retire(WriteFailure::WriteFailed);
+                false
+            } else {
+                true
+            }
+        });
+        for _ in 0..self.data_rx.len() {
+            match self.data_rx.try_recv() {
+                Ok(PtyIoDataCommand::WriteUserInput(bytes)) => self.push_pending(bytes),
+                Ok(PtyIoDataCommand::WriteTrackedInput(ticket)) => {
+                    ticket.retire(WriteFailure::WriteFailed);
+                }
+                Err(_) => break,
+            }
+        }
     }
 
     fn discard_pending_writes(&mut self) {
@@ -1592,6 +1636,67 @@ mod tests {
     }
 
     #[test]
+    fn full_actor_channel_returns_the_same_ticket_for_native_replay() {
+        use crate::pty::write_receipt::{WriteDisposition, WriteFailure, WriteReceipt};
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (data_tx, data_rx) = mpsc::channel(1);
+        let mut runner = runner_on(socket, data_rx);
+        let (control_tx, _control_rx) = std_mpsc::channel();
+        let (wake, _wake_read) = test_wake_pair();
+        let handle = PtyIoActorHandle {
+            data_tx,
+            control_tx,
+            wake,
+            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            controls: runner.controls.clone(),
+            writer_health: runner.writer_health.clone(),
+        };
+        handle
+            .try_write_user_input(Bytes::from_static(b"older"))
+            .unwrap();
+        let deadline = Some(Instant::now() + Duration::from_secs(30));
+        let (ticket, receipt) = WriteReceipt::channel(Bytes::from_static(b"tracked"), deadline);
+        let ticket = match handle.try_write_ticket(ticket) {
+            Err(mpsc::error::TrySendError::Full(ticket)) => ticket,
+            result => panic!("expected the native bounded channel to be full: {result:?}"),
+        };
+        assert_eq!(receipt.progress().failure, None);
+        assert_eq!(receipt.progress().bytes_written, 0);
+        assert_eq!(ticket.pending_bytes(), 7);
+        assert!(!runner.drain_data_commands());
+        handle.try_write_ticket(ticket).unwrap();
+        let (cancelled, cancelled_receipt) =
+            WriteReceipt::channel(Bytes::from_static(b"cancelled"), deadline);
+        let cancelled = match handle.try_write_ticket(cancelled) {
+            Err(mpsc::error::TrySendError::Full(ticket)) => ticket,
+            result => panic!("expected a second full-channel refusal: {result:?}"),
+        };
+        assert_eq!(cancelled_receipt.cancel(), WriteDisposition::Cancelled);
+        assert_eq!(cancelled.pending_bytes(), 0);
+        assert!(!runner.drain_data_commands());
+        handle.try_write_ticket(cancelled).unwrap();
+        assert!(!runner.drain_data_commands());
+        handle
+            .try_write_user_input(Bytes::from_static(b"later"))
+            .unwrap();
+        assert!(!runner.drain_data_commands());
+        runner.flush_pending_writes_once();
+        let mut observed = [0; 17];
+        peer.read_exact(&mut observed).unwrap();
+        assert_eq!(&observed, b"oldertrackedlater");
+        assert!(receipt.try_completed().is_ok());
+        assert_eq!(receipt.progress().bytes_written, 7);
+        assert_eq!(
+            cancelled_receipt.progress().failure,
+            Some(WriteFailure::Cancelled)
+        );
+        assert_eq!(cancelled_receipt.progress().bytes_written, 0);
+        assert!(runner.pending_writes.is_empty());
+    }
+
+    #[test]
     fn tracked_write_completes_only_after_the_final_partial_write() {
         let (mut runner, mut peer, _) = socket_pair_runner();
         let (completion, receipt) =
@@ -1706,7 +1811,49 @@ mod tests {
     }
 
     #[test]
-    fn broken_writer_retires_pending_and_channel_tickets_with_exact_counts() {
+    fn hard_error_preserves_queued_operator_keys_in_order_on_recovery() {
+        let (mut runner, peer, data_tx) = socket_pair_runner();
+        let (ticket, receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(Bytes::from_static(b"fail"), None);
+        runner.enqueue_write(PtyIoDataCommand::WriteTrackedInput(ticket));
+        data_tx
+            .try_send(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+                b"older",
+            )))
+            .unwrap();
+        let (queued, queued_receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(Bytes::from_static(b"retire"), None);
+        data_tx
+            .try_send(PtyIoDataCommand::WriteTrackedInput(queued))
+            .unwrap();
+        drop(peer);
+        runner.flush_pending_writes_once();
+        for receipt in [&receipt, &queued_receipt] {
+            assert_eq!(
+                receipt.progress().failure,
+                Some(crate::pty::write_receipt::WriteFailure::WriteFailed)
+            );
+            assert_eq!(receipt.progress().bytes_written, 0);
+            assert!(receipt.progress().remainder_discarded);
+        }
+        assert!(!runner.writer_health.is_broken());
+        let (socket, mut recovered_peer) = UnixStream::pair().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        recovered_peer
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        runner.file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(socket.into_raw_fd()) });
+        runner.enqueue_write(PtyIoDataCommand::WriteUserInput(Bytes::from_static(
+            b"later",
+        )));
+        runner.flush_pending_writes_once();
+        let mut observed = [0; 10];
+        recovered_peer.read_exact(&mut observed).unwrap();
+        assert_eq!(&observed, b"olderlater");
+    }
+
+    #[test]
+    fn hard_error_retires_pending_and_channel_tickets_with_exact_counts() {
         use crate::pty::write_receipt::{WriteFailure, WriteReceipt};
         let (mut runner, mut peer, data_tx) = socket_pair_runner();
         let (completed, completed_receipt) =
@@ -1738,7 +1885,7 @@ mod tests {
         assert_eq!(queued_receipt.progress().bytes_written, 0);
         assert_eq!(
             queued_receipt.progress().failure,
-            Some(WriteFailure::WriterGone)
+            Some(WriteFailure::WriteFailed)
         );
         for receipt in [partial_receipt, queued_receipt] {
             assert_eq!(
