@@ -35,7 +35,9 @@ This is the ADR-0028 §1a **binding foundation**. A validated binding establishe
 path/metadata/local-writer attribution only, not an idle/working decision. The
 launch-resolved absolute home and writer candidates must come from trusted local
 runtime attribution, never hook JSON, aliases, ambient cwd or another profile.
-S1 supplies the cached launch writer probe. Actual first metadata supplies its
+The captured node/pane and launch generation must match the callback key before
+any path is opened. Late SessionStart claims from a retired launch are rejected
+before changing the current binding. S1 supplies the cached launch writer probe. Actual first metadata supplies its
 own version, so a deferred hook does not require a second writer probe.
 
 File validation runs on a worker with a caller-supplied metadata-byte budget.

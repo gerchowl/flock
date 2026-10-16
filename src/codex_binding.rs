@@ -28,6 +28,19 @@ pub(crate) struct Writer {
     pub birth: u64,
 }
 
+/// Immutable facts captured for a local writer launch, never copied from hook
+/// JSON. Retain the home override and generation chosen before SessionStart.
+pub(crate) struct Launch {
+    /// Canonical local node/pane owning the writer.
+    pub owner: Owner,
+    /// `Binding::launch_generation()` captured when this writer launched.
+    pub generation: u64,
+    /// Absolute launch-resolved CODEX_HOME, with no profile fallback here.
+    pub home: PathBuf,
+    /// Local writer PID and process start identity.
+    pub writer: Writer,
+}
+
 /// Full callback capability. Equal paths or labels do not grant this capability.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Key {
@@ -89,13 +102,17 @@ pub(crate) struct Validated {
 /// Version eligibility is supplied by S1, not re-probed for each claim.
 pub(crate) fn validate(
     key: &Key,
-    home: &Path,
+    launch: &Launch,
     transcript: Option<&Path>,
-    expected_writer: Writer,
     writers: &[Writer],
     compatibility: &Compatibility,
     metadata_limit: u64,
 ) -> Result<Validated, Failure> {
+    if key.owner != launch.owner || key.launch != launch.generation {
+        return Err(Failure::Route);
+    }
+    let home = &launch.home;
+    let expected_writer = launch.writer;
     if writers != [expected_writer]
         || platform::process_start_time(expected_writer.pid) != Some(expected_writer.birth)
     {
@@ -226,10 +243,15 @@ impl Binding {
         }
     }
 
+    /// Capture this scope with the actual launch, not when a later claim arrives.
+    pub fn launch_generation(&self) -> u64 {
+        self.launch
+    }
+
     /// Every attributed SessionStart, including compact and repeated IDs, revokes
     /// the previous generation immediately. A claim alone never resets trust.
-    pub fn begin(&mut self, route: &Owner, thread: String) -> Result<Key, Failure> {
-        if route != &self.owner {
+    pub fn begin(&mut self, route: &Owner, launch: u64, thread: String) -> Result<Key, Failure> {
+        if route != &self.owner || launch != self.launch {
             return Err(Failure::Route);
         }
         self.key = None;

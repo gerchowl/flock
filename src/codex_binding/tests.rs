@@ -37,9 +37,8 @@ impl Fixture {
     fn validate(&self, key: &Key) -> Result<Validated, Failure> {
         validate(
             key,
-            &self.home,
+            &launch(key, &self.home, self.writer),
             Some(&self.path),
-            self.writer,
             &[self.writer],
             &compatibility(),
             4096,
@@ -64,9 +63,21 @@ fn owner(pane: &str) -> Owner {
         pane: pane.into(),
     }
 }
+fn launch(key: &Key, home: &Path, writer: Writer) -> Launch {
+    Launch {
+        owner: key.owner.clone(),
+        generation: key.launch,
+        home: home.to_path_buf(),
+        writer,
+    }
+}
 fn begin(binding: &mut Binding) -> Key {
     binding
-        .begin(&binding.owner.clone(), "child".into())
+        .begin(
+            &binding.owner.clone(),
+            binding.launch_generation(),
+            "child".into(),
+        )
         .unwrap()
 }
 fn bind(binding: &mut Binding, owners: &mut Ownership, fixture: &Fixture) -> Key {
@@ -153,6 +164,12 @@ fn known_launch_retirement_alone_resets_trust_and_revokes_queued_work() {
     let queued = begin(&mut b);
     b.retire(&mut o).unwrap();
     assert_eq!(b.decision(&o), Decision::AwaitingFirstTurn);
+    assert_eq!(
+        b.begin(&old.owner, old.launch, old.thread.clone())
+            .unwrap_err(),
+        Failure::Route
+    );
+    assert_eq!(b.decision(&o), Decision::AwaitingFirstTurn);
     assert!(b.finish(&queued, f.validate(&queued), &mut o).is_err());
     assert!(!b.accepts(&old, &o));
     let new = begin(&mut b);
@@ -209,7 +226,11 @@ fn route_aliases_and_other_nodes_do_not_claim_this_pane() {
             pane: "pane".into(),
         },
     ] {
-        assert_eq!(b.begin(&wrong, "child".into()).unwrap_err(), Failure::Route);
+        assert_eq!(
+            b.begin(&wrong, b.launch_generation(), "child".into())
+                .unwrap_err(),
+            Failure::Route
+        );
         assert_eq!(b.decision(&o), Decision::AwaitingFirstTurn);
     }
 }
@@ -298,9 +319,8 @@ fn metadata_requires_complete_bounded_first_line_without_scanning_ahead() {
     assert_eq!(
         validate(
             &key,
-            &f.home,
+            &launch(&key, &f.home, f.writer),
             Some(&f.path),
-            f.writer,
             &[f.writer],
             &compatibility(),
             1
@@ -326,9 +346,8 @@ fn launch_home_override_missing_path_and_escape_are_never_guessed() {
         assert_eq!(
             validate(
                 &key,
-                &f.home,
+                &launch(&key, &f.home, f.writer),
                 path,
-                f.writer,
                 &[f.writer],
                 &compatibility(),
                 4096
@@ -340,9 +359,8 @@ fn launch_home_override_missing_path_and_escape_are_never_guessed() {
     assert_eq!(
         validate(
             &key,
-            Path::new("relative-home"),
+            &launch(&key, Path::new("relative-home"), f.writer),
             Some(&f.path),
-            f.writer,
             &[f.writer],
             &compatibility(),
             4096
@@ -355,9 +373,8 @@ fn launch_home_override_missing_path_and_escape_are_never_guessed() {
     assert_eq!(
         validate(
             &key,
-            &other_home,
+            &launch(&key, &other_home, f.writer),
             Some(&f.path),
-            f.writer,
             &[f.writer],
             &compatibility(),
             4096
@@ -406,9 +423,8 @@ fn writer_pid_reuse_missing_and_ambiguous_writer_are_rejected() {
         assert_eq!(
             validate(
                 &key,
-                &f.home,
+                &launch(&key, &f.home, f.writer),
                 Some(&f.path),
-                f.writer,
                 &writers,
                 &compatibility(),
                 4096
@@ -425,9 +441,8 @@ fn writer_pid_reuse_missing_and_ambiguous_writer_are_rejected() {
     assert_eq!(
         validate(
             &key,
-            &f.home,
+            &launch(&key, &f.home, absent),
             Some(&f.path),
-            absent,
             &[absent],
             &compatibility(),
             4096
@@ -438,9 +453,8 @@ fn writer_pid_reuse_missing_and_ambiguous_writer_are_rejected() {
     assert_eq!(
         validate(
             &key,
-            &f.home,
+            &launch(&key, &f.home, reused),
             Some(&f.path),
-            reused,
             &[reused],
             &compatibility(),
             4096
@@ -465,9 +479,8 @@ fn binding_consumes_s1_version_evidence_and_records_actual_metadata() {
     assert_eq!(
         validate(
             &key,
-            &f.home,
+            &launch(&key, &f.home, f.writer),
             Some(&f.path),
-            f.writer,
             &[f.writer],
             &evidence,
             4096
@@ -480,9 +493,8 @@ fn binding_consumes_s1_version_evidence_and_records_actual_metadata() {
     assert_eq!(
         validate(
             &key,
-            &f.home,
+            &launch(&key, &f.home, f.writer),
             Some(&f.path),
-            f.writer,
             &[f.writer],
             &evidence,
             4096
@@ -520,9 +532,8 @@ fn cached_writer_probe_without_metadata_uses_actual_first_metadata() {
     probe.metadata_version = None;
     let value = validate(
         &key,
-        &f.home,
+        &launch(&key, &f.home, f.writer),
         Some(&f.path),
-        f.writer,
         &[f.writer],
         &probe,
         4096,
@@ -627,6 +638,7 @@ fn validated_file_keeps_real_metadata_and_ordinal_for_the_reader() {
     let key = b
         .begin(
             &b.owner.clone(),
+            b.launch_generation(),
             meta["payload"]["id"].as_str().unwrap().into(),
         )
         .unwrap();
@@ -666,7 +678,11 @@ fn rejected_rebind_retains_prior_known_live_thread_ownership() {
     let mut o = Ownership::default();
     bind(&mut a, &mut o, &f);
     let bad = a
-        .begin(&a.owner.clone(), "unvalidated-thread".into())
+        .begin(
+            &a.owner.clone(),
+            a.launch_generation(),
+            "unvalidated-thread".into(),
+        )
         .unwrap();
     a.finish(&bad, Err(Failure::Path), &mut o).unwrap_err();
     let key = begin(&mut b);
@@ -688,5 +704,64 @@ fn file_loss_alone_does_not_release_known_live_writer_ownership() {
     assert_eq!(
         b.finish(&key, f.validate(&key), &mut o).unwrap_err(),
         Failure::DuplicateOwner
+    );
+}
+
+#[test]
+fn foreign_node_or_pane_claim_cannot_open_a_local_launch_source() {
+    let f = Fixture::new();
+    let mut b = Binding::new(owner("pane"));
+    let key = begin(&mut b);
+    let captured = launch(&key, &f.home, f.writer);
+    for foreign in [
+        Owner {
+            node: "remote.example".into(),
+            pane: "pane".into(),
+        },
+        owner("other-pane"),
+    ] {
+        let wrong = Key {
+            owner: foreign,
+            ..key.clone()
+        };
+        assert_eq!(
+            validate(
+                &wrong,
+                &captured,
+                Some(&f.path),
+                &[f.writer],
+                &compatibility(),
+                4096
+            )
+            .unwrap_err(),
+            Failure::Route
+        );
+    }
+}
+
+#[test]
+fn stale_launch_capture_cannot_validate_a_current_generation() {
+    let f = Fixture::new();
+    let mut b = Binding::new(owner("pane"));
+    let mut o = Ownership::default();
+    let captured = Launch {
+        owner: b.owner.clone(),
+        generation: b.launch_generation(),
+        home: f.home.clone(),
+        writer: f.writer,
+    };
+    b.retire(&mut o).unwrap();
+    let current = begin(&mut b);
+    assert_eq!(
+        validate(
+            &current,
+            &captured,
+            Some(&f.path),
+            &[f.writer],
+            &compatibility(),
+            4096
+        )
+        .unwrap_err(),
+        Failure::Route
     );
 }
