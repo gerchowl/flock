@@ -22,6 +22,8 @@ use support::fleet;
 /// through `nodeb`'s relay — if the sidebar only reads locally-polled peers and
 /// the carried snapshot, `nodea` sees a strictly smaller fleet than `nodeb`
 /// does, and "the fleet" means something different on every machine.
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn relayed_two_hop_peer_renders_on_the_hub() {
     let fleet = fleet::spawn("gossip-chain", fleet::CHAIN_ABC);
@@ -47,6 +49,8 @@ fn relayed_two_hop_peer_renders_on_the_hub() {
 /// It used to be delivered out of band — a fire-and-forget
 /// `ssh <peer> flk workspace focus` racing the attach — so you arrived on
 /// whatever space that machine was last looking at.
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn selecting_a_remote_space_carries_it_through_the_switch() {
     let fleet = fleet::spawn("switch-focus", fleet::CHAIN_ABC);
@@ -122,6 +126,8 @@ fn focus_workspace_message_lands_the_arriving_client_on_that_space() {
 
 /// Restart uses the same durable directories, and the isolated shell sees
 /// the sandbox rather than the developer's HOME or XDG state.
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn mesh_harness_restart_preserves_state_and_sandboxes_remote_commands() {
     let mut fleet = fleet::spawn("mesh-restart", fleet::LAPTOP_HUB_SPOKE);
@@ -166,6 +172,8 @@ fn shim_command(
 
 /// Cut an actual held relay while a reverse edge remains usable. The marker
 /// prevents reconnects until the test explicitly restores this direction.
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn mesh_harness_kills_a_held_edge_and_restores_only_that_direction() {
     let fleet = fleet::spawn("mesh-cut", fleet::HUB_SPOKES);
@@ -245,6 +253,8 @@ fn relay_probes(
 }
 
 /// Fault modes refuse mesh and the real relay refuses unauthenticated traffic.
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn mesh_harness_disabled_and_mismatched_edges_refuse_unauthenticated_ping() {
     use fleet::{MeshMode, NodeSpec};

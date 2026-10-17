@@ -350,6 +350,8 @@ fn replacement_after_exit_accepts_mail_with_fresh_identity() {
     assert_eq!(restored["agent"]["agent_id"], replacement["agent_id"]);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn explicit_kill_terminates_pending_mail_as_recipient_gone_at_origin() {
     let fleet = fleet::spawn_with_startup_probe("ts-kill", PAIR, |fleet, name| {
@@ -411,6 +413,8 @@ fn explicit_kill_terminates_pending_mail_as_recipient_gone_at_origin() {
     assert_eq!(reason, "killed");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn stale_directory_send_gets_recipient_gone_from_owner() {
     let fleet = fleet::spawn("ts-stale", PAIR);
@@ -510,6 +514,8 @@ fn resume_failure_reports_offline_not_removed() {
     state(node, "failed-resume-mail", "queued");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn reply_to_removed_sender_lands_in_origin_status_not_a_replacement_inbox() {
     let fleet = fleet::spawn("ts-reply", PAIR);

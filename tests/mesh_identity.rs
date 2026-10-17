@@ -29,15 +29,13 @@ impl Fixture {
 
     fn command(&self, session: &str, state: &Path) -> Command {
         let config = self.base.join("config");
-        {
-            let app_dir = support::paths::app_dir_name();
-            fs::create_dir_all(config.join(app_dir).join("sessions").join(session)).unwrap();
-            fs::write(
-                config.join(app_dir).join("config.toml"),
-                "onboarding = false\n[checks]\nenable = false\n",
-            )
-            .unwrap();
-        }
+        let app_dir = support::paths::app_dir_name();
+        fs::create_dir_all(config.join(app_dir).join("sessions").join(session)).unwrap();
+        fs::write(
+            config.join(app_dir).join("config.toml"),
+            "onboarding = false\n[checks]\nenable = false\n",
+        )
+        .unwrap();
         let runtime = self.base.join("run");
         fs::create_dir_all(&runtime).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_flk"));
@@ -299,6 +297,8 @@ fn assert_processes_gone(pids: &[u32]) {
     });
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn node_stop_reaps_shim_grandchildren() {
     use support::fleet::{self, ONE_WAY_PAIR};
@@ -314,6 +314,8 @@ fn node_stop_reaps_shim_grandchildren() {
     assert_processes_gone(&pids);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn kill_edge_leaves_no_orphans() {
     use support::fleet::{self, ONE_WAY_PAIR};
@@ -326,6 +328,8 @@ fn kill_edge_leaves_no_orphans() {
     assert!(!fleet.node_id("nodeb").is_empty());
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn killed_shim_still_leaves_an_owned_relay_to_clean_up() {
     use support::fleet::{self, ONE_WAY_PAIR};
@@ -346,6 +350,8 @@ fn killed_shim_still_leaves_an_owned_relay_to_clean_up() {
     assert_processes_gone(&pids);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn mesh_topology_helpers_observe_routes_and_reload_allow_policy() {
     use support::fleet::{self, LAPTOP_TWO_HUBS};
