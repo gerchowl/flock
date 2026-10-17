@@ -41,6 +41,8 @@ function mount(view: () => ReturnType<typeof App>): HTMLElement {
 const $ = (root: ParentNode, id: string): Element | null => root.querySelector(`[data-testid="${id}"]`);
 const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAll(`[data-testid="${id}"]`)];
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+/** The fleet stream's sub id: the connection allocates every id. */
+const fleetSub = (h: Harness): string => (sentFrames(h).find((frame) => (frame as { t: string; stream?: string }).t === "sub" && (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
 /** The sub id of the latest `sub` for `agent`: ids are unique per connection, not per view. */
 const agentSub = (h: Harness, agent: string): string =>
   (sentFrames(h).filter((frame) => (frame as { t: string; stream?: string }).t === "sub" && (frame as { stream?: string }).stream === `agent/${agent}`).at(-1) as { sub_id: string }).sub_id;
@@ -449,8 +451,8 @@ describe("composer", () => {
     expect($(root, "agent-phase")).toBeNull();
     h.net.current().open();
     h.net.current().deliver(WELCOME);
-    h.net.current().deliver({ t: "gap", sub_id: "f1", from: 1, to: 0, snapshot_to: 0 });
-    h.net.current().deliver({ t: "synced", sub_id: "f1", seq: 0 });
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
     ($(root, "palette-trigger") as HTMLButtonElement).click();
     const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
     search.value = "atlas";
@@ -481,8 +483,8 @@ describe("composer", () => {
     const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
     h.net.current().open();
     h.net.current().deliver(WELCOME);
-    h.net.current().deliver({ t: "gap", sub_id: "f1", from: 1, to: 0, snapshot_to: 0 });
-    h.net.current().deliver({ t: "synced", sub_id: "f1", seq: 0 });
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
     ($(root, "palette-trigger") as HTMLButtonElement).click();
     const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
     search.value = "atlas";
@@ -511,8 +513,8 @@ describe("composer", () => {
     const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
     h.net.current().open();
     h.net.current().deliver(WELCOME);
-    h.net.current().deliver({ t: "gap", sub_id: "f1", from: 1, to: 0, snapshot_to: 0 });
-    h.net.current().deliver({ t: "synced", sub_id: "f1", seq: 0 });
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
     ($(root, "palette-trigger") as HTMLButtonElement).click();
     const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
     search.value = "atlas";
@@ -605,8 +607,8 @@ describe("composer", () => {
     const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
     h.net.current().open();
     h.net.current().deliver(WELCOME);
-    h.net.current().deliver({ t: "gap", sub_id: "f1", from: 1, to: 0, snapshot_to: 0 });
-    h.net.current().deliver({ t: "synced", sub_id: "f1", seq: 0 });
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
     ($(root, "palette-trigger") as HTMLButtonElement).click();
     const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
     search.value = "atlas";
