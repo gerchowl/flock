@@ -234,6 +234,14 @@ pub enum Method {
     EventsWait(EventsWaitParams),
     #[serde(rename = "events.read")]
     EventsRead(EventsReadParams),
+    #[serde(rename = "client.token.add")]
+    ClientTokenAdd(super::client_tokens::AddParams),
+    #[serde(rename = "client.token.rm")]
+    ClientTokenRemove(super::client_tokens::RemoveParams),
+    #[serde(rename = "client.token.list")]
+    ClientTokenList(EmptyParams),
+    #[serde(rename = "client.open")]
+    ClientOpen(EmptyParams),
     #[serde(rename = "channel.hello")]
     ChannelHello(ChannelHelloParams),
     /// ADR-0028 §5 (#1031): park the calling agent on a registered wait and
@@ -475,6 +483,10 @@ impl Method {
             | Self::PaneSplit(_)
             | Self::PaneMove(_)
             | Self::PaneRename(_)
+            | Self::ClientTokenAdd(_)
+            | Self::ClientTokenRemove(_)
+            | Self::ClientTokenList(_)
+            | Self::ClientOpen(_)
             | Self::ChannelHello(_)
             | Self::WaitPark(_)
             | Self::OwnerBind(_)
@@ -2963,6 +2975,15 @@ pub struct ApiListenerHealth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    ClientTokenIssued {
+        issued: super::client_tokens::Issued,
+    },
+    ClientTokenList {
+        entries: Vec<super::client_tokens::Listed>,
+    },
+    ClientOpen {
+        url: super::client_tokens::Bearer,
+    },
     Paste {
         outcome: String,
         reason: String,

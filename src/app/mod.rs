@@ -178,6 +178,8 @@ pub(crate) struct AppRuntimeConfig {
 
 pub struct App {
     pub(crate) runtime_config: AppRuntimeConfig,
+    /// Shared, in-memory one-time browser handoffs, never persisted across restart.
+    pub(crate) client_codes: crate::client_open::Codes,
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
@@ -1082,6 +1084,7 @@ impl App {
             mesh_offers_checked_ms: 0,
             mesh_receipt_log_at: None,
             pending_agent_removals: Default::default(),
+            client_codes: Default::default(),
             delegations: Default::default(),
             goals: Default::default(),
             owner_policies: Default::default(),

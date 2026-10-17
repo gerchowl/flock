@@ -981,3 +981,22 @@ mode-0600 quarantine sidecar retains full typed rows before bodies are
 cleared, with two files capped at 64 MiB each. Copy both before another
 rotation; decode `body.base64` and `envelope.base64` for inspection. Repair a database copy rather than blindly resending mail.
 See [custody recovery](./socket-api.mdx) for storage details.
+
+## Client tokens and browser entry
+
+`flk client token add NAME --scopes read,send,answer,operate`,
+`flk client token list`, and `flk client token rm NAME` manage private GUI
+credentials over the Unix socket. Use `token rm --entry HEX_ID` for an unsafe
+entry reported by list. Only the local operator outside agent panes may use
+these commands; other callers receive `operator_only` (exit 13).
+
+`flk client open [--print]` creates or reuses the operator credential and opens
+a new browser tab or window at a configured loopback URL containing a single-use
+code in its fragment. `--print` prints only the URL, including with `--json`.
+The code is 64 lowercase hex characters. The served GUI derives its transport and
+server URL from its own location; no config script is served.
+The code expires after 60 seconds; it is exchanged once for a bearer and is never
+placed in the query or diagnostic logs. Set `[client] bind = "127.0.0.1:7682"`
+explicitly. This is separate from the terminal bridge's `[web]` settings and
+requires the `web` feature. The structured listener integration is tracked by
+#1828; the exchange router alone does not start a listener.

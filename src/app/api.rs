@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 mod agents;
 mod channels;
 mod checks;
+mod client_tokens;
 mod delegates;
 mod digest;
 mod edges;
@@ -154,16 +155,12 @@ fn run_pr_poll_round(
 
 /// Local-operator evidence borrowed from the classified API request.
 /// Only this dispatcher can construct it; it cannot outlive or mutate its caller.
-// Slice 7b (#1827) connects the token-management socket handlers.
-#[allow(dead_code)]
 pub(crate) struct LocalOperator<'a> {
     _app: &'a mut App,
 }
 
 impl App {
     /// Mint token-management authority only from the existing kernel/lease policy.
-    // Slice 7b (#1827) calls this from token-management socket handlers.
-    #[allow(dead_code)]
     pub(crate) fn client_token_authority(
         &mut self,
     ) -> Result<LocalOperator<'_>, crate::api::error_code::ErrorCode> {
@@ -1410,7 +1407,13 @@ impl App {
         let uid = self.current_api_peer_uid?;
         let code = if matches!(
             request.method,
-            Method::ServerStop(_) | Method::ServerReloadConfig(_) | Method::ServerLiveHandoff(_)
+            Method::ServerStop(_)
+                | Method::ServerReloadConfig(_)
+                | Method::ServerLiveHandoff(_)
+                | Method::ClientTokenAdd(_)
+                | Method::ClientTokenRemove(_)
+                | Method::ClientTokenList(_)
+                | Method::ClientOpen(_)
         ) && !matches!(self.spawn_caller(), spawn::SpawnCaller::Operator { .. })
         {
             Some(ErrorCode::OperatorOnly)
@@ -1583,6 +1586,12 @@ impl App {
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
+            Method::ClientTokenAdd(_)
+            | Method::ClientTokenRemove(_)
+            | Method::ClientTokenList(_)
+            | Method::ClientOpen(_) => {
+                return self.handle_client_token(request.id, request.method);
+            }
             Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),
             Method::WaitPark(params) => return self.handle_wait_park(request.id, params),
             Method::WaitHold(predicate, hold_ms) => {
