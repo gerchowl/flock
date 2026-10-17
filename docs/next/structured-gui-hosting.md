@@ -15,7 +15,12 @@ callers can supply `guiDist` themselves; Cargo callers set `FLOCK_GUI_DIST` to t
 A relative path is resolved against the Cargo manifest directory;
 the default is `web/client/dist`. This build consumes the artifact without
 fetching dependencies or running Vite. The assets, including debug builds, are
-embedded with `rust-embed`; rebuild to consume a changed dist. A non-web build
+embedded with `rust-embed`; rebuild to consume a changed dist. Dist roots and
+entries that are symlinks (including dangling links) are refused before
+embedding. Build inputs must remain unchanged during compilation; immutable
+Nix outputs provide that guarantee. Only existing dist paths are watched; when
+supplying a previously absent bundle, set `FLOCK_GUI_DIST` to its new output path.
+Unchanged embed declarations are not rewritten. A non-web build
 never declares or embeds the GUI assets and has no GUI router.
 
 If the artifact or `index.html` is absent, requests return HTTP 503 with registered
@@ -32,6 +37,9 @@ Slice #1828 merges this stateless router after installing its own state and
 funnel refusal, transport authentication and shutdown. The terminal bridge's
 listener and routes remain separate.
 
+This router requires the HTTP/1 `Host` header. HTTP/2 `:authority` without
+`Host` receives HTTP 403; #1828 must mount it on an HTTP/1 listener.
+
 HTTP Host must match the actual numeric loopback authority including port;
 HTTP port 80 may be omitted in the standard browser form. An Origin, if present,
 must be `http://` plus that authority, with the same default-port normalization. Opaque,
@@ -46,7 +54,8 @@ Serving the static bundle does not grant token scopes or mutation authority.
 
 - `/` and `/index.html` serve the entry document with `Cache-Control: no-cache`
   and a quoted SHA-256 ETag of its embedded bytes.
-- Vite's standard `assets/<name>-<8-character-base64url-hash>.<extension>` files
+- Vite's anchored flat `assets/<name>-<8-character-base64url-hash>.<extension>` files
+  (nonempty ASCII alphanumeric/underscore/hyphen name, alphanumeric extension)
   get `public, max-age=31536000, immutable`, with an ETag. Other files use
   `no-cache`, so a nonstandard naming scheme conservatively revalidates.
 - GET conditional requests support matching, weak/list and wildcard
@@ -60,4 +69,7 @@ Serving the static bundle does not grant token scopes or mutation authority.
   `Vary: Origin, Sec-Fetch-Site`. Refusals are uncached and add no CORS allowance.
 
 Tests serve a committed fixture dist over owned loopback TCP listeners, with
-bounded HTTP reads and cleanup. No live server or model is involved.
+bounded HTTP reads and cleanup. `just gui-check` explicitly supplies the fixture
+at compile time in both feature variants: the web router must serve it and
+the non-web executable must exclude its bytes and refuse the web command.
+Build-generator tests cover unchanged-file timestamps and symlink refusal. No live server or model is involved.

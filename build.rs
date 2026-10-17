@@ -38,9 +38,13 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
+#[path = "src/web/bundle_build.rs"]
+mod bundle_build;
+
 /// Consume the GUI-owned dist output; building it belongs to #1731.
 fn gui_bundle(manifest_dir: &std::path::Path) {
     println!("cargo:rerun-if-env-changed=FLOCK_GUI_DIST");
+    println!("cargo:rerun-if-changed=src/web/bundle_build.rs");
     if env::var_os("CARGO_FEATURE_WEB").is_none() {
         return;
     }
@@ -52,14 +56,10 @@ fn gui_bundle(manifest_dir: &std::path::Path) {
     } else {
         manifest_dir.join(path)
     };
-    println!("cargo:rerun-if-changed={}", path.display());
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    // A missing artifact is an explicit HTTP refusal, not a different frontend.
-    let code = format!(
-        "#[derive(rust_embed::RustEmbed)]\n#[folder = {:?}]\n#[allow_missing = true]\nstruct GuiAssets;\n",
-        path.to_str().expect("FLOCK_GUI_DIST must be valid UTF-8")
-    );
-    fs::write(output.join("gui_assets.rs"), code).expect("write GUI embed declaration");
+    if bundle_build::prepare(&path, &output).expect("prepare symlink-free FLOCK_GUI_DIST") {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
 }
 
 fn main() {

@@ -29,6 +29,8 @@ include!(concat!(env!("OUT_DIR"), "/gui_assets.rs"));
 /// match `http://{bind}` with HTTP's default port normalized; aliases, proxy
 /// origins and opaque origins are refused.
 /// Hashed Vite assets are immutable; every other file revalidates by ETag.
+/// HTTP/1 Host is required. HTTP/2 `:authority` without Host receives 403,
+/// so the mounting listener must serve this router over HTTP/1.
 /// A non-loopback address is rejected before any route is constructed.
 // #1828 mounts this independently delivered router.
 #[allow(dead_code)]
@@ -86,22 +88,25 @@ fn origin_allowed(headers: &HeaderMap, authority: &str) -> bool {
 }
 
 fn immutable(path: &str) -> bool {
-    if !path.starts_with("assets/") {
-        return false;
-    }
-    let name = path.rsplit('/').next().unwrap_or_default();
-    let Some((stem, _extension)) = name.rsplit_once('.') else {
+    // Anchor Vite's default flat assets/[name]-[hash:8].[ext] pattern.
+    let Some(name) = path.strip_prefix("assets/") else {
         return false;
     };
-    // Vite's default fingerprint is eight base64url characters, including '-'.
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
     let Some(separator) = stem.len().checked_sub(9) else {
         return false;
     };
+    let prefix = &stem.as_bytes()[..separator];
     let suffix = &stem.as_bytes()[separator..];
-    suffix[0] == b'-'
-        && suffix[1..]
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    let name_char = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-');
+    !prefix.is_empty()
+        && prefix.iter().all(name_char)
+        && suffix[0] == b'-'
+        && suffix[1..].iter().all(name_char)
+        && !extension.is_empty()
+        && extension.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 fn content_type(path: &str) -> &'static str {

@@ -240,6 +240,12 @@ fn loopback_only_constructor_does_not_bind_and_rejects_routable_or_wildcard_addr
 async fn public_router_uses_the_build_selected_embedded_bundle() {
     let server = Server::with(router).await;
     let (status, headers, body) = server.request("GET", "/", "").await;
+    if option_env!("FLOCK_GUI_DIST")
+        .is_some_and(|path| std::path::Path::new(path).ends_with("tests/fixtures/gui-dist"))
+    {
+        assert_eq!(status, 200, "the configured fixture must be embedded");
+        assert!(body.contains("GUI bundle fixture"));
+    }
     match GuiAssets::get("index.html") {
         Some(file) => {
             assert_eq!(status, 200);
@@ -287,4 +293,46 @@ fn default_http_port_has_equivalent_canonical_host_and_origin_forms() {
             }
         }
     }
+}
+
+#[test]
+fn immutable_cache_requires_the_entire_vite_filename_pattern() {
+    for path in [
+        "assets/main-AbCd-E_1.js",
+        "assets/style-1234ABcd.css",
+        "assets/font_name-1234ABcd.woff2",
+    ] {
+        assert!(immutable(path), "{path}");
+    }
+    for path in [
+        "main-1234ABcd.js",
+        "assets/-1234ABcd.js",
+        "assets/.hidden-1234ABcd.js",
+        "assets/notes.preview-1234ABcd.js",
+        "assets/sub/main-1234ABcd.js",
+        "assets/main-1234ABcd.js.map",
+        "assets/main-1234ABcd.",
+        "assets/main-1234ABcd.j+s",
+        "assets/main-1234ABc.js",
+        "assets/main-1234ABcde.js",
+        "assets/máin-1234ABcd.js",
+        "assets/main-1234ABc!.js",
+    ] {
+        assert!(!immutable(path), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn non_vite_suffix_lookalike_revalidates_over_http() {
+    let server = Server::start::<Fixture>().await;
+    let (status, headers, _) = server
+        .request("GET", "/assets/notes.preview-1234ABcd.js", "")
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-cache");
+}
+
+#[test]
+fn authority_without_http1_host_is_refused() {
+    assert!(!origin_allowed(&HeaderMap::new(), "127.0.0.1:80"));
 }
