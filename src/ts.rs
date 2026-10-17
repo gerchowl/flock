@@ -57,6 +57,12 @@ fn contracts() -> BTreeMap<PathBuf, String> {
     collector.add::<crate::structured_wire::ClientFrame>();
     collector.add::<crate::structured_wire::ServerFrame>();
     collector.add::<crate::structured_wire::fixture::FixtureLine>();
+    collector.add::<crate::structured_wire::FleetAgentRow>();
+    collector.add::<crate::structured_wire::AgentDecide>();
+    collector.add::<crate::structured_wire::PermissionDecision>();
+    collector.add::<crate::structured_wire::FleetDelta>();
+    collector.add::<crate::structured_wire::AgentDecideResult>();
+    collector.add::<crate::structured_wire::AgentDecideErrorCode>();
     let mut files = collector.files;
     // Classification comes from the adapter, so new fixtures cannot silently be skipped.
     let mut fixtures = String::from(

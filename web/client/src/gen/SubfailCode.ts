@@ -3,4 +3,4 @@
 /**
  * Subscription-only refusals (ADR-0036 §5a); sibling streams stay connected.
  */
-export type SubfailCode = "cursor_ahead" | "operator_only" | "unknown_stream" | "scope";
+export type SubfailCode = "cursor_ahead" | "operator_only" | "unknown_stream" | "scope" | "sub_id_reused";

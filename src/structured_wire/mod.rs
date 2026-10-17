@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub(crate) mod fixture;
+mod minimal;
+pub use minimal::{
+    AgentDecide, AgentDecideErrorCode, AgentDecideResult, FleetAgentRow, FleetDelta,
+    PermissionDecision,
+};
 #[cfg(test)]
 mod review_tests;
 #[cfg(test)]
@@ -73,7 +78,7 @@ pub enum ClientFrame {
     },
     /// Subscribe by identity; after is the last applied cursor, never skipped_to.
     Sub {
-        /// Connection-local subscription identity.
+        /// Fresh connection-local identity, never reused even after this sub closes.
         sub_id: String,
         /// ADR-0036 §5 stream path; an unknown/removed path gets unknown_stream.
         stream: String,
@@ -88,7 +93,7 @@ pub enum ClientFrame {
         /// Opaque outstanding ping identity; invalid/replayed values renew nothing.
         nonce: String,
     },
-    /// End just this subscription.
+    /// Close this subscription; clients drop late frames for this identity.
     Unsub {
         /// Identity supplied in sub.
         sub_id: String,
@@ -119,6 +124,8 @@ pub enum SubfailCode {
     UnknownStream,
     /// Stop until read authorization changes.
     Scope,
+    /// Subscription identity was already used on this connection; allocate a fresh one.
+    SubIdReused,
 }
 
 /// Token removed/replaced; ack precedes close 4403. Registered when S7 emits it.
@@ -131,6 +138,8 @@ pub const UNKNOWN_STREAM: &str = "unknown_stream";
 pub const CURSOR_AHEAD: &str = "cursor_ahead";
 /// Stream requires an operator principal.
 pub const OPERATOR_ONLY: &str = "operator_only";
+/// Subscription identity was already used on the current connection.
+pub const SUB_ID_REUSED: &str = "sub_id_reused";
 /// Original command effect remains uncertain; never dispatch a missing claim.
 pub const SESSION_UNCONFIRMED: &str = "session_unconfirmed";
 
@@ -268,7 +277,7 @@ pub enum ServerFrame {
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         seq: u64,
     },
-    /// End only this subscription with a typed recovery/refusal reason.
+    /// Close only this subscription with a typed refusal; drop later frames for its ID.
     Subfail {
         /// Subscription identity.
         sub_id: String,
@@ -295,7 +304,8 @@ pub enum ServerFrame {
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         snapshot_to: Option<u64>,
     },
-    /// Slow subscriber lost buffered frames; re-subscribe from the applied cursor.
+    /// Close this subscription after lost buffered frames; the server emits no more on its ID.
+    /// Re-subscribe with a fresh ID from the applied cursor, without an unsub.
     Lagged {
         /// Subscription identity.
         sub_id: String,

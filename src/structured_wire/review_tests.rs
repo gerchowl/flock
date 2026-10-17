@@ -92,8 +92,15 @@ fn wire_error_constants_match_registered_and_subscription_spellings() {
         (SubfailCode::OperatorOnly, OPERATOR_ONLY),
         (SubfailCode::UnknownStream, UNKNOWN_STREAM),
         (SubfailCode::Scope, SCOPE),
+        (SubfailCode::SubIdReused, SUB_ID_REUSED),
     ] {
-        assert_eq!(serde_json::to_value(code).unwrap(), spelling);
+        assert_eq!(serde_json::to_value(&code).unwrap(), spelling);
+        let frame = json!({"t":"subfail","sub_id":"s1","code":spelling,"message":"Refused"});
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<ServerFrame>(frame.clone()).unwrap())
+                .unwrap(),
+            frame
+        );
     }
     // S7 registers the new auth/scope/stream codes when it starts emitting them.
     let ack = json!({"t":"ack","cmd_id":"c","ok":false,"error":{

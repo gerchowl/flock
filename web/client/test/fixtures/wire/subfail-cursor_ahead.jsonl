@@ -7,8 +7,9 @@
 {"v":1,"step":"client","action":{"kind":"subscribe","sub_id":"s1","stream":"fleet"}}
 {"v":1,"step":"expect","frame":{"t":"sub","sub_id":"s1","stream":"fleet","after":9},"fields":["sub_id","stream","after"],"absent":[]}
 {"v":1,"step":"send","frame":{"t":"subfail","sub_id":"s1","code":"cursor_ahead","message":"fixture refusal"}}
-{"v":1,"step":"expect","frame":{"t":"sub","sub_id":"s1","stream":"fleet"},"fields":["sub_id","stream"],"absent":["after"]}
-{"v":1,"step":"send","frame":{"t":"gap","sub_id":"s1","from":1,"to":0,"snapshot_to":0}}
-{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s1","seq":0}}
-{"v":1,"step":"observe","connection":"Live","streams":{"s1":{"state":"Current","cursor":0}},"outbox":{}}
+{"v":1,"step":"expect","frame":{"t":"sub","sub_id":"s2","stream":"fleet"},"fields":["sub_id","stream"],"absent":["after"]}
+{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s1","seq":99}}
+{"v":1,"step":"send","frame":{"t":"gap","sub_id":"s2","from":1,"to":0,"snapshot_to":0}}
+{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s2","seq":0}}
+{"v":1,"step":"observe","connection":"Live","streams":{"s2":{"state":"Current","cursor":0}},"outbox":{},"absent_streams":["s1"]}
 {"v":1,"step":"quiet","ceiling_ms":1000}
