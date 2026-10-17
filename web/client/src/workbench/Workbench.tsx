@@ -81,7 +81,7 @@ function AgentRowButton(props: { readonly row: AgentRow; readonly focused: boole
 export function InboxCards(props: { readonly cards: readonly InboxCard[] }): JSX.Element {
   return (
     <>
-      <p class="inbox__note">Sample cards: the live inbox arrives with G5 (#1597).</p>
+      <p class="inbox__note">{props.cards.length === 0 ? "The live inbox arrives with G5 (#1597)." : "Sample cards: the live inbox arrives with G5 (#1597)."}</p>
       <For each={sortInbox(props.cards)}>
         {(card) => {
           const reason = createUniqueId();

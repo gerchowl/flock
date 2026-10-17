@@ -177,6 +177,9 @@ export class WireConnection {
   #attempt = 0;
   #timers = new Map<Timer, TimerHandle>();
   #subs = new Map<string, Sub>();
+  /** Every sub id ever opened here: one is never reused (ADR-0038 §3). */
+  #used = new Set<string>();
+  #nextSub = 0;
   /** Sub ids ended by `unsub` on this socket, whose late frames are not errors. */
   #ended = new Set<string>();
   #cursors: Map<string, number>;
@@ -285,16 +288,30 @@ export class WireConnection {
   }
 
   /**
+   * A sub id never used on this connection, as `<prefix><n>`. The counter
+   * lives here, not in a view or adapter, so remounting one cannot reuse an
+   * id whose late frames may still be in flight (ADR-0038 §3).
+   */
+  nextSubId(prefix: string): string {
+    let id: string;
+    do id = `${prefix}${++this.#nextSub}`;
+    while (this.#used.has(id));
+    return id;
+  }
+
+  /**
    * Subscribes `id` to `stream` from `after`, or from the applied cursor
    * this connection holds for the stream. Sent at once when connected,
    * otherwise after the next `welcome`.
+   *
+   * @throws if `id` was already opened on this connection, even if closed since.
    */
   subscribe(id: string, stream: StreamName, handler: StreamHandler, after?: number | null): void {
-    if (this.#subs.has(id)) throw new Error(`subscription ${id} already exists`);
+    if (this.#used.has(id)) throw new Error(`sub id ${id} was already used on this connection`);
+    this.#used.add(id);
     const cursor = after === undefined ? (this.#cursors.get(stream) ?? null) : after;
     const sub: Sub = { id, stream, handler, state: "Replaying", cursor, settled: false, progress: null, refusal: null, snapshot: null };
     this.#subs.set(id, sub);
-    this.#ended.delete(id);
     if (this.#connected()) this.#sendSub(sub);
     this.#settle();
   }

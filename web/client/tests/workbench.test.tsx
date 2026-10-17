@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { render } from "solid-js/web";
 
 import { App } from "../src/App";
+import type { ServerFrame } from "../src/gen/ServerFrame";
 import { createFixtureFleet, type AgentRow, type FleetObserver, type FleetSource } from "../src/fleet";
 import { emptyLayout } from "../src/layout/model";
 import { createFixtureTransport } from "../src/transport/fixture";
@@ -232,6 +233,72 @@ describe("command palette", () => {
     key(document, { key: "k", ctrlKey: true });
     key($(root, "palette")?.querySelector("input") as HTMLInputElement, { key: "Escape" });
     expect($(root, "palette")).toBeNull();
+  });
+});
+
+describe("wire mode, one transport per connection", () => {
+  const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+  const send = (h: Harness, frame: ServerFrame): void => h.step(step({ step: "send", frame }));
+  const agentSubs = (h: Harness): string[] =>
+    sentFrames(h).flatMap((frame) => {
+      const f = frame as { t: string; sub_id: string; stream?: string };
+      return f.t === "sub" && f.stream?.startsWith("agent/") ? [f.sub_id] : [];
+    });
+
+  /** Mounts the wire App, Live with fleet rows atlas, kite and ember. */
+  function liveApp(): { h: Harness; root: HTMLElement } {
+    const h = new Harness();
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.step(step({ step: "open" }));
+    h.step(step({ step: "send", frame: WELCOME }));
+    const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
+    const ids = ["atlas", "kite", "ember"];
+    send(h, { t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: ids.length });
+    ids.forEach((id, i) => send(h, { t: "ev", sub_id: fleet, stream: "fleet", seq: i + 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id, label: id, state: "working", waiting_on_human: [] } } }));
+    send(h, { t: "synced", sub_id: fleet, seq: ids.length });
+    return { h, root };
+  }
+
+  test("switching agents twice opens three distinct sub ids, and the old subs' late frames are ignored", () => {
+    const { h, root } = liveApp();
+    const rows = (): HTMLButtonElement[] => $$(root, "agent-row") as HTMLButtonElement[];
+    rows()[0]?.click();
+    rows()[1]?.click();
+    rows()[2]?.click();
+    const subs = agentSubs(h);
+    expect(subs).toHaveLength(3);
+    expect(new Set(subs).size).toBe(3);
+    const [first, second, current] = subs as [string, string, string];
+    send(h, { t: "ev", sub_id: current, stream: "agent/ember", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "ember's own line" } } });
+    send(h, { t: "synced", sub_id: current, seq: 1 });
+    expect(root.querySelector(".topbar__status")?.textContent).toBe("Live");
+    const pane = $(root, "focus-pane")?.textContent;
+    send(h, { t: "ev", sub_id: first, stream: "agent/atlas", seq: 2, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "late atlas line" } } });
+    send(h, { t: "synced", sub_id: second, seq: 0 });
+    send(h, { t: "subfail", sub_id: first, code: "unknown_stream", message: "gone" });
+    expect(root.querySelector(".topbar__status")?.textContent).toBe("Live");
+    expect($(root, "focus-pane")?.textContent).toBe(pane ?? "");
+    expect(pane).toContain("ember's own line");
+  });
+
+  test("a layout-load notice does not hide the connection status: after 4401 it shows NeedsToken", () => {
+    localStorage.setItem(`flock.layout:${encodeURIComponent("wss://fixture.invalid/v1/ws")}`, "not json");
+    const h = new Harness();
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.step(step({ step: "open" }));
+    h.step(step({ step: "token_refused", code: 4401 }));
+    const status = root.querySelector(".topbar__status")?.textContent ?? "";
+    expect(status).toContain("Saved layout could not be loaded");
+    expect(status).toContain("NeedsToken · The server refused the token.");
+  });
+
+  test("wire mode shows no sample inbox cards; the inbox says it arrives with G5", () => {
+    const { root } = liveApp();
+    expect($$(root, "inbox-card")).toHaveLength(0);
+    expect($(root, "inbox")?.textContent).toContain("The live inbox arrives with G5 (#1597).");
+    expect($(root, "inbox")?.textContent).not.toMatch(/Sample/);
   });
 });
 

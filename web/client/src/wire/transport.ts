@@ -36,10 +36,9 @@ export function sessionEntry(seq: number, ev: WireEvent): SessionEntry {
 
 /** Creates a {@link Transport} whose subscriptions run on `connection`. */
 export function createWireTransport(connection: WireConnection): Transport {
-  let next = 0;
   return {
     subscribe(stream: SessionStream, after: Cursor, observer: SessionObserver): Subscription {
-      const id = `t${++next}`;
+      const id = connection.nextSubId("t");
       let open = true;
       let synced = false;
       const close = (): void => {
