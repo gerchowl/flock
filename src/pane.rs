@@ -23,6 +23,7 @@ use crate::layout::PaneId;
 use crate::pty::actor::{PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadResult};
 
 mod injection_lease;
+pub(crate) use injection_lease::is_interrupt as is_input_interrupt;
 mod input;
 mod kitty_keyboard;
 mod osc;
@@ -2422,15 +2423,15 @@ impl PaneRuntime {
     /// Queue a caller-owned request through the same operator lease/backlog path.
     /// The returned receipt carries admission failure or later completion;
     /// returning a ticket is never an acknowledgement of a completed write.
-    // #1638 connects this transport foundation to API response ownership.
-    #[allow(dead_code)]
     pub(crate) fn try_send_tracked(
         &self,
         bytes: Bytes,
         deadline: std::time::Instant,
+        operator_interrupt: bool,
     ) -> crate::pty::write_receipt::WriteReceipt {
-        let (ticket, receipt) =
+        let (mut ticket, receipt) =
             crate::pty::write_receipt::WriteReceipt::channel(bytes, Some(deadline));
+        ticket.operator_interrupt = operator_interrupt;
         self.has_been_typed_into.set(true);
         if let Some(batch) = self.injection_lease.intercept(
             injection_lease::QueuedInput::Tracked(ticket),
@@ -4016,7 +4017,7 @@ mod tests {
             now + std::time::Duration::from_secs(30),
             now
         ));
-        let receipt = runtime.try_send_tracked(Bytes::from_static(b"expired"), deadline);
+        let receipt = runtime.try_send_tracked(Bytes::from_static(b"expired"), deadline, false);
         assert_eq!(
             receipt.progress().failure,
             None,
@@ -4054,9 +4055,9 @@ mod tests {
         let now = std::time::Instant::now();
         let until = now + std::time::Duration::from_secs(30);
         assert!(runtime.begin_injection_lease("ticket", until, now));
-        let cancelled = runtime.try_send_tracked(Bytes::from_static(b"cancelled"), until);
-        let first = runtime.try_send_tracked(Bytes::from_static(b"first"), until);
-        let second = runtime.try_send_tracked(Bytes::from_static(b"second"), until);
+        let cancelled = runtime.try_send_tracked(Bytes::from_static(b"cancelled"), until, false);
+        let first = runtime.try_send_tracked(Bytes::from_static(b"first"), until, false);
+        let second = runtime.try_send_tracked(Bytes::from_static(b"second"), until, false);
         assert!(runtime.end_injection_lease("ticket"));
         assert!(runtime.has_held_backlog());
         assert_eq!(
@@ -4097,7 +4098,7 @@ mod tests {
             let now = std::time::Instant::now();
             let until = now + std::time::Duration::from_secs(30);
             assert!(runtime.begin_injection_lease("ticket", until, now));
-            let receipt = runtime.try_send_tracked(Bytes::from_static(b"retired"), until);
+            let receipt = runtime.try_send_tracked(Bytes::from_static(b"retired"), until, false);
             runtime
                 .try_send_bytes(Bytes::from_static(b"operator"))
                 .unwrap();
@@ -4126,7 +4127,7 @@ mod tests {
         let now = std::time::Instant::now();
         let until = now + std::time::Duration::from_secs(30);
         assert!(runtime.begin_injection_lease("ticket", until, now));
-        let receipt = runtime.try_send_tracked(Bytes::from_static(b"retired"), until);
+        let receipt = runtime.try_send_tracked(Bytes::from_static(b"retired"), until, false);
         drop(runtime);
         assert_eq!(receipt.progress().bytes_written, 0);
         assert_eq!(
@@ -4146,6 +4147,7 @@ mod tests {
         let receipt = runtime.try_send_tracked(
             Bytes::from(vec![b'p'; 16 * 1024 * 1024]),
             std::time::Instant::now() + std::time::Duration::from_secs(30),
+            false,
         );
         let mut first = [0; 1];
         std::io::Read::read_exact(&mut peer, &mut first).unwrap();
@@ -4177,8 +4179,8 @@ mod tests {
         runtime
             .try_send_bytes(Bytes::from_static(b"operator"))
             .unwrap();
-        let first = runtime.try_send_tracked(Bytes::from_static(b"first"), until);
-        let second = runtime.try_send_tracked(Bytes::from_static(b"second"), until);
+        let first = runtime.try_send_tracked(Bytes::from_static(b"first"), until, false);
+        let second = runtime.try_send_tracked(Bytes::from_static(b"second"), until, false);
         drop(guard);
         assert!(!runtime.end_injection_lease("ticket"));
         for receipt in [first, second] {
