@@ -100,6 +100,22 @@ impl SessionState {
         }
     }
 
+    /// Set the initial registry lifecycle before any stream observations exist.
+    /// Used for cold restored records, without manufacturing a clock or event.
+    pub(super) fn set_initial_lifecycle(&mut self, lifecycle: Lifecycle) {
+        self.lifecycle = lifecycle;
+        self.phase = AgentState::derive(
+            Turn::Unknown,
+            Background::Unknown,
+            Attention::Unknown,
+            lifecycle,
+            Waiting::Unknown,
+            None,
+            StateSources::default(),
+        )
+        .phase;
+    }
+
     /// Reduce one fact using monotonic time for ages and Unix ms for reset times.
     /// `stall_after` is the caller's `[sessions] stall_ms` policy, not a guessed
     /// turn timeout. Call Observe at its boundary; never poll or kill on silence.

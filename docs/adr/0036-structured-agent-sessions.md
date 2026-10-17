@@ -398,6 +398,36 @@ or `agent.session_stalled` EventHub envelopes: `AgentPhaseEvent` and mesh v5
 stay unchanged. #1804 owns the mesh-versioned pane-free event contract.
 No placement is empty or fabricated, and list/side-pane wiring remains #1439.
 
+S3a-3 registry amendment (#1439, owner-approved split). #1841 owns pure
+records, runtime-tagged persistence and the S4 `StateSink` consumer. Each
+registered agent owns a reducer and a generation token. Admission rejects
+conflicting agent ids, names and native session ids without replacing another
+record. Removal and state delivery require the current generation, so late
+worker output cannot alter a replacement. The registry stores the complete S4
+publication, including phase edges, needs-human facts and the next observation
+deadline; it emits no EventHub envelopes (#1804).
+
+Session persistence stores `runtime: structured` identity/name/harness/session,
+cwd and requested model alongside `runtime: pty` pane records. Older snapshots
+without structured records remain valid; older pane records default to PTY.
+Cold restore retains metadata only: lifecycle is offline, observations are
+unknown, and no clock ages, outstanding questions, deadlines, process ids or
+lease proofs survive. Duplicate or invalid structured records reject the
+snapshot rather than silently dropping agents. A registry-only session remains
+persistable even when there are no terminal workspaces. Handoff also restores
+structured records offline; this slice owns no workers to transfer.
+
+#1842 owns runtime workers, actual lease ownership and observation scheduling.
+Its caller must mark session persistence dirty when durable metadata changes.
+#1843 owns the public `StructuredAgentInfo`, additive `structured_agents` list,
+get/status/stop routes and `runtime_unsupported` refusals. Existing PTY
+`AgentInfo` placement fields remain mandatory and unchanged; structured records
+have no fabricated placement. Mesh VERSION stays 5; remote directory rows
+remain #1380. Public structured start stays unreachable until #1843 and #1734
+have landed. The default remains the agent user (#1177); the owner-approved
+MVP exception permits explicit operator-mode opt-in only. #1843 supplies the
+public admission wiring and isolated manual dogfood runbook for that exception.
+
 The caller supplies monotonic observation time and its configured `stall_ms`;
 the reducer never starts a timer, polls a process or kills/retries a turn.
 Every stdout line, including an unknown line, proves progress but an unknown

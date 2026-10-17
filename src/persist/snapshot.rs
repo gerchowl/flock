@@ -17,6 +17,12 @@ pub struct SessionSnapshot {
     /// Format version — used to detect incompatible changes.
     #[serde(default)]
     pub version: u32,
+    /// Pane-free records. Empty in older snapshots, restored offline without authority.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::structured::registry::Registry::is_empty"
+    )]
+    pub structured_agents: crate::structured::registry::Registry,
     pub workspaces: Vec<WorkspaceSnapshot>,
     pub active: Option<usize>,
     pub selected: usize,
@@ -129,8 +135,19 @@ pub struct TabSnapshot {
     pub root_pane: Option<u32>,
 }
 
+/// A pane snapshot always owns a PTY, never a structured runtime.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PtyRuntime {
+    #[default]
+    Pty,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnapshot {
+    /// Additive runtime discriminator. Older pane snapshots are PTY records.
+    #[serde(default)]
+    pub runtime: PtyRuntime,
     pub cwd: PathBuf,
     /// Fleet-global agent identity (see [`crate::terminal::AgentId`]).
     ///
@@ -286,6 +303,8 @@ struct RawSessionSnapshot {
     #[serde(default)]
     workspaces: Vec<serde_json::Value>,
     #[serde(default)]
+    structured_agents: crate::structured::registry::Registry,
+    #[serde(default)]
     active: Option<usize>,
     #[serde(default)]
     selected: usize,
@@ -307,6 +326,7 @@ struct RawSessionSnapshot {
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
     Ok(SessionSnapshot {
+        structured_agents: raw.structured_agents,
         issue_draft: None,
         version: raw.version,
         workspaces: raw
@@ -374,6 +394,7 @@ fn first_pane_id_in_layout(layout: &LayoutSnapshot) -> Option<u32> {
 
 /// Capture the current app state into a serializable snapshot.
 pub fn capture(
+    structured_agents: &crate::structured::registry::Registry,
     workspaces: &[Workspace],
     terminals: &std::collections::HashMap<
         crate::terminal::TerminalId,
@@ -389,6 +410,7 @@ pub fn capture(
     pane_id_aliases: std::collections::HashMap<u32, u32>,
 ) -> SessionSnapshot {
     SessionSnapshot {
+        structured_agents: structured_agents.snapshot(),
         issue_draft: None,
         version: SNAPSHOT_VERSION,
         workspaces: workspaces
@@ -511,6 +533,7 @@ fn capture_tab(
         panes.insert(
             id.raw(),
             PaneSnapshot {
+                runtime: crate::persist::snapshot::PtyRuntime::Pty,
                 cwd,
                 agent_id,
                 label,
@@ -848,6 +871,65 @@ mod tests {
             .all(|pane| pane.hibernated.is_none()));
     }
 
+    #[test]
+    fn structured_registry_round_trips_actual_snapshot_with_pty_records() {
+        use crate::structured::registry::Record;
+        let mut state = state_with_workspaces(&["registry-fixture"]);
+        let record = Record {
+            runtime: crate::structured::registry::StructuredRuntime::Structured,
+            agent_id: "agent_fixture_structured".into(),
+            name: Some("fixture-worker".into()),
+            harness: "claude".into(),
+            session_id: "fixture-session".into(),
+            cwd: std::env::temp_dir().join("registry-fixture"),
+            model: Some("fixture-model".into()),
+        };
+        state.structured_agents.register(record.clone()).unwrap();
+        let captured = capture_from_state(&state);
+        let json = serde_json::to_value(&captured).unwrap();
+        assert_eq!(json["structured_agents"][0]["runtime"], "structured");
+        let panes = json["workspaces"][0]["tabs"][0]["panes"]
+            .as_object()
+            .unwrap();
+        assert!(!panes.is_empty());
+        assert!(panes.values().all(|pane| pane["runtime"] == "pty"));
+        let parsed = parse_snapshot(&json.to_string()).unwrap();
+        assert_eq!(parsed.structured_agents.records(), vec![record.clone()]);
+        let restored = parsed.structured_agents;
+        assert_eq!(restored.records(), vec![record]);
+        assert_eq!(
+            restored
+                .get("agent_fixture_structured")
+                .unwrap()
+                .1
+                .update
+                .state
+                .phase,
+            crate::api::agent_state::Phase::Offline
+        );
+        let mut invalid = json.clone();
+        invalid["structured_agents"]
+            .as_array_mut()
+            .unwrap()
+            .push(json["structured_agents"][0].clone());
+        assert!(parse_snapshot(&invalid.to_string()).is_err());
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("structured_agents");
+        for pane in old["workspaces"][0]["tabs"][0]["panes"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            pane.as_object_mut().unwrap().remove("runtime");
+        }
+        let parsed = parse_snapshot(&old.to_string()).unwrap();
+        assert!(parsed.structured_agents.is_empty());
+        assert!(parsed.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .all(|pane| matches!(pane.runtime, PtyRuntime::Pty)));
+    }
+
     fn capture_from_state(state: &AppState) -> SessionSnapshot {
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         capture_from_state_with_runtimes(state, &terminal_runtimes)
@@ -858,6 +940,7 @@ mod tests {
         terminal_runtimes: &TerminalRuntimeRegistry,
     ) -> SessionSnapshot {
         capture(
+            &state.structured_agents,
             &state.workspaces,
             &state.terminals,
             terminal_runtimes,
@@ -888,6 +971,7 @@ mod tests {
     #[test]
     fn round_trip_empty_session() {
         let snap = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
             issue_draft: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![],
@@ -937,6 +1021,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                runtime: crate::persist::snapshot::PtyRuntime::Pty,
                 agent_id: None,
                 cwd: PathBuf::from("/home/can/Projects/flock"),
                 label: None,
@@ -956,6 +1041,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                runtime: crate::persist::snapshot::PtyRuntime::Pty,
                 agent_id: None,
                 cwd: PathBuf::from("/home/can/Projects/website"),
                 label: Some("website".into()),
@@ -974,6 +1060,7 @@ mod tests {
         );
 
         let snap = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
             issue_draft: None,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wproj".to_string()),
@@ -1247,6 +1334,7 @@ mod tests {
         // Sibling workspaces (#25) group purely via stamped membership — a
         // snapshot round-trip must preserve it or restore loses grouping.
         let snap = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
             issue_draft: None,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wsib".to_string()),
@@ -1641,6 +1729,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                runtime: crate::persist::snapshot::PtyRuntime::Pty,
                 agent_id: None,
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-flock-test"),
                 label: None,
@@ -1660,6 +1749,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                runtime: crate::persist::snapshot::PtyRuntime::Pty,
                 agent_id: None,
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
@@ -1680,6 +1770,7 @@ mod tests {
         );
 
         let snap = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
             issue_draft: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
