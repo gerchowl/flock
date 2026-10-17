@@ -1112,3 +1112,26 @@ fn io_completion_cancellation_does_not_turn_a_rejected_submit_into_stop() {
     assert_eq!(running.finish().outcome, Outcome::Exited);
     assert!(!child.alive());
 }
+
+#[test]
+fn disconnected_acceptance_observer_requests_runtime_stop_and_reaps_child() {
+    let fixture = Fixture::new();
+    // This child ignores EOF and SIGTERM, so pipe cancellation alone cannot
+    // produce the stopped outcome or confirm that the process was reaped.
+    let mut running = fixture.launch("no-read", "2.1.296").unwrap();
+    running.receive_after_accepted();
+    let child = fixture.identity("model.pid");
+    running.runtime.transport.disconnect_acceptance_observer();
+    let error = running
+        .runtime
+        .try_submit(&serde_json::json!({"type":"user"}))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(error.to_string(), "admission observer unavailable");
+    assert!(
+        running.runtime.stop.requested(),
+        "runtime must request stop when its acceptance observer disconnects"
+    );
+    assert_eq!(running.finish().outcome, Outcome::Stopped);
+    assert!(!child.alive(), "owned harness survived runtime stop");
+}

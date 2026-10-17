@@ -2227,11 +2227,9 @@ fn admission_replay_is_skipped_and_stdout_cannot_forge_acceptance() {
 #[test]
 fn disconnected_acceptance_observer_requests_stop_without_admitting_bytes() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-    let (transport, _stdout, _input) = start(&root);
+    let (transport, _stdout, mut input) = start(&root);
     let mut handle = transport.input_handle();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    drop(receiver);
-    handle.accepted = sender;
+    handle.disconnect_acceptance_observer();
     let stop = crate::structured::supervision::StopRequest::default();
     let error = handle
         .try_submit_observed(&user("first"), || stop.request())
@@ -2240,4 +2238,25 @@ fn disconnected_acceptance_observer_requests_stop_without_admitting_bytes() {
     assert!(stop.requested());
     assert!(handle.cancel.load(Ordering::Acquire));
     assert!(!handle.input_inflight());
+    assert_eq!(
+        worker_done(&transport, false).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    // Writer completion closes the only write end, so this read reaches EOF.
+    let mut received_input = Vec::new();
+    input.read_to_end(&mut received_input).unwrap();
+    assert!(
+        received_input.is_empty(),
+        "unexpected stdin bytes: {received_input:?}"
+    );
+}
+
+impl InputHandle {
+    /// Simulate losing the acceptance observer without cancelling other lanes.
+    /// Test-only authority used to verify the runtime's ADR-0036 S4 stop wiring.
+    pub(crate) fn disconnect_acceptance_observer(&mut self) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        self.accepted = sender;
+    }
 }
