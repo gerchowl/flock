@@ -12,6 +12,8 @@
 #![deny(missing_docs)]
 
 use super::claude::SessionEvent;
+use super::permissions::{self, AgentDecide, Book, Principal};
+use crate::api::error_code::ErrorCode;
 use crate::platform::structured as private_fs;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(2);
+
+type Permissions = Arc<parking_lot::Mutex<Book>>;
+struct Control {
+    answer: permissions::Answer,
+    bytes: Vec<u8>,
+}
+enum Input {
+    User(Vec<u8>),
+    Decision(Control),
+}
+struct ControlPlane {
+    book: Permissions,
+    decisions: mpsc::Receiver<Control>,
+    input: mpsc::SyncSender<Input>,
+}
 
 /// Durable stream location. Components are validated before any worker starts.
 pub struct StreamLocation {
@@ -96,7 +113,9 @@ pub struct Transport {
 /// Submission authority separated from worker-owned event receivers.
 #[derive(Clone)]
 pub(super) struct InputHandle {
-    input: Option<mpsc::SyncSender<Vec<u8>>>,
+    input: Option<mpsc::SyncSender<Input>>,
+    decisions: mpsc::SyncSender<Control>,
+    permissions: Permissions,
     busy: Arc<AtomicBool>,
     uncertain: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
@@ -167,7 +186,14 @@ impl Transport {
         }
         private_fs::set_nonblocking(&stdout)?;
         private_fs::set_nonblocking(&stdin)?;
-        let (input, input_rx) = mpsc::sync_channel(1);
+        let (input, input_rx) = mpsc::sync_channel(4);
+        let (decisions, decision_rx) = mpsc::sync_channel(4);
+        let permissions = Arc::new(parking_lot::Mutex::new(Book::new(location.agent.clone())));
+        let plane = ControlPlane {
+            book: permissions.clone(),
+            decisions: decision_rx,
+            input: input.clone(),
+        };
         let (output_tx, output) = mpsc::sync_channel(4);
         let (done, completion) = mpsc::sync_channel(2);
         let busy = Arc::new(AtomicBool::new(false));
@@ -183,17 +209,26 @@ impl Transport {
         thread::Builder::new()
             .name("session-stdout".into())
             .spawn(move || {
-                let result = pump(stdout, location, &version, output_tx, &b, &u, &c);
+                let result = pump(stdout, location, &version, output_tx, &b, &u, &c, &plane);
+                plane.book.lock().end();
                 if result.is_err() {
                     c.store(true, Ordering::Release);
                 }
                 let _ = d.try_send(Completion::Reader(result));
             })?;
         let (c, closed) = (cancel.clone(), close.clone());
+        let writer_permissions = permissions.clone();
         if let Err(err) = thread::Builder::new()
             .name("session-stdin".into())
             .spawn(move || {
-                let result = write_inputs(stdin, input_rx, &c, &closed, before_first_write);
+                let result = write_inputs(
+                    stdin,
+                    input_rx,
+                    &c,
+                    &closed,
+                    before_first_write,
+                    &writer_permissions,
+                );
                 if result.is_err() {
                     c.store(true, Ordering::Release);
                 }
@@ -206,6 +241,8 @@ impl Transport {
         Ok(Self {
             input: InputHandle {
                 input: Some(input),
+                decisions,
+                permissions,
                 busy,
                 uncertain,
                 cancel,
@@ -238,6 +275,20 @@ impl Transport {
     /// Indeterminate loss returns `structured_turn_end_unknown` instead of busy.
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
         self.input.try_submit(user)
+    }
+
+    /// Admit a token-authorized decision without waiting for pipes or disk.
+    pub fn agent_decide(
+        &self,
+        principal: &Principal<'_>,
+        args: &AgentDecide,
+    ) -> Result<(), ErrorCode> {
+        self.input.agent_decide(principal, args)
+    }
+
+    /// Open permission ids; contention fails closed rather than claiming no wait.
+    pub fn waiting_on_human(&self) -> Result<Vec<String>, ErrorCode> {
+        self.input.waiting_on_human()
     }
 
     /// Poll the bounded event queue without waiting. Empty is not EOF.
@@ -278,6 +329,41 @@ impl Drop for Transport {
 }
 
 impl InputHandle {
+    pub(super) fn waiting_on_human(&self) -> Result<Vec<String>, ErrorCode> {
+        Ok(self
+            .permissions
+            .try_lock()
+            .ok_or(ErrorCode::SessionBusy)?
+            .waiting())
+    }
+    pub(super) fn agent_decide(
+        &self,
+        principal: &Principal<'_>,
+        args: &AgentDecide,
+    ) -> Result<(), ErrorCode> {
+        if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        let mut book = self.permissions.try_lock().ok_or(ErrorCode::SessionBusy)?;
+        let answer = book.prepare(principal, args)?;
+        let bytes = match encode(&answer.response) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                book.aborted(&answer.id);
+                return Err(ErrorCode::InvalidParams);
+            }
+        };
+        if let Err(error) = self.decisions.try_send(Control { answer, bytes }) {
+            let control = match error {
+                mpsc::TrySendError::Full(control) | mpsc::TrySendError::Disconnected(control) => {
+                    control
+                }
+            };
+            book.aborted(&control.answer.id);
+            return Err(ErrorCode::SessionBusy);
+        }
+        Ok(())
+    }
     /// Whether an accepted input lacks any top-level result, including Unknown.
     pub(super) fn input_inflight(&self) -> bool {
         self.busy.load(Ordering::Acquire)
@@ -285,7 +371,7 @@ impl InputHandle {
 
     /// Offer one user envelope at idle. WouldBlock means busy; it never queues a
     /// mid-turn steering write. Input is capped before serialization allocation.
-    /// Only this method can reach the private stdin sender; no control bypass.
+    /// This is the only user-input admission path; permission responses use a private lane.
     /// Loss with no identifiable event type yields `structured_turn_end_unknown`
     /// until a real result confirms the boundary; never retry it as ordinary busy.
     pub(super) fn try_submit(&self, user: &Value) -> io::Result<()> {
@@ -298,12 +384,17 @@ impl InputHandle {
         if self.uncertain.load(Ordering::Acquire) {
             return Err(io::Error::other("structured_turn_end_unknown"));
         }
+        let permissions = self
+            .permissions
+            .try_lock()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+        if permissions.blocked() {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
         if user.get("type").and_then(Value::as_str) != Some("user") {
             return Err(io::Error::other("stdin accepts only user envelopes"));
         }
-        let mut bytes = Vec::new();
-        serde_json::to_writer(InputBuffer(&mut bytes), user)?;
-        bytes.push(b'\n');
+        let bytes = encode(user)?;
         if self
             .busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -318,13 +409,20 @@ impl InputHandle {
             .input
             .as_ref()
             .ok_or_else(|| io::Error::other("stdin closed"))?
-            .try_send(bytes)
+            .try_send(Input::User(bytes))
         {
             self.busy.store(false, Ordering::Release);
             return Err(io::Error::other(err.to_string()));
         }
         Ok(())
     }
+}
+
+fn encode(value: &Value) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    serde_json::to_writer(InputBuffer(&mut bytes), value)?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 struct InputBuffer<'a>(&'a mut Vec<u8>);
@@ -350,12 +448,14 @@ fn cancelled() -> io::Error {
 
 fn write_inputs(
     mut pipe: File,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Input>,
     cancel: &AtomicBool,
     close: &AtomicBool,
     before_first_write: impl FnOnce() -> io::Result<()>,
+    permissions: &Permissions,
 ) -> io::Result<()> {
     let mut before_first_write = Some(before_first_write);
+    let mut pending = None;
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(cancelled());
@@ -363,8 +463,23 @@ fn write_inputs(
         if close.load(Ordering::Acquire) {
             return Ok(());
         }
-        match rx.recv_timeout(POLL) {
-            Ok(bytes) => {
+        let next = if pending.is_some() && !permissions.lock().blocked() {
+            Ok(Input::User(
+                pending.take().expect("pending input was checked"),
+            ))
+        } else {
+            rx.recv_timeout(POLL)
+        };
+        match next {
+            Ok(input) => {
+                let (bytes, answer) = match input {
+                    Input::User(bytes) if permissions.lock().blocked() => {
+                        pending = Some(bytes);
+                        continue;
+                    }
+                    Input::User(bytes) => (bytes, None),
+                    Input::Decision(control) => (control.bytes, Some(control.answer)),
+                };
                 if let Some(check) = before_first_write.take() {
                     check()?;
                 }
@@ -388,6 +503,9 @@ fn write_inputs(
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => (),
                         Err(e) => return Err(e),
                     }
+                }
+                if let Some(answer) = answer {
+                    permissions.lock().written(answer)
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => (),
@@ -472,6 +590,7 @@ fn pump(
     busy: &AtomicBool,
     uncertain: &AtomicBool,
     cancel: &AtomicBool,
+    controls: &ControlPlane,
 ) -> io::Result<()> {
     let (mut file, mut seq) = open_stream(location, cancel)?;
     let mut line = Vec::new();
@@ -480,6 +599,11 @@ fn pump(
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(cancelled());
+        }
+        while let Ok(control) = controls.decisions.try_recv() {
+            answer(
+                &mut file, &mut seq, control, version, &tx, busy, uncertain, cancel, controls,
+            )?;
         }
         let n = match pipe.read(&mut chunk) {
             Ok(n) => n,
@@ -492,8 +616,9 @@ fn pump(
         };
         for &byte in &chunk[..n] {
             if byte == b'\n' {
-                emit(
+                observed(
                     &mut file, &mut seq, &line, count, version, &tx, busy, uncertain, cancel,
+                    controls,
                 )?;
                 line.clear();
                 count = 0;
@@ -506,13 +631,86 @@ fn pump(
         }
         if n == 0 {
             if count > 0 {
-                emit(
+                observed(
                     &mut file, &mut seq, &line, count, version, &tx, busy, uncertain, cancel,
+                    controls,
                 )?;
             }
             return Ok(());
         }
     }
+}
+
+fn observed(
+    file: &mut File,
+    seq: &mut u64,
+    line: &[u8],
+    count: u64,
+    version: &str,
+    tx: &mpsc::SyncSender<Received>,
+    busy: &AtomicBool,
+    uncertain: &AtomicBool,
+    cancel: &AtomicBool,
+    controls: &ControlPlane,
+) -> io::Result<()> {
+    let open = if count <= MAX_LINE_BYTES as u64 {
+        match std::str::from_utf8(line).map(|s| SessionEvent::parse(s, version)) {
+            Ok(SessionEvent::CanUseTool(event)) => {
+                let mut book = controls.book.lock();
+                Some(
+                    book.observe(&event.request_id, event.request)
+                        .map_err(|code| io::Error::other(code.as_str()))?,
+                )
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let mut publish = |line: &[u8], count, synthetic| {
+        emit(
+            file, seq, line, count, version, tx, busy, uncertain, cancel, synthetic,
+        )
+    };
+    publish(line, count, false)?;
+    if let Some(audit) = open {
+        let mut raw = encode(&audit)?;
+        raw.pop();
+        publish(&raw, raw.len() as u64, true)?;
+    }
+    Ok(())
+}
+
+fn answer(
+    file: &mut File,
+    seq: &mut u64,
+    control: Control,
+    version: &str,
+    tx: &mpsc::SyncSender<Received>,
+    busy: &AtomicBool,
+    uncertain: &AtomicBool,
+    cancel: &AtomicBool,
+    controls: &ControlPlane,
+) -> io::Result<()> {
+    let mut raw = encode(&control.answer.audit)?;
+    raw.pop();
+    emit(
+        file,
+        seq,
+        &raw,
+        raw.len() as u64,
+        version,
+        tx,
+        busy,
+        uncertain,
+        cancel,
+        true,
+    )?;
+    controls.book.lock().audited(&control.answer);
+    controls
+        .input
+        .try_send(Input::Decision(control))
+        .map_err(|_| io::Error::other("permission writer queue unavailable"))
 }
 
 /// Inspect a bounded JSON object prefix structurally, never matching nested
@@ -554,8 +752,10 @@ fn emit(
     busy: &AtomicBool,
     uncertain: &AtomicBool,
     cancel: &AtomicBool,
+    synthetic: bool,
 ) -> io::Result<()> {
-    let origin = if count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err() {
+    let origin = if synthetic || count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err()
+    {
         RecordOrigin::Flk
     } else {
         RecordOrigin::Claude
@@ -611,7 +811,11 @@ fn emit(
     if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {
         uncertain.store(false, Ordering::Release);
         busy.store(false, Ordering::Release);
-    } else if origin == RecordOrigin::Flk && turn_end == "unknown" && busy.load(Ordering::Acquire) {
+    } else if !synthetic
+        && origin == RecordOrigin::Flk
+        && turn_end == "unknown"
+        && busy.load(Ordering::Acquire)
+    {
         uncertain.store(true, Ordering::Release);
     }
     let mut received = Received { record, event };
