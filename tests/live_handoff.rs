@@ -3600,6 +3600,25 @@ fn live_handoff_names_undrained_pane_and_skip_undrained_proceeds() {
 
 #[test]
 fn s3b_live_handoff_retires_partial_api_input_before_owner_release() {
+    native_write_retirement("pane.write_input", true);
+}
+
+#[test]
+fn s3c_native_legacy_text_deadline_discards_suffix_before_observation() {
+    native_write_retirement("pane.send_text", false);
+}
+
+#[test]
+fn s3c_native_write_text_deadline_discards_suffix_before_observation() {
+    native_write_retirement("pane.write_text", false);
+}
+
+#[test]
+fn s3c_native_agent_send_deadline_discards_suffix_before_observation() {
+    native_write_retirement("agent.send", false);
+}
+
+fn native_write_retirement(method: &str, handoff: bool) {
     use std::os::unix::fs::OpenOptionsExt;
     let _lock = test_lock();
     let directory = SocketDir::reserve("hlh");
@@ -3671,10 +3690,17 @@ with open({gate:?}, "rb") as finish:
         .parse()
         .unwrap();
     assert_ok(try_request_bounded(&api_socket,serde_json::json!({"id":"ready","method":"pane.wait_for_output","params":{"pane_id":pane,"source":"recent","match":{"type":"substring","value":"WRITE_ACK_READY"},"timeout_ms":5000}}),Some(Duration::from_secs(6))).unwrap_or_else(|error|panic!("{}",error.message)));
+    let payload = if handoff {
+        "x".repeat(256 * 1024)
+    } else {
+        "é".repeat(128 * 1024)
+    };
+    let expected = payload.as_bytes().to_vec();
+    let method = method.to_string();
     let flood_socket = api_socket.clone();
     let flood_pane = pane.clone();
     let flood = thread::spawn(move || {
-        try_request_bounded(&flood_socket,serde_json::json!({"id":"flood","method":"pane.write_input","params":{"pane_id":flood_pane,"text":"x".repeat(256*1024),"raw":true,"write_timeout_ms":8000}}),Some(Duration::from_secs(11))).unwrap_or_else(|error|panic!("{}",error.message))
+        try_request_bounded(&flood_socket,serde_json::json!({"id":"flood","method":method,"params":{"pane_id":flood_pane,"target":flood_pane,"text":payload,"raw":true,"write_timeout_ms":if handoff {8000} else {1000}}}),Some(Duration::from_secs(11))).unwrap_or_else(|error|panic!("{}",error.message))
     });
     support::fleet::wait_until("native input prefix", Duration::from_secs(5), || {
         assert_eq!(
@@ -3683,7 +3709,7 @@ with open({gate:?}, "rb") as finish:
             "reader died before observing input"
         );
         match fs::read(&first_byte) {
-            Ok(bytes) if bytes == b"x" => Some(()),
+            Ok(bytes) if bytes == expected[..1] => Some(()),
             Ok(bytes) if bytes.is_empty() => None,
             Ok(bytes) => panic!("unexpected first input byte: {bytes:?}"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -3694,26 +3720,33 @@ with open({gate:?}, "rb") as finish:
         !flood.is_finished(),
         "a partial native write must retain its response owner"
     );
-    assert_ok(
-        try_request_bounded(
-            &api_socket,
-            serde_json::json!({"id":"handoff","method":"server.live_handoff","params":{}}),
-            Some(Duration::from_secs(10)),
-        )
-        .unwrap_or_else(|error| panic!("{}", error.message)),
-    );
+    if handoff {
+        assert_ok(
+            try_request_bounded(
+                &api_socket,
+                serde_json::json!({"id":"handoff","method":"server.live_handoff","params":{}}),
+                Some(Duration::from_secs(10)),
+            )
+            .unwrap_or_else(|error| panic!("{}", error.message)),
+        );
+    }
     let response = flood.join().unwrap();
     assert_eq!(
         response["error"]["code"], "input_write_failed",
         "{response}"
     );
     let evidence = &response["error"]["data"]["input_write"];
-    assert_eq!(evidence["reason"], "owner_changed");
+    assert_eq!(
+        evidence["reason"],
+        if handoff { "owner_changed" } else { "deadline" }
+    );
     assert_eq!(evidence["bytes_total"], 256 * 1024);
     assert_eq!(evidence["remainder_discarded"], true);
     let written = evidence["bytes_written"].as_u64().unwrap() as usize;
     assert!((1..256 * 1024).contains(&written), "{response}");
-    drop(spawned);
+    if handoff {
+        drop(spawned);
+    }
     assert_ok(
         try_request_bounded(
             &api_socket,
@@ -3762,7 +3795,7 @@ with open({gate:?}, "rb") as finish:
         written,
         "retired suffix appeared after handoff"
     );
-    assert!(observed.iter().all(|byte| *byte == b'x'));
+    assert_eq!(observed, expected[..written]);
     let _ = try_request_bounded(
         &api_socket,
         serde_json::json!({"id":"stop","method":"server.stop","params":{}}),

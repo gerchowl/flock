@@ -203,30 +203,41 @@ fn failed_bind_and_unconfirmed_cleanup_only_restrict_the_recorded_root() {
 }
 
 #[test]
-fn short_registry_contention_waits_for_the_existing_identity() {
+fn registry_contention_preserves_identity_after_explicit_release() {
+    #[derive(Debug, PartialEq)]
+    enum ReadStep {
+        Contended(bool),
+        Resolved(Caller),
+    }
+
     let leases = bound();
     let guard = leases.0.lock();
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = leases.clone();
     let worker = std::thread::spawn(move || {
-        tx.send(reader.resolve(Some(10), |_| Some((1, 20))))
-            .unwrap();
+        let contended = reader.0.try_lock().is_none();
+        tx.send(ReadStep::Contended(contended)).unwrap();
+        tx.send(ReadStep::Resolved(
+            reader.resolve(Some(10), |_| Some((1, 20))),
+        ))
+        .unwrap();
     });
-    // Event-driven deadline proves contention doesn't immediately deny the caller.
-    assert!(matches!(
-        rx.recv_timeout(Duration::from_millis(25)),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-    ));
+    // ADR-0037 §1: observed contention commands the holder's release. Both
+    // coherent registry views may resolve before the observer is scheduled.
+    let entered = rx.recv_timeout(Duration::from_secs(1));
     drop(guard);
-    let resolved = rx.recv_timeout(Duration::from_secs(1)).unwrap();
-    worker.join().unwrap();
+    assert_eq!(entered, Ok(ReadStep::Contended(true)));
+    let resolved = rx.recv_timeout(Duration::from_secs(1));
     assert_eq!(
         resolved,
-        Caller::Agent {
+        Ok(ReadStep::Resolved(Caller::Agent {
             agent: "agent".into(),
-            depth: 2
-        }
+            depth: 2,
+        }))
     );
+    // Validate every stage before joining: a live silent reader must fail,
+    // rather than hold nextest open on an unbounded thread join.
+    worker.join().unwrap();
 }
 
 #[test]
