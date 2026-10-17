@@ -42,6 +42,9 @@ fn unknown_pairs_and_incompatible_payloads_preserve_raw() {
         json!({"type":"control_request", "request":{"subtype":"future"}}),
         json!({"type":"control_request", "request":{"subtype":null}}),
         json!({"type":"control_response", "response":{"subtype":"future"}}),
+        json!({"type":"control_cancel_request"}),
+        json!({"type":"control_cancel_request", "request_id":null}),
+        json!({"type":"control_cancel_request", "request_id":42}),
         json!({"type":"result", "subtype":"future", "is_error":false}),
         json!({"type":"assistant", "message":42}),
         json!({"type":"result", "subtype":"success", "is_error":"false"}),
@@ -281,6 +284,7 @@ optional_null_tests! {
     peer_message_hold_optional_fields_accept_null("PeerMessageHold", ["/session_id", "/uuid", "/parent_tool_use_id", "/timestamp"]);
     rate_limit_optional_fields_accept_null("RateLimit", ["/session_id", "/uuid", "/parent_tool_use_id", "/timestamp"]);
     can_use_tool_optional_fields_accept_null("CanUseTool", ["/session_id", "/uuid", "/parent_tool_use_id", "/timestamp"]);
+    control_cancel_optional_fields_accept_null("ControlCancel", ["/session_id", "/uuid", "/parent_tool_use_id", "/timestamp"]);
     control_success_optional_fields_accept_null("ControlSuccess", ["/session_id", "/uuid", "/parent_tool_use_id", "/timestamp"]);
     control_error_optional_fields_accept_null("ControlError", ["/session_id", "/uuid", "/parent_tool_use_id", "/timestamp"]);
     message_start_optional_fields_accept_null("MessageStart", ["/session_id", "/uuid", "/parent_tool_use_id", "/timestamp", "/api_message_id", "/ttft_ms", "/user_message_uuid", "/user_message_uuids"]);

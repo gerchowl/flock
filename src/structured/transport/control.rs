@@ -133,6 +133,22 @@ impl<'a> Recorder<'a> {
                         );
                     }
                 }
+                SessionEvent::ControlCancel(event) => {
+                    match self
+                        .controls
+                        .book
+                        .lock()
+                        .close(Some(&event.request_id), CloseReason::Cancelled)
+                    {
+                        Ok(closed) => closings = closed,
+                        // Repeated or unrelated cancels do not invent audit facts.
+                        Err(
+                            ErrorCode::PermissionRequestUnknown
+                            | ErrorCode::PermissionRequestClosed,
+                        ) => (),
+                        Err(code) => return Err(io::Error::other(code)),
+                    }
+                }
                 SessionEvent::Success(event)
                     if event
                         .parent_tool_use_id
