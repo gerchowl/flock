@@ -58,6 +58,8 @@
           flock-web = pkgs.callPackage ./nix/package.nix {
             buildCommit = self.rev or self.dirtyRev or null;
             withWeb = true;
+            # Until #1731 lands, missing assets receive the typed HTTP 503.
+            guiDist = self.packages.${system}.flock-client or null;
           };
         in
         {
@@ -136,12 +138,15 @@
           default = self.checks.${system}.flock;
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
-          macos-process-facts = pkgs.runCommand "flock-process-c-toolchain-check" {
-            nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
-            SDKROOT = self.packages.${system}.default.SDKROOT;
-          } ''
-            "$CC" -Werror -c ${./src/platform/macos_process.c} -o "$out"
-          '';
+          macos-process-facts =
+            pkgs.runCommand "flock-process-c-toolchain-check"
+              {
+                nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
+                SDKROOT = self.packages.${system}.default.SDKROOT;
+              }
+              ''
+                "$CC" -Werror -c ${./src/platform/macos_process.c} -o "$out"
+              '';
         }
       );
 

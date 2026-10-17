@@ -6,9 +6,13 @@ off-by-default listener and token-authenticated transport belong to #1828;
 this slice does not expose a new CLI or listener by itself.
 
 The GUI-owned #1731 build supplies `packages.<system>.flock-client` from
-`nix/client.nix`: the Vite-built dist directory. Set the build-time
-`FLOCK_GUI_DIST` environment variable to that output path when building the
-`web` feature. A relative path is resolved against the Cargo manifest directory;
+`nix/client.nix`: the Vite-built dist directory. `nix build .#flock-web` passes
+that package output to `nix/package.nix` as `guiDist`, which sets the build-time
+`FLOCK_GUI_DIST` environment variable only for the web feature. This wiring
+uses the bundle provider (#1835); until it lands, the web package has no GUI
+bundle and returns the typed HTTP 503 described below. Direct Nix package
+callers can supply `guiDist` themselves; Cargo callers set `FLOCK_GUI_DIST` to the dist output path.
+A relative path is resolved against the Cargo manifest directory;
 the default is `web/client/dist`. This build consumes the artifact without
 fetching dependencies or running Vite. The assets, including debug builds, are
 embedded with `rust-embed`; rebuild to consume a changed dist. A non-web build
