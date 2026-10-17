@@ -135,12 +135,40 @@ pub struct TabSnapshot {
     pub root_pane: Option<u32>,
 }
 
-/// A pane snapshot always owns a PTY, never a structured runtime.
-#[derive(Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Pane runtime discriminator with lossless retention of unknown tags.
+#[derive(Clone, Default)]
 pub enum PtyRuntime {
+    /// Supported PTY placement, also the default for older snapshots.
     #[default]
     Pty,
+    /// Future tag retained across saves, without automatic agent resume.
+    Unknown(serde_json::Value),
+}
+impl Serialize for PtyRuntime {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Pty => "pty".serialize(serializer),
+            Self::Unknown(raw) => raw.serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for PtyRuntime {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        if raw == "pty" {
+            return Ok(Self::Pty);
+        }
+        tracing::warn!("unknown pane runtime tag retained; automatic agent resume disabled");
+        Ok(Self::Unknown(raw))
+    }
+}
+impl PtyRuntime {
+    pub(super) fn unknown(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Pty => None,
+            Self::Unknown(raw) => Some(raw),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -533,7 +561,13 @@ fn capture_tab(
         panes.insert(
             id.raw(),
             PaneSnapshot {
-                runtime: crate::persist::snapshot::PtyRuntime::Pty,
+                runtime: tab
+                    .panes
+                    .get(id)
+                    .and_then(|pane| terminals.get(&pane.attached_terminal_id))
+                    .and_then(|terminal| terminal.persisted_runtime_tag.clone())
+                    .map(PtyRuntime::Unknown)
+                    .unwrap_or_default(),
                 cwd,
                 agent_id,
                 label,
@@ -912,7 +946,9 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(json["structured_agents"][0].clone());
-        assert!(parse_snapshot(&invalid.to_string()).is_err());
+        let lenient = parse_snapshot(&invalid.to_string()).unwrap();
+        assert_eq!(lenient.structured_agents.records().len(), 1);
+        assert_eq!(lenient.structured_agents.retained_count(), 1);
         let mut old = json;
         old.as_object_mut().unwrap().remove("structured_agents");
         for pane in old["workspaces"][0]["tabs"][0]["panes"]
@@ -928,6 +964,126 @@ mod tests {
             .panes
             .values()
             .all(|pane| matches!(pane.runtime, PtyRuntime::Pty)));
+    }
+
+    async fn assert_lenient_registry_round_trip(case: &str) {
+        use crate::structured::registry::{Record, StructuredRuntime};
+        let root = crate::test_support::TempDir::socket();
+        let mut state = state_with_workspaces(&["first", "second"]);
+        for workspace in &mut state.workspaces {
+            workspace.identity_cwd = root.path().to_owned();
+        }
+        let record = Record {
+            runtime: StructuredRuntime::Structured,
+            agent_id: "agent_fixture_structured".into(),
+            name: Some("fixture-worker".into()),
+            harness: "claude".into(),
+            session_id: "fixture-session".into(),
+            cwd: root.path().to_owned(),
+            model: None,
+        };
+        state.structured_agents.register(record.clone()).unwrap();
+        let mut json = serde_json::to_value(capture_from_state(&state)).unwrap();
+        let mut future = json["structured_agents"][0].clone();
+        future["future_metadata"] = serde_json::json!({"nested": [1, "keep me"]});
+        match case {
+            "runtime" => future["runtime"] = "future-runtime".into(),
+            "harness" => future["harness"] = "future-harness".into(),
+            "duplicate" => future["model"] = "different-second-record".into(),
+            "invalid" => future = serde_json::json!({"runtime":"structured","broken":[1,2]}),
+            "pane" => {
+                let panes = json["workspaces"][0]["tabs"][0]["panes"]
+                    .as_object_mut()
+                    .unwrap();
+                let pane = panes.values_mut().next().unwrap();
+                pane["runtime"] = serde_json::json!({"future":"pane-runtime"});
+                pane["agent_session"] = serde_json::json!({
+                    "source":"flock:codex", "agent":"codex", "kind":"id",
+                    "value":"00000000-0000-4000-8000-000000000001",
+                });
+            }
+            _ => unreachable!(),
+        }
+        if case != "pane" {
+            json["structured_agents"]
+                .as_array_mut()
+                .unwrap()
+                .push(future);
+        }
+        let expected = json["structured_agents"].clone();
+        let parsed =
+            parse_snapshot(&json.to_string()).expect("one bad entry must not lose PTY workspaces");
+        assert_eq!(parsed.structured_agents.records(), vec![record]);
+        let (events, _receiver) = tokio::sync::mpsc::channel(32);
+        let (workspaces, terminals, runtimes) = crate::persist::restore(
+            &parsed,
+            None,
+            24,
+            80,
+            0,
+            &crate::test_support::no_op_program(),
+            crate::config::ShellModeConfig::NonLogin,
+            case == "pane",
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        assert_eq!(workspaces.len(), 2);
+        assert!(terminals
+            .values()
+            .all(|terminal| terminal.pending_agent_resume_plan.is_none()));
+        assert!(workspaces
+            .iter()
+            .all(|workspace| !workspace.tabs[0].panes.is_empty()));
+        let recaptured = capture(
+            &parsed.structured_agents,
+            &workspaces,
+            &terminals,
+            &runtimes.into(),
+            parsed.active,
+            parsed.selected,
+            state.panel_scopes(),
+            24,
+            0.5,
+            Default::default(),
+            Default::default(),
+        );
+        let path = root.path().join("round-trip.json");
+        super::super::io::save_to_path(&path, &recaptured).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            saved["structured_agents"], expected,
+            "raw entries and order survive save"
+        );
+        if case == "pane" {
+            assert!(saved["workspaces"][0]["tabs"][0]["panes"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|pane| pane["runtime"] == serde_json::json!({"future":"pane-runtime"})));
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_runtime_preserves_pty_workspaces_and_raw_record() {
+        assert_lenient_registry_round_trip("runtime").await;
+    }
+    #[tokio::test]
+    async fn unknown_harness_preserves_pty_workspaces_and_raw_record() {
+        assert_lenient_registry_round_trip("harness").await;
+    }
+    #[tokio::test]
+    async fn duplicate_preserves_first_record_pty_workspaces_and_raw_record() {
+        assert_lenient_registry_round_trip("duplicate").await;
+    }
+    #[tokio::test]
+    async fn invalid_record_preserves_pty_workspaces_and_raw_record() {
+        assert_lenient_registry_round_trip("invalid").await;
+    }
+    #[tokio::test]
+    async fn future_pane_runtime_preserves_workspace_and_tag_after_save() {
+        assert_lenient_registry_round_trip("pane").await;
     }
 
     fn capture_from_state(state: &AppState) -> SessionSnapshot {

@@ -223,3 +223,49 @@ fn durable_restore_discards_live_observations_and_authority() {
         Err(RegistryError::Conflict)
     ));
 }
+
+#[test]
+fn disk_duplicates_keep_first_and_retain_raw_order_after_mutation() {
+    let original = record("agent_fixture_a");
+    for field in ["agent_id", "name", "session_id"] {
+        let mut duplicate = record("agent_fixture_b");
+        match field {
+            "agent_id" => duplicate.agent_id = original.agent_id.clone(),
+            "name" => duplicate.name = original.name.clone(),
+            _ => duplicate.session_id = original.session_id.clone(),
+        }
+        let raw = serde_json::json!([original, duplicate]);
+        let mut registry: Registry = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(registry.records(), vec![original.clone()]);
+        assert_eq!(registry.retained_count(), 1);
+        assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), raw);
+        let extra = record("agent_fixture_c");
+        let generation = registry.register(extra.clone()).unwrap();
+        registry.remove(&extra.agent_id, generation).unwrap();
+        assert_eq!(serde_json::to_value(&registry).unwrap(), raw);
+        let generation = registry.get(&original.agent_id).unwrap().2;
+        registry.remove(&original.agent_id, generation).unwrap();
+        assert!(registry.records().is_empty());
+        assert!(
+            !registry.is_empty(),
+            "retained duplicate must not be cleared"
+        );
+        assert_eq!(
+            serde_json::to_value(registry).unwrap(),
+            serde_json::json!([duplicate])
+        );
+    }
+}
+
+#[test]
+fn opaque_prefix_and_known_extra_fields_survive_save_in_original_order() {
+    let mut known = serde_json::to_value(record("agent_fixture_a")).unwrap();
+    known["newer_field"] = serde_json::json!({"kept":[1,2]});
+    let raw = serde_json::json!([
+        {"runtime":"future-runtime","native_data":{"kept":true}}, known, 42,
+    ]);
+    let registry: Registry = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(registry.records(), vec![record("agent_fixture_a")]);
+    assert_eq!(registry.retained_count(), 2);
+    assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), raw);
+}

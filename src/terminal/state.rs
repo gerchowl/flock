@@ -221,6 +221,9 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     /// Failed resume retains identity and mail while the process is offline.
     pub resume_failed: bool,
+    /// Unknown persisted pane runtime tag, retained across rollback saves.
+    /// It grants no agent resume authority.
+    pub(crate) persisted_runtime_tag: Option<serde_json::Value>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     /// True when `persisted_agent_session` was established by a hook report
     /// from the process running in this pane, rather than restored from a
@@ -372,6 +375,7 @@ impl TerminalState {
             last_state_authority: StateAuthority::Screen,
             hook_authority: None,
             agent_metadata: HashMap::new(),
+            persisted_runtime_tag: None,
             persisted_agent_session: None,
             resume_failed: false,
             session_ref_hook_confirmed: false,

@@ -516,11 +516,12 @@ fn restore_tab(
             .map(crate::terminal::AgentId::from_persisted)
             .unwrap_or_else(|| crate::terminal::AgentId::alloc(&crate::app::short_host_name()));
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
+        let unknown_runtime = saved_pane.and_then(|p| p.runtime.unknown());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
             let mut agent_restore = AgentRestoreState {
-                enabled: runtime_context.resume_agents_on_restore,
+                enabled: runtime_context.resume_agents_on_restore && unknown_runtime.is_none(),
                 resumed_sessions: resumed_agent_sessions,
             };
             pane_restore_startup(saved_agent_session, saved_history, &mut agent_restore)
@@ -538,7 +539,7 @@ fn restore_tab(
         // agent resumable, and a cold start is exactly when that request has
         // to hold: the old server's memory, where hibernation used to live, is
         // gone.
-        let saved_hibernation = if was_imported {
+        let saved_hibernation = if was_imported || unknown_runtime.is_some() {
             None
         } else {
             saved_pane
@@ -572,6 +573,7 @@ fn restore_tab(
             }
             terminal.launch_argv = saved_launch_argv.clone();
             terminal.launch_env = saved_pane.map(|p| p.launch_env.clone()).unwrap_or_default();
+            terminal.persisted_runtime_tag = unknown_runtime.cloned();
             terminal.last_prompt = saved_last_prompt.clone();
             terminal.header_reserved = saved_header_reserved;
             if let Some(label) = saved_label {
@@ -646,6 +648,7 @@ fn restore_tab(
                     cwd.clone(),
                 );
                 terminal.launch_env = saved_pane.map(|p| p.launch_env.clone()).unwrap_or_default();
+                terminal.persisted_runtime_tag = unknown_runtime.cloned();
                 terminal.last_prompt = saved_last_prompt.clone();
                 terminal.header_reserved = saved_header_reserved;
                 if was_imported {

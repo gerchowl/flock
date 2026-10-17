@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
@@ -52,10 +53,16 @@ fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io:
     }
     let json = serde_json::to_string_pretty(snapshot)?;
     let tmp_path = target.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &json)?;
+    let mut temporary = std::fs::File::create(&tmp_path)?;
+    temporary.write_all(json.as_bytes())?;
+    temporary.sync_all()?;
+    drop(temporary);
     if let Err(err) = std::fs::rename(&tmp_path, &target) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
     }
     Ok(())
 }

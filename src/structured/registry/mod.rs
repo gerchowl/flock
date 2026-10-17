@@ -6,17 +6,24 @@
 //! and #1734's caller-identity fix. Pane-free EventHub events belong to #1804.
 //! Durable records contain identity and launch metadata only. Cold restore
 //! starts offline with unknown observations and no lease, never an auto-resume.
+//! Unknown/invalid/duplicate disk entries remain raw, inactive and in order across
+//! saves (ADR-0028 §3a). The first supported identity/name/session wins. Warnings
+//! never log raw payloads. Gone processes remain `Lifecycle::Offline`, resumable by explicit
+//! launch only. Opaque retained data never supplies process, state or lease
+//! authority. Metadata admission cannot replace an unknown collection format.
 #![deny(missing_docs)]
 
 use super::state::{Input, SessionState, StateSink, Update};
 use crate::api::agent_state::{AgentState, Lifecycle};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Durable structured identity. The runtime tag cannot describe a PTY record.
-/// No credentials, process identifiers, attention, ages or lease proofs persist.
+/// This typed record writes no credentials, process ids, attention, ages or lease
+/// proofs. Opaque future fields pass through separately without granting authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// Required runtime discriminator, never a PTY or an untagged record.
@@ -70,13 +77,14 @@ impl StateSink for Projection {
 
 struct Entry {
     record: Record,
+    slot: usize,
     generation: u64,
     reducer: SessionState,
     projection: Projection,
 }
 
 impl Entry {
-    fn cold(record: Record, generation: u64) -> Self {
+    fn cold(record: Record, generation: u64, slot: usize) -> Self {
         let mut reducer = SessionState::new(record.agent_id.clone());
         let mut state = AgentState::unknown();
         state.lifecycle = Lifecycle::Offline;
@@ -95,6 +103,7 @@ impl Entry {
         };
         Self {
             record,
+            slot,
             generation,
             reducer,
             projection,
@@ -108,18 +117,27 @@ impl Entry {
 pub struct Registry {
     entries: BTreeMap<String, Entry>,
     generation: u64,
+    preserved: Vec<Option<Value>>,
+    unparsed: Option<Value>,
 }
 impl Registry {
-    /// Whether there are any records, including offline restored agents.
+    /// Whether there is nothing durable, including inactive retained records.
+    /// Unknown-only sessions must survive the application's empty-session cleanup.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.preserved.iter().all(Option::is_none) && self.unparsed.is_none()
     }
 
     /// Admit a record before a worker exists. It starts offline, without authority.
     /// A worker must explicitly supply Live after acquiring its actual lease.
     /// Duplicate identity/name/session and unsupported harnesses are refused.
     pub fn register(&mut self, record: Record) -> Result<u64, RegistryError> {
-        if record.agent_id.is_empty()
+        let raw = serde_json::to_value(&record).map_err(|_| RegistryError::InvalidRecord)?;
+        self.register_raw(record, raw)
+    }
+
+    fn register_raw(&mut self, record: Record, raw: Value) -> Result<u64, RegistryError> {
+        if self.unparsed.is_some()
+            || record.agent_id.is_empty()
             || record.session_id.is_empty()
             || record.harness != "claude"
             || record.name.as_ref().is_some_and(|name| name.is_empty())
@@ -137,8 +155,11 @@ impl Registry {
             .generation
             .checked_add(1)
             .ok_or(RegistryError::GenerationExhausted)?;
-        self.entries
-            .insert(record.agent_id.clone(), Entry::cold(record, generation));
+        self.entries.insert(
+            record.agent_id.clone(),
+            Entry::cold(record, generation, self.preserved.len()),
+        );
+        self.preserved.push(Some(raw));
         self.generation = generation;
         Ok(generation)
     }
@@ -153,7 +174,7 @@ impl Registry {
     /// Apply trusted stream/lifecycle facts to exactly one launch through StateSink.
     /// Caller supplies clocks and stall policy. The returned update carries the
     /// next deadline for #1842, which must schedule it rather than poll.
-    pub fn apply(
+    pub(crate) fn apply(
         &mut self,
         agent_id: &str,
         generation: u64,
@@ -181,10 +202,12 @@ impl Registry {
         {
             return Err(RegistryError::StaleGeneration);
         }
-        self.entries
+        let entry = self
+            .entries
             .remove(agent_id)
-            .map(|entry| entry.record)
-            .ok_or(RegistryError::StaleGeneration)
+            .ok_or(RegistryError::StaleGeneration)?;
+        self.preserved[entry.slot] = None;
+        Ok(entry.record)
     }
 
     /// Durable metadata in stable agent-id order, without observations or authority.
@@ -204,15 +227,27 @@ impl Registry {
                 .map(|(id, entry)| {
                     (
                         id.clone(),
-                        Entry::cold(entry.record.clone(), entry.generation),
+                        Entry::cold(entry.record.clone(), entry.generation, entry.slot),
                     )
                 })
                 .collect(),
             generation: self.generation,
+            preserved: self.preserved.clone(),
+            unparsed: self.unparsed.clone(),
         }
     }
 
-    /// Restore metadata only. Reject conflicts atomically, never adopt a process.
+    /// Inactive retained entries, for diagnostics without exposing raw payloads.
+    /// Slice (a) has no structured status/doctor route; #1843 owns public routing.
+    pub fn retained_count(&self) -> usize {
+        self.preserved.iter().flatten().count() - self.entries.len()
+            + usize::from(self.unparsed.is_some())
+    }
+
+    /// Construct from known typed metadata. Conflicts reject this admission batch.
+    /// Disk deserialization instead retains incompatible entries individually.
+    /// A restored agent whose process is gone stays `Lifecycle::Offline` and resumable,
+    /// without automatically resurrecting a process or acquiring a lease.
     pub fn restore(records: Vec<Record>) -> Result<Self, RegistryError> {
         let mut registry = Self::default();
         for record in records {
@@ -224,15 +259,44 @@ impl Registry {
 
 impl Serialize for Registry {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.records().serialize(serializer)
+        if let Some(raw) = &self.unparsed {
+            return raw.serialize(serializer);
+        }
+        self.preserved
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .serialize(serializer)
     }
 }
 impl<'de> Deserialize<'de> for Registry {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let records = Vec::<Record>::deserialize(deserializer)?;
-        Self::restore(records).map_err(|error| {
-            serde::de::Error::custom(format!("invalid structured registry: {error:?}"))
-        })
+        let raw = Value::deserialize(deserializer)?;
+        let mut registry = Self::default();
+        let Value::Array(records) = raw else {
+            tracing::warn!(
+                "structured registry has an unknown collection shape; retained inactive"
+            );
+            registry.unparsed = Some(raw);
+            return Ok(registry);
+        };
+        for (index, raw) in records.into_iter().enumerate() {
+            let reason = match serde_json::from_value::<Record>(raw.clone()) {
+                Ok(record) => match registry.register_raw(record, raw.clone()) {
+                    Ok(_) => continue,
+                    Err(RegistryError::Conflict) => "duplicate",
+                    Err(_) => "invalid_record",
+                },
+                Err(_) => "unsupported_shape",
+            };
+            tracing::warn!(
+                index,
+                reason,
+                "structured record skipped; raw data retained inactive"
+            );
+            registry.preserved.push(Some(raw));
+        }
+        Ok(registry)
     }
 }
 

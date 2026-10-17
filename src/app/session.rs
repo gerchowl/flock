@@ -126,4 +126,50 @@ mod tests {
         assert!(view.update.needs_human.is_empty());
         assert!(view.update.observe_at.is_none());
     }
+    #[test]
+    fn unknown_only_session_survives_real_startup_and_save() {
+        let _guard = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        let _env = SavedEnv(vec![
+            (
+                crate::config::CONFIG_PATH_ENV_VAR,
+                std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR),
+            ),
+            ("XDG_STATE_HOME", std::env::var_os("XDG_STATE_HOME")),
+        ]);
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        let path = crate::session::data_dir().join("session.json");
+        for raw in [
+            serde_json::json!([{"runtime":"future-runtime","future_data":[1,{"kept":true}]}]),
+            serde_json::json!({"future_collection":["kept"]}),
+        ] {
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "workspaces":[],"active":null,"selected":0,"structured_agents":raw,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(
+                &crate::config::Config::default(),
+                false,
+                None,
+                rx,
+                crate::api::EventHub::default(),
+            );
+            assert!(app.state.workspaces.is_empty());
+            assert!(app.state.structured_agents.records().is_empty());
+            assert_eq!(app.state.structured_agents.retained_count(), 1);
+            app.save_session_now();
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved["structured_agents"], raw);
+        }
+    }
 }
