@@ -1,3 +1,6 @@
+// Fake SSH relay requires the debug-only ancestry override (#1715).
+#![cfg(debug_assertions)]
+
 //! Step-1 acceptance: real sandbox servers and agent CLI calls over one-hop edges.
 mod support;
 

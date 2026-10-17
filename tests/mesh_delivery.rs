@@ -4,6 +4,8 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use support::fleet::{self, Node, NodeSpec};
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 const PAIR: &[NodeSpec] = &[
     NodeSpec::new("nodea", "mesh-origin", &["nodeb"]),
     NodeSpec::new("nodeb", "mesh-recipient", &[]),
@@ -32,6 +34,8 @@ fn agent(node: &Node) -> Value {
     started["result"]["agent"].clone()
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn discover(fleet: &fleet::Fleet, recipient: &Value) {
     fleet.wait_route("nodea", "nodeb", true);
     fleet::wait_until("recipient discovery", Duration::from_secs(90), || {
@@ -43,6 +47,8 @@ fn discover(fleet: &fleet::Fleet, recipient: &Value) {
     });
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn send(fleet: &fleet::Fleet, recipient: &Value, correlation: &str) -> Value {
     request(
         fleet.node("nodea"),

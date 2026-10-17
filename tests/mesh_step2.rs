@@ -2,10 +2,18 @@
 mod support;
 
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
-use support::fleet::{self, Fleet, Node, NodeSpec};
+use std::time::Duration;
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
+use std::time::Instant;
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
+use support::fleet::Fleet;
+use support::fleet::{self, Node, NodeSpec};
 
 const DEADLINE: Duration = Duration::from_secs(30);
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 const DIRECT: &[NodeSpec] = fleet::ONE_WAY_PAIR;
 
 fn api(node: &Node, method: &str, params: Value) -> Value {
@@ -27,6 +35,8 @@ fn quote(text: &str) -> String {
 
 struct Agent {
     id: String,
+    // Only relay CLI helpers need the pane handle (#1715).
+    #[cfg(debug_assertions)]
     pane: String,
 }
 
@@ -42,15 +52,20 @@ impl Agent {
         );
         Self {
             id: started["agent"]["agent_id"].as_str().unwrap().into(),
+            #[cfg(debug_assertions)]
             pane: started["agent"]["pane_id"].as_str().unwrap().into(),
         }
     }
 
     // Execute inside the real agent ancestry, including on an edge-less spoke.
+    // Used only by debug-only fake SSH relay tests (#1715).
+    #[cfg(debug_assertions)]
     fn cli(&self, node: &Node, args: &[&str]) -> Value {
         cli_result(&self.start_cli(node, args))
     }
 
+    // Used only by debug-only fake SSH relay tests (#1715).
+    #[cfg(debug_assertions)]
     fn start_cli(&self, node: &Node, args: &[&str]) -> std::path::PathBuf {
         let output = node.home.join("acceptance-cli.json");
         for path in [
@@ -78,6 +93,8 @@ impl Agent {
     }
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn cli_result(output: &std::path::Path) -> Value {
     let response: Value = fleet::wait_until("agent CLI result", DEADLINE, || {
         if let Ok(code) = fs::read_to_string(output.with_extension("status")) {
@@ -96,6 +113,8 @@ fn cli_result(output: &std::path::Path) -> Value {
     response["result"].clone()
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 struct Conversation {
     fleet: Fleet,
     sender: Agent,
@@ -103,6 +122,7 @@ struct Conversation {
     target: String,
 }
 
+#[cfg(debug_assertions)]
 impl Conversation {
     fn new(specs: &[NodeSpec]) -> Self {
         Self::to(specs, "nodeb")
@@ -187,10 +207,14 @@ impl Conversation {
     }
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn status(node: &Node, correlation: &str) -> Value {
     api(node, "msg.status", json!({"correlation_id":correlation}))
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn delivery_attempts(fleet: &Fleet, from: &str, to: &str, correlation: &str) -> usize {
     std::fs::read_to_string(fleet.base.join(format!("delivery-attempts-{from}-{to}")))
         .unwrap_or_default()
@@ -223,10 +247,14 @@ fn state(node: &Node, correlation: &str, expected: &str) -> Value {
     )
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn read(node: &Node, pane: &str) -> Value {
     api(node, "msg.read", json!({"pane":pane}))["messages"].clone()
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn mail(node: &Node, pane: &str) -> Value {
     let started = Instant::now();
     fleet::wait_until("inbox delivery", DEADLINE, || {
@@ -242,6 +270,8 @@ fn mail(node: &Node, pane: &str) -> Value {
 }
 
 // Every node's rows, so a stalled leg names its sender and its backoff.
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn custody(node: &Node) -> String {
     let Some(Ok(entries)) = node.home.parent().map(fs::read_dir) else {
         return String::new();
@@ -291,11 +321,15 @@ fn db(node: &Node) -> rusqlite::Connection {
     db
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn cut(fleet: &Fleet, from: &str, to: &str) {
     fleet.refuse_edge(from, to);
     fleet.kill_edge(from, to, Duration::from_secs(10));
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn reconnect(fleet: &Fleet, from: &str, to: &str) {
     fleet.allow_edge(from, to);
     fleet::wait_until("replacement edge enrolled", DEADLINE, || {
@@ -309,6 +343,8 @@ fn reconnect(fleet: &Fleet, from: &str, to: &str) {
 
 // Advance fixture deadlines only after a deliberate partition. Production
 // backoff remains unchanged, and every delivery still crosses the real edge.
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn due(node: &Node) {
     db(node)
         .execute(
@@ -318,10 +354,14 @@ fn due(node: &Node) {
         .unwrap();
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn scalar(node: &Node, sql: &str) -> i64 {
     db(node).query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn once(node: &Node, correlation: &str) {
     assert_eq!(
         db(node)
@@ -337,6 +377,8 @@ fn once(node: &Node, correlation: &str) {
     );
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn routes(node: &Node) -> Vec<Value> {
     api(node, "peers.enrollment", json!({}))["routes"]
         .as_array()
@@ -344,6 +386,8 @@ fn routes(node: &Node) -> Vec<Value> {
         .clone()
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn route(node: &Node, target: &Node) -> Value {
     let id = fleet::node_id(target);
     fleet::wait_until("live route", DEADLINE, || {
@@ -351,6 +395,8 @@ fn route(node: &Node, target: &Node) -> Value {
     })
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn raw(node: &Node, method: &str, params: Value) -> Value {
     serde_json::from_str(
         &node.api(&json!({"id":"s2", "method":method, "params":params}).to_string()),
@@ -358,6 +404,8 @@ fn raw(node: &Node, method: &str, params: Value) -> Value {
     .unwrap()
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn send_as(node: &Node, sender: &Agent, receiver: &Agent, correlation: &str) -> Value {
     api(
         node,
@@ -367,6 +415,8 @@ fn send_as(node: &Node, sender: &Agent, receiver: &Agent, correlation: &str) -> 
     )
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn round_trip(c: &Conversation) {
     let sent = c.send();
     assert!(
@@ -389,6 +439,8 @@ fn round_trip(c: &Conversation) {
     );
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn cli_answer(c: &Conversation) {
     for args in [
         vec!["msg", "status", "question"],
@@ -483,6 +535,8 @@ fn one_way_edge_carries_both_directions() {
 // test-side `due`, and nowhere near the 299 s idle poll (#879). A silent loss
 // leaves the collector healthy, so the hub's wake carries it. A failed poll
 // holds wakes off, so the collector's own failure retry carries it.
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn lost_offer_on_one_way_edge_is_reoffered_after_backoff(how: &str) {
     let c = Conversation::new(DIRECT);
     round_trip(&c);
@@ -566,6 +620,8 @@ fn failed_offer_on_one_way_edge_is_reoffered_after_backoff() {
 
 // Wait until no edge has polled for 8 s, so each dialer sits on its idle
 // ladder rather than on the tail of the round trip's own receipt traffic.
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn quiesce(fleet: &Fleet, specs: &[NodeSpec]) {
     let polls = |name: &str, peer: &str| {
         fs::read_to_string(fleet.base.join(format!("outbound-polls-{name}-{peer}")))
@@ -595,6 +651,8 @@ fn quiesce(fleet: &Fleet, specs: &[NodeSpec]) {
 // is down, the summary is the only prompt left, so it must carry that debt or
 // the read waits for the idle poll, 60 to 299 s out once the edge has any
 // history (#780). The round trip first gives every edge that history.
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn read_receipt_reaches_origin_without_wakes(specs: &[NodeSpec], target: &str) {
     let c = Conversation::to(specs, target);
     round_trip(&c);
@@ -920,6 +978,8 @@ fn withdrawn_return_route_keeps_reply_at_spoke_until_second_hub_connects() {
     once(spoke, "question");
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn wait_unrouted_reply(node: &Node, correlation: &str) {
     fleet::wait_until("reply held without a stale next hop", DEADLINE, || {
         // A bounded API request checks the producer before each bounded DB probe.
@@ -941,6 +1001,8 @@ fn wait_unrouted_reply(node: &Node, correlation: &str) {
     });
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn sender_cli_state(c: &Conversation, expected: &str) -> Value {
     let started = Instant::now();
     fleet::wait_until("sender CLI receives routed outcome", DEADLINE, || {
@@ -1010,6 +1072,8 @@ fn two_hubs_hold_edges_to_one_spoke_concurrently() {
 
 // Patch only this sandbox's transport, before its first dial. No live server
 // or shared shim is changed. Markers prove the fault traversed the held edge.
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn shim(fleet: &Fleet, marker: &str, source: &str) {
     let path = fleet.base.join("bin/ssh");
     let text = std::fs::read_to_string(&path).unwrap();
@@ -1197,6 +1261,8 @@ fn allow_from_checks_origin_not_the_allowed_forwarding_hub() {
 }
 // Record the writer's connection-local total_changes in the transaction that
 // mutates each table. A separate observer connection cannot read that counter.
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn trace_writes(node: &Node) {
     let db = db(node);
     let tables = db

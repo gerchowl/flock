@@ -201,6 +201,8 @@ fn mesh_harness_kills_a_held_edge_and_restores_only_that_direction() {
     assert_eq!(reply["error"]["code"], "mesh_not_enrolled", "{reply}");
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn relay_probe(fleet: &fleet::Fleet, from: &str, to: &str, method: &str) -> serde_json::Value {
     relay_probes(
         fleet,

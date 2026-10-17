@@ -2,8 +2,13 @@
 mod support;
 use serde_json::{json, Value};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
-use support::fleet::{self, Fleet, Node, NodeSpec};
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
+use support::fleet::Fleet;
+use support::fleet::{self, Node, NodeSpec};
 const DEADLINE: Duration = Duration::from_secs(45);
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 const PAIR: &[NodeSpec] = &[
     NodeSpec::new("nodea", "tombstone-origin", &["nodeb"]),
     NodeSpec::new("nodeb", "tombstone-owner", &[]),
@@ -73,6 +78,8 @@ fn state(node: &Node, correlation: &str, expected: &str) -> Value {
 fn close(node: &Node, agent: &Value) {
     api(node, "pane.close", json!({"pane_id":agent["pane_id"]}));
 }
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn discover(fleet: &Fleet, target: &Value) {
     fleet.wait_route("nodea", "nodeb", true);
     fleet::wait_until("remote recipient", DEADLINE, || {

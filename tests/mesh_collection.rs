@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use support::fleet::{self, Node, NodeSpec};
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 const PAIR: &[NodeSpec] = &[
     NodeSpec::new("nodea", "mesh-origin", &["nodeb"]),
     NodeSpec::new("nodeb", "mesh-recipient", &[]),
@@ -34,6 +36,8 @@ fn agent(node: &Node) -> Value {
     started["result"]["agent"].clone()
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn discover(fleet: &fleet::Fleet, recipient: &Value) {
     let location = fleet::wait_until("recipient discovery", Duration::from_secs(90), || {
         request(fleet.node("nodea"), "agent.list", json!({}))["result"]["fleet"]
@@ -45,6 +49,8 @@ fn discover(fleet: &fleet::Fleet, recipient: &Value) {
     fleet.wait_route("nodea", location["host"].as_str().unwrap(), true);
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn send(fleet: &fleet::Fleet, recipient: &Value, correlation: &str) -> Value {
     request(
         fleet.node("nodea"),
@@ -57,6 +63,8 @@ fn send(fleet: &fleet::Fleet, recipient: &Value, correlation: &str) -> Value {
     )
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn read(node: &Node, pane: &Value) -> Value {
     request(node, "msg.read", json!({"pane":pane}))["result"]["messages"].clone()
 }
@@ -81,6 +89,8 @@ fn reply(node: &Node, correlation: &str, body: &str) -> Value {
     )
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn ready(node: &Node) {
     // Move only this sandbox's scheduler deadline, not production backoff or timeouts.
     database(node)
@@ -88,6 +98,8 @@ fn ready(node: &Node) {
         .unwrap();
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn answers(node: &Node, pane: &Value) -> Value {
     fleet::wait_until("collected answer", Duration::from_secs(30), || {
         let messages = read(node, pane);
@@ -97,10 +109,14 @@ fn answers(node: &Node, pane: &Value) -> Value {
 
 /// Keep the held answer on the collect lane. The outbound poll offers it too,
 /// and when that poll wins it bypasses the collect-lane fault under test.
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn withhold_outbound_answers(fleet: &fleet::Fleet) {
     std::fs::write(fleet.base.join("withhold-outbound-answers-nodea-nodeb"), "").unwrap();
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn question(fleet: &fleet::Fleet, correlation: &str) -> (Value, Value) {
     let sender = agent(fleet.node("nodea"));
     let recipient = agent(fleet.node("nodeb"));
@@ -435,6 +451,8 @@ fn local_held_answer_and_deferral_use_custody_and_keep_existing_wait_semantics()
     );
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn enrolled(node: &Node, peer: &str) {
     fleet::wait_until("outbound edge enrolled", Duration::from_secs(30), || {
         request(node, "peers.enrollment", json!({}))["result"]["peers"]
@@ -1049,6 +1067,8 @@ fn custody_status_read_receipt_and_wait_survive_audit_rotation_and_restart() {
 
 // This integration probe executes the real CLI against only its isolated server.
 #[allow(clippy::disallowed_methods)]
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn cli_status(node: &Node, correlation: &str) -> Value {
     let output = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
         .env_clear()

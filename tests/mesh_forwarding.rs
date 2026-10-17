@@ -1,3 +1,6 @@
+// Fake SSH relay requires the debug-only ancestry override (#1715).
+#![cfg(debug_assertions)]
+
 //! Requests traverse authenticated custody hops in isolated real servers.
 mod support;
 use serde_json::{json, Value};

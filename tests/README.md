@@ -19,7 +19,15 @@ The local fake SSH relay needs `FLOCK_TEST_RELAY_ANCESTOR=flk` in place of real
 sshd ancestry. The product deliberately honors this substitution only with debug
 assertions (`src/app/api/edges.rs::relay_ancestor_override`); release must never
 accept that environment variable as remote-caller authority. Every test using
-this substitution has its own documented `#[cfg(debug_assertions)]` gate.
+this substitution has a documented `#[cfg(debug_assertions)]` gate.
+The fully relay-dependent `mesh_step1`, `mesh_forwarding`, `mesh_routes` and
+`mcp_fleet_messaging` crates also have file-level gates, so their imports,
+helpers and copies of shared support tests are omitted from release builds.
+Mixed crates gate only relay-dependent helpers and imports. Across the 13
+affected binaries, debug retains 485 cases and release retains 227: the
+difference is these 182 relay tests plus 76 shared support-test copies from
+the four gated crates. The same shared support tests still run in the
+release-enabled crates.
 Single-node and unrelated tests remain available in release, including the
 actual detached-daemon reaping and cleanup matcher tests.
 

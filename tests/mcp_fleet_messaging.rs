@@ -1,3 +1,6 @@
+// Fake SSH relay requires the debug-only ancestry override (#1715).
+#![cfg(debug_assertions)]
+
 //! E2E: an agent on one host discovers and messages an agent on ANOTHER host,
 //! using only MCP tools (#320).
 //!

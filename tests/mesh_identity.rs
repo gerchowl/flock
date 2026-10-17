@@ -272,6 +272,8 @@ fn mesh_identity_unbound_warning_reaches_ping_summary_and_status() {
     );
 }
 
+// Only the debug-only fake SSH cleanup tests use this helper (#1715).
+#[cfg(debug_assertions)]
 fn recorded_edge_processes(fleet: &support::fleet::Fleet) -> Vec<u32> {
     fleet.wait_for_edge("nodea", "nodeb", Duration::from_secs(10));
     let mut pids = Vec::new();
@@ -289,6 +291,8 @@ fn recorded_edge_processes(fleet: &support::fleet::Fleet) -> Vec<u32> {
     pids
 }
 
+// Only the debug-only fake SSH cleanup tests use this helper (#1715).
+#[cfg(debug_assertions)]
 fn assert_processes_gone(pids: &[u32]) {
     support::fleet::wait_until("shim descendants to exit", Duration::from_secs(5), || {
         pids.iter()

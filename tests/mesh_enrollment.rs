@@ -2,8 +2,13 @@ mod support;
 
 use serde_json::{json, Value};
 use std::time::Duration;
-use support::fleet::{self, MeshMode, Node, NodeSpec};
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
+use support::fleet::MeshMode;
+use support::fleet::{self, Node, NodeSpec};
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 const PAIR: &[NodeSpec] = &[
     NodeSpec::new("dialer.test", "mesh-dialer", &["acceptor.test"]),
     NodeSpec::new("acceptor.test", "mesh-acceptor", &[]),
@@ -16,6 +21,8 @@ fn request(node: &Node, method: &str, params: Value) -> Value {
     .unwrap()
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn enrollment(node: &Node, peer: &str, state: &str) -> Value {
     fleet::wait_until("mesh enrollment", Duration::from_secs(90), || {
         let response = request(node, "peers.enrollment", json!({}));
@@ -48,6 +55,8 @@ fn cli_text(node: &Node, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn cli(node: &Node, args: &[&str]) -> Value {
     serde_json::from_str(&cli_text(node, args)).unwrap()
 }
@@ -160,6 +169,8 @@ fn changed_key_is_refused_until_operator_reset() {
     assert_ne!(new["node_id"], old["node_id"]);
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn refused_mode(tag: &str, mode: MeshMode, expected: &str) {
     let mut specs = PAIR.to_vec();
     specs[1].mesh = mode;
@@ -212,11 +223,15 @@ fn previous_mesh_version_peer_is_refused_with_upgrade_instruction() {
     );
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 const PRE_MESH: &str = "upgrade flk on acceptor.test (peer runs a pre-mesh flk)";
 
 /// A v0.11.0 peer is refused permanently: the upgrade instruction reaches
 /// status and `flk peers`, and the edge waits out the long refusal backoff
 /// instead of redialling on the 1-30 s transient schedule.
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn pre_mesh_peer_is_refused_without_hot_retry(tag: &str, mode: MeshMode) {
     let mut specs = PAIR.to_vec();
     specs[1].mesh = mode;
@@ -275,6 +290,8 @@ fn forged_acceptor_challenge_is_refused() {
     );
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn remove_identity(node: &Node) {
     let app = support::paths::app_dir_name();
     let key = node.home.join("state").join(app).join("mesh/identity.json");
@@ -536,6 +553,8 @@ fn old_server_keeps_status_output_when_enrollment_method_is_missing() {
     assert_eq!(peers[0]["enrollment"], "unknown");
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn rename_node(node: &Node, name: &str) {
     let app = support::paths::app_dir_name();
     let path = node.config_home.join(app).join("config.toml");
@@ -564,9 +583,15 @@ fn old_dialer_is_refused_without_attaching_an_inbound_edge() {
     assert_eq!(status["result"]["peers"], json!([]));
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 const ALIAS_A_TO_B: &str = "[[peers]]\nname = \"b-ts.test\"\nssh = \"b.test\"\n";
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 const ALIAS_B_TO_A: &str = "[[peers]]\nname = \"a-ts.test\"\nssh = \"a.test\"\n";
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn add_peer(node: &Node, config: &str) {
     use std::io::Write;
     let app = support::paths::app_dir_name();
@@ -575,6 +600,8 @@ fn add_peer(node: &Node, config: &str) {
     writeln!(file, "\n{config}").unwrap();
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn bidirectional_aliases(a_dials_first: bool) {
     let specs = [
         NodeSpec::new("a.test", "alias-a", &[]).with_config(if a_dials_first {
@@ -775,6 +802,8 @@ fn configured_name_first_contact_is_tofu_but_later_impersonation_is_refused() {
     }
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn identity_id(node: &Node) -> String {
     // Derive the identity independently of the node's claimed name.
     let path = node
@@ -827,6 +856,8 @@ fn fresh_exact_name_peers_enroll_simultaneously() {
     }
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn assert_single_configured_row(node: &Node) {
     let preview = request(
         node,
@@ -858,6 +889,8 @@ fn assert_single_configured_row(node: &Node) {
     );
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn two_hubs_ready(fleet: &fleet::Fleet) {
     for hub in ["nodea", "nodeb"] {
         enrollment(fleet.node(hub), "nodec", "pinned");
@@ -866,6 +899,8 @@ fn two_hubs_ready(fleet: &fleet::Fleet) {
     }
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn mailbox_agent(node: &Node) -> Value {
     let existing = request(node, "agent.list", json!({}))["result"]["agents"][0].clone();
     if !existing.is_null() {
@@ -882,6 +917,8 @@ fn mailbox_agent(node: &Node) -> Value {
     started["result"]["agent"].clone()
 }
 
+// Used only by debug-only fake SSH relay tests (#1715).
+#[cfg(debug_assertions)]
 fn hub_send(fleet: &fleet::Fleet, hub: &str, recipient: &Value, correlation: &str) -> Value {
     fleet::wait_until("hub discovers spoke agent", Duration::from_secs(90), || {
         request(fleet.node(hub), "agent.list", json!({}))["result"]["fleet"]
