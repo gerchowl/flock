@@ -58,6 +58,8 @@
           flock-web = pkgs.callPackage ./nix/package.nix {
             buildCommit = self.rev or self.dirtyRev or null;
             withWeb = true;
+            # Until #1731 lands, missing assets receive the typed HTTP 503.
+            guiDist = self.packages.${system}.flock-client or null;
           };
         in
         {

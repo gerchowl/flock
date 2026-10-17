@@ -19,6 +19,8 @@
 //!      `--allow-funnel`,
 //!   3. same-origin check on the WS upgrade (CSWSH defence).
 
+pub(crate) mod gui;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,7 +51,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Local aliases for the defaults, now sourced from [`crate::config`] so the
-/// [`WebSectionConfig`] and this file agree on the same numbers (ADR-0002
+/// [`WebSectionConfig`](crate::config::model::WebSectionConfig) and this file agree on the same numbers (ADR-0002
 /// phase e).
 const DEFAULT_BIND: &str = CONFIG_DEFAULT_BIND;
 const DEFAULT_MAX_SESSIONS: usize = CONFIG_DEFAULT_MAX_SESSIONS;
@@ -552,7 +554,7 @@ fn pty_writer_loop(
 /// - `allow_any` bypasses the check (explicit `--allow-any-origin`).
 /// - An absent Origin is allowed: non-browser clients (curl, native) don't send
 ///   one, and CSWSH requires a browser that always does.
-/// - Otherwise the Origin's authority (host[:port], scheme stripped) must equal
+/// - Otherwise the Origin's authority (`host[:port]`, scheme stripped) must equal
 ///   the request Host header (same-origin) or appear in the allow-list.
 fn origin_allowed(
     origin: Option<&str>,
