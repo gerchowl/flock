@@ -1,14 +1,23 @@
-//! Pure UID boundary, ADR-0036 §1a; ancestry supplies agent identity separately.
+//! UID boundary, ADR-0036 §1a; ancestry supplies agent identity separately.
 use crate::platform::peer;
 use std::sync::{Arc, Once, OnceLock};
 
 type LookupResult = Result<Option<u32>, ()>;
+
+static COLLISION: OnceLock<crate::api::schema::AgentAccountDiagnostic> = OnceLock::new();
+
+/// Last confirmed collision, without starting or waiting for directory services.
+pub(crate) fn account_diagnostic() -> Option<crate::api::schema::AgentAccountDiagnostic> {
+    UidPolicy::default().report_cached_collision();
+    COLLISION.get().cloned()
+}
 
 /// Lazy, process-shared resolution. First use waits at most 100 ms for NSS.
 /// after that wait, pending calls return immediately without new workers.
 #[derive(Clone)]
 pub(crate) struct DedicatedUid(Arc<AccountLookup>);
 struct AccountLookup {
+    collision_reported: Once,
     started: Once,
     result: Arc<OnceLock<LookupResult>>,
     resolve: Arc<dyn Fn() -> std::io::Result<Option<u32>> + Send + Sync>,
@@ -19,6 +28,7 @@ impl DedicatedUid {
         resolve: impl Fn() -> std::io::Result<Option<u32>> + Send + Sync + 'static,
     ) -> Self {
         Self(Arc::new(AccountLookup {
+            collision_reported: Once::new(),
             started: Once::new(),
             result: Arc::new(OnceLock::new()),
             resolve: Arc::new(resolve),
@@ -65,7 +75,9 @@ impl From<LookupResult> for DedicatedUid {
 pub(crate) struct UidPolicy {
     /// Effective UID of the server at construction.
     pub operator: u32,
-    /// Cached account result, or Unknown while lazy resolution is pending.
+    /// Cached account result, or Unknown while configured resolution is pending.
+    /// Explicit `security.agent_account = "none"` installs `Ok(None)` at startup,
+    /// bypassing NSS entirely. `run_as = "operator"` never disables recognition.
     pub dedicated: DedicatedUid,
 }
 /// Local socket UID classification. Unknown is never operator authority.
@@ -90,11 +102,25 @@ impl Default for UidPolicy {
     }
 }
 impl UidPolicy {
+    /// Publish a completed collision without starting or waiting for NSS.
+    fn report_cached_collision(&self) {
+        if self.dedicated.0.result.get() == Some(&Ok(Some(self.operator))) {
+            self.dedicated.0.collision_reported.call_once(|| {
+                tracing::warn!(code = "agent_account_uid_collision", uid = self.operator,
+                    "flk-agent UID equals server UID: ADR-0036 section 1a misconfiguration; operator authority refused");
+                let _ = COLLISION.set(crate::api::schema::AgentAccountDiagnostic::AgentAccountUidCollision { uid: self.operator });
+            });
+        }
+    }
+
     /// Constrain the caller role by UID; agent identity still requires ancestry.
+    /// Configured pending/failed lookups deny operator availability. Only explicit
+    /// account-policy `none` avoids that cost; a resolved UID collision fails closed.
     pub fn classify(&self, uid: Option<u32>) -> Principal {
         let (Some(uid), Ok(dedicated)) = (uid, self.dedicated.get()) else {
             return Principal::Unknown;
         };
+        self.report_cached_collision();
         if dedicated == Some(uid) {
             Principal::Agent
         } else if uid == self.operator {
@@ -181,29 +207,42 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_constructs_shared_unstarted_cache() {
+    fn policy_construction_leaves_its_owned_cache_unstarted() {
         let (done, result) = mpsc::channel();
         let driver = std::thread::spawn(move || {
-            let first = UidPolicy::default();
-            let second = UidPolicy::default();
+            let lookup = DedicatedUid::lazy(|| panic!("construction must not enter NSS"));
+            let policy = UidPolicy {
+                operator: 7,
+                dedicated: lookup.clone(),
+            };
             let proof = (
-                Arc::ptr_eq(&first.dedicated.0, &second.dedicated.0),
-                first.dedicated.0.started.is_completed(),
-                first.dedicated.0.result.get().is_none(),
+                Arc::ptr_eq(&policy.dedicated.0, &lookup.0),
+                lookup.0.started.is_completed(),
+                lookup.0.result.get().is_none(),
             );
-            drop((first, second));
+            drop((policy, lookup));
             let _ = done.send(proof);
         });
         let proof = result
             .recv_timeout(Duration::from_secs(2))
-            .expect("default must not enter NSS");
+            .expect("construction must not enter NSS");
         driver.join().unwrap();
         assert_eq!(proof, (true, false, true));
     }
 
     #[test]
     fn blocked_account_lookup_does_not_block_app_startup_or_grant_authority() {
+        exercise_blocked_lookup(crate::config::model::AgentAccount::FlkAgent);
+    }
+
+    #[test]
+    fn explicit_no_account_allows_operator_stop_without_entering_hung_lookup() {
+        exercise_blocked_lookup(crate::config::model::AgentAccount::None);
+    }
+
+    fn exercise_blocked_lookup(account: crate::config::model::AgentAccount) {
         use crate::api::schema::*;
+        let recognition = account == crate::config::model::AgentAccount::FlkAgent;
         let (release, held) = mpsc::channel();
         let release = ReleaseLookup(Some(release));
         let held = std::sync::Mutex::new(held);
@@ -224,8 +263,11 @@ mod tests {
                 .unwrap();
             let _guard = runtime.enter();
             let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut config = crate::config::Config::default();
+            config.security.agent_account = account;
+            config.structured.run_as = crate::structured::launch::RunAs::Operator;
             let mut app = crate::app::App::new_with_runtime_config(
-                &crate::config::Config::default(),
+                &config,
                 true,
                 None,
                 rx,
@@ -276,22 +318,44 @@ mod tests {
             "startup must leave lookup lazy"
         );
         go.send(()).unwrap();
-        lookup_entered
-            .recv_timeout(Duration::from_secs(2))
-            .expect("classification starts lookup");
+        if recognition {
+            lookup_entered
+                .recv_timeout(Duration::from_secs(2))
+                .expect("configured classification starts lookup");
+        }
         // The lookup remains alive and silent until cleanup: no sleep or retry.
         let (roles, stop, read, quit) = result
             .recv_timeout(Duration::from_secs(2))
             .expect("classification must finish while NSS stays blocked");
         driver.join().unwrap();
-        assert!(roles.iter().all(|role| *role == Principal::Unknown));
-        assert_eq!(stop["error"]["code"], "operator_only");
+        assert_eq!(
+            roles[0],
+            if recognition {
+                Principal::Unknown
+            } else {
+                Principal::Operator
+            }
+        );
+        assert!(roles[1..].iter().all(|role| *role == Principal::Unknown));
+        if recognition {
+            assert_eq!(stop["error"]["code"], "operator_only");
+        } else {
+            assert!(stop.get("result").is_some(), "{stop}");
+        }
         assert!(read.get("result").is_some(), "{read}");
-        assert!(!quit);
+        assert_eq!(quit, !recognition);
         assert!(
             lookup_entered.try_recv().is_err(),
             "one worker despite repeated calls"
         );
+        if !recognition {
+            assert!(
+                !cached.0.started.is_completed(),
+                "disabled policy never starts NSS"
+            );
+            assert_eq!(cached.get(), Ok(None));
+            return;
+        }
         let (published, ready) = mpsc::channel();
         let waiter_cache = cached.clone();
         let waiter = std::thread::spawn(move || {

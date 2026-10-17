@@ -326,6 +326,30 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   `caller_is_local_operator()` gains that uid check first; a detached
   (`setsid`) child of a structured agent is still `flk-agent` and still
   refused.
+  **Account policy (owner decisions, #1795).** File-only
+  `[security] agent_account = "flk-agent" | "none"` defaults to `"flk-agent"`.
+  Recognition is independent of `structured.run_as`: opting into operator-mode
+  launch does not disable it. With recognition enabled, a pending or failed
+  directory lookup classifies socket callers as `Unknown`, including callers
+  with the server UID: reads remain available but operator mutations, including
+  server stop, are refused. A resolved dedicated UID distinct from the server
+  UID permits the server UID to proceed to the existing ancestry checks; a
+  resolved absent account does too. A dedicated UID equal to the server UID
+  is a §1a misconfiguration, never operator authority. Report
+  `agent_account_uid_collision` once in the log and retain the typed diagnostic
+  in server status until restart.
+
+  Explicit `agent_account = "none"` declares that no dedicated account is used.
+  The server never starts the dedicated-account NSS lookup, and callers with
+  its own UID immediately pass the UID boundary. Lease, pane, birth and relay
+  checks still apply: known same-UID agents remain non-operator. Other or missing
+  UIDs remain unknown/read-only. This opt-in avoids the default directory-service
+  availability cost but gives up recognizing anonymous/detached callers as
+  `flk-agent` by UID. It cannot provide a dedicated-account isolation boundary;
+  same-UID callers without lease/pane ancestry remain cooperative under #1177.
+  Changing the setting requires a server restart; reload keeps the active policy
+  and reports that requirement.
+
 - **Which agent is calling.** The session lease (§1) records the process's
   pid and start time. A socket caller whose ancestry reaches a leased pid
   (with a matching `process_start_time`, so pid reuse cannot impersonate)
