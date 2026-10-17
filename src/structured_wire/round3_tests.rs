@@ -371,7 +371,10 @@ fn round3_cap_reset_and_expiry_scenarios_assert_real_timing_and_states() {
         "Reconnecting",
     ] {
         let rows = script(&format!("outbox-window-expiry-{}", state.to_lowercase()));
-        assert_eq!(rows[0]["now_ms"], 2099);
+        assert_eq!(
+            rows[0]["now_ms"],
+            if state == "Disconnected" { 2099 } else { 2098 }
+        );
         assert_eq!(rows[0]["outbox"][0]["created_ms"], 0);
         assert_eq!(rows[0]["outbox"][0]["first_sent_ms"], 100);
         assert_eq!(rows[0]["idempotency_window_ms"], 2000);
@@ -384,7 +387,10 @@ fn round3_cap_reset_and_expiry_scenarios_assert_real_timing_and_states() {
         let expected = &rows[index];
         assert_eq!(expected["connection"], state);
         assert_eq!(rows[index - 1]["step"], "quiet");
-        assert_eq!(rows[index - 1]["ceiling_ms"], 2);
+        assert_eq!(
+            rows[index - 1]["ceiling_ms"],
+            if state == "Disconnected" { 1 } else { 2 }
+        );
         let mut bad = expected.clone();
         bad["outbox"]["c1"] = json!("sent");
         assert!(
@@ -402,5 +408,89 @@ fn round3_absence_and_restored_status_typos_are_explicit_errors() {
         json!({"v":1,"step":"client","action":{"kind":"set_token","principal":"fixture","typo":true}}),
     ] {
         assert!(FixtureLine::parse(&raw.to_string()).is_err(), "{raw}");
+    }
+}
+
+#[test]
+fn expiry_sent_observations_precede_expiry_even_at_the_latest_connect_instant() {
+    for state in [
+        "disconnected",
+        "connecting",
+        "hello",
+        "live",
+        "needstoken",
+        "readonly",
+        "reconnecting",
+        "syncing",
+    ] {
+        let rows = script(&format!("outbox-window-expiry-{state}"));
+        let given = &rows[0];
+        let mut latest = given["now_ms"].as_u64().unwrap();
+        let sent = given["outbox"][0]["first_sent_ms"].as_u64().unwrap();
+        let window = given["idempotency_window_ms"].as_u64().unwrap();
+        for row in &rows[1..] {
+            if row["step"] == "expect_connect" {
+                latest += row["within_ms"].as_u64().unwrap();
+            }
+            if row["step"] == "quiet" {
+                latest += row["ceiling_ms"].as_u64().unwrap();
+            }
+            if row["outbox"]["c1"] == "sent" {
+                assert!(
+                    latest - sent < window,
+                    "{state}: latest connect has already expired c1"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_expiry_boundary_rejects_a_strict_greater_than_client() {
+    let rows = script("outbox-window-expiry-disconnected");
+    let given = &rows[0];
+    let mut now = given["now_ms"].as_u64().unwrap();
+    let sent = given["outbox"][0]["first_sent_ms"].as_u64().unwrap();
+    let window = given["idempotency_window_ms"].as_u64().unwrap();
+    for row in &rows[1..] {
+        if row["step"] == "quiet" {
+            now += row["ceiling_ms"].as_u64().unwrap();
+        }
+        if row["outbox"]["c1"] == "unknown_outcome" {
+            assert_eq!(now - sent, window);
+            let mut wrong = row.clone();
+            wrong["outbox"]["c1"] = json!(if now - sent > window {
+                "unknown_outcome"
+            } else {
+                "sent"
+            });
+            assert!(
+                !observation(row, &wrong),
+                "strict > expiry must fail at equality"
+            );
+            return;
+        }
+    }
+    panic!("exact-boundary observation missing");
+}
+
+#[test]
+fn initial_syncing_scripts_subscribe_before_connect() {
+    for name in [
+        "bootstrap-snapshot",
+        "empty-snapshot",
+        "gap-snapshot",
+        "subscription-deadline",
+    ] {
+        let rows = script(name);
+        let connect = rows
+            .iter()
+            .position(|row| row["action"]["kind"] == "connect")
+            .unwrap();
+        for (index, row) in rows.iter().enumerate() {
+            if row["action"]["kind"] == "subscribe" {
+                assert!(index < connect, "{name}");
+            }
+        }
     }
 }

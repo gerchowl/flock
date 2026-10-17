@@ -1,4 +1,4 @@
-# guardrails-ok(ci-shim): host-bound: one platform leg of ci.yml (cargo-nextest with zig 0.15 + macos-15 SDK constraints); run steps use `just` recipes or scripts/ entry points
+# guardrails-ok(ci-shim): host-bound build/test legs of ci.yml use zig 0.15 + macos-15 SDK constraints; lint runs in the dev shell through `just` recipes
 name: CI leg
 
 # One platform's test run, split across parallel jobs (#991). ci.yml calls this
@@ -41,58 +41,32 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Rust tools
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
-          tool: just
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            always-allow-substitutes = true
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
         with:
-          version: 0.15.2
-          use-cache: false
+          primary-key: nix-v1-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-
+          save: ${{ github.ref == 'refs/heads/dev' }}
+          gc-max-store-size-linux: 2G
+          gc-max-store-size-macos: 2G
 
-      # setup-zig's own cache adds a run ID. Reuse its directory and old
-      # dev entries, but save only one key per compiler/source generation.
-      - name: Restore Zig build cache
-        id: zig-cache
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ${{ github.workspace }}/.zig-cache
-          key: setup-zig-cache-v2-${{ github.job }}-zig-${{ runner.arch == 'X64' && 'x86_64' || 'aarch64' }}-${{ runner.os == 'Linux' && 'linux' || 'macos' }}-0.15.2--dev-${{ hashFiles('vendor/libghostty-vt/**', 'build.rs') }}
-          restore-keys: setup-zig-cache-v2-${{ github.job }}-zig-${{ runner.arch == 'X64' && 'x86_64' || 'aarch64' }}-${{ runner.os == 'Linux' && 'linux' || 'macos' }}-0.15.2--
-
-      - name: Install macOS build tools
-        if: runner.os == 'macOS'
-        run: brew install cmake ninja
-
-      - name: Restore cargo cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
-          cache-bin: false
-
-      - name: Lint
-        run: just lint
+      - name: Lint in the dev shell
+        run: nix develop -c just lint
 
       - name: Check Rust documentation
-        run: just doc-check
+        run: nix develop -c just doc-check
 
-      - name: Save Zig build cache from dev
-        if: github.ref == 'refs/heads/dev' && steps.zig-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: ${{ github.workspace }}/.zig-cache
-          key: ${{ steps.zig-cache.outputs.cache-primary-key }}
-
-      # Maintenance-script unittests and the platform test-gap ratchet (#597).
-      # Ubuntu only: pure Python plus git fixtures, so one platform is enough.
+      # Maintenance-script tests and the platform test-gap ratchet (#597).
       - name: Run maintenance script tests
         if: runner.os == 'Linux'
-        run: just script-tests
+        run: nix develop -c just script-tests
 
   build:
     name: build

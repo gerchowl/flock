@@ -244,13 +244,18 @@ fn every_omitted_script_field_is_optional_in_generated_types() {
         for key in canonical.as_object().unwrap().keys() {
             if raw.get(key).is_none() {
                 assert!(
-                    declaration.contains(&format!("{key}?:")),
+                    optional_field(declaration, key),
                     "{location}: omitted {key} must be optional in TS"
                 );
             }
         }
     }
-    for (name, content) in fixtures() {
+    let mut scripts = fixtures();
+    scripts.push((
+        "omitted-observe-selectors".into(),
+        r#"{"v":1,"step":"observe"}"#.into(),
+    ));
+    for (name, content) in scripts {
         for (index, line) in content.lines().enumerate() {
             let raw: Value = serde_json::from_str(line).unwrap();
             let canonical = serde_json::to_value(FixtureLine::parse(line).unwrap()).unwrap();
@@ -275,5 +280,101 @@ fn every_omitted_script_field_is_optional_in_generated_types() {
                 }
             }
         }
+    }
+}
+
+fn optional_field(declaration: &str, key: &str) -> bool {
+    declaration.contains(&format!("\n{key}?:"))
+}
+
+#[test]
+fn optional_field_names_cannot_match_absence_selectors() {
+    for key in ["streams", "outbox"] {
+        assert!(!optional_field(
+            &format!("\nabsent_{key}?: Array<string>,"),
+            key
+        ));
+        assert!(optional_field(&format!("\n{key}?: Array<string>,"), key));
+    }
+}
+
+#[test]
+fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operations() {
+    let minimal = [
+        "clean",
+        "agent-gap",
+        "agent-send",
+        "ping-pong",
+        "token-refused",
+        "token-revoked",
+    ];
+    let files = fixtures();
+    let mut seen = BTreeSet::new();
+    for (name, content) in &files {
+        let rows: Vec<Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let expected = if minimal.contains(&name.as_str()) {
+            "s7-min"
+        } else {
+            "s7"
+        };
+        assert_eq!(rows[0]["covers"], json!([expected]), "{name}");
+        if expected == "s7-min" {
+            for row in rows {
+                if let Some(tag) = row["frame"]["t"].as_str() {
+                    seen.insert(tag.to_owned());
+                    if tag == "sub" && row["frame"].get("after").is_some() {
+                        seen.insert("cursor".into());
+                    }
+                    if tag == "ack" && row["frame"]["ok"] == true {
+                        seen.insert("ack_ok".into());
+                    }
+                    if tag == "gap" {
+                        assert!(
+                            row["frame"].get("snapshot_to").is_none(),
+                            "{name}: agent gaps have no entity snapshot"
+                        );
+                    }
+                }
+                if row["step"] == "token_refused" {
+                    seen.insert(format!("close{}", row["code"]));
+                }
+                for payload in [&row["action"], &row["frame"]] {
+                    if let Some(stream) = payload.get("stream").and_then(Value::as_str) {
+                        assert!(
+                            stream.starts_with("agent/") && !stream.ends_with("/live"),
+                            "{name}: {stream}"
+                        );
+                    }
+                    if let Some(verb) = payload.get("verb").and_then(Value::as_str) {
+                        assert_eq!(verb, "agent.send", "{name}");
+                    }
+                }
+            }
+        }
+    }
+    for required in [
+        "hello",
+        "welcome",
+        "sub",
+        "cursor",
+        "synced",
+        "gap",
+        "cmd",
+        "ack_ok",
+        "ping",
+        "pong",
+        "close4401",
+        "close4403",
+    ] {
+        assert!(
+            seen.contains(required),
+            "missing minimal operation: {required}"
+        );
+    }
+    for name in minimal {
+        assert!(files.iter().any(|(found, _)| found == name), "{name}");
     }
 }

@@ -3,6 +3,7 @@ import type { AppliedCursor } from "./AppliedCursor";
 import type { ClientAction } from "./ClientAction";
 import type { ClientFrame } from "./ClientFrame";
 import type { DeadlineStage } from "./DeadlineStage";
+import type { FixtureCoverage } from "./FixtureCoverage";
 import type { OutboxStatus } from "./OutboxStatus";
 import type { QueuedCommand } from "./QueuedCommand";
 import type { ResyncMarker } from "./ResyncMarker";
@@ -18,6 +19,10 @@ export type FixtureLine = {
  * Fixture schema version, currently one (not WIRE_JSON_VERSION).
  */
 v: number, } & ({ "step": "given",
+/**
+ * Acceptance slice; absent only in older version-one scripts.
+ */
+covers?: Array<FixtureCoverage>,
 /**
  * Last applied cursor per stream, never a diagnostic skipped_to.
  */

@@ -1,4 +1,4 @@
-{"v":1,"step":"given","cursors":{"fleet":2},"outbox":[]}
+{"v":1,"step":"given","cursors":{"fleet":2},"outbox":[],"covers":["s7"]}
 {"v":1,"step":"client","action":{"kind":"subscribe","sub_id":"s1","stream":"fleet"}}
 {"v":1,"step":"client","action":{"kind":"connect"}}
 {"v":1,"step":"expect_connect","within_ms":1,"not_before_ms":0}

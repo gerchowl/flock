@@ -35,7 +35,7 @@ uses equal jitter in `[ceiling/2,ceiling]`, starting at 500 ms, multiplying by
 two, capped at 30 s, and resetting only after 60 s healthy. All time is virtual.
 
 `WireEvent = UnknownEvent | KnownSessionEvent | JsonValue`. Known events come
-from the existing catalogue; #1656 owns its remaining nested literal tags.
+from #1723’s production known-event catalogue projection.
 Unknown agent events use **exactly** `{type:"unknown",raw,shape}`: raw is the
 original line (including non-JSON diagnostics), shape is the sender-supplied
 harness/version key. A malformed known event must be wrapped, never accepted
@@ -71,8 +71,11 @@ Round 3 runner contract (ADR-0038 §3):
   `first_sent_ms` measures age for sent/uncertain entries, independently of
   `created_ms` (queue time). Missing first-send age after restart means
   unknown_outcome. Pending entries have no first-send time yet. The expiry
-  scripts use creation at 0, first send at 100 and restore at 2,099 with a
-  2,000 ms window, so using creation time incorrectly expires them early.
+  scripts use creation at 0 and first send at 100 with a 2,000 ms window.
+  Connecting scripts restore at 2,098, so every allowed 0–1 ms attempt stays
+  below expiry at the sent observation. Disconnected restores at 2,099 and
+  advances 1 ms to assert unknown_outcome exactly at age == window; a client
+  using > instead of >= fails. Using creation time expires the command early.
 - The closed outbox vocabulary is **pending, sent, uncertain, unknown_outcome,
   acked, failed**. Pending first sends use `resume_only:false`; restored sent
   and uncertain sends use `resume_only:true`. A 30 s ack deadline with the
@@ -116,3 +119,16 @@ oracle: early/late attempts, early deadlines, wrong close codes, missing Stale,
 retained absent entries, wrong restored resume_only, and wrong action outcomes.
 They validate the script assertions; they do not execute G3. G3 must consume the
 same scripts with its actual client, fake transport and virtual clock.
+
+
+Every script header has machine-readable `covers:["s7-min"]` or `covers:["s7"]`.
+S7-min (#1746) selects clean, agent-gap, agent-send, ping-pong, token-refused and
+token-revoked: hello/welcome/token, agent/<id> cursor replay with synced and gap
+(no entity snapshot), agent.send with ack, ping/pong and 4401/4403 closes. These
+scripts request no fleet/inbox/queue verb. All other scripts target full S7.
+The field defaults to an empty list only when reading older version-one scripts;
+the checked-in inventory requires exactly one of the two slice labels.
+
+The generator also emits FixtureExamples.ts from every JSONL line as a literal
+checked against FixtureLine. The strict ts-check recipe compiles that artifact;
+the Rust drift test ensures it cannot silently lag behind the scripts.

@@ -1,4 +1,4 @@
-{"v":1,"step":"given","cursors":{},"outbox":[]}
+{"v":1,"step":"given","cursors":{},"outbox":[],"covers":["s7-min"]}
 {"v":1,"step":"client","action":{"kind":"connect"}}
 {"v":1,"step":"expect_connect","within_ms":1,"not_before_ms":0}
 {"v":1,"step":"open"}

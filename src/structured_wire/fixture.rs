@@ -29,6 +29,10 @@ pub struct FixtureLine {
 pub enum FixtureStep {
     /// Initial durable cursors and queued commands; required once, first.
     Given {
+        /// Acceptance slice; absent only in older version-one scripts.
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        covers: Vec<FixtureCoverage>,
         /// Last applied cursor per stream, never a diagnostic skipped_to.
         cursors: BTreeMap<String, AppliedCursor>,
         /// Pending commands restored before any connection attempt.
@@ -148,6 +152,18 @@ pub enum FixtureStep {
         /// Only the two auth close codes are valid here.
         code: u16,
     },
+}
+
+/// Acceptance slice selected by the fixture's initial header.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum FixtureCoverage {
+    /// Minimal GUI dogfood transport: handshake, agent stream/send and liveness/auth.
+    #[serde(rename = "s7-min")]
+    S7Min,
+    /// Full S7 transport and client recovery.
+    #[serde(rename = "s7")]
+    S7,
 }
 
 /// JSON cursor; exact in JavaScript below 2^53.

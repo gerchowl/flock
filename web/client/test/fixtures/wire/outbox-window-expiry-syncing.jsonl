@@ -1,4 +1,4 @@
-{"v":1,"step":"given","cursors":{},"outbox":[{"cmd_id":"c1","verb":"queue.add","args":{"text":"fixture"},"principal":"fixture-principal","created_ms":0,"status":"sent","first_sent_ms":100}],"now_ms":2099,"idempotency_window_ms":2000}
+{"v":1,"step":"given","cursors":{},"outbox":[{"cmd_id":"c1","verb":"queue.add","args":{"text":"fixture"},"principal":"fixture-principal","created_ms":0,"status":"sent","first_sent_ms":100}],"now_ms":2098,"idempotency_window_ms":2000,"covers":["s7"]}
 {"v":1,"step":"client","action":{"kind":"subscribe","sub_id":"s1","stream":"fleet"}}
 {"v":1,"step":"client","action":{"kind":"connect"}}
 {"v":1,"step":"expect_connect","within_ms":1,"not_before_ms":0}

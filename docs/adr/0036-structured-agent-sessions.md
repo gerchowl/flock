@@ -1241,17 +1241,19 @@ files. No hand-written TS type may describe a wire shape.
 S8a (#1592) starts with the socket API's `AgentInfo`, `FleetAgentInfo`,
 `WorkspaceInfo` and `PaneInfo` records, their transitive dependencies, the
 question types and the Claude adapter's `SessionEvent`. The adapter's custom
-serializer emits bare known events and bare raw unknown input; it is not the
-frontend-neutral wire envelope. Its generated `SessionEvent` union currently
-includes `unknown`, so TypeScript cannot narrow that union without validation.
-Literal nested discriminators and a narrowable known-event union are tracked in
-#1656. Extra JSON fields stay flattened as an index signature.
+serializer emits an untagged union; its generated stored form is
+`SessionEvent = KnownSessionEvent | JsonValue`. Clients narrow `KnownSessionEvent`
+on literal `type` and catalogue discriminators, including nested stream and
+control tags. Switching on a nested tag narrows its payload, but TypeScript does
+not correlate that narrowing back to the containing envelope. Absent-only subtypes are `subtype?: never`. The event catalogue
+supplies these literals to ts-rs; no TypeScript wire declarations are maintained
+by hand. Extra JSON fields stay flattened as an index signature. Unknown events
+reach clients only through §8's `UnknownEvent` wrapper and use §8's rendering.
 
 S7a (#1604) defines separate `ClientFrame` and `ServerFrame` enums tagged by
 `t`, with unknown transport tags rejected as protocol errors and additive fields
 ignored. `WireEvent = UnknownEvent | KnownSessionEvent | JsonValue`: the known-only
-projection is generated from the S8a catalogue, with remaining nested literal
-discriminators coordinated in #1656. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
+projection is the S8a catalogue type supplied by #1723. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
 client-version-ineligible event uses `{type:"unknown", raw, shape}`. `raw` is
 the exact original line as a string (including non-JSON diagnostics); `shape`
 is the sender's §8 canonical key, never recomputed with the client version.
