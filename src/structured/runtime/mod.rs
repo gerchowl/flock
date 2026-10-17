@@ -94,6 +94,7 @@ impl Runtime {
         self.transport.waiting_on_human()
     }
     /// Poll persisted events. Empty is not EOF; monitor the owning worker result too.
+    /// Feed `Received::state_input` into S4 so book closures clear attention.
     pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
         self.events.try_recv()
     }

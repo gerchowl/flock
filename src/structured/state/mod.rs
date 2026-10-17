@@ -28,8 +28,10 @@ use std::time::{Duration, Instant};
 /// Facts supplied by the stream owner, never inferred from screen text.
 pub enum Input<'a> {
     /// Every stdout event, including unknown lines, counts as stream progress.
+    /// Stream consumers must use `Received::state_input` to include host closes.
     Event(&'a SessionEvent),
-    /// An answer was sent for this exact incoming permission request.
+    /// The book durably closed this request (decision, cancel, result, interrupt
+    /// or end). This is not an acknowledgment of stdin delivery.
     ControlAnswered(&'a str),
     /// The process exited. A started input without result is crashed, not idle.
     ProcessExited,
@@ -98,6 +100,22 @@ impl SessionState {
             phase: Phase::Unknown,
             phase_since: None,
         }
+    }
+
+    /// Set the initial registry lifecycle before any stream observations exist.
+    /// Used for cold restored records, without manufacturing a clock or event.
+    pub(super) fn set_initial_lifecycle(&mut self, lifecycle: Lifecycle) {
+        self.lifecycle = lifecycle;
+        self.phase = AgentState::derive(
+            Turn::Unknown,
+            Background::Unknown,
+            Attention::Unknown,
+            lifecycle,
+            Waiting::Unknown,
+            None,
+            StateSources::default(),
+        )
+        .phase;
     }
 
     /// Reduce one fact using monotonic time for ages and Unix ms for reset times.
