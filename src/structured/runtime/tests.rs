@@ -81,6 +81,9 @@ impl Fixture {
         path
     }
     pub(crate) fn profile(&self, mode: &str, version: &str) -> LaunchProfile {
+        self.profile_at(mode, version, SESSION)
+    }
+    pub(crate) fn profile_at(&self, mode: &str, version: &str, session: &str) -> LaunchProfile {
         self.file(
             "case.json",
             serde_json::json!({"mode":mode,"version":version})
@@ -101,7 +104,7 @@ impl Fixture {
             LaunchProfile::prepare(
                 &config,
                 self.root.path(),
-                SESSION,
+                session,
                 binary,
                 |key| match key {
                     "HOME" | "TMPDIR" => Some(self.root.path().as_os_str().to_owned()),

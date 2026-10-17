@@ -132,9 +132,11 @@ if mode.startswith("init-socket"):
     else:
         init["messaging_socket_path"] = 42 if mode.endswith("wrong-type") else None
 emit(init)
-if mode == "state-reducer":
+if mode in ("state-reducer", "worker-exit", "worker-exit-ok"):
     for event in (root / "state-events.jsonl").read_text().splitlines():
         emit(json.loads(event))
+    if mode.startswith("worker-exit"):
+        sys.exit(0 if mode == "worker-exit-ok" else 7)
     sys.stdin.read()
     sys.exit(0)
 if mode == "lease-calls":

@@ -3784,8 +3784,9 @@ impl HeadlessServer {
     /// would never see the fault that only the server can have.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         self.app.input_writes.service_due(now);
+        let structured_changed = self.app.service_structured_workers(now);
         self.app.start_ready_pastes();
-        let mut changed = false;
+        let mut changed = structured_changed;
 
         self.app.sync_headless_animation_timer(now);
         changed |= self.app.refresh_session_health(now);
@@ -4731,6 +4732,109 @@ mod tests {
             server.app.session_health.probe_in_flight(),
             "the headless loop must drive the session probe"
         );
+    }
+
+    #[tokio::test]
+    async fn structured_worker_notifications_and_exact_deadlines_reach_the_scheduler() {
+        use crate::api::agent_state::{Lifecycle, Phase};
+        use crate::structured::workers::tests::{event, wait, Case};
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        let notify = server.app.render_notify.clone();
+        server.app.state.workspaces.clear();
+        server.app.state.config.checks.enable = false;
+        server.app.next_auto_update_check = None;
+        server.app.checks_heartbeat_deadline = None;
+        server.app.checks_next_deadline = None;
+        server.app.next_animation_tick = None;
+        server.app.session_save_deadline = None;
+        let (mut case, mut launch, factory) = Case::prepare(
+            &mut server.app.state.structured_agents,
+            11,
+            "state-reducer",
+            vec![event("command_lifecycle")],
+        );
+        // Choose an explicit fixture policy earlier than unrelated app deadlines.
+        launch.stall_after = Duration::from_millis(1);
+        case.generation = server
+            .app
+            .structured_workers
+            .start(&mut server.app.state.structured_agents, launch, factory)
+            .unwrap();
+        wait(&notify, || {
+            server.handle_scheduled_tasks_headless(now, false);
+            assert!(server
+                .app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            server
+                .app
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle
+                == Lifecycle::Live
+        })
+        .await;
+        case.submit(&server.app.structured_workers);
+        wait(&notify, || {
+            server.handle_scheduled_tasks_headless(now, false);
+            assert!(server
+                .app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            server
+                .app
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .phase
+                == Phase::Working
+        })
+        .await;
+        server.app.checks_next_deadline = None;
+        server.app.checks_heartbeat_deadline = None;
+        let due = server
+            .app
+            .structured_workers
+            .next_deadline(&server.app.state.structured_agents)
+            .unwrap();
+        assert_eq!(
+            server
+                .app
+                .next_headless_loop_deadline_with_git_refresh(now, false, false),
+            Some(due)
+        );
+        let now = due;
+        server.handle_scheduled_tasks_headless(now, false);
+        let update = &server
+            .app
+            .state
+            .structured_agents
+            .get(&case.id)
+            .unwrap()
+            .1
+            .update;
+        assert_eq!(update.state.phase, Phase::Working);
+        assert!(update.stalled_since_ms.is_some());
+        case.finish(
+            &mut server.app.state.structured_agents,
+            &mut server.app.structured_workers,
+            &notify,
+            now,
+            Some(crate::structured::runtime::Outcome::Stopped),
+        )
+        .await;
     }
 
     #[tokio::test]

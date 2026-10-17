@@ -440,7 +440,32 @@ Handoff restores structured metadata offline; this slice owns no workers to
 transfer.
 
 #1842 owns runtime workers, actual lease ownership and observation scheduling.
-Its caller must mark session persistence dirty when durable metadata changes.
+The app owns `structured::workers::Workers` outside pure `AppState`. Each launch
+reserves its native session before running the admission-supplied, bounded
+profile factory on an owning thread, then binds the registered cwd/model.
+Preparation is cancellable at its boundaries; an in-progress factory must finish
+within its own bound. One blocked factory cannot block another agent or the app.
+A new launch advances the observation generation, without modifying durable
+metadata. Live/unconfirmed workers refuse replacement. Cold restore remains
+offline and never starts a worker automatically.
+
+Ready/completion share a bounded two-message channel. Runtime stream queues are
+bounded separately; an app pass drains at most four records per worker and
+rearms its existing event wake when it reaches that budget. Every stream record
+enters S4 only via `Received::state_input`, so durable permission-book closes
+clear attention without waiting for a result (#1846/#1849). Lifecycle and due
+observations are explicit host facts. Both TUI and headless schedulers service
+owner wakes and include S4's exact next observation boundary. No periodic
+structured-agent timer, kill-on-silence policy or EventHub emission is added.
+
+Stop latches cancellation and never joins on the app loop. A terminal report
+becomes visible only after queued stream facts drain. Confirmed cleanup closes
+open requests and sets Offline; unconfirmed ownership instead retains authority
+and Unknown lifecycle, refuses restart, and requires explicit recovery. Reports
+retain actual exit status/outcome or typed preparation/worker failure; results
+remain turn facts rather than process-success evidence. Drop requests stop
+without waiting for an owning thread. The caller must mark session persistence
+dirty when durable metadata changes.
 #1843 owns the public `StructuredAgentInfo`, additive `structured_agents` list,
 get/status/stop routes and `runtime_unsupported` refusals. Existing PTY
 `AgentInfo` placement fields remain mandatory and unchanged; structured records
