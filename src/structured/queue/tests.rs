@@ -648,7 +648,7 @@ fn unknown_enum_items_keep_positions_through_later_updates_and_removals() {
             a["item"]
         );
         assert_eq!(journal.items()[1], item("b"));
-        assert!(journal.checkpoint().is_err());
+        assert!(journal.read_only().is_none());
         journal
             .append(if remove {
                 Change::Remove {

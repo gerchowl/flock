@@ -955,8 +955,13 @@ Malformed known records in supported formats load read-only as
 mutation/checkpoint and preserve the whole file. Operator recovery is outside
 this slice. A crash-torn final line keeps the existing truncation/sync path;
 it is not corruption. Neither read-only mode permits tail repair.
+Owner clarification (#1922): an invalid header format version is known-record
+corruption and uses the same typed read-only refusal. Unknown data in v1 prevent
+its mandatory upgrade, so it opens read-only with `queue_journal_corrupt` and
+reason `unknown_data_prevents_checkpoint`. Same-version unknown data permit
+known writes only until a checkpoint is required; a refused checkpoint latches
+that typed read-only reason before any further writes, bounding journal growth.
 The fsync-temp, rename, fsync-directory rule below is unchanged.
-
 
 - **Per-agent session stream.** Every stdout line of a structured agent is
   appended, with a per-stream `seq` and a receive timestamp, to

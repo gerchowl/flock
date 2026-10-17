@@ -62,9 +62,13 @@ pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'s
 
 /// Report the first corrupt queue record without exposing any input payload.
 pub(crate) fn structured_queue_corrupt(reason: &crate::structured::queue::QueueJournalCorrupt) {
-    tracing::warn!(event = "structured.queue.corrupt", sequence = ?reason.seq,
-        offset = reason.offset, reason = reason.reason,
-        "queue journal is read-only; operator recovery required");
+    tracing::warn!(
+        event = "structured.queue.corrupt",
+        sequence = ?reason.seq,
+        offset = reason.offset,
+        reason = reason.reason,
+        "queue journal is read-only; operator recovery required"
+    );
 }
 
 pub(crate) fn init_file_logging(file_name: &str) {

@@ -106,7 +106,8 @@ impl Journal {
     /// Components are ASCII identifiers, never paths. Uppercase letters use an
     /// injective, case-insensitive-safe encoding; the journal verifies the original
     /// id. Root aliases resolve, but linked/private-namespace violations fail.
-    /// Newer versions and corrupt supported records open read-only without repair.
+    /// Newer versions, corrupt supported records and legacy unknown data that
+    /// prevent upgrade open read-only without repair.
     /// Unknown data are logged and preserved raw, never interpreted for delivery.
     /// Only a supported journal's unterminated final tail is repaired.
     pub fn open(data: &Path, agent: &str) -> io::Result<Self> {
@@ -199,7 +200,8 @@ impl Journal {
         self.healthy()?;
         Ok(self.file.metadata()?.len())
     }
-    /// Persisted format version; absence of a stamp means version 1.
+    /// Last valid format version; absence of a stamp means version 1.
+    /// If the header is corrupt, inspect [`Self::read_only`] instead.
     pub fn format_version(&self) -> u64 {
         self.version
     }
@@ -314,10 +316,15 @@ impl Journal {
     /// reject a truncated snapshot. Unknown kinds, fields or enum variants block
     /// rewriting rather than discard future state. Failed replacements can leave
     /// unique .next files; open removes these under the exclusive lease.
+    /// If unknown data prevent a required rewrite, latch a typed read-only
+    /// refusal before any more writes (ADR-0036 §4, owner decision #1922).
     pub fn checkpoint(&mut self) -> io::Result<Cut> {
         self.writable()?;
-        if self.future {
-            return Err(problem("future queue data prevent checkpoint"));
+        if let Err(error) = self.checkpointable() {
+            if let Some(reason) = self.corrupt {
+                crate::logging::structured_queue_corrupt(&reason);
+            }
+            return Err(error);
         }
         let before = self.seq;
         before
@@ -365,6 +372,18 @@ impl Journal {
         self.records = records;
         self.checkpoint = Some((before, high));
         self.replay(before)
+    }
+    fn checkpointable(&mut self) -> io::Result<()> {
+        if self.future {
+            let reason = QueueJournalCorrupt {
+                seq: Some(self.seq),
+                offset: self.file.metadata()?.len(),
+                reason: "unknown_data_prevents_checkpoint",
+            };
+            self.corrupt = Some(reason);
+            return Err(io::Error::other(reason));
+        }
+        Ok(())
     }
     fn identity(&self, version: u64) -> Value {
         let mut header = json!({"kind":"queue_identity", "agent_id":self.agent});
@@ -430,7 +449,7 @@ impl Journal {
                     good += n as u64;
                     continue;
                 }
-                Err(error) => return Err(error.into()),
+                Err(_error) => return Err(corrupt(good, None, "invalid_json")),
             };
             if good == 0 {
                 if value["kind"] != "queue_identity" || value["agent_id"] != self.agent {
@@ -441,7 +460,7 @@ impl Journal {
                     Some(version) => version
                         .as_u64()
                         .filter(|v| *v > 0)
-                        .ok_or_else(|| problem("invalid queue format stamp"))?,
+                        .ok_or_else(|| corrupt(0, None, "invalid_format_version"))?,
                 };
                 let mut expected = self.identity(self.version);
                 if self.version == 1 && value.get("format_version").is_some() {
@@ -553,6 +572,9 @@ impl Journal {
         }
         if self.checkpoint.is_some_and(|(_, high)| self.seq < high) {
             return Err(corrupt(good, None, "incomplete_checkpoint"));
+        }
+        if self.version < FORMAT_VERSION {
+            self.checkpointable()?;
         }
         if good < self.file.metadata()?.len() {
             self.file.set_len(good)?;
