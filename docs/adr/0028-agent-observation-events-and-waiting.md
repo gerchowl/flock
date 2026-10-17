@@ -1151,6 +1151,15 @@ the one log, not a second event system.
   delegates gets well under one digest per delegate per hour, which matches
   the cadence `supervisor.py` already had to batch to.
 
+Deferred resume failure persistence (#1728): `resume_failed` remains an
+in-memory launch observation, not a durable operator request to hibernate.
+Keep the saved binding and deferred plan, but do not persist this flag across a
+cold server restart: the plan becomes eligible for one automatic attempt when
+normal deferred-resume conditions are met, and a new failure suppresses further
+automatic attempts in that server. Focus does not retry a failed deferred plan;
+`agent resume` is the explicit retry. Rationale: preserving a resumable binding
+under §1/§3 does not turn a past execution failure into a hibernation request.
+
 ### 3a. Mixed fleets: every change here is additive on the wire
 
 Clients and servers of different versions meet daily: a CLI updated before the
