@@ -98,7 +98,7 @@ export function createWireFleet(connection: WireConnection): FleetSource {
         else into.delete(delta.id);
         return true;
       };
-      unsubscribe = connection.subscribe(connection.nextSubId("f"), "fleet", {
+      unsubscribe = connection.subscribe("fleet", {
         event: (_seq, ev) => open && apply(rows, ev) && observer.rows([...rows.values()]),
         snapshot: (lines) => {
           const fresh = new Map<string, AgentRow>();
@@ -115,7 +115,7 @@ export function createWireFleet(connection: WireConnection): FleetSource {
           observer.rows([]);
         },
         refused: (refusal) => end(refusal.message),
-      });
+      }).close;
       return () => {
         if (!open) return;
         open = false;
