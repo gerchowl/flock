@@ -135,6 +135,7 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
                 stream={`agent/${agent}`}
                 source={props.source}
                 onEntry={(seq, text) => props.composer.observe(agent, seq, text)}
+                onCurrent={(current) => props.composer.current(agent, current)}
               />
             </div>
             <Composer agent={agent} row={props.row()} sender={props.sender} state={props.composer} />

@@ -13,7 +13,7 @@ import { createFixtureFleet, type AgentRow, type FleetObserver, type FleetSource
 import { createManager, emptyLayout, type Layout } from "../src/layout/model";
 import { createFixtureTransport } from "../src/transport/fixture";
 import { createWireTransport } from "../src/wire/transport";
-import { delivery, deliveryFor, sendHint, type Sender } from "../src/workbench/Composer";
+import { STATUS_LABELS, phaseLine, rowLine, sendHint, type Sender } from "../src/workbench/Composer";
 import type { Phase } from "../src/gen/Phase";
 import { SAMPLE_INBOX } from "../src/workbench/inbox";
 import { markFor } from "../src/workbench/marks";
@@ -437,7 +437,7 @@ describe("composer", () => {
     const config = { transport: "fixture", fixtureJsonl: "", source: "x" } as const;
     const root = mount(() => <App config={{ ok: true, config }} />);
     await tick();
-    expect($(root, "delivery-mode")?.textContent).toBe("Replay: sending needs a live server.");
+    expect($(root, "agent-phase")?.textContent).toBe("Replay: sending needs a live server.");
     expect(($(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement).disabled).toBe(true);
   });
 
@@ -446,7 +446,7 @@ describe("composer", () => {
     const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
     h.step(step({ step: "given", cursors: {}, outbox: [] }));
     const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
-    expect($(root, "delivery-mode")).toBeNull();
+    expect($(root, "agent-phase")).toBeNull();
     h.net.current().open();
     h.net.current().deliver(WELCOME);
     h.net.current().deliver({ t: "gap", sub_id: "f1", from: 1, to: 0, snapshot_to: 0 });
@@ -456,7 +456,7 @@ describe("composer", () => {
     search.value = "atlas";
     search.dispatchEvent(new InputEvent("input", { bubbles: true }));
     ($$(root, "palette-item")[0] as HTMLButtonElement).click();
-    expect($(root, "delivery-mode")?.textContent).toBe("Goes to the agent's queue.");
+    expect($(root, "agent-phase")?.textContent).toBe("Agent not in the agent list");
 
     const box = $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
     box.value = "please rebase";
@@ -471,7 +471,7 @@ describe("composer", () => {
     expect($$(root, "sent-message").map((item) => item.getAttribute("data-status"))).toEqual(["sent"]);
     expect(box.value).toBe("");
     h.net.current().deliver({ t: "ack", cmd_id: cmd.cmd_id, ok: false, error: { code: "agent_busy", message: "try later", exit: 3, retry: "later" } });
-    expect($(root, "sent-message")?.textContent).toBe("please rebasefailed: try later");
+    expect($(root, "sent-message")?.textContent).toBe("please rebaserefused by the server: try later");
   });
 
   test("an accepted message is never in the transcript before the server's event, and shows once after it", async () => {
@@ -495,7 +495,7 @@ describe("composer", () => {
     ($(root, "composer") as HTMLFormElement).requestSubmit();
     const cmd = sentFrames(h).find((frame) => (frame as { t: string }).t === "cmd") as { cmd_id: string };
     h.net.current().deliver({ t: "ack", cmd_id: cmd.cmd_id, ok: true });
-    expect($$(root, "sent-message").map((item) => item.textContent)).toEqual(["please rebaseaccepted"]);
+    expect($$(root, "sent-message").map((item) => item.textContent)).toEqual(["please rebaseaccepted by the server"]);
     expect(root.querySelector(".transcript")?.textContent).not.toContain("please rebase");
     h.net.current().deliver({ t: "ev", sub_id: agentSub(h, "atlas"), stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "please rebase" } } });
     expect(root.querySelector(".transcript")?.textContent).toContain("please rebase");
@@ -537,7 +537,7 @@ describe("composer", () => {
   test("the same text already in the history is not this message's event", () => {
     const { root, send, ack, said } = liveAtlas(["continue"]);
     ack(send("continue"));
-    expect(listed(root)).toEqual(["continueaccepted"]);
+    expect(listed(root)).toEqual(["continueaccepted by the server"]);
     said(2, "continue");
     expect(listed(root)).toEqual([]);
   });
@@ -549,30 +549,86 @@ describe("composer", () => {
     ack(first);
     ack(second);
     said(1, "continue");
-    expect(listed(root)).toEqual(["continueaccepted"]);
+    expect(listed(root)).toEqual(["continueaccepted by the server"]);
     said(2, "continue");
     expect(listed(root)).toEqual([]);
   });
 
-  test("the delivery line maps every reported phase", () => {
+  test("the phase line states every reported phase as a fact", () => {
     const expected: { readonly [P in Phase]: string } = {
-      working: "Queued until the turn ends.",
-      settling: "Queued until the turn ends.",
-      finished: "Delivered now.",
-      waiting_on_event: "Delivered now.",
-      finished_with_background: "Delivered now.",
-      blocked: "Queued; the agent is waiting on a decision.",
-      needs_human: "Queued; the agent is waiting on a decision.",
-      offline: "Queued. The agent isn't reachable right now.",
-      hibernated: "Queued. The agent isn't reachable right now.",
-      limit_reached: "Queued. The agent isn't reachable right now.",
-      unknown: "Queued. The agent isn't reachable right now.",
-      gone: "This agent has ended.",
+      working: "Agent working",
+      settling: "Agent finishing its turn",
+      finished: "Agent idle",
+      waiting_on_event: "Agent waiting on an event",
+      finished_with_background: "Agent idle, background work running",
+      blocked: "Agent blocked",
+      needs_human: "Agent needs you",
+      offline: "Agent offline",
+      hibernated: "Agent hibernated",
+      limit_reached: "Agent at its usage limit",
+      unknown: "Agent state unknown",
+      gone: "Agent ended",
     };
     for (const [state, line] of Object.entries(expected) as [Phase, string][]) {
-      expect(deliveryFor(state)).toEqual({ line, open: state !== "gone" });
+      expect(phaseLine(state)).toEqual({ line, open: state !== "gone" });
     }
-    expect(delivery(undefined)).toEqual({ line: "Goes to the agent's queue.", open: true });
+    expect(rowLine(undefined)).toEqual({ line: "Agent not in the agent list", open: true });
+  });
+
+  test("no composer string predicts delivery: every phase and every outbox state", async () => {
+    const phases: Phase[] = ["working", "settling", "finished", "waiting_on_event", "finished_with_background", "blocked", "needs_human", "offline", "hibernated", "limit_reached", "unknown", "gone"];
+    const statuses = Object.keys(STATUS_LABELS) as (keyof typeof STATUS_LABELS)[];
+    const commands = statuses.map((status, i) => ({ cmd_id: `c${i}`, verb: "agent.send", args: { target: "p0", text: `m${i}`, submit: true }, principal: "p", created_ms: 0, status }));
+    const all: Sender = { commands: () => commands, send: () => "c9", blocked: () => null };
+    const agents: AgentRow[] = [...phases.map((state, i) => ({ id: `p${i}`, label: `p${i}`, state, activity: "", waitingOnHuman: [] })), { id: "unlisted", label: "unlisted", state: "working", activity: "", waitingOnHuman: [] }];
+    let shown: AgentRow[] = agents;
+    const root = mount(() => <Workbench fleet={{ subscribe: (o) => (queueMicrotask(() => o.rows(shown)), () => undefined) }} transport={createFixtureTransport("")} inbox={[]} sender={all} layout={emptyLayout()} saveLayout={() => undefined} source="live" />);
+    await tick();
+    const texts: string[] = [];
+    for (const row of $$(root, "agent-row") as HTMLButtonElement[]) {
+      row.click();
+      texts.push($(root, "composer")?.textContent ?? "");
+    }
+    expect($$(root, "sent-message")).toHaveLength(0);
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    expect($$(root, "sent-message")).toHaveLength(statuses.length);
+    texts.push($(root, "composer")?.textContent ?? "");
+    shown = [];
+    expect(texts).toHaveLength(agents.length + 1);
+    for (const text of texts) expect(text.toLowerCase()).not.toMatch(/deliver|queued until/);
+  });
+
+  test("a message sent before the transcript is Current is not foldable: an older identical line never hides it", () => {
+    const h = new Harness();
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    h.net.current().deliver({ t: "gap", sub_id: "f1", from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: "f1", seq: 0 });
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    search.value = "atlas";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($$(root, "palette-item")[0] as HTMLElement).click();
+    const box = $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
+    box.value = "continue";
+    box.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($(root, "composer") as HTMLFormElement).requestSubmit();
+    h.net.current().deliver({ t: "ev", sub_id: agentSub(h, "atlas"), stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "continue" } } });
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: 1 });
+    const cmd = sentFrames(h).find((frame) => (frame as { t: string }).t === "cmd") as { cmd_id: string };
+    h.net.current().deliver({ t: "ack", cmd_id: cmd.cmd_id, ok: true });
+    expect($$(root, "sent-message").map((item) => item.textContent)).toEqual(["continueaccepted by the server"]);
+  });
+
+  test("an acked message whose echo differs in text shows as accepted, then folds at the next person's turn", () => {
+    const { root, send, ack, said } = liveAtlas(["older"]);
+    ack(send("please  rebase"));
+    expect(listed(root)).toEqual(["please  rebaseaccepted by the server"]);
+    said(2, "please rebase");
+    expect(listed(root)).toEqual([]);
   });
 
   const sender: Sender = { commands: () => [], send: () => "c1", blocked: () => null };
@@ -590,7 +646,7 @@ describe("composer", () => {
   test("a gone agent's composer is closed and says the agent has ended", async () => {
     const root = await composing();
     ($$(root, "agent-row")[1] as HTMLButtonElement).click();
-    expect($(root, "delivery-mode")?.textContent).toBe("This agent has ended.");
+    expect($(root, "agent-phase")?.textContent).toBe("Agent ended");
     expect(textarea(root).disabled).toBe(true);
     expect(($(root, "composer")?.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(true);
   });

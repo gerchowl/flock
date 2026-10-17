@@ -1,15 +1,22 @@
 /**
- * The composer (ADR-0038 §2a): it says what will happen to a message, sends
- * it as `cmd agent.send` through the outbox (§3, G3a #1747), and shows each
- * message's command state.
+ * The composer (ADR-0038 §2a): it states the agent's reported phase, sends
+ * a message as `cmd agent.send` through the outbox (§3, G3a #1747), and
+ * shows each message's outbox state.
  *
- * The delivery line presents the server's own state, mapped from every
- * reported phase in {@link delivery}. The `ack` is the authority on what
- * happened. Optimism is visual only: a message never appears in the
- * transcript until the server's event does, and once that event has
- * arrived the accepted message leaves "Your messages", so it shows once.
- * A message's event is a person's message with its text and a seq after
- * the transcript's cursor when it was sent; each event answers one message.
+ * The client never derives queue order or delivery (§3), so nothing here
+ * predicts what will happen: the phase line is the server's last report,
+ * worded as a fact ({@link phaseLine}), and each message's line says what
+ * has happened to it so far ({@link STATUS_LABELS}). The `ack` is the
+ * authority on what happened. Optimism is visual only: a message never
+ * appears in the transcript until the server's event does, and once a
+ * person's turn has arrived after an accepted message, it leaves "Your
+ * messages", so it shows once.
+ *
+ * Folding needs the transcript's cursor at the send, recorded only while
+ * the transcript is Current; a message sent earlier is not foldable and
+ * stays listed. Each person's turn after the cursor folds one message: one
+ * with the same text first, then any, since the echo's text may differ
+ * (whitespace, for example).
  *
  * Drafts are kept per agent while the workbench is open, so switching
  * agents never loses one.
@@ -36,13 +43,14 @@ export type Sender = {
   readonly blocked: () => string | null;
 };
 
-const STATUS_LABELS: { readonly [S in OutboxStatus]: string } = {
-  pending: "queued here",
-  sent: "sent, waiting for the server",
-  uncertain: "no answer yet: delivery unknown",
-  unknown_outcome: "unknown outcome",
-  acked: "accepted",
-  failed: "failed",
+/** What has happened to a message, for every outbox state; never a prediction. */
+export const STATUS_LABELS: { readonly [S in OutboxStatus]: string } = {
+  pending: "not sent yet",
+  sent: "sent; no answer from the server yet",
+  uncertain: "no answer from the server in 30 s",
+  unknown_outcome: "outcome unknown",
+  acked: "accepted by the server",
+  failed: "refused by the server",
 };
 
 /** The `target` and `text` of an `agent.send` command, or null for other verbs. */
@@ -52,47 +60,46 @@ function sentText(entry: OutboxEntry, agent: string): string | null {
   return args["target"] === agent && typeof args["text"] === "string" ? args["text"] : null;
 }
 
-/** What sending does for one reported phase: the line to show, and whether sending is open. */
-export type Delivery = { readonly line: string; readonly open: boolean };
+/** The agent's reported phase as the composer states it, and whether sending is open. */
+export type PhaseLine = { readonly line: string; readonly open: boolean };
 
 /**
- * The delivery line for every {@link Phase}; a new phase fails `tsc` here.
- *
- * - A turn in progress holds the message until the turn ends: an
- *   `at_idle` item is written after the current `result` (ADR-0036 §3).
- * - The idle phases take it at once ("an idle agent with an empty queue
- *   takes an `at_idle` item at once", ADR-0036 §3): `finished`, and
- *   `waiting_on_event` and `finished_with_background`, whose turn is idle
- *   (ADR-0028's phase table).
- * - Waiting on a decision, or away, it stays queued, and nothing is
- *   promised about when.
- * - A `gone` agent has ended: sending is closed.
+ * The line for every {@link Phase} (ADR-0028's phase table), stated as the
+ * server's report and never as what will happen to a message; a new phase
+ * fails `tsc` here. A `gone` agent has ended: sending is closed.
  */
-export function deliveryFor(state: Phase): Delivery {
+export function phaseLine(state: Phase): PhaseLine {
   switch (state) {
     case "working":
+      return { line: "Agent working", open: true };
     case "settling":
-      return { line: "Queued until the turn ends.", open: true };
+      return { line: "Agent finishing its turn", open: true };
     case "finished":
+      return { line: "Agent idle", open: true };
     case "waiting_on_event":
+      return { line: "Agent waiting on an event", open: true };
     case "finished_with_background":
-      return { line: "Delivered now.", open: true };
+      return { line: "Agent idle, background work running", open: true };
     case "blocked":
+      return { line: "Agent blocked", open: true };
     case "needs_human":
-      return { line: "Queued; the agent is waiting on a decision.", open: true };
+      return { line: "Agent needs you", open: true };
     case "offline":
+      return { line: "Agent offline", open: true };
     case "hibernated":
+      return { line: "Agent hibernated", open: true };
     case "limit_reached":
+      return { line: "Agent at its usage limit", open: true };
     case "unknown":
-      return { line: "Queued. The agent isn't reachable right now.", open: true };
+      return { line: "Agent state unknown", open: true };
     case "gone":
-      return { line: "This agent has ended.", open: false };
+      return { line: "Agent ended", open: false };
   }
 }
 
-/** The delivery line for `row`, which may not be listed. */
-export function delivery(row: AgentRow | undefined): Delivery {
-  return row === undefined ? { line: "Goes to the agent's queue.", open: true } : deliveryFor(row.state);
+/** The phase line for `row`, which may not be listed. */
+export function rowLine(row: AgentRow | undefined): PhaseLine {
+  return row === undefined ? { line: "Agent not in the agent list", open: true } : phaseLine(row.state);
 }
 
 /** The send shortcut as this platform writes it. */
@@ -100,8 +107,11 @@ export function sendHint(platform: string): string {
   return `${/Mac|iPhone|iPad|iPod/.test(platform) ? "⌘" : "Ctrl"} + Enter to send`;
 }
 
-/** What one agent's transcript has shown: its highest seq, and its people's messages by seq. */
-type Seen = { readonly cursor: number; readonly texts: ReadonlyMap<number, string> };
+/**
+ * What one agent's transcript has shown: its highest seq, its people's
+ * messages by seq, and whether its stream is Current.
+ */
+type Seen = { readonly cursor: number; readonly texts: ReadonlyMap<number, string>; readonly current: boolean };
 
 /**
  * Composer state that outlives one agent's composer: drafts by agent, what
@@ -112,6 +122,8 @@ export type ComposerState = {
   readonly drafts: Map<string, string>;
   /** The transcript applied `seq`, a person's message when `text` is not null. */
   readonly observe: (agent: string, seq: number, text: string | null) => void;
+  /** The agent's transcript stream became Current, or (re)started replaying. */
+  readonly current: (agent: string, current: boolean) => void;
   /** `cmdId` was just sent to `agent`. */
   readonly sent: (agent: string, cmdId: string) => void;
   /** Which accepted commands' events the transcript has shown (see the module doc). */
@@ -122,28 +134,43 @@ export type ComposerState = {
 export function createComposerState(): ComposerState {
   const [seen, setSeen] = createSignal<ReadonlyMap<string, Seen>>(new Map());
   const sentAt = new Map<string, number>();
+  const of = (agent: string): Seen => seen().get(agent) ?? { cursor: 0, texts: new Map(), current: false };
   return {
     drafts: new Map(),
     observe: (agent, seq, text) => {
-      const before = seen().get(agent) ?? { cursor: 0, texts: new Map() };
+      const before = of(agent);
       if (seq <= before.cursor && (text === null || before.texts.get(seq) === text)) return;
       const texts = text === null ? before.texts : new Map(before.texts).set(seq, text);
-      setSeen(new Map(seen()).set(agent, { cursor: Math.max(before.cursor, seq), texts }));
+      setSeen(new Map(seen()).set(agent, { ...before, cursor: Math.max(before.cursor, seq), texts }));
     },
-    sent: (agent, cmdId) => void sentAt.set(cmdId, seen().get(agent)?.cursor ?? 0),
+    current: (agent, current) => {
+      if (of(agent).current !== current) setSeen(new Map(seen()).set(agent, { ...of(agent), current }));
+    },
+    sent: (agent, cmdId) => {
+      // Before the transcript is Current its cursor is not the stream's: the message stays unfoldable.
+      const now = of(agent);
+      if (now.current) sentAt.set(cmdId, now.cursor);
+    },
     echoed: (agent, accepted) => {
-      const texts = [...(seen().get(agent)?.texts ?? new Map<number, string>())].sort(([a], [b]) => a - b);
+      const turns = [...of(agent).texts].sort(([a], [b]) => a - b);
       const used = new Set<number>();
       const matched = new Set<string>();
-      for (const { cmdId, text } of accepted) {
-        const after = sentAt.get(cmdId);
-        // A command restored from storage has no send cursor here: it stays listed.
-        if (after === undefined) continue;
-        const echo = texts.find(([seq, shown]) => seq > after && shown === text && !used.has(seq));
-        if (echo === undefined) continue;
-        used.add(echo[0]);
-        matched.add(cmdId);
-      }
+      // A command restored from storage, or sent before Current, has no send cursor: it stays listed.
+      const foldable = accepted.flatMap((command) => {
+        const after = sentAt.get(command.cmdId);
+        return after === undefined ? [] : [{ ...command, after }];
+      });
+      const fold = (same: boolean): void => {
+        for (const { cmdId, text, after } of foldable) {
+          if (matched.has(cmdId)) continue;
+          const echo = turns.find(([seq, shown]) => seq > after && !used.has(seq) && (!same || shown === text));
+          if (echo === undefined) continue;
+          used.add(echo[0]);
+          matched.add(cmdId);
+        }
+      };
+      fold(true);
+      fold(false);
       return matched;
     },
   };
@@ -165,7 +192,7 @@ export function Composer(props: {
   const [error, setError] = createSignal<string | null>(null);
   const blocked = (): string | null => {
     if (props.sender === null) return "Replay: sending needs a live server.";
-    const mode = delivery(props.row);
+    const mode = rowLine(props.row);
     return mode.open ? props.sender.blocked() : mode.line;
   };
   /** Accepted messages whose event the transcript has shown are left out (see the module doc). */
@@ -225,8 +252,8 @@ export function Composer(props: {
         }}
       />
       <div class="composer__footer">
-        <span class="composer__mode" data-testid="delivery-mode">
-          {blocked() ?? error() ?? delivery(props.row).line}
+        <span class="composer__mode" data-testid="agent-phase">
+          {blocked() ?? error() ?? rowLine(props.row).line}
         </span>
         <span class="composer__hint" data-testid="send-hint">
           {sendHint(navigator.platform || navigator.userAgent)}

@@ -129,6 +129,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
                   stream={`agent/${agent}`}
                   source={props.source}
                   onEntry={(seq, text) => composer.observe(agent, seq, text)}
+                  onCurrent={(current) => composer.current(agent, current)}
                 />
               </div>
               <Composer agent={agent} row={focusedRow()} sender={props.sender} state={composer} />

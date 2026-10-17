@@ -46,6 +46,8 @@ export type TranscriptProps = {
   readonly source: TranscriptSource;
   /** Told each entry's seq as it is applied, with its text when it is a person's message. */
   readonly onEntry?: (seq: number, userText: string | null) => void;
+  /** Told false when the stream starts replaying, and true once it is Current (`synced`). */
+  readonly onCurrent?: (current: boolean) => void;
 };
 
 /** A person's message text: a `user` event's string content, or its text blocks. */
@@ -197,13 +199,17 @@ function Entry(props: { readonly entry: SessionEntry; readonly turns: Turns }): 
 export function Transcript(props: TranscriptProps): JSX.Element {
   const [entries, setEntries] = createStore<SessionEntry[]>([]);
   const [progress, setProgress] = createSignal<Progress>({ phase: "replaying" });
+  props.onCurrent?.(false);
   const subscription = props.transport.subscribe(props.stream, null, {
     entry: (entry) => {
       setEntries(entries.length, entry);
       props.onEntry?.(entry.seq, userText(entry));
     },
     reset: () => setEntries([]),
-    synced: () => setProgress({ phase: "synced" }),
+    synced: () => {
+      setProgress({ phase: "synced" });
+      props.onCurrent?.(true);
+    },
     failed: (failure) => setProgress({ phase: "failed", failure }),
   });
   onCleanup(subscription.close);
