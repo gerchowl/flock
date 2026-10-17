@@ -8,6 +8,8 @@
  * happened. Optimism is visual only: a message never appears in the
  * transcript until the server's event does, and once that event has
  * arrived the accepted message leaves "Your messages", so it shows once.
+ * A message's event is a person's message with its text and a seq after
+ * the transcript's cursor when it was sent; each event answers one message.
  *
  * Drafts are kept per agent while the workbench is open, so switching
  * agents never loses one.
@@ -29,7 +31,7 @@ export type Sender = {
   /** The outbox, oldest first; reactive. */
   readonly commands: () => readonly OutboxEntry[];
   /** Queues `agent.send`; throws when no principal is known yet. */
-  readonly send: (agent: string, text: string) => void;
+  readonly send: (agent: string, text: string) => string;
   /** Why sending is impossible right now, or null. */
   readonly blocked: () => string | null;
 };
@@ -82,7 +84,7 @@ export function deliveryFor(state: Phase): Delivery {
     case "hibernated":
     case "limit_reached":
     case "unknown":
-      return { line: "Queued; delivered when the agent is back.", open: true };
+      return { line: "Queued. The agent isn't reachable right now.", open: true };
     case "gone":
       return { line: "This agent has ended.", open: false };
   }
@@ -98,28 +100,51 @@ export function sendHint(platform: string): string {
   return `${/Mac|iPhone|iPad|iPod/.test(platform) ? "⌘" : "Ctrl"} + Enter to send`;
 }
 
+/** What one agent's transcript has shown: its highest seq, and its people's messages by seq. */
+type Seen = { readonly cursor: number; readonly texts: ReadonlyMap<number, string> };
+
 /**
- * Composer state that outlives one agent's composer: drafts by agent, and
- * the `user` texts each agent's transcript has shown, by seq.
+ * Composer state that outlives one agent's composer: drafts by agent, what
+ * each agent's transcript has shown, and the transcript cursor each sent
+ * message was sent at.
  */
 export type ComposerState = {
   readonly drafts: Map<string, string>;
-  readonly echoes: (agent: string) => readonly string[];
-  /** The transcript showed `text` as a person's message at `seq`. */
-  readonly echo: (agent: string, seq: number, text: string) => void;
+  /** The transcript applied `seq`, a person's message when `text` is not null. */
+  readonly observe: (agent: string, seq: number, text: string | null) => void;
+  /** `cmdId` was just sent to `agent`. */
+  readonly sent: (agent: string, cmdId: string) => void;
+  /** Which accepted commands' events the transcript has shown (see the module doc). */
+  readonly echoed: (agent: string, accepted: readonly { readonly cmdId: string; readonly text: string }[]) => ReadonlySet<string>;
 };
 
 /** Creates the {@link ComposerState} of one workbench. */
 export function createComposerState(): ComposerState {
-  const [seen, setSeen] = createSignal<ReadonlyMap<string, ReadonlyMap<number, string>>>(new Map());
+  const [seen, setSeen] = createSignal<ReadonlyMap<string, Seen>>(new Map());
+  const sentAt = new Map<string, number>();
   return {
     drafts: new Map(),
-    echoes: (agent) => [...(seen().get(agent)?.values() ?? [])],
-    echo: (agent, seq, text) => {
-      if (seen().get(agent)?.get(seq) === text) return;
-      const next = new Map(seen());
-      next.set(agent, new Map(next.get(agent)).set(seq, text));
-      setSeen(next);
+    observe: (agent, seq, text) => {
+      const before = seen().get(agent) ?? { cursor: 0, texts: new Map() };
+      if (seq <= before.cursor && (text === null || before.texts.get(seq) === text)) return;
+      const texts = text === null ? before.texts : new Map(before.texts).set(seq, text);
+      setSeen(new Map(seen()).set(agent, { cursor: Math.max(before.cursor, seq), texts }));
+    },
+    sent: (agent, cmdId) => void sentAt.set(cmdId, seen().get(agent)?.cursor ?? 0),
+    echoed: (agent, accepted) => {
+      const texts = [...(seen().get(agent)?.texts ?? new Map<number, string>())].sort(([a], [b]) => a - b);
+      const used = new Set<number>();
+      const matched = new Set<string>();
+      for (const { cmdId, text } of accepted) {
+        const after = sentAt.get(cmdId);
+        // A command restored from storage has no send cursor here: it stays listed.
+        if (after === undefined) continue;
+        const echo = texts.find(([seq, shown]) => seq > after && shown === text && !used.has(seq));
+        if (echo === undefined) continue;
+        used.add(echo[0]);
+        matched.add(cmdId);
+      }
+      return matched;
     },
   };
 }
@@ -143,26 +168,23 @@ export function Composer(props: {
     const mode = delivery(props.row);
     return mode.open ? props.sender.blocked() : mode.line;
   };
-  /** Accepted messages the transcript has shown are left out: each echo hides one, oldest first. */
+  /** Accepted messages whose event the transcript has shown are left out (see the module doc). */
   const mine = (): { readonly id: string; readonly text: string; readonly status: OutboxStatus; readonly error?: string }[] => {
-    const echoes = new Map<string, number>();
-    for (const echoed of props.state.echoes(props.agent)) echoes.set(echoed, (echoes.get(echoed) ?? 0) + 1);
-    return (props.sender?.commands() ?? []).flatMap((entry) => {
+    const own = (props.sender?.commands() ?? []).flatMap((entry) => {
       const sent = sentText(entry, props.agent);
-      if (sent === null) return [];
-      const left = echoes.get(sent) ?? 0;
-      if (entry.status === "acked" && left > 0) {
-        echoes.set(sent, left - 1);
-        return [];
-      }
-      return [{ id: entry.cmd_id, text: sent, status: entry.status, ...(entry.error ? { error: entry.error.message } : {}) }];
+      return sent === null ? [] : [{ entry, sent }];
     });
+    const accepted = own.filter(({ entry }) => entry.status === "acked").map(({ entry, sent }) => ({ cmdId: entry.cmd_id, text: sent }));
+    const echoed = props.state.echoed(props.agent, accepted);
+    return own
+      .filter(({ entry }) => !echoed.has(entry.cmd_id))
+      .map(({ entry, sent }) => ({ id: entry.cmd_id, text: sent, status: entry.status, ...(entry.error ? { error: entry.error.message } : {}) }));
   };
   const submit = (): void => {
     const message = text().trim();
     if (message === "" || props.sender === null || blocked() !== null) return;
     try {
-      props.sender.send(props.agent, message);
+      props.state.sent(props.agent, props.sender.send(props.agent, message));
       setText("");
       setError(null);
     } catch (thrown) {

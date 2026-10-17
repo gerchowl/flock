@@ -430,6 +430,57 @@ describe("composer", () => {
     expect($$(root, "sent-message")).toEqual([]);
   });
 
+  /** The wire App, focused on atlas, whose history holds `history` user texts; returns a sender and an event source. */
+  function liveAtlas(history: readonly string[]): { root: HTMLElement; send: (text: string) => string; ack: (id: string) => void; said: (seq: number, text: string) => void } {
+    const h = new Harness();
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    h.net.current().deliver({ t: "gap", sub_id: "f1", from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: "f1", seq: 0 });
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    search.value = "atlas";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($$(root, "palette-item")[0] as HTMLElement).click();
+    const said = (seq: number, text: string): void =>
+      h.net.current().deliver({ t: "ev", sub_id: "t1", stream: "agent/atlas", seq, ts_ms: 0, ev: { type: "user", message: { role: "user", content: text } } });
+    history.forEach((text, index) => said(index + 1, text));
+    h.net.current().deliver({ t: "synced", sub_id: "t1", seq: history.length });
+    const send = (text: string): string => {
+      const box = $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
+      box.value = text;
+      box.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      ($(root, "composer") as HTMLFormElement).requestSubmit();
+      const cmds = sentFrames(h).filter((frame) => (frame as { t: string }).t === "cmd") as { cmd_id: string }[];
+      return cmds.at(-1)?.cmd_id ?? "";
+    };
+    return { root, send, ack: (id) => h.net.current().deliver({ t: "ack", cmd_id: id, ok: true }), said };
+  }
+  const listed = (root: HTMLElement): (string | null)[] => $$(root, "sent-message").map((item) => item.textContent);
+
+  test("the same text already in the history is not this message's event", () => {
+    const { root, send, ack, said } = liveAtlas(["continue"]);
+    ack(send("continue"));
+    expect(listed(root)).toEqual(["continueaccepted"]);
+    said(2, "continue");
+    expect(listed(root)).toEqual([]);
+  });
+
+  test("two identical sends need two events", () => {
+    const { root, send, ack, said } = liveAtlas([]);
+    const first = send("continue");
+    const second = send("continue");
+    ack(first);
+    ack(second);
+    said(1, "continue");
+    expect(listed(root)).toEqual(["continueaccepted"]);
+    said(2, "continue");
+    expect(listed(root)).toEqual([]);
+  });
+
   test("the delivery line maps every reported phase", () => {
     const expected: { readonly [P in Phase]: string } = {
       working: "Queued until the turn ends.",
@@ -439,10 +490,10 @@ describe("composer", () => {
       finished_with_background: "Delivered now.",
       blocked: "Queued; the agent is waiting on a decision.",
       needs_human: "Queued; the agent is waiting on a decision.",
-      offline: "Queued; delivered when the agent is back.",
-      hibernated: "Queued; delivered when the agent is back.",
-      limit_reached: "Queued; delivered when the agent is back.",
-      unknown: "Queued; delivered when the agent is back.",
+      offline: "Queued. The agent isn't reachable right now.",
+      hibernated: "Queued. The agent isn't reachable right now.",
+      limit_reached: "Queued. The agent isn't reachable right now.",
+      unknown: "Queued. The agent isn't reachable right now.",
       gone: "This agent has ended.",
     };
     for (const [state, line] of Object.entries(expected) as [Phase, string][]) {
@@ -451,7 +502,7 @@ describe("composer", () => {
     expect(delivery(undefined)).toEqual({ line: "Goes to the agent's queue.", open: true });
   });
 
-  const sender: Sender = { commands: () => [], send: () => undefined, blocked: () => null };
+  const sender: Sender = { commands: () => [], send: () => "c1", blocked: () => null };
   const rows: AgentRow[] = [
     { id: "atlas", label: "atlas", state: "working", activity: "", waitingOnHuman: [] },
     { id: "kite", label: "kite", state: "gone", activity: "", waitingOnHuman: [] },

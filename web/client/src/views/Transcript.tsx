@@ -44,8 +44,8 @@ export type TranscriptProps = {
   readonly transport: Transport;
   readonly stream: SessionStream;
   readonly source: TranscriptSource;
-  /** Told each person's message the stream shows: its seq and text. */
-  readonly onUserText?: (seq: number, text: string) => void;
+  /** Told each entry's seq as it is applied, with its text when it is a person's message. */
+  readonly onEntry?: (seq: number, userText: string | null) => void;
 };
 
 /** A person's message text: a `user` event's string content, or its text blocks. */
@@ -200,8 +200,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
   const subscription = props.transport.subscribe(props.stream, null, {
     entry: (entry) => {
       setEntries(entries.length, entry);
-      const text = userText(entry);
-      if (text !== null) props.onUserText?.(entry.seq, text);
+      props.onEntry?.(entry.seq, userText(entry));
     },
     reset: () => setEntries([]),
     synced: () => setProgress({ phase: "synced" }),

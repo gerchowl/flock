@@ -131,7 +131,7 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
                 transport={props.transport}
                 stream={`agent/${agent}`}
                 source={props.source}
-                onUserText={(seq, text) => props.composer.echo(agent, seq, text)}
+                onEntry={(seq, text) => props.composer.observe(agent, seq, text)}
               />
             </div>
             <Composer agent={agent} row={props.row()} sender={props.sender} state={props.composer} />
