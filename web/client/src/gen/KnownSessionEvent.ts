@@ -6,6 +6,7 @@ import type { CompactBoundary } from "./CompactBoundary";
 import type { ContentBlockDelta } from "./ContentBlockDelta";
 import type { ContentBlockStart } from "./ContentBlockStart";
 import type { ContentBlockStop } from "./ContentBlockStop";
+import type { ControlCancel } from "./ControlCancel";
 import type { ControlError } from "./ControlError";
 import type { ControlSuccess } from "./ControlSuccess";
 import type { ExecutionError } from "./ExecutionError";
@@ -31,4 +32,4 @@ import type { User } from "./User";
  * Deserialization uses the adapter parser and rejects unknown payloads;
  * those require the separate unknown wrapper, including its shape key.
  */
-export type KnownSessionEvent = Assistant | User | CommandLifecycle | Init | Status | ThinkingTokens | CompactBoundary | PermissionDenied | HookStarted | HookResponse | PeerMessageHold | RateLimit | CanUseTool | ControlSuccess | ControlError | MessageStart | ContentBlockStart | ContentBlockDelta | ContentBlockStop | MessageDelta | MessageStop | Success | ExecutionError;
+export type KnownSessionEvent = Assistant | User | CommandLifecycle | Init | Status | ThinkingTokens | CompactBoundary | PermissionDenied | HookStarted | HookResponse | PeerMessageHold | RateLimit | CanUseTool | ControlCancel | ControlSuccess | ControlError | MessageStart | ContentBlockStart | ContentBlockDelta | ContentBlockStop | MessageDelta | MessageStop | Success | ExecutionError;

@@ -43,6 +43,7 @@ const TYPES = set<KnownSessionEvent["type"]>({
   system: true,
   rate_limit_event: true,
   control_request: true,
+  control_cancel_request: true,
   control_response: true,
   stream_event: true,
   result: true,

@@ -123,8 +123,9 @@ mod tests {
                 }),
             },
             respond_to,
-            peer_pid: None,
-            peer_birth: None,
+            peer_pid: Some(std::process::id()),
+            peer_birth: crate::platform::process_start_time(std::process::id()),
+            peer_uid: Some(crate::platform::peer::effective_uid()),
         });
 
         // The loop is back while the probe is still held.

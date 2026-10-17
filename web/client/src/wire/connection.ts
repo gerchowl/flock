@@ -17,6 +17,12 @@
  * once. A newer snapshot `gap` supersedes an unfinished one, and `synced`
  * before the end is a protocol error.
  *
+ * **Sub ids** are never reused on a connection (ADR-0038 §3, "Sub ids and
+ * closed subs"). A re-`sub` on the same socket, after the progress
+ * deadline, `lagged` or `cursor_ahead`, moves the stream to a fresh id and
+ * closes the old one, whose late frames are dropped and touch nothing. A
+ * reconnect re-sends each `sub` under its current id on the new socket.
+ *
  * **The outbox:** see `outbox.ts`. Commands go out only in Live.
  *
  * Every timer runs on the injected {@link Clock}; every socket comes from the
@@ -133,7 +139,10 @@ export type ConnectionOptions = {
 };
 
 type Sub = {
-  readonly id: string;
+  /** The id on the wire now: a re-sub on the same socket moves it to a fresh one. */
+  id: string;
+  /** The prefix fresh ids take, from the id it was opened with. */
+  readonly prefix: string;
   readonly stream: string;
   readonly handler: StreamHandler;
   state: StreamState;
@@ -304,28 +313,39 @@ export class WireConnection {
    * this connection holds for the stream. Sent at once when connected,
    * otherwise after the next `welcome`.
    *
+   * A re-sub on the same socket (the progress deadline, `lagged`,
+   * `cursor_ahead`) moves the subscription to a fresh id with the same
+   * prefix (ADR-0038 §3, ADR-0036 §5a), so `id` names it only until then.
+   * The returned function ends it whatever its id has become.
+   *
    * @throws if `id` was already opened on this connection, even if closed since.
    */
-  subscribe(id: string, stream: StreamName, handler: StreamHandler, after?: number | null): void {
+  subscribe(id: string, stream: StreamName, handler: StreamHandler, after?: number | null): () => void {
     if (this.#used.has(id)) throw new Error(`sub id ${id} was already used on this connection`);
     this.#used.add(id);
     const cursor = after === undefined ? (this.#cursors.get(stream) ?? null) : after;
-    const sub: Sub = { id, stream, handler, state: "Replaying", cursor, settled: false, progress: null, refusal: null, snapshot: null };
+    const prefix = id.replace(/\d+$/, "");
+    const sub: Sub = { id, prefix, stream, handler, state: "Replaying", cursor, settled: false, progress: null, refusal: null, snapshot: null };
     this.#subs.set(id, sub);
     if (this.#connected()) this.#sendSub(sub);
     this.#settle();
+    return () => this.#unsubscribe(sub);
   }
 
-  /** Ends a subscription; no handler call follows. */
+  /** Ends the subscription whose id on the wire is now `id`; no handler call follows. */
   unsubscribe(id: string): void {
     const sub = this.#subs.get(id);
-    if (sub === undefined) return;
+    if (sub !== undefined) this.#unsubscribe(sub);
+  }
+
+  #unsubscribe(sub: Sub): void {
+    if (this.#subs.get(sub.id) !== sub) return;
     this.#stopProgress(sub);
-    this.#subs.delete(id);
+    this.#subs.delete(sub.id);
     if (this.#connected()) {
-      this.#ended.add(id);
+      this.#ended.add(sub.id);
       // A refused sub was already ended by the server's `subfail` (ADR-0036 §5a): nothing to unsub.
-      if (sub.state !== "Refused") this.#send({ t: "unsub", sub_id: id });
+      if (sub.state !== "Refused") this.#send({ t: "unsub", sub_id: sub.id });
     }
     this.#settle();
   }
@@ -519,6 +539,8 @@ export class WireConnection {
         return before.server_version !== after.server_version;
       case "cursor_ahead":
         return true;
+      case "sub_id_reused":
+        return false;
     }
   }
 
@@ -530,12 +552,30 @@ export class WireConnection {
     this.#startProgress(sub);
   }
 
+  /**
+   * Re-subscribes on the same socket under a fresh id (ADR-0038 §3, "Sub
+   * ids and closed subs"; ADR-0036 §5a). The old id is closed: its late
+   * frames are dropped. `unsub` is sent for it only when the server still
+   * holds it, not after `lagged` or `subfail`, which closed it there.
+   * Handler, cursor and state move with the subscription.
+   */
+  #resub(sub: Sub, unsubOld: boolean): void {
+    const old = sub.id;
+    if (unsubOld) this.#send({ t: "unsub", sub_id: old });
+    this.#subs.delete(old);
+    this.#ended.add(old);
+    sub.id = this.nextSubId(sub.prefix);
+    this.#used.add(sub.id);
+    this.#subs.set(sub.id, sub);
+    this.#sendSub(sub);
+  }
+
+  /** The progress deadline: on expiry, `unsub`, then a re-sub from the applied cursor. */
   #startProgress(sub: Sub): void {
     this.#stopProgress(sub);
     sub.progress = this.#options.clock.setTimeout(() => {
       sub.progress = null;
-      this.#send({ t: "unsub", sub_id: sub.id });
-      this.#sendSub(sub);
+      this.#resub(sub, true);
       this.#changed();
     }, DEADLINES.progress);
   }
@@ -582,7 +622,8 @@ export class WireConnection {
         sub.handler.synced();
         return this.#settle();
       case "lagged":
-        this.#sendSub(sub);
+        // `lagged` closes the id on the server, like `subfail`.
+        this.#resub(sub, false);
         return this.#changed();
       case "subfail":
         return this.#subfail(sub, frame.code, frame.message);
@@ -652,7 +693,7 @@ export class WireConnection {
     if (this.#subs.get(sub.id) !== sub) return this.#changed();
     sub.cursor = null;
     this.#cursors.delete(sub.stream);
-    this.#sendSub(sub);
+    this.#resub(sub, false);
     this.#changed();
   }
 

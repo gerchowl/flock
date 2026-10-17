@@ -271,8 +271,7 @@ mod handler_tests {
         let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
         terminal.launch_argv = Some(vec!["codex".into()]);
         let agent_id = terminal.agent_id.to_string();
-        app.test_pane_child_pids.clear();
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
+        crate::test_support::attest_pane_caller(app, pane_id);
         agent_id
     }
 
@@ -297,7 +296,6 @@ mod handler_tests {
         assert_eq!(delegates_of(&a_rows), want);
 
         // A's own `--mine`, run from A's pane, is exactly A's three.
-        app.test_pane_child_pids.clear();
         assert_eq!(caller_is_an_agent(&mut app), a);
         let a_mine = list(&mut app, &["--mine"]).expect("a lists");
         assert_eq!(delegates_of(&a_mine), want);

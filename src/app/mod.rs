@@ -141,11 +141,18 @@ impl PaneClickState {
     }
 }
 
+/// Socket attribution preserved across recovery continuations.
+#[derive(Clone, Copy)]
+pub(crate) struct ApiCaller {
+    pid: Option<u32>,
+    birth: Option<Option<u64>>,
+    uid: Option<Option<u32>>,
+}
+
 /// An API request held back until the mesh store finishes recovering.
 struct ParkedApiRequest {
     request: crate::api::schema::Request,
-    peer_pid: Option<u32>,
-    peer_birth: Option<Option<u64>>,
+    caller: ApiCaller,
     respond_to: std::sync::mpsc::Sender<String>,
     deadline: Instant,
 }
@@ -164,6 +171,8 @@ pub(crate) const RECOVERY_PARK_LIMIT: Duration = Duration::from_secs(5);
 pub(crate) struct AppRuntimeConfig {
     /// Command used by every app merge-evidence query, including workers.
     pub(crate) merge_gate: crate::worktree::MergeGateContext,
+    /// Account lookup captured once, independent of caller-controlled requests.
+    pub(crate) uid_policy: crate::structured::identity::UidPolicy,
 }
 
 pub struct App {
@@ -176,6 +185,8 @@ pub struct App {
     pub(crate) current_api_peer_pid: Option<u32>,
     /// Internal call, captured socket birth, or captured-but-unavailable birth.
     pub(crate) current_api_peer_birth: Option<Option<u64>>,
+    /// Internal call, captured UID, or captured-but-unavailable UID.
+    pub(crate) current_api_peer_uid: Option<Option<u32>>,
     pub(crate) session_leases: crate::structured::lease::SessionLeases,
     /// Test-only override for pane child PIDs so ancestry reconciliation can
     /// be exercised without spawning real PTYs.
@@ -221,11 +232,7 @@ pub struct App {
     /// then would read an empty projection, so they wait for the rebuild.
     recovery_parked: Vec<ParkedApiRequest>,
     /// Set by dispatch, taken by `respond_or_park`, which owns the responder.
-    pub(crate) pending_recovery_park: Option<(
-        crate::api::schema::Request,
-        Option<u32>,
-        Option<Option<u64>>,
-    )>,
+    pub(crate) pending_recovery_park: Option<(crate::api::schema::Request, ApiCaller)>,
     pub(crate) mesh_enrollment_generation: u64,
     pub(crate) mesh_forward_generation: Option<u64>,
     pub(crate) mesh_forward_cursor: Option<(u64, crate::mesh::key::MessageKey)>,
@@ -246,7 +253,6 @@ pub struct App {
     /// Operator drafts an injection could not type back (#850).
     pub(crate) kept_drafts: std::cell::RefCell<draft_stash::KeptDrafts>,
     /// Plain paste observation parked by `respond_or_park` after dispatch.
-    pub(crate) pending_paste: Option<paste_confirm::Paste>,
     /// `integration.install`, answered from a worker thread by
     /// `respond_or_park`, because installing Claude probes `claude --version`.
     pub(crate) pending_integration_install: Option<api::integrations::PendingInstall>,
@@ -534,8 +540,12 @@ impl App {
         config_diagnostic: Option<String>,
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
-        runtime_config: AppRuntimeConfig,
+        mut runtime_config: AppRuntimeConfig,
     ) -> Self {
+        // Absence is explicit policy, never an inference from a pending lookup.
+        if config.security.agent_account == crate::config::model::AgentAccount::None {
+            runtime_config.uid_policy.dedicated = Ok(None).into();
+        }
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
         crate::channels::issue_tokens(&config.channels, &short_host_name());
@@ -976,6 +986,7 @@ impl App {
             event_tx,
             current_api_peer_pid: None,
             current_api_peer_birth: None,
+            current_api_peer_uid: None,
             session_leases: Default::default(),
             #[cfg(test)]
             test_pane_child_pids: std::collections::HashMap::new(),
@@ -1048,7 +1059,6 @@ impl App {
             inbound: Default::default(),
             message_relays: Default::default(),
             pending_agent_submit: None,
-            pending_paste: None,
             pending_integration_install: None,
             claude_version_probe: std::sync::Arc::new(crate::integration::probe_claude_version),
             active_submissions: Default::default(),
@@ -1258,12 +1268,16 @@ impl App {
         request: crate::api::schema::Request,
         peer_pid: Option<u32>,
         peer_birth: Option<Option<u64>>,
+        peer_uid: Option<Option<u32>>,
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
         self.recovery_parked.push(ParkedApiRequest {
             request,
-            peer_pid,
-            peer_birth,
+            caller: ApiCaller {
+                pid: peer_pid,
+                birth: peer_birth,
+                uid: peer_uid,
+            },
             respond_to,
             deadline: Instant::now() + RECOVERY_PARK_LIMIT,
         });
@@ -1287,14 +1301,23 @@ impl App {
 
     /// Answer parked mail requests in arrival order, each with its own caller.
     fn replay_recovery_parked(&mut self) {
-        let caller = (self.current_api_peer_pid, self.current_api_peer_birth);
+        let caller = (
+            self.current_api_peer_pid,
+            self.current_api_peer_birth,
+            self.current_api_peer_uid,
+        );
         for parked in std::mem::take(&mut self.recovery_parked) {
-            self.current_api_peer_pid = parked.peer_pid;
-            self.current_api_peer_birth = parked.peer_birth;
+            self.current_api_peer_pid = parked.caller.pid;
+            self.current_api_peer_birth = parked.caller.birth;
+            self.current_api_peer_uid = parked.caller.uid;
             let response = self.handle_api_request_after_internal_events_drained(parked.request);
             self.respond_or_park(parked.respond_to, response);
         }
-        (self.current_api_peer_pid, self.current_api_peer_birth) = caller;
+        (
+            self.current_api_peer_pid,
+            self.current_api_peer_birth,
+            self.current_api_peer_uid,
+        ) = caller;
     }
 
     #[cfg(unix)]
@@ -1635,7 +1658,7 @@ impl App {
             };
 
             match event {
-                LoopEvent::InputWrites => self.input_writes.service(),
+                LoopEvent::InputWrites => self.service_input_writes(),
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
                     self.handle_internal_event_with_prefix_sync(ev);
@@ -1863,6 +1886,10 @@ impl App {
         let mut diagnostics = load_diagnostics.to_vec();
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
+
+        if !invalid_section("security") && config.security != self.state.config.security {
+            diagnostics.push("security.agent_account changed: restart the server to apply socket account policy; keeping current policy".into());
+        }
 
         // Snapshot fields that need to detect a change relative to the
         // previous live config BEFORE any per-section replacement below.
@@ -2961,6 +2988,23 @@ mod tests {
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         restore_xdg_state_home(original_xdg_state_home);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn account_policy_reload_keeps_active_policy_and_requires_restart() {
+        let mut app = test_app();
+        let mut incoming = app.state.config.clone();
+        incoming.security.agent_account = crate::config::model::AgentAccount::None;
+        let report = app.apply_live_config(&incoming, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("security.agent_account changed: restart")));
+        assert_eq!(
+            app.state.config.security.agent_account,
+            crate::config::model::AgentAccount::FlkAgent
+        );
     }
 
     #[test]
@@ -4314,8 +4358,7 @@ sidebar_pane_gap = 99
         let pane_id = app.state.workspaces[ws_idx]
             .focused_pane_id()
             .expect("a pane to be sitting in");
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(app, pane_id);
         assert_eq!(
             app.spawn_caller().own_workspace(),
             Some(ws_idx),
@@ -4897,8 +4940,7 @@ sidebar_pane_gap = 99
                 .get_mut(&terminal_id)
                 .expect("terminal")
                 .launch_argv = Some(vec!["claude".into()]);
-            app.test_pane_child_pids.insert(pane_id, std::process::id());
-            app.current_api_peer_pid = Some(std::process::id());
+            crate::test_support::attest_pane_caller(&mut app, pane_id);
             app
         }
 

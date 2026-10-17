@@ -806,7 +806,7 @@ When flock types a sentence into an agent pane and presses Enter for it (an inbo
 enabled = true   # the kill switch
 ```
 
-- **Your keystrokes are held, not dropped.** Keys and pastes from an attached client, and `pane send-text` / `send-keys` / `agent send` calls from other tools, are kept in order in memory while flock types. They are replayed into the pane, in the order you sent them, as soon as the injection ends. If the pane's input channel is full at that moment, they wait and are retried, still in order, rather than dropped. The pane's bottom border reads `flock is typing…` meanwhile. Other panes are not affected. An `agent send` paste made while the pane is held reports `unconfirmed` with reason `held_by_injection`: it is delivered after the injection, but the screen cannot prove it.
+- **Your keystrokes wait in order.** Keys and pastes from an attached client are kept while flock types and replay when the injection ends. If the input channel is temporarily full, they wait in order. The pane's bottom border reads `flock is typing…` meanwhile; other panes remain usable. Automated text calls normally refuse with `injection_pending` while an injection holds an agent pane. Raw `pane send-text` and non-submit `agent send` calls can wait behind it, but stay pending until their PTY write completes or the write deadline expires. Expiry discards the unsent payload and reports whether any prefix was written. Paste observation starts only after the completed write. See [completed input writes](./socket-api.mdx#completed-input-writes) for budgets and byte-count failures.
 - **Esc and Ctrl-C stop it.** Either key ends the hold at once. It reaches the pane straight away, after anything already held, and the injection is abandoned (`operator_active`) before its Enter. A draft that was moved aside and not yet typed back goes to the stash.
 - **The hold is bounded.** It ends with the injection, whatever the outcome, and never lasts longer than 7 seconds (5 seconds plus the 2-second submit confirmation). It also ends before the server stops or hands off, so held keys reach the pane first.
 - **A draft moves aside and comes back.** For an inbox wake or `agent send`, a one-row draft in a Claude, Codex or OpenCode composer is cleared (End, then Backspace), the sentence is typed and submitted, and the draft is typed back into the emptied composer and read back exactly. The draft lives in flock's memory only, never in the system clipboard. A draft of several rows, or one holding a paste or image chip, is refused as before (`input_not_empty`), because the screen cannot show it exactly. So is any draft in an unrecognised composer, and any draft for `pane.submit` and `delegate start`, which type into panes nobody should be typing in.
@@ -922,6 +922,34 @@ Until then the previously adopted version applies, and before any adoption nothi
 - `origin/HEAD` is written at clone time and git never revises it. If the repo's default branch moved, run `git remote set-head origin --auto`. `show` reports the branch it read as `default_branch`.
 - A pending change is reported by `flk owner policy show`, not yet by a notification (#1239).
 - Repos are keyed by their canonical git common dir.
+
+## Socket account policy
+
+```toml
+[security]
+agent_account = "flk-agent" # default; "none" explicitly disables recognition
+```
+
+This file-only setting requires a server restart. Reload reports a change and
+keeps the active policy. `structured.run_as = "operator"` selects launch identity
+and does not disable account recognition.
+
+With the default, the first socket classification starts one lazy `flk-agent`
+account lookup, waiting at most 100 ms; later calls do not wait for a stuck
+lookup. Pending/failed resolution leaves callers read-only, including the
+operator: mutations such as server stop are refused. An absent account or a
+resolved UID different from the server UID permits the operator, subject to
+ancestry checks. A dedicated UID equal to the server UID is a misconfiguration:
+operator authority is refused, `agent_account_uid_collision` is logged once and
+retained in `flk status server` (including its JSON diagnostic) until restart.
+
+Use `agent_account = "none"` only when no dedicated agent account is used. It
+avoids the directory-service availability cost entirely: no dedicated-account
+NSS lookup runs, and the server UID passes the UID check immediately. Known
+leased or pane agents still cannot act as the operator; other/missing UIDs
+remain read-only. This gives up dedicated-UID recognition of anonymous/detached
+agents. Same-UID callers without lease or pane ancestry cannot be distinguished
+from the operator (the cooperative limit tracked in #1177; ADR-0036 §1a).
 
 ## Environment variables
 
