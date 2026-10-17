@@ -1,11 +1,28 @@
 //! Anchored private client-token namespace; no filesystem path follows a link.
-use std::ffi::CString;
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+/// A directory entry with a lossless, non-secret management identifier.
+pub(crate) struct Entry {
+    /// Hex-encoded raw filename, used only as an opaque management identifier.
+    pub(crate) id: String,
+    /// The filename when it is UTF-8, absent for arbitrary Unix byte names.
+    pub(crate) name: Option<String>,
+}
+impl Entry {
+    /// Preserve arbitrary directory-name bytes even on non-UTF-8 filesystems.
+    pub(crate) fn from_name(name: OsString) -> Self {
+        Self {
+            id: name.as_bytes().iter().map(|b| format!("{b:02x}")).collect(),
+            name: name.into_string().ok(),
+        }
+    }
+}
 pub(crate) struct Namespace {
     root: PathBuf,
     directory: File,
@@ -23,7 +40,7 @@ impl Namespace {
         File::open(result.root.parent().ok_or(io::ErrorKind::InvalidInput)?)?.sync_all()?;
         Ok(result)
     }
-    fn check(&self) -> io::Result<()> {
+    pub(crate) fn check(&self) -> io::Result<()> {
         super::structured::check_private_dir(&self.root)?;
         let current = fs::symlink_metadata(&self.root)?;
         let pinned = self.directory.metadata()?;
@@ -73,15 +90,49 @@ impl Namespace {
         }
         Ok(file)
     }
-    pub(crate) fn names(&self) -> io::Result<Vec<String>> {
+    pub(crate) fn names(&self) -> io::Result<Vec<Entry>> {
         self.check()?;
         fs::read_dir(&self.root)?
-            .map(|e| {
-                e?.file_name()
-                    .into_string()
-                    .map_err(|_| io::ErrorKind::InvalidData.into())
-            })
+            .map(|entry| Ok(Entry::from_name(entry?.file_name())))
             .collect()
+    }
+    fn decode_entry(id: &str) -> io::Result<Vec<u8>> {
+        if id.is_empty()
+            || !id.len().is_multiple_of(2)
+            || !id.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        Ok(id
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |b: u8| {
+                    if b.is_ascii_digit() {
+                        b - b'0'
+                    } else {
+                        b.to_ascii_lowercase() - b'a' + 10
+                    }
+                };
+                digit(pair[0]) * 16 + digit(pair[1])
+            })
+            .collect())
+    }
+    /// Unlink an exact listed token entry, without trusting its name or contents.
+    pub(crate) fn remove_entry(&self, id: &str) -> io::Result<()> {
+        let bytes = Self::decode_entry(id)?;
+        if !bytes.ends_with(b".token") {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        self.unlink(OsStr::from_bytes(&bytes))
+    }
+    /// Remove only a temporary entry while the caller holds the writer lock.
+    pub(crate) fn remove_temporary(&self, id: &str) -> io::Result<()> {
+        let bytes = Self::decode_entry(id)?;
+        if !bytes.starts_with(b".tmp-") {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        self.unlink(OsStr::from_bytes(&bytes))
     }
     pub(crate) fn publish(&self, from: &str, to: &str, replace: bool) -> io::Result<()> {
         self.check()?;
@@ -101,8 +152,15 @@ impl Namespace {
         self.sync()
     }
     pub(crate) fn remove(&self, name: &str) -> io::Result<()> {
+        self.unlink(OsStr::new(name))
+    }
+    fn unlink(&self, name: &OsStr) -> io::Result<()> {
         self.check()?;
-        let name = Self::name(name)?;
+        let bytes = name.as_bytes();
+        if bytes.is_empty() || bytes.contains(&b'/') || matches!(bytes, b"." | b"..") {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let name = CString::new(bytes).map_err(|_| io::ErrorKind::InvalidInput)?;
         // SAFETY: a terminated component relative to the owned descriptor.
         if unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) } < 0 {
             return Err(io::Error::last_os_error());

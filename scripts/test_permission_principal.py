@@ -10,7 +10,7 @@ class PermissionPrincipalPrivacy(unittest.TestCase):
     def test_token_cannot_be_forged_from_a_subject(self):
         root = pathlib.Path(__file__).resolve().parents[1]
         # Compile the actual sealed declaration without its token-store dependencies.
-        module = (root / "src/structured/permissions/auth.rs").read_text().split("\npub mod tokens;")[0]
+        module = (root / "src/structured/permissions/auth.rs").read_text().split("\npub(crate) mod tokens;")[0]
         probes = [
             ("let _: Option<auth::VerifiedToken<'static>> = None;", None),
             ('let _ = auth::VerifiedToken { subject: "fixture", operate: true };', "E0451"),

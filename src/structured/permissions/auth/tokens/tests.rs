@@ -6,6 +6,7 @@ use std::os::unix::{
     fs::{symlink, MetadataExt, PermissionsExt},
     net::UnixStream,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -32,9 +33,20 @@ fn operator() -> App {
 fn scopes(values: &[Scope]) -> BTreeSet<Scope> {
     values.iter().copied().collect()
 }
+struct FixtureEntropy(u64);
+impl Entropy for FixtureEntropy {
+    fn fill(&mut self, bytes: &mut [u8]) -> io::Result<()> {
+        for chunk in bytes.chunks_mut(32) {
+            let digest = Sha256::digest(self.0.to_le_bytes());
+            chunk.copy_from_slice(&digest[..chunk.len()]);
+            self.0 += 1;
+        }
+        Ok(())
+    }
+}
 fn setup() -> (SessionConfigDir, TokenStore, App) {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-    let store = TokenStore::open(root.path()).unwrap();
+    let store = TokenStore::open_with_entropy(root.path(), FixtureEntropy(0)).unwrap();
     (root, store, operator())
 }
 fn issue(store: &TokenStore, app: &mut App, name: &str, values: &[Scope]) -> Issued {
@@ -88,7 +100,18 @@ fn issue_authenticate_list_and_private_persistence_survive_reopen() {
     let listed = reopened
         .list(&app.client_token_authority().unwrap())
         .unwrap();
-    assert_eq!(listed.as_slice(), std::slice::from_ref(&issued.info));
+    assert_eq!(
+        listed,
+        vec![Listed::Valid {
+            entry: hex(b"browser.token"),
+            info: issued.info.clone()
+        }]
+    );
+    assert_eq!(issued.token.0, hex(&Sha256::digest(0u64.to_le_bytes())));
+    assert_eq!(
+        issued.info.principal,
+        hex(&Sha256::digest(1u64.to_le_bytes())[..16])
+    );
     assert!(!serde_json::to_string(&listed)
         .unwrap()
         .contains(&issued.token.0));
@@ -210,7 +233,7 @@ fn revoked_replaced_and_reissued_tokens_never_admit_an_old_session() {
     ));
 }
 #[test]
-fn unsafe_paths_links_modes_and_corrupt_records_fail_without_leaking_content() {
+fn unsafe_entries_match_nobody_but_do_not_deny_other_clients_or_operator_inspection() {
     let (root, store, mut app) = setup();
     for name in ["", "..", "../escape", "Upper", "a/b"] {
         assert!(matches!(
@@ -222,48 +245,84 @@ fn unsafe_paths_links_modes_and_corrupt_records_fail_without_leaking_content() {
             Err(TokenError::Unsafe)
         ));
     }
-    let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
-    let file = root.path().join("client-tokens/browser.token");
+    let good = issue(&store, &mut app, "good", &[Scope::Read]);
+    let bad = issue(&store, &mut app, "bad", &[Scope::Read]);
+    let dir = root.path().join("client-tokens");
+    let file = dir.join("bad.token");
     let original = fs::read(&file).unwrap();
     let outside = root.path().join("outside");
     fs::write(&outside, &original).unwrap();
     fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
     fs::remove_file(&file).unwrap();
     symlink(&outside, &file).unwrap();
-    assert!(matches!(
-        store.authenticate(&issued.token),
-        Err(TokenError::Unsafe)
-    ));
+    let inspect = |store: &TokenStore, app: &mut App| {
+        assert_eq!(store.authenticate(&good.token).unwrap().info, good.info);
+        assert!(matches!(
+            store.authenticate(&bad.token),
+            Err(TokenError::Unauthorized)
+        ));
+        let listed = store.list(&app.client_token_authority().unwrap()).unwrap();
+        assert!(listed.contains(&Listed::Unsafe {
+            entry: hex(b"bad.token"),
+            name: Some("bad.token".into())
+        }));
+        assert!(listed
+            .iter()
+            .any(|entry| matches!(entry, Listed::Valid{info, ..} if info == &good.info)));
+        assert!(!serde_json::to_string(&listed)
+            .unwrap()
+            .contains(&bad.token.0));
+    };
+    inspect(&store, &mut app);
     fs::remove_file(&file).unwrap();
     fs::write(&file, &original).unwrap();
     fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(matches!(
-        store.authenticate(&issued.token),
-        Err(TokenError::Unsafe)
-    ));
+    inspect(&store, &mut app);
     assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o644);
     fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
     let mut oversized = original.clone();
     oversized.resize(4097, b' ');
     for corrupt in [
         oversized,
-        format!("{{\"{}\":true}}", issued.token.0).into_bytes(),
+        format!("{{\"{}\":true}}", bad.token.0).into_bytes(),
         vec![b' '; 4097],
         b"{\"token\":\"bad\"}".to_vec(),
     ] {
         fs::write(&file, corrupt).unwrap();
-        let error = store.authenticate(&issued.token).err().unwrap();
-        assert!(matches!(error, TokenError::Unsafe));
-        assert!(!format!("{error}").contains(&issued.token.0));
+        inspect(&store, &mut app);
     }
-    fs::rename(root.path().join("client-tokens"), root.path().join("saved")).unwrap();
-    symlink(root.path().join("saved"), root.path().join("client-tokens")).unwrap();
-    assert!(store.authenticate(&issued.token).is_err());
+    for name in ["Upper.token", &format!("{}.token", "a".repeat(65))] {
+        let name = std::ffi::OsString::from(name);
+        let path = dir.join(&name);
+        fs::write(&path, &original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        inspect(&store, &mut app);
+        let listed = store.list(&app.client_token_authority().unwrap()).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        let entry = hex(name.as_bytes());
+        assert!(listed
+            .iter()
+            .any(|row| matches!(row, Listed::Unsafe {entry: id, ..} if id == &entry)));
+        store
+            .revoke_entry(&app.client_token_authority().unwrap(), &entry)
+            .unwrap();
+        assert!(!path.exists());
+    }
+    store
+        .revoke(&app.client_token_authority().unwrap(), "bad")
+        .unwrap();
+    assert!(!file.exists());
+    assert_eq!(fs::read(outside).unwrap(), original);
+    fs::rename(&dir, root.path().join("saved")).unwrap();
+    symlink(root.path().join("saved"), &dir).unwrap();
+    assert!(store.authenticate(&good.token).is_err());
+    assert!(store.list(&app.client_token_authority().unwrap()).is_err());
     assert!(TokenStore::open(root.path()).is_err());
 }
 #[test]
 fn namespace_replacement_and_write_failure_do_not_redirect_or_issue_tokens() {
     let (root, store, mut app) = setup();
+    fs::remove_file(root.path().join("client-tokens/.lock")).unwrap();
     fs::remove_dir(root.path().join("client-tokens")).unwrap();
     assert!(matches!(
         store.issue(
@@ -274,6 +333,12 @@ fn namespace_replacement_and_write_failure_do_not_redirect_or_issue_tokens() {
         Err(TokenError::Io(_))
     ));
     assert!(root.path().is_dir());
+    assert!(
+        matches!(store.authenticate(&Bearer("0".repeat(64))), Err(TokenError::Io(error)) if error.kind() == io::ErrorKind::NotFound)
+    );
+    assert!(
+        matches!(store.list(&app.client_token_authority().unwrap()), Err(TokenError::Io(error)) if error.kind() == io::ErrorKind::NotFound)
+    );
     let replacement = TokenStore::open(root.path()).unwrap();
     assert!(matches!(
         store.issue(
@@ -289,12 +354,63 @@ fn namespace_replacement_and_write_failure_do_not_redirect_or_issue_tokens() {
         .is_empty());
 }
 #[test]
-fn separate_handles_serialize_admission_with_operator_revocation_without_waiting() {
-    let (root, store, mut app) = setup();
+fn authentication_does_not_acquire_the_admission_lock() {
+    let (_root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
+    let _guard = store.lock().unwrap();
+    assert_eq!(store.authenticate(&issued.token).unwrap().info, issued.info);
+    assert!(matches!(
+        store.authenticate(&Bearer("0".repeat(64))),
+        Err(TokenError::Unauthorized)
+    ));
+    assert!(store.list(&app.client_token_authority().unwrap()).is_ok());
+}
+#[test]
+fn authentication_contention_cannot_make_revocation_busy() {
+    let (_root, store, mut app) = setup();
     let issued = issue(&store, &mut app, "browser", &[Scope::Send]);
     let session = store.authenticate(&issued.token).unwrap();
     let store = Arc::new(store);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = {
+        let store = store.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            // The first iteration proves the caller is active before revocation.
+            assert!(matches!(
+                store.authenticate(&Bearer("0".repeat(64))),
+                Err(TokenError::Unauthorized)
+            ));
+            ready_tx.send(()).unwrap();
+            while !stop.load(Ordering::Acquire) {
+                assert!(matches!(
+                    store.authenticate(&Bearer("0".repeat(64))),
+                    Err(TokenError::Unauthorized)
+                ));
+            }
+            done_tx.send(()).unwrap();
+        })
+    };
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let result = store.revoke(&app.client_token_authority().unwrap(), "browser");
+    stop.store(true, Ordering::Release);
+    done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    worker.join().unwrap();
+    result.unwrap();
+    assert!(matches!(
+        store.admit(&session, Scope::Send, |_| panic!("revoked")),
+        Err(TokenError::Revoked)
+    ));
+}
+#[test]
+fn separate_handles_wait_for_admission_and_revocation_wins_after_it() {
+    let (root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Send]);
+    let session = store.authenticate(&issued.token).unwrap();
     let other = TokenStore::open(root.path()).unwrap();
+    let store = Arc::new(store);
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
@@ -310,43 +426,81 @@ fn separate_handles_serialize_admission_with_operator_revocation_without_waiting
         })
     };
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // Begin the real revocation while dispatch holds the OS lock. The staged
+    // operation must wait, rather than fail Busy or delete an admitted record.
+    let pending = other.begin_revoke("browser").unwrap();
     assert!(matches!(
-        other.revoke(&app.client_token_authority().unwrap(), "browser"),
-        Err(TokenError::Busy)
+        pending.guard.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
     ));
+    assert_eq!(store.authenticate(&issued.token).unwrap().info, issued.info);
     release_tx.send(()).unwrap();
+    pending.finish().unwrap();
     done_rx
         .recv_timeout(Duration::from_secs(10))
         .unwrap()
         .unwrap();
     worker.join().unwrap();
-    other
-        .revoke(&app.client_token_authority().unwrap(), "browser")
-        .unwrap();
     assert!(matches!(
         store.admit(&session, Scope::Send, |_| panic!("after revocation")),
         Err(TokenError::Revoked)
     ));
 }
-
 #[test]
-fn private_issue_restores_owner_access_under_restrictive_umask() {
-    struct Mask(libc::mode_t);
-    impl Drop for Mask {
-        fn drop(&mut self) {
-            // SAFETY: nextest isolates this process-local umask.
-            unsafe {
-                libc::umask(self.0);
-            }
-        }
-    }
-    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-    let mut app = operator();
-    // SAFETY: nextest isolates this process-local umask.
-    let _mask = Mask(unsafe { libc::umask(0o777) });
-    let store = TokenStore::open(root.path()).unwrap();
+fn revocation_lock_deadline_fails_without_removing_a_credential() {
+    let (root, store, mut app) = setup();
     let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
+    let other = TokenStore::open(root.path()).unwrap();
+    let guard = store.lock().unwrap();
+    assert!(
+        matches!(other.revoke(&app.client_token_authority().unwrap(), "browser"), Err(TokenError::Io(error)) if error.kind() == io::ErrorKind::TimedOut)
+    );
+    drop(guard);
     assert_eq!(store.authenticate(&issued.token).unwrap().info, issued.info);
+}
+#[test]
+fn open_sweeps_orphan_bearers_without_following_links() {
+    let (root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
+    let directory = root.path().join("client-tokens");
+    fs::copy(
+        directory.join("browser.token"),
+        directory.join(".tmp-orphan"),
+    )
+    .unwrap();
+    let outside = root.path().join("preserve");
+    fs::write(&outside, b"fixture").unwrap();
+    symlink(&outside, directory.join(".tmp-link")).unwrap();
+    let reopened = TokenStore::open(root.path()).unwrap();
+    assert!(!directory.join(".tmp-orphan").exists());
+    assert!(fs::symlink_metadata(directory.join(".tmp-link")).is_err());
+    assert_eq!(fs::read(outside).unwrap(), b"fixture");
+    assert_eq!(
+        reopened.authenticate(&issued.token).unwrap().info,
+        issued.info
+    );
+}
+#[test]
+fn same_uid_with_lease_ancestry_cannot_issue() {
+    let (_root, store, mut app) = setup();
+    assert!(app.client_token_authority().is_ok());
+    let mut lease = app
+        .session_leases
+        .reserve("agent_atlas_token", "token-fixture", None)
+        .unwrap();
+    lease.bind(std::process::id()).unwrap();
+    assert!(matches!(
+        app.session_leases.caller(Some(std::process::id())),
+        crate::structured::lease::Caller::Agent { .. }
+    ));
+    assert!(matches!(
+        app.client_token_authority(),
+        Err(crate::api::error_code::ErrorCode::OperatorOnly)
+    ));
+    assert!(store
+        .list(&operator().client_token_authority().unwrap())
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -356,17 +510,88 @@ fn fifo_token_is_refused_without_waiting_for_a_writer() {
     let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
     let path = root.path().join("client-tokens/browser.token");
     fs::remove_file(&path).unwrap();
+    let good = issue(&store, &mut app, "good", &[Scope::Read]);
     let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: terminated sandbox fixture path, never a shared entry.
     assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
+        let mut app = operator();
+        assert_eq!(store.authenticate(&good.token).unwrap().info, good.info);
+        assert!(store.list(&app.client_token_authority().unwrap()).unwrap().iter().any(|row| matches!(row, Listed::Unsafe {name: Some(name), ..} if name == "browser.token")));
         tx.send(store.authenticate(&issued.token).map(|_| ()))
             .unwrap();
     });
     assert!(matches!(
         rx.recv_timeout(Duration::from_secs(10)).unwrap(),
-        Err(TokenError::Unsafe)
+        Err(TokenError::Unauthorized)
     ));
     worker.join().unwrap();
+}
+
+#[test]
+fn open_cannot_sweep_an_active_issue_temporary() {
+    let (root, store, _app) = setup();
+    let guard = store.lock().unwrap();
+    let temporary = root.path().join("client-tokens/.tmp-active");
+    fs::write(&temporary, b"fixture").unwrap();
+    assert!(matches!(
+        TokenStore::open(root.path()),
+        Err(TokenError::Busy)
+    ));
+    assert!(temporary.exists());
+    drop(guard);
+    TokenStore::open(root.path()).unwrap();
+    assert!(!temporary.exists());
+}
+
+#[test]
+fn non_utf8_directory_entries_are_lossless_unsafe_rows_not_scan_errors() {
+    use std::os::unix::ffi::OsStringExt;
+    let (_root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
+    // APFS rejects non-UTF-8 file creation. Drive the production directory-name
+    // decoder and entry loader directly, together with an actual valid record.
+    let bad = Entry::from_name(std::ffi::OsString::from_vec(b"\xff.token".to_vec()));
+    assert!(bad.name.is_none());
+    assert_eq!(bad.id, "ff2e746f6b656e");
+    let mut entries = store.0.names().unwrap();
+    entries.push(bad);
+    let loaded: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| entry.id.ends_with("2e746f6b656e"))
+        .map(|entry| store.load_entry(entry))
+        .collect();
+    assert!(loaded
+        .iter()
+        .any(|(entry, record)| entry.id == "ff2e746f6b656e" && record.is_none()));
+    assert!(loaded.iter().any(|(_, record)| record
+        .as_ref()
+        .is_some_and(|(_, record)| record.token.0 == issued.token.0)));
+    assert_eq!(store.authenticate(&issued.token).unwrap().info, issued.info);
+}
+
+#[test]
+fn listed_entry_identifiers_cannot_revoke_outside_the_token_namespace_or_its_lock() {
+    let (root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
+    let outside = root.path().join("outside.token");
+    fs::write(&outside, b"fixture").unwrap();
+    for entry in [
+        String::new(),
+        "z0".into(),
+        "0".into(),
+        hex(b"../outside.token"),
+        hex(b".lock"),
+        hex(b".tmp-active"),
+        hex(b"browser.token\0"),
+    ] {
+        assert!(matches!(
+            store.revoke_entry(&app.client_token_authority().unwrap(), &entry),
+            Err(TokenError::Unsafe)
+        ));
+    }
+    assert_eq!(fs::read(outside).unwrap(), b"fixture");
+    assert_eq!(store.authenticate(&issued.token).unwrap().info, issued.info);
+    store.lock().unwrap();
 }
