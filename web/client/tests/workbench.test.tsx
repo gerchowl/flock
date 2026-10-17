@@ -111,6 +111,16 @@ describe("wire mode", () => {
     expect($(root, "connection-bar")?.textContent).not.toContain("secret");
   });
 
+  test("an unreadable stored outbox record is named in the connection strip, and the app still loads", () => {
+    const h = new Harness();
+    h.store.setItem("flock.outbox.v1", JSON.stringify({ principal: "p", commands: [{ cmd_id: "c9", verb: 1 }] }));
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    expect($(root, "workbench")).not.toBeNull();
+    expect($(root, "outbox-problem")?.textContent).toBe("Dropped unreadable stored command: c9.");
+  });
+
   test("an agent list that failed says why, and an empty one says so", async () => {
     for (const [deliver, note] of [
       [(observer: FleetObserver) => observer.failed("This token cannot read the fleet."), "This token cannot read the fleet."],

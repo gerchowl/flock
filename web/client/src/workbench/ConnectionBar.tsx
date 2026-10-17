@@ -1,7 +1,8 @@
 /**
  * The live connection's strip (ADR-0038 §3): its state, the latest failure
  * while reconnecting or stopped, the always-offered *Disconnect* (or
- * *Connect*), and in NeedsToken a field for a new token. The token is
+ * *Connect*), in NeedsToken a field for a new token, and what restoring
+ * the stored outbox had to drop, if anything. The token is
  * handed to the connection and never shown, logged or stored by the page.
  *
  * @module
@@ -22,6 +23,13 @@ export function ConnectionBar(props: ConnectionBarProps): JSX.Element {
     <div class="connection-bar" classList={{ "connection-bar--live": state() === "Live" }} role="status" data-testid="connection-bar">
       <strong class="connection-bar__state">{state()}</strong>
       <Show when={error()}>{(message) => <span class="connection-bar__error">{message()}</span>}</Show>
+      <Show when={props.connection.outboxProblem}>
+        {(problem) => (
+          <span class="connection-bar__error" data-testid="outbox-problem">
+            {problem()}
+          </span>
+        )}
+      </Show>
       <Show when={state() === "NeedsToken"}>
         <form
           class="connection-bar__token"
