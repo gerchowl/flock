@@ -1039,6 +1039,7 @@ fn review_render_failure_fails_only_the_invalid_head_and_survives_reopen() {
     invalid_head_recovery(false);
     invalid_head_recovery(true);
 }
+
 fn invalid_head_recovery(bad_attachment: bool) {
     let root = Root::new();
     let mut j = root.open();
@@ -1185,4 +1186,68 @@ fn review_render_failure_cannot_publish_failed_state_before_sync() {
     assert!(q.journal().replay(0).is_err());
     drop(q);
     assert_eq!(root.open().items()[0].state, State::Queued);
+}
+
+#[test]
+fn batch_entropy_failure_keeps_the_journal_and_items_unchanged() {
+    for leading_invalid in [false, true] {
+        for (count, fail_on) in [(1, 0), (2, 1), (2, 2)] {
+            let root = Root::new();
+            let mut j = root.open();
+            if leading_invalid {
+                let mut invalid = input(9);
+                invalid.kind = Kind::Reply;
+                invalid
+                    .metadata
+                    .insert("anchor".into(), json!({"question_id":"invalid"}));
+                invalid
+                    .metadata
+                    .insert("gate".into(), json!({"decision":"send"}));
+                j.append(Change::Upsert {
+                    item: Box::new(invalid),
+                    position: 0,
+                })
+                .unwrap();
+            }
+            let mut q = Admission::new(j, MAX_BATCH).unwrap();
+            for n in 0..count {
+                send(&mut q, n, Producer::Human);
+            }
+            let bytes = fs::read(root.path()).unwrap();
+            let original = q.journal().items().to_vec();
+            let through = q.journal().replay(0).unwrap().through;
+            let mut calls = 0;
+            let error = q
+                .batch_with_entropy(100, &mut |bytes| {
+                    let call = calls;
+                    calls += 1;
+                    if call == fail_on {
+                        Err(getrandom::Error::UNSUPPORTED)
+                    } else {
+                        bytes.fill(0xa5);
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InternalError);
+            assert!(error.source.is_some());
+            assert_eq!(
+                calls,
+                fail_on + 1,
+                "entropy fails inside envelope rendering"
+            );
+            assert_eq!(fs::read(root.path()).unwrap(), bytes);
+            assert_eq!(q.journal().items(), original);
+            assert!(q.journal().items().iter().all(|i| i.state == State::Queued));
+            assert_eq!(q.journal().replay(0).unwrap().through, through);
+            drop(q);
+            let mut q = queue(&root);
+            assert_eq!(q.journal().items(), original);
+            assert_eq!(
+                q.batch(100).unwrap().unwrap().items.len(),
+                count as usize,
+                "normal entropy recovers without poisoning"
+            );
+        }
+    }
 }

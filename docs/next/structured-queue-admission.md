@@ -21,8 +21,9 @@ metadata, missing reply/continuation anchors and invalid commands are refused
 before any append. Reply question IDs must be canonical lowercase hyphenated
 UUIDs, both at admission and on replacement. Attachment strings must be
 `blob:<sha256>` with exactly 64 lowercase hex digits; arbitrary text, paths,
-URLs and noncanonical hashes are refused. Deterministic validation errors are `invalid_request`, entropy failures
-are `internal_error`, and serialization errors are `serialization_error`.
+URLs and noncanonical hashes are refused. Deterministic validation errors
+are `invalid_request`, entropy failures are `internal_error`, and
+serialization errors are `serialization_error`.
 Only actual append I/O failures or an already poisoned journal report
 `input_write_unknown`; callers must reopen after uncertain I/O, not blindly
 retry. Validation failure does not poison the journal or spend a cursor.
@@ -37,8 +38,11 @@ architect-approved exception recorded in ADR-0036 §3 and §3a.
 For valid candidates, `batch(now_ms)` returns an owned candidate without
 spending a cursor, reserving items or marking them delivered. An unbounded
 head instead receives a durable `failed` state with `queue_item_too_large`;
-a head that fails rendering receives its render refusal (for example
-`invalid_request` for a malformed reply anchor or blob ref). Formation then
+a head with invalid render data receives `invalid_request` (for example,
+a malformed reply anchor or blob ref). Only those data/size errors fail an
+item. Other formation errors, including entropy and serialization failures,
+return unchanged without writing anything or changing queued items. Earlier
+data refusals are committed only once formation succeeds. Formation then
 continues with the next eligible item. A valid prefix is returned before a
 later malformed member becomes the head and is failed, so valid items are
 never discarded because a later member cannot render. A compact `fail`

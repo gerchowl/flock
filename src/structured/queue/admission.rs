@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io;
 
+type Entropy<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>;
+
 /// One persisted admission decision; no automatic re-gating exists.
 #[derive(Debug, Serialize)]
 #[serde(tag = "decision", content = "stash", rename_all = "snake_case")]
@@ -197,19 +199,26 @@ impl Admission {
                             .is_none_or(|v| v == &Value::Bool(false))
                 }))
     }
-    /// Form one bounded FIFO candidate. An invalid or unbounded head is durably failed
-    /// before trying the next item; valid candidates do not spend a cursor.
+    /// Form one bounded FIFO candidate, durably failing invalid/oversized heads.
+    /// Other formation errors return without committing any queue changes.
     /// The runtime owner must reserve atomically and enforce S4/S6 before writing.
     pub fn batch(&mut self, now_ms: u64) -> Result<Option<Batch>, Failure> {
+        self.batch_with_entropy(now_ms, &mut getrandom::fill)
+    }
+    /// Form through the same worker path with caller-supplied entropy.
+    pub(super) fn batch_with_entropy(
+        &mut self,
+        now_ms: u64,
+        fill: Entropy<'_>,
+    ) -> Result<Option<Batch>, Failure> {
         self.journal.healthy()?;
-        loop {
-            let mut eligible = self
-                .journal
-                .items()
-                .iter()
-                .filter(|i| self.eligible(i, now_ms));
+        let mut failed: Vec<(String, ErrorCode)> = Vec::new();
+        let candidate = loop {
+            let mut eligible = self.journal.items().iter().filter(|i| {
+                self.eligible(i, now_ms) && !failed.iter().any(|(id, _)| id == &i.item_id)
+            });
             let Some(head) = eligible.next() else {
-                return Ok(None);
+                break None;
             };
             let mut items = vec![head.clone()];
             if head.producer == Producer::Human && head.kind != Kind::Command {
@@ -224,30 +233,43 @@ impl Admission {
                 let id = if items.len() == 1 {
                     items[0].item_id.clone()
                 } else {
-                    batch_uuid()?
+                    batch_uuid(fill)?
                 };
-                let refusal = match envelope(&items, &id) {
+                let refusal = match envelope_with_entropy(&items, &id, fill) {
                     Ok(user) if bounded(&items, &user) => break (id, user),
                     Ok(_) => ErrorCode::QueueItemTooLarge,
-                    Err(error) => error.code,
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            ErrorCode::InvalidRequest | ErrorCode::QueueItemTooLarge
+                        ) =>
+                    {
+                        error.code
+                    }
+                    Err(error) => return Err(error),
                 };
                 if items.len() == 1 {
-                    self.commit(Change::Fail {
-                        item_id: items[0].item_id.clone(),
-                        reason: refusal.as_str().into(),
-                    })?;
+                    failed.push((items[0].item_id.clone(), refusal));
                     break (id, Value::Null);
                 }
                 items.pop();
             };
             if !user.is_null() {
-                return Ok(Some(Batch {
+                break Some(Batch {
                     id,
                     envelope: user,
                     items,
-                }));
+                });
             }
+        };
+        // A transient formation error must not commit even earlier data refusals.
+        for (item_id, code) in failed {
+            self.commit(Change::Fail {
+                item_id,
+                reason: code.as_str().into(),
+            })?;
         }
+        Ok(candidate)
     }
     /// Replace existing items together, retaining order; no success precedes sync.
     pub fn replace(&mut self, items: Vec<Item>) -> Result<(), Failure> {
@@ -335,7 +357,7 @@ fn header_json(value: &impl Serialize) -> Result<String, Failure> {
         .replace('\u{2029}', "\\u2029")
         .replace('\u{85}', "\\u0085"))
 }
-fn render(item: &Item) -> Result<String, Failure> {
+fn render(item: &Item, fill: Entropy<'_>) -> Result<String, Failure> {
     validate_content(item)?;
     if item.kind == Kind::Command {
         return Ok(item.body.clone());
@@ -349,7 +371,7 @@ fn render(item: &Item) -> Result<String, Failure> {
     } else {
         String::new()
     };
-    let nonce = nonce(&item.body, getrandom::fill)?;
+    let nonce = nonce(&item.body, fill)?;
     Ok(format!(
         "From {} (item {}):{reply} Attachments (blob refs): {}\n<<<flk-item {nonce}\n{}\nflk-item {nonce}>>>",
         header_json(&item.producer)?, item.item_id, header_json(&item.attachments)?, item.body
@@ -373,8 +395,8 @@ fn nonce(
         }
     }
 }
-fn batch_uuid() -> Result<String, Failure> {
-    let mut h = nonce("", getrandom::fill)?.into_bytes();
+fn batch_uuid(fill: Entropy<'_>) -> Result<String, Failure> {
+    let mut h = nonce("", fill)?.into_bytes();
     h[12] = b'4';
     h[16] = match h[16] {
         b'0'..=b'3' => b'8',
@@ -416,9 +438,12 @@ fn valid_id(id: &str) -> bool {
         })
 }
 fn envelope(items: &[Item], id: &str) -> Result<Value, Failure> {
+    envelope_with_entropy(items, id, &mut getrandom::fill)
+}
+fn envelope_with_entropy(items: &[Item], id: &str, fill: Entropy<'_>) -> Result<Value, Failure> {
     let content = items
         .iter()
-        .map(|i| Ok(json!({"type":"text", "text":render(i)?})))
+        .map(|i| Ok(json!({"type":"text", "text":render(i, fill)?})))
         .collect::<Result<Vec<_>, Failure>>()?;
     Ok(json!({"type":"user", "uuid":id, "message":{"role":"user", "content":content}}))
 }

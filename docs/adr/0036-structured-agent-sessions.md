@@ -763,7 +763,7 @@ back-to-back turns. For a structured agent there is no polling at all:
   metadata never enter the body block. The operator-only native command
   exception in §3 remains verbatim and isolated. Admission and replacement
   validate anchors and refs, refusing `invalid_request` before writing.
-  Rendering validates again: an unrenderable head becomes durably `failed`
+  Rendering validates again: an invalid head becomes durably `failed`
   with its typed refusal, allowing subsequent items through. A valid prefix
   is delivered before a later malformed item is failed.
 - **Trigger.** The turn end is the `result` event (E1). An armed self-compact
