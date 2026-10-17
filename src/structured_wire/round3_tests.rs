@@ -297,7 +297,9 @@ fn round3_required_recovery_scenarios_pin_their_key_steps() {
     has("stream-independence", |s| {
         s["streams"]["s1"]["state"] == "Current" && s["streams"]["s2"]["state"] == "Resyncing"
     });
-    has("lagged", |s| s["streams"]["s1"]["state"] == "Replaying");
+    has("lagged", |s| {
+        s["streams"]["s2"]["state"] == "Replaying" && s["absent_streams"] == json!(["s1"])
+    });
     has("heartbeat-missed", |s| {
         s["connection_transitions"] == json!(["Stale", "Reconnecting"])
     });
@@ -328,8 +330,14 @@ fn round3_required_recovery_scenarios_pin_their_key_steps() {
     assert_eq!(rows[deadline + 1]["frame"]["t"], "unsub");
     assert_eq!(rows[deadline + 1]["frame"]["sub_id"], "s1");
     assert_eq!(rows[deadline + 2]["frame"]["t"], "sub");
-    assert_eq!(rows[deadline + 2]["frame"]["sub_id"], "s1");
-    assert_eq!(rows[deadline + 3]["streams"]["s2"]["state"], "Current");
+    assert_eq!(rows[deadline + 2]["frame"]["sub_id"], "s3");
+    let observe = rows[deadline + 3..]
+        .iter()
+        .find(|row| row["step"] == "observe")
+        .unwrap();
+    assert_eq!(observe["streams"]["s2"]["state"], "Current");
+    assert_eq!(observe["streams"]["s3"]["state"], "Replaying");
+    assert_eq!(observe["absent_streams"], json!(["s1"]));
 }
 #[test]
 fn round3_cap_reset_and_expiry_scenarios_assert_real_timing_and_states() {

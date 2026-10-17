@@ -2943,6 +2943,14 @@ pub struct ServerCapabilities {
     pub agent_questions: bool,
 }
 
+/// Confirmed local account-policy fault, retained until server restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum AgentAccountDiagnostic {
+    /// The dedicated agent and server share a UID and cannot be distinguished.
+    AgentAccountUidCollision { uid: u32 },
+}
+
 /// Accept failures retained for the lifetime of the API listener.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiListenerHealth {
@@ -2988,6 +2996,9 @@ pub enum ResponseResult {
         session_health: Option<crate::platform::SessionHealth>,
         #[serde(default)]
         api_listener: Option<ApiListenerHealth>,
+        /// Missing on older servers; observing status never starts an NSS lookup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_account_diagnostic: Option<AgentAccountDiagnostic>,
     },
     NotificationShow {
         shown: bool,
@@ -5679,6 +5690,7 @@ mod tests {
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
+                agent_account_diagnostic: None,
             },
         };
 

@@ -923,6 +923,34 @@ Until then the previously adopted version applies, and before any adoption nothi
 - A pending change is reported by `flk owner policy show`, not yet by a notification (#1239).
 - Repos are keyed by their canonical git common dir.
 
+## Socket account policy
+
+```toml
+[security]
+agent_account = "flk-agent" # default; "none" explicitly disables recognition
+```
+
+This file-only setting requires a server restart. Reload reports a change and
+keeps the active policy. `structured.run_as = "operator"` selects launch identity
+and does not disable account recognition.
+
+With the default, the first socket classification starts one lazy `flk-agent`
+account lookup, waiting at most 100 ms; later calls do not wait for a stuck
+lookup. Pending/failed resolution leaves callers read-only, including the
+operator: mutations such as server stop are refused. An absent account or a
+resolved UID different from the server UID permits the operator, subject to
+ancestry checks. A dedicated UID equal to the server UID is a misconfiguration:
+operator authority is refused, `agent_account_uid_collision` is logged once and
+retained in `flk status server` (including its JSON diagnostic) until restart.
+
+Use `agent_account = "none"` only when no dedicated agent account is used. It
+avoids the directory-service availability cost entirely: no dedicated-account
+NSS lookup runs, and the server UID passes the UID check immediately. Known
+leased or pane agents still cannot act as the operator; other/missing UIDs
+remain read-only. This gives up dedicated-UID recognition of anonymous/detached
+agents. Same-UID callers without lease or pane ancestry cannot be distinguished
+from the operator (the cooperative limit tracked in #1177; ADR-0036 §1a).
+
 ## Environment variables
 
 | Variable | Purpose |
