@@ -3,4 +3,4 @@
 /**
  * Where an axis's value came from.
  */
-export type StateSource = "screen" | "hook" | "plugin" | "process_tree" | "wait_registry" | "unknown";
+export type StateSource = "session" | "screen" | "hook" | "plugin" | "process_tree" | "wait_registry" | "unknown";

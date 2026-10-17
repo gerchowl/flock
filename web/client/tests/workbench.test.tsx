@@ -3,18 +3,20 @@
  * fixture mode and in wire mode, the latter driven through the wire
  * transport's scripted replay (`tests/wire/harness.ts`).
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, onTestFinished, test } from "bun:test";
+import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
 
 import { App } from "../src/App";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import { createFixtureFleet, type AgentRow, type FleetObserver, type FleetSource } from "../src/fleet";
-import { emptyLayout } from "../src/layout/model";
+import { createManager, emptyLayout, type Layout } from "../src/layout/model";
 import { createFixtureTransport } from "../src/transport/fixture";
 import { createWireTransport } from "../src/wire/transport";
 import { SAMPLE_INBOX } from "../src/workbench/inbox";
 import { markFor } from "../src/workbench/marks";
 import { SAMPLE_AGENTS } from "../src/workbench/samples";
+import { shortcutLabel } from "../src/workbench/Palette";
 import { Workbench } from "../src/workbench/Workbench";
 import { readFixture } from "./fixture-replay";
 import { Harness, WELCOME, live, sentFrames, step } from "./wire/harness";
@@ -162,6 +164,256 @@ describe("wire mode", () => {
     const sub = sentFrames(h).at(-1) as { sub_id: string };
     h.step(step({ step: "send", frame: { t: "subfail", sub_id: sub.sub_id, code: "scope", message: "not for this token" } }));
     expect($(root, "focus-pane")?.querySelector('[role="alert"]')?.textContent).toBe("Couldn't load this agent's history: not for this token");
+  });
+});
+
+describe("phone", () => {
+  async function phone(source: "replay" | "live" = "replay"): Promise<HTMLElement> {
+    const root = mount(() => (
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={SAMPLE_INBOX} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source={source} />
+    ));
+    await tick();
+    return root;
+  }
+  const tab = (root: HTMLElement, label: string): HTMLButtonElement | undefined =>
+    [...root.querySelectorAll<HTMLButtonElement>(".tabbar > button")].find((button) => button.textContent === label);
+
+  test("opens on the Inbox tab, which says what is blocked on the person", async () => {
+    const root = await phone();
+    expect($(root, "workbench")).toBeNull();
+    expect(tab(root, "Inbox")?.getAttribute("aria-current")).toBe("page");
+    expect($(root, "inbox-headline")?.textContent).toBe("1 blocked on you.");
+    expect($$(root, "inbox-card").length).toBe(2);
+    const activity = [...root.querySelectorAll<HTMLButtonElement>(".tabbar button")].find((button) => button.textContent === "Activity");
+    expect(activity?.getAttribute("aria-disabled")).toBe("true");
+    expect(document.getElementById(activity?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Waits for the events stream (S7-rest)");
+  });
+
+  test("live, as the wire App mounts it, the inbox shows no sample cards and says it arrives with G5", async () => {
+    const root = mount(() => (
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source="live" />
+    ));
+    await tick();
+    expect($(root, "inbox-headline")?.textContent).toBe("Your inbox arrives with G5 (#1597).");
+    expect($$(root, "inbox-card")).toHaveLength(0);
+    expect($(root, "phone")?.textContent).not.toMatch(/Sample|blocked on you/);
+  });
+
+  test("the agent screen is a history entry: system back returns to its tab, and the URL is untouched", async () => {
+    // A push without a URL keeps the page's own, `?layout=` and fixture parameters included.
+    const pushes: unknown[][] = [];
+    const push = history.pushState.bind(history);
+    history.pushState = (...args: Parameters<History["pushState"]>) => (pushes.push(args), push(...args));
+    onTestFinished(() => void (history.pushState = push));
+    const root = await phone();
+    tab(root, "Agents")?.click();
+    const before = history.length;
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    await tick();
+    expect($(root, "phone-agent")).not.toBeNull();
+    expect(history.length).toBe(before + 1);
+    expect(pushes.map((args) => args.length)).toEqual([2]);
+    history.back();
+    await tick();
+    expect($(root, "phone-agent")).toBeNull();
+    expect(tab(root, "Agents")?.getAttribute("aria-current")).toBe("page");
+  });
+
+  test("an agent already focused by the saved layout: back pops nothing this screen did not push", async () => {
+    const manager = createManager(emptyLayout());
+    manager.open("agent/fixture", "push");
+    manager.open("agent/atlas", "push");
+    const saved: Layout = structuredClone(manager.state);
+    const layouts: Layout[] = [];
+    const root = mount(() => (
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={saved} saveLayout={(next) => void layouts.push(next)} mode="phone" source="replay" />
+    ));
+    await tick();
+    tab(root, "Agents")?.click();
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    await tick();
+    expect($(root, "phone-agent")?.querySelector("h1")?.textContent).toBe("atlas");
+    [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"))?.click();
+    await tick();
+    expect($(root, "phone-agent")).toBeNull();
+    const focusedSubject = (layout: Layout): string | undefined => (layout.focused === null ? undefined : layout.tiles[layout.focused]?.subject);
+    expect(layouts.map(focusedSubject).filter((subject) => subject !== "agent/atlas")).toEqual([]);
+  });
+
+  test("widening past the breakpoint with the agent screen open consumes its history entry", async () => {
+    const [mode, setMode] = createSignal<"phone" | "desktop">("phone");
+    const root = mount(() => (
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} mode={mode()} source="replay" />
+    ));
+    await tick();
+    const prior: unknown = history.state;
+    tab(root, "Agents")?.click();
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    await tick();
+    expect(history.state).toEqual({ "flock.phone-agent": "atlas" });
+    setMode("desktop");
+    await tick();
+    expect($(root, "workbench")).not.toBeNull();
+    expect(history.state).toEqual(prior);
+    expect($(root, "focus-pane")?.querySelector("h1")?.textContent).toBe("atlas");
+  });
+
+  test("Agents → an agent screen with its transcript; back returns to the tabs", async () => {
+    const root = await phone();
+    tab(root, "Agents")?.click();
+    expect($$(root, "agent-row").length).toBe(4);
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    await tick();
+    expect($(root, "phone-agent")?.querySelector("h1")?.textContent).toBe("fixture");
+    expect([...root.querySelectorAll(".segmented button")].map((button) => [button.textContent?.trim(), button.getAttribute("aria-disabled") === "true"])).toEqual([
+      ["Summary", true],
+      ["Transcript", false],
+      ["PR", true],
+      ["Terminal", true],
+    ]);
+    const terminal = [...root.querySelectorAll(".segmented button")].find((button) => button.textContent === "Terminal");
+    expect(document.getElementById(terminal?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Terminal waits for the terminal tile.");
+    expect($(root, "segmented-reasons")?.textContent).toContain("PR waits for a PR source.");
+    expect($(root, "transcript-synced")).not.toBeNull();
+    [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"))?.click();
+    await tick();
+    expect($(root, "phone-agent")).toBeNull();
+    expect($$(root, "agent-row").length).toBe(4);
+  });
+
+  test("unmounting the workbench with the agent screen open, without crossing the breakpoint, leaves history alone", async () => {
+    const root = await phone();
+    tab(root, "Agents")?.click();
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    await tick();
+    const entry = { "flock.phone-agent": "atlas" };
+    expect(history.state).toEqual(entry);
+    dispose?.();
+    dispose = undefined;
+    await tick();
+    expect(history.state).toEqual(entry);
+    // Consume the entry this test left, so later tests start from their own.
+    history.back();
+    await tick();
+  });
+
+  test("the wire phone path shares one transport: open, close, reopen, widen; sub ids stay unique and late frames are ignored", async () => {
+    const width = Object.getOwnPropertyDescriptor(window, "innerWidth");
+    const setWidth = (value: number): void => void Object.defineProperty(window, "innerWidth", { value, configurable: true, writable: true });
+    onTestFinished(() => void (width === undefined ? Reflect.deleteProperty(window, "innerWidth") : Object.defineProperty(window, "innerWidth", width)));
+    setWidth(375);
+    const h = new Harness();
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    const send = (frame: ServerFrame): void => h.step(step({ step: "send", frame }));
+    h.step(step({ step: "open" }));
+    send(WELCOME);
+    const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
+    send({ t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: 1 });
+    send({ t: "ev", sub_id: fleet, stream: "fleet", seq: 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id: "atlas", label: "atlas", state: "working", waiting_on_human: [] } } });
+    send({ t: "synced", sub_id: fleet, seq: 1 });
+    expect($(root, "phone")).not.toBeNull();
+    const backButton = (): HTMLButtonElement | undefined => [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"));
+    tab(root, "Agents")?.click();
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    await tick();
+    backButton()?.click();
+    await tick();
+    expect($(root, "phone-agent")).toBeNull();
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    await tick();
+    expect($(root, "phone-agent")).not.toBeNull();
+    setWidth(1024);
+    window.dispatchEvent(new Event("resize"));
+    await tick();
+    expect($(root, "workbench")).not.toBeNull();
+    const subs = sentFrames(h).flatMap((frame) => {
+      const f = frame as { t: string; sub_id: string; stream?: string };
+      return f.t === "sub" && f.stream === "agent/atlas" ? [f.sub_id] : [];
+    });
+    expect(subs).toHaveLength(3);
+    expect(new Set(subs).size).toBe(3);
+    const [first, second, current] = subs as [string, string, string];
+    send({ t: "ev", sub_id: current, stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "the current line" } } });
+    send({ t: "synced", sub_id: current, seq: 1 });
+    const pane = $(root, "focus-pane")?.textContent ?? "";
+    send({ t: "ev", sub_id: first, stream: "agent/atlas", seq: 2, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "a late line" } } });
+    send({ t: "synced", sub_id: second, seq: 0 });
+    send({ t: "subfail", sub_id: second, code: "unknown_stream", message: "gone" });
+    expect(root.querySelector(".topbar__status")?.textContent).toBe("Live");
+    expect(pane).toContain("the current line");
+    expect($(root, "focus-pane")?.textContent).toBe(pane);
+  });
+});
+
+describe("command palette", () => {
+  async function workbench(fleet: FleetSource): Promise<HTMLElement> {
+    const root = mount(() => <Workbench fleet={fleet} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} source="replay" />);
+    await tick();
+    return root;
+  }
+  const key = (target: EventTarget, init: KeyboardEventInit): boolean => target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, ...init }));
+
+  test("⌘K opens it; typing filters agents; Enter focuses the match", async () => {
+    const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
+    expect($(root, "palette")).toBeNull();
+    key(document, { key: "k", metaKey: true });
+    const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    expect($$(root, "palette-item").length).toBe(4);
+    input.value = "wr";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    expect($$(root, "palette-item").map((item) => item.textContent)).toEqual(["wrenTurn finished"]);
+    key(input, { key: "Enter" });
+    expect($(root, "palette")).toBeNull();
+    expect($(root, "focus-pane")?.querySelector("h1")?.textContent).toBe("wren");
+  });
+
+  test("the input names the selected option, and closing returns focus to the trigger", async () => {
+    const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
+    const trigger = $(root, "palette-trigger") as HTMLButtonElement;
+    trigger.click();
+    const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    const active = (): string | null | undefined => document.getElementById(input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+    expect(active()).toBe("fixtureWaiting for permission to run Bash");
+    key(input, { key: "ArrowDown" });
+    expect(active()).toBe("atlasRunning the wire script suite");
+    key(input, { key: "Escape" });
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  test("Tab and Shift+Tab stay in the dialog, and options hold no nested controls", async () => {
+    const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    await tick();
+    const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    for (const shiftKey of [false, true]) {
+      const tab = new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true });
+      input.dispatchEvent(tab);
+      expect(tab.defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(input);
+    }
+    expect($(root, "palette")?.querySelectorAll('[role="option"] button, [role="option"] a, [role="option"] input').length).toBe(0);
+    expect($$(root, "palette-item").every((item) => item.getAttribute("role") === "option")).toBe(true);
+  });
+
+  test("the shortcut reads ⌘K on Apple platforms and Ctrl K elsewhere", () => {
+    expect(["MacIntel", "iPhone", "Win32", "Linux x86_64"].map(shortcutLabel)).toEqual(["⌘K", "⌘K", "Ctrl K", "Ctrl K"]);
+  });
+
+  test("a query that matches no listed agent opens one by id; Escape closes", async () => {
+    const root = await workbench(createFixtureFleet([]));
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    input.value = "agent-7";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    expect($$(root, "palette-item").map((item) => item.textContent)).toEqual(["Open agent agent-7by id"]);
+    ($$(root, "palette-item")[0] as HTMLElement).click();
+    expect($(root, "focus-pane")?.querySelector("h1")?.textContent).toBe("agent-7");
+    key(document, { key: "k", ctrlKey: true });
+    key($(root, "palette")?.querySelector("input") as HTMLInputElement, { key: "Escape" });
+    expect($(root, "palette")).toBeNull();
   });
 });
 

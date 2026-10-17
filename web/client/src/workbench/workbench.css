@@ -1,9 +1,18 @@
 /* The MVP workbench (ADR-0038 §2a). Tokens come from styles.css. */
-.workbench {
-  display: grid;
-  grid-template: "top top top" auto "side focus inbox" minmax(0, 1fr) / 16rem minmax(0, 1fr) 20rem;
+
+/* One viewport-high column: the replay badge, if any, then the workbench. */
+#root {
+  display: flex;
+  flex-direction: column;
   height: 100vh;
   height: 100dvh;
+}
+
+.workbench {
+  display: grid;
+  flex: 1;
+  grid-template: "top top top" auto "side focus inbox" minmax(0, 1fr) / 16rem minmax(0, 1fr) 20rem;
+  min-height: 0;
 }
 
 .topbar {
@@ -228,4 +237,199 @@
   flex-wrap: wrap;
   gap: 0.5rem;
   margin-top: 0.5rem;
+}
+
+.palette-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 1.5rem;
+  min-height: 44px;
+  padding: 0 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  justify-content: center;
+  padding-top: 15vh;
+  background: rgb(0 0 0 / 0.35);
+}
+
+.palette {
+  width: min(36rem, calc(100vw - 2rem));
+  max-height: 60vh;
+  overflow: hidden auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.palette__input {
+  width: 100%;
+  min-height: 48px;
+  padding: 0 1rem;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  color: inherit;
+  font: inherit;
+}
+
+.palette__list {
+  margin: 0;
+  padding: 0.25rem;
+  list-style: none;
+}
+
+.palette__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 0.75rem;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.palette__item[aria-selected="true"],
+.palette__item:hover {
+  background: var(--surface);
+}
+
+.palette__hint {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Phone (ADR-0038 §2a): inbox first, one screen at a time, tabs at the bottom. */
+.phone {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  /* ADR-0038 §2a's phone body text, also when `?layout=phone` forces it on a wide window. */
+  font-size: 15px;
+}
+
+.phone__screen {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.75rem 1rem;
+}
+
+.phone__screen--agent {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+
+.phone__title {
+  margin: 0.25rem 0;
+  font-size: 1.25rem;
+}
+
+.phone__headline {
+  margin: 0 0 0.5rem;
+  color: var(--muted);
+}
+
+.phone .card__choices .waits {
+  flex: 1 1 100%;
+  align-items: stretch;
+}
+
+.phone .card__choices .action {
+  min-height: 48px;
+}
+
+.phone__agent-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.25rem;
+  padding: 0.5rem 1rem;
+}
+
+.segmented .action {
+  padding: 0 0.25rem;
+}
+
+.segmented .waits {
+  align-items: stretch;
+}
+
+.segmented + .waits__reason {
+  padding: 0 1rem 0.5rem;
+}
+
+.segmented [aria-pressed="true"] {
+  border-color: var(--fg);
+  font-weight: 600;
+}
+
+.phone__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 1rem 1rem;
+}
+
+.tabbar {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.tabbar > button {
+  min-height: 56px;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+}
+
+.tabbar > .waits {
+  align-items: stretch;
+  justify-content: center;
+  text-align: center;
+}
+
+.tabbar > .waits .action {
+  min-height: 44px;
+  border: 0;
+  background: none;
+}
+
+.tabbar__tab[aria-current="page"] {
+  color: var(--fg);
+  font-weight: 700;
+  box-shadow: inset 0 3px 0 var(--working);
 }

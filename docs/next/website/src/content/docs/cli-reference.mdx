@@ -532,6 +532,16 @@ Hibernation survives a server restart, not only a live handoff: the stashed plan
 
 A restored native session whose launch is still deferred and has no runtime reports `agent_status: offline`, `state.lifecycle: offline` and `resumable: true`, rather than an idle/live turn. An explicitly hibernated session stays `hibernated`. Use `agent resume` on the existing agent or pane to continue the recorded session and profile; do not start a second agent on that session as a workaround. These status reports retain the binding and do not retire or release its claim. While parked without a runtime, `pane.read` can return `pane_not_found`; after a successful resume it can read the running pane again. Per ADR-0028 §1 (lifecycle outranks turn state), settled `agent wait` and `delegate wait` return `gone` with reason `offline` for an offline execution, even without `--timeout`: a retained resumable binding has no live turn to settle. This also applies to failed resumes. Scheduled reap skips offline bindings; resume the existing session explicitly. Local sidebar lifecycle projection is tracked separately in [#1644](https://github.com/gerchowl/flock/issues/1644).
 
+Focusing a pane whose deferred launch failed does not retry that launch. Use
+`flk agent resume <target>` for an explicit retry; focusing a genuinely
+hibernated pane still resumes it. The `resume_failed` flag is not saved across a
+cold server restart: the failed deferred plan is restored as deferred and can
+launch automatically once normal deferred-resume conditions are met (including
+resume-on-restore being enabled and a client being attached). If that attempt
+fails, automatic retries stop again until an explicit `agent resume` or another
+server restart. This is a server restart, distinct from `agent restart`, which
+refuses parked bindings as described below.
+
 Hibernating saves the session snapshot at once rather than after the usual save delay, so a server stopped (even with `kill -9`) right after `agent hibernate` returns still restores the agent hibernated.
 
 `agent restart` refuses a runtime-less binding that holds a hibernated or deferred resume plan with `parked` (`retry: never`, exit 2). This is a wrong operation for the saved binding, rather than a busy live agent: use `agent resume` to launch its saved session first. Actual busy or in-flight restarts continue to use their own retryable refusal codes. Explicit deferred resumes no longer emit `agent_resumed_from_hibernation`, so the event digest no longer lists them as "resumed". Automatic deferred resumes never emitted that event. Both paths emit `pane_agent_status_changed`; consumers of explicit deferred resumes should watch the status event instead. Failed resume attempts retain their original deferred or hibernated plan slot for explicit retry and persistence (ADR-0028 §1/§3). An explicit `agent resume` of a hibernated pane emits `pane_agent_status_changed` first (hibernated to live), then `agent_resumed_from_hibernation`. Event consumers see these two ordered facts for the same resume; they should not treat the second event as another launch.
@@ -981,3 +991,25 @@ mode-0600 quarantine sidecar retains full typed rows before bodies are
 cleared, with two files capped at 64 MiB each. Copy both before another
 rotation; decode `body.base64` and `envelope.base64` for inspection. Repair a database copy rather than blindly resending mail.
 See [custody recovery](./socket-api.mdx) for storage details.
+
+## Client tokens and browser entry
+
+`flk client token add NAME --scopes read,send,answer,operate [--show-token]`,
+`flk client token list`, and `flk client token rm NAME` manage private GUI
+credentials over the Unix socket. Use `token rm --entry HEX_ID` for an unsafe
+entry reported by list. Only the local operator outside agent panes may use
+these commands; other callers receive `operator_only` (exit 13). Issuance prints
+its bearer only when stdout is a terminal, unless `--json` or `--show-token`
+explicitly permits secret output to a pipe or file. Otherwise it refuses before
+creating a token.
+
+`flk client open [--print]` creates or reuses the operator credential and opens
+a new browser tab or window at a configured loopback URL containing a single-use
+code in its fragment. `--print` prints only the URL, including with `--json`.
+The code is 64 lowercase hex characters. The served GUI derives its transport and
+server URL from its own location; no config script is served.
+The code expires after 60 seconds; it is exchanged once for a bearer and is never
+placed in the query or diagnostic logs. Set `[client] bind = "127.0.0.1:7682"`
+explicitly. This is separate from the terminal bridge's `[web]` settings and
+requires the `web` feature. The structured listener integration is tracked by
+#1828; the exchange router alone does not start a listener.

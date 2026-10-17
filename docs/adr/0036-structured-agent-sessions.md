@@ -379,10 +379,144 @@ screen detector is not run.
 | `control_request{can_use_tool}` (any other tool) | `hook.decide{point: permission.request}` (ADR-0034 §1); `pass` answers allow, `deny` answers deny with the reason; `defer` holds the request open and makes it a question |
 | `control_request{other subtype}` | answered with an error and logged as an unknown shape (§8) |
 | flk's own `deny` answer to a `can_use_tool`; `system/permission_denied`, `result.permission_denials` | `agent.permission_denied{tool, reason}`, once per `tool_use_id`. A stdio `deny` that flk sends emits no `system/permission_denied` event (A.12, A.17), so for those the fact comes from flk's own answer; `system/permission_denied` and `result.permission_denials` add only the denials the harness made itself. Carve-out: the `deny` that carries a question deferral (§2a) is not a permission denial. flk records the `tool_use_id` of every deferral, and neither its answer nor that id's entry in `result.permission_denials` emits anything here |
-| `rate_limit_event{status != allowed}` | `Attention::Blocked{ProviderLimit, retry_after_ms}` from `resetsAt` |
-| `result` | queue items `done`; `Turn::Idle`; usage recorded; outcome per §1 |
-| process exit without `result` | `Lifecycle` unchanged, `Attention::Blocked{crashed}` |
+| `rate_limit_event{status: rejected}` | `Attention::Blocked{ProviderLimit, retry_after_ms}` from `resetsAt` |
+| `rate_limit_event{status: allowed or allowed_warning}` | clear provider-limit attention; a warning does not block |
+| `rate_limit_event{unknown status}` | ignore the status, preserving the last known observation (ADR-0028 §3a) |
+| `control_cancel_request{request_id}` | close that incoming permission/question request only |
+| `result` | close open permission/question requests; queue items `done`; `Turn::Idle`; usage recorded; outcome per §1 |
+| process exit without `result` | close open permission/question requests; `Lifecycle` unchanged, `Attention::Blocked{crashed}` |
 | anything unknown | §8 |
+
+S4 integration boundary (architect ruling, #1427). One pure reducer per
+`agent_id` and launch generation consumes S1 events and explicit host facts.
+Its `StateSink` publishes `AgentState` snapshots, immediate phase transitions,
+all open needs-human request ids/reasons, and one stall observation per silent
+interval. #1439 connects this seam to the registry and agent.get/list; S7-min
+#1746 connects it to agent/<id> and fleet-lite. These immediate facts are not
+settled supervisor events. S4 emits no `agent.phase_changed`, `agent.needs_human`
+or `agent.session_stalled` EventHub envelopes: `AgentPhaseEvent` and mesh v5
+stay unchanged. #1804 owns the mesh-versioned pane-free event contract.
+No placement is empty or fabricated, and list/side-pane wiring remains #1439.
+
+S3a-3 registry amendment (#1439, owner-approved split). #1841 owns pure
+records, runtime-tagged persistence and the S4 `StateSink` consumer. Each
+registered agent owns a reducer and a generation token. Admission rejects
+conflicting agent ids, names and native session ids without replacing another
+record. Removal and state delivery require the current generation, so late
+worker output cannot alter a replacement. The registry stores the complete S4
+publication, including phase edges, needs-human facts and the next observation
+deadline; it emits no EventHub envelopes (#1804).
+
+Session persistence stores `runtime: structured` identity/name/harness/session,
+cwd and requested model alongside `runtime: pty` pane records. Older snapshots
+without structured records remain valid; older pane records default to PTY.
+Cold restore retains metadata only: lifecycle is offline, observations are
+unknown, and no clock ages, outstanding questions, deadlines, process ids or
+lease proofs survive. An agent whose process is gone stays `Lifecycle::Offline`:
+it remains resumable by explicit launch and is never resurrected automatically.
+Under ADR-0028 §3a, structured records deserialize individually. Unknown runtime
+or harness records, invalid entries and duplicates are skipped with a warning,
+without rejecting any PTY workspace. The first supported id/name/session wins.
+Skipped entries remain raw and in order across saves, including additional
+fields, so rollback cannot erase newer records. Explicit removal also discards
+retained entries sharing the removed id or session, preventing a shadowed
+duplicate from becoming active after restart. Known-runtime shadows also match
+by name; a future-runtime record sharing only a name has a separate identity
+and survives removal (#1858). Explicit admission refuses any retained name.
+Removal compacts retained slots.
+Known records also retain their original extra fields. An unknown collection shape remains raw
+and inactive; new admission refuses until its shape is understood. Warnings
+contain an index and reason, never raw payloads. The registry exposes a retained
+entry count for diagnostics; structured status/doctor routing remains #1843.
+Unknown pane runtime tags also survive restore/save and disable automatic agent
+resume for that pane only; its hibernation request and shell placement survive,
+and other panes retain normal resume behavior. A registry-only session remains
+persistable even when it contains only inactive raw entries and no terminal
+workspaces; #1853 tracks the lifetime of retained-only records. Both the temporary
+snapshot file before rename and its parent directory after rename are fsynced.
+A directory sync failure after successful replacement is logged as a durability
+warning and the save reports success because the new file is already installed.
+Handoff restores structured metadata offline; this slice owns no workers to
+transfer.
+
+#1842 owns runtime workers, actual lease ownership and observation scheduling.
+The app owns `structured::workers::Workers` outside pure `AppState`. Each launch
+reserves its native session before running the admission-supplied, bounded
+profile factory on an owning thread, then binds the registered cwd/model.
+Preparation is cancellable at its boundaries; an in-progress factory must finish
+within its own bound. One blocked factory cannot block another agent or the app.
+A new launch advances the observation generation, without modifying durable
+metadata. Live/unconfirmed workers refuse replacement. Cold restore remains
+offline and never starts a worker automatically.
+
+Ready/completion share a bounded two-message channel. Runtime stream queues are
+bounded separately; an app pass drains at most four records per worker and
+rearms its existing event wake when it reaches that budget. Every stream record
+enters S4 only via `Received::state_input`, so durable permission-book closes
+clear attention without waiting for a result (#1846/#1849). Lifecycle and due
+observations are explicit host facts. Both TUI and headless schedulers service
+owner wakes and include S4's exact next observation boundary. No periodic
+structured-agent timer, kill-on-silence policy or EventHub emission is added.
+
+Ordinary stop latches cancellation without waiting; polling joins only finished threads. A terminal report
+becomes visible only after queued stream facts drain. Confirmed cleanup closes
+open requests and sets Offline; unconfirmed ownership instead retains authority
+and Unknown lifecycle, refuses restart, and requires explicit recovery. Reports
+retain actual exit status/outcome or typed preparation/worker failure; results
+remain turn facts rather than process-success evidence. Finished threads are joined
+before replacement or pruning. Shutdown and the pre-handoff step attempt to stop
+all workers, drain durable permission closes, release confirmed leases, and join
+within the stated bound. Handoff deliberately stops structured sessions in this
+slice (full single-writer transfer is S7-rest). Records remain Offline and resume
+only through an explicit start using their stored session id, never automatically.
+A shared 10-second graceful deadline is followed by identity-checked child-tree
+KILL and a bounded 10-second cleanup/join interval. Deadline overruns report
+`structured_worker_timeout`; unconfirmed cleanup reports
+`structured_worker_cleanup_failed`. Worker diagnostics never veto handoff: kill,
+report the typed codes and proceed once the real handoff preconditions hold.
+An additive, optional handoff-manifest list carries uncertain agent identities,
+restored as Unknown without lease or process authority; confirmed cleanup stays
+Offline. Cold disk restore still defaults to Offline. Unknown identities never
+grant permission to signal. An unjoined worker remains owned and fenced, and
+later owner polls can finish joining it. Worker panics report the distinct
+`structured_worker_panicked` failure. These diagnostics require human inspection
+before retrying an uncertain session. Shutdown runs once per worker set and caches its typed result.
+Both TUI and headless quit always save the session before returning a shutdown
+error. Drop runs bounded teardown only if it has not already been attempted;
+after success or failure it joins only finished threads, without another wait.
+A newly admitted worker resets that cached result. The caller must mark session persistence
+dirty when durable metadata changes.
+#1843 owns the public `StructuredAgentInfo`, additive `structured_agents` list,
+get/status/stop routes and `runtime_unsupported` refusals. Existing PTY
+`AgentInfo` placement fields remain mandatory and unchanged; structured records
+have no fabricated placement. Mesh VERSION stays 5; remote directory rows
+remain #1380. Public structured start stays unreachable until #1843 and #1734
+have landed. The default remains the agent user (#1177); the owner-approved
+MVP exception permits explicit operator-mode opt-in only. #1843 supplies the
+public admission wiring and isolated manual dogfood runbook for that exception.
+
+The caller supplies monotonic observation time and its configured `stall_ms`;
+the reducer never starts a timer, polls a process or kills/retries a turn.
+Every stdout line, including an unknown line, proves progress but an unknown
+event never changes the axes. A host-sent answer closes only its incoming
+`request_id`; stdout control responses acknowledge host-initiated controls
+and cannot close incoming permission requests. A CLI `control_cancel_request`
+closes only its named request; a top-level result or process exit closes all
+open permission/question requests, including an interrupted or errored turn.
+A tool remains open past its
+argument `content_block_stop`, until its matching `tool_result` or a top-level
+`result`. No stall is reported while any tool is open, however long it runs.
+Subagent results never end the parent turn. A late result ends a
+stalled turn normally; the observation itself leaves the phase unchanged.
+Unavailable background and registered-wait evidence stays `unknown`, so idle
+alone cannot manufacture `finished`. Provider reset timestamps are Unix seconds
+converted to an optional duration against receive-time Unix milliseconds;
+missing, null, incompatible or overflowing reset metadata gives no duration.
+Lifecycle comes explicitly from the registry and retains ADR-0028 precedence.
+While attention is set, public `turn` is `unknown` per ADR-0028 §1; the
+underlying turn boundary is retained for when attention clears. A known provider
+limit outranks crashed attention while lifecycle remains live; a registry-owned
+offline/hibernated/gone lifecycle outranks both.
 
 Phase derivation is ADR-0028 §1's unchanged; only the inputs differ. A
 question answered while its control request is still open becomes the
@@ -956,10 +1090,34 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   type the client's protocol predates without the §8 unknown wrapper.
 - **Auth.** Every client presents a bearer token in `hello`; the address it
   connects from grants nothing (§1a). The operator's own browser gets an
-  `operator`-scoped token through `flk client open`, which runs over the
+  `operate`-scoped token through `flk client open`, which runs over the
   unix socket (so `caller_is_local_operator()` and the uid check of §1a
-  apply), mints a one-time code, and opens the client with it; the client
-  exchanges the code for its session token once. Tokens follow the channel-token model of ADR-0028 §8
+  apply), mints a one-time code, and opens the client in a new browser tab or
+  window; the client
+  exchanges the code for its session token once. The code contains 256 bits of
+  randomness encoded as 64 lowercase hex characters, is bound to that token,
+  exists only in server memory, is single
+  use, and expires at age 60 seconds. `flk client open --print` prints the
+  loopback URL rather than launching the browser. The code is carried only in
+  the URL fragment (`#code=…`), never the query, so it is absent from HTTP
+  request targets and Referer. The browser consumes that fragment and sends
+  `POST /v1/client/exchange` with JSON `{ "code": "…" }`; the loopback-only,
+  same-origin endpoint returns `{ "token": "…" }` exactly once, with
+  `Cache-Control: no-store`. Used, expired and unknown codes get one uniform
+  401. There is no global failed-exchange gate: every caller reaches the
+  loopback listener locally, and local processes can forge Host/Origin.
+  Such a gate would let any local process, including an agent, lock out the
+  operator. Guessing a 256-bit, single-use code with a 60-second lifetime is
+  infeasible. Keep the store bounded at 128 live codes and request bodies at
+  1024 bytes. Cross-origin and non-loopback requests are refused, and neither
+  codes nor tokens enter diagnostic logs.
+  The token then travels in the unchanged normal `hello` frame.
+  The served client derives its server and transport from its own location
+  (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.
+  `token add` prints the bearer only to terminal stdout unless `--json` or
+  `--show-token` explicitly permits redirected secret output. Without that
+  consent it refuses before issuance, so no undisclosed credential is created.
+  Tokens follow the channel-token model of ADR-0028 §8
   (`src/channels.rs`): 32 random bytes as 64 hex digits, one file per client
   under `<data dir>/client-tokens/<name>.token`, mode 0600 in a 0700 dir,
   compared as SHA-256 digests in constant time, never logged, revoked by
@@ -1598,6 +1756,56 @@ P16 and P17 have no source in the stream today and are not promised;
   is refused with `operator_only` (exit 13). A switch down needs `send`
   scope. A `flk-agent` caller can switch its own agent down, never up.
 
+- **Per-request session grants (S6, #1429).** `agent.decide` accepts
+  `allow_once`, `allow_always` and `deny` only from an authenticated,
+  `operate`-scoped token principal. A local UID alone, pane input, an agent
+  message or a structured harness's MCP lease never authorizes a decision
+  (`not_authorized`, retry never). Identity comes from the authenticated
+  dispatcher context, never command arguments. Every decision is recorded
+  on `agent/<id>` in ordered open/closed permission audit records, including
+  automatic matches, with the originating token subject. Automatic closes also
+  reference the originating grant request ID. A raw request already reserved by
+  an exact grant carries that trusted reference into replay and counts as
+  stdout progress without ever opening S4 needs-human attention.
+- **`allow_always` lasts for one live harness runtime.** Its grant is held
+  only in memory for that structured agent. Exit, restart and resume into a
+  new runtime discard it, even when resuming the same persisted session.
+  Grants are never shared between agents, persisted in flk policy, or
+  written to a settings file. Persistent presets remain the separately
+  operator-edited policy described above (#1799).
+- **Match exactly; never forward harness rules.** `allow_always` always
+  installs an in-memory grant for only the exact tool name plus canonical
+  JSON input (recursively sorted object keys; array order and scalar values
+  preserved). Matching performs no Unicode normalization and treats `1` and
+  `1.0` as different. A different tool or input prompts again.
+  Harness permission suggestions are never interpreted or forwarded, even
+  when they appear limited to the requested tool: determining their scope
+  would require interpreting the harness rule grammar. The response allows
+  the current call with its original input and no `updatedPermissions`.
+  When nonempty suggestions are present, the closed audit records
+  `ignored_suggestions` with reason `not_forwarded` and the request ID linking
+  to the open audit record containing the full original suggestions.
+  Absent, null and empty suggestions produce the same exact grant.
+  Broader rules belong to the separately operator-edited policy in #1799.
+  The `MAX_GRANTS` constant in `src/structured/permissions.rs` bounds distinct
+  installed and reserved exact grant keys per runtime; exceeding that bound
+  returns `permission_grant_limit` (retry never, policy refusal) without
+  closing the request or sending a response. The operator may still allow
+  once or deny that request. Token authorization still applies to manual
+  decisions after a grant exists.
+- **Delivery and audit ordering.** A permission closes for attention only
+  after its decision audit is durable, and user input remains gated until
+  the control response is fully written. Admission success reserves a
+  decision and does not promise eventual pipe delivery. Audit or writer
+  failure stops delivery; runtime shutdown writes a reasoned terminal close
+  for each outstanding request before clearing the book, without inventing
+  an operator decision.
+  Harness cancellation closes its named request; top-level result and host
+  interruption also produce reasoned closes. A cancelled reservation cannot
+  deliver a stale answer. Disk errors are surfaced; failed persistence cannot
+  promise a durable close. Unknown and already accepted or closed request IDs are distinct `permission_request_unknown` and
+  `permission_request_closed` refusals, both retry never.
+
 ### 11. Harness neutrality
 
 One flk event model covers Claude, Codex and opencode at the level of §2:
@@ -1617,7 +1825,12 @@ four places that the schema must normalise rather than mirror:
    `completed` / `error`. flk stores a generic call with a typed `kind`.
 3. **Approvals.** Claude allow / deny with `updatedInput`; Codex accept /
    acceptForSession / decline / cancel; opencode once / always / reject. flk
-   keeps `allow | allow_always | deny{reason}` and maps down.
+   keeps `allow_once | allow_always | deny{reason}` and maps down.
+   `allow_always` obeys §10b's live-runtime lifetime, token-only authority
+   and audit contract. flk always uses exact in-memory grants and never
+   forwards harness permission suggestions or sends `updatedPermissions`.
+   Future adapters must preserve that scope rather than map an always
+   decision to a persistent harness rule.
 4. **Fork granularity.** Claude forks at a message uuid; opencode at a
    message id; Codex at a turn (`thread/fork{lastTurnId}`). `agent.fork`
    refuses a mid-turn point on Codex with `unsupported_for_agent`.
@@ -1838,7 +2051,7 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S1 | `SessionEvent` types for Claude stream-json: known variants with `extra`, `Unknown{raw, shape}`, shape key; redacted probe fixtures as tests | — | 350 |
 | S2 | `session.unknown_shape` persisted kind (skip test per ADR-0028 §3a), once-per-shape registry logging through `tracing` only (#1300), `flk report --unknown-events` | S1 | 250 |
 | S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (the login from the 0600 `setup-token` file g-fleet renders (g-fleet#476), passed as `CLAUDE_CODE_OAUTH_TOKEN` in the session env and never logged, owner decision 1; `--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
-| S4 | State mapping: `StateSource::Session`, turn / attention / limit from events, stall observation, `agent.phase_changed` | S3 | 300 |
+| S4 | Pure per-agent state reducer: `StateSource::Session`, turn / attention / limit from events, stall observation and in-process phase/needs-human facts; registry seam for #1439 and S7-min #1746. Pane-free EventHub events deferred to #1804 | S3 | 300 |
 | S5 | Input queue: `queue/<agent>` stream, producers, gate, `command_lifecycle` acks, independent `delivery` (`at_idle` / `steer` / `interrupt`) and `priority` ordering, one batch per turn with the FIFO rules 1 to 4 and batch messages, `flk agent send` and msg delivery routed to it | S3 | 400 |
 | S5c | Queue UX: `queue.update` / `edit` leases / `move` / `delete`, named stashes with `stash` / `pop` / `clear` / `stashes`, `send_now` (`steer`, or `interrupt` through the harness's `interrupt{send_now}`), `take_back` through `cancel_async_message` (§3, A.14, owner decision 4) | S0, S5 | 300 |
 | S5d | System One for the queue: relatedness joins at idle and the relevance check during a turn, `[queue] relevance` (whose `force` sends through S5c's `send_now`), recorded for rating (§3, owner decisions 4 and 5) | S5, S5c | 200 |
