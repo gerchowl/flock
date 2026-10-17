@@ -519,8 +519,8 @@ fn committed_repo(server: &Server) -> PathBuf {
 /// The test needs it for one thing only: rewriting an entry so its
 /// `workspace_id`, `pane_id`, and `root_pane` name a workspace that is not the
 /// delegate's, which is what a restarted server can leave behind. The key is
-/// FNV-1a 64 over the socket path string, exactly as `cli::delegate::server_key`
-/// computes it.
+/// produced by `support::paths::server_key`, matching the CLI's FNV-1a 64
+/// over the socket path string.
 fn registry_entry_path(server: &Server, name: &str) -> PathBuf {
     server
         .base

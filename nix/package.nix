@@ -86,6 +86,8 @@ rustPlatform.buildRustPackage {
   };
 
   nativeBuildInputs = [
+    # SDK-defined process facts compile through cc-rs on Darwin.
+    stdenv.cc
     git
     pkg-config
   ]

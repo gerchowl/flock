@@ -7,3 +7,5 @@ pub mod lease;
 pub mod runtime;
 pub mod supervision;
 pub mod transport;
+
+pub(crate) mod identity;

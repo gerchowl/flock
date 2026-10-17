@@ -138,17 +138,24 @@ fn held(app: &App) -> bool {
     runtime(app).injection_lease_until().is_some()
 }
 
-fn send_text(app: &mut App, pane: &str, text: &str) {
+fn send_text(app: &mut App, pane: &str, text: &str) -> std::sync::mpsc::Receiver<String> {
     let response = app.handle_api_request(Request {
         id: "req".into(),
         // A raw send: a guarded one refuses a held pane (#1162).
         method: Method::PaneSendText(PaneSendTextParams {
+            write_timeout_ms: None,
             raw: true,
             pane_id: pane.into(),
             text: text.into(),
         }),
     });
-    assert!(response.contains("\"result\""), "{response}");
+    assert!(
+        response.is_empty(),
+        "paste observation retains the response owner"
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.respond_or_park(sender, response);
+    receiver
 }
 
 /// Drive an attempt whose sentence is typed through its Enter and the turn.
@@ -203,7 +210,11 @@ async fn keystrokes_from_both_seams_are_held_and_replay_in_order_after_the_submi
         app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
         Some(Outcome::ObservedAccepted)
     );
-    assert_eq!(drain(&mut pty), vec![b"abc".to_vec()], "replayed in order");
+    assert_eq!(
+        drain(&mut pty),
+        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+        "replayed in order with the tracked request identity retained"
+    );
     assert!(!held(&app));
     assert!(runtime(&app).last_operator_input_at().is_some());
 }
@@ -854,21 +865,30 @@ async fn a_paste_held_by_an_injection_claims_no_evidence() {
     } = lock_rig(&CLAUDE);
     let _attempt = inject(&app, &pane, Instant::now());
     drain(&mut pty);
-    let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
+    let response = app.handle_api_request(Request {
         id: "paste".into(),
-        // A raw send: a guarded one refuses a held pane (#1162).
         method: Method::AgentSend(crate::api::schema::AgentSendParams {
+            write_timeout_ms: None,
             raw: true,
             target: pane.clone(),
             text: "note".into(),
             submit: false,
         }),
-    }))
-    .unwrap();
-    assert_eq!(response["result"]["outcome"], "unconfirmed", "{response}");
-    assert_eq!(response["result"]["reason"], "held_by_injection");
-    assert!(response["result"]["evidence"]["level"].is_null());
-    assert!(app.pending_paste.is_none(), "nothing left to observe");
+    });
+    assert!(
+        response.is_empty(),
+        "held paste must not claim a terminal outcome"
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.respond_or_park(sender, response);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    app.input_writes
+        .retire_all(crate::pty::write_receipt::WriteFailure::OwnerChanged);
+    let response: serde_json::Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+    assert_eq!(response["error"]["code"], "input_write_cancelled");
     assert!(drain(&mut pty).is_empty(), "held behind the injection");
 }
 
@@ -882,6 +902,7 @@ fn typing_verbs(pane: &str, raw: bool) -> Vec<(&'static str, Method)> {
         (
             "pane send-text",
             Method::PaneSendText(PaneSendTextParams {
+                write_timeout_ms: None,
                 pane_id: pane.into(),
                 text: "note".into(),
                 raw,
@@ -890,6 +911,7 @@ fn typing_verbs(pane: &str, raw: bool) -> Vec<(&'static str, Method)> {
         (
             "pane run",
             Method::PaneSendInput(crate::api::schema::PaneSendInputParams {
+                write_timeout_ms: None,
                 pane_id: pane.into(),
                 text: "note".into(),
                 keys: Vec::new(),
@@ -899,6 +921,7 @@ fn typing_verbs(pane: &str, raw: bool) -> Vec<(&'static str, Method)> {
         (
             "agent send --no-submit",
             Method::AgentSend(crate::api::schema::AgentSendParams {
+                write_timeout_ms: None,
                 target: pane.into(),
                 text: "note".into(),
                 submit: false,
@@ -908,12 +931,31 @@ fn typing_verbs(pane: &str, raw: bool) -> Vec<(&'static str, Method)> {
     ]
 }
 
-fn call(app: &mut App, method: Method) -> serde_json::Value {
-    serde_json::from_str(&app.handle_api_request(Request {
+async fn call(app: &mut App, method: Method) -> serde_json::Value {
+    let response = app.handle_api_request(Request {
         id: "req".into(),
         method,
-    }))
-    .unwrap()
+    });
+    if !response.is_empty() {
+        return serde_json::from_str(&response).unwrap();
+    }
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(4);
+    app.event_tx = event_tx;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.respond_or_park(sender, response);
+    let crate::events::AppEvent::PasteConfirm {
+        mut paste,
+        respond_to,
+    } = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        panic!("expected paste observation")
+    };
+    paste.deadline = Instant::now();
+    app.advance_paste(paste, respond_to);
+    serde_json::from_str(&receiver.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap()
 }
 
 #[tokio::test]
@@ -928,7 +970,7 @@ async fn typing_verbs_refuse_an_operator_draft_before_typing_in_every_harness() 
                 } = lock_rig(harness);
                 let (verb, method) = typing_verbs(&pane, false).swap_remove(index);
                 paint(&app, harness, draft);
-                let response = call(&mut app, method);
+                let response = call(&mut app, method).await;
                 let case = format!("{:?} {verb} onto {draft:?}", harness.agent);
                 assert_eq!(response["error"]["code"], "input_not_empty", "{case}");
                 assert!(
@@ -967,7 +1009,7 @@ async fn draft_refusal_reports_visible_utf8_bytes_without_returning_content() {
         } = lock_rig(harness);
         paint(&app, harness, draft);
         let (_, method) = typing_verbs(&pane, false).swap_remove(2);
-        let response = call(&mut app, method);
+        let response = call(&mut app, method).await;
         assert_eq!(
             response["error"]["data"]["composer"]["visible_bytes"],
             draft.len()
@@ -991,7 +1033,7 @@ async fn typing_verbs_type_into_an_empty_composer_and_raw_types_onto_a_draft() {
                 } = lock_rig(harness);
                 let (verb, method) = typing_verbs(&pane, raw).swap_remove(index);
                 paint(&app, harness, draft);
-                let response = call(&mut app, method);
+                let response = call(&mut app, method).await;
                 let case = format!("{:?} {verb} raw={raw} onto {draft:?}", harness.agent);
                 assert!(response.get("error").is_none(), "{case}: {response}");
                 assert_eq!(drain(&mut pty).len(), 1, "{case}: typed");
@@ -1011,7 +1053,7 @@ async fn a_shell_pane_is_typed_into_whatever_its_prompt_shows() {
         let (verb, method) = typing_verbs(&pane, false).swap_remove(index);
         terminal(&mut app).detected_agent = None;
         paint(&app, &CLAUDE, DRAFT);
-        let response = call(&mut app, method);
+        let response = call(&mut app, method).await;
         assert!(response.get("error").is_none(), "{verb}: {response}");
         assert_eq!(drain(&mut pty).len(), 1, "{verb}: typed");
     }
@@ -1029,7 +1071,7 @@ async fn typing_verbs_refuse_a_pane_an_injection_holds() {
         paint(&app, &CLAUDE, DRAFT);
         let _attempt = inject(&app, &pane, Instant::now());
         drain(&mut pty);
-        let response = call(&mut app, method);
+        let response = call(&mut app, method).await;
         assert_eq!(
             response["error"]["code"], "injection_pending",
             "{verb}: held text would replay onto the restored draft"
@@ -1048,6 +1090,7 @@ async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
         let agent = harness.agent;
         let send_submit = |pane: &str| {
             Method::AgentSend(crate::api::schema::AgentSendParams {
+                write_timeout_ms: None,
                 target: pane.into(),
                 text: "hello".into(),
                 submit: true,
@@ -1061,7 +1104,7 @@ async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
             mut pty,
         } = lock_rig(harness);
         paint(&app, harness, MULTI_ROW);
-        let response = call(&mut app, send_submit(&pane));
+        let response = call(&mut app, send_submit(&pane)).await;
         assert_eq!(response["error"]["code"], "input_not_empty", "{agent:?}");
         assert!(
             response["error"]["data"]["composer"]["visible_bytes"]
@@ -1081,7 +1124,7 @@ async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
             mut pty,
         } = lock_rig(harness);
         paint(&app, harness, DRAFT);
-        let response = call(&mut app, send_submit(&pane));
+        let response = call(&mut app, send_submit(&pane)).await;
         assert!(response.get("error").is_none(), "{agent:?}: {response}");
         let (_, _, mut attempt) = app.pending_agent_submit.take().expect("parked");
         assert_eq!(

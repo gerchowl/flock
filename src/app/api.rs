@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod peer_uid_tests;
+#[cfg(test)]
 mod structured_lease_tests;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -1379,11 +1381,44 @@ impl App {
         response
     }
 
+    /// Apply ADR-0036 §1a before normal dispatch or headless lifecycle fast paths.
+    pub(crate) fn peer_uid_refusal(
+        &mut self,
+        request: &crate::api::schema::Request,
+    ) -> Option<String> {
+        use crate::api::{error_code::ErrorCode, schema::Method};
+        let uid = self.current_api_peer_uid?;
+        let code = if matches!(
+            request.method,
+            Method::ServerStop(_) | Method::ServerReloadConfig(_) | Method::ServerLiveHandoff(_)
+        ) && !matches!(self.spawn_caller(), spawn::SpawnCaller::Operator { .. })
+        {
+            Some(ErrorCode::OperatorOnly)
+        } else {
+            let uid = if self.current_api_peer_pid.is_some() && self.socket_birth_valid() {
+                uid
+            } else {
+                None
+            };
+            let attributed = self.runtime_config.uid_policy.classify(uid)
+                == crate::structured::identity::Principal::Agent
+                && self.lease_caller() != crate::structured::lease::Caller::Uncertain;
+            self.runtime_config
+                .uid_policy
+                .refusal(uid, attributed, &request.method)
+        }?;
+        Some(responses::encode_error(
+            request.id.clone(),
+            code.as_str(),
+            "socket caller lacks authority for this operation",
+        ))
+    }
+
     fn dispatch_api_request(&mut self, request: crate::api::schema::Request) -> String {
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
-        self.pending_paste = None;
+        self.input_writes.abandon_staged();
         self.pending_integration_install = None;
         self.detach_pending_message_relay();
         debug_assert!(
@@ -1399,11 +1434,17 @@ impl App {
             self.active_submissions.remove(&pane);
         }
         self.pending_recovery_park = None;
+        if let Some(response) = self.peer_uid_refusal(&request) {
+            return response;
+        }
         if self.waits_for_mesh_recovery(&request.method) {
             self.pending_recovery_park = Some((
                 request,
-                self.current_api_peer_pid,
-                self.current_api_peer_birth,
+                super::ApiCaller {
+                    pid: self.current_api_peer_pid,
+                    birth: self.current_api_peer_birth,
+                    uid: self.current_api_peer_uid,
+                },
             ));
             return String::new();
         }
@@ -1599,8 +1640,10 @@ impl App {
             Method::PaneReleaseAgent(params) => {
                 return self.handle_pane_release_agent(request.id, params);
             }
-            Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
-            Method::PaneSendInput(params) => {
+            Method::PaneSendText(params) | Method::PaneWriteText(params) => {
+                return self.handle_pane_send_text(request.id, params)
+            }
+            Method::PaneSendInput(params) | Method::PaneWriteInput(params) => {
                 return self.handle_pane_send_input(request.id, params)
             }
             Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
@@ -1610,7 +1653,9 @@ impl App {
             Method::PaneStashRestore(target) => {
                 return self.handle_pane_stash_restore(request.id, target)
             }
-            Method::PaneSendKeys(params) => return self.handle_pane_send_keys(request.id, params),
+            Method::PaneSendKeys(params) | Method::PaneWriteKeys(params) => {
+                return self.handle_pane_send_keys(request.id, params)
+            }
             Method::PaneArmSelfCompact(params) => {
                 return self.handle_pane_arm_self_compact(request.id, params);
             }

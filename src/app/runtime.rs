@@ -65,9 +65,11 @@ impl App {
         let changed = crate::api::request_changes_ui(&msg.request);
         self.current_api_peer_pid = msg.peer_pid;
         self.current_api_peer_birth = Some(msg.peer_birth);
+        self.current_api_peer_uid = Some(msg.peer_uid);
         let response = self.handle_api_request(msg.request);
         self.current_api_peer_pid = None;
         self.current_api_peer_birth = None;
+        self.current_api_peer_uid = None;
         self.respond_or_park(msg.respond_to, response);
         self.sync_prefix_input_source(previous_mode);
         changed
@@ -213,6 +215,8 @@ impl App {
         let mut changed = false;
         let mut resized = false;
 
+        self.input_writes.service_due(now);
+        self.start_ready_pastes();
         self.sync_animation_timer(now);
         changed |= self.refresh_session_health(now);
 
@@ -719,6 +723,7 @@ impl App {
             self.idle_wake.next_deadline(),
             // ADR-0028 §5: a wait expires on time in a quiet loop.
             self.waits.next_deadline(),
+            self.input_writes.next_deadline(),
             // #540: the same, for an armed self-compaction — the Enter of a
             // typed write, a settle that lifts, or a timeout coming due.
             self.self_compact_deadline,

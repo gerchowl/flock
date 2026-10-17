@@ -137,9 +137,9 @@ pub(super) fn mint_correlation_id() -> String {
 /// Whose `blocking` budget a message spends (ADR-0018 §1): an identity this
 /// server attested from process ancestry, and nothing a caller asserted.
 ///
-/// An attested agent is keyed by its id, one attested only as a pane by that
-/// pane. EVERY unattested sender — each relayed message, each socket client
-/// outside a pane — shares one bucket, because `from_agent` is a claim.
+/// An attested agent is keyed by its id. Otherwise a server-resolved pane
+/// candidate separates quotas without granting sender authority. Callers
+/// outside a pane share one bucket, because `from_agent` is a claim.
 /// Keying on it let a caller mint fresh budget per invented name, or name a
 /// real agent and spend its budget for it. One shared bucket is safe because
 /// a spent budget downgrades rather than refuses
@@ -272,13 +272,21 @@ impl App {
             );
         }
 
-        if from_pane.as_deref() == Some(to_pane.as_str()) {
+        let possible_sender = self.caller_pane_candidate();
+        if from_pane.as_deref() == Some(to_pane.as_str())
+            || possible_sender == Some((to_ws_idx, to_pane_id))
+        {
             return encode_error(id, "self_message_forbidden", "a pane cannot message itself");
         }
 
         let now = now_ms();
-        let sender_key = from_pane.clone().unwrap_or_else(|| "unknown".into());
-        let blocking_key = blocking_budget_key(attested_agent.as_deref(), from_pane.as_deref());
+        // Candidates and proven panes share a rate bucket for throttling only.
+        // Sender stamps and authority still require attestation.
+        let quota_pane = from_pane
+            .clone()
+            .or_else(|| possible_sender.and_then(|(ws, pane)| self.public_pane_id(ws, pane)));
+        let sender_key = quota_pane.clone().unwrap_or_else(|| "unknown".into());
+        let blocking_key = blocking_budget_key(attested_agent.as_deref(), quota_pane.as_deref());
         let (applied_intent, downgrade) =
             self.apply_blocking_budget(params.intent, &blocking_key, now);
         if let Err(retry_after_ms) = self.mailboxes.admit_rate(&sender_key, now) {
@@ -295,7 +303,7 @@ impl App {
             .unwrap_or_else(mint_correlation_id);
         let mut warnings = Vec::new();
         warnings.extend(downgrade.map(str::to_string));
-        if from_pane.is_none() {
+        if quota_pane.is_none() {
             warnings.push("sender_unresolved_shared_rate_bucket".to_string());
         }
         let message = PendingMessage {
@@ -1697,6 +1705,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unproven_candidates_have_independent_quotas_without_sender_authority() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("quota-target"));
+        app.state.ensure_test_terminals();
+        let target = pane_target(&app, 2);
+        for ws in 0..2 {
+            let pane = app.state.workspaces[ws].focused_pane_id().unwrap();
+            crate::test_support::adopt_unproven_pane_caller(&mut app, pane, ws == 1);
+            assert!(app.caller_pane().is_none());
+            assert!(app.attested_sender_agent().is_none());
+            let send = |app: &mut crate::app::App| -> serde_json::Value {
+                serde_json::from_str(&app.send_message(
+                    "quota".into(),
+                    MsgSendParams {
+                        from_agent: None,
+                        to: MessageTarget::Pane {
+                            pane: target.clone(),
+                        },
+                        body: "quota fixture".into(),
+                        correlation_id: None,
+                        in_reply_to: None,
+                        intent: MsgIntent::Fyi,
+                    },
+                ))
+                .unwrap()
+            };
+            for _ in 0..if ws == 0 { 20 } else { 1 } {
+                let reply = send(&mut app);
+                assert!(reply.get("result").is_some(), "candidate {ws}: {reply}");
+            }
+            if ws == 0 {
+                assert_eq!(send(&mut app)["error"]["code"], "msg_rate_limited");
+            }
+        }
+        let messages = app.mailboxes.pending_messages();
+        assert!(!messages.is_empty());
+        for message in messages {
+            assert!(message.from_pane.is_none());
+            assert!(message.from_agent.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn recovery_decodes_each_record_and_does_not_recommit_idle_replay() {
         let mut app = test_app_with_hub(crate::api::EventHub::default());
         let _store = crate::mesh::runtime_store::TestStore::new();
@@ -2054,8 +2107,9 @@ mod tests {
                 }),
             },
             respond_to,
-            peer_pid: None,
-            peer_birth: None,
+            peer_pid: Some(std::process::id()),
+            peer_birth: crate::platform::process_start_time(std::process::id()),
+            peer_uid: Some(crate::platform::peer::effective_uid()),
         });
         assert!(
             responses.try_recv().is_err(),
@@ -2080,8 +2134,9 @@ mod tests {
                 method,
             },
             respond_to,
-            peer_pid: None,
-            peer_birth: None,
+            peer_pid: Some(std::process::id()),
+            peer_birth: crate::platform::process_start_time(std::process::id()),
+            peer_uid: Some(crate::platform::peer::effective_uid()),
         });
         assert!(responses.try_recv().is_err(), "parked, not answered");
         responses
@@ -2233,8 +2288,9 @@ mod tests {
                 method: fyi_send(&app, "after-recovery"),
             },
             respond_to,
-            peer_pid: None,
-            peer_birth: None,
+            peer_pid: Some(std::process::id()),
+            peer_birth: crate::platform::process_start_time(std::process::id()),
+            peer_uid: Some(crate::platform::peer::effective_uid()),
         });
         let response = answer(&responses);
         assert!(response.get("error").is_none(), "{response}");
@@ -2472,9 +2528,7 @@ mod tests {
             assert!(response.get("error").is_none(), "{response}");
         }
         let sender_pane = app.state.workspaces[0].focused_pane_id().unwrap();
-        app.test_pane_child_pids
-            .insert(sender_pane, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(&mut app, sender_pane);
         let response = claimed_send(&mut app, &pane, serde_json::json!({}));
         assert!(response.get("error").is_none(), "{response}");
         app.current_api_peer_pid = None;
@@ -3322,9 +3376,7 @@ mod tests {
                 intent: MsgIntent::NeedsReply,
             });
         let answerer_pane = app.state.workspaces[1].focused_pane_id().unwrap();
-        app.test_pane_child_pids
-            .insert(answerer_pane, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(&mut app, answerer_pane);
         let response = app.handle_api_request(wire_request(serde_json::json!({
             "id": "req",
             "method": "msg.reply",
@@ -3371,9 +3423,7 @@ mod tests {
             });
         // The caller sits in the ASKER's pane, not the recipient's.
         let asker_pane = app.state.workspaces[0].focused_pane_id().unwrap();
-        app.test_pane_child_pids
-            .insert(asker_pane, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(&mut app, asker_pane);
         let _ = app.handle_api_request(wire_request(serde_json::json!({
             "id": "req",
             "method": "msg.reply",

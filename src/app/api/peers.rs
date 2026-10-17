@@ -976,12 +976,19 @@ fn workspace_peer_summary(
         .min_by_key(|detail| detail.state_changed_at.unwrap_or(now));
     let (agent, status_age_secs, activity) = leading
         .map(|detail| {
+            // The leading status already uses the live registry and raw pane state.
+            // Read the original activity payload without a presentation-state gate.
+            let activity = ws
+                .pane_state(detail.pane_id)
+                .and_then(|pane| terminals.get(&pane.attached_terminal_id))
+                .filter(|_| status == crate::api::schema::AgentStatus::Working)
+                .and_then(|terminal| terminal.live_activity.clone());
             (
                 Some(agent_label_on_the_wire(&detail)),
                 detail
                     .state_changed_at
                     .map(|changed| changed.elapsed().as_secs()),
-                detail.live_activity,
+                activity,
             )
         })
         .unwrap_or((None, None, None));
@@ -2294,5 +2301,63 @@ mod tests {
         assert_eq!(summary.status, AgentStatus::Done);
         assert_eq!(summary.agents[0].status, AgentStatus::Done);
         runtimes.remove(&id).unwrap().shutdown();
+    }
+    #[tokio::test]
+    async fn peer_summary_activity_uses_live_status_before_view_preparation() {
+        use crate::api::schema::AgentStatus;
+        use crate::detect::{Agent, AgentState};
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces
+            .push(crate::workspace::Workspace::test_new("peer-activity-1686"));
+        app.ensure_test_terminals();
+        let pane = app.workspaces[0].tabs[0].root_pane;
+        let id = app.workspaces[0].terminal_id(pane).unwrap().clone();
+        let session = crate::agent_resume::AgentSessionRef::id("activity-session").unwrap();
+        let terminal = app.terminals.get_mut(&id).unwrap();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+        terminal.pending_agent_resume_plan =
+            crate::agent_resume::plan("flock:codex", "codex", &session);
+        terminal.live_activity = Some("Reading fixture messages".into());
+        // A cold restore has no monotonic transition timestamp to age.
+        terminal.state_changed_at = None;
+        let mut runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        runtimes.insert(
+            id.clone(),
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                80,
+                24,
+                4096,
+                b"fixture harness\r\n",
+            ),
+        );
+        let detail = &app.workspaces[0].pane_details(&app.terminals)[0];
+        assert_eq!(detail.state, AgentState::Unknown);
+        let live = super::workspace_peer_summary(&app.workspaces[0], &app.terminals, &runtimes);
+        assert_eq!(live.status, AgentStatus::Working);
+        assert_eq!(live.agents[0].status, AgentStatus::Working);
+        assert_eq!(live.activity.as_deref(), Some("Reading fixture messages"));
+
+        // Publishing the view snapshot must not change any peer summary field.
+        app.refresh_terminal_runtime_presence(&runtimes);
+        assert_eq!(
+            live,
+            super::workspace_peer_summary(&app.workspaces[0], &app.terminals, &runtimes)
+        );
+
+        runtimes.remove(&id).unwrap().shutdown();
+        let detail = &app.workspaces[0].pane_details(&app.terminals)[0];
+        assert_eq!(detail.state, AgentState::Working);
+        let offline = super::workspace_peer_summary(&app.workspaces[0], &app.terminals, &runtimes);
+        assert_eq!(offline.status, AgentStatus::Offline);
+        assert_eq!(offline.agents[0].status, AgentStatus::Offline);
+        assert!(
+            offline.activity.is_none(),
+            "offline peers cannot retain cached Working activity"
+        );
+        app.refresh_terminal_runtime_presence(&runtimes);
+        assert_eq!(
+            offline,
+            super::workspace_peer_summary(&app.workspaces[0], &app.terminals, &runtimes)
+        );
     }
 }

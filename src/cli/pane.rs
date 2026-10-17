@@ -532,7 +532,12 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
     let text = args[1..].join(" ");
     super::print_send_response(&super::send_request(&Request {
         id: "cli:pane:send-text".into(),
-        method: Method::PaneSendText(PaneSendTextParams { pane_id, text, raw }),
+        method: Method::PaneSendText(PaneSendTextParams {
+            write_timeout_ms: None,
+            pane_id,
+            text,
+            raw,
+        }),
     })?)
 }
 
@@ -553,7 +558,11 @@ fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
 
     let pane_id = super::resolve_pane_arg(&args[0]);
     let keys = args[1..].to_vec();
-    super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams { pane_id, keys }))
+    super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams {
+        write_timeout_ms: None,
+        pane_id,
+        keys,
+    }))
 }
 
 /// Arm a self-compaction of the calling agent's own session (#540).
@@ -861,6 +870,7 @@ pub(super) fn submit_sequence(pane_id: &str, text: &str, raw: bool) -> std::io::
     for step in pane_run_steps(pane_id, text) {
         let method = match step {
             PaneRunStep::Type { pane_id, text } => Method::PaneSendInput(PaneSendInputParams {
+                write_timeout_ms: None,
                 pane_id,
                 text,
                 keys: Vec::new(),
@@ -871,6 +881,7 @@ pub(super) fn submit_sequence(pane_id: &str, text: &str, raw: bool) -> std::io::
                 continue;
             }
             PaneRunStep::Submit { pane_id } => Method::PaneSendKeys(PaneSendKeysParams {
+                write_timeout_ms: None,
                 pane_id,
                 keys: vec!["Enter".into()],
             }),

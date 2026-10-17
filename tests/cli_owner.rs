@@ -11,6 +11,8 @@
 
 mod support;
 
+use support::paths::app_dir_name;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -56,14 +58,6 @@ impl Drop for Server {
         }
         unregister_spawned_flock_pid(pid);
         cleanup_test_base(&self.base);
-    }
-}
-
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
     }
 }
 

@@ -153,11 +153,13 @@ fn spawn_server(
     api_socket_path: &PathBuf,
     _client_socket_path: &PathBuf,
 ) -> SpawnedFlock {
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -482,11 +484,7 @@ fn client_sees_headless_startup_config_diagnostic() {
     let api_socket = runtime_dir.join("flock.sock");
     let client_socket = runtime_dir.join("flock-client.sock");
 
-    let app_dir = if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    };
+    let app_dir = support::paths::app_dir_name();
     fs::create_dir_all(config_home.join(app_dir)).unwrap();
     fs::write(
         config_home.join(app_dir).join("config.toml"),
@@ -748,11 +746,13 @@ fn server_unreachable_shows_clear_error() {
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("flock.sock");
 
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     register_runtime_dir(&runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -1441,11 +1441,13 @@ fn killing_a_client_mid_held_handoff_restores_the_terminal() {
     let api_socket = runtime_dir.join("flock.sock");
     let client_socket = runtime_dir.join("flock-client.sock");
 
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     register_runtime_dir(&runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();

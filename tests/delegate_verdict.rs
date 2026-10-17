@@ -14,10 +14,11 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use support::environment::Command;
 
 struct Pane {
+    _socket_dir: support::socket_dir::SocketDir,
     base: PathBuf,
     registry: PathBuf,
     socket: PathBuf,
@@ -78,16 +79,9 @@ impl Pane {
     }
 
     fn serve(frames: Vec<(String, String, String)>, evented: bool, stall_results: bool) -> Self {
-        let suffix = format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let base = std::env::temp_dir().join(format!("delegate-verdict-{suffix}"));
-        let socket = std::env::temp_dir().join(format!("dv-{suffix}.sock"));
+        let socket_dir = support::socket_dir::SocketDir::reserve("dv1683");
+        let base = socket_dir.path().join("home");
+        let socket = socket_dir.path().join("peer.sock");
         std::fs::create_dir_all(&base).unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -232,6 +226,7 @@ impl Pane {
             "cursor": "term_fixture:0:0:0:i", "created_at_ms": 1,
         }).to_string()).unwrap();
         Self {
+            _socket_dir: socket_dir,
             registry,
             base,
             socket,

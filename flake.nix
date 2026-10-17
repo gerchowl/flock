@@ -135,6 +135,14 @@
               '';
           default = self.checks.${system}.flock;
         }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          macos-process-facts = pkgs.runCommand "flock-process-c-toolchain-check" {
+            nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
+            SDKROOT = self.packages.${system}.default.SDKROOT;
+          } ''
+            "$CC" -Werror -c ${./src/platform/macos_process.c} -o "$out"
+          '';
+        }
       );
 
       devShells = forAllSystems (
@@ -161,6 +169,7 @@
               just
               ninja
               nodejs
+              bun
               perl
               pkg-config
               rustc

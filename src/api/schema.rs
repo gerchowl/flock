@@ -183,10 +183,16 @@ pub enum Method {
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.send_text")]
     PaneSendText(PaneSendTextParams),
+    #[serde(rename = "pane.write_text")]
+    PaneWriteText(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]
     PaneSendKeys(PaneSendKeysParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
+    #[serde(rename = "pane.write_keys")]
+    PaneWriteKeys(PaneSendKeysParams),
+    #[serde(rename = "pane.write_input")]
+    PaneWriteInput(PaneSendInputParams),
     #[serde(rename = "pane.submit")]
     PaneSubmit(PaneSubmitParams),
     #[serde(rename = "pane.arm_self_compact")]
@@ -327,6 +333,7 @@ impl Method {
     /// Can this request be sent again after a transport error that left its
     /// fate unknown (#910)?
     ///
+    /// The anonymous-UID boundary also relies on this being reads/previews only.
     /// Only reads qualify: a read timeout on a write says nothing about
     /// whether the server applied it, and sending a `pane.close` twice turns
     /// "closed" into `pane_not_found`. `msg.read` is left out on purpose, it
@@ -477,8 +484,11 @@ impl Method {
             | Self::GoalResume(_)
             | Self::GoalStop(_)
             | Self::PaneSendText(_)
+            | Self::PaneWriteText(_)
             | Self::PaneSendKeys(_)
             | Self::PaneSendInput(_)
+            | Self::PaneWriteKeys(_)
+            | Self::PaneWriteInput(_)
             | Self::PaneSubmit(_)
             | Self::PaneArmSelfCompact(_)
             | Self::PaneStashRestore(_)
@@ -1071,6 +1081,13 @@ pub const AGENT_HISTORY_MAX_TURNS: u32 = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSendParams {
+    /// Raw-write milliseconds: integer 1..=30000, default 10000. Not a submit budget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub target: String,
     pub text: String,
     /// Guard an empty idle composer, send delayed Enter and confirm with one retry.
@@ -1950,6 +1967,13 @@ pub struct PaneRenameParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSendTextParams {
+    /// Raw-write milliseconds: integer 1..=30000, default 10000. Not a submit budget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub pane_id: String,
     pub text: String,
     /// Type even when the target is an agent pane whose composer holds a
@@ -1960,8 +1984,22 @@ pub struct PaneSendTextParams {
     pub raw: bool,
 }
 
+/// Preserve explicit null for validation; only an absent timeout gets the default.
+fn present_write_timeout<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSendKeysParams {
+    /// Integer milliseconds, validated before admission: 1..=30000, default 10000.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub pane_id: String,
     pub keys: Vec<String>,
 }
@@ -2032,6 +2070,13 @@ pub struct PaneSubmitParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSendInputParams {
+    /// Integer milliseconds, validated before admission: 1..=30000, default 10000.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
