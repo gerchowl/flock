@@ -48,10 +48,11 @@ describe("Transcript", () => {
     const [fixture, variants] = await Promise.all([readFixture(), readVariants()]);
     const jsonl = `${fixture}${UNKNOWN_LINE}\nnot json\n${MALFORMED_KNOWN_LINE}\n`;
     const { transport, synced } = whenSynced(createFixtureTransport(jsonl));
-    const root = mount(() => <Transcript transport={transport} stream={FIXTURE_STREAM} />);
+    const root = mount(() => <Transcript transport={transport} stream={FIXTURE_STREAM} source="replay" />);
     await synced;
 
     expect(root.querySelectorAll('[data-testid="known-event"]').length).toBe(variants.length);
+    expect(root.textContent).toContain("Control request cancelled");
     const unknown = [...root.querySelectorAll<HTMLDetailsElement>('[data-testid="unknown-event"]')];
     expect(unknown.map((block) => block.querySelector("summary")?.textContent)).toEqual([
       "Unrecognised event: future_event",
@@ -72,7 +73,7 @@ describe("Transcript", () => {
   test("a gap entry renders the fixed missing-range marker, and reset clears the list", async () => {
     let observer: Parameters<Transport["subscribe"]>[2] | undefined;
     const transport: Transport = { subscribe: (_stream, _after, given) => ((observer = given), { close: () => undefined }) };
-    const root = mount(() => <Transcript transport={transport} stream="agent/a" />);
+    const root = mount(() => <Transcript transport={transport} stream="agent/a" source="replay" />);
     observer?.entry({ seq: 1, kind: "unknown", unknown: { raw: "x", shape: "s" } });
     observer?.entry({ seq: 9, kind: "gap", from: 2, to: 9 });
     expect(root.querySelector('[data-testid="transcript-gap"]')?.textContent).toBe("Events 2–9 of this session are no longer stored.");
@@ -82,7 +83,7 @@ describe("Transcript", () => {
   });
 
   test("a failed subscription is shown, not swallowed", async () => {
-    const root = mount(() => <Transcript transport={createFixtureTransport("")} stream="agent/other" />);
+    const root = mount(() => <Transcript transport={createFixtureTransport("")} stream="agent/other" source="replay" />);
     await Promise.resolve();
     expect(root.querySelector('[role="alert"]')?.textContent).toContain("serves only agent/fixture");
   });
@@ -92,13 +93,6 @@ describe("App", () => {
   test("a missing shell config renders an explicit error state", () => {
     const root = mount(() => <App config={{ ok: false, error: { message: "No shell configuration" } }} />);
     expect(root.querySelector('[data-testid="config-error"]')?.textContent).toContain("No shell configuration");
-    expect(root.querySelector('[data-testid="replay-badge"]')).toBeNull();
-  });
-
-  test("a wire config is reported as unavailable, never replaced by fixtures", () => {
-    const config = { transport: "wire", serverUrl: "wss://h/v1/ws", token: "t" } as const;
-    const root = mount(() => <App config={{ ok: true, config }} />);
-    expect(root.querySelector('[data-testid="config-error"]')).not.toBeNull();
     expect(root.querySelector('[data-testid="replay-badge"]')).toBeNull();
   });
 

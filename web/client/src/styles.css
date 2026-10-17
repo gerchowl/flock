@@ -9,6 +9,11 @@
   --badge-bg: #7a3e00;
   --badge-fg: #ffffff;
   --error: #a4161a;
+  --working: #1f5fbf;
+  --needs: #b25e00;
+  --idle: #6b6f76;
+  --done: #2e7d32;
+  --failed: #8e1b1b;
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
@@ -23,6 +28,11 @@
     --badge-bg: #f0a040;
     --badge-fg: #1a1100;
     --error: #ff8a80;
+    --working: #7fb0ff;
+    --needs: #ffb347;
+    --idle: #a0a4ab;
+    --done: #7bd389;
+    --failed: #ff8a80;
   }
 }
 
@@ -37,8 +47,22 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
-  font: 16px/1.5 var(--font-ui);
+  font: 14px/1.5 var(--font-ui);
   overflow-wrap: anywhere;
+}
+
+/* One visible focus ring for every control, keyboard focus only. */
+:focus-visible {
+  outline: 2px solid var(--working);
+  outline-offset: 2px;
+}
+
+/* ADR-0038 §2a: 14 px body text on desktop, 15 px below the phone breakpoint. */
+@media (max-width: 767.98px) {
+  html,
+  body {
+    font-size: 15px;
+  }
 }
 
 .replay-badge {

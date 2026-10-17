@@ -70,12 +70,26 @@ compiles the SDK helper using that package's compiler and SDK inputs.
 
 The Unix API captures the kernel peer UID (`getpeereid` on macOS,
 `SO_PEERCRED` on Linux) with PID and birth before queueing. That context is
-preserved across mesh recovery and lifecycle dispatch. Account resolution is lazy:
-construction and handoff import perform no NSS lookup. The first classification
+preserved across mesh recovery and lifecycle dispatch. File-only
+`[security] agent_account` defaults to `"flk-agent"`, independently of launch
+`run_as`. Explicit `"none"` installs a known-absent policy: no dedicated-account
+NSS lookup runs and the server UID passes the UID boundary immediately, subject
+to lease/pane/birth checks. Other/missing UIDs stay unknown/read-only. This opts
+out of dedicated-UID recognition for anonymous/detached agents; it is only for
+servers using no dedicated agent account. Changes require restart; reload keeps
+the active policy and reports that requirement.
+
+With default recognition, account resolution is lazy: construction and handoff
+import perform no NSS lookup. The first classification
 starts one process-wide helper and waits at most 100 milliseconds; concurrent
 first uses share that wait. Afterward calls never wait or launch another helper.
 Pending lookups and lookup errors classify
-all socket UIDs as `Unknown` (read-only); a late answer is cached when it arrives.
+all socket UIDs as `Unknown` (read-only), including the operator, so even server
+stop is refused. Explicit account policy `"none"` avoids that availability cost.
+A late answer is cached when it arrives. A dedicated UID equal to the server
+UID is a misconfiguration: same-UID callers never become operator;
+`agent_account_uid_collision` is logged once and retained as a typed diagnostic
+in server status until restart.
 A permanently stuck directory service retains at most one worker until process
 exit. Dedicated-user callers never become the
 operator, even from a shell pane or after detaching. A dedicated caller with no

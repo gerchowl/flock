@@ -450,6 +450,7 @@ fn handle_request(
                 // unavailable opendirectoryd would hang `flk status` for
                 // exactly as long as the fault lasts.
                 session_health: Some(crate::health::confirmed()),
+                agent_account_diagnostic: crate::structured::identity::account_diagnostic(),
                 api_listener: Some(
                     listener_health
                         .lock()
@@ -1229,6 +1230,80 @@ mod tests {
         let generic_error =
             r#"{"id":"req","error":{"code":"server_unavailable","message":"boom"}}"#;
         assert_eq!(api_response_outcome(generic_error), "error");
+    }
+
+    #[tokio::test]
+    async fn account_uid_collision_denies_stop_and_reports_once_in_log_and_status() {
+        use crate::api::schema::{AgentAccountDiagnostic, EmptyParams};
+        let root = crate::test_support::TempDir::socket();
+        let log_path = root.path().join("collision.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || log.try_clone().unwrap())
+            .finish();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            EventHub::default(),
+        );
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: 7,
+            dedicated: Ok(Some(7)).into(),
+        };
+        app.current_api_peer_pid = Some(std::process::id());
+        app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
+        app.current_api_peer_uid = Some(Some(7));
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..2 {
+                let reply: serde_json::Value =
+                    serde_json::from_str(&app.handle_api_request(Request {
+                        id: "collision-stop".into(),
+                        method: Method::ServerStop(EmptyParams {}),
+                    }))
+                    .unwrap();
+                assert_eq!(reply["error"]["code"], "operator_only");
+                assert!(!app.state.should_quit);
+            }
+        });
+        let output = std::fs::read_to_string(log_path).unwrap();
+        assert_eq!(
+            output.matches("agent_account_uid_collision").count(),
+            1,
+            "{output}"
+        );
+        assert!(
+            output.contains("flk-agent UID equals server UID"),
+            "{output}"
+        );
+        let reply = handle_request(
+            Request {
+                id: "collision-status".into(),
+                method: Method::Ping(crate::api::schema::PingParams::default()),
+            },
+            &tx,
+            None,
+            crate::platform::peer::Credentials::default(),
+            &Mutex::default(),
+        );
+        let parsed: SuccessResponse = serde_json::from_str(&reply).unwrap();
+        assert!(
+            matches!(
+                parsed.result,
+                ResponseResult::Pong {
+                    agent_account_diagnostic: Some(
+                        AgentAccountDiagnostic::AgentAccountUidCollision { .. }
+                    ),
+                    ..
+                }
+            ),
+            "{reply}"
+        );
     }
 
     #[test]

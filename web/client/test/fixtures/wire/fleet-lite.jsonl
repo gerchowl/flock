@@ -1,0 +1,27 @@
+{"v":1,"step":"given","cursors":{},"outbox":[],"covers":["s7-min"]}
+{"v":1,"step":"client","action":{"kind":"subscribe","sub_id":"s1","stream":"fleet"}}
+{"v":1,"step":"client","action":{"kind":"connect"}}
+{"v":1,"step":"expect_connect","within_ms":1,"not_before_ms":0}
+{"v":1,"step":"open"}
+{"v":1,"step":"expect","frame":{"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol","token"],"absent":[]}
+{"v":1,"step":"send","frame":{"t":"welcome","protocol":1,"server_version":"fixture","capabilities":["read","send"],"principal":"fixture-principal","server_epoch":"fixture-epoch","idempotency_window_ms":86400000}}
+{"v":1,"step":"expect","frame":{"t":"sub","sub_id":"s1","stream":"fleet"},"fields":["sub_id","stream"],"absent":["after"]}
+{"v":1,"step":"send","frame":{"t":"gap","sub_id":"s1","from":1,"to":0,"snapshot_to":2}}
+{"v":1,"step":"observe","connection":"Syncing","streams":{"s1":{"state":"Resyncing","cursor":null}},"outbox":{}}
+{"v":1,"step":"send","frame":{"t":"ev","sub_id":"s1","stream":"fleet","seq":1,"ts_ms":1,"ev":{"type":"fleet.upsert","row":{"id":"fixture-agent","label":"Example","state":{"turn":"working","background":"none","attention":"none","waiting":"none","lifecycle":"live","phase":"working","source":{}},"activity":"Reading a file","waiting_on_human":[]}}}}
+{"v":1,"step":"send","frame":{"t":"ev","sub_id":"s1","stream":"fleet","seq":2,"ts_ms":2,"ev":{"type":"fleet.upsert","row":{"id":"second-fixture-agent","label":"Second","state":{"turn":"idle","background":"none","attention":{"needs_human":{"reason":"permission"}},"waiting":"none","lifecycle":"live","phase":"needs_human","source":{}},"waiting_on_human":["request-one"]}}}}
+{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s1","seq":2}}
+{"v":1,"step":"observe","connection":"Live","streams":{"s1":{"state":"Current","cursor":2}},"outbox":{}}
+{"v":1,"step":"send","frame":{"t":"ev","sub_id":"s1","stream":"fleet","seq":3,"ts_ms":3,"ev":{"type":"fleet.upsert","row":{"id":"fixture-agent","label":"Example","state":{"turn":"working","background":"none","attention":"none","waiting":"none","lifecycle":"live","phase":"working","source":{}},"activity":"Writing a file","waiting_on_human":[]}}}}
+{"v":1,"step":"send","frame":{"t":"ev","sub_id":"s1","stream":"fleet","seq":4,"ts_ms":4,"ev":{"type":"fleet.remove","id":"second-fixture-agent"}}}
+{"v":1,"step":"observe","connection":"Live","streams":{"s1":{"state":"Current","cursor":4}},"outbox":{}}
+{"v":1,"step":"send","frame":{"t":"lagged","sub_id":"s1","skipped_to":7}}
+{"v":1,"step":"expect","frame":{"t":"sub","sub_id":"s2","stream":"fleet","after":4},"fields":["sub_id","stream","after"],"absent":[]}
+{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s1","seq":99}}
+{"v":1,"step":"send","frame":{"t":"gap","sub_id":"s2","from":5,"to":7,"snapshot_to":8}}
+{"v":1,"step":"observe","connection":"Live","streams":{"s2":{"state":"Resyncing","cursor":4}},"outbox":{},"absent_streams":["s1"]}
+{"v":1,"step":"send","frame":{"t":"ev","sub_id":"s2","stream":"fleet","seq":8,"ts_ms":8,"ev":{"type":"fleet.upsert","row":{"id":"second-fixture-agent","label":"Second","state":{"turn":"idle","background":"none","attention":{"needs_human":{"reason":"permission"}},"waiting":"none","lifecycle":"live","phase":"needs_human","source":{}},"waiting_on_human":["request-one"]}}}}
+{"v":1,"step":"observe","connection":"Live","streams":{"s2":{"state":"Replaying","cursor":8}},"outbox":{},"absent_streams":["s1"]}
+{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s2","seq":8}}
+{"v":1,"step":"observe","connection":"Live","streams":{"s2":{"state":"Current","cursor":8}},"outbox":{},"absent_streams":["s1"]}
+{"v":1,"step":"quiet","ceiling_ms":1000}

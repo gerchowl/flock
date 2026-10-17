@@ -24,11 +24,24 @@ import type { KnownSessionEvent } from "../gen/KnownSessionEvent";
 import type { SessionEntry, SessionStream, Transport, TransportFailure } from "../transport";
 import { UnknownBlock } from "./UnknownBlock";
 
+/**
+ * What the stream is: a recorded session replayed (fixture mode), or a
+ * live agent's stream from the server (wire mode). Only the status
+ * wording differs.
+ */
+export type TranscriptSource = "replay" | "live";
+
 /** Props of {@link Transcript}. */
 export type TranscriptProps = {
   readonly transport: Transport;
   readonly stream: SessionStream;
+  readonly source: TranscriptSource;
 };
+
+const WORDING = {
+  replay: { loading: "Replaying…", synced: (count: number) => `End of recording · ${count} events`, failed: "Replay failed" },
+  live: { loading: "Loading history…", synced: () => "Up to date", failed: "Couldn't load this agent's history" },
+} as const;
 
 type Progress = { readonly phase: "replaying" | "synced" } | { readonly phase: "failed"; readonly failure: TransportFailure };
 
@@ -51,6 +64,8 @@ function label(event: KnownSessionEvent): string {
       return `Stream · ${event.event.type}`;
     case "control_request":
       return `Permission request · ${event.request.tool_name}`;
+    case "control_cancel_request":
+      return "Control request cancelled";
     case "control_response":
       return `Control response · ${event.response.subtype}`;
     case "command_lifecycle":
@@ -153,18 +168,18 @@ export function Transcript(props: TranscriptProps): JSX.Element {
       <For each={entries}>{(entry) => <Entry entry={entry} />}</For>
       <Switch>
         <Match when={progress().phase === "replaying"}>
-          <p class="transcript__status">Replaying…</p>
+          <p class="transcript__status">{WORDING[props.source].loading}</p>
         </Match>
         <Match when={progress().phase === "synced"}>
           <p class="transcript__status" data-testid="transcript-synced">
-            End of recording · {entries.length} events
+            {WORDING[props.source].synced(entries.length)}
           </p>
         </Match>
       </Switch>
       <Show when={failure()}>
         {(shown) => (
           <p class="transcript__status state-error" role="alert">
-            Replay failed: {shown().message}
+            {WORDING[props.source].failed}: {shown().message}
           </p>
         )}
       </Show>
