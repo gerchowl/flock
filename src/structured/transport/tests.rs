@@ -1079,7 +1079,6 @@ fn replay_open_permissions(root: &SessionConfigDir) -> std::collections::BTreeSe
                 open.remove(&id),
                 "close must follow exactly one open: {value}"
             ),
-            "refused" => assert!(open.contains(&id), "a refusal must leave its request open"),
             state => panic!("unknown permission state {state}"),
         }
     }
@@ -1607,9 +1606,7 @@ fn session_grant_matches_canonical_input_but_other_input_and_tools_prompt() {
 }
 
 #[test]
-fn session_grant_suggestions_refuse_non_session_destinations() {
-    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-    let (transport, mut output, mut input) = start(&root);
+fn session_grant_suggestions_ignore_non_session_destinations() {
     for (n, rule) in [
         serde_json::json!({"destination":"userSettings"}),
         serde_json::json!({"destination":"projectSettings"}),
@@ -1621,6 +1618,8 @@ fn session_grant_suggestions_refuse_non_session_destinations() {
     .into_iter()
     .enumerate()
     {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (transport, mut output, mut input) = start(&root);
         let id = format!("invalid-{n}");
         let mut invalid_rule =
             serde_json::json!({"type":"addRules","behavior":"allow","rules":[{"toolName":"Bash"}]});
@@ -1637,24 +1636,10 @@ fn session_grant_suggestions_refuse_non_session_destinations() {
             ),
         );
         opened(&transport);
-        assert_eq!(
-            call_decide(
-                &transport,
-                &owner(),
-                &decide(&id, permissions::Decision::AllowAlways)
-            ),
-            Err(ErrorCode::PermissionSuggestionsRefused)
-        );
-        let refusal: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
-        assert_eq!(refusal["state"], "refused");
-        assert_eq!(transport.waiting_on_human().unwrap(), vec![id.clone()]);
-        assert_eq!(
-            close_with(&transport, &mut input, &id, permissions::Decision::Deny)["response"]
-                ["response"]["behavior"],
-            "deny",
-            "the first response after refusal must be the explicit deny"
-        );
+        assert_exact_suggestion_fallback(&root, &transport, &mut output, &mut input, &id);
     }
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
     let rules = serde_json::json!([{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"true"}],"behavior":"allow","destination":"session"}]);
     grant_request(
         &mut output,
@@ -1982,9 +1967,7 @@ fn harness_cannot_forge_an_automatic_grant_reservation() {
 }
 
 #[test]
-fn unsafe_session_suggestions_are_refused_without_closing_or_sending() {
-    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-    let (transport, mut output, mut input) = start(&root);
+fn unsafe_session_suggestions_fall_back_to_exact_grants() {
     let valid = serde_json::json!({"type":"addRules", "behavior":"allow", "destination":"session", "rules":[{"toolName":"Bash"}]});
     let mut unsafe_updates = Vec::new();
     for kind in [
@@ -2018,92 +2001,106 @@ fn unsafe_session_suggestions_are_refused_without_closing_or_sending() {
     unsafe_updates.push(rule_extra);
     for (n, update) in unsafe_updates.into_iter().enumerate() {
         let id = format!("unsafe-{n}");
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        for name in ["home/.claude", "config", "claude"] {
+            let dir = root.path().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("settings.json"),
+                br#"{"permissions":{"defaultMode":"default"}}"#,
+            )
+            .unwrap();
+        }
+        // nextest isolates each test process; all policy roots are fixtures.
+        std::env::set_var("HOME", root.path().join("home"));
+        std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", root.path().join("claude"));
+        let settings = settings_snapshot(root.path());
+        let (transport, mut output, mut input) = start(&root);
         grant_request(
             &mut output,
             &id,
             "Bash",
             serde_json::json!({}),
-            Some(serde_json::json!([update])),
+            Some(serde_json::json!([valid, update])),
         );
         opened(&transport);
-        assert_eq!(
-            call_decide(
-                &transport,
-                &owner(),
-                &decide(&id, permissions::Decision::AllowAlways)
-            ),
-            Err(ErrorCode::PermissionSuggestionsRefused)
-        );
-        let refusal: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
-        assert_eq!(refusal["state"], "refused");
-        assert_eq!(refusal["request_id"], id);
-        assert_eq!(
-            refusal["error_code"],
-            ErrorCode::PermissionSuggestionsRefused.as_str()
-        );
-        assert_eq!(refusal["principal"], "fixture-client");
-        assert_eq!(transport.waiting_on_human().unwrap(), vec![id.clone()]);
-        private_fs::set_nonblocking(&input).unwrap();
-        assert_eq!(
-            input.read(&mut [0]).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        assert_eq!(
-            close_with(&transport, &mut input, &id, permissions::Decision::Deny)["response"]
-                ["response"]["behavior"],
-            "deny",
-            "the first response after refusal must be the explicit deny"
-        );
+        assert_exact_suggestion_fallback(&root, &transport, &mut output, &mut input, &id);
+        assert_eq!(settings_snapshot(root.path()), settings);
     }
-    assert!(replay_open_permissions(&root).is_empty());
 }
 
-#[test]
-fn an_admitted_suggestion_refusal_survives_cancelled_notification_delivery() {
-    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-    let (transport, mut output, _input) = start(&root);
-    grant_request(
-        &mut output,
-        "unsafe-request",
-        "Bash",
-        serde_json::json!({}),
-        Some(
-            serde_json::json!([{"type":"setMode","mode":"bypassPermissions","destination":"session"}]),
-        ),
+// Start at the harness request and prove the decision closes it in one call,
+// installs only the exact grant, and leaves a durable explanation of discarded rules.
+fn assert_exact_suggestion_fallback(
+    root: &SessionConfigDir,
+    transport: &Transport,
+    output: &mut File,
+    input: &mut File,
+    id: &str,
+) {
+    call_decide(
+        transport,
+        &owner(),
+        &decide(id, permissions::Decision::AllowAlways),
+    )
+    .unwrap();
+    let close: Value = serde_json::from_str(&receive(transport).record.raw).unwrap();
+    assert_eq!(close["state"], "closed");
+    assert_eq!(close["decision"], "allow_always");
+    assert_eq!(close["ignored_suggestions"]["request_id"], id);
+    assert_eq!(
+        close["ignored_suggestions"]["reason"],
+        "unsafe_session_rules"
     );
-    opened(&transport);
-    for n in 0..5 {
-        writeln!(
-            output,
-            "{}",
-            serde_json::json!({"type":"fixture_progress","n":n})
-        )
-        .unwrap();
-    }
-    wait(&transport, || (records(&root).len() == 7).then_some(()));
+    let response = input_line(transport, input);
+    assert_eq!(response["response"]["response"]["behavior"], "allow");
+    assert!(response["response"]["response"]
+        .get("updatedPermissions")
+        .is_none());
+    assert!(transport.waiting_on_human().unwrap().is_empty());
     assert_eq!(
         call_decide(
-            &transport,
+            transport,
             &owner(),
-            &decide("unsafe-request", permissions::Decision::AllowAlways)
+            &decide(id, permissions::Decision::Deny)
         ),
-        Err(ErrorCode::PermissionSuggestionsRefused)
+        Err(ErrorCode::PermissionRequestClosed)
     );
-    transport.cancel();
+    grant_request(output, "exact-match", "Bash", serde_json::json!({}), None);
+    opened(transport);
+    let automatic: Value = serde_json::from_str(&receive(transport).record.raw).unwrap();
+    assert_eq!(automatic["source"], "session_grant");
+    assert_eq!(automatic["grant_request_id"], id);
     assert_eq!(
-        worker_done(&transport, true).unwrap_err().kind(),
-        io::ErrorKind::Interrupted
+        input_line(transport, input)["response"]["response"]["behavior"],
+        "allow"
     );
-    let records = records(&root);
-    assert_eq!(records.len(), 9);
-    let refusal: Value = serde_json::from_str(&records[7].raw).unwrap();
-    assert_eq!(refusal["state"], "refused");
+    grant_request(
+        output,
+        "different-input",
+        "Bash",
+        serde_json::json!({"command":"different"}),
+        None,
+    );
+    opened(transport);
     assert_eq!(
-        refusal["error_code"],
-        ErrorCode::PermissionSuggestionsRefused.as_str()
+        transport.waiting_on_human().unwrap(),
+        vec!["different-input"]
     );
-    let close: Value = serde_json::from_str(&records[8].raw).unwrap();
-    assert_eq!(close["state"], "closed");
-    assert_eq!(close["reason"], "ended");
-    assert!(replay_open_permissions(&root).is_empty());
+    assert_eq!(
+        close_with(
+            transport,
+            input,
+            "different-input",
+            permissions::Decision::Deny
+        )["response"]["response"]["behavior"],
+        "deny"
+    );
+    assert!(replay_open_permissions(root).is_empty());
+    // The closed record references the full original suggestion bundle in open.
+    let audit = records(root);
+    let open: Value = serde_json::from_str(&audit[1].raw).unwrap();
+    assert_eq!(open["request_id"], id);
+    assert!(open.to_string().contains("permission_suggestions"));
 }

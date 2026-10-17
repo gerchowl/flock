@@ -1658,11 +1658,16 @@ P16 and P17 have no source in the stream today and are not promised;
   if each suggestion is exactly an `addRules` update with behavior `allow`,
   destination `session`, and nonempty rules naming the requested tool only.
   Mode changes, rule removal/replacement, deny/ask rules, directory updates,
-  other tools, wildcard tool names and unknown modifiers are refused with
-  `permission_suggestions_refused`, leaving the request open and recording the
-  refusal. No unsafe suggestion is forwarded.
-  The harness matches the suggested rules. When suggestions are absent,
-  null or empty, flk grants only the exact tool name plus canonical JSON
+  other tools, wildcard tool names and unknown modifiers invalidate the entire
+  suggestion bundle. If any suggestion fails this filter, flk ignores all
+  suggestions and falls back to an exact in-memory grant in the same call:
+  `allow_always` still answers allow and closes the request, with no second
+  decision or wire selector. The closed audit records `ignored_suggestions`
+  with reason `unsafe_session_rules` and the request ID linking to the open
+  audit record containing the full original suggestions. No unsafe suggestion
+  is forwarded or written to settings.
+  The harness matches accepted suggested rules. When suggestions are invalid,
+  absent, null or empty, flk grants only the exact tool name plus canonical JSON
   input (recursively sorted object keys; array order and scalar values
   preserved). Matching performs no Unicode normalization and treats `1` and
   `1.0` as different. A different tool or input prompts again. At most 16 exact

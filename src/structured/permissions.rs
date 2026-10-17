@@ -237,28 +237,33 @@ impl Book {
             .filter(|r| r.stage == Stage::Open && self.active)
             .ok_or(missing)?;
         let mut grant = None;
+        let mut ignored_suggestions = None;
         let response = if decision == Decision::Deny {
             json!({"behavior":"deny","message":message.unwrap_or("Denied by the operator")})
         } else {
             let mut response = json!({"behavior":"allow","updatedInput":open.request.input});
             if decision == Decision::AllowAlways {
-                match open
+                let suggestions = open
                     .request
                     .permission_suggestions
                     .as_ref()
                     .and_then(Option::as_ref)
-                    .filter(|r| !r.is_empty())
-                {
-                    Some(rules) => {
+                    .filter(|r| !r.is_empty());
+                match suggestions {
+                    Some(rules)
                         if rules
                             .iter()
-                            .any(|rule| !safe_suggestion(rule, &open.request.tool_name))
-                        {
-                            return Err(ErrorCode::PermissionSuggestionsRefused);
-                        }
+                            .all(|rule| safe_suggestion(rule, &open.request.tool_name)) =>
+                    {
                         response["updatedPermissions"] = json!(rules);
                     }
-                    None => {
+                    _ => {
+                        if suggestions.is_some() {
+                            // The durable open record already contains the complete
+                            // bundle. Link it rather than duplicate an unbounded value.
+                            ignored_suggestions =
+                                Some(json!({"request_id":id,"reason":"unsafe_session_rules"}));
+                        }
                         let k = key(&open.request);
                         let reserved: BTreeSet<_> = self
                             .open
@@ -287,10 +292,14 @@ impl Book {
         let open = self.open.get_mut(id).ok_or(missing)?;
         open.grant = grant.as_ref().map(|(key, _)| key.clone());
         open.stage = Stage::Reserved;
+        let mut audit = json!({"type":"flk_permission_request","state":"closed","request_id":id,"decision":decision,"message":message,"principal":subject,"source":source});
+        if let Some(ignored) = ignored_suggestions {
+            audit["ignored_suggestions"] = ignored;
+        }
         Ok(Answer {
             id: id.into(),
             response: json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":response}}),
-            audit: json!({"type":"flk_permission_request","state":"closed","request_id":id,"decision":decision,"message":message,"principal":subject,"source":source}),
+            audit,
             grant,
         })
     }

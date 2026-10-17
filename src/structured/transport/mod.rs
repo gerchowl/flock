@@ -46,7 +46,6 @@ enum Input {
 enum Command {
     Decide(Control),
     Close(Vec<permissions::Closing>),
-    Refused(Value),
 }
 struct ControlPlane {
     book: Permissions,
@@ -392,22 +391,12 @@ impl InputHandle {
         principal: &Principal<'_>,
         args: &AgentDecide,
     ) -> Result<(), ErrorCode> {
-        let subject = principal.decision_subject()?;
+        principal.decision_subject()?;
         if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
             return Err(ErrorCode::AgentNotFound);
         }
         let mut book = self.permissions.try_lock().ok_or(ErrorCode::SessionBusy)?;
-        let answer = match book.prepare(principal, args) {
-            Err(code @ ErrorCode::PermissionSuggestionsRefused) => {
-                let audit = serde_json::json!({"type":"flk_permission_request","state":"refused","request_id":args.request_id,"decision":args.decision,"principal":subject,"error_code":code.as_str()});
-                encode(&audit).map_err(|_| ErrorCode::InvalidParams)?;
-                self.decisions
-                    .try_send(Command::Refused(audit))
-                    .map_err(|_| ErrorCode::SessionBusy)?;
-                return Err(code);
-            }
-            answer => answer?,
-        };
+        let answer = book.prepare(principal, args)?;
         let bytes = match encode(&answer.response) {
             Ok(bytes) => bytes,
             Err(_) => {

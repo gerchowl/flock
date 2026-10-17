@@ -62,10 +62,6 @@ impl<'a> Recorder<'a> {
         match command {
             Command::Decide(control) => self.answer(control),
             Command::Close(closings) => self.close(closings),
-            Command::Refused(audit) => {
-                let event = self.audit(&audit)?;
-                publish(event, self.tx, self.cancel)
-            }
         }
     }
     fn answer(&mut self, control: Control) -> io::Result<()> {
@@ -97,20 +93,8 @@ impl<'a> Recorder<'a> {
         Ok(())
     }
     pub fn finish(&mut self) -> io::Result<()> {
-        // Terminal reservation excludes new decisions/refusals under the same
-        // book lock used by admission, so all admitted refusals are now queued.
         let closings = self.controls.book.lock().terminal();
-        let mut events = Vec::new();
-        while let Ok(command) = self.controls.decisions.try_recv() {
-            if let Command::Refused(audit) = command {
-                events.push(self.audit(&audit)?);
-            }
-        }
-        events.extend(self.close_records(closings)?);
-        for event in events {
-            publish(event, self.tx, self.cancel)?;
-        }
-        Ok(())
+        self.close(closings)
     }
     pub fn observed(
         &mut self,
