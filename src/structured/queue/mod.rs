@@ -71,14 +71,14 @@ fn encode(value: &impl serde::Serialize) -> io::Result<Vec<u8>> {
 }
 impl Journal {
     /// Acquire exclusive queue/<agent> ownership and recover committed state.
-    /// Components are ASCII identifiers, never paths. Root aliases resolve, but
+    /// Components are lowercase ASCII identifiers, never paths. Root aliases resolve, but
     /// linked/private-namespace violations fail. Malformed complete lines or
     /// non-dense sequences fail; only an unterminated final tail is repaired.
     pub fn open(data: &Path, agent: &str) -> io::Result<Self> {
         if agent.is_empty()
             || !agent
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_".contains(&b))
         {
             return Err(problem("invalid queue agent component"));
         }
@@ -88,7 +88,10 @@ impl Journal {
         let dir = sessions.join(agent);
         private_fs::ensure_private_dir(&dir)?;
         let lease = open_file(&dir.join(".queue.lock"))?;
-        lease.try_lock().map_err(io::Error::other)?;
+        lease.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
+            fs::TryLockError::Error(error) => error,
+        })?;
         let path = dir.join("queue.jsonl");
         let file = open_file(&path)?;
         for path in [&root, &sessions, &dir] {
@@ -107,6 +110,20 @@ impl Journal {
             _lease: lease,
         };
         journal.recover()?;
+        for entry in fs::read_dir(
+            journal
+                .path
+                .parent()
+                .ok_or_else(|| problem("missing queue directory"))?,
+        )? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".queue-") && name.ends_with(".next") {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        journal.directory.sync_all()?;
         Ok(journal)
     }
     /// Current materialized state, in queue order; contains no runtime handles.
@@ -190,13 +207,13 @@ impl Journal {
     }
     /// Sync a replacement, rename, then sync its directory before publishing.
     /// Header `before` records H as well as high_water=H+N, allowing recovery to
-    /// reject a truncated snapshot. Unknown kinds block rewriting rather than
-    /// silently discard future state. Failed replacements can leave a unique
-    /// .next file; recovery ignores these and reads only queue.jsonl.
+    /// reject a truncated snapshot. Unknown kinds, fields or enum variants block
+    /// rewriting rather than discard future state. Failed replacements can leave
+    /// unique .next files; open removes these under the exclusive lease.
     pub fn checkpoint(&mut self) -> io::Result<Cut> {
         self.healthy()?;
         if self.future {
-            return Err(problem("future queue kinds prevent checkpoint"));
+            return Err(problem("future queue data prevent checkpoint"));
         }
         let before = self.seq;
         before
@@ -243,6 +260,9 @@ impl Journal {
         self.replay(before)
     }
     fn recover(&mut self) -> io::Result<()> {
+        // A dead writer may have written complete lines without syncing them.
+        // Make those bytes durable before publishing any recovered sequence.
+        self.file.sync_all()?;
         let mut reader = BufReader::new(&self.file);
         let mut good = 0;
         let mut line = Vec::new();
@@ -282,9 +302,18 @@ impl Journal {
                     return Err(problem("non-dense queue sequence"));
                 }
                 if matches!(value["kind"].as_str(), Some("upsert" | "remove")) {
-                    serde_json::from_value::<Record>(value.clone())?
-                        .change
-                        .apply(&mut self.items)?;
+                    match serde_json::from_value::<Record>(value.clone()) {
+                        Ok(record) => {
+                            self.future |= serde_json::to_value(&record)? != value;
+                            record.change.apply(&mut self.items)?;
+                        }
+                        // Serde distinguishes future enum variants from malformed
+                        // records. Preserve the former opaquely (ADR-0028 §3a).
+                        Err(error) if error.to_string().starts_with("unknown variant `") => {
+                            self.future = true;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 } else if value["kind"].is_string() {
                     self.future = true;
                 } else {

@@ -8,8 +8,10 @@ publication are #1803. This storage slice does not expose a new send route.
 `Journal::open(data, agent)` acquires an exclusive OS lock on the stable
 `sessions/<agent>/.queue.lock` file. It keeps that lease across atomic replacement
 of `queue.jsonl`. Drop the old journal before handing ownership to a successor;
-a cooperating second writer is refused while the old lease exists. Agent path
-components permit only ASCII letters, digits, `-` and `_`. Namespace directories
+a cooperating second writer receives `WouldBlock` while the old lease exists. Agent
+path components permit only lowercase ASCII letters, digits, `-` and `_`. Uppercase
+identifiers are refused to prevent distinct identities aliasing on case-insensitive
+filesystems, including after a writer exits. Namespace directories
 are private and files are owner-only, with existing symlinks/nonregular files
 refused. The data root itself may be an alias such as a canonicalized temp root.
 
@@ -30,7 +32,11 @@ sequences fail without spending a cursor. A write/sync/rename failure poisons th
 handle: its live state stays at the last published cut and replay or further
 mutations fail. Drop and reopen to discover the actual durable outcome; never
 blindly retry an uncertain append. A successful write followed by failed sync
-can be present after recovery even though the call did not acknowledge it.
+can be present after recovery even though the call did not acknowledge it. Reopen
+unconditionally syncs the journal before publishing any recovered sequence or
+state; a failed recovery sync fails open. Thus complete unacknowledged lines can
+never be served as committed while remaining vulnerable to cursor reuse after
+a power cut.
 
 `items()` exposes the pure materialized queue. `bytes()` lets its owning worker
 check the configured rewrite threshold. `checkpoint()` and appends both require
@@ -40,8 +46,8 @@ the replacement contains a header
 snapshot records H+1 through H+N. `before` also lets recovery detect an incomplete
 snapshot. The header consumes no sequence and is never a queue event. The worker
 syncs the temporary file, renames it, syncs the directory, then publishes the new
-cut. Unique `.queue-*.next` files left by failed/crashed replacements are ignored
-by recovery; they are not committed state. A checkpoint after removing all items
+cut. Open removes stale `.queue-*.next` files left by failed/crashed replacements
+under the exclusive lease and syncs the directory; they are not committed state. A checkpoint after removing all items
 still records H, so restart cannot reuse a cursor.
 
 `replay(after)` returns an owned, immutable cut and its `through` barrier. A
@@ -55,12 +61,15 @@ immediately; no event is needed to complete it. An initial empty queue returns
 `from:1,to:0,snapshot_to:0`. A cursor ahead of the journal is refused. No cut
 shares a mutable record buffer with future appends or rewrites.
 
-On reopen, only an unterminated final tail is truncated and synced. Malformed
+On reopen, the journal is synced unconditionally; only an unterminated final tail
+is truncated and synced again. Malformed
 complete records, oversized lines, non-dense sequences, interior checkpoint
 headers and incomplete snapshots are corruption and fail without repair.
 Unknown string event kinds spend their cursors and remain available in replay,
 but do not change the known materialized state (ADR-0028 §3a). A writer that
 encounters such a kind refuses checkpointing rather than discard state it cannot
-interpret; it can still append known changes. Future incompatible shapes inside
-a known event are refused. Disk operations are blocking worker operations and
+interpret; it can still append known changes. Unknown enum variants inside known
+events are also retained opaquely and skipped without failing open. Unknown fields
+on known events survive in replay and block rewriting rather than being discarded.
+Malformed required fields and invalid known changes still fail open. Disk operations are blocking worker operations and
 must never run on the server event loop or during render.

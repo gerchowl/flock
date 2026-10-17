@@ -1,6 +1,7 @@
 use super::model::{Delivery, Kind, Priority, Producer, State};
 use super::*;
 use std::collections::BTreeMap;
+use std::net::Shutdown;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
@@ -131,6 +132,20 @@ fn failed_append_or_sync_never_folds_or_publishes_and_requires_reopen() {
     assert!(journal.items().is_empty());
     assert_eq!(journal.seq, 0);
     drop(journal);
+    // A complete but unacknowledged line may only be published after recovery syncs.
+    let (file, mut peer) = socket_file();
+    peer.write_all(&bytes).unwrap();
+    peer.shutdown(Shutdown::Write).unwrap();
+    let mut recovery = root.open();
+    recovery.file = file;
+    recovery.items.clear();
+    recovery.records.clear();
+    recovery.seq = 0;
+    assert!(
+        recovery.recover().is_err(),
+        "recovery must refuse failed sync"
+    );
+    drop(recovery);
     let recovered = root.open();
     assert_eq!(recovered.seq, 1);
     assert_eq!(recovered.items(), &[item("unacknowledged")]);
@@ -336,10 +351,19 @@ fn failed_checkpoint_publication_never_advances_live_state_or_releases_lease() {
 fn writer_lease_survives_rename_then_releases_for_handoff() {
     let root = Root::new();
     let mut journal = root.open();
-    assert!(Journal::open(&root.0, "fixture-agent").is_err());
-    journal.append(upsert("a", 0)).unwrap();
-    journal.checkpoint().unwrap();
-    assert!(Journal::open(&root.0, "fixture-agent").is_err());
+    for checkpoint in [false, true] {
+        if checkpoint {
+            journal.append(upsert("a", 0)).unwrap();
+            journal.checkpoint().unwrap();
+        }
+        assert_eq!(
+            Journal::open(&root.0, "fixture-agent")
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
     drop(journal);
     let mut successor = root.open();
     assert_eq!(successor.append(upsert("b", 1)).unwrap().seq, 3);
@@ -435,6 +459,10 @@ fn unrenamed_checkpoint_is_ignored_and_a_later_torn_append_is_repaired() {
     .unwrap();
     drop(journal);
     let mut journal = root.open();
+    assert!(!root
+        .path()
+        .with_file_name(".queue-interrupted.next")
+        .exists());
     assert_eq!(journal.seq, 1);
     assert_eq!(journal.items(), &[item("committed")]);
     journal.checkpoint().unwrap();
@@ -462,9 +490,19 @@ fn writer_lease_excludes_another_process_across_checkpoint_rename() {
     let root = Root::new();
     let mut journal = root.open();
     let probe = || {
-        let mut command = crate::process::TracedCommand::new("python3", "queue-lease-probe");
-        command.args(["-c", "import fcntl,sys\nf=open(sys.argv[1], 'a')\ntry: fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(42)\n"]);
-        command.arg(root.path().with_file_name(".queue.lock"));
+        let mut command = crate::process::TracedCommand::new(
+            std::env::current_exe().unwrap(),
+            "queue-lease-probe",
+        );
+        command.args([
+            "--exact",
+            "structured::queue::tests::lease_probe_child",
+            "--nocapture",
+        ]);
+        command.env(
+            "QUEUE_LEASE_PROBE",
+            root.path().with_file_name(".queue.lock"),
+        );
         command
             .output_traced_with_timeout(Duration::from_secs(2))
             .unwrap()
@@ -475,4 +513,70 @@ fn writer_lease_excludes_another_process_across_checkpoint_rename() {
     assert_eq!(probe().status.code(), Some(42));
     drop(journal);
     assert!(probe().status.success());
+}
+
+#[test]
+fn lease_probe_child() {
+    let Some(path) = std::env::var_os("QUEUE_LEASE_PROBE") else {
+        return;
+    };
+    let file = private_fs::open_append_file(Path::new(&path)).unwrap();
+    match file.try_lock() {
+        Ok(()) => (),
+        Err(std::fs::TryLockError::WouldBlock) => std::process::exit(42),
+        Err(error) => panic!("unexpected lease failure: {error}"),
+    }
+}
+
+#[test]
+fn case_aliases_are_refused_even_after_the_original_writer_exits() {
+    let root = Root::new();
+    let mut journal = Journal::open(&root.0, "foo").unwrap();
+    journal.append(upsert("original", 0)).unwrap();
+    assert!(Journal::open(&root.0, "Foo").is_err());
+    drop(journal);
+    assert!(Journal::open(&root.0, "Foo").is_err());
+    assert_eq!(
+        Journal::open(&root.0, "foo").unwrap().items(),
+        &[item("original")]
+    );
+}
+
+#[test]
+fn future_record_fields_remain_opaque_and_block_checkpoint() {
+    assert_future_data_preserved(&["upsert", "remove"]);
+}
+
+#[test]
+fn future_enum_values_remain_opaque_and_block_checkpoint() {
+    assert_future_data_preserved(&["state", "producer", "delivery", "kind", "priority"]);
+}
+
+fn assert_future_data_preserved(extensions: &[&str]) {
+    for &extension in extensions {
+        let root = Root::new();
+        drop(root.open());
+        let mut value = serde_json::to_value(Record {
+            seq: 1,
+            change: upsert("future", 0),
+        })
+        .unwrap();
+        match extension {
+            "upsert" => {
+                value["future_field"] = json!({"x":1});
+            }
+            "remove" => {
+                value = json!({"seq":1,"kind":"remove","item_id":"future","future_field":[1,2]});
+            }
+            field => {
+                value["item"][field] = json!("future_variant");
+            }
+        }
+        fs::write(root.path(), encode(&value).unwrap()).unwrap();
+        let mut journal = root.open();
+        assert_eq!(journal.replay(0).unwrap().records, [value.clone()]);
+        assert!(journal.checkpoint().is_err(), "cannot discard {extension}");
+        drop(journal);
+        assert_eq!(root.open().replay(0).unwrap().records, [value]);
+    }
 }
