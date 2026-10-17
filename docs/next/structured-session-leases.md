@@ -22,9 +22,15 @@ the human. Existing PTY callers retain their pane identity.
 
 ADR-0036 §1a attributes callers by their own ancestry. Preparation and version
 probes are scoped to the launcher's ancestry, with independently proven pane
-callers retaining their PTY identity. Spawn publishes its PID under the table lock;
-a bind failure or unconfirmed cleanup retains that root, so its descendants fail
-closed without denying unrelated operator and pane callers. If spawn panics before
+callers retaining their PTY identity. A launch keeps its uncertain launcher marker
+while fork/exec runs without registry locks. Binding captures process identity
+outside the locks, then publishes PID/birth before exposing a runtime handle.
+A failed birth lookup after PID publication retains that process root, so its
+descendants fail closed. If binding times out before publication, the root stays
+the server's launcher PID. If release also times out, every unproven server
+descendant stays uncertain until the retained reservation is cleared or the
+server restarts. Independently proven pane callers and unrelated ancestry remain
+available. If spawn panics before
 publishing a PID, its launcher ancestry remains uncertain. A proven PTY boundary
 retains today's pane identity. Registry reads wait at most 100 milliseconds for
 short contention on the primary table; after that deadline, the pre-spawn
@@ -37,20 +43,63 @@ Missing/reused process facts and ancestry cycles fail closed for affected caller
 Failed preparation or confirmed
 spawn failure releases a reservation; confirmed process-tree cleanup releases it
 on stop or crash. Panics after a spawn attempt and unconfirmed cleanup retain it,
-with a diagnostic. No time-based lease expiry grants authority or permits a
-second process.
+with a diagnostic. Reservation, spawn-marker publication, binding, release and
+Drop each wait at most 100 milliseconds per registry lock. Mutations acquire both
+the primary table and published view before changing either; contention leaves
+them unchanged. Admission reports `agent_start_failed` on contention. A release
+that cannot acquire the locks retains the reservation and logs a warning; a
+retained reservation can require a server restart after process cleanup. No
+time-based lease expiry grants authority or permits a second process.
 
 This is server-local in-memory bookkeeping. Existing S3a supervision owns process
 tree cleanup and stale-session recovery. It does not provide a persistent lease
 service across server restarts. The runtime's process identity is distinct from
 turn state; an exit code alone is not a successful turn.
 
+Pane authority binds the child PID to the birth captured at spawn. Live handoff
+carries that birth as optional metadata; old manifests with no birth cannot grant
+pane-based API authority. Missing or mismatched birth fails closed without
+promoting the process to operator. Granting pane authority requires birth
+validation. PID ancestry candidates still refuse pane callers as inbound relays and preserve
+self-kill, self-submit, bulk self-exclusion and restart-warning protections. An
+unproven candidate never proves that a caller is outside every pane.
+Named hook reconciliation retains its existing
+claim-healing behavior; an empty claim used for authority requires trusted birth.
+The Mac Nix package explicitly declares its C compiler, and `macos-process-facts`
+compiles the SDK helper using that package's compiler and SDK inputs.
+
+The Unix API captures the kernel peer UID (`getpeereid` on macOS,
+`SO_PEERCRED` on Linux) with PID and birth before queueing. That context is
+preserved across mesh recovery and lifecycle dispatch. Account resolution is lazy:
+construction and handoff import perform no NSS lookup. The first classification
+starts one process-wide helper and waits at most 100 milliseconds; concurrent
+first uses share that wait. Afterward calls never wait or launch another helper.
+Pending lookups and lookup errors classify
+all socket UIDs as `Unknown` (read-only); a late answer is cached when it arrives.
+A permanently stuck directory service retains at most one worker until process
+exit. Dedicated-user callers never become the
+operator, even from a shell pane or after detaching. A dedicated caller with no
+verified pane or lease may read, but sends (including raw terminal writes) return
+`msg_not_allowed`; other mutations return `operator_only`. Unknown UIDs, missing
+credentials and account-directory errors also fail closed for mutations. An
+absent dedicated account still permits the operator UID. Restart the server to
+pick up account-directory changes or recover from a lookup error.
+
+For a server running as a non-root operator, UID 0 (root) and UIDs outside the
+operator and dedicated accounts are `Unknown`, read-only; root has no special
+bypass. The operator UID is the server's effective UID. SSH-forwarded relays arrive
+as that operator UID, then remain subject to the existing pane exclusion and
+sshd ancestry/enrollment checks. UID alone never proves a relay or grants an
+agent the operator role.
+
+Pane candidates separate rate-limit and blocking-budget buckets without stamping
+sender identity or granting authority. Candidates with no birth proof still
+cannot send through the public API.
+
 Public structured start, registry integration and structured `self` targets in
-agent restart/list remain #1439. #1629 must land before #1439. Kernel UID
-attestation and detached anonymous-agent policy are #1629; blob storage is #1630.
-The UID slice can enforce the dedicated-user boundary. Operator mode remains
+agent restart/list remain #1439; blob storage is #1630. Operator mode remains
 cooperative under #1177: same-UID reparented children without lease ancestry
-resolve `Unrelated` until #1629; they cannot be distinguished from the operator. This slice does not enable structured
+cannot be distinguished from the operator. This slice does not enable structured
 launches or change the default dedicated-user launch policy.
 
 Tests use the S1-derived fake Claude with owned Unix sockets, PID/birth evidence,

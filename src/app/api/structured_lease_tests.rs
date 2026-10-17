@@ -40,8 +40,7 @@ const SESSION: &str = "00000000-0000-4000-8000-000000000001";
 
 #[tokio::test]
 async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption() {
-    // guardrails-ok(hermetic): Unix socket fixtures require a short owned root independent of TMPDIR.
-    let fixture = runtime::tests::Fixture::under(std::path::Path::new("/tmp"));
+    let fixture = runtime::tests::Fixture::for_socket();
     let root = fixture.root.path().to_owned();
     let socket = root.join("api.sock");
     assert!(socket.as_os_str().as_encoded_bytes().len() < 104);
@@ -279,6 +278,7 @@ async fn queued_socket_requests_with_reused_birth_never_become_operator() {
             respond_to,
             peer_pid: Some(pid),
             peer_birth,
+            peer_uid: Some(crate::platform::peer::effective_uid()),
         });
         let response: serde_json::Value =
             serde_json::from_str(&response.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
@@ -311,6 +311,7 @@ async fn recovery_parked_requests_preserve_original_peer_birth() {
         },
         Some(pid),
         Some(Some(birth.wrapping_add(1))),
+        None,
         respond_to,
     );
     app.replay_recovery_parked();
@@ -355,19 +356,41 @@ async fn real_pane_ancestry_survives_an_unrelated_pending_lease() {
         .attached_terminal_id
         .clone();
     app.state.terminals.get_mut(&terminal).unwrap().launch_argv = Some(vec!["claude".into()]);
-    app.test_pane_child_pids.insert(pane, std::process::id());
-    app.current_api_peer_pid = Some(std::process::id());
-    app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
+    let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let runtime = crate::terminal::TerminalRuntime::spawn_shell_command(
+        pane,
+        24,
+        80,
+        root.path().to_owned(),
+        "read line",
+        &[],
+        4096,
+        Default::default(),
+        app.event_tx.clone(),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
+    let pid = runtime.child_pid().unwrap();
+    app.current_api_peer_pid = Some(pid);
+    app.current_api_peer_birth = Some(crate::platform::process_start_time(pid));
+    app.terminal_runtimes.insert(terminal.clone(), runtime);
     let _pending = app.session_leases.reserve(AGENT, SESSION, None).unwrap();
-    assert_eq!(
-        app.lease_caller(),
-        crate::structured::lease::Caller::Unrelated
-    );
-    assert!(matches!(
-        app.spawn_caller(),
-        super::spawn::SpawnCaller::Agent { .. }
-    ));
-    assert!(!app.caller_is_local_operator());
+    let caller = app.lease_caller();
+    let agent = matches!(app.spawn_caller(), super::spawn::SpawnCaller::Agent { .. });
+    let operator = app.caller_is_local_operator();
+    let runtime = app.terminal_runtimes.remove(&terminal).unwrap();
+    assert!(tokio::time::timeout(
+        Duration::from_secs(10),
+        runtime.shutdown_for_restart(vec![pid], Duration::ZERO)
+    )
+    .await
+    .unwrap()
+    .unwrap());
+    assert_eq!(caller, crate::structured::lease::Caller::Unrelated);
+    assert!(agent);
+    assert!(!operator);
+    assert!(app.test_pane_child_pids.is_empty());
 }
 
 #[tokio::test]
@@ -388,4 +411,95 @@ async fn unreadable_peer_birth_with_active_leases_remains_uncertain() {
         crate::structured::lease::Caller::Uncertain
     );
     assert!(!app.caller_is_local_operator());
+}
+
+#[tokio::test]
+async fn self_submit_guard_protects_unproven_handoff_panes() {
+    for mismatch in [false, true] {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("self-submit")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        crate::test_support::adopt_unproven_pane_caller(&mut app, pane, mismatch);
+        assert_eq!(app.caller_pane(), None);
+        assert!(!app.caller_is_local_operator());
+        let target = app.public_pane_id(0, pane).unwrap();
+        let response = app.handle_pane_submit(
+            "self".into(),
+            PaneSubmitParams {
+                pane_id: target,
+                text: "owned fixture input".into(),
+                if_session: None,
+                min_age_secs: 0,
+                self_submit_confirmed: Some(false),
+            },
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["error"]["code"], "self_submit_unconfirmed",
+            "{response}"
+        );
+        assert!(app.pending_agent_submit.is_none());
+    }
+}
+
+#[tokio::test]
+async fn self_exclusion_reads_and_self_message_refusals_keep_unproven_candidates() {
+    for mismatch in [false, true] {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("self-exclusion")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        crate::test_support::adopt_unproven_pane_caller(&mut app, pane, mismatch);
+        let terminal = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&terminal).unwrap().launch_argv = Some(vec!["claude".into()]);
+        assert_eq!(app.caller_pane(), None);
+        assert!(app.attested_sender_agent().is_none());
+        let response: serde_json::Value = serde_json::from_str(&app.handle_agent_get(
+            "self".into(),
+            AgentTarget {
+                target: "self".into(),
+            },
+        ))
+        .unwrap();
+        assert!(
+            response.get("result").is_some(),
+            "bulk self-exclusion keeps its candidate: {response}"
+        );
+        let target = app.public_pane_id(0, pane).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&app.send_message(
+            "send".into(),
+            MsgSendParams {
+                to: MessageTarget::Pane { pane: target },
+                body: "fixture message".into(),
+                from_agent: None,
+                correlation_id: None,
+                in_reply_to: None,
+                intent: MsgIntent::Fyi,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            response["error"]["code"], "self_message_forbidden",
+            "{response}"
+        );
+    }
 }

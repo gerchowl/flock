@@ -43,13 +43,17 @@ fn rig_with_script(script: &str) -> Rig {
 }
 
 fn rig_with_launch_options(script: &str, options: &[&str]) -> Rig {
+    rig_with_harness_options("claude", script, options)
+}
+
+fn rig_with_harness_options(agent: &str, script: &str, options: &[&str]) -> Rig {
     let directory = std::env::temp_dir().join(format!(
         "flock-restart-{}-{}",
         std::process::id(),
         super::super::notifications::mint_notification_id()
     ));
     std::fs::create_dir_all(&directory).unwrap();
-    let executable = directory.join("claude");
+    let executable = directory.join(agent);
     std::fs::write(&executable, script).unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut config = crate::config::Config::default();
@@ -96,11 +100,15 @@ fn rig_with_launch_options(script: &str, options: &[&str]) -> Rig {
         pane,
         directory,
     };
-    report_session(&mut rig, "restart-session", 1);
+    report_harness_session(&mut rig, agent, "restart-session", 1);
     rig
 }
 
 fn report_session(rig: &mut Rig, session: &str, seq: u64) {
+    report_harness_session(rig, "claude", session, seq);
+}
+
+fn report_harness_session(rig: &mut Rig, agent: &str, session: &str, seq: u64) {
     rig.app.current_api_peer_pid = rig
         .app
         .terminal_runtimes
@@ -110,8 +118,8 @@ fn report_session(rig: &mut Rig, session: &str, seq: u64) {
         id: "session-report".into(),
         method: Method::PaneReportAgentSession(PaneReportAgentSessionParams {
             pane_id: rig.pane.clone(),
-            source: "flock:claude".into(),
-            agent: "claude".into(),
+            source: format!("flock:{agent}"),
+            agent: agent.into(),
             seq: Some(seq),
             agent_session_id: Some(session.into()),
             agent_session_path: None,
@@ -1366,5 +1374,60 @@ async fn restart_refusal_envelope_omits_attached_values_without_stopping() {
             pid
         );
         assert!(rig.app.state.agent_restarts.is_empty());
+    }
+}
+
+/// Pin Codex's concatenated config override through the complete API envelope.
+#[tokio::test]
+async fn restart_codex_concatenated_config_refusal_omits_key_and_value() {
+    let mut rig = rig_with_harness_options(
+        "codex",
+        "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
+        &["-cfixture-sensitive-key=fixture-sensitive-value"],
+    );
+    let pid = rig.app.terminal_runtimes.get(&rig.id).unwrap().child_pid();
+    let response = request(&mut rig);
+    assert_eq!(
+        response["error"]["code"], "restart_unsupported",
+        "{response}"
+    );
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("-c (attached value omitted)"),
+        "{response}"
+    );
+    // Serialize the entire response, including optional error.data.
+    let envelope = response.to_string();
+    for sensitive in ["fixture-sensitive-key", "fixture-sensitive-value"] {
+        assert!(
+            !envelope.contains(sensitive),
+            "value in error envelope: {response}"
+        );
+    }
+    assert!(pid.is_some(), "fixture must have a live child");
+    assert_eq!(
+        rig.app.terminal_runtimes.get(&rig.id).unwrap().child_pid(),
+        pid
+    );
+    assert!(rig.app.state.agent_restarts.is_empty());
+}
+
+#[tokio::test]
+async fn restart_warning_requester_keeps_unproven_handoff_candidates() {
+    for mismatch in [false, true] {
+        let mut rig = rig();
+        let (ws, pane) = rig.app.parse_pane_id(&rig.pane).unwrap();
+        crate::test_support::adopt_unproven_pane_caller(&mut rig.app, pane, mismatch);
+        assert_eq!(rig.app.caller_pane(), None);
+        let agent = rig.app.state.terminals
+            [rig.app.state.workspaces[ws].terminal_id(pane).unwrap()]
+        .agent_id
+        .to_string();
+        let response = request(&mut rig);
+        assert!(response.get("result").is_some(), "{response}");
+        assert_eq!(
+            rig.app.state.agent_restarts.pending[&rig.id].requester,
+            Some(agent)
+        );
     }
 }

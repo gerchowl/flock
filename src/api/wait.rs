@@ -62,8 +62,12 @@ pub(super) fn wait_for_output(
                 strip_ansi: params.strip_ansi,
             }),
         };
-        let response =
-            dispatch_to_app_with_timeout(read_request, api_tx, Some(APP_RESPONSE_TIMEOUT), None);
+        let response = dispatch_to_app_with_timeout(
+            read_request,
+            api_tx,
+            Some(APP_RESPONSE_TIMEOUT),
+            Default::default(),
+        );
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else {
             return Ok(Some(response));
         };
