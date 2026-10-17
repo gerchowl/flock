@@ -14,6 +14,7 @@ import { createWireTransport } from "../src/wire/transport";
 import { SAMPLE_INBOX } from "../src/workbench/inbox";
 import { markFor } from "../src/workbench/marks";
 import { SAMPLE_AGENTS } from "../src/workbench/samples";
+import { shortcutLabel } from "../src/workbench/Palette";
 import { Workbench } from "../src/workbench/Workbench";
 import { readFixture } from "./fixture-replay";
 import { Harness, WELCOME, live, sentFrames, step } from "./wire/harness";
@@ -161,6 +162,60 @@ describe("wire mode", () => {
     const sub = sentFrames(h).at(-1) as { sub_id: string };
     h.step(step({ step: "send", frame: { t: "subfail", sub_id: sub.sub_id, code: "scope", message: "not for this token" } }));
     expect($(root, "focus-pane")?.querySelector('[role="alert"]')?.textContent).toBe("Couldn't load this agent's history: not for this token");
+  });
+});
+
+describe("command palette", () => {
+  async function workbench(fleet: FleetSource): Promise<HTMLElement> {
+    const root = mount(() => <Workbench fleet={fleet} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} source="replay" />);
+    await tick();
+    return root;
+  }
+  const key = (target: EventTarget, init: KeyboardEventInit): boolean => target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, ...init }));
+
+  test("⌘K opens it; typing filters agents; Enter focuses the match", async () => {
+    const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
+    expect($(root, "palette")).toBeNull();
+    key(document, { key: "k", metaKey: true });
+    const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    expect($$(root, "palette-item").length).toBe(4);
+    input.value = "wr";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    expect($$(root, "palette-item").map((item) => item.textContent)).toEqual(["wrenTurn finished"]);
+    key(input, { key: "Enter" });
+    expect($(root, "palette")).toBeNull();
+    expect($(root, "focus-pane")?.querySelector("h1")?.textContent).toBe("wren");
+  });
+
+  test("the input names the selected option, and closing returns focus to the trigger", async () => {
+    const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
+    const trigger = $(root, "palette-trigger") as HTMLButtonElement;
+    trigger.click();
+    const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    const active = (): string | null | undefined => document.getElementById(input.getAttribute("aria-activedescendant") ?? "")?.textContent;
+    expect(active()).toBe("fixtureWaiting for permission to run Bash");
+    key(input, { key: "ArrowDown" });
+    expect(active()).toBe("atlasRunning the wire script suite");
+    key(input, { key: "Escape" });
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  test("the shortcut reads ⌘K on Apple platforms and Ctrl K elsewhere", () => {
+    expect(["MacIntel", "iPhone", "Win32", "Linux x86_64"].map(shortcutLabel)).toEqual(["⌘K", "⌘K", "Ctrl K", "Ctrl K"]);
+  });
+
+  test("a query that matches no listed agent opens one by id; Escape closes", async () => {
+    const root = await workbench(createFixtureFleet([]));
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    input.value = "agent-7";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    expect($$(root, "palette-item").map((item) => item.textContent)).toEqual(["Open agent agent-7by id"]);
+    ($$(root, "palette-item")[0] as HTMLButtonElement).click();
+    expect($(root, "focus-pane")?.querySelector("h1")?.textContent).toBe("agent-7");
+    key(document, { key: "k", ctrlKey: true });
+    key($(root, "palette")?.querySelector("input") as HTMLInputElement, { key: "Escape" });
+    expect($(root, "palette")).toBeNull();
   });
 });
 

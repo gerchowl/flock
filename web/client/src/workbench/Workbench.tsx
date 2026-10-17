@@ -20,6 +20,7 @@ import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
 import { sortInbox, type InboxCard } from "./inbox";
 import { PHASE_LABELS, StatusMark, markFor } from "./marks";
+import { Palette } from "./Palette";
 import "./workbench.css";
 
 /** Where the workbench's data comes from, and how its layout persists. */
@@ -144,6 +145,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     <div class="workbench" data-testid="workbench">
       <header class="topbar">
         <span class="topbar__mark">flock</span>
+        <Palette rows={rows} onOpen={openAgent} />
         <span class="topbar__summary" data-testid="agent-summary">
           {rows().length} agents · {working()} working
         </span>
