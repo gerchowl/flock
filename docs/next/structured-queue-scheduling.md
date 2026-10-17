@@ -29,8 +29,32 @@ retire the outstanding flag, mark remaining members done and preserve
 cancelled states. Producer attribution and batch IDs remain on the journal
 items and their raw audit records, including verbatim native commands.
 
+`deliver()` returns a typed `Offer`: `Submitted`, `NoEligibleItems`, or
+`Pending { batch_id, since_ms, cause }`. `status()` exposes the same turn
+blocker without writing. A reservation keeps its original batch ID/time across
+observations; S4/S6 gate observations have no batch ID. Pending causes are:
+
+- `awaiting_result`: stdin accepted the batch, but the queue worker has not
+  consumed its known top-level result.
+- `turn_end_unknown`: lossy output left the boundary unconfirmed. The S3a
+  writer guard stays closed; no input crosses that boundary.
+- `cancelled_awaiting_result`: matching harness cancellation keeps the items
+  cancelled, but does not establish the turn boundary. ADR §3 operator
+  take-back, which returns items to queued, is not implemented in this slice.
+- `state_not_ready`: S4 lacks live, attention-free idle/fresh bootstrap.
+- `waiting_on_human`: S6 still has an open permission/question request.
+
+The three turn-pending causes end only on a real result or runtime exit/restart.
+Restart holds outstanding items `session_unconfirmed`; they are never
+automatically resent. Pending age never triggers a timeout or recovery. Gate
+causes recover only when their S4/S6 evidence changes.
+
 A known busy refusal restores the exact original members and returns
-session_busy. Other offer errors hold the candidate with input_write_failed
+session_busy. A typed `structured_turn_end_unknown` offer refusal also
+restores the original items/order, without holding them or claiming any stdin
+write. It returns `Pending { cause: turn_end_unknown }`; repeated status/delivery
+calls do not rewrite the journal or retry the offer before its real result or
+exit. Other offer errors hold the candidate with input_write_failed
 and the source error. Uncertain journal I/O stops the operation before success;
 reopen under the lease instead of blind retry. Process exit without a result
 holds every unresolved member with no_result, including a completed lifecycle

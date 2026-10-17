@@ -3,7 +3,7 @@ use crate::api::agent_state::{AgentState, Turn};
 use crate::api::error_code::ErrorCode;
 use crate::structured::queue::admission::{Admission, Gate, Principal, MAX_BATCH};
 use crate::structured::queue::model::{Delivery, Kind, Priority, Producer, State};
-use crate::structured::queue::scheduler::Scheduler;
+use crate::structured::queue::scheduler::{Offer, Pending, PendingCause, Scheduler};
 use crate::structured::queue::{Change, Item, Journal};
 use crate::structured::state::{Input, SessionState};
 use serde_json::json;
@@ -113,10 +113,33 @@ impl QueueRun {
         &mut self,
         now_ms: u64,
     ) -> Result<Option<String>, crate::structured::queue::admission::Failure> {
+        self.outcome_at(now_ms).map(|outcome| match outcome {
+            Offer::Submitted { batch_id } => Some(batch_id),
+            Offer::Pending(_) | Offer::NoEligibleItems => None,
+        })
+    }
+    fn outcome_at(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<Offer, crate::structured::queue::admission::Failure> {
         self.scheduler
             .as_mut()
             .unwrap()
             .deliver(&self.running.runtime, &self.state, now_ms)
+    }
+    fn barrier(&mut self, after_count: u64) -> u64 {
+        self.control(json!({"op":"barrier", "after_count":after_count}));
+        self.received("fixture_barrier")["count"].as_u64().unwrap()
+    }
+    fn loss(&mut self) {
+        self.control(json!({"op":"loss"}));
+        let event = self.raw("flk_oversize");
+        assert_eq!(event.record.origin, RecordOrigin::Flk);
+        assert_eq!(
+            serde_json::from_str::<Value>(&event.record.raw).unwrap()["turn_end"],
+            "unknown"
+        );
+        self.apply(&event);
     }
     fn control(&mut self, value: Value) {
         let mut bytes = serde_json::to_vec(&value).unwrap();
@@ -531,14 +554,6 @@ fn fresh_generation_holds_unresolved_and_unknown_result_flags() {
 }
 
 #[test]
-fn observed_stdin_marker_is_bounded_if_producer_stays_live_and_silent() {
-    let mut run = QueueRun::new();
-    run.send(0, Producer::Human);
-    run.offer().unwrap().unwrap();
-    assert_eq!(run.input()["input"]["uuid"], id(0));
-}
-
-#[test]
 fn reservation_sync_failure_precedes_any_runtime_offer() {
     let mut run = QueueRun::new();
     drop(run.scheduler.take());
@@ -670,4 +685,195 @@ fn nonlive_or_unconfirmed_s4_state_never_spends_a_queue_cursor() {
     run.input();
     run.lifecycle("started");
     run.result();
+}
+
+fn pending(batch_id: &str, since_ms: u64, cause: PendingCause) -> Offer {
+    Offer::Pending(Pending {
+        batch_id: Some(batch_id.into()),
+        since_ms,
+        cause,
+    })
+}
+
+#[test]
+fn queue_silent_reports_stable_pending_without_a_second_write() {
+    let mut run = QueueRun::mode("queue-silent");
+    run.send(0, Producer::Human);
+    assert_eq!(run.offer().unwrap(), Some(id(0)));
+    run.send(1, Producer::Human);
+    // Positive acknowledgement of the actual read, not a missing-event deadline.
+    assert_eq!(run.barrier(1), 1);
+    let through = run.q().journal().replay(0).unwrap().through;
+    for now_ms in [200, 300] {
+        assert_eq!(
+            run.outcome_at(now_ms).unwrap(),
+            pending(&id(0), 100, PendingCause::AwaitingResult)
+        );
+    }
+    assert_eq!(
+        run.q().status(&run.running.runtime),
+        Some(Pending {
+            batch_id: Some(id(0)),
+            since_ms: 100,
+            cause: PendingCause::AwaitingResult
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(run.outcome_at(400).unwrap()).unwrap(),
+        json!({"outcome":"pending", "detail":{"batch_id":id(0), "since_ms":100, "cause":"awaiting_result"}})
+    );
+    assert_eq!(run.barrier(1), 1);
+    assert!(matches!(
+        run.running.result.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(run.q().journal().replay(0).unwrap().through, through);
+    assert!(run
+        .q()
+        .journal()
+        .items()
+        .iter()
+        .all(|i| i.state == State::Queued));
+}
+
+#[test]
+fn turn_end_unknown_reports_pending_without_holding_or_resending() {
+    let mut run = QueueRun::new();
+    run.send(0, Producer::Human);
+    run.offer().unwrap().unwrap();
+    run.input();
+    run.send(1, Producer::Agent("sender".into()));
+    run.send(2, Producer::Human);
+    run.loss();
+    let before = run.q().journal().items().to_vec();
+    let through = run.q().journal().replay(0).unwrap().through;
+    for now_ms in [200, 300] {
+        assert_eq!(
+            run.outcome_at(now_ms).unwrap(),
+            pending(&id(0), 100, PendingCause::TurnEndUnknown)
+        );
+        assert_eq!(run.q().journal().items(), before);
+    }
+    assert_eq!(run.barrier(1), 1);
+    assert_eq!(run.q().journal().replay(0).unwrap().through, through);
+    assert_eq!(
+        run.q().status(&run.running.runtime).unwrap().cause,
+        PendingCause::TurnEndUnknown
+    );
+    run.result();
+    assert!(run.q().status(&run.running.runtime).is_none());
+    for (n, count) in [(1, 2), (2, 3)] {
+        assert_eq!(run.offer().unwrap(), Some(id(n)));
+        let read = run.input();
+        assert_eq!(read["input"]["uuid"], id(n));
+        assert_eq!(read["count"], count);
+        run.lifecycle("started");
+        run.result();
+    }
+    assert!(run
+        .q()
+        .journal()
+        .items()
+        .iter()
+        .all(|i| i.state == State::Done));
+}
+
+#[test]
+fn turn_end_unknown_refusal_rolls_back_intact_instead_of_holding() {
+    let mut run = QueueRun::new();
+    let external = json!({"type":"user","uuid":"external","message":{"role":"user","content":[{"type":"text","text":"owned fixture input"}]}});
+    run.running.runtime.try_submit(&external).unwrap();
+    run.input();
+    run.send(0, Producer::Human);
+    run.send(1, Producer::Agent("sender".into()));
+    run.loss();
+    let before = run.q().journal().items().to_vec();
+    let offered = run.outcome_at(101);
+    assert_eq!(
+        run.q().journal().items(),
+        before,
+        "refused input was never written"
+    );
+    assert_eq!(
+        offered.unwrap(),
+        pending(&id(0), 101, PendingCause::TurnEndUnknown)
+    );
+    let through = run.q().journal().replay(0).unwrap().through;
+    assert_eq!(
+        run.outcome_at(201).unwrap(),
+        pending(&id(0), 101, PendingCause::TurnEndUnknown)
+    );
+    assert_eq!(run.q().journal().replay(0).unwrap().through, through);
+    assert_eq!(run.barrier(1), 1);
+    assert_eq!(
+        run.q().status(&run.running.runtime).unwrap().cause,
+        PendingCause::TurnEndUnknown
+    );
+    run.result();
+    assert!(run.q().status(&run.running.runtime).is_none());
+    for n in [0, 1] {
+        assert_eq!(run.offer().unwrap(), Some(id(n)));
+        assert_eq!(run.input()["input"]["uuid"], id(n));
+        run.lifecycle("started");
+        run.result();
+    }
+}
+
+#[test]
+fn cancelled_without_result_reports_pending_until_real_result_or_exit() {
+    for (completed, result) in [(true, true), (true, false), (false, true), (false, false)] {
+        let mut run = QueueRun::new();
+        run.send(0, Producer::Human);
+        run.send(1, Producer::Human);
+        let batch = run.offer().unwrap().unwrap();
+        run.input();
+        run.send(2, Producer::Human);
+        if completed {
+            run.lifecycle("started");
+            run.lifecycle("completed");
+        }
+        run.lifecycle("cancelled");
+        let outcome = if completed {
+            State::Done
+        } else {
+            State::Cancelled
+        };
+        let through = run.q().journal().replay(0).unwrap().through;
+        for now_ms in [200, 300] {
+            assert_eq!(
+                run.outcome_at(now_ms).unwrap(),
+                pending(&batch, 100, PendingCause::CancelledAwaitingResult)
+            );
+        }
+        assert_eq!(run.barrier(1), 1);
+        assert_eq!(run.q().journal().replay(0).unwrap().through, through);
+        assert!(run.q().journal().items()[..2]
+            .iter()
+            .all(|i| i.state == outcome));
+        assert_eq!(
+            run.q().status(&run.running.runtime).unwrap().cause,
+            PendingCause::CancelledAwaitingResult
+        );
+        if result {
+            run.result();
+            assert!(run.q().status(&run.running.runtime).is_none());
+            assert_eq!(run.offer().unwrap(), Some(id(2)));
+            run.input();
+            run.lifecycle("started");
+            run.result();
+        } else {
+            run.control(json!({"op":"exit"}));
+            run.running.finish();
+            run.q_mut().exited().unwrap();
+            assert!(run.q().status(&run.running.runtime).is_none());
+            assert!(run.q().journal().items()[..2].iter().all(|i| i.state
+                == if completed {
+                    State::Held
+                } else {
+                    State::Cancelled
+                }
+                && !i.metadata.contains_key("awaiting_result")));
+            assert_eq!(run.q().journal().items()[2].state, State::Queued);
+        }
+    }
 }

@@ -70,6 +70,11 @@ impl Runtime {
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
         self.transport.try_submit(user)
     }
+    /// Whether lossy stdout left the turn boundary unconfirmed. This never
+    /// releases stdin: only a real result or a new runtime clears the guard.
+    pub fn turn_end_unknown(&self) -> bool {
+        self.transport.turn_end_unknown()
+    }
     /// Server entry for a dispatcher-authenticated agent.decide command.
     /// Token identity is context, never a field decoded from command arguments.
     pub fn agent_decide(

@@ -12,10 +12,61 @@ use crate::structured::{claude::SessionEvent, runtime::Runtime};
 use serde_json::{json, Value};
 use std::io;
 
+/// Why a live queue cannot offer another input. None of these causes expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PendingCause {
+    /// An accepted batch still needs its real result; runtime exit/restart also
+    /// ends the wait, holding unresolved items instead of resending them.
+    AwaitingResult,
+    /// Loss obscured the boundary. The transport guard remains closed until a
+    /// real result, or runtime exit/restart; no input is written across it.
+    TurnEndUnknown,
+    /// The harness cancelled the batch but has not reported its real result.
+    /// Items stay cancelled; only a real result or runtime exit/restart ends it.
+    CancelledAwaitingResult,
+    /// S4 does not report live, attention-free idle (or fresh bootstrap).
+    StateNotReady,
+    /// S6 has an open permission/question request; its closure permits a retry.
+    WaitingOnHuman,
+}
+/// Status of an accepted batch or a candidate refused without any stdin write.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Pending {
+    /// Accepted/refused batch UUID, or none when no candidate was formed.
+    pub batch_id: Option<String>,
+    /// Reservation/first-refusal time, or observation time for an S4/S6 gate.
+    pub since_ms: u64,
+    /// Explicit blocking cause; age never triggers queue recovery.
+    pub cause: PendingCause,
+}
+/// An offer always names its outcome; pending is never disguised as no work.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "outcome", content = "detail", rename_all = "snake_case")]
+pub(crate) enum Offer {
+    /// Stdin accepted this batch; this does not mean the harness started it.
+    Submitted {
+        /// Single-item UUID or multi-item batch UUID.
+        batch_id: String,
+    },
+    /// This attempt made no write; inspect the cause and await recovery.
+    Pending(Pending),
+    /// Admission found no eligible queued input.
+    NoEligibleItems,
+}
+
+struct Reservation {
+    id: String,
+    members: Vec<String>,
+    since_ms: u64,
+    cancelled: bool,
+}
+
 /// Own one reservation until its top-level result is consumed.
 pub(crate) struct Scheduler {
     admission: Admission,
-    reserved: Option<(String, Vec<String>)>,
+    reserved: Option<Reservation>,
+    refused: Option<Pending>,
     virgin: bool,
 }
 impl Scheduler {
@@ -36,6 +87,7 @@ impl Scheduler {
         let mut this = Self {
             admission,
             reserved: None,
+            refused: None,
             virgin: true,
         };
         this.hold(pending, ErrorCode::SessionUnconfirmed)?;
@@ -49,6 +101,25 @@ impl Scheduler {
     pub fn journal(&self) -> &Journal {
         self.admission.journal()
     }
+    /// Current accepted-turn blocker or unconfirmed refused candidate. Status and
+    /// deliver report the same cause/time. No status observation writes a record;
+    /// S4/S6 gates and no-eligible-input are reported by deliver when unreserved.
+    pub fn status(&self, runtime: &Runtime) -> Option<Pending> {
+        self.reserved
+            .as_ref()
+            .map(|reservation| Pending {
+                batch_id: Some(reservation.id.clone()),
+                since_ms: reservation.since_ms,
+                cause: if runtime.turn_end_unknown() {
+                    PendingCause::TurnEndUnknown
+                } else if reservation.cancelled {
+                    PendingCause::CancelledAwaitingResult
+                } else {
+                    PendingCause::AwaitingResult
+                },
+            })
+            .or_else(|| self.refused.clone())
+    }
     /// Offer once after S4/S6 permit. Runtime admission is the final idle guard.
     /// A fresh generation may bootstrap Unknown exactly once; later offers need
     /// S4 Idle. A refused offer consumes no input. Success is not delivery.
@@ -57,21 +128,33 @@ impl Scheduler {
         runtime: &Runtime,
         state: &AgentState,
         now_ms: u64,
-    ) -> Result<Option<String>, Failure> {
+    ) -> Result<Offer, Failure> {
         self.journal().healthy()?;
+        if let Some(pending) = self.status(runtime) {
+            return Ok(Offer::Pending(pending));
+        }
         let open = runtime
             .waiting_on_human()
             .map_err(|code| Failure { code, source: None })?;
-        if self.reserved.is_some()
-            || !open.is_empty()
-            || state.lifecycle != Lifecycle::Live
+        let cause = if !open.is_empty() {
+            Some(PendingCause::WaitingOnHuman)
+        } else if state.lifecycle != Lifecycle::Live
             || state.attention != Attention::None
             || !(state.turn == Turn::Idle || (self.virgin && state.turn == Turn::Unknown))
         {
-            return Ok(None);
+            Some(PendingCause::StateNotReady)
+        } else {
+            None
+        };
+        if let Some(cause) = cause {
+            return Ok(Offer::Pending(Pending {
+                batch_id: None,
+                since_ms: now_ms,
+                cause,
+            }));
         }
         let Some(batch) = self.admission.batch(now_ms)? else {
-            return Ok(None);
+            return Ok(Offer::NoEligibleItems);
         };
         let originals = batch.items.clone();
         let mut members = batch.items;
@@ -80,11 +163,28 @@ impl Scheduler {
             item.metadata.insert("awaiting_result".into(), json!(true));
         }
         self.admission.replace(members)?;
-        self.reserved = Some((
-            batch.id.clone(),
-            originals.iter().map(|i| i.item_id.clone()).collect(),
-        ));
+        self.reserved = Some(Reservation {
+            id: batch.id.clone(),
+            members: originals.iter().map(|i| i.item_id.clone()).collect(),
+            since_ms: now_ms,
+            cancelled: false,
+        });
         if let Err(error) = runtime.try_submit(&batch.envelope) {
+            // Refused input never owns result processing, even if undo fails.
+            self.reserved = None;
+            if error
+                .get_ref()
+                .is_some_and(|e| e.is::<crate::structured::transport::TurnEndUnknown>())
+            {
+                let pending = Pending {
+                    batch_id: Some(batch.id),
+                    since_ms: now_ms,
+                    cause: PendingCause::TurnEndUnknown,
+                };
+                self.refused = Some(pending.clone());
+                self.admission.replace(originals)?;
+                return Ok(Offer::Pending(pending));
+            }
             let code = if error.kind() == io::ErrorKind::WouldBlock {
                 ErrorCode::SessionBusy
             } else {
@@ -95,14 +195,14 @@ impl Scheduler {
             } else {
                 self.hold(originals, code)?;
             }
-            self.reserved = None;
             return Err(Failure {
                 code,
                 source: Some(error),
             });
         }
+        self.refused = None;
         self.virgin = false;
-        Ok(Some(batch.id))
+        Ok(Offer::Submitted { batch_id: batch.id })
     }
     fn members(&self) -> Vec<Item> {
         self.admission
@@ -112,7 +212,7 @@ impl Scheduler {
             .filter(|i| {
                 self.reserved
                     .as_ref()
-                    .is_some_and(|(_, ids)| ids.contains(&i.item_id))
+                    .is_some_and(|reservation| reservation.members.contains(&i.item_id))
             })
             .cloned()
             .collect()
@@ -137,11 +237,14 @@ impl Scheduler {
                 if self
                     .reserved
                     .as_ref()
-                    .is_some_and(|(id, _)| id == &e.command_uuid) =>
+                    .is_some_and(|reservation| reservation.id == e.command_uuid) =>
             {
                 match e.state.as_str() {
                     "started" => Some(State::Delivered),
                     "completed" => Some(State::Done),
+                    // ADR §3 take-back returns to queued only for an operator
+                    // take-back, which is not implemented here. Harness cancellation
+                    // remains terminal and does not confirm the turn boundary.
                     "cancelled" => Some(State::Cancelled),
                     _ => None,
                 }
@@ -156,6 +259,12 @@ impl Scheduler {
                 }
             }
             self.admission.replace(items)?;
+            // Track the session signal independently of terminal item outcomes.
+            if target == State::Cancelled {
+                if let Some(reservation) = &mut self.reserved {
+                    reservation.cancelled = true;
+                }
+            }
         }
         let result = match event {
             SessionEvent::Success(e) => e
@@ -180,6 +289,7 @@ impl Scheduler {
             }
             self.admission.replace(items)?;
             self.reserved = None;
+            self.refused = None;
             self.virgin = false;
         }
         Ok(())
@@ -189,6 +299,7 @@ impl Scheduler {
     pub fn exited(&mut self) -> Result<(), Failure> {
         self.hold(self.members(), ErrorCode::NoResult)?;
         self.reserved = None;
+        self.refused = None;
         self.virgin = false;
         Ok(())
     }

@@ -106,6 +106,7 @@ if mode.startswith("queue"):
         control = driver.makefile("r")
         current_uuid = None
         count = 0
+        barrier = None
         while True:
             ready, _, _ = select.select([sys.stdin, driver], [], [])
             if driver in ready:
@@ -130,8 +131,12 @@ if mode.startswith("queue"):
                         event["subtype"] = "future_result"
                     emit(event)
                 elif request["op"] == "barrier":
-                    emit({"type": "fixture_barrier", "count": count})
-                elif request["op"] != "event":
+                    assert barrier is None, "only one fixture barrier at a time"
+                    barrier = request["after_count"]
+                elif request["op"] == "loss":
+                    sys.stdout.write("x" * (2 * 1024 * 1024 + 1) + "\n")
+                    sys.stdout.flush()
+                else:
                     raise AssertionError("unexpected driver stage")
             if sys.stdin in ready:
                 line = sys.stdin.readline()
@@ -146,6 +151,9 @@ if mode.startswith("queue"):
                 if mode != "queue-silent":
                     emit({"type": "fixture_input", "input": message,
                           "executed_command": native, "count": count})
+            if barrier is not None and count >= barrier:
+                emit({"type": "fixture_barrier", "count": count})
+                barrier = None
     sys.exit(0)
 
 if mode == "idle":
