@@ -4,11 +4,12 @@
  * transport's scripted replay (`tests/wire/harness.ts`).
  */
 import { afterEach, describe, expect, onTestFinished, test } from "bun:test";
+import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
 
 import { App } from "../src/App";
 import { createFixtureFleet, type AgentRow, type FleetObserver, type FleetSource } from "../src/fleet";
-import { emptyLayout } from "../src/layout/model";
+import { createManager, emptyLayout, type Layout } from "../src/layout/model";
 import { createFixtureTransport } from "../src/transport/fixture";
 import { createWireTransport } from "../src/wire/transport";
 import { SAMPLE_INBOX } from "../src/workbench/inbox";
@@ -212,6 +213,45 @@ describe("phone", () => {
     await tick();
     expect($(root, "phone-agent")).toBeNull();
     expect(tab(root, "Agents")?.getAttribute("aria-current")).toBe("page");
+  });
+
+  test("an agent already focused by the saved layout: back pops nothing this screen did not push", async () => {
+    const manager = createManager(emptyLayout());
+    manager.open("agent/fixture", "push");
+    manager.open("agent/atlas", "push");
+    const saved: Layout = structuredClone(manager.state);
+    const layouts: Layout[] = [];
+    const root = mount(() => (
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={saved} saveLayout={(next) => void layouts.push(next)} mode="phone" source="replay" />
+    ));
+    await tick();
+    tab(root, "Agents")?.click();
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    await tick();
+    expect($(root, "phone-agent")?.querySelector("h1")?.textContent).toBe("atlas");
+    [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"))?.click();
+    await tick();
+    expect($(root, "phone-agent")).toBeNull();
+    const focusedSubject = (layout: Layout): string | undefined => (layout.focused === null ? undefined : layout.tiles[layout.focused]?.subject);
+    expect(layouts.map(focusedSubject).filter((subject) => subject !== "agent/atlas")).toEqual([]);
+  });
+
+  test("widening past the breakpoint with the agent screen open consumes its history entry", async () => {
+    const [mode, setMode] = createSignal<"phone" | "desktop">("phone");
+    const root = mount(() => (
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} mode={mode()} source="replay" />
+    ));
+    await tick();
+    const prior: unknown = history.state;
+    tab(root, "Agents")?.click();
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    await tick();
+    expect(history.state).toEqual({ "flock.phone-agent": "atlas" });
+    setMode("desktop");
+    await tick();
+    expect($(root, "workbench")).not.toBeNull();
+    expect(history.state).toEqual(prior);
+    expect($(root, "focus-pane")?.querySelector("h1")?.textContent).toBe("atlas");
   });
 
   test("Agents → an agent screen with its transcript; back returns to the tabs", async () => {

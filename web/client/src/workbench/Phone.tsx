@@ -21,7 +21,8 @@ export type PhoneProps = {
   readonly fleetNote: () => string | null;
   readonly agent: () => string | null;
   readonly row: () => AgentRow | undefined;
-  readonly open: (agentId: string) => void;
+  /** Focuses the agent; true when that pushed a layout tile. */
+  readonly open: (agentId: string) => boolean;
   readonly back: () => void;
   readonly transport: Transport;
   readonly source: TranscriptSource;
@@ -44,22 +45,31 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
    * a URL keeps the current one, `?layout=` and fixture parameters included.
    */
   const AGENT_ENTRY = "flock.phone-agent";
+  const ownEntry = (): boolean => typeof history.state === "object" && history.state !== null && AGENT_ENTRY in history.state;
+  // Whether opening the screen pushed a layout tile: closing pops only what this screen pushed.
+  let pushedTile = false;
   const close = (): void => {
     if (!onAgent()) return;
-    props.back();
+    if (pushedTile) props.back();
+    pushedTile = false;
     setOnAgent(false);
   };
   const onPop = (): void => close();
   window.addEventListener("popstate", onPop);
-  onCleanup(() => window.removeEventListener("popstate", onPop));
+  onCleanup(() => {
+    window.removeEventListener("popstate", onPop);
+    // Unmounted with the agent screen open (the window widened past the phone
+    // breakpoint): consume its history entry, so the next back is not a no-op.
+    if (onAgent() && ownEntry()) history.back();
+  });
   const open = (id: string): void => {
-    props.open(id);
+    pushedTile = props.open(id);
     if (!onAgent()) history.pushState({ [AGENT_ENTRY]: id }, "");
     setOnAgent(true);
   };
   /** Leaves the agent screen through its history entry when it has one. */
   const back = (): void => {
-    if (onAgent() && typeof history.state === "object" && history.state !== null && AGENT_ENTRY in history.state) history.back();
+    if (onAgent() && ownEntry()) history.back();
     else close();
   };
   const tabButton = (id: Tab, label: string): JSX.Element => (

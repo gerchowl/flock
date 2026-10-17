@@ -80,10 +80,12 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
     return agentOf(current.focused === null ? undefined : current.tiles[current.focused]?.subject);
   });
   const focusedRow = createMemo(() => rows().find((row) => row.id === focusedAgent()));
-  const openAgent = (id: string): void => {
-    if (focusedAgent() === id) return;
+  /** Focuses `id`'s tile; true when that pushed a tile, which `back` may then pop. */
+  const openAgent = (id: string): boolean => {
+    if (focusedAgent() === id) return false;
     manager.open(`agent/${id}`, phone() ? "push" : "replace");
     publish();
+    return true;
   };
   const back = (): void => {
     manager.back();
