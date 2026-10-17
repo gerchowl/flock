@@ -137,7 +137,7 @@ fn failed_admission_can_retry_and_requests_are_bounded() {
 #[test]
 fn session_grants_reserve_distinct_keys_and_abort_releases_capacity() {
     let mut b = Book::new("fixture-agent".into());
-    for n in 0..14 {
+    for n in 0..MAX_GRANTS - 2 {
         let id = format!("grant-{n}");
         let mut r = request();
         r.input.insert("n".into(), json!(n));
@@ -166,8 +166,9 @@ fn session_grants_reserve_distinct_keys_and_abort_releases_capacity() {
     b.observe("overflow", overflow).unwrap();
     assert_eq!(
         b.prepare(&token(), &args("overflow", Decision::AllowAlways))
-            .err(),
-        Some(ErrorCode::InvalidParams)
+            .err()
+            .map(|code| code.as_str()),
+        Some("permission_grant_limit")
     );
     b.aborted("last-slot");
     assert!(b

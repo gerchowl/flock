@@ -1638,42 +1638,6 @@ fn session_grant_suggestions_ignore_non_session_destinations() {
         opened(&transport);
         assert_exact_suggestion_fallback(&root, &transport, &mut output, &mut input, &id);
     }
-    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-    let (transport, mut output, mut input) = start(&root);
-    let rules = serde_json::json!([{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"true"}],"behavior":"allow","destination":"session"}]);
-    grant_request(
-        &mut output,
-        "session-rules",
-        "Bash",
-        serde_json::json!({"command":"true"}),
-        Some(rules.clone()),
-    );
-    opened(&transport);
-    let response = close_with(
-        &transport,
-        &mut input,
-        "session-rules",
-        permissions::Decision::AllowAlways,
-    );
-    assert_eq!(
-        response["response"]["response"]["updatedPermissions"],
-        rules
-    );
-    // The harness matches suggested rules; flk must not create a fallback grant.
-    grant_request(
-        &mut output,
-        "harness-match-only",
-        "Bash",
-        serde_json::json!({"command":"true"}),
-        None,
-    );
-    opened(&transport);
-    close_with(
-        &transport,
-        &mut input,
-        "harness-match-only",
-        permissions::Decision::Deny,
-    );
 }
 
 #[test]
@@ -1967,9 +1931,14 @@ fn harness_cannot_forge_an_automatic_grant_reservation() {
 }
 
 #[test]
-fn unsafe_session_suggestions_fall_back_to_exact_grants() {
+fn all_session_suggestions_use_only_exact_grants() {
     let valid = serde_json::json!({"type":"addRules", "behavior":"allow", "destination":"session", "rules":[{"toolName":"Bash"}]});
-    let mut unsafe_updates = Vec::new();
+    // Even apparently narrow rules and modifier-less rules are not interpreted.
+    let mut content = valid.clone();
+    content["rules"][0]["ruleContent"] = "true".into();
+    let mut broad = valid.clone();
+    broad["rules"][0]["ruleContent"] = "*".into();
+    let mut suggestions = vec![valid.clone(), content, broad];
     for kind in [
         "setMode",
         "removeRules",
@@ -1980,27 +1949,27 @@ fn unsafe_session_suggestions_fall_back_to_exact_grants() {
         let mut update = valid.clone();
         update["type"] = kind.into();
         update["mode"] = "bypassPermissions".into();
-        unsafe_updates.push(update);
+        suggestions.push(update);
     }
     for behavior in ["deny", "ask"] {
         let mut update = valid.clone();
         update["behavior"] = behavior.into();
-        unsafe_updates.push(update);
+        suggestions.push(update);
     }
     let mut other_tool = valid.clone();
     other_tool["rules"][0]["toolName"] = "Write".into();
-    unsafe_updates.push(other_tool);
+    suggestions.push(other_tool);
     let mut wildcard = valid.clone();
     wildcard["rules"][0]["toolName"] = "*".into();
-    unsafe_updates.push(wildcard);
+    suggestions.push(wildcard);
     let mut directories = valid.clone();
     directories["directories"] = serde_json::json!(["relative-fixture"]);
-    unsafe_updates.push(directories);
+    suggestions.push(directories);
     let mut rule_extra = valid.clone();
     rule_extra["rules"][0]["directories"] = serde_json::json!(["relative-fixture"]);
-    unsafe_updates.push(rule_extra);
-    for (n, update) in unsafe_updates.into_iter().enumerate() {
-        let id = format!("unsafe-{n}");
+    suggestions.push(rule_extra);
+    for (n, update) in suggestions.into_iter().enumerate() {
+        let id = format!("suggested-{n}");
         let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         for name in ["home/.claude", "config", "claude"] {
             let dir = root.path().join(name);
@@ -2049,10 +2018,7 @@ fn assert_exact_suggestion_fallback(
     assert_eq!(close["state"], "closed");
     assert_eq!(close["decision"], "allow_always");
     assert_eq!(close["ignored_suggestions"]["request_id"], id);
-    assert_eq!(
-        close["ignored_suggestions"]["reason"],
-        "unsafe_session_rules"
-    );
+    assert_eq!(close["ignored_suggestions"]["reason"], "not_forwarded");
     let response = input_line(transport, input);
     assert_eq!(response["response"]["response"]["behavior"], "allow");
     assert!(response["response"]["response"]
@@ -2102,5 +2068,59 @@ fn assert_exact_suggestion_fallback(
     let audit = records(root);
     let open: Value = serde_json::from_str(&audit[1].raw).unwrap();
     assert_eq!(open["request_id"], id);
-    assert!(open.to_string().contains("permission_suggestions"));
+    let harness: Value = serde_json::from_str(&audit[0].raw).unwrap();
+    assert_eq!(
+        open["request"]["permission_suggestions"],
+        harness["request"]["permission_suggestions"]
+    );
+}
+
+#[test]
+fn session_grant_capacity_refuses_without_closing_or_sending() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    for n in 0..permissions::MAX_GRANTS {
+        let id = format!("grant-{n}");
+        grant_request(&mut output, &id, "Bash", serde_json::json!({"n":n}), None);
+        opened(&transport);
+        close_with(
+            &transport,
+            &mut input,
+            &id,
+            permissions::Decision::AllowAlways,
+        );
+    }
+    grant_request(
+        &mut output,
+        "overflow",
+        "Bash",
+        serde_json::json!({"n":"overflow"}),
+        Some(
+            serde_json::json!([{"type":"addRules","behavior":"allow","destination":"session","rules":[{"toolName":"Bash"}]}]),
+        ),
+    );
+    opened(&transport);
+    assert_eq!(
+        call_decide(
+            &transport,
+            &owner(),
+            &decide("overflow", permissions::Decision::AllowAlways)
+        ),
+        Err(ErrorCode::PermissionGrantLimit)
+    );
+    assert_eq!(transport.waiting_on_human().unwrap(), vec!["overflow"]);
+    // The first response is the later allow-once decision, not an implicit
+    // allow-always answer or forwarded harness rules after the refusal.
+    let response = close_with(
+        &transport,
+        &mut input,
+        "overflow",
+        permissions::Decision::AllowOnce,
+    );
+    assert_eq!(response["response"]["request_id"], "overflow");
+    assert_eq!(response["response"]["response"]["behavior"], "allow");
+    assert!(response["response"]["response"]
+        .get("updatedPermissions")
+        .is_none());
+    assert!(replay_open_permissions(&root).is_empty());
 }

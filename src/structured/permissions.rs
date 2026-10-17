@@ -2,18 +2,18 @@
 //! Caller identity is trusted dispatcher context, never command JSON. Only an
 //! authenticated operator token may decide; socket UID and agent ancestry alone
 //! grant nothing. A new transport owns a new book, including on resume.
-//! At most 16 concurrent requests and 1024 lifetime IDs are accepted. Invalid or
+//! At most [`MAX_OPEN`] concurrent requests and 1024 lifetime IDs are accepted. Invalid or
 //! repeated harness IDs stop the transport rather than risk miscorrelation.
 //! The stream owner audits terminal closes before clearing runtime state.
 //! Audits and responses share the transport byte cap; an audit failure cancels
 //! delivery. Admission success reserves a decision, not its eventual delivery.
-//! Grants live only in this runtime: exact tool/canonical-input matches, or
-//! harness suggestions restricted to session destinations. No settings are written.
-//! At most 16 distinct exact grants, including pending grants, are retained.
+//! Grants live only in this runtime as exact tool/canonical-input matches.
+//! Harness suggestions are never interpreted or forwarded. No settings are written.
+//! [`MAX_GRANTS`] bounds distinct exact grants, including pending grants.
 pub mod auth;
 
 pub(super) const MAX_OPEN: usize = 16;
-const MAX_GRANTS: usize = 16;
+pub(super) const MAX_GRANTS: usize = 16;
 
 use super::claude::ToolRequest;
 use crate::api::error_code::ErrorCode;
@@ -241,51 +241,39 @@ impl Book {
         let response = if decision == Decision::Deny {
             json!({"behavior":"deny","message":message.unwrap_or("Denied by the operator")})
         } else {
-            let mut response = json!({"behavior":"allow","updatedInput":open.request.input});
+            let response = json!({"behavior":"allow","updatedInput":open.request.input});
             if decision == Decision::AllowAlways {
-                let suggestions = open
+                if open
                     .request
                     .permission_suggestions
                     .as_ref()
                     .and_then(Option::as_ref)
-                    .filter(|r| !r.is_empty());
-                match suggestions {
-                    Some(rules)
-                        if rules
-                            .iter()
-                            .all(|rule| safe_suggestion(rule, &open.request.tool_name)) =>
-                    {
-                        response["updatedPermissions"] = json!(rules);
-                    }
-                    _ => {
-                        if suggestions.is_some() {
-                            // The durable open record already contains the complete
-                            // bundle. Link it rather than duplicate an unbounded value.
-                            ignored_suggestions =
-                                Some(json!({"request_id":id,"reason":"unsafe_session_rules"}));
-                        }
-                        let k = key(&open.request);
-                        let reserved: BTreeSet<_> = self
-                            .open
-                            .values()
-                            .filter_map(|r| r.grant.as_ref())
-                            .filter(|key| !self.grants.contains_key(*key))
-                            .collect();
-                        if self.grants.len() + reserved.len() >= MAX_GRANTS
-                            && !self.grants.contains_key(&k)
-                            && !reserved.contains(&k)
-                        {
-                            return Err(ErrorCode::InvalidParams);
-                        }
-                        grant = Some((
-                            k,
-                            Grant {
-                                subject: subject.into(),
-                                request_id: id.into(),
-                            },
-                        ));
-                    }
+                    .is_some_and(|rules| !rules.is_empty())
+                {
+                    // The durable open record contains the complete bundle.
+                    // Never interpret the harness rule grammar or forward rules.
+                    ignored_suggestions = Some(json!({"request_id":id,"reason":"not_forwarded"}));
                 }
+                let k = key(&open.request);
+                let reserved: BTreeSet<_> = self
+                    .open
+                    .values()
+                    .filter_map(|r| r.grant.as_ref())
+                    .filter(|key| !self.grants.contains_key(*key))
+                    .collect();
+                if self.grants.len() + reserved.len() >= MAX_GRANTS
+                    && !self.grants.contains_key(&k)
+                    && !reserved.contains(&k)
+                {
+                    return Err(ErrorCode::PermissionGrantLimit);
+                }
+                grant = Some((
+                    k,
+                    Grant {
+                        subject: subject.into(),
+                        request_id: id.into(),
+                    },
+                ));
             }
             response
         };
@@ -390,36 +378,6 @@ impl Book {
     pub fn closed(&mut self, id: &str) {
         self.open.remove(id);
     }
-}
-
-fn safe_suggestion(value: &Value, tool: &str) -> bool {
-    let Some(update) = value.as_object() else {
-        return false;
-    };
-    if tool.is_empty()
-        || tool.contains(['*', '?'])
-        || !update
-            .keys()
-            .all(|key| matches!(key.as_str(), "type" | "behavior" | "destination" | "rules"))
-        || value["type"] != "addRules"
-        || value["behavior"] != "allow"
-        || value["destination"] != "session"
-    {
-        return false;
-    }
-    value
-        .get("rules")
-        .and_then(Value::as_array)
-        .is_some_and(|rules| {
-            !rules.is_empty()
-                && rules.iter().all(|rule| {
-                    rule.as_object().is_some_and(|rule| {
-                        rule.keys()
-                            .all(|key| matches!(key.as_str(), "toolName" | "ruleContent"))
-                    }) && rule["toolName"].as_str() == Some(tool)
-                        && rule.get("ruleContent").is_none_or(Value::is_string)
-                })
-        })
 }
 
 fn key(request: &ToolRequest) -> String {
