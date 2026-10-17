@@ -83,7 +83,10 @@ impl App {
         response: String,
     ) {
         let respond_to = match self.input_writes.park(respond_to) {
-            Ok(()) => return,
+            Ok(()) => {
+                self.start_ready_pastes();
+                return;
+            }
             Err(respond_to) => respond_to,
         };
         if let Some((request, peer_pid, peer_birth)) = self.pending_recovery_park.take() {
@@ -97,10 +100,6 @@ impl App {
         }
         if let Some((request_id, pane_id, attempt)) = self.pending_agent_submit.take() {
             self.schedule_guarded_request(request_id, pane_id, attempt, respond_to);
-            return;
-        }
-        if let Some(paste) = self.pending_paste.take() {
-            self.schedule_paste(paste, respond_to);
             return;
         }
         if let Some(install) = self.pending_integration_install.take() {

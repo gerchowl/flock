@@ -214,6 +214,7 @@ impl App {
         let mut resized = false;
 
         self.input_writes.service_due(now);
+        self.start_ready_pastes();
         self.sync_animation_timer(now);
         changed |= self.refresh_session_health(now);
 

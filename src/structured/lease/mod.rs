@@ -52,12 +52,24 @@ pub struct Lease {
     released: bool,
 }
 impl SessionLeases {
-    fn publish(&self, entries: &BTreeMap<String, Entry>) {
-        *self.1.lock() = entries.values().cloned().collect();
+    // ADR-0036 §1a: acquire both views before mutation; timeout leaves the
+    // reservation intact. No process creation or OS lookup runs under these locks.
+    fn update<T>(&self, change: impl FnOnce(&mut BTreeMap<String, Entry>) -> T) -> io::Result<T> {
+        let mut entries = self
+            .0
+            .try_lock_for(LOCK_LIMIT)
+            .ok_or_else(|| io::Error::other("lease registry busy"))?;
+        let mut published = self
+            .1
+            .try_lock_for(LOCK_LIMIT)
+            .ok_or_else(|| io::Error::other("lease snapshot busy"))?;
+        let result = change(&mut entries);
+        *published = entries.values().cloned().collect();
+        Ok(result)
     }
     fn snapshot(&self) -> Option<Vec<Entry>> {
-        // ADR-0036 §1a: short contention waits; longer spawn work uses the
-        // last published snapshot, which already contains its uncertain root.
+        // ADR-0036 §1a: short contention waits; longer registry contention uses
+        // the last published snapshot, which already contains its uncertain root.
         // Independent callers can still prove unrelated ancestry at the deadline.
         if let Some(entries) = self.0.try_lock_for(LOCK_LIMIT) {
             Some(entries.values().cloned().collect())
@@ -67,7 +79,8 @@ impl SessionLeases {
                 .map(|entries| entries.clone())
         }
     }
-    /// Reserve a session before preparation/spawn, or return `session_busy`.
+    /// Reserve before preparation/spawn; an existing session returns `session_busy`.
+    /// Registry contention returns `agent_start_failed` without changing either view.
     /// Forks use a new session id; resume and in-place fork cannot share a lease.
     /// `lineage` supplies the parent id and parent depth; None is an operator start.
     pub(crate) fn reserve(
@@ -76,21 +89,23 @@ impl SessionLeases {
         session: &str,
         lineage: Option<(&str, u32)>,
     ) -> Result<Lease, crate::api::error_code::ErrorCode> {
-        let mut entries = self.0.lock();
-        if entries.contains_key(session) {
-            return Err(crate::api::error_code::ErrorCode::SessionBusy);
-        }
-        entries.insert(
-            session.into(),
-            Entry {
-                agent: agent.into(),
-                depth: lineage.map_or(0, |(_, depth)| depth.saturating_add(1)),
-                parent: lineage.map(|(parent, _)| parent.to_owned()),
-                process: None,
-                root: Root::Launcher(std::process::id()),
-            },
-        );
-        self.publish(&entries);
+        self.update(|entries| {
+            if entries.contains_key(session) {
+                return Err(crate::api::error_code::ErrorCode::SessionBusy);
+            }
+            entries.insert(
+                session.into(),
+                Entry {
+                    agent: agent.into(),
+                    depth: lineage.map_or(0, |(_, depth)| depth.saturating_add(1)),
+                    parent: lineage.map(|(parent, _)| parent.to_owned()),
+                    process: None,
+                    root: Root::Launcher(std::process::id()),
+                },
+            );
+            Ok(())
+        })
+        .map_err(|_| crate::api::error_code::ErrorCode::AgentStartFailed)??;
         Ok(Lease {
             leases: self.clone(),
             session: session.into(),
@@ -209,41 +224,38 @@ impl Lease {
     pub(super) fn matches(&self, agent: &str, session: &str) -> bool {
         self.agent == agent && self.session == session
     }
-    /// Mark spawn before acquiring its birth identity; a failed lookup retains it.
-    pub(super) fn spawned(&mut self) {
-        self.spawned = true;
-        let mut entries = self.leases.0.lock();
-        if let Some(entry) = entries.get_mut(&self.session) {
+    /// Publish launcher uncertainty with a bounded wait, before attempting spawn.
+    pub(super) fn spawned(&mut self) -> io::Result<()> {
+        self.leases.update(|entries| {
+            let entry = entries
+                .get_mut(&self.session)
+                .ok_or_else(|| io::Error::other("lease missing"))?;
             entry.root = Root::Launcher(std::process::id());
-        }
-        self.leases.publish(&entries);
+            Ok::<_, io::Error>(())
+        })??;
+        self.spawned = true;
+        Ok(())
     }
-    /// Publish the spawned PID atomically with respect to attribution readers.
-    /// ADR-0036 §1a: a birth lookup failure retains only that root's uncertainty.
+    /// Spawn only on the runtime worker, holding no registry lock across fork/exec.
+    /// Launcher ancestry stays uncertain until bind, including early child exit.
     pub(super) fn spawn(
         &mut self,
         spawn: impl FnOnce() -> io::Result<std::process::Child>,
     ) -> io::Result<std::process::Child> {
-        self.spawned();
-        let mut entries = self.leases.0.lock();
-        let entry = entries
-            .get_mut(&self.session)
-            .ok_or_else(|| io::Error::other("lease missing"))?;
-        let child = spawn()?;
-        entry.root = Root::Process(child.id());
-        self.leases.publish(&entries);
-        Ok(child)
+        self.spawned()?;
+        spawn()
     }
-    /// Bind the newly spawned process before publishing a runtime/input handle.
+    /// Publish PID/birth before the runtime handle, retaining uncertainty on failure.
     pub(super) fn bind(&mut self, pid: u32) -> io::Result<()> {
-        let mut entries = self.leases.0.lock();
-        let entry = entries
-            .get_mut(&self.session)
-            .ok_or_else(|| io::Error::other("lease missing"))?;
-        entry.root = Root::Process(pid);
         let process = ProcessIdentity::capture(pid);
-        entry.process = process.as_ref().ok().copied();
-        self.leases.publish(&entries);
+        self.leases.update(|entries| {
+            let entry = entries
+                .get_mut(&self.session)
+                .ok_or_else(|| io::Error::other("lease missing"))?;
+            entry.root = Root::Process(pid);
+            entry.process = process.as_ref().ok().copied();
+            Ok::<_, io::Error>(())
+        })??;
         process.map(|_| ())
     }
     /// Release after the runtime confirms process-tree cleanup, including startup errors.
@@ -251,10 +263,15 @@ impl Lease {
         if self.released {
             return;
         }
-        let mut entries = self.leases.0.lock();
-        entries.remove(&self.session);
-        self.leases.publish(&entries);
-        self.released = true;
+        if self
+            .leases
+            .update(|entries| entries.remove(&self.session))
+            .is_ok()
+        {
+            self.released = true;
+        } else {
+            tracing::warn!("structured lease retained: registry busy during release");
+        }
     }
 }
 impl Drop for Lease {
