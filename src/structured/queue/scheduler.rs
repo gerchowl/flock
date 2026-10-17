@@ -19,6 +19,14 @@ pub(crate) enum PendingCause {
     /// An accepted batch still needs its real result; runtime exit/restart also
     /// ends the wait, holding unresolved items instead of resending them.
     AwaitingResult,
+    /// Journal downgrade refused. Only upgrading to a compatible writer permits
+    /// mutations; a real harness result or a queue retry cannot recover it.
+    QueueJournalNewer {
+        /// Persisted format version.
+        found: u64,
+        /// Highest version understood by this writer.
+        supported: u64,
+    },
     /// Loss obscured the boundary. The transport guard remains closed until a
     /// real result, or runtime exit/restart; no input is written across it.
     TurnEndUnknown,
@@ -36,6 +44,7 @@ pub(crate) struct Pending {
     /// Accepted/refused batch UUID, or none when no candidate was formed.
     pub batch_id: Option<String>,
     /// Reservation/first-refusal time, or observation time for an S4/S6 gate.
+    /// Zero for journal-version refusal, which has no reservation clock.
     pub since_ms: u64,
     /// Explicit blocking cause; age never triggers queue recovery.
     pub cause: PendingCause,
@@ -90,7 +99,9 @@ impl Scheduler {
             refused: None,
             virgin: true,
         };
-        this.hold(pending, ErrorCode::SessionUnconfirmed)?;
+        if this.journal().read_only().is_none() {
+            this.hold(pending, ErrorCode::SessionUnconfirmed)?;
+        }
         Ok(this)
     }
     /// Durable producer admission through the same worker and gate.
@@ -101,10 +112,20 @@ impl Scheduler {
     pub fn journal(&self) -> &Journal {
         self.admission.journal()
     }
-    /// Current accepted-turn blocker or unconfirmed refused candidate. Status and
+    /// Current journal/accepted-turn blocker or unconfirmed refused candidate. Status and
     /// deliver report the same cause/time. No status observation writes a record;
     /// S4/S6 gates and no-eligible-input are reported by deliver when unreserved.
     pub fn status(&self, runtime: &Runtime) -> Option<Pending> {
+        if let Some(reason) = self.journal().read_only() {
+            return Some(Pending {
+                batch_id: None,
+                since_ms: 0,
+                cause: PendingCause::QueueJournalNewer {
+                    found: reason.found,
+                    supported: reason.supported,
+                },
+            });
+        }
         self.reserved
             .as_ref()
             .map(|reservation| Pending {
@@ -129,7 +150,7 @@ impl Scheduler {
         state: &AgentState,
         now_ms: u64,
     ) -> Result<Offer, Failure> {
-        self.journal().healthy()?;
+        self.journal().writable()?;
         if let Some(pending) = self.status(runtime) {
             return Ok(Offer::Pending(pending));
         }
@@ -232,6 +253,7 @@ impl Scheduler {
     /// nested results cannot release the reservation. completed/cancelled still
     /// wait for the top-level result before any subsequent offer.
     pub fn observe(&mut self, event: &SessionEvent) -> Result<(), Failure> {
+        self.journal().writable()?;
         let target = match event {
             SessionEvent::CommandLifecycle(e)
                 if self
@@ -297,6 +319,7 @@ impl Scheduler {
     /// No result means held, even if the stdin writer completed or a lifecycle
     /// completed arrived. Call after draining durable events on any process exit.
     pub fn exited(&mut self) -> Result<(), Failure> {
+        self.journal().writable()?;
         self.hold(self.members(), ErrorCode::NoResult)?;
         self.reserved = None;
         self.refused = None;

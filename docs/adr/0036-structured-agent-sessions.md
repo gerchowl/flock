@@ -841,6 +841,19 @@ back-to-back turns. For a structured agent there is no polling at all:
 
 ### 4. Storage
 
+Owner amendment (#1820): each queue identity header declares a journal format
+version. Missing stamps mean version 1. Append/checkpoint require a journal
+version no greater than the writer's supported version, and checkpoint writes
+the writer's own version before any new-format append. Bump for every new kind,
+top-level field or enum name. Newer journals load read-only with persistence
+leniency (ADR-0028 §3a), preserving raw bytes without repair or rewriting.
+Every mutation returns typed `queue_journal_newer { found, supported }`;
+queue status exposes the refusal, which requires a compatible writer and must
+never be retried in a loop. Opaque checkpoint passthrough is forbidden because
+an older writer cannot preserve unknown records' interleaving semantics.
+The fsync-temp, rename, fsync-directory rule below is unchanged.
+
+
 - **Per-agent session stream.** Every stdout line of a structured agent is
   appended, with a per-stream `seq` and a receive timestamp, to
   `<data dir>/sessions/<agent>/<session>.jsonl`. This is the lossless copy;

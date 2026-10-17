@@ -1251,3 +1251,51 @@ fn batch_entropy_failure_keeps_the_journal_and_items_unchanged() {
         }
     }
 }
+
+#[test]
+fn newer_journal_refuses_all_admission_mutations_with_a_typed_version_error() {
+    let root = Root::new();
+    let mut admission = Admission::new(root.open(), MAX_BATCH).unwrap();
+    admission
+        .enqueue(input(1), Principal::Operator, Gate::Hold)
+        .unwrap();
+    let mut saved = admission.journal().items()[0].clone();
+    drop(admission);
+    let mut header: Value = serde_json::from_slice(&root.identity_prefix()).unwrap();
+    header["format_version"] = json!(999);
+    let old = fs::read(root.path()).unwrap();
+    let mut bytes = encode(&header).unwrap();
+    bytes.extend(old.split_inclusive(|b| *b == b'\n').skip(1).flatten());
+    fs::write(root.path(), &bytes).unwrap();
+    let mut admission = Admission::new(root.open(), MAX_BATCH).unwrap();
+    saved.state = State::Queued;
+    let errors = [
+        admission
+            .enqueue(input(1), Principal::Operator, Gate::Hold)
+            .unwrap_err(),
+        admission
+            .enqueue(input(2), Principal::Operator, Gate::Hold)
+            .unwrap_err(),
+        admission.batch(100).unwrap_err(),
+        admission.replace(vec![saved]).unwrap_err(),
+        admission.replace(vec![]).unwrap_err(),
+    ];
+    for error in errors {
+        assert_eq!(error.code, ErrorCode::QueueJournalNewer);
+        let source = error.source.unwrap();
+        let typed = source
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<QueueJournalNewer>()
+            .unwrap();
+        assert_eq!(
+            *typed,
+            QueueJournalNewer {
+                found: 999,
+                supported: FORMAT_VERSION
+            }
+        );
+        assert_eq!(error.code.retry().as_str(), "after_handoff");
+    }
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}

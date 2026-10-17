@@ -268,6 +268,7 @@ error_codes! {
         MailStoreSchemaTooNew = "mail_store_schema_too_new",
         MeshVersionMismatch = "mesh_version_mismatch",
         PeerIncompatible = "peer_incompatible",
+        QueueJournalNewer = "queue_journal_newer",
         ServerVersionGap = "server_version_gap";
 }
 
@@ -322,7 +323,7 @@ mod tests {
             ("later", "agent_not_ready at_agent_capacity at_fanout_limit channel_token_unavailable fleet_paused handoff_undrained injection_pending input_not_empty input_write_cancelled mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active restart_busy restart_pending restart_rate_limited session_busy session_unconfirmed too_many_waits unknown_composer worktree_merge_unknown worktree_open_pr"),
             ("after_inspecting", "agent_exited_at_start agent_exited_before_ready input_write_failed input_write_unknown no_result self_submit_unconfirmed session_mismatch"),
             ("after_human", "claude_folder_trust codex_folder_trust codex_hook_review structured_harness_version_unsupported structured_needs_agent_user"),
-            ("after_handoff", "mail_store_schema_too_new mesh_version_mismatch peer_incompatible server_version_gap"),
+            ("after_handoff", "mail_store_schema_too_new mesh_version_mismatch peer_incompatible queue_journal_newer server_version_gap"),
         ]
         .into_iter()
         .map(|(class, codes)| (class, codes.to_string()))

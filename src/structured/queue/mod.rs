@@ -17,6 +17,30 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
+/// Journal format understood by this writer. Unstamped journals are version 1.
+/// Bump for every new record kind, top-level field or enum variant name.
+pub const FORMAT_VERSION: u64 = 2;
+
+/// A newer journal is inspectable but must only be served by a compatible writer.
+/// Retrying without upgrading the writer cannot make this refusal succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct QueueJournalNewer {
+    /// Version declared by the journal identity header.
+    pub found: u64,
+    /// Highest format version understood by this writer.
+    pub supported: u64,
+}
+impl std::fmt::Display for QueueJournalNewer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "queue_journal_newer: found {}, supported {}",
+            self.found, self.supported
+        )
+    }
+}
+impl std::error::Error for QueueJournalNewer {}
+
 const LINE_LIMIT: u64 = 2 * 1024 * 1024;
 
 /// Snapshot gap followed inline by the retained records (ADR-0036 §4).
@@ -49,6 +73,7 @@ pub struct Journal {
     records: Vec<Value>,
     seq: u64,
     checkpoint: Option<(u64, u64)>,
+    version: u64,
     future: bool,
     poisoned: bool,
     _lease: File,
@@ -76,9 +101,10 @@ impl Journal {
     /// Acquire exclusive `queue/<agent>` ownership and recover committed state.
     /// Components are ASCII identifiers, never paths. Uppercase letters use an
     /// injective, case-insensitive-safe encoding; the journal verifies the original
-    /// id. Root aliases resolve, but
-    /// linked/private-namespace violations fail. Malformed complete lines or
-    /// non-dense sequences fail; only an unterminated final tail is repaired.
+    /// id. Root aliases resolve, but linked/private-namespace violations fail.
+    /// Newer versions open read-only without repair. Invalid individual records
+    /// are logged and preserved raw; supported-format framing corruption fails.
+    /// Only a supported journal's unterminated final tail is repaired.
     pub fn open(data: &Path, agent: &str) -> io::Result<Self> {
         if agent.is_empty()
             || !agent
@@ -121,11 +147,15 @@ impl Journal {
             records: Vec::new(),
             seq: 0,
             checkpoint: None,
+            version: FORMAT_VERSION,
             future: false,
             poisoned: false,
             _lease: lease,
         };
         journal.recover()?;
+        if journal.read_only().is_some() {
+            return Ok(journal);
+        }
         for entry in fs::read_dir(
             journal
                 .path
@@ -143,6 +173,7 @@ impl Journal {
         Ok(journal)
     }
     /// Current materialized state, in queue order; contains no runtime handles.
+    /// For newer journals this is best-effort inspection, never schedulable state.
     pub fn items(&self) -> &[Item] {
         &self.items
     }
@@ -150,6 +181,24 @@ impl Journal {
     pub fn bytes(&self) -> io::Result<u64> {
         self.healthy()?;
         Ok(self.file.metadata()?.len())
+    }
+    /// Persisted format version; absence of a stamp means version 1.
+    pub fn format_version(&self) -> u64 {
+        self.version
+    }
+    /// Typed read-only status. Reads remain available; mutations must not retry.
+    pub fn read_only(&self) -> Option<QueueJournalNewer> {
+        (self.version > FORMAT_VERSION).then_some(QueueJournalNewer {
+            found: self.version,
+            supported: FORMAT_VERSION,
+        })
+    }
+    fn writable(&self) -> io::Result<()> {
+        self.healthy()?;
+        if let Some(reason) = self.read_only() {
+            return Err(io::Error::other(reason));
+        }
+        Ok(())
     }
     fn healthy(&self) -> io::Result<()> {
         if self.poisoned {
@@ -159,7 +208,7 @@ impl Journal {
         }
     }
     fn durable<T>(&mut self, operation: impl FnOnce(&mut Self) -> io::Result<T>) -> io::Result<T> {
-        self.healthy()?;
+        self.writable()?;
         let result = operation(self);
         if result.is_err() {
             self.poisoned = true;
@@ -168,19 +217,32 @@ impl Journal {
     }
     /// Append and sync before folding state or publishing the returned record.
     /// Validation failures do not write or spend a sequence; I/O failures poison.
+    /// Newer journals return [`QueueJournalNewer`] without writing. Older formats
+    /// checkpoint to this writer's version before appending any new-format data.
+    /// Publish replay from the previous cursor to include this upgrade's gap and
+    /// snapshot, rather than assuming append always advances by exactly one.
     pub fn append(&mut self, change: Change) -> io::Result<Record> {
-        self.healthy()?;
+        self.writable()?;
         let mut items = self.items.clone();
         change.apply(&mut items)?;
+        let snapshot = if self.version < FORMAT_VERSION {
+            self.items.len() as u64
+        } else {
+            0
+        };
         let record = Record {
             seq: self
                 .seq
-                .checked_add(1)
+                .checked_add(snapshot)
+                .and_then(|seq| seq.checked_add(1))
                 .ok_or_else(|| problem("queue sequence exhausted"))?,
             change,
         };
         let value = serde_json::to_value(&record)?;
         let bytes = encode(&value)?;
+        if self.version < FORMAT_VERSION {
+            self.checkpoint()?;
+        }
         self.durable(|this| {
             this.file.write_all(&bytes)?;
             this.file.sync_data()
@@ -228,7 +290,7 @@ impl Journal {
     /// rewriting rather than discard future state. Failed replacements can leave
     /// unique .next files; open removes these under the exclusive lease.
     pub fn checkpoint(&mut self) -> io::Result<Cut> {
-        self.healthy()?;
+        self.writable()?;
         if self.future {
             return Err(problem("future queue data prevent checkpoint"));
         }
@@ -253,7 +315,7 @@ impl Journal {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let mut bytes = encode(&self.identity())?;
+        let mut bytes = encode(&self.identity(FORMAT_VERSION))?;
         bytes.extend(encode(
             &json!({"kind":"queue_checkpoint","before":before,"high_water":high}),
         )?);
@@ -273,47 +335,103 @@ impl Journal {
             this.file = private_fs::open_append_file(&this.path)?;
             Ok(())
         })?;
+        self.version = FORMAT_VERSION;
         self.seq = high;
         self.records = records;
         self.checkpoint = Some((before, high));
         self.replay(before)
     }
-    fn identity(&self) -> Value {
-        json!({"kind":"queue_identity", "agent_id":self.agent})
+    fn identity(&self, version: u64) -> Value {
+        let mut header = json!({"kind":"queue_identity", "agent_id":self.agent});
+        if version > 1 {
+            header["format_version"] = json!(version);
+        }
+        header
     }
     fn recover(&mut self) -> io::Result<()> {
         // A dead writer may have written complete lines without syncing them.
         // Make those bytes durable before publishing any recovered sequence.
         self.file.sync_all()?;
         if self.file.metadata()?.len() == 0 {
-            self.file.write_all(&encode(&self.identity())?)?;
+            self.file
+                .write_all(&encode(&self.identity(self.version))?)?;
             self.file.sync_all()?;
         }
         self.file.rewind()?;
         let mut reader = BufReader::new(&self.file);
         let mut good = 0;
         let mut line = Vec::new();
+        let mut skipped_sequence = false;
         loop {
             line.clear();
-            let n = Read::by_ref(&mut reader)
+            let mut n = Read::by_ref(&mut reader)
                 .take(LINE_LIMIT + 1)
                 .read_until(b'\n', &mut line)?;
             if n == 0 {
                 break;
             }
             if n as u64 > LINE_LIMIT {
-                return Err(problem("oversize queue record"));
+                if self.read_only().is_none() {
+                    return Err(problem("oversize queue record"));
+                }
+                while !line.ends_with(b"\n") {
+                    line.clear();
+                    let chunk = Read::by_ref(&mut reader)
+                        .take(LINE_LIMIT + 1)
+                        .read_until(b'\n', &mut line)?;
+                    n += chunk;
+                    if chunk == 0 {
+                        break;
+                    }
+                }
+                crate::logging::structured_queue_record_skipped(None, "oversized_record");
+                good += n as u64;
+                continue;
             }
             if !line.ends_with(b"\n") {
                 break;
             }
-            let value: Value = serde_json::from_slice(&line)?;
+            let value: Value = match serde_json::from_slice(&line) {
+                Ok(value) => value,
+                Err(_error) if good > 0 => {
+                    self.future = true;
+                    skipped_sequence = true;
+                    crate::logging::structured_queue_record_skipped(None, "invalid_json");
+                    good += n as u64;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             if good == 0 {
                 if value["kind"] != "queue_identity" || value["agent_id"] != self.agent {
                     return Err(problem("missing or mismatched queue identity"));
                 }
-                self.future |= value != self.identity();
-            } else if value["kind"] == "queue_identity" {
+                self.version = match value.get("format_version") {
+                    None => 1,
+                    Some(version) => version
+                        .as_u64()
+                        .filter(|v| *v > 0)
+                        .ok_or_else(|| problem("invalid queue format stamp"))?,
+                };
+                let mut expected = self.identity(self.version);
+                if self.version == 1 && value.get("format_version").is_some() {
+                    expected["format_version"] = json!(1);
+                }
+                self.future |= value != expected;
+            } else if self.read_only().is_some() && value["kind"] == "queue_checkpoint" {
+                let checkpoint = value["before"]
+                    .as_u64()
+                    .zip(value["high_water"].as_u64())
+                    .filter(|(before, high)| high >= before);
+                if let Some((before, high)) =
+                    checkpoint.filter(|_| self.checkpoint.is_none() && self.records.is_empty())
+                {
+                    self.seq = self.seq.max(before);
+                    self.checkpoint = Some((before, high));
+                } else {
+                    crate::logging::structured_queue_record_skipped(None, "unknown_checkpoint");
+                }
+            } else if value["kind"] == "queue_identity" && self.read_only().is_none() {
                 return Err(problem("interior queue identity"));
             } else if value["kind"] == "queue_checkpoint" {
                 if self.checkpoint.is_some() || !self.records.is_empty() {
@@ -329,26 +447,50 @@ impl Journal {
                 self.seq = before;
                 self.checkpoint = Some((before, high));
             } else {
-                let seq = value["seq"]
-                    .as_u64()
-                    .ok_or_else(|| problem("missing queue sequence"))?;
-                if Some(seq) != self.seq.checked_add(1) {
+                let Some(seq) = value["seq"].as_u64() else {
+                    self.future = true;
+                    skipped_sequence = true;
+                    crate::logging::structured_queue_record_skipped(None, "missing_sequence");
+                    good += n as u64;
+                    continue;
+                };
+                if self.read_only().is_none()
+                    && Some(seq) != self.seq.checked_add(1)
+                    && !(skipped_sequence && seq > self.seq)
+                {
                     return Err(problem("non-dense queue sequence"));
                 }
-                if matches!(
+                let known = matches!(
                     value["kind"].as_str(),
                     Some("upsert" | "remove" | "batch" | "fail")
-                ) {
-                    let record = serde_json::from_value::<Record>(value.clone())?;
-                    self.future |=
-                        record.change.has_unknown() || serde_json::to_value(&record)? != value;
-                    record.change.apply(&mut self.items)?;
-                } else if value["kind"].is_string() {
-                    self.future = true;
+                );
+                let recovered = if known {
+                    serde_json::from_value::<Record>(value.clone())
+                        .map_err(io::Error::other)
+                        .and_then(|record| {
+                            let mut items = self.items.clone();
+                            record.change.apply(&mut items)?;
+                            self.future |= record.change.has_unknown()
+                                || serde_json::to_value(&record)? != value;
+                            self.items = items;
+                            Ok(())
+                        })
                 } else {
-                    return Err(problem("missing queue kind"));
+                    Err(problem("unknown queue kind"))
+                };
+                if recovered.is_err() {
+                    self.future = true;
+                    crate::logging::structured_queue_record_skipped(
+                        Some(seq),
+                        if known {
+                            "invalid_change"
+                        } else {
+                            "unknown_kind"
+                        },
+                    );
                 }
-                self.seq = seq;
+                skipped_sequence = false;
+                self.seq = self.seq.max(seq);
                 self.records.push(value);
             }
             good += n as u64;
@@ -358,9 +500,13 @@ impl Journal {
             // The identity is only created in an empty file, so rewrite it safely.
             self.file.set_len(0)?;
             self.file.rewind()?;
-            self.file.write_all(&encode(&self.identity())?)?;
+            self.file
+                .write_all(&encode(&self.identity(self.version))?)?;
             self.file.sync_all()?;
             tracing::warn!("repaired unterminated queue identity");
+            return Ok(());
+        }
+        if self.read_only().is_some() {
             return Ok(());
         }
         if self.checkpoint.is_some_and(|(_, high)| self.seq < high) {

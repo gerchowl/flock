@@ -38,6 +38,16 @@ pub(crate) fn structured_stream_repaired(bytes_dropped: u64) {
     );
 }
 
+/// Report skipped queue records with fixed reasons and optional cursors, never payloads.
+pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'static str) {
+    tracing::warn!(
+        event = "structured.queue.record_skipped",
+        sequence = ?sequence,
+        reason,
+        "skipped queue record; original journal retained"
+    );
+}
+
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),

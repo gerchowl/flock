@@ -221,8 +221,7 @@ fn torn_tail_is_repaired_before_the_next_append() {
 #[test]
 fn complete_corruption_gaps_and_incomplete_checkpoints_are_refused_without_repair() {
     for bytes in [
-        "garbage\n", "{\"seq\":2,\"kind\":\"future\"}\n",
-        "{\"seq\":1}\n", "{\"seq\":1,\"kind\":\"upsert\"}\n",
+        "{\"seq\":2,\"kind\":\"future\"}\n",
         "{\"kind\":\"queue_checkpoint\",\"before\":4,\"high_water\":5}\n",
         "{\"kind\":\"queue_checkpoint\",\"before\":4,\"high_water\":5}\n{\"seq\":5",
         "{\"kind\":\"queue_checkpoint\",\"before\":5,\"high_water\":4}\n",
@@ -567,7 +566,10 @@ fn mixed_case_identity_round_trips_with_its_original_spelling() {
     let path = journal.path.clone();
     let identity: Value =
         serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap()).unwrap();
-    assert_eq!(identity, json!({"kind":"queue_identity", "agent_id":agent}));
+    assert_eq!(
+        identity,
+        json!({"kind":"queue_identity", "agent_id":agent, "format_version":FORMAT_VERSION})
+    );
     journal.checkpoint().unwrap();
     drop(journal);
     let journal = Journal::open(&root.0, agent).unwrap();
@@ -792,7 +794,7 @@ fn torn_first_identity_is_rewritten_without_losing_records() {
         assert_eq!(journal.replay(0).unwrap().through, 0);
         assert_eq!(
             fs::read(root.path()).unwrap(),
-            encode(&journal.identity()).unwrap()
+            encode(&journal.identity(journal.version)).unwrap()
         );
         assert_eq!(journal.append(upsert("first", 0)).unwrap().seq, 1);
         drop(journal);
@@ -800,7 +802,7 @@ fn torn_first_identity_is_rewritten_without_losing_records() {
     }
 }
 
-fn assert_corrupt_item_refused(field: &str, malformed: Value) {
+fn assert_corrupt_item_skipped(field: &str, malformed: Value) {
     let root = Root::new();
     drop(root.open());
     let mut record = serde_json::to_value(Record {
@@ -810,23 +812,27 @@ fn assert_corrupt_item_refused(field: &str, malformed: Value) {
     .unwrap();
     record["item"][field] = malformed;
     let original = root.write_records(encode(&record).unwrap());
-    assert!(Journal::open(&root.0, "fixture-agent").is_err());
+    assert!(serde_json::from_value::<Record>(record).is_err());
+    let mut journal = root.open();
+    assert!(journal.items().is_empty());
+    assert_eq!(journal.replay(0).unwrap().records.len(), 1);
+    assert!(journal.checkpoint().is_err());
     assert_eq!(fs::read(root.path()).unwrap(), original);
 }
 
 #[test]
-fn known_system_tag_with_bad_payload_refuses_open() {
-    assert_corrupt_item_refused("producer", json!({"system":42}));
+fn known_system_tag_with_bad_payload_is_skipped_not_unknown() {
+    assert_corrupt_item_skipped("producer", json!({"system":42}));
 }
 
 #[test]
-fn known_channel_tag_without_user_refuses_open() {
-    assert_corrupt_item_refused("producer", json!({"channel":{"binding":"x"}}));
+fn known_channel_tag_without_user_is_skipped_not_unknown() {
+    assert_corrupt_item_skipped("producer", json!({"channel":{"binding":"x"}}));
 }
 
 #[test]
-fn state_without_a_variant_name_refuses_open() {
-    assert_corrupt_item_refused("state", json!(7));
+fn state_without_a_variant_name_is_skipped_not_unknown() {
+    assert_corrupt_item_skipped("state", json!(7));
 }
 
 #[test]
@@ -834,11 +840,11 @@ fn known_variant_names_never_fall_back_to_unknown() {
     for field in ["state", "kind", "priority", "delivery"] {
         let value = serde_json::to_value(item("known")).unwrap();
         let tag = value[field].as_str().unwrap();
-        assert_corrupt_item_refused(field, json!({tag:42}));
-        assert_corrupt_item_refused(field, json!(7));
+        assert_corrupt_item_skipped(field, json!({tag:42}));
+        assert_corrupt_item_skipped(field, json!(7));
     }
     for malformed in [json!("agent"), json!({"human":42}), json!({"fork":false})] {
-        assert_corrupt_item_refused("producer", malformed);
+        assert_corrupt_item_skipped("producer", malformed);
     }
 }
 
@@ -867,4 +873,205 @@ pub(crate) fn fail_writes(journal: &mut Journal) -> UnixStream {
     let (file, peer) = socket_file();
     journal.file = file;
     peer
+}
+
+#[test]
+fn newer_stamp_loads_but_refuses_mutations_without_changing_bytes() {
+    let root = Root::new();
+    drop(root.open());
+    let mut identity: Value = serde_json::from_slice(&root.identity_prefix()).unwrap();
+    identity["format_version"] = json!(999);
+    let mut bytes = encode(&identity).unwrap();
+    bytes.extend(b"{\"seq\":1,\"kind\":\"future_queue_fact\"}\n");
+    bytes.extend(b"{\"seq\":2,\"kind\":\"upsert\",\"item\":42}\n");
+    bytes.extend(b"torn future tail");
+    fs::write(root.path(), &bytes).unwrap();
+    let mut journal = root.open();
+    let append = journal.append(upsert("a", 0)).unwrap_err();
+    assert!(append.to_string().contains("queue_journal_newer"));
+    let checkpoint = journal.checkpoint().unwrap_err();
+    assert!(checkpoint.to_string().contains("queue_journal_newer"));
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn unstamped_v1_gains_a_version_stamp_on_checkpoint() {
+    let root = Root::new();
+    drop(root.open());
+    fs::write(
+        root.path(),
+        b"{\"kind\":\"queue_identity\",\"agent_id\":\"fixture-agent\"}\n",
+    )
+    .unwrap();
+    let before = fs::read(root.path()).unwrap();
+    let mut journal = root.open();
+    assert_eq!(journal.format_version(), 1);
+    assert_eq!(fs::read(root.path()).unwrap(), before);
+    journal.checkpoint().unwrap();
+    let header: Value = serde_json::from_slice(&root.identity_prefix()).unwrap();
+    assert_eq!(header["format_version"], 2);
+}
+
+#[test]
+fn same_version_invalid_record_is_skipped_logged_and_preserved() {
+    let root = Root::new();
+    drop(root.open());
+    let bytes = root.write_records(b"{\"seq\":1,\"kind\":\"upsert\",\"item\":42}\n{\"seq\":2,\"kind\":\"future_queue_fact\"}\n");
+    let mut journal = root.open();
+    assert!(journal.items().is_empty());
+    assert_eq!(journal.replay(0).unwrap().records.len(), 2);
+    assert!(journal.checkpoint().is_err());
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn old_format_is_upgraded_before_any_new_append() {
+    let root = Root::new();
+    let mut journal = root.open();
+    journal.append(upsert("a", 0)).unwrap();
+    drop(journal);
+    let old = fs::read(root.path()).unwrap();
+    let mut legacy = encode(&json!({"kind":"queue_identity", "agent_id":"fixture-agent"})).unwrap();
+    legacy.extend(old.split_inclusive(|b| *b == b'\n').skip(1).flatten());
+    fs::write(root.path(), &legacy).unwrap();
+    let mut journal = root.open();
+    assert_eq!(journal.format_version(), 1);
+    assert!(journal.append(upsert("invalid", 5)).is_err());
+    assert_eq!(fs::read(root.path()).unwrap(), legacy);
+    assert_eq!(journal.append(upsert("b", 1)).unwrap().seq, 3);
+    assert_eq!(journal.format_version(), FORMAT_VERSION);
+    drop(journal);
+    let journal = root.open();
+    assert_eq!(journal.items(), &[item("a"), item("b")]);
+    assert_eq!(journal.format_version(), FORMAT_VERSION);
+}
+
+#[test]
+fn invalid_record_fold_is_atomic_and_later_entries_still_load() {
+    let root = Root::new();
+    drop(root.open());
+    let mut records = encode(&Record {
+        seq: 1,
+        change: upsert("a", 0),
+    })
+    .unwrap();
+    let mut changed = item("a");
+    changed.body = "must not leak from a rejected batch".into();
+    records.extend(
+        encode(&Record {
+            seq: 2,
+            change: Change::Batch {
+                items: vec![changed, item("missing")],
+            },
+        })
+        .unwrap(),
+    );
+    records.extend(
+        encode(&Record {
+            seq: 3,
+            change: upsert("a", 5),
+        })
+        .unwrap(),
+    );
+    records.extend(b"invalid JSON record\n");
+    records.extend(
+        encode(&Record {
+            seq: 5,
+            change: upsert("b", 1),
+        })
+        .unwrap(),
+    );
+    let bytes = root.write_records(records);
+    let mut journal = root.open();
+    assert_eq!(journal.items(), &[item("a"), item("b")]);
+    assert_eq!(journal.replay(0).unwrap().through, 5);
+    assert!(journal.checkpoint().is_err());
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn newer_format_records_are_not_subject_to_older_framing_or_repair() {
+    let root = Root::new();
+    drop(root.open());
+    let mut bytes =
+        encode(&json!({"kind":"queue_identity", "agent_id":"fixture-agent", "format_version":999}))
+            .unwrap();
+    bytes.extend(b"{\"kind\":\"queue_checkpoint\",\"new_snapshot\":true}\n");
+    bytes.extend(b"{\"kind\":\"future\",\"seq\":20}\n");
+    bytes.extend(b"{\"kind\":\"queue_checkpoint\",\"before\":20,\"high_water\":19}\n");
+    bytes.extend(b"{\"kind\":\"future_unsequenced\"}\n");
+    bytes.extend(vec![b'x'; LINE_LIMIT as usize + 100]);
+    bytes.extend(b"\ninvalid JSON\ntorn tail");
+    fs::write(root.path(), &bytes).unwrap();
+    let temporary = root.path().with_file_name(".queue-future.next");
+    fs::write(&temporary, b"future pending replacement").unwrap();
+    let mut journal = root.open();
+    assert_eq!(journal.read_only().unwrap().found, 999);
+    assert_eq!(journal.replay(0).unwrap().through, 20);
+    assert!(journal.replay(0).unwrap().gap.is_none());
+    assert!(journal.checkpoint().is_err());
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+    assert_eq!(fs::read(temporary).unwrap(), b"future pending replacement");
+}
+
+#[test]
+fn legacy_upgrade_sequence_exhaustion_refuses_before_any_checkpoint_write() {
+    let root = Root::new();
+    drop(root.open());
+    let mut bytes = encode(&json!({"kind":"queue_identity", "agent_id":"fixture-agent"})).unwrap();
+    bytes.extend(
+        encode(&json!({"kind":"queue_checkpoint", "before":u64::MAX-2, "high_water":u64::MAX-1}))
+            .unwrap(),
+    );
+    bytes.extend(
+        encode(&Record {
+            seq: u64::MAX - 1,
+            change: upsert("a", 0),
+        })
+        .unwrap(),
+    );
+    fs::write(root.path(), &bytes).unwrap();
+    let mut journal = root.open();
+    assert!(journal.append(upsert("b", 1)).is_err());
+    assert_eq!(journal.replay(u64::MAX - 1).unwrap().through, u64::MAX - 1);
+    assert_eq!(journal.format_version(), 1);
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn legacy_upgrade_encoded_size_refuses_before_any_checkpoint_write() {
+    let root = Root::new();
+    drop(root.open());
+    let mut bytes = encode(&json!({"kind":"queue_identity", "agent_id":"fixture-agent"})).unwrap();
+    bytes.extend(encode(&json!({"kind":"queue_checkpoint", "before":7, "high_water":8})).unwrap());
+    bytes.extend(
+        encode(&Record {
+            seq: 8,
+            change: upsert("a", 0),
+        })
+        .unwrap(),
+    );
+    fs::write(root.path(), &bytes).unwrap();
+    let mut b = item("b");
+    b.body.clear();
+    let base = encode(&Record {
+        seq: 9,
+        change: Change::Upsert {
+            item: Box::new(b.clone()),
+            position: 1,
+        },
+    })
+    .unwrap()
+    .len();
+    b.body = "x".repeat(LINE_LIMIT as usize - base);
+    let mut journal = root.open();
+    assert!(journal
+        .append(Change::Upsert {
+            item: Box::new(b),
+            position: 1
+        })
+        .is_err());
+    assert_eq!(journal.replay(8).unwrap().through, 8);
+    assert_eq!(journal.format_version(), 1);
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
 }

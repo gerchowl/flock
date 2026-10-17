@@ -877,3 +877,62 @@ fn cancelled_without_result_reports_pending_until_real_result_or_exit() {
         }
     }
 }
+
+#[test]
+fn newer_journal_status_survives_scheduler_open_and_every_runtime_mutation_is_refused() {
+    let mut run = QueueRun::mode("queue-silent");
+    run.send(1, Producer::Human);
+    run.offer().unwrap().unwrap();
+    assert_eq!(run.barrier(1), 1);
+    drop(run.scheduler.take());
+    let path = run
+        .fixture
+        .root
+        .path()
+        .join("sessions/fixture-agent/queue.jsonl");
+    let old = fs::read(&path).unwrap();
+    let mut lines = old.split_inclusive(|b| *b == b'\n');
+    let mut header: Value = serde_json::from_slice(lines.next().unwrap()).unwrap();
+    header["format_version"] = json!(999);
+    let mut bytes = serde_json::to_vec(&header).unwrap();
+    bytes.push(b'\n');
+    bytes.extend(lines.flatten());
+    fs::write(&path, &bytes).unwrap();
+    let admission = Admission::new(
+        Journal::open(run.fixture.root.path(), "fixture-agent").unwrap(),
+        MAX_BATCH,
+    )
+    .unwrap();
+    let mut scheduler = Scheduler::new(admission).unwrap();
+    let status = scheduler.status(&run.running.runtime).unwrap();
+    assert_eq!(
+        status.cause,
+        PendingCause::QueueJournalNewer {
+            found: 999,
+            supported: 2
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(&status).unwrap()["cause"]["queue_journal_newer"]["found"],
+        999
+    );
+    let event = crate::structured::claude::SessionEvent::parse(
+        &catalogue("result", Some("success")).to_string(),
+        "fixture",
+    );
+    let errors = [
+        scheduler
+            .deliver(&run.running.runtime, &run.state, 100)
+            .unwrap_err(),
+        scheduler.observe(&event).unwrap_err(),
+        scheduler.exited().unwrap_err(),
+        scheduler
+            .enqueue(item(2), Principal::Operator, Gate::Send)
+            .unwrap_err(),
+    ];
+    for error in errors {
+        assert_eq!(error.code, ErrorCode::QueueJournalNewer);
+    }
+    assert_eq!(scheduler.status(&run.running.runtime).unwrap(), status);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
