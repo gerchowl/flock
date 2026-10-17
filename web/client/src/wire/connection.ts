@@ -47,7 +47,7 @@ import type { WireError } from "../gen/WireError";
 import type { WireEvent } from "../gen/WireEvent";
 import type { JsonValue } from "../gen/serde_json/JsonValue";
 import { decodeServerFrame } from "./decode";
-import { backoffDelay, type Clock, type KeyValueStore, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
+import { backoffDelay, uuidv7, type Clock, type KeyValueStore, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
 import { Outbox, type OutboxEntry } from "./outbox";
 
 /**
@@ -204,6 +204,11 @@ export class WireConnection {
     return this.#error;
   }
 
+  /** What restoring the stored outbox had to drop, or null (shown, never fatal). */
+  get outboxProblem(): string | null {
+    return this.#outbox.problem;
+  }
+
   /** The principal of the last `welcome`, or of the restored outbox. */
   get principal(): string | null {
     return this.#welcome?.principal ?? this.#outbox.principal;
@@ -319,7 +324,7 @@ export class WireConnection {
   command(verb: string, args: JsonValue, cmdId?: string): string {
     const principal = this.principal;
     if (principal === null) throw new Error("no principal yet: connect once before sending commands");
-    const id = cmdId ?? this.#options.newCommandId?.() ?? crypto.randomUUID();
+    const id = cmdId ?? this.#options.newCommandId?.() ?? uuidv7(this.#options.clock.wallNow());
     this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending" });
     this.#flush();
     return id;
