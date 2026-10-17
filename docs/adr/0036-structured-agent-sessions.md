@@ -582,7 +582,7 @@ same queue (owner decision 5): there is no second input path.
   delivery: at_idle | steer | interrupt,   timing only: when the item is written
   state: queued | held | stashed | delivered | done | cancelled | dropped | failed,
   (queued → delivered → done | cancelled; queued → held | stashed | dropped;
-   held | stashed → queued; queued → failed with queue_item_too_large;
+   held | stashed → queued; queued → failed with a typed refusal;
    delivered → held when the process dies without a result)
   stash?: name,                       which stash a stashed item is in
   edit_lease?: { client, until_ms },  human producers only; skipped while it holds
@@ -751,15 +751,21 @@ back-to-back turns. For a structured agent there is no polling at all:
   item uses a single header line `From <producer> (item <item_id>):` with
   reply metadata and `Attachments (blob refs): <JSON refs>` on that line.
   Producer/attachment values are JSON-encoded so embedded newlines remain
-  escaped. Reply `question_id` must be a canonical lowercase hyphenated UUID,
-  or admission refuses it. The next line is `<<<flk-item <nonce>`, followed
+  escaped, including U+2028, U+2029 and U+0085. Attachment strings must be
+  content-addressed `blob:<sha256>` refs: exactly 64 lowercase hex digits
+  after `blob:`. Reply `question_id` must be a canonical lowercase hyphenated
+  UUID. The next line is `<<<flk-item <nonce>`, followed
   by the literal body and a final line `flk-item <nonce>>>>`. Here `<nonce>`
   denotes 128 random bits encoded as 32 lowercase hex digits. Generate a
   fresh nonce per rendered item and regenerate if its hex string occurs
   anywhere in the body. Sender text, including fake labels, attachment lines
   or delimiters, remains inside that item's block. Attachments and reply
   metadata never enter the body block. The operator-only native command
-  exception in §3 remains verbatim and isolated.
+  exception in §3 remains verbatim and isolated. Admission and replacement
+  validate anchors and refs, refusing `invalid_request` before writing.
+  Rendering validates again: an unrenderable head becomes durably `failed`
+  with its typed refusal, allowing subsequent items through. A valid prefix
+  is delivered before a later malformed item is failed.
 - **Trigger.** The turn end is the `result` event (E1). An armed self-compact
   (`flock_self_compact`, `flk pane arm-self-compact`) queues a `command`
   item with body `/compact`, `delivery: at_idle`, `priority: urgent`. The §3

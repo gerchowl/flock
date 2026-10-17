@@ -1,7 +1,7 @@
 //! Durable admission and bounded batch formation (ADR-0036 §3/§4, #1878).
 //!
 //! One blocking worker owns this value. Admission persists the authenticated
-//! producer and gate before acknowledging; formation durably fails oversized heads.
+//! producer and gate before acknowledging; formation durably fails invalid or oversized heads.
 //! Runtime reservation/lifecycle belongs to the next S5b slice, server wiring to #1803.
 use super::model::{Delivery, Kind, Priority, Producer, State};
 use super::{Change, Item, Journal};
@@ -102,32 +102,27 @@ impl Admission {
             _ => return Err(refuse(ErrorCode::OperatorOnly)),
         };
         self.journal.healthy()?;
-        if !valid_id(&item.item_id)
-            || [
-                "admission_hash",
-                "gate",
-                "batch_id",
-                "awaiting_result",
-                "refusal",
-                "stash",
-                "item_id",
-                "producer",
-                "kind",
-                "state",
-                "delivery",
-                "priority",
-                "body",
-                "attachments",
-            ]
-            .iter()
-            .any(|k| item.metadata.contains_key(*k))
+        if [
+            "admission_hash",
+            "gate",
+            "batch_id",
+            "awaiting_result",
+            "refusal",
+            "stash",
+            "item_id",
+            "producer",
+            "kind",
+            "state",
+            "delivery",
+            "priority",
+            "body",
+            "attachments",
+        ]
+        .iter()
+        .any(|k| item.metadata.contains_key(*k))
             || (item.producer != Producer::Human && item.metadata.contains_key("edit_lease"))
             || (item.kind == Kind::Command
                 && (!item.body.starts_with('/') || !item.attachments.is_empty()))
-            || (item.kind == Kind::Reply
-                && metadata(&item, "anchor")["question_id"]
-                    .as_str()
-                    .is_none_or(|id| !canonical_uuid(id)))
             || (item.kind == Kind::Continuation
                 && metadata(&item, "anchor")["item_id"]
                     .as_str()
@@ -135,6 +130,7 @@ impl Admission {
         {
             return Err(refuse(ErrorCode::InvalidRequest));
         }
+        validate_content(&item)?;
         item.state = match &gate {
             Gate::Send => State::Queued,
             Gate::Hold => State::Held,
@@ -201,7 +197,7 @@ impl Admission {
                             .is_none_or(|v| v == &Value::Bool(false))
                 }))
     }
-    /// Form one bounded FIFO candidate. An unbounded head is durably failed
+    /// Form one bounded FIFO candidate. An invalid or unbounded head is durably failed
     /// before trying the next item; valid candidates do not spend a cursor.
     /// The runtime owner must reserve atomically and enforce S4/S6 before writing.
     pub fn batch(&mut self, now_ms: u64) -> Result<Option<Batch>, Failure> {
@@ -230,14 +226,15 @@ impl Admission {
                 } else {
                     batch_uuid()?
                 };
-                let user = envelope(&items, &id)?;
-                if bounded(&items, &user) {
-                    break (id, user);
-                }
+                let refusal = match envelope(&items, &id) {
+                    Ok(user) if bounded(&items, &user) => break (id, user),
+                    Ok(_) => ErrorCode::QueueItemTooLarge,
+                    Err(error) => error.code,
+                };
                 if items.len() == 1 {
                     self.commit(Change::Fail {
                         item_id: items[0].item_id.clone(),
-                        reason: ErrorCode::QueueItemTooLarge.as_str().into(),
+                        reason: refusal.as_str().into(),
                     })?;
                     break (id, Value::Null);
                 }
@@ -277,6 +274,7 @@ impl Admission {
             {
                 return Err(refuse(ErrorCode::InvalidRequest));
             }
+            validate_content(item)?;
             let probe = envelope(std::slice::from_ref(item), &item.item_id)?;
             if !bounded(std::slice::from_ref(item), &probe) {
                 return Err(refuse(ErrorCode::InvalidRequest));
@@ -309,7 +307,36 @@ impl Admission {
         Ok(())
     }
 }
+// Intake and edits share the same validation. Rendering repeats it so legacy
+// or otherwise malformed durable items are failed instead of wedging a worker.
+fn validate_content(item: &Item) -> Result<(), Failure> {
+    if !valid_id(&item.item_id)
+        || (item.kind == Kind::Reply
+            && metadata(item, "anchor")["question_id"]
+                .as_str()
+                .is_none_or(|id| !canonical_uuid(id)))
+        || item.attachments.iter().any(|reference| {
+            !reference.strip_prefix("blob:").is_some_and(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+        })
+    {
+        return Err(refuse(ErrorCode::InvalidRequest));
+    }
+    Ok(())
+}
+fn header_json(value: &impl Serialize) -> Result<String, Failure> {
+    Ok(serde_json::to_string(value)
+        .map_err(serialization)?
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+        .replace('\u{85}', "\\u0085"))
+}
 fn render(item: &Item) -> Result<String, Failure> {
+    validate_content(item)?;
     if item.kind == Kind::Command {
         return Ok(item.body.clone());
     }
@@ -325,7 +352,7 @@ fn render(item: &Item) -> Result<String, Failure> {
     let nonce = nonce(&item.body, getrandom::fill)?;
     Ok(format!(
         "From {} (item {}):{reply} Attachments (blob refs): {}\n<<<flk-item {nonce}\n{}\nflk-item {nonce}>>>",
-        json!(item.producer), item.item_id, json!(item.attachments), item.body
+        header_json(&item.producer)?, item.item_id, header_json(&item.attachments)?, item.body
     ))
 }
 // The callback is the entropy source, kept local so collision/failure handling

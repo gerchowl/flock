@@ -19,7 +19,9 @@ refuses unsupported delivery/priority modes and unknown scheduling types with
 the registered `queue_mode_unsupported` code. Invalid UUIDs, forged gate/batch
 metadata, missing reply/continuation anchors and invalid commands are refused
 before any append. Reply question IDs must be canonical lowercase hyphenated
-UUIDs. Deterministic validation errors are `invalid_request`, entropy failures
+UUIDs, both at admission and on replacement. Attachment strings must be
+`blob:<sha256>` with exactly 64 lowercase hex digits; arbitrary text, paths,
+URLs and noncanonical hashes are refused. Deterministic validation errors are `invalid_request`, entropy failures
 are `internal_error`, and serialization errors are `serialization_error`.
 Only actual append I/O failures or an already poisoned journal report
 `input_write_unknown`; callers must reopen after uncertain I/O, not blindly
@@ -34,8 +36,12 @@ architect-approved exception recorded in ADR-0036 §3 and §3a.
 
 For valid candidates, `batch(now_ms)` returns an owned candidate without
 spending a cursor, reserving items or marking them delivered. An unbounded
-head instead receives a durable `failed` state with `queue_item_too_large`
-before formation continues with the next eligible item. A compact `fail`
+head instead receives a durable `failed` state with `queue_item_too_large`;
+a head that fails rendering receives its render refusal (for example
+`invalid_request` for a malformed reply anchor or blob ref). Formation then
+continues with the next eligible item. A valid prefix is returned before a
+later malformed member becomes the head and is failed, so valid items are
+never discarded because a later member cannot render. A compact `fail`
 record retains the original content, even when a full replacement cannot fit.
 The failure is published only after sync and survives reopen. The runtime owner must enforce
 S4/S6 and reserve before writing. Eligible items are queued, normal, at_idle,
@@ -49,7 +55,8 @@ editors are skipped. Default max_batch is 8; zero is invalid. A single-item
 candidate uses its item UUID; a multi-item candidate has a fresh version-4
 batch UUID and one producer-labelled block per member. Each non-command
 header names its producer and item UUID, reply question UUID when applicable,
-and JSON-encoded attachment refs. The body is enclosed in nonce delimiters
+and JSON-encoded attachment refs. Header JSON also escapes U+2028, U+2029
+and U+0085 so they cannot form a labelled header line. The body is enclosed in nonce delimiters
 per ADR-0036 §3a. Each rendering uses 128 random bits in lowercase hex,
 regenerated if present anywhere in the body; fake labels and delimiter-like
 text cannot escape that block. This framing preserves attribution, rather than
