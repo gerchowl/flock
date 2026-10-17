@@ -124,8 +124,9 @@ same scripts with its actual client, fake transport and virtual clock.
 Every script header has a machine-readable covers list containing s7-min, s7,
 or both when the script is required by both slices.
 S7-min (#1746) selects clean, agent-gap, agent-send, ping-pong, token-refused,
-token-revoked, heartbeat-missed and fleet-lite: hello/welcome/token, agent/<id> cursor replay with synced and gap
-(no entity snapshot), agent.send with ack, ping/pong and 4401/4403 closes. These
+token-revoked, heartbeat-missed, fleet-lite and unknown-subscription: hello/welcome/token, agent/<id> cursor replay with synced and gap
+(no entity snapshot), agent.send with ack, ping/pong, 4401/4403 closes and
+a protocol close (1002) for a never-opened subscription ID. These
 scripts use agent streams or fleet and only agent.send/agent.decide commands.
 The minimal verb check includes restored given.outbox entries. Heartbeat carries
 both labels because liveness belongs to both slices. Other scripts target full S7.
@@ -143,9 +144,18 @@ rows absent from it must disappear. The script exercises both snapshot passes,
 activity and permission badges, a live replacement, and a live removal.
 
 Every sub uses a fresh ID for the connection's lifetime. Lagged and subfail
-close their ID: the server sends nothing more on it, and recovery subscribes with
-a fresh ID without unsub while retaining the stream cursor. A progress deadline
+close their ID: the server sends nothing more on it. Lagged recovery subscribes
+with a fresh ID without unsub while retaining the stream cursor. After subfail,
+follow the code's recovery rule; operator_only, unknown_stream and scope stop
+until their specified condition changes. Any permitted re-sub uses a fresh ID. A progress deadline
 sends unsub to close the stalled ID before subscribing with a fresh one. The lagged, deadline,
 cursor-ahead and fleet-lite scripts inject late synced frames for retired IDs;
 these must be silently ignored. A never-opened ID is a protocol error, while a
 server refuses reused live or closed IDs with subfail code sub_id_reused.
+
+FleetAgentRow.state is the shared S4 AgentState object, including its lenient
+per-axis reading (ADR-0028 §3a); it is not a phase string. unknown-subscription
+injects a frame for an ID never opened on the current connection and requires
+protocol close 1002. Rust contract tests also pin sub_id_reused for both live and
+closed IDs. The subscription guard models live-to-closed transitions on unsub,
+subfail and lagged, retaining closed IDs until the connection ends.

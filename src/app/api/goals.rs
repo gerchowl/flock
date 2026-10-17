@@ -493,7 +493,7 @@ mod tests {
             .is_some());
         let read = call(&mut app, status("self"));
         assert!(read["result"]["goal"].get("paused").is_none(), "{read}");
-        app.test_pane_child_pids.clear();
+        app.current_api_peer_pid = Some(std::process::id());
         assert_eq!(code(&call(&mut app, resume(&agent))), "goal_not_paused");
         shutdown(app);
         let _ = std::fs::remove_dir_all(log.parent().expect("log dir"));
@@ -507,7 +507,7 @@ mod tests {
         let hub = EventHub::with_persistence(log.clone());
         let mut app = app_on(hub.clone());
         let agent = caller_is_an_agent(&mut app);
-        app.test_pane_child_pids.clear();
+        app.current_api_peer_pid = Some(std::process::id());
 
         assert_eq!(
             code(&call(&mut app, arm(&agent, "operator goal"))),
@@ -595,7 +595,7 @@ mod tests {
         let hub = EventHub::with_persistence(log.clone());
         let mut app = app_on(hub.clone());
         let agent = caller_is_an_agent(&mut app);
-        app.test_pane_child_pids.clear();
+        app.current_api_peer_pid = Some(std::process::id());
         let me = agent.as_str();
 
         for method in [status(me), pause(me, None), resume(me), stop(me)] {

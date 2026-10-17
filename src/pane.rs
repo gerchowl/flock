@@ -705,6 +705,10 @@ impl PaneRuntime {
         (pid > 0).then_some(pid)
     }
 
+    /// Birth captured at spawn or carried by the owning handoff server.
+    pub(crate) fn child_birth(&self) -> Option<u64> {
+        self.child_birth
+    }
     /// The pane child's exit slot, for panes that own a watcher (#178). A
     /// pane adopted over a live handoff has none: its child was reaped by the
     /// process that spawned it, not by this one.
@@ -749,6 +753,7 @@ pub struct PaneRuntime {
     io: PaneRuntimeIo,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
+    child_birth: Option<u64>,
     child_exit: Option<Arc<ChildExit>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     detect_reset_notify: Arc<Notify>,
@@ -1432,6 +1437,7 @@ impl PaneRuntime {
         crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
             child_pid,
+            child_birth: self.child_birth,
             rows,
             cols,
             cell_width_px,
@@ -1627,6 +1633,7 @@ impl PaneRuntime {
         let crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
             child_pid,
+            child_birth,
             rows,
             cols,
             cell_width_px,
@@ -1725,6 +1732,7 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
+            child_birth,
             child_exit: None,
             kitty_keyboard_flags,
             detect_reset_notify,
@@ -1778,6 +1786,10 @@ impl PaneRuntime {
                 )
             })?;
 
+        let child_birth = spawned
+            .child
+            .process_id()
+            .and_then(crate::platform::process_start_time);
         // --- Child watcher task ---
         let child_pid = Arc::new(AtomicU32::new(0));
         let child_exit = Arc::new(ChildExit::default());
@@ -2178,6 +2190,7 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
+            child_birth,
             child_exit: Some(child_exit),
             kitty_keyboard_flags,
             detect_reset_notify,
@@ -2800,6 +2813,7 @@ impl PaneRuntime {
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
+                child_birth: None,
                 child_exit: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detect_reset_notify: Arc::new(Notify::new()),
@@ -3302,6 +3316,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_birth: None,
             child_exit: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detect_reset_notify: Arc::new(Notify::new()),
@@ -3334,6 +3349,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_birth: None,
             child_exit: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detect_reset_notify: Arc::new(Notify::new()),

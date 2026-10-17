@@ -240,8 +240,7 @@ pub(crate) fn handle_connection(
     capabilities: Option<ServerCapabilities>,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
 ) -> std::io::Result<()> {
-    let peer_pid = socket_peer_pid(&stream);
-    let peer_birth = peer_pid.and_then(crate::platform::process_start_time);
+    let peer = crate::platform::peer::credentials(&stream);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         crate::logging::api_connection_write_timeout_unavailable(&err.to_string());
     }
@@ -343,7 +342,7 @@ pub(crate) fn handle_connection(
                 event_hub,
                 running,
                 api_tx,
-                peer_pid,
+                peer,
             )?
             else {
                 crate::logging::api_request_completed(
@@ -402,8 +401,7 @@ pub(crate) fn handle_connection(
                 },
                 api_tx,
                 capabilities,
-                peer_pid,
-                peer_birth,
+                peer,
                 listener_health,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
@@ -423,59 +421,16 @@ pub(crate) fn handle_connection(
     }
 }
 
-/// PID of the process at the other end of the unix socket. macOS exposes it
-/// via LOCAL_PEERPID; Linux via SO_PEERCRED. None when unavailable.
+/// PID supplied by the kernel for this socket connection.
 pub(crate) fn socket_peer_pid(stream: &UnixStream) -> Option<u32> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::fd::AsRawFd;
-        let mut pid: libc::pid_t = 0;
-        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-        // SOL_LOCAL = 0, LOCAL_PEERPID = 2 (sys/un.h)
-        let rc = unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                0,
-                2,
-                &mut pid as *mut _ as *mut libc::c_void,
-                &mut len,
-            )
-        };
-        return (rc == 0 && pid > 0).then_some(pid as u32);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        let mut cred = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        let rc = unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                &mut cred as *mut _ as *mut libc::c_void,
-                &mut len,
-            )
-        };
-        return (rc == 0 && cred.pid > 0).then_some(cred.pid as u32);
-    }
-    #[allow(unreachable_code)]
-    {
-        let _ = stream;
-        None
-    }
+    crate::platform::peer::credentials(stream).pid
 }
 
 fn handle_request(
     request: Request,
     api_tx: &ApiRequestSender,
     capabilities: Option<ServerCapabilities>,
-    peer_pid: Option<u32>,
-    peer_birth: Option<u64>,
+    peer: crate::platform::peer::Credentials,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
 ) -> String {
     match request.method {
@@ -507,7 +462,7 @@ fn handle_request(
             r#"{"id":"","error":{"code":"internal_error","message":"failed to encode response"}}"#
                 .to_string()
         }),
-        _ => dispatch_attributed(request, api_tx, None, peer_pid, peer_birth),
+        _ => dispatch_to_app_with_timeout(request, api_tx, None, peer),
     }
 }
 
@@ -596,6 +551,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneGet(_) => "pane.get",
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
+        Method::PaneWriteText(_) => "pane.write_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
         Method::PaneWriteKeys(_) => "pane.write_keys",
         Method::PaneWriteInput(_) => "pane.write_input",
@@ -884,31 +840,16 @@ pub(super) fn dispatch_to_app_with_timeout(
     request: Request,
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
-    peer_pid: Option<u32>,
-) -> String {
-    dispatch_attributed(
-        request,
-        api_tx,
-        timeout,
-        peer_pid,
-        peer_pid.and_then(crate::platform::process_start_time),
-    )
-}
-
-fn dispatch_attributed(
-    request: Request,
-    api_tx: &ApiRequestSender,
-    timeout: Option<Duration>,
-    peer_pid: Option<u32>,
-    peer_birth: Option<u64>,
+    peer: crate::platform::peer::Credentials,
 ) -> String {
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
         request,
         respond_to,
-        peer_pid,
-        peer_birth,
+        peer_pid: peer.pid,
+        peer_birth: peer.birth,
+        peer_uid: peer.uid,
     }) {
         return error_response_json(
             request_id,
@@ -1116,8 +1057,7 @@ mod tests {
                 },
                 &tx,
                 None,
-                None,
-                None,
+                Default::default(),
                 &health,
             );
             let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1308,8 +1248,7 @@ mod tests {
                 agent_questions: true,
                 pane_input_write_ack: false,
             }),
-            None,
-            None,
+            crate::platform::peer::Credentials::default(),
             &Mutex::default(),
         );
 
@@ -1328,7 +1267,13 @@ mod tests {
 
         let request_for_thread = request.clone();
         let thread = std::thread::spawn(move || {
-            handle_request(request_for_thread, &tx, None, None, None, &Mutex::default())
+            handle_request(
+                request_for_thread,
+                &tx,
+                None,
+                Default::default(),
+                &Mutex::default(),
+            )
         });
 
         let msg = rx.blocking_recv().unwrap();
@@ -1489,6 +1434,18 @@ mod tests {
         let app = std::thread::spawn(move || {
             let mut seen = Vec::new();
             while let Some(message) = api_rx.blocking_recv() {
+                if matches!(message.request.method, Method::WaitHold(..)) {
+                    assert_eq!(
+                        message.peer_uid,
+                        Some(crate::platform::peer::effective_uid())
+                    );
+                    assert_eq!(
+                        message.peer_birth,
+                        message
+                            .peer_pid
+                            .and_then(crate::platform::process_start_time)
+                    );
+                }
                 let _ = message
                     .respond_to
                     .send(r#"{"id":"","result":{"type":"wait_held","wait_id":"w_1"}}"#.into());

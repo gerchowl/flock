@@ -1,6 +1,6 @@
 //! Minimal GUI transport payloads specified by #1746 and ADR-0036 §2/§5a.
 
-use crate::api::agent_state::Phase;
+use crate::api::agent_state::AgentState;
 use serde::{Deserialize, Serialize};
 
 /// Structured-agent row in the minimal fleet snapshot and its upsert deltas.
@@ -11,8 +11,8 @@ pub struct FleetAgentRow {
     pub id: String,
     /// User-visible agent label.
     pub label: String,
-    /// S4's derived phase; ADR-0036 §2 retains ADR-0028's phase derivation.
-    pub state: Phase,
+    /// Shared S4 axes and phase, read leniently per ADR-0028 §3a.
+    pub state: AgentState,
     /// Current activity text, omitted when no activity is available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -96,17 +96,23 @@ pub enum PermissionDecision {
 
 #[cfg(test)]
 mod tests {
+    use crate::api::agent_state::AgentState;
     use crate::structured_wire::{
         AgentDecide, AgentDecideErrorCode, AgentDecideResult, FleetAgentRow, FleetDelta,
         PermissionDecision,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
+
+    fn state(phase: &str) -> Value {
+        serde_json::to_value(serde_json::from_value::<AgentState>(json!({"phase":phase})).unwrap())
+            .unwrap()
+    }
 
     #[test]
     fn structured_rows_round_trip_activity_and_waiting_request_ids() {
         for value in [
-            json!({"id":"fixture-agent","label":"Example","state":"working","waiting_on_human":[]}),
-            json!({"id":"fixture-agent","label":"Example","state":"needs_human","activity":"Reading a file","waiting_on_human":["request-one","request-two"]}),
+            json!({"id":"fixture-agent","label":"Example","state":state("working"),"waiting_on_human":[]}),
+            json!({"id":"fixture-agent","label":"Example","state":state("needs_human"),"activity":"Reading a file","waiting_on_human":["request-one","request-two"]}),
         ] {
             let row: FleetAgentRow = serde_json::from_value(value.clone()).unwrap();
             assert_eq!(serde_json::to_value(row).unwrap(), value);
@@ -140,7 +146,7 @@ mod tests {
 
     #[test]
     fn fleet_payloads_are_closed_and_round_trip_full_rows() {
-        let row = json!({"id":"fixture-agent","label":"Example","state":"needs_human",
+        let row = json!({"id":"fixture-agent","label":"Example","state":state("needs_human"),
             "activity":"Permission needed","waiting_on_human":["request-one"]});
         for value in [
             json!({"type":"fleet.upsert","row":row}),
@@ -229,10 +235,25 @@ mod tests {
     }
 
     #[test]
-    fn generated_minimal_roots_have_optional_strings_and_shared_phase() {
+    fn newer_fleet_phase_decodes_as_unknown_without_losing_other_axes() {
+        let delta: FleetDelta = serde_json::from_value(json!({
+            "type":"fleet.upsert","row":{
+                "id":"fixture-agent","label":"Example","waiting_on_human":[],
+                "state":{"phase":"future_phase","turn":"working","lifecycle":"live"}
+            }
+        }))
+        .expect("newer phases must not discard the fleet delta");
+        let value = serde_json::to_value(delta).unwrap();
+        assert_eq!(value["row"]["state"]["phase"], "unknown");
+        assert_eq!(value["row"]["state"]["turn"], "working");
+        assert_eq!(value["row"]["state"]["lifecycle"], "live");
+    }
+
+    #[test]
+    fn generated_minimal_roots_have_optional_strings_and_shared_agent_state() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/client/src/gen");
         let row = std::fs::read_to_string(root.join("FleetAgentRow.ts")).unwrap();
-        assert!(row.contains("state: Phase,"));
+        assert!(row.contains("state: AgentState,"));
         assert!(row.contains("activity?: string,"));
         assert!(row.contains("waiting_on_human: Array<string>,"));
         let request = std::fs::read_to_string(root.join("AgentDecide.ts")).unwrap();

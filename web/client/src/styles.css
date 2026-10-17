@@ -149,3 +149,13 @@ details > summary::-webkit-details-marker {
   color: var(--muted);
   font-size: 0.875rem;
 }
+
+/* A history gap (ADR-0038 §3): fixed text, never implying a complete transcript. */
+.transcript__gap {
+  margin: 0.75rem 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 0.875rem;
+}

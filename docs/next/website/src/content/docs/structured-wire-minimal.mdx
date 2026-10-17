@@ -8,14 +8,16 @@ contracts for the GUI and server work in #1746; this types slice does not enable
 a WebSocket endpoint or execute commands.
 
 `FleetAgentRow` contains `id`, `label`, `state`, optional `activity`, and required
-`waiting_on_human: string[]`. State uses the existing `Phase` vocabulary retained
-by ADR-0036 §2. The waiting IDs identify permission requests on `agent/<id>`;
+`waiting_on_human: string[]`. State is the shared S4 `AgentState` object: axes, derived phase and sources.
+Its per-field `or_unknown` deserializers follow ADR-0028 §3a, so an unknown
+phase from a newer server becomes `unknown` while the other axes survive and
+the fleet delta remains usable. The waiting IDs identify permission requests on `agent/<id>`;
 there is no separate inbox stream in S7-min. Rows represent structured agents.
 
 The `fleet` stream carries the closed `FleetDelta` union inside `ev`:
 
 ```json
-{"type":"fleet.upsert","row":{"id":"example-agent","label":"Example","state":"needs_human","activity":"Permission needed","waiting_on_human":["request-one"]}}
+{"type":"fleet.upsert","row":{"id":"example-agent","label":"Example","state":{"turn":"idle","background":"none","attention":{"needs_human":{"reason":"permission"}},"waiting":"none","lifecycle":"live","phase":"needs_human","source":{}},"activity":"Permission needed","waiting_on_human":["request-one"]}}
 {"type":"fleet.remove","id":"example-agent"}
 ```
 

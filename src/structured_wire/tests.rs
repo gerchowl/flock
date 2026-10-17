@@ -309,6 +309,7 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
         "token-revoked",
         "heartbeat-missed",
         "fleet-lite",
+        "unknown-subscription",
     ];
     let files = fixtures();
     let mut seen = BTreeSet::new();
@@ -317,7 +318,7 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let expected = if name == "heartbeat-missed" {
+        let expected = if matches!(name.as_str(), "heartbeat-missed" | "unknown-subscription") {
             json!(["s7", "s7-min"])
         } else if minimal.contains(&name.as_str()) {
             json!(["s7-min"])
@@ -359,7 +360,7 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
                         );
                     }
                 }
-                if row["step"] == "token_refused" {
+                if row["step"] == "token_refused" || row["step"] == "expect_close" {
                     seen.insert(format!("close{}", row["code"]));
                 }
                 for payload in [&row["action"], &row["frame"]] {
@@ -391,6 +392,7 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
         "ack_ok",
         "ping",
         "pong",
+        "close1002",
         "close4401",
         "close4403",
     ] {
@@ -505,20 +507,70 @@ fn minimal_fleet_fixture_has_typed_rows_deltas_and_fresh_snapshot_recovery() {
     );
 }
 
-fn subscription_ids_are_fresh(rows: &[Value]) -> bool {
-    let mut used = BTreeSet::new();
-    for row in rows {
-        if row["step"] == "open" {
-            used.clear();
+#[derive(Default)]
+struct SubscriptionIds {
+    live: BTreeSet<String>,
+    closed: BTreeSet<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SubscriptionFrame {
+    Apply,
+    Drop,
+    ProtocolError,
+}
+
+impl SubscriptionIds {
+    fn subscribe(&mut self, id: &str) -> Result<(), SubfailCode> {
+        if self.live.contains(id) || self.closed.contains(id) {
+            return Err(SubfailCode::SubIdReused);
         }
-        if row["step"] == "expect"
-            && row["frame"]["t"] == "sub"
-            && !used.insert(row["frame"]["sub_id"].as_str().unwrap())
-        {
-            return false;
+        self.live.insert(id.to_owned());
+        Ok(())
+    }
+
+    fn retire(&mut self, id: &str) {
+        if self.live.remove(id) {
+            self.closed.insert(id.to_owned());
         }
     }
-    true
+
+    fn frame(&self, id: &str) -> SubscriptionFrame {
+        if self.live.contains(id) {
+            SubscriptionFrame::Apply
+        } else if self.closed.contains(id) {
+            SubscriptionFrame::Drop
+        } else {
+            SubscriptionFrame::ProtocolError
+        }
+    }
+}
+
+fn subscription_ids(rows: &[Value]) -> Result<SubscriptionIds, SubfailCode> {
+    let mut ids = SubscriptionIds::default();
+    for row in rows {
+        if row["step"] == "open" {
+            ids = SubscriptionIds::default();
+        }
+        let frame = &row["frame"];
+        let Some(id) = frame["sub_id"].as_str() else {
+            continue;
+        };
+        if row["step"] == "expect" && frame["t"] == "sub" {
+            ids.subscribe(id)?;
+        } else if (row["step"] == "expect" && frame["t"] == "unsub")
+            || (row["step"] == "send"
+                && row["socket"] != "previous"
+                && matches!(frame["t"].as_str(), Some("subfail" | "lagged")))
+        {
+            ids.retire(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn subscription_ids_are_fresh(rows: &[Value]) -> bool {
+    subscription_ids(rows).is_ok()
 }
 
 #[test]
@@ -543,6 +595,16 @@ fn subscription_id_guard_remembers_retired_ids_until_the_next_connection() {
         json!({"step":"send","frame":{"t":"subfail","sub_id":"s1","code":"scope"}}),
         json!({"step":"send","frame":{"t":"lagged","sub_id":"s1","skipped_to":9}}),
     ] {
+        let ids = subscription_ids(&[sub.clone(), retirement.clone()]).unwrap();
+        assert!(
+            ids.live.is_empty(),
+            "retirement must end the live subscription"
+        );
+        assert!(
+            ids.closed.contains("s1"),
+            "retirement must retain the closed ID"
+        );
+        assert_eq!(ids.frame("s1"), SubscriptionFrame::Drop);
         assert!(!subscription_ids_are_fresh(&[
             sub.clone(),
             retirement,
@@ -587,5 +649,51 @@ fn lagged_recovery_uses_a_fresh_id_without_unsubscribing_the_closed_id() {
             .all(|row| !(row["step"] == "expect"
                 && row["frame"]["t"] == "unsub"
                 && &row["frame"]["sub_id"] == old_id)));
+    }
+}
+
+#[test]
+fn never_opened_subscription_frame_requires_protocol_close_not_silent_drop() {
+    let script = fixtures()
+        .into_iter()
+        .find(|(name, _)| name == "unknown-subscription")
+        .unwrap()
+        .1;
+    let rows: Vec<Value> = script
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let index = rows
+        .iter()
+        .position(|row| row["frame"]["sub_id"] == "never-opened")
+        .unwrap();
+    let mut ids = subscription_ids(&rows[..index]).unwrap();
+    assert_eq!(ids.frame("never-opened"), SubscriptionFrame::ProtocolError);
+    assert_eq!(rows[index + 1]["step"], "expect_close");
+    assert_eq!(rows[index + 1]["code"], 1002);
+    ids.subscribe("s1").unwrap();
+    assert_eq!(ids.frame("s1"), SubscriptionFrame::Apply);
+    ids.retire("s1");
+    assert_eq!(ids.frame("s1"), SubscriptionFrame::Drop);
+}
+
+#[test]
+fn sub_id_reused_refusal_is_typed_for_both_live_and_closed_ids() {
+    for closed in [false, true] {
+        let mut ids = SubscriptionIds::default();
+        ids.subscribe("s1").unwrap();
+        if closed {
+            ids.retire("s1");
+        }
+        let code = ids.subscribe("s1").unwrap_err();
+        assert_eq!(code, SubfailCode::SubIdReused);
+        let frame = ServerFrame::Subfail {
+            sub_id: "s1".into(),
+            code,
+            message: "Subscription ID was already used".into(),
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["code"], "sub_id_reused");
+        assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
     }
 }

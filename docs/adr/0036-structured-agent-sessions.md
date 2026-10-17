@@ -867,6 +867,25 @@ server → client
   ack     { cmd_id, ok, result? | error{ code, message, exit, retry } }
 ```
 
+**S7-min fleet and permission contracts (#1746).** The `fleet` snapshot stream
+lists structured agents as `FleetAgentRow { id, label, state: AgentState,
+activity?, waiting_on_human: string[] }`. `AgentState` is the shared S4 object,
+including axes, phase and sources, not a bare phase. Its per-field `or_unknown`
+reading follows ADR-0028 §3a: an unknown newer phase becomes `unknown` while the
+other axes survive; it must not discard the fleet delta. Snapshot rows use §5a's
+existing inline gap/checkpoint path. Fleet `ev` payloads are the closed tagged
+`FleetDelta` union: `{ type:"fleet.upsert", row: FleetAgentRow }` or
+`{ type:"fleet.remove", id }`, rather than session `WireEvent` payloads.
+
+`cmd agent.decide` takes `AgentDecide { agent, request_id, decision, message? }`,
+where decision is `allow_once`, `allow_always` or `deny`. Only a token-authenticated
+client principal may call it. The existing ack envelope echoes `cmd_id`; success
+returns `AgentDecideResult { request_id, decision }`, echoing the applied answer.
+Decision-specific failure names are `permission_request_unknown`,
+`permission_request_closed` and `not_authorized`, with retry class `never` in the
+existing error envelope. Their API error-code registration and command behavior
+are deferred to S6 (#1429); this types slice names the contracts only.
+
 - **Cursors and bootstrap (architect decisions iii/iv).** Every stream except
   `agent/<id>/live` has seqs, including `terminal/<pane>` and `events`.
   `sub` with `after` replays from the last applied cursor, then goes live.
@@ -883,9 +902,10 @@ server → client
   snapshot lines. The barrier's seq is that head (zero only for a genuinely
   new empty stream); all later frames are live. `lagged` closes the old ID;
   re-subscription with a fresh ID gets its own barrier without an `unsub`.
-  Empty-checkpoint completion advances to `to` before `synced`; a nonzero high-water never becomes zero merely because no items
-  remain. Delivery is at-least-once; dedupe on `(stream, seq)` and persist a
-  cursor only after applying its event or empty checkpoint. Persist a pending
+  Empty-checkpoint completion advances to `to` before `synced`; a nonzero
+  high-water never becomes zero merely because no items remain. Delivery is
+  at-least-once; dedupe on `(stream, seq)` and persist a cursor only after
+  applying its event or empty checkpoint. Persist a pending
   `snapshot_to` and unconfirmed-entity set with the cursor across disconnects.
   Resume unfinished snapshots before declaring Current. A new gap supersedes
   an old resync marker and marks all entities unconfirmed again.
@@ -1045,9 +1065,11 @@ never reused on that connection, including re-subscriptions of the same stream
 after `lagged` or the progress deadline. `unsub`, `subfail` and `lagged` each
 close the named ID; the server sends nothing more on a closed ID. Clients
 silently drop late frames for any closed ID, without advancing a cursor or
-renewing progress. After `lagged` or `subfail`, subscribe with a fresh ID without
-an `unsub`; a progress deadline first sends `unsub` to close the stalled ID.
-A frame for an ID never opened on the current connection is a protocol error. The server refuses
+renewing progress. After `lagged`, re-subscribe with a fresh ID without an
+`unsub`. After `subfail`, re-subscribe only where its code calls for it, using a
+fresh ID without `unsub`; otherwise stop until the code table's condition changes.
+A progress deadline first sends `unsub` to close the stalled ID. A frame for an
+ID never opened on the current connection is a protocol error. The server refuses
 a `sub` that reuses either a live or closed ID with typed
 `subfail { code:"sub_id_reused", ... }`. Preserve stream cursors and resync
 markers across replacement while allocating a new subscription identity.

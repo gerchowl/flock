@@ -1,5 +1,6 @@
-//! ADR-0028 §5a: bounded response ownership until the final PTY write.
+//! ADR-0028 §5a: bounded response ownership through PTY writes and paste observation.
 use super::api::responses::{encode_error_with_data, encode_success};
+use super::paste_confirm::Paste;
 use crate::api::schema::ResponseResult;
 use crate::pty::write_receipt::{WriteFailure, WriteReceipt};
 use std::{
@@ -16,9 +17,20 @@ pub(crate) struct InputWrites {
     next_ticket: u64,
     staged: Option<u64>,
     pending: BTreeMap<u64, PendingWrite>,
+    ready_pastes: Vec<(Paste, Sender<String>, Instant)>,
+}
+
+/// Ordered encoded input plus an optional post-write observation continuation.
+pub(super) struct InputPayload {
+    pub bytes: bytes::Bytes,
+    pub deadline: Instant,
+    pub operator_interrupt: bool,
+    pub paste: Option<Paste>,
 }
 
 struct PendingWrite {
+    paste: Option<Paste>,
+    observing: bool,
     id: String,
     pane: String,
     deadline: Instant,
@@ -56,6 +68,8 @@ impl InputWrites {
         self.pending.insert(
             self.next_ticket,
             PendingWrite {
+                paste: None,
+                observing: false,
                 id,
                 pane,
                 deadline,
@@ -89,12 +103,23 @@ impl InputWrites {
     /// Called on receipt notification or the original deadline, never a polling timer.
     pub(crate) fn service(&mut self) {
         self.pending.retain(|_, write| {
-            if write.respond_to.is_none() {
+            if write.observing || write.respond_to.is_none() {
                 return true;
             }
             let Some(response) = completed_reply(&write.id, &write.receipt) else {
                 return true;
             };
+            if let Some(paste) = &write.paste {
+                let progress = write.receipt.progress();
+                if let (None, Some(at), Some(respond_to)) =
+                    (progress.failure, progress.completed_at, &write.respond_to)
+                {
+                    write.observing = true;
+                    self.ready_pastes
+                        .push((paste.clone(), respond_to.clone(), at));
+                    return true;
+                }
+            }
             if let Some(respond_to) = write.respond_to.take() {
                 let _ = respond_to.send(response);
             }
@@ -108,7 +133,31 @@ impl InputWrites {
             write.receipt.retire(reason);
         }
         self.service();
+        for write in self.pending.values() {
+            if let (Some(paste), Some(respond_to)) = (&write.paste, &write.respond_to) {
+                let reason = if reason == WriteFailure::OwnerChanged {
+                    "owner_changed"
+                } else {
+                    "pane_gone"
+                };
+                let _ = respond_to.send(paste.response(reason, None, None));
+            }
+        }
+        self.pending.clear();
+        self.ready_pastes.clear();
         self.abandon_staged();
+    }
+
+    /// Ignore events whose response owner was already settled during retirement.
+    pub(super) fn paste_is_live(&self, ticket: u64) -> bool {
+        self.pending
+            .get(&ticket)
+            .is_some_and(|write| write.observing)
+    }
+
+    /// Release the shared admission slot exactly once at the terminal observation.
+    pub(super) fn finish_paste(&mut self, ticket: u64) -> bool {
+        self.pending.remove(&ticket).is_some()
     }
 
     pub(crate) fn service_due(&mut self, now: Instant) {
@@ -121,6 +170,7 @@ impl InputWrites {
         // Equality remains timely; wake at the first representable expired instant.
         self.pending
             .values()
+            .filter(|write| !write.observing)
             .map(|write| write.deadline + Duration::from_nanos(1))
             .min()
     }
@@ -176,15 +226,37 @@ pub(super) fn completed_reply(id: &str, receipt: &WriteReceipt) -> Option<String
 }
 
 impl super::App {
+    /// Drain terminal writes and start their bounded observation continuations.
+    pub(crate) fn service_input_writes(&mut self) {
+        self.input_writes.service();
+        self.start_ready_pastes();
+    }
+
+    /// Snapshot post-write operator evidence only after a timely completed receipt.
+    pub(crate) fn start_ready_pastes(&mut self) {
+        for (mut paste, respond_to, at) in std::mem::take(&mut self.input_writes.ready_pastes) {
+            let input = self
+                .parse_pane_id(paste.pane_id())
+                .and_then(|(ws, pane)| self.lookup_runtime_sender(ws, pane))
+                .and_then(|runtime| runtime.last_operator_input_at());
+            paste.written(at, input);
+            self.schedule_paste(paste, respond_to);
+        }
+    }
+
     pub(super) fn begin_input_write(
         &mut self,
         id: String,
         ws: usize,
         pane: crate::layout::PaneId,
-        bytes: bytes::Bytes,
-        deadline: Instant,
-        operator_interrupt: bool,
+        payload: InputPayload,
     ) -> String {
+        let InputPayload {
+            bytes,
+            deadline,
+            operator_interrupt,
+            mut paste,
+        } = payload;
         let Some(terminal) = self.state.terminal_id_for_pane(ws, pane) else {
             return super::api::responses::encode_error(
                 id,
@@ -192,14 +264,14 @@ impl super::App {
                 "pane no longer exists",
             );
         };
-        if bytes.is_empty() {
+        if bytes.is_empty() && paste.is_none() {
             return if Instant::now() <= deadline {
                 encode_success(id, ResponseResult::Ok {})
             } else {
                 failure(id, 0, 0, "deadline")
             };
         }
-        self.input_writes.service();
+        self.service_input_writes();
         let key = terminal.to_string();
         if !self.input_writes.has_capacity(&key) {
             return failure(id, 0, bytes.len(), "admission_limit");
@@ -211,11 +283,25 @@ impl super::App {
                 "pane runtime no longer exists",
             );
         };
-        let receipt = runtime.try_send_tracked(bytes, deadline, operator_interrupt);
-        if let Some(response) = completed_reply(&id, &receipt) {
-            return response;
+        let receipt = if bytes.is_empty() {
+            let (ticket, receipt) = WriteReceipt::channel(bytes, Some(deadline));
+            let _ = ticket.write(|_| Ok(0));
+            receipt
+        } else {
+            runtime.try_send_tracked(bytes, deadline, operator_interrupt)
+        };
+        if paste.is_none() || receipt.progress().failure.is_some() {
+            if let Some(response) = completed_reply(&id, &receipt) {
+                return response;
+            }
         }
         self.input_writes.stage(id, key, deadline, receipt);
+        if let Some(mut paste) = paste.take() {
+            paste.ticket = self.input_writes.next_ticket;
+            if let Some(write) = self.input_writes.pending.get_mut(&paste.ticket) {
+                write.paste = Some(paste);
+            }
+        }
         String::new()
     }
 }

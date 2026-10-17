@@ -81,6 +81,8 @@ pub struct ApiRequestMessage {
     pub peer_pid: Option<u32>,
     /// Process birth captured with socket credentials, before queueing the request.
     pub peer_birth: Option<u64>,
+    /// Effective UID captured from kernel socket credentials.
+    pub peer_uid: Option<u32>,
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;
