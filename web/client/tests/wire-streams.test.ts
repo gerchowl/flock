@@ -346,3 +346,40 @@ describe("a same-socket re-sub takes a fresh id (ADR-0038 §3, ADR-0036 §5a)", 
     });
   }
 });
+
+describe("sub_id_reused (ADR-0036 §5a)", () => {
+  function refusedStream(): { h: Harness; seen: string[]; sub: { readonly id: string; readonly close: () => void } } {
+    const h = new Harness();
+    live(h);
+    const seen: string[] = [];
+    const sub = h.connection.subscribe("agent/a", { event: () => seen.push("event"), gap: () => seen.push("gap"), synced: () => seen.push("synced"), snapshot: () => seen.push("snapshot"), reset: () => seen.push("reset"), refused: (refusal) => seen.push(`refused ${refusal.code}: ${refusal.message}`) });
+    h.step(step({ step: "send", frame: { t: "subfail", sub_id: sub.id, code: "sub_id_reused", message: "s1 was used" } }));
+    return { h, seen, sub };
+  }
+
+  test("marks the stream Refused with a visible reason, and closes the id", () => {
+    const { h, seen } = refusedStream();
+    expect(h.connection.streams().get("s1")).toEqual({ stream: "agent/a", state: "Refused", cursor: null });
+    expect(seen).toEqual(["refused sub_id_reused: The server refused sub id s1 as already used on this connection, so this stream is not retried. Server: s1 was used"]);
+    const sent = sentFrames(h).length;
+    h.step(step({ step: "send", frame: { t: "ev", sub_id: "s1", stream: "agent/a", seq: 1, ts_ms: 0, ev: { type: "user", message: {} } } }));
+    h.step(step({ step: "send", frame: { t: "synced", sub_id: "s1", seq: 1 } }));
+    expect(seen).toHaveLength(1);
+    expect(h.connection.state).toBe("Live");
+    expect(sentFrames(h).length).toBe(sent);
+  });
+
+  test("is never re-subscribed: not on the same socket, nor after a reconnect", () => {
+    const { h } = refusedStream();
+    // Past the 30 s progress deadline, inside the 45 s liveness window.
+    h.clock.advanceTo(h.clock.now() + 31_000);
+    expect(subIds(h)).toEqual(["s1"]);
+    h.step(step({ step: "drop" }));
+    h.step(step({ step: "expect_connect", within_ms: 500, not_before_ms: 250 }));
+    h.step(step({ step: "open" }));
+    h.step(step({ step: "send", frame: WELCOME }));
+    expect(h.connection.state).toBe("Live");
+    expect(subIds(h)).toEqual(["s1"]);
+    expect(h.connection.streams().get("s1")?.state).toBe("Refused");
+  });
+});

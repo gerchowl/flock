@@ -530,6 +530,8 @@ export class WireConnection {
 
   /** Whether a new `welcome` can cure a refusal (ADR-0038 §3, Refused). */
   #cures(refusal: Refusal, before: Welcome | null, after: Welcome): boolean {
+    // A reused sub id is the client's own fault, which no new `welcome` cures (ADR-0036 §5a).
+    if (refusal.code === "sub_id_reused") return false;
     if (before === null) return true;
     switch (refusal.code) {
       case "scope":
@@ -540,8 +542,6 @@ export class WireConnection {
         return before.server_version !== after.server_version;
       case "cursor_ahead":
         return true;
-      case "sub_id_reused":
-        return false;
     }
   }
 
@@ -688,6 +688,16 @@ export class WireConnection {
   }
 
   #subfail(sub: Sub, code: SubfailCode, message: string): void {
+    if (code === "sub_id_reused") {
+      /*
+       * ADR-0036 §5a: the server refuses a `sub` whose id this connection
+       * already used. That is never retried: the stream is Refused, says so,
+       * and its id stays closed (Refused frames are dropped, and no `welcome`
+       * cures it; see `#cures`).
+       */
+      const reason = `The server refused sub id ${sub.id} as already used on this connection, so this stream is not retried. Server: ${message}`;
+      return this.#refuse(sub, { code, message: reason });
+    }
     if (code !== "cursor_ahead") return this.#refuse(sub, { code, message });
     sub.handler.reset();
     if (this.#subs.get(sub.id) !== sub) return this.#changed();
