@@ -2,6 +2,7 @@
 // The fixture drives the compiled CLI with raw Command, as the existing delegate tests do.
 #![allow(clippy::disallowed_methods)]
 mod support;
+
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -12,6 +13,7 @@ use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use support::environment::Command;
+use support::paths::app_dir_name;
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_flock_pid,
     unregister_spawned_flock_pid, wait_for_socket,
@@ -45,14 +47,6 @@ impl Drop for Server {
         }
         unregister_spawned_flock_pid(pid);
         cleanup_test_base(&self.base);
-    }
-}
-
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
     }
 }
 

@@ -48,10 +48,15 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 // Advance only the sandbox's durable collection deadline after a held answer.
 // An earlier empty poll correctly backs off for 60s in production.
 fn collect_now(node: &fleet::Node) {
-    rusqlite::Connection::open(node.home.join("state/flock-dev/mesh-mail.sqlite"))
-        .unwrap()
-        .execute("UPDATE envelopes SET collect_at=0", [])
-        .unwrap();
+    rusqlite::Connection::open(
+        node.home
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
+    )
+    .unwrap()
+    .execute("UPDATE envelopes SET collect_at=0", [])
+    .unwrap();
 }
 
 // ---- MCP client that lives inside a pane ---------------------------------
@@ -656,8 +661,13 @@ fn spoke_api(node: &fleet::Node, method: &str, params: Value) -> Value {
 }
 
 fn spoke_db(node: &fleet::Node) -> rusqlite::Connection {
-    let db =
-        rusqlite::Connection::open(node.home.join("state/flock-dev/mesh-mail.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(
+        node.home
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
+    )
+    .unwrap();
     db.busy_timeout(Duration::from_secs(5)).unwrap();
     db
 }
