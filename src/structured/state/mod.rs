@@ -4,6 +4,12 @@
 //! and publishes snapshots through agent.get/list; #1746 consumes the same seam
 //! for agent/<id> and fleet-lite. Control answers are host facts, not stdout
 //! control_response events (those answer requests initiated by the host).
+//! Exit and top-level result retire all open requests; CLI control_cancel_request
+//! retires only its named id. The S0 catalogue lacks cancellation, but the CLI
+//! emits it and the official SDK receiver handles it by request_id:
+//! https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py
+//! Only rejected establishes a provider limit. allowed/allowed_warning clear it.
+//! Unknown statuses are ignored, preserving the last known observation (ADR-0028 §3a).
 //!
 //! Notifications are in-process facts, NOT EventHub events. Mesh v5's
 //! AgentPhaseEvent requires a pane. #1804 owns pane-free, versioned events.
@@ -115,6 +121,8 @@ impl SessionState {
             }
             Input::ProcessExited => {
                 self.crashed = self.started;
+                self.controls.clear();
+                self.tools.clear();
             }
             Input::Lifecycle(lifecycle) => {
                 self.lifecycle = lifecycle;
@@ -139,6 +147,8 @@ impl SessionState {
         } else {
             Attention::None
         };
+        // ADR-0028 §1 masks turn while attention is set. Retain the underlying
+        // turn boundary so answering/cancelling a prompt restores its known state.
         let turn = if attention == Attention::None {
             self.turn
         } else {
@@ -284,21 +294,27 @@ impl SessionState {
                 );
             }
             SessionEvent::RateLimit(e) => {
-                self.limit = if e.rate_limit_info.status == "allowed" {
-                    None
-                } else {
-                    // SDK resets_at is a Unix timestamp (seconds), not a duration.
-                    // https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/types.py
-                    Some(
-                        e.rate_limit_info
-                            .resets_at
-                            .as_ref()
-                            .and_then(Option::as_ref)
-                            .and_then(serde_json::Value::as_u64)
-                            .and_then(|s| s.checked_mul(1000)),
-                    )
-                };
+                match e.rate_limit_info.status.as_str() {
+                    "allowed" | "allowed_warning" => self.limit = None,
+                    "rejected" => {
+                        // SDK resets_at is a Unix timestamp (seconds), not a duration.
+                        // https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/types.py
+                        self.limit = Some(
+                            e.rate_limit_info
+                                .resets_at
+                                .as_ref()
+                                .and_then(Option::as_ref)
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|s| s.checked_mul(1000)),
+                        );
+                    }
+                    _ => (), // Unknown future status is not evidence of a new limit.
+                }
             }
+            SessionEvent::ControlCancel(e) => {
+                self.controls.remove(&e.request_id);
+            }
+
             SessionEvent::ContentBlockStart(e) => self.tool_start(e.event.get("content_block")),
             SessionEvent::Assistant(e) => {
                 for block in e
@@ -344,7 +360,7 @@ impl SessionState {
         self.started = false;
         self.crashed = false;
         self.tools.clear();
-        // Only an actual host answer closes an incoming control request.
+        self.controls.clear();
     }
 }
 fn millis(duration: Duration) -> u64 {

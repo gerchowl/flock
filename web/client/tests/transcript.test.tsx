@@ -52,6 +52,7 @@ describe("Transcript", () => {
     await synced;
 
     expect(root.querySelectorAll('[data-testid="known-event"]').length).toBe(variants.length);
+    expect(root.textContent).toContain("Control request cancelled");
     const unknown = [...root.querySelectorAll<HTMLDetailsElement>('[data-testid="unknown-event"]')];
     expect(unknown.map((block) => block.querySelector("summary")?.textContent)).toEqual([
       "Unrecognised event: future_event",

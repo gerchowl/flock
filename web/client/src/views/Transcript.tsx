@@ -51,6 +51,8 @@ function label(event: KnownSessionEvent): string {
       return `Stream · ${event.event.type}`;
     case "control_request":
       return `Permission request · ${event.request.tool_name}`;
+    case "control_cancel_request":
+      return "Control request cancelled";
     case "control_response":
       return `Control response · ${event.response.subtype}`;
     case "command_lifecycle":

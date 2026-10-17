@@ -668,6 +668,12 @@ events! {
         request: ToolRequest,
     } optional {
     }
+    /// The CLI abandoned an incoming control request (SDK cancellation protocol).
+    ControlCancel("control_cancel_request", "", "") {
+        /// Exact incoming request to retire; other requests remain open.
+        request_id: String,
+    } optional {
+    }
     /// Successful response to a host control request (A.5, A.14-A.15).
     ControlSuccess("control_response", "/response/subtype", "success") {
         /// Request identifier and verb-specific result.

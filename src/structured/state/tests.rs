@@ -74,7 +74,7 @@ fn recorded_turn_boundaries_use_session_authority() {
 }
 
 #[test]
-fn every_open_request_requires_its_own_host_answer() {
+fn host_answers_only_close_their_own_incoming_requests() {
     let now = Instant::now();
     let mut reducer = SessionState::new("agent_fixture".into());
     step(&mut reducer, started(), now);
@@ -331,4 +331,126 @@ fn keyed_sink_never_changes_another_agent_or_publishes_eventhub_events() {
     assert_eq!(sink.0[1].state.phase, Phase::NeedsHuman);
     assert_eq!(clock(&mut a, now).state.phase, Phase::Working);
     assert_eq!(clock(&mut b, now).needs_human.len(), 1);
+}
+
+#[test]
+fn review_blocker_allowed_warning_does_not_block() {
+    let now = Instant::now();
+    let mut reducer = SessionState::new("agent_fixture".into());
+    step(&mut reducer, started(), now);
+    let mut rate = fixture("rate_limit_event", None);
+    rate["rate_limit_info"]["status"] = "allowed_warning".into();
+    assert_eq!(
+        step(&mut reducer, rate.clone(), now).state.phase,
+        Phase::Working
+    );
+    rate["rate_limit_info"]["status"] = "rejected".into();
+    step(&mut reducer, rate.clone(), now);
+    rate["rate_limit_info"]["status"] = "allowed_warning".into();
+    assert_eq!(
+        step(&mut reducer, rate, now).state.attention,
+        Attention::None
+    );
+}
+
+#[test]
+fn review_blocker_unknown_limit_status_preserves_the_last_observation() {
+    let now = Instant::now();
+    let mut reducer = SessionState::new("agent_fixture".into());
+    step(&mut reducer, started(), now);
+    let mut rate = fixture("rate_limit_event", None);
+    rate["rate_limit_info"]["status"] = "future-status".into();
+    assert_eq!(
+        step(&mut reducer, rate.clone(), now).state.phase,
+        Phase::Working
+    );
+    rate["rate_limit_info"]["status"] = "rejected".into();
+    let rejected = step(&mut reducer, rate.clone(), now).state;
+    rate["rate_limit_info"]["status"] = "future-status".into();
+    assert_eq!(step(&mut reducer, rate, now).state, rejected);
+}
+
+#[test]
+fn review_blocker_exit_closes_all_open_requests() {
+    let now = Instant::now();
+    let mut reducer = SessionState::new("agent_fixture".into());
+    step(&mut reducer, started(), now);
+    step(&mut reducer, permission("p1", "Read"), now);
+    step(&mut reducer, permission("p2", "AskUserQuestion"), now);
+    let exit = reducer.reduce(Input::ProcessExited, now, 1000, STALL);
+    assert!(
+        exit.needs_human.is_empty(),
+        "stale requests: {:?}",
+        exit.needs_human
+    );
+    assert_eq!(exit.state.phase, Phase::Blocked);
+    assert_eq!(
+        exit.state.attention,
+        Attention::Blocked {
+            reason: BlockedReason::Crashed,
+            retry_after_ms: None
+        }
+    );
+}
+
+#[test]
+fn review_blocker_result_closes_all_open_requests() {
+    for result in [
+        result(),
+        fixture("result", Some(("/subtype", "error_during_execution"))),
+    ] {
+        let now = Instant::now();
+        let mut reducer = SessionState::new("agent_fixture".into());
+        step(&mut reducer, started(), now);
+        step(&mut reducer, permission("p1", "Read"), now);
+        step(&mut reducer, permission("p2", "AskUserQuestion"), now);
+        let ended = step(&mut reducer, result, now);
+        assert!(
+            ended.needs_human.is_empty(),
+            "stale requests: {:?}",
+            ended.needs_human
+        );
+        assert_eq!(ended.state.turn, Turn::Idle);
+        assert_eq!(ended.state.phase, Phase::Settling);
+    }
+}
+
+#[test]
+fn review_blocker_cancel_closes_only_the_named_request() {
+    let now = Instant::now();
+    let mut reducer = SessionState::new("agent_fixture".into());
+    step(&mut reducer, started(), now);
+    step(&mut reducer, permission("p1", "Read"), now);
+    step(&mut reducer, permission("p2", "AskUserQuestion"), now);
+    let cancel = |id: &str| json!({"type":"control_cancel_request","request_id":id});
+    assert_eq!(
+        step(&mut reducer, cancel("other"), now).needs_human.len(),
+        2
+    );
+    let first = step(&mut reducer, cancel("p1"), now);
+    assert_eq!(first.needs_human, [("p2".into(), HumanReason::Question)]);
+    assert_eq!(first.state.phase, Phase::NeedsHuman);
+    assert_eq!(step(&mut reducer, cancel("p1"), now).needs_human.len(), 1);
+    let last = step(&mut reducer, cancel("p2"), now);
+    assert!(last.needs_human.is_empty());
+    assert_eq!(last.state.phase, Phase::Working);
+}
+
+#[test]
+fn provider_limit_outranks_crashed_until_the_registry_changes_lifecycle() {
+    let now = Instant::now();
+    let mut reducer = SessionState::new("agent_fixture".into());
+    step(&mut reducer, started(), now);
+    let mut rate = fixture("rate_limit_event", None);
+    rate["rate_limit_info"]["status"] = "rejected".into();
+    step(&mut reducer, rate, now);
+    assert_eq!(
+        reducer
+            .reduce(Input::ProcessExited, now, 1000, STALL)
+            .state
+            .phase,
+        Phase::LimitReached
+    );
+    let offline = reducer.reduce(Input::Lifecycle(Lifecycle::Offline), now, 1000, STALL);
+    assert_eq!(offline.state.phase, Phase::Offline);
 }

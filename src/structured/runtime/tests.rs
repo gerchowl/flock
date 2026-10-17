@@ -882,6 +882,7 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
 #[test]
 fn scripted_stream_drives_session_state_through_the_keyed_sink() {
     use crate::api::agent_state::{Phase, Turn};
+    use crate::structured::claude::SessionEvent;
     use crate::structured::state::{Input, SessionState, StateSink, Update};
     struct Sink(Vec<Update>);
     impl StateSink for Sink {
@@ -918,10 +919,23 @@ fn scripted_stream_drives_session_state_through_the_keyed_sink() {
         .find(|e| e["type"] == "result")
         .unwrap()
         .clone();
-    let lines = [start, permission, second, limit, result]
+    // Extra init/hook traffic must not change which state transitions are asserted.
+    let extra_init = catalogue
         .iter()
-        .map(|e| format!("{e}\n"))
-        .collect::<String>();
+        .find(|e| e["type"] == "system" && e["subtype"] == "init")
+        .unwrap()
+        .clone();
+    let extra_hook = catalogue
+        .iter()
+        .find(|e| e["subtype"] == "hook_response")
+        .unwrap()
+        .clone();
+    let lines = [
+        extra_init, start, permission, extra_hook, second, limit, result,
+    ]
+    .iter()
+    .map(|e| format!("{e}\n"))
+    .collect::<String>();
     fixture.file("state-events.jsonl", lines.as_bytes(), 0o600);
     let mut running = fixture.launch("state-reducer", "2.1.296").expect("launch");
     running.receive();
@@ -929,9 +943,18 @@ fn scripted_stream_drives_session_state_through_the_keyed_sink() {
     let now = Instant::now();
     let mut reducer = SessionState::new("fixture-agent".into());
     let mut sink = Sink(Vec::new());
-    for _ in 0..7 {
-        // The helper bounds receive and reports worker death, not an unbounded wait.
-        let received = running.receive();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stage = 0;
+    loop {
+        let received = running
+            .runtime
+            .receive_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "state stream stage {stage}: {error}; worker: {:?}",
+                    running.result.try_recv()
+                )
+            });
         reducer.publish(
             Input::Event(&received.event),
             now,
@@ -939,30 +962,48 @@ fn scripted_stream_drives_session_state_through_the_keyed_sink() {
             Duration::from_secs(1),
             &mut sink,
         );
+        let update = sink.0.last().unwrap();
+        match received.event {
+            SessionEvent::Init(_)
+            | SessionEvent::HookStarted(_)
+            | SessionEvent::HookResponse(_) => continue,
+            SessionEvent::CommandLifecycle(e) if e.state == "started" => {
+                assert_eq!(stage, 0);
+                assert_eq!(update.state.turn, Turn::Working);
+                assert_eq!(update.phase_changed, Some((Phase::Unknown, Phase::Working)));
+            }
+            SessionEvent::CanUseTool(e) => {
+                assert!(
+                    stage == 1 || stage == 2,
+                    "unexpected request at stage {stage}"
+                );
+                assert_eq!(e.request_id, format!("p{stage}"));
+                assert_eq!(update.state.phase, Phase::NeedsHuman);
+                assert_eq!(update.needs_human.len(), stage);
+                if stage == 1 {
+                    assert_eq!(
+                        update.phase_changed,
+                        Some((Phase::Working, Phase::NeedsHuman))
+                    );
+                }
+            }
+            SessionEvent::RateLimit(_) => {
+                assert_eq!(stage, 3);
+                assert_eq!(update.state.phase, Phase::LimitReached);
+                assert_eq!(update.needs_human.len(), 2);
+            }
+            SessionEvent::Success(_) => {
+                assert_eq!(stage, 4);
+                assert_eq!(update.state.phase, Phase::LimitReached);
+                assert_eq!(update.state.turn, Turn::Unknown);
+                assert!(update.needs_human.is_empty());
+                break;
+            }
+            other => panic!("unexpected state stream event: {other:?}"),
+        }
+        stage += 1;
     }
-    assert_eq!(
-        sink.0.iter().map(|u| u.state.phase).collect::<Vec<_>>(),
-        [
-            Phase::Unknown,
-            Phase::Unknown,
-            Phase::Working,
-            Phase::NeedsHuman,
-            Phase::NeedsHuman,
-            Phase::LimitReached,
-            Phase::LimitReached
-        ]
-    );
     assert!(sink.0.iter().all(|u| u.agent_id == "fixture-agent"));
-    assert_eq!(sink.0[4].needs_human.len(), 2);
-    assert_eq!(sink.0[6].state.turn, Turn::Unknown);
-    assert_eq!(
-        sink.0[2].phase_changed,
-        Some((Phase::Unknown, Phase::Working))
-    );
-    assert_eq!(
-        sink.0[3].phase_changed,
-        Some((Phase::Working, Phase::NeedsHuman))
-    );
     running.runtime.stop();
     assert_eq!(running.finish().outcome, Outcome::Stopped);
 }
