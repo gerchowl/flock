@@ -1384,7 +1384,6 @@ impl App {
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
         self.input_writes.abandon_staged();
-        self.pending_paste = None;
         self.pending_integration_install = None;
         self.detach_pending_message_relay();
         debug_assert!(
@@ -1600,7 +1599,9 @@ impl App {
             Method::PaneReleaseAgent(params) => {
                 return self.handle_pane_release_agent(request.id, params);
             }
-            Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
+            Method::PaneSendText(params) | Method::PaneWriteText(params) => {
+                return self.handle_pane_send_text(request.id, params)
+            }
             Method::PaneSendInput(params) | Method::PaneWriteInput(params) => {
                 return self.handle_pane_send_input(request.id, params)
             }

@@ -993,6 +993,7 @@ fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
         return None;
     }
     Some(AgentSendParams {
+        write_timeout_ms: None,
         target,
         text: text.join(" "),
         submit,
