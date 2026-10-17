@@ -50,8 +50,6 @@ pub struct PaneDetail {
     pub state_labels: HashMap<String, String>,
     /// Session-promoted header fields (chips), non-expired, insertion order.
     pub header_fields: Vec<(String, String)>,
-    /// Live status-line activity while Working (e.g. "Implementing the parser").
-    pub live_activity: Option<String>,
     /// When the effective agent state last transitioned.
     pub state_changed_at: Option<std::time::Instant>,
 }
@@ -141,9 +139,6 @@ impl Tab {
                     custom_status: presentation.custom_status,
                     state_labels: presentation.state_labels,
                     header_fields: terminal.active_header_fields(),
-                    live_activity: (state == AgentState::Working)
-                        .then(|| terminal.live_activity.clone())
-                        .flatten(),
                     state_changed_at: terminal.state_changed_at,
                 })
             })
