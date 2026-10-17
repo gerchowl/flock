@@ -21,6 +21,9 @@ test("auth refusal → NeedsToken from Syncing too", () => {
 /** The id of the latest `sub` sent: a same-socket re-sub moves a stream to a fresh one. */
 const lastSub = (h: Harness): string => (sentFrames(h).filter((frame) => (frame as { t: string }).t === "sub").at(-1) as { sub_id: string }).sub_id;
 
+/** The ids of every `sub` sent, in order. */
+const subIds = (h: Harness): string[] => sentFrames(h).flatMap((frame) => ((frame as { t: string }).t === "sub" ? [(frame as { sub_id: string }).sub_id] : []));
+
 /** A fleet snapshot line or delta; the connection does not look inside. */
 const fleetLine = (seq: number, id: string): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { id } });
 
@@ -134,7 +137,7 @@ describe("streams", () => {
     const h = new Harness();
     live(h);
     const cursors: (number | null)[] = [];
-    h.connection.subscribe("s1", "agent/a", {
+    h.connection.subscribe("agent/a", {
       event: () => cursors.push(h.connection.streams().get("s1")?.cursor ?? null),
       gap: () => undefined,
       synced: () => undefined,
@@ -220,19 +223,18 @@ describe("wire transport", () => {
     const h = new Harness();
     live(h);
     createWireTransport(h.connection).subscribe("agent/a", 7, { entry: () => undefined, synced: () => undefined, failed: () => undefined });
-    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "t1", stream: "agent/a", after: 7 });
-    h.step(step({ step: "send", frame: { t: "ev", sub_id: "t1", stream: "agent/a", seq: 8, ts_ms: 0, ev: { type: "user", message: {} } } }));
+    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s1", stream: "agent/a", after: 7 });
+    h.step(step({ step: "send", frame: { t: "ev", sub_id: "s1", stream: "agent/a", seq: 8, ts_ms: 0, ev: { type: "user", message: {} } } }));
     h.step(step({ step: "drop" }));
     h.step(step({ step: "expect_connect", within_ms: 500, not_before_ms: 250 }));
     h.step(step({ step: "open" }));
     h.step(step({ step: "send", frame: WELCOME }));
-    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "t1", stream: "agent/a", after: 8 });
+    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s1", stream: "agent/a", after: 8 });
   });
 });
 
 describe("sub ids (ADR-0038 §3, sub ids and closed subs)", () => {
   const quiet = { entry: () => undefined, synced: () => undefined, failed: () => undefined };
-  const subIds = (h: Harness): string[] => sentFrames(h).flatMap((frame) => ((frame as { t: string }).t === "sub" ? [(frame as { sub_id: string }).sub_id] : []));
 
   test("transports on one connection never reuse a sub id, even across agent switches", () => {
     const h = new Harness();
@@ -245,14 +247,24 @@ describe("sub ids (ADR-0038 §3, sub ids and closed subs)", () => {
     expect(new Set(ids).size).toBe(3);
   });
 
-  test("a sub id is never opened twice on a connection, even after its unsub", () => {
+  test("the connection allocates every id: one opened after an automatic re-sub never collides with it (#1816)", () => {
     const h = new Harness();
     live(h);
     const handler = { event: () => undefined, gap: () => undefined, synced: () => undefined, snapshot: () => undefined, reset: () => undefined, refused: () => undefined };
-    h.connection.subscribe("s1", "agent/a", handler);
-    h.connection.unsubscribe("s1");
-    expect(() => h.connection.subscribe("s1", "agent/b", handler)).toThrow("s1");
-    expect(h.connection.nextSubId("s")).not.toBe("s1");
+    const a = h.connection.subscribe("agent/a", handler);
+    expect(a.id).toBe("s1");
+    h.step(step({ step: "send", frame: { t: "lagged", sub_id: "s1", skipped_to: 9 } }));
+    // The re-sub took s2, the very id a caller picking "the next one" by hand would have chosen.
+    expect(a.id).toBe("s2");
+    const b = h.connection.subscribe("agent/b", handler);
+    expect(b.id).toBe("s3");
+    expect([...h.connection.streams()].map(([id, status]) => [id, status.stream])).toEqual([
+      ["s2", "agent/a"],
+      ["s3", "agent/b"],
+    ]);
+    a.close();
+    b.close();
+    expect(subIds(h)).toEqual(["s1", "s2", "s3"]);
   });
 
   test("late frames for a closed sub are dropped: the connection stays Live and the next agent is untouched", () => {
@@ -311,7 +323,7 @@ describe("a same-socket re-sub takes a fresh id (ADR-0038 §3, ADR-0036 §5a)", 
       live(h);
       const calls: string[] = [];
       const record = (kind: string) => () => void calls.push(kind);
-      h.connection.subscribe("s1", "agent/a", { event: record("event"), gap: record("gap"), synced: record("synced"), snapshot: record("snapshot"), reset: record("reset"), refused: record("refused") });
+      h.connection.subscribe("agent/a", { event: record("event"), gap: record("gap"), synced: record("synced"), snapshot: record("snapshot"), reset: record("reset"), refused: record("refused") });
       trigger(h);
       const fresh = lastSub(h);
       expect(fresh).not.toBe("s1");
@@ -333,4 +345,41 @@ describe("a same-socket re-sub takes a fresh id (ADR-0038 §3, ADR-0036 §5a)", 
       expect(sentFrames(h).length).toBe(sent.length);
     });
   }
+});
+
+describe("sub_id_reused (ADR-0036 §5a)", () => {
+  function refusedStream(): { h: Harness; seen: string[]; sub: { readonly id: string; readonly close: () => void } } {
+    const h = new Harness();
+    live(h);
+    const seen: string[] = [];
+    const sub = h.connection.subscribe("agent/a", { event: () => seen.push("event"), gap: () => seen.push("gap"), synced: () => seen.push("synced"), snapshot: () => seen.push("snapshot"), reset: () => seen.push("reset"), refused: (refusal) => seen.push(`refused ${refusal.code}: ${refusal.message}`) });
+    h.step(step({ step: "send", frame: { t: "subfail", sub_id: sub.id, code: "sub_id_reused", message: "s1 was used" } }));
+    return { h, seen, sub };
+  }
+
+  test("marks the stream Refused with a visible reason, and closes the id", () => {
+    const { h, seen } = refusedStream();
+    expect(h.connection.streams().get("s1")).toEqual({ stream: "agent/a", state: "Refused", cursor: null });
+    expect(seen).toEqual(["refused sub_id_reused: The server refused sub id s1 as already used on this connection, so this stream is not retried. Server: s1 was used"]);
+    const sent = sentFrames(h).length;
+    h.step(step({ step: "send", frame: { t: "ev", sub_id: "s1", stream: "agent/a", seq: 1, ts_ms: 0, ev: { type: "user", message: {} } } }));
+    h.step(step({ step: "send", frame: { t: "synced", sub_id: "s1", seq: 1 } }));
+    expect(seen).toHaveLength(1);
+    expect(h.connection.state).toBe("Live");
+    expect(sentFrames(h).length).toBe(sent);
+  });
+
+  test("is never re-subscribed: not on the same socket, nor after a reconnect", () => {
+    const { h } = refusedStream();
+    // Past the 30 s progress deadline, inside the 45 s liveness window.
+    h.clock.advanceTo(h.clock.now() + 31_000);
+    expect(subIds(h)).toEqual(["s1"]);
+    h.step(step({ step: "drop" }));
+    h.step(step({ step: "expect_connect", within_ms: 500, not_before_ms: 250 }));
+    h.step(step({ step: "open" }));
+    h.step(step({ step: "send", frame: WELCOME }));
+    expect(h.connection.state).toBe("Live");
+    expect(subIds(h)).toEqual(["s1"]);
+    expect(h.connection.streams().get("s1")?.state).toBe("Refused");
+  });
 });
