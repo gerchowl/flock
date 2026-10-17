@@ -206,6 +206,7 @@ error_codes! {
     Yes:
         Timeout = "timeout";
     Later:
+        SessionBusy = "session_busy",
         InputWriteCancelled = "input_write_cancelled",
         AgentNotReady = "agent_not_ready",
         AtAgentCapacity = "at_agent_capacity",
@@ -299,7 +300,7 @@ mod tests {
             ("never", "agent_here_unavailable agent_name_taken agent_no_active_workspace agent_not_found agent_placement_conflict agent_placement_not_found agent_placement_required agent_profile_unresolved agent_spawn_disabled agent_target_ambiguous already_hibernated ambiguous_worktree_branch at_lineage_depth channel_not_owner channel_unauthorized check_not_found cursor_ahead dirty_worktree_requires_force goal_already_armed goal_caller_refused goal_not_armed goal_not_paused handoff_not_found handoff_too_large hibernate_unsupported hop_budget_exhausted identity_pin_conflict identity_unknown invalid_agent invalid_agent_argv invalid_agent_name invalid_custody_state invalid_envelope invalid_header_field invalid_key invalid_metadata_request invalid_params invalid_regex invalid_request invalid_session_name invalid_signature invalid_state_label lineage_not_found linked_worktree_source loop_detected mesh_collection_refused mesh_refused message_expired message_key_conflict message_not_found msg_not_allowed msg_target_ambiguous msg_target_not_found no_agent_session no_branch no_caller_pane no_checkout not_an_edge not_found not_from_a_pane not_git_worktree not_hibernated not_implemented not_linked_worktree operator_only origin_mismatch owner_policy_changed owner_policy_unreadable pane_gone pane_not_found parked prompt_control_bytes prompt_empty prompt_too_long questions_widening_refused recipient_gone relay_not_from_ssh relay_unattestable reply_unavailable restart_disabled restart_unsupported self_compact_instructions_unsupported self_compact_unavailable self_kill_unconfirmed self_message_forbidden sender_unresolved spawn_caller_unknown stash_empty submodule_worktree_requires_force tab_not_found target_pane_not_found too_many_header_fields transcript_not_found unknown_agent_kind unsafe_text unsupported_for_agent unsupported_in_app_mode wait_deadline_too_long wait_predicate_invalid wait_predicate_unsupported workspace_not_found worktree_not_found"),
             ("maybe", "agent_fork_failed agent_start_failed checkout_prepare_failed delegate_unreachable digest_write_failed handoff_failed handoff_unreadable integration_install_failed integration_uninstall_failed internal_error mail_store_unavailable mesh_delivery_refused mesh_store_unavailable pane_move_failed pane_send_failed pane_split_failed pause_persist_failed serialization_error server_unavailable session_broken session_delete_failed session_stop_failed spawn_failed spawn_location_unresolved tab_close_failed tab_create_failed transcript_unreadable transport workspace_create_failed worktree_create_failed worktree_list_failed worktree_open_failed worktree_prune_failed worktree_remove_failed write_failed"),
             ("yes", "timeout"),
-            ("later", "agent_not_ready at_agent_capacity at_fanout_limit channel_token_unavailable fleet_paused handoff_undrained injection_pending input_not_empty input_write_cancelled mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active restart_busy restart_pending restart_rate_limited session_unconfirmed too_many_waits unknown_composer worktree_merge_unknown worktree_open_pr"),
+            ("later", "agent_not_ready at_agent_capacity at_fanout_limit channel_token_unavailable fleet_paused handoff_undrained injection_pending input_not_empty input_write_cancelled mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active restart_busy restart_pending restart_rate_limited session_busy session_unconfirmed too_many_waits unknown_composer worktree_merge_unknown worktree_open_pr"),
             ("after_inspecting", "agent_exited_at_start agent_exited_before_ready input_write_failed input_write_unknown no_result self_submit_unconfirmed session_mismatch"),
             ("after_human", "claude_folder_trust codex_folder_trust codex_hook_review structured_harness_version_unsupported structured_needs_agent_user"),
             ("after_handoff", "mail_store_schema_too_new mesh_version_mismatch peer_incompatible server_version_gap"),
@@ -308,7 +309,13 @@ mod tests {
         .map(|(class, codes)| (class, codes.to_string()))
         .collect();
         assert_eq!(actual, expected);
-        assert_eq!(ErrorCode::ALL.len(), 178);
+        // Count the independent expected table so concurrent additions cannot
+        // silently overwrite each other's aggregate count during a merge.
+        let expected_count: usize = expected
+            .iter()
+            .map(|(_, codes)| codes.split_whitespace().count())
+            .sum();
+        assert_eq!(ErrorCode::ALL.len(), expected_count);
     }
 
     #[test]

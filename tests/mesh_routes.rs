@@ -161,22 +161,21 @@ fn agent_owner_hint_survives_restart_as_offline() {
         .to_owned();
     let a = fleet.node("nodea");
     let db = fleet::wait_until("owner hint committed", Duration::from_secs(20), || {
-        ["flock", "flock-dev"].into_iter().find_map(|app| {
-            let path = a.home.join("state").join(app).join("mesh-mail.sqlite");
-            let db = rusqlite::Connection::open_with_flags(
-                &path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        let app = support::paths::app_dir_name();
+        let path = a.home.join("state").join(app).join("mesh-mail.sqlite");
+        let db = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()?;
+        let node: String = db
+            .query_row(
+                "SELECT node_id FROM agent_owners WHERE agent_id=?1",
+                [&agent],
+                |r| r.get(0),
             )
             .ok()?;
-            let node: String = db
-                .query_row(
-                    "SELECT node_id FROM agent_owners WHERE agent_id=?1",
-                    [&agent],
-                    |r| r.get(0),
-                )
-                .ok()?;
-            (node == id(b)).then_some(path)
-        })
+        (node == id(b)).then_some(path)
     });
     fleet.refuse_ssh_to("nodeb");
     fleet.node_mut("nodea").restart();

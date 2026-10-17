@@ -24,6 +24,11 @@ use super::responses::{encode_error, encode_error_with_data, encode_success};
 /// caller-supplied identity would be a claim, and depth is exactly the thing a
 /// runaway caller would want to lie about.
 pub(in crate::app) enum SpawnCaller {
+    /// A pane-less lease owner; None is unresolved evidence, never operator authority.
+    Structured {
+        agent_id: Option<String>,
+        depth: u32,
+    },
     /// Ancestry attests a live pane that is running an agent. Whatever it
     /// asks for is agent-initiated, whichever verb it reached for.
     Agent {
@@ -108,7 +113,7 @@ impl SpawnCaller {
             SpawnCaller::Operator {
                 pane: Some((ws_idx, _)),
             } => Some(*ws_idx),
-            SpawnCaller::Operator { pane: None } => None,
+            SpawnCaller::Operator { pane: None } | SpawnCaller::Structured { .. } => None,
         }
     }
 }
@@ -363,6 +368,21 @@ impl App {
     /// one answer — a second classification over the same evidence is the
     /// drift #124 / #197 / #199-#210 are.
     pub(in crate::app) fn spawn_caller(&mut self) -> SpawnCaller {
+        match self.lease_caller() {
+            crate::structured::lease::Caller::Agent { agent, depth } => {
+                return SpawnCaller::Structured {
+                    agent_id: Some(agent),
+                    depth,
+                };
+            }
+            crate::structured::lease::Caller::Uncertain => {
+                return SpawnCaller::Structured {
+                    agent_id: None,
+                    depth: 0,
+                };
+            }
+            crate::structured::lease::Caller::Unrelated => (),
+        }
         let peer_pane = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
         let Some((ws_idx, pane_id)) = peer_pane else {
             return SpawnCaller::Operator { pane: None };
@@ -411,15 +431,44 @@ impl App {
         caller: &SpawnCaller,
         inherits_depth_from: Option<(usize, crate::layout::PaneId)>,
     ) -> Result<Option<SpawnLineage>, SpawnRefusal> {
-        let SpawnCaller::Agent {
-            ws_idx,
-            pane_id,
-            agent_id,
-        } = caller
-        else {
-            return Ok(None);
+        let (mut census, agent_id) = match caller {
+            SpawnCaller::Agent {
+                ws_idx,
+                pane_id,
+                agent_id,
+            } => (self.spawn_census(*ws_idx, *pane_id), agent_id),
+            SpawnCaller::Structured {
+                agent_id: Some(agent_id),
+                depth,
+            } => (
+                SpawnCensus {
+                    live_agent_started: self
+                        .state
+                        .terminals
+                        .values()
+                        .filter(|t| t.spawned_by.is_some())
+                        .count(),
+                    parent_live_children: self
+                        .state
+                        .terminals
+                        .values()
+                        .filter(|t| t.spawned_by.as_deref() == Some(agent_id))
+                        .count(),
+                    child_depth: depth.saturating_add(1),
+                },
+                agent_id,
+            ),
+            SpawnCaller::Structured { agent_id: None, .. } => {
+                return Err(SpawnRefusal::CallerUnknown)
+            }
+            SpawnCaller::Operator { .. } => return Ok(None),
         };
-        let mut census = self.spawn_census(*ws_idx, *pane_id);
+        let (leased, children) = self
+            .session_leases
+            .counts(agent_id)
+            .map_err(|_| SpawnRefusal::CallerUnknown)?;
+        census.live_agent_started += leased;
+        census.parent_live_children += children;
         if let Some((ws_idx, pane_id)) = inherits_depth_from {
             census.child_depth = census
                 .child_depth
@@ -572,7 +621,7 @@ pub(super) fn refusal_data(refusal: &SpawnRefusal) -> serde_json::Value {
                 map.insert("env_value".into(), value.clone().into());
             }
         }
-        SpawnRefusal::FleetPaused | SpawnRefusal::NotEnabled => {}
+        SpawnRefusal::FleetPaused | SpawnRefusal::NotEnabled | SpawnRefusal::CallerUnknown => {}
     }
     data
 }
@@ -802,7 +851,9 @@ mod tests {
                 assert_eq!(resolved, pane_id);
                 assert_eq!(resolved_id, agent_id);
             }
-            super::SpawnCaller::Operator { .. } => panic!("an agent pane must attest as an agent"),
+            super::SpawnCaller::Operator { .. } | super::SpawnCaller::Structured { .. } => {
+                panic!("an agent pane must attest as an agent")
+            }
         }
     }
 

@@ -2993,10 +2993,12 @@ impl HeadlessServer {
             })
         } else {
             self.app.current_api_peer_pid = msg.peer_pid;
+            self.app.current_api_peer_birth = Some(msg.peer_birth);
             let response = self
                 .app
                 .handle_api_request_after_internal_events_drained(msg.request);
             self.app.current_api_peer_pid = None;
+            self.app.current_api_peer_birth = None;
             response
         };
         self.app.respond_or_park(msg.respond_to, response);
@@ -4719,7 +4721,7 @@ mod tests {
         let (respond_to, response) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true,"write_timeout_ms":200}})).unwrap(),
-            respond_to, peer_pid:None,
+            respond_to, peer_pid:None, peer_birth:None,
         });
         assert!(matches!(
             response.try_recv(),
@@ -4763,7 +4765,7 @@ mod tests {
         let (respond_to, response) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true}})).unwrap(),
-            respond_to, peer_pid:None,
+            respond_to, peer_pid:None, peer_birth:None,
         });
         assert!(matches!(
             response.try_recv(),
@@ -4889,6 +4891,7 @@ mod tests {
                 },
                 respond_to,
                 peer_pid: None,
+                peer_birth: None,
             })
         );
         let response = response_rx
@@ -7605,6 +7608,7 @@ next_tab = ""
                 },
                 respond_to,
                 peer_pid: None,
+                peer_birth: None,
             })
         );
         let _ = response_rx
@@ -9240,6 +9244,7 @@ next_tab = ""
             },
             respond_to,
             peer_pid: None,
+            peer_birth: None,
         });
 
         assert!(changed);

@@ -1321,3 +1321,50 @@ async fn restart_1659_claude_print_is_not_a_value_taking_option() {
         ]
     );
 }
+
+#[tokio::test]
+async fn restart_refusal_envelope_omits_attached_values_without_stopping() {
+    for (option, flag, omitted) in [
+        (
+            "-pfixture-sensitive-profile",
+            "-p",
+            "fixture-sensitive-profile",
+        ),
+        (
+            "-mfixture-sensitive-profile",
+            "-m",
+            "fixture-sensitive-profile",
+        ),
+        ("-abc", "-a", "bc"),
+        (
+            "--unverified=fixture-sensitive-profile",
+            "--unverified",
+            "fixture-sensitive-profile",
+        ),
+    ] {
+        let mut rig = rig_with_launch_options(
+            "#!/bin/sh\nwhile IFS= read -r line; do :; done\n",
+            &[option],
+        );
+        let pid = rig.app.terminal_runtimes.get(&rig.id).unwrap().child_pid();
+        let response = request(&mut rig);
+        assert_eq!(
+            response["error"]["code"], "restart_unsupported",
+            "{response}"
+        );
+        assert!(
+            !response.to_string().contains(omitted),
+            "value in error envelope: {response}"
+        );
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(flag) && message.contains("(attached value omitted)"),
+            "{response}"
+        );
+        assert_eq!(
+            rig.app.terminal_runtimes.get(&rig.id).unwrap().child_pid(),
+            pid
+        );
+        assert!(rig.app.state.agent_restarts.is_empty());
+    }
+}

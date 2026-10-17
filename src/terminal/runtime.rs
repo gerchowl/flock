@@ -596,7 +596,7 @@ mod write_ack_tests {
         let (respond_to, response) = reply::channel();
         api_tx.send(crate::api::ApiRequestMessage {
             request: serde_json::from_value(serde_json::json!({"id":"native","method":"pane.write_input","params":{"pane_id":public,"text":"é","keys":["Enter"],"raw":true}})).unwrap(),
-            respond_to, peer_pid:None,
+            respond_to, peer_pid:None, peer_birth:None,
         }).unwrap();
         app.drain_api_requests();
         assert!(matches!(

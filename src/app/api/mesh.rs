@@ -180,7 +180,8 @@ impl App {
     /// agent's detached (`setsid`) child has no pane in its ancestry and
     /// passes (ADR-0027 §1a).
     pub(super) fn caller_is_local_operator(&mut self) -> bool {
-        self.current_api_peer_pid.is_some()
+        self.lease_caller() == crate::structured::lease::Caller::Unrelated
+            && self.current_api_peer_pid.is_some()
             && self
                 .parse_pane_id_or_peer("", self.current_api_peer_pid)
                 .is_none()

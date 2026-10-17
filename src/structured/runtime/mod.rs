@@ -74,6 +74,11 @@ impl Runtime {
     pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
         self.events.try_recv()
     }
+    /// Wait for a persisted event on a worker, with a finite deadline.
+    /// Server-loop callers must use `try_receive` instead.
+    pub fn receive_timeout(&self, timeout: Duration) -> Result<Received, mpsc::RecvTimeoutError> {
+        self.events.recv_timeout(timeout)
+    }
     /// Record intent before cancellation/closure/signals; never join workers here.
     pub fn stop(&self) {
         self.stop.request();
@@ -94,13 +99,19 @@ impl Drop for Runtime {
 /// that residual TOCTOU. Registry parent verification also has a residual path
 /// lookup window; see `registry_has_messaging_socket`. Forward the returned exit
 /// through the caller's event channel. This API does not expose agent.start or
-/// supply a lease.
+/// reserve a lease; the caller must reserve before preparing the launch.
 pub fn run(
     state: &Path,
     profile: LaunchProfile,
+    mut lease: super::lease::Lease,
     location: StreamLocation,
     ready: impl FnOnce(Runtime),
 ) -> Result<Exit, LaunchError> {
+    if !lease.matches(&location.agent, &location.session)
+        || profile.session_id() != location.session
+    {
+        return Err(io::Error::other("structured lease/stream mismatch").into());
+    }
     for entry in supervision::sweep_stale_sessions(state)? {
         crate::logging::structured_sweep_outcome(&entry);
     }
@@ -130,14 +141,29 @@ pub fn run(
     profile.configure_environment(|key, value| {
         command.env(key, value);
     });
-    let (mut child, profile) = profile.try_spawn(|| command.spawn_traced())?;
+    let (mut child, profile) = match profile.try_spawn(|| lease.spawn(|| command.spawn_traced())) {
+        Ok(started) => started,
+        Err(error) => {
+            lease.release();
+            return Err(error.into());
+        }
+    };
     let config = profile.config_dir().to_owned();
     let files = profile.into_session_files();
     let pid = child.id();
+    if let Err(error) = lease.bind(pid) {
+        return Err(startup_failed(
+            child, files, config, error, true, &mut lease,
+        ));
+    }
     let registry = config.clone();
     let (stdout, stdin) = match platform::structured::child_pipes(&mut child) {
         Ok(pipes) => pipes,
-        Err(error) => return Err(startup_failed(child, files, config, error, true)),
+        Err(error) => {
+            return Err(startup_failed(
+                child, files, config, error, true, &mut lease,
+            ))
+        }
     };
     let transport = Transport::start_guarded(stdout, stdin, location, version, move || {
         match registry_has_messaging_socket(&registry, pid) {
@@ -154,7 +180,11 @@ pub fn run(
     });
     let transport = match transport {
         Ok(transport) => transport,
-        Err(error) => return Err(startup_failed(child, files, config, error, false)),
+        Err(error) => {
+            return Err(startup_failed(
+                child, files, config, error, false, &mut lease,
+            ))
+        }
     };
     let control = transport.stop_handle();
     let input = transport.input_handle();
@@ -180,7 +210,9 @@ pub fn run(
         })
     {
         control.cancel();
-        return Err(startup_failed(child, files, config, error, false));
+        return Err(startup_failed(
+            child, files, config, error, false, &mut lease,
+        ));
     }
     let publication_failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ready(Runtime {
@@ -224,6 +256,9 @@ pub fn run(
         supervision::Schedule::default(),
     );
     control.cancel();
+    if report.cleanup.is_ok() {
+        lease.release();
+    }
     let cleanup = report.cleanup.err().map(|error| error.to_string());
     let outcome = if facts.refusal.is_some() {
         Outcome::Refused
@@ -255,6 +290,7 @@ fn startup_failed(
     config: std::path::PathBuf,
     error: io::Error,
     io_confirmed: bool,
+    lease: &mut super::lease::Lease,
 ) -> LaunchError {
     let stop = StopRequest::default();
     stop.request();
@@ -275,6 +311,9 @@ fn startup_failed(
         },
         supervision::Schedule::default(),
     );
+    if report.cleanup.is_ok() {
+        lease.release();
+    }
     let cleanup = match report.cleanup {
         Ok(()) => "cleanup confirmed".to_owned(),
         Err(error) => format!("cleanup failed: {error}"),
@@ -399,4 +438,4 @@ fn collect(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

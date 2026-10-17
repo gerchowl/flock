@@ -54,7 +54,67 @@ fn contracts() -> BTreeMap<PathBuf, String> {
     collector.add::<WorkspaceInfo>();
     collector.add::<PaneInfo>();
     crate::structured::claude::ts_events(&mut collector);
-    collector.files
+    collector.add::<crate::structured_wire::ClientFrame>();
+    collector.add::<crate::structured_wire::ServerFrame>();
+    collector.add::<crate::structured_wire::fixture::FixtureLine>();
+    let mut files = collector.files;
+    // Classification comes from the adapter, so new fixtures cannot silently be skipped.
+    let mut fixtures = String::from(
+        "// Generated from Rust-classified Claude fixtures by just gen-ts. Do not edit.\n\
+         import type { KnownSessionEvent } from './KnownSessionEvent';\n",
+    );
+    for line in include_str!("../tests/fixtures/claude-session/events.jsonl").lines() {
+        if !matches!(
+            crate::structured::claude::SessionEvent::parse(line, "fixture"),
+            crate::structured::claude::SessionEvent::Unknown { .. }
+        ) {
+            fixtures.push_str(&format!("({line}) satisfies KnownSessionEvent;\n"));
+        }
+    }
+    files.insert(PathBuf::from("known-session-fixtures.ts"), fixtures);
+    // Compile literal fixture inputs under the same strict TS config as contracts.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web/client/test/fixtures/wire");
+    let mut scripts: Vec<_> = std::fs::read_dir(root)
+        .expect("fixture directory")
+        .map(|entry| entry.expect("fixture entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    scripts.sort();
+    let mut examples = String::from(
+        r#"// Generated from wire JSONL scripts by just gen-ts.
+import type { FixtureLine } from "./FixtureLine";
+export const fixtureExamples = {
+"#,
+    );
+    for path in scripts {
+        let name = path.file_stem().expect("fixture name").to_string_lossy();
+        examples.push_str(&format!(
+            "{}: [
+",
+            serde_json::to_string(&name).expect("fixture key")
+        ));
+        for line in std::fs::read_to_string(&path)
+            .expect("fixture script")
+            .lines()
+        {
+            let value: serde_json::Value = serde_json::from_str(line).expect("fixture JSON");
+            examples.push_str(&serde_json::to_string(&value).expect("fixture literal"));
+            examples.push_str(
+                ",
+",
+            );
+        }
+        examples.push_str(
+            "],
+",
+        );
+    }
+    examples.push_str(
+        "} satisfies Record<string, FixtureLine[]>;
+",
+    );
+    files.insert(PathBuf::from("FixtureExamples.ts"), examples);
+    files
 }
 
 fn generated_paths(root: &std::path::Path) -> Vec<PathBuf> {

@@ -189,14 +189,21 @@ fn legacy_log_inbox_is_imported_once_and_survives_log_removal() {
     );
     let node = fleet.node("nodea");
     let recipient = agent(node);
-    let database_path = node.home.join("state/flock-dev/mesh-mail.sqlite");
+    let database_path = node
+        .home
+        .join("state")
+        .join(support::paths::app_dir_name())
+        .join("mesh-mail.sqlite");
     let connection = rusqlite::Connection::open(database_path).unwrap();
     // Model the pre-custody migration boundary in this isolated database.
     connection
         .execute("DELETE FROM migrations WHERE name='audit-inbox-v1'", [])
         .unwrap();
     drop(connection);
-    let log = node.config_home.join("flock-dev/event-log.jsonl");
+    let log = node
+        .config_home
+        .join(support::paths::app_dir_name())
+        .join("event-log.jsonl");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -243,8 +250,13 @@ fn legacy_log_inbox_is_imported_once_and_survives_log_removal() {
 }
 
 fn database(node: &Node) -> rusqlite::Connection {
-    let db =
-        rusqlite::Connection::open(node.home.join("state/flock-dev/mesh-mail.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(
+        node.home
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
+    )
+    .unwrap();
     db.busy_timeout(Duration::from_secs(5)).unwrap();
     db
 }
@@ -567,7 +579,9 @@ fn live_handoff_resumes_pending_outbox_once() {
     let path = fleet
         .node("nodea")
         .home
-        .join("state/flock-dev/mesh-mail.sqlite");
+        .join("state")
+        .join(support::paths::app_dir_name())
+        .join("mesh-mail.sqlite");
     fleet::wait_until(
         "durable handoff delivery receipt",
         Duration::from_secs(30),
@@ -612,7 +626,9 @@ fn cold_restart_quarantines_undecodable_mail_and_restores_valid_records() {
     let path = fleet
         .node("nodea")
         .home
-        .join("state/flock-dev/mesh-mail.sqlite");
+        .join("state")
+        .join(support::paths::app_dir_name())
+        .join("mesh-mail.sqlite");
     {
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute(
