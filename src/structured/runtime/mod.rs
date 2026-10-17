@@ -7,7 +7,8 @@
 #![deny(missing_docs)]
 
 use super::launch::{
-    registry_has_messaging_socket, LaunchError, LaunchProfile, SessionConfigDir, VerifiedBinary,
+    registry_has_messaging_socket, LaunchError, LaunchProfile, SessionConfigDir, SessionMcp,
+    VerifiedBinary,
 };
 use super::supervision::{self, StopRequest};
 use super::transport::{
@@ -100,11 +101,13 @@ impl Drop for Runtime {
 /// lookup window; see `registry_has_messaging_socket`. Forward the returned exit
 /// through the caller's event channel. This API does not expose agent.start or
 /// reserve a lease; the caller must reserve before preparing the launch.
+/// `mcp` pins this build and the owning server socket; no ambient endpoint lookup.
 pub fn run(
     state: &Path,
     profile: LaunchProfile,
     mut lease: super::lease::Lease,
     location: StreamLocation,
+    mcp: SessionMcp,
     ready: impl FnOnce(Runtime),
 ) -> Result<Exit, LaunchError> {
     if !lease.matches(&location.agent, &location.session)
@@ -112,6 +115,7 @@ pub fn run(
     {
         return Err(io::Error::other("structured lease/stream mismatch").into());
     }
+    profile.register_flock_mcp(Some(&lease), &mcp)?;
     for entry in supervision::sweep_stale_sessions(state)? {
         crate::logging::structured_sweep_outcome(&entry);
     }
