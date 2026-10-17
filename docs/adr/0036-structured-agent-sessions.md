@@ -360,6 +360,32 @@ screen detector is not run.
 | process exit without `result` | `Lifecycle` unchanged, `Attention::Blocked{crashed}` |
 | anything unknown | §8 |
 
+S4 integration boundary (architect ruling, #1427). One pure reducer per
+`agent_id` and launch generation consumes S1 events and explicit host facts.
+Its `StateSink` publishes `AgentState` snapshots, immediate phase transitions,
+all open needs-human request ids/reasons, and one stall observation per silent
+interval. #1439 connects this seam to the registry and agent.get/list; S7-min
+#1746 connects it to agent/<id> and fleet-lite. These immediate facts are not
+settled supervisor events. S4 emits no `agent.phase_changed`, `agent.needs_human`
+or `agent.session_stalled` EventHub envelopes: `AgentPhaseEvent` and mesh v5
+stay unchanged. #1804 owns the mesh-versioned pane-free event contract.
+No placement is empty or fabricated, and list/side-pane wiring remains #1439.
+
+The caller supplies monotonic observation time and its configured `stall_ms`;
+the reducer never starts a timer, polls a process or kills/retries a turn.
+Every stdout line, including an unknown line, proves progress but an unknown
+event never changes the axes. A host-sent answer closes only its incoming
+`request_id`; stdout control responses acknowledge host-initiated controls
+and cannot close incoming permission requests. A tool remains open past its
+argument `content_block_stop`, until its matching `tool_result` or a top-level
+`result`. Subagent results never end the parent turn. A late result ends a
+stalled turn normally; the observation itself leaves the phase unchanged.
+Unavailable background and registered-wait evidence stays `unknown`, so idle
+alone cannot manufacture `finished`. Provider reset timestamps are Unix seconds
+converted to an optional duration against receive-time Unix milliseconds;
+missing, null, incompatible or overflowing reset metadata gives no duration.
+Lifecycle comes explicitly from the registry and retains ADR-0028 precedence.
+
 Phase derivation is ADR-0028 §1's unchanged; only the inputs differ. A
 question answered while its control request is still open becomes the
 `control_response` (`behavior: allow`, `updatedInput` with `answers`), so the
@@ -1770,7 +1796,7 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S1 | `SessionEvent` types for Claude stream-json: known variants with `extra`, `Unknown{raw, shape}`, shape key; redacted probe fixtures as tests | — | 350 |
 | S2 | `session.unknown_shape` persisted kind (skip test per ADR-0028 §3a), once-per-shape registry logging through `tracing` only (#1300), `flk report --unknown-events` | S1 | 250 |
 | S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (the login from the 0600 `setup-token` file g-fleet renders (g-fleet#476), passed as `CLAUDE_CODE_OAUTH_TOKEN` in the session env and never logged, owner decision 1; `--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
-| S4 | State mapping: `StateSource::Session`, turn / attention / limit from events, stall observation, `agent.phase_changed` | S3 | 300 |
+| S4 | Pure per-agent state reducer: `StateSource::Session`, turn / attention / limit from events, stall observation and in-process phase/needs-human facts; registry seam for #1439 and S7-min #1746. Pane-free EventHub events deferred to #1804 | S3 | 300 |
 | S5 | Input queue: `queue/<agent>` stream, producers, gate, `command_lifecycle` acks, independent `delivery` (`at_idle` / `steer` / `interrupt`) and `priority` ordering, one batch per turn with the FIFO rules 1 to 4 and batch messages, `flk agent send` and msg delivery routed to it | S3 | 400 |
 | S5c | Queue UX: `queue.update` / `edit` leases / `move` / `delete`, named stashes with `stash` / `pop` / `clear` / `stashes`, `send_now` (`steer`, or `interrupt` through the harness's `interrupt{send_now}`), `take_back` through `cancel_async_message` (§3, A.14, owner decision 4) | S0, S5 | 300 |
 | S5d | System One for the queue: relatedness joins at idle and the relevance check during a turn, `[queue] relevance` (whose `force` sends through S5c's `send_now`), recorded for rating (§3, owner decisions 4 and 5) | S5, S5c | 200 |

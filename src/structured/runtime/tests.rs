@@ -878,3 +878,91 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
         assert!(fixture.leases.reserve(agent, session, None).is_ok());
     }
 }
+
+#[test]
+fn scripted_stream_drives_session_state_through_the_keyed_sink() {
+    use crate::api::agent_state::{Phase, Turn};
+    use crate::structured::state::{Input, SessionState, StateSink, Update};
+    struct Sink(Vec<Update>);
+    impl StateSink for Sink {
+        fn publish(&mut self, update: Update) {
+            self.0.push(update);
+        }
+    }
+    let fixture = Fixture::new();
+    let catalogue: Vec<Value> = include_str!("../../../tests/fixtures/claude-session/events.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let start = catalogue
+        .iter()
+        .find(|e| e["state"] == "started")
+        .unwrap()
+        .clone();
+    let mut permission = catalogue
+        .iter()
+        .find(|e| e["type"] == "control_request")
+        .unwrap()
+        .clone();
+    permission["request_id"] = "p1".into();
+    let mut second = permission.clone();
+    second["request_id"] = "p2".into();
+    let mut limit = catalogue
+        .iter()
+        .find(|e| e["type"] == "rate_limit_event")
+        .unwrap()
+        .clone();
+    limit["rate_limit_info"]["status"] = "rejected".into();
+    let result = catalogue
+        .iter()
+        .find(|e| e["type"] == "result")
+        .unwrap()
+        .clone();
+    let lines = [start, permission, second, limit, result]
+        .iter()
+        .map(|e| format!("{e}\n"))
+        .collect::<String>();
+    fixture.file("state-events.jsonl", lines.as_bytes(), 0o600);
+    let mut running = fixture.launch("state-reducer", "2.1.296").expect("launch");
+    running.receive();
+    running.submit();
+    let now = Instant::now();
+    let mut reducer = SessionState::new("fixture-agent".into());
+    let mut sink = Sink(Vec::new());
+    for _ in 0..7 {
+        // The helper bounds receive and reports worker death, not an unbounded wait.
+        let received = running.receive();
+        reducer.publish(
+            Input::Event(&received.event),
+            now,
+            received.record.received_at_ms.try_into().unwrap(),
+            Duration::from_secs(1),
+            &mut sink,
+        );
+    }
+    assert_eq!(
+        sink.0.iter().map(|u| u.state.phase).collect::<Vec<_>>(),
+        [
+            Phase::Unknown,
+            Phase::Unknown,
+            Phase::Working,
+            Phase::NeedsHuman,
+            Phase::NeedsHuman,
+            Phase::LimitReached,
+            Phase::LimitReached
+        ]
+    );
+    assert!(sink.0.iter().all(|u| u.agent_id == "fixture-agent"));
+    assert_eq!(sink.0[4].needs_human.len(), 2);
+    assert_eq!(sink.0[6].state.turn, Turn::Unknown);
+    assert_eq!(
+        sink.0[2].phase_changed,
+        Some((Phase::Unknown, Phase::Working))
+    );
+    assert_eq!(
+        sink.0[3].phase_changed,
+        Some((Phase::Working, Phase::NeedsHuman))
+    );
+    running.runtime.stop();
+    assert_eq!(running.finish().outcome, Outcome::Stopped);
+}
