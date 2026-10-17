@@ -8,8 +8,11 @@
  * that hosts it, through one global, {@link SHELL_CONFIG_GLOBAL}, which the
  * shell sets before the bundle's module script runs:
  *
- * - **Browser shell** (`flk` with the `web` feature): the page `flk` serves
- *   carries an inline script that assigns the global.
+ * - **Browser shell** (`flk` with the `web` feature): an external script
+ *   that the page loads before the bundle assigns the global, without a
+ *   token. The served page enforces `script-src 'self'` with no inline
+ *   script or eval (#1875), so nothing here relies on either. The token
+ *   comes from the one-time code exchange (`src/wire/token.ts`).
  * - **Tauri v2 shell** (#1601): an initialization script assigns it before
  *   the page loads, with the token read from the keychain.
  * - **Fixture build** (`vite build --mode fixture`, `just client-preview`):
@@ -30,8 +33,12 @@ export type WireShellConfig = {
   readonly transport: "wire";
   /** Absolute `ws:`, `wss:`, `http:` or `https:` URL of the server. */
   readonly serverUrl: string;
-  /** Client token (ADR-0036 §5); never persisted by the bundle. */
-  readonly token: string;
+  /**
+   * Client token (ADR-0036 §5), when the shell has one (Tauri, from the
+   * keychain). The browser shell has none: its token comes from the code
+   * exchange and is kept in `sessionStorage` (ADR-0038 §3).
+   */
+  readonly token?: string;
 };
 
 /** Fixture mode: replay a recorded session; no server is contacted. */
@@ -89,10 +96,10 @@ export function readShellConfig(scope: object): ConfigResult {
       if (!ABSOLUTE_SCHEMES.has(new URL(serverUrl).protocol)) {
         return refuse("serverUrl must use ws:, wss:, http: or https:.");
       }
-      if (typeof token !== "string" || token === "") {
-        return refuse("token must be a non-empty string.");
+      if (token !== undefined && (typeof token !== "string" || token === "")) {
+        return refuse("token, when given, must be a non-empty string.");
       }
-      return { ok: true, config: { transport: "wire", serverUrl, token } };
+      return { ok: true, config: { transport: "wire", serverUrl, ...(token === undefined ? {} : { token }) } };
     }
     case "fixture": {
       const { fixtureJsonl, source } = raw;

@@ -21,9 +21,17 @@ describe("readShellConfig", () => {
     }
   });
 
-  test("a non-network scheme and an empty token are refused", () => {
+  test("a non-network scheme and an empty or non-string token are refused", () => {
     expect(readShellConfig(scope({ transport: "wire", serverUrl: "file:///x", token: "t" })).ok).toBe(false);
     expect(readShellConfig(scope({ transport: "wire", serverUrl: "wss://h/v1/ws", token: "" })).ok).toBe(false);
+    expect(readShellConfig(scope({ transport: "wire", serverUrl: "wss://h/v1/ws", token: 7 })).ok).toBe(false);
+  });
+
+  test("the browser shell's config carries no token: it comes from the code exchange", () => {
+    expect(readShellConfig(scope({ transport: "wire", serverUrl: "https://h:7000" }))).toEqual({
+      ok: true,
+      config: { transport: "wire", serverUrl: "https://h:7000" },
+    });
   });
 
   test("an unknown transport or a non-object is refused", () => {
