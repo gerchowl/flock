@@ -1057,3 +1057,51 @@ fn the_server_decides_from_the_agent_record() {
     // A tool that asks nobody passes, whatever the policy.
     assert_eq!(routed.ask(&server, "", "Read").as_deref(), Some(""));
 }
+
+#[test]
+fn claude_probe_uses_the_namespace_passed_by_the_test_profile() {
+    let root = SocketDir::reserve("probe-ns");
+    let probe = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/probes/question_hook_claude.py");
+    for (index, spelling) in ["renamed-flk", "debug/flk"].iter().enumerate() {
+        let sandbox = root.path().join(format!("case-{index}"));
+        let binary = root.path().join(spelling);
+        let output = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                r#"
+import pathlib, runpy, sys
+probe, binary, root, namespace = sys.argv[1:]
+Sandbox = runpy.run_path(probe)["Sandbox"]
+sandbox = Sandbox(binary, root, namespace)
+class FixtureBoundary(Exception):
+    pass
+def no_process(*args, **kwargs):
+    assert args == ("integration", "install", "claude")
+    raise FixtureBoundary()
+sandbox.run = no_process
+try:
+    sandbox.prepare()
+except FixtureBoundary:
+    pass
+else:
+    raise AssertionError("fixture unexpectedly started a process")
+config = pathlib.Path(root) / "x" / namespace / "config.toml"
+assert config.read_text() == "onboarding = false\n"
+other = "flock" if namespace == "flock-dev" else "flock-dev"
+assert not (pathlib.Path(root) / "x" / other).exists()
+"#,
+            ])
+            .arg(&probe)
+            .arg(&binary)
+            .arg(&sandbox)
+            .arg(support::paths::app_dir_name())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

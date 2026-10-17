@@ -1048,7 +1048,7 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
 /// on Linux and the Darwin equivalents elsewhere. What identifies a process as ours has
 /// not changed and is the reason this is safe to run on a developer's whole
 /// machine: `is_test_flock_binary` requires the executable to be THIS
-/// checkout's `target/debug/flk`, so a daemon built by another session from
+/// Cargo-selected binary under test, so a daemon built by another session from
 /// its own worktree — or an installed `flock` — is never in the returned set.
 /// The `server` argv check narrows it further to servers.
 ///
@@ -1136,7 +1136,7 @@ fn current_checkout_root() -> &'static Path {
 }
 
 /// The one executable this sweep is ever allowed to kill: this checkout's own
-/// debug build of `flk`.
+/// Cargo-selected build of `flk`, in any profile or target directory.
 ///
 /// Equality against a canonicalised path, not a component-prefix test. The
 /// earlier `path.ends_with("target/debug/flk") && path.starts_with(root)` admits
@@ -1162,7 +1162,7 @@ fn is_test_flock_binary(path: &Path) -> bool {
     static EXPECTED: OnceLock<Option<PathBuf>> = OnceLock::new();
 
     let expected = EXPECTED
-        .get_or_init(|| fs::canonicalize(current_checkout_root().join("target/debug/flk")).ok())
+        .get_or_init(|| fs::canonicalize(env!("CARGO_BIN_EXE_flk")).ok())
         .as_deref();
 
     match expected {
@@ -1328,11 +1328,11 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_matcher_accepts_current_checkout_debug_binary() {
-        let binary = current_checkout_root().join("target/debug/flk");
+    fn test_binary_matcher_accepts_the_binary_under_test() {
+        let binary = PathBuf::from(env!("CARGO_BIN_EXE_flk"));
         assert!(
             is_test_flock_binary(&binary),
-            "current checkout debug binary should be considered test-owned"
+            "the actual binary under test must be considered test-owned"
         );
     }
 
@@ -1395,33 +1395,27 @@ mod tests {
     /// different one.
     #[test]
     fn test_binary_matcher_accepts_a_symlink_to_the_checkout_binary() {
-        let real = current_checkout_root().join("target/debug/flk");
-        if !real.exists() {
-            // Not built in this test's environment; the accept-case above
-            // already covers the direct path.
-            return;
-        }
+        let real = PathBuf::from(env!("CARGO_BIN_EXE_flk"));
+        assert!(real.is_file(), "Cargo must build the fixture executable");
 
-        let link_dir = std::env::temp_dir().join(format!(
-            "flock-binary-matcher-link-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&link_dir).expect("create link dir");
-        let link = link_dir.join("flk");
-        let linked = symlink(&real, &link);
+        let link_dir = super::socket_dir::SocketDir::reserve("flk-bin-link");
+        let link = link_dir.path().join("flk");
+        symlink(&real, &link).expect("link the actual Cargo binary");
+        assert!(
+            is_test_flock_binary(&link),
+            "a symlink to the selected binary stays test-owned"
+        );
+    }
 
-        if linked.is_ok() {
-            assert!(
-                is_test_flock_binary(&link),
-                "a symlink resolving to this checkout's binary is that binary"
-            );
-        }
-
-        let _ = fs::remove_dir_all(&link_dir);
+    #[test]
+    fn test_binary_matcher_rejects_an_existing_different_flk() {
+        let fixture = super::socket_dir::SocketDir::reserve("flk-bin-other");
+        let other = fixture.path().join("flk");
+        fs::write(&other, "fixture file, never executed").unwrap();
+        assert!(
+            !is_test_flock_binary(&other),
+            "a matching basename cannot authorize reaping"
+        );
     }
 
     fn symlink(original: &Path, link: &Path) -> std::io::Result<()> {

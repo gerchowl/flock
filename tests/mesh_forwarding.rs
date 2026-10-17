@@ -1,3 +1,6 @@
+// Fake SSH relay requires the debug-only ancestry override (#1715).
+#![cfg(debug_assertions)]
+
 //! Requests traverse authenticated custody hops in isolated real servers.
 mod support;
 use serde_json::{json, Value};
@@ -119,6 +122,8 @@ fn due(node: &Node) {
         .unwrap();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn chain_request_is_forwarded_and_imported_once() {
     let (fleet, sender, recipient) = setup("forward-chain", CHAIN);
@@ -149,6 +154,8 @@ fn chain_request_is_forwarded_and_imported_once() {
     assert!(body.is_empty(), "forwarder deletes its transferred body");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_without_outbound_edges_reaches_a_third_node_through_hub() {
     let (fleet, sender, recipient) = setup("forward-spoke", HUB);
@@ -158,6 +165,8 @@ fn spoke_without_outbound_edges_reaches_a_third_node_through_hub() {
     row_state(fleet.node("nodea"), "spoke", "transferred");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn allow_from_checks_origin_not_allowed_forwarding_hub() {
     let (fleet, sender, recipient) = setup(
@@ -191,6 +200,8 @@ fn allow_from_checks_origin_not_allowed_forwarding_hub() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn pause_at_forwarder_refuses_transiently_and_origin_retains() {
     let (fleet, sender, recipient) = setup("forward-pause", CHAIN);
@@ -205,6 +216,8 @@ fn pause_at_forwarder_refuses_transiently_and_origin_retains() {
     read_once(&fleet, &recipient, "paused");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn forwarder_restart_resumes_custody_once() {
     let (mut fleet, sender, recipient) = setup("forward-restart", CHAIN);
@@ -218,6 +231,8 @@ fn forwarder_restart_resumes_custody_once() {
     read_once(&fleet, &recipient, "restart");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn known_offline_owner_is_queued_unknown_target_refused() {
     let (fleet, sender, recipient) = setup("forward-offline", CHAIN);
@@ -246,6 +261,8 @@ fn known_offline_owner_is_queued_unknown_target_refused() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn one_undecodable_record_does_not_stall_the_retry_pass() {
     let (fleet, sender, recipient) = setup("forward-corrupt", CHAIN);
@@ -327,6 +344,8 @@ fn audited_writes(connection: &rusqlite::Connection, after: i64) -> Vec<String> 
     ).unwrap().query_map([after], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn idle_forwarder_makes_no_commits() {
     let (fleet, sender, recipient) = setup("forward-idle", CHAIN);
@@ -394,6 +413,8 @@ fn idle_forwarder_makes_no_commits() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn incompatible_next_hop_refuses_new_acceptance_existing_custody_kept() {
     let (mut fleet, sender, _) = setup("forward-incompatible", CHAIN);
@@ -490,16 +511,22 @@ fn reroute_after_refusal(tag: &str, looped: bool) {
     read_once(&fleet, &recipient, "reroute");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn hop_budget_exhausted_retains_custody_and_reroutes_on_route_change() {
     reroute_after_refusal("forward-hops", false);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn route_cycle_is_loop_detected_and_custody_retained() {
     reroute_after_refusal("forward-cycle", true);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn slow_next_hop_does_not_starve_user_sends_to_another_peer() {
     let (fleet, sender, recipient) = setup(
@@ -546,6 +573,8 @@ fn slow_next_hop_does_not_starve_user_sends_to_another_peer() {
     read_once(&fleet, &recipient, "fast");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn forwarded_request_is_collected_over_inbound_only_next_hop() {
     let (fleet, sender, recipient) = prepare(
@@ -563,6 +592,8 @@ fn forwarded_request_is_collected_over_inbound_only_next_hop() {
     row_state(fleet.node("nodeb"), "forwarded-held", "delivered");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn offline_requests_do_not_starve_a_live_route_generation() {
     let (fleet, sender, offline) = setup(
@@ -623,6 +654,8 @@ fn offline_requests_do_not_starve_a_live_route_generation() {
     assert_eq!(queued, 100);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn configured_origin_name_is_accepted_by_forwarded_policy() {
     let (fleet, sender, recipient) = setup(
@@ -691,6 +724,8 @@ fn remote_state(fleet: &Fleet, correlation: &str, expected: &str) {
     });
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn answer_routes_back_across_two_hops_and_imports_once() {
     let (fleet, sender, recipient) = setup("routed-answer", CHAIN);
@@ -700,6 +735,8 @@ fn answer_routes_back_across_two_hops_and_imports_once() {
     read_answer(&fleet, &sender, "answer across two hops");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn delivered_and_read_receipts_reach_origin_across_hops() {
     let (fleet, sender, recipient) = setup("routed-receipts", CHAIN);
@@ -709,6 +746,8 @@ fn delivered_and_read_receipts_reach_origin_across_hops() {
     remote_state(&fleet, "receipts", "read");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn answer_held_while_origin_unroutable_moves_when_route_appears() {
     let (fleet, sender, recipient) = setup("routed-offline", CHAIN);
@@ -726,6 +765,8 @@ fn answer_held_while_origin_unroutable_moves_when_route_appears() {
     read_answer(&fleet, &sender, "held answer");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn follow_up_after_final_answer_on_one_way_edge_is_collected() {
     let (fleet, sender, recipient) = setup("routed-followup", CHAIN);
@@ -737,6 +778,8 @@ fn follow_up_after_final_answer_on_one_way_edge_is_collected() {
     read_answer(&fleet, &sender, "second answer");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn recipient_gone_receipt_reaches_multihop_origin() {
     let (fleet, sender, recipient) = setup("routed-gone", CHAIN);
@@ -751,6 +794,8 @@ fn recipient_gone_receipt_reaches_multihop_origin() {
     remote_state(&fleet, "gone", "recipient_gone");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn expired_receipt_reaches_multihop_origin() {
     let (fleet, sender, recipient) = setup("routed-expired", CHAIN);
@@ -768,6 +813,8 @@ fn expired_receipt_reaches_multihop_origin() {
     remote_state(&fleet, "expiring", "expired");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn channel_original_settles_on_reply_custody_multihop() {
     let (fleet, sender, recipient) = setup(
@@ -805,6 +852,8 @@ fn channel_original_settles_on_reply_custody_multihop() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn laptop_collects_answer_through_a_different_hub() {
     let fleet = fleet::spawn("routed-two-hubs", fleet::LAPTOP_TWO_HUBS);
@@ -854,6 +903,8 @@ fn laptop_collects_answer_through_a_different_hub() {
     read_answer(&fleet, &sender, "via second hub");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn forged_answer_signature_or_token_is_refused() {
     for wrong_token in [false, true] {
@@ -904,6 +955,8 @@ fn forged_answer_signature_or_token_is_refused() {
 }
 
 // Ported from #852's mesh_step2 regression at 65709cd6, using this suite's helpers.
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn route_cycle_and_exhausted_hop_budget_retain_custody() {
     for (field, value) in [("visited", json!(["receiver"])), ("hops_left", json!(0))] {
@@ -1083,6 +1136,8 @@ fn lapse_hub_custody(fleet: &Fleet, correlation: &str) {
     assert_eq!(lapsed, 1);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn loop_at_a_hub_reaches_the_origin_as_a_hub_signed_outcome() {
     let (fleet, sender, recipient) = setup("hub-loop", CHAIN);
@@ -1104,6 +1159,8 @@ fn loop_at_a_hub_reaches_the_origin_as_a_hub_signed_outcome() {
     hub_outcome(&fleet, "hub-loop", "loop_detected at nodeb");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn exhausted_hop_budget_at_a_hub_reaches_the_origin() {
     let (fleet, sender, recipient) = prepare(
@@ -1124,6 +1181,8 @@ fn exhausted_hop_budget_at_a_hub_reaches_the_origin() {
     hub_outcome(&fleet, "hub-hops", "hop_budget_exhausted at nodeb");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn no_route_at_a_hub_reaches_the_origin_after_its_own_expiry() {
     let (fleet, sender, recipient) = setup("hub-no-route", CHAIN);
@@ -1210,6 +1269,8 @@ fn hub_outcome_for(fleet: &Fleet, key: &str) {
     });
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn answer_that_dies_at_a_hub_is_undeliverable_at_the_replier() {
     let (fleet, sender, recipient) = setup("hub-answer", HUB);
@@ -1242,6 +1303,8 @@ fn answer_that_dies_at_a_hub_is_undeliverable_at_the_replier() {
     std::fs::remove_file(capture).unwrap();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn receipt_that_dies_at_a_hub_is_routed_once_more_and_reaches_the_origin() {
     let (fleet, sender, recipient) = setup("hub-receipt", HUB);
@@ -1280,6 +1343,8 @@ fn receipt_that_dies_at_a_hub_is_routed_once_more_and_reaches_the_origin() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn receipt_that_dies_twice_at_a_hub_is_surfaced_without_bouncing() {
     let (fleet, sender, recipient) = setup("hub-receipt-twice", HUB);
@@ -1414,6 +1479,8 @@ fn route_via(fleet: &Fleet, node: &str, target: &str, via: &str) {
     });
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn hub_whose_only_route_loops_reports_undeliverable_before_custody_expiry() {
     let (fleet, _sender, _recipient) = strand_at_hub("hub-strand", 1_000);
@@ -1432,6 +1499,8 @@ fn hub_whose_only_route_loops_reports_undeliverable_before_custody_expiry() {
     std::fs::remove_file(fleet.base.join("capture-delivery-nodeb-nodec")).unwrap();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn hub_route_that_loops_only_briefly_still_delivers() {
     // A grace far beyond every wait here, so a slow edge reconnect can
@@ -1466,6 +1535,8 @@ fn hub_route_that_loops_only_briefly_still_delivers() {
 /// The same strand for an answer: the replier reaches the sender only
 /// through the hub, then the hub's own edge to the sender drops while it
 /// holds the answer, so its only route runs back through the replier.
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn answer_whose_only_route_loops_at_a_hub_is_undeliverable_at_the_replier() {
     let (fleet, sender, recipient) = setup(

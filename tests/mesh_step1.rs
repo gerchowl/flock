@@ -1,3 +1,6 @@
+// Fake SSH relay requires the debug-only ancestry override (#1715).
+#![cfg(debug_assertions)]
+
 //! Step-1 acceptance: real sandbox servers and agent CLI calls over one-hop edges.
 mod support;
 
@@ -360,6 +363,8 @@ fn due(node: &Node) {
         .unwrap();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn incident_direct_held_collected_read_without_an_active_waiter() {
     let conversation = Conversation::new(DIRECT);
@@ -388,6 +393,8 @@ fn incident_direct_held_collected_read_without_an_active_waiter() {
     state(conversation.fleet.node("nodea"), "question", "read");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn incident_reverse_edge_pushes_within_two_seconds() {
     let conversation = Conversation::new(&[
@@ -435,6 +442,8 @@ fn incident_reverse_edge_pushes_within_two_seconds() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn incident_spoke_outbox_is_collected_and_answer_is_pushed_down() {
     let conversation = Conversation::new(SPOKE);
@@ -463,6 +472,8 @@ fn incident_spoke_outbox_is_collected_and_answer_is_pushed_down() {
     conversation.answer_once();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn failed_receipt_commit_backs_off_on_a_healthy_edge() {
     let conversation = Conversation::new(SPOKE);
@@ -526,6 +537,8 @@ fn failed_receipt_commit_backs_off_on_a_healthy_edge() {
     conversation.answer_once();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn queued_request_and_held_answer_survive_offline_reconnect() {
     let mut conversation = Conversation::new(DIRECT);
@@ -567,21 +580,29 @@ fn restart_role(specs: &[NodeSpec], role: &str) {
     conversation.answer_once();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn cold_restart_sender_mid_conversation() {
     restart_role(DIRECT, "nodea");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn cold_restart_receiver_mid_conversation() {
     restart_role(DIRECT, "nodeb");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn cold_restart_hub_mid_conversation() {
     restart_role(SPOKE, "nodeb");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn lost_collect_ack_reimports_once_after_edge_is_killed() {
     let mut conversation = Conversation::new(DIRECT);
@@ -621,6 +642,8 @@ fn lost_collect_ack_reimports_once_after_edge_is_killed() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn real_answer_supersedes_a_deferral() {
     let conversation = Conversation::new(DIRECT);
@@ -647,6 +670,8 @@ fn real_answer_supersedes_a_deferral() {
     conversation.answer_once();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn lost_delivery_ack_and_duplicate_imports_preserve_one_message() {
     let conversation = Conversation::new(DIRECT);
@@ -724,6 +749,8 @@ fn lost_delivery_ack_and_duplicate_imports_preserve_one_message() {
     conversation.answer_once();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn multihop_chain_is_delivered_once() {
     let fleet = fleet::spawn(
@@ -772,6 +799,8 @@ fn multihop_chain_is_delivered_once() {
     assert_eq!(read(fleet.node("nodec"), &recipient.pane), json!([]));
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn old_mesh_version_retains_origin_custody_without_legacy_delivery() {
     let mut conversation = Conversation::new(&[
@@ -951,21 +980,29 @@ fn handoff_role(specs: &[NodeSpec], role: &str) {
     conversation.answer_once();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn live_handoff_sender_keeps_panes_and_delivers_once() {
     handoff_role(DIRECT, "nodea");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn live_handoff_receiver_keeps_panes_and_delivers_once() {
     handoff_role(DIRECT, "nodeb");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn live_handoff_hub_keeps_panes_and_delivers_once() {
     handoff_role(SPOKE, "nodeb");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn audit_rotation_during_held_conversation_loses_nothing() {
     use std::io::Write;
@@ -1005,6 +1042,8 @@ fn audit_rotation_during_held_conversation_loses_nothing() {
     conversation.answer_once();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn fleet_pause_freezes_retries_and_ttl_then_resumes() {
     let mut conversation = Conversation::new(DIRECT);
@@ -1091,6 +1130,8 @@ fn fleet_pause_freezes_retries_and_ttl_then_resumes() {
     conversation.answer_once();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn spoke_read_receipt_reaches_origin_within_seconds() {
     let conversation = Conversation::new(DIRECT);
@@ -1109,6 +1150,8 @@ fn spoke_read_receipt_reaches_origin_within_seconds() {
     assert!(started.elapsed() < Duration::from_secs(4));
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn follow_up_reply_after_final_answer_on_one_way_edge_is_collected() {
     let conversation = Conversation::new(DIRECT);
@@ -1132,6 +1175,8 @@ fn follow_up_reply_after_final_answer_on_one_way_edge_is_collected() {
     assert_eq!(read(origin, &conversation.sender.pane), json!([]));
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn failed_reply_push_on_pinned_edge_is_retried_without_reenrollment() {
     let conversation = Conversation::new(SPOKE);
@@ -1177,6 +1222,8 @@ fn failed_reply_push_on_pinned_edge_is_retried_without_reenrollment() {
     assert!(delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation) >= 2);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn reply_push_in_flight_is_not_pushed_again_by_the_retry_scheduler() {
     let conversation = Conversation::new(SPOKE);
@@ -1210,6 +1257,8 @@ fn reply_push_in_flight_is_not_pushed_again_by_the_retry_scheduler() {
     }
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn idle_edge_emits_no_wakes_and_no_commits() {
     use std::io::{BufRead, BufReader, Write};
@@ -1247,6 +1296,8 @@ fn idle_edge_emits_no_wakes_and_no_commits() {
     assert_eq!(version(), before);
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn hundred_held_answers_cause_bounded_polls() {
     let conversation = Conversation::new(DIRECT);
@@ -1330,6 +1381,8 @@ fn hundred_held_answers_cause_bounded_polls() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn outbound_answer_import_failure_skips_only_its_own_ack() {
     let conversation = Conversation::new(DIRECT);
@@ -1472,16 +1525,22 @@ fn receipt_waits_for_original_custody(receipt_state: &str) {
     });
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn read_receipt_is_not_acked_until_lost_push_response_is_recovered() {
     receipt_waits_for_original_custody("read");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn expired_receipt_is_not_acked_until_lost_push_response_is_recovered() {
     receipt_waits_for_original_custody("expired");
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn duplicate_read_receipt_is_acked_without_rewriting_the_original() {
     let conversation = Conversation::new(DIRECT);
@@ -1560,6 +1619,8 @@ fn duplicate_read_receipt_is_acked_without_rewriting_the_original() {
         .unwrap();
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn imports_and_reads_for_outbound_neighbors_emit_no_mesh_wakes() {
     use std::io::{BufRead, BufReader, Write};
@@ -1590,6 +1651,8 @@ fn imports_and_reads_for_outbound_neighbors_emit_no_mesh_wakes() {
     );
 }
 
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
 #[test]
 fn answer_signature_covers_the_collection_token() {
     let conversation = Conversation::new(SPOKE);

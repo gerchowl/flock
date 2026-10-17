@@ -33,7 +33,7 @@ Claude already trusts (a flk-created worktree is, #605), because an untrusted
 folder holds every settings hook back behind the trust dialog.
 
     python3 -I tests/probes/question_hook_claude.py --flk target/debug/flk \\
-        --cwd <trusted dir> [case ...]
+        --app-dir flock-dev --cwd <trusted dir> [case ...]
 """
 
 from __future__ import annotations
@@ -87,7 +87,10 @@ def wait_for(read, predicate, timeout_s: float, seen: dict | None = None) -> str
 class Sandbox:
     """Paths and an environment that can only reach the sandbox flk."""
 
-    def __init__(self, flk: str, root: str):
+    def __init__(self, flk: str, root: str, app_dir: str):
+        if app_dir not in {"flock", "flock-dev"}:
+            raise ValueError("app_dir must match the compiled flk namespace")
+        self.app_dir = app_dir
         self.root = root
         self.flk = os.path.abspath(flk)
         self.socket = os.path.join(root, "f.sock")
@@ -112,7 +115,7 @@ class Sandbox:
 
     def prepare(self) -> dict:
         """Install into a sandbox Claude dir and write the --settings file."""
-        app = "flock-dev" if "/debug/" in self.flk else "flock"
+        app = self.app_dir
         os.makedirs(os.path.join(self.root, "x", app), exist_ok=True)
         with open(os.path.join(self.root, "x", app, "config.toml"), "w") as fh:
             fh.write("onboarding = false\n")
@@ -292,6 +295,8 @@ CASES = {"delegate": case_delegate, "root-stopped": case_root_stopped, "delegate
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--flk", required=True, help="the flk build under test")
+    parser.add_argument("--app-dir", required=True, choices=("flock", "flock-dev"),
+                        help="compiled namespace, supplied by the Rust harness via paths::app_dir_name()")
     parser.add_argument("--cwd", required=True, help="a folder Claude already trusts")
     parser.add_argument("--claude-model", default="haiku")
     parser.add_argument("--root", default=f"/tmp/q2p{os.getpid()}", help="short sandbox root")
@@ -299,7 +304,7 @@ def main() -> int:
     a = parser.parse_args()
     a.cwd = os.path.abspath(a.cwd)
     os.makedirs(a.root, exist_ok=True)
-    sb = Sandbox(a.flk, a.root)
+    sb = Sandbox(a.flk, a.root, a.app_dir)
     entry = sb.prepare()
     print("installed entry:", json.dumps(entry))
     failed = 0
