@@ -755,8 +755,10 @@ impl App {
         };
         // Normalize once and use it twice: the identity event below, and the
         // self-compaction (#540), whose whole completion signal IS this field.
-        let session_start_source =
-            crate::agent_resume::normalize_claude_session_start_source(params.session_start_source);
+        let session_start_source = crate::agent_resume::normalize_session_start_source(
+            &agent_label,
+            params.session_start_source,
+        );
         if let Some(pane) = self.public_pane_id(ws_idx, pane_id) {
             // Done here rather than on the queued event, because the
             // continuation is a keystroke into a pane and this is the one
@@ -767,6 +769,7 @@ impl App {
                 std::time::Instant::now(),
             );
         }
+        let transcript_path = params.agent_session_path.clone();
         let session_ref = crate::agent_resume::session_ref_from_report(
             &params.source,
             &agent_label,
@@ -777,6 +780,7 @@ impl App {
         let reported_session = session_ref.as_ref().map(|r| r.value.clone());
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
+            transcript_path,
             session_ref,
             source: params.source,
             agent_label,

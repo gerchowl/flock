@@ -96,6 +96,13 @@ pub(crate) struct Validated {
     pub metadata_version: String,
 }
 
+impl Validated {
+    /// Attribution capability retained by file/cursor and supervised reader slices.
+    pub fn key(&self) -> &Key {
+        &self.key
+    }
+}
+
 /// Validate on a worker, with a caller-supplied metadata byte budget. The writer
 /// candidates must come from this local launch's process attribution, never hook
 /// JSON or a filename. No environment/default profile lookup occurs here.
@@ -271,6 +278,11 @@ impl Binding {
         self.key = Some(key.clone());
         self.pending = true;
         Ok(key)
+    }
+
+    /// Reject stale worker callbacks before segment preparation or admission.
+    pub fn pending(&self, key: &Key) -> bool {
+        self.pending && self.key.as_ref() == Some(key)
     }
 
     /// Complete exactly the still-pending capability. Rejected and superseded
