@@ -313,6 +313,15 @@ The **progress deadline** runs while a stream waits for `synced` or for a snapsh
   - The outbox is **held** until a new token connects. If the new principal differs from the old one, the outbox is **dropped** and the user is told, because commands must not run under another identity.
   - A Tauri shell may unlock a stored token with biometrics (§6).
 
+**Getting and keeping the token (browser shell).** ADR-0036 §5 decides the exchange: `flk client open` runs as the operator over the unix socket, mints a one-time code (single use, 60 s) and opens the loopback URL with the code in the **fragment** (`#code=…`), never the query, so it never reaches a server log or a `Referer`.
+- **On load,** the client reads `code` from `location.hash` and removes it at once with `history.replaceState`, before any other script or request runs. It then `POST`s `/v1/client/exchange` (same origin) with `{"code"}` and gets `{"token"}` exactly once. Every failure is one uniform 401. The client shows one message, "This link has expired or was already used. Run `flk client open` again.", and never retries the code.
+- **The token goes into `hello` only** (unchanged), never into a URL, a log, an error message or the outbox records.
+- **Storage: `sessionStorage`, decided here.** An `operate`-scoped token is the operator's identity, so it is kept no longer than the tab that received it. `sessionStorage` survives a reload, which the reconnect, the outbox and a dev reload need, but not closing the tab. Each tab needs its own `flk client open`.
+  - Rejected: memory only, because every reload would need a new `flk client open` and the outbox could not resume.
+  - Rejected: `localStorage`, because it keeps the identity on disk with no end, shares it across tabs, and survives the browser closing.
+  - What remains is script running in the page, which can read `sessionStorage`. The enforcing Content-Security-Policy on the served page (`script-src 'self'`, no inline or eval; #1875) is the control for that, so the client never needs inline scripts. Bootstrap configuration comes from an external script or from `welcome`.
+- **NeedsToken** clears the stored token, as above. A Tauri shell keeps its token in the platform keystore instead (§6).
+
 **The store.**
 - Entities are kept normalised by kind and id.
 - Each stream has a cursor, persisted per device so a reload resumes without a full replay. It is persisted only after the event (or the empty snapshot) it names has been applied, and together with the stream's resync marker. The `*/live` streams are the exception: they carry deltas with no cursor (§5).
