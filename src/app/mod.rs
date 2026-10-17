@@ -37,6 +37,7 @@ pub(crate) mod goals;
 pub(crate) mod handoffs;
 mod ids;
 mod input;
+mod input_writes;
 pub(crate) mod issue_drop;
 pub(crate) mod line_editor;
 pub(crate) mod mailboxes;
@@ -347,6 +348,7 @@ pub struct App {
     pub(crate) last_render_at: Option<Instant>,
     pub(crate) suppressed_repeat_keys:
         HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+    pub(crate) input_writes: input_writes::InputWrites,
     pub render_notify: Arc<Notify>,
     pub render_dirty: Arc<AtomicBool>,
     pub(crate) full_redraw_pending: bool,
@@ -398,6 +400,7 @@ pub(crate) const APP_EVENT_DRAIN_LIMIT: usize = 64;
 
 pub(crate) enum LoopEvent {
     Timer,
+    InputWrites,
     Internal(AppEvent),
     Api(crate::api::ApiRequestMessage),
     RawInput(crate::raw_input::RawInputEvent),
@@ -1088,6 +1091,7 @@ impl App {
             no_session,
             input_rx: None,
             last_terminal_size: terminal::size().ok(),
+            input_writes: input_writes::InputWrites::default(),
             render_notify,
             render_dirty,
             full_redraw_pending: false,
@@ -1625,11 +1629,13 @@ impl App {
                         None => LoopEvent::InputClosed,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
+                    _ = self.input_writes.notify.notified() => LoopEvent::InputWrites,
                     _ = self.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
 
             match event {
+                LoopEvent::InputWrites => self.input_writes.service(),
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
                     self.handle_internal_event_with_prefix_sync(ev);
@@ -1656,6 +1662,8 @@ impl App {
             }
         }
 
+        self.input_writes
+            .retire_all(crate::pty::write_receipt::WriteFailure::PaneGone);
         // Save session on exit (skip in --no-session mode)
         if !self.no_session {
             self.save_session_now();
