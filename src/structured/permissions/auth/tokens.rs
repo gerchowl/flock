@@ -12,51 +12,7 @@ use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 use zeroize::Zeroize;
 
-/// Explicit token scopes; operate does not silently grant the other scopes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Scope {
-    /// Read authorized streams.
-    Read,
-    /// Queue authorized user turns.
-    Send,
-    /// Answer scoped questions without acquiring operator authority.
-    Answer,
-    /// Act as an operator for explicitly authorized verbs.
-    Operate,
-}
-/// A wire bearer whose diagnostic form is always redacted.
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(transparent)]
-pub(crate) struct Bearer(String);
-impl std::fmt::Debug for Bearer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Bearer(<redacted>)")
-    }
-}
-impl Drop for Bearer {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
-/// Public token metadata, never containing a bearer or digest.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct TokenInfo {
-    /// Lowercase operator-assigned client name.
-    pub(crate) name: String,
-    /// Opaque identity, fresh on every issuance.
-    pub(crate) principal: String,
-    /// Exact grants; no implicit scope hierarchy.
-    pub(crate) scopes: BTreeSet<Scope>,
-}
-/// The only explicit secret response, for the authenticated issuing operator.
-#[derive(Debug, Serialize)]
-pub(crate) struct Issued {
-    /// Public identity and scope metadata.
-    pub(crate) info: TokenInfo,
-    /// Secret returned only by explicit operator issuance.
-    pub(crate) token: Bearer,
-}
+pub(crate) use crate::api::client_tokens::{Bearer, Issued, Listed, Scope, TokenInfo};
 /// Admission failures contain no bearer or file contents.
 #[derive(Debug)]
 pub(crate) enum TokenError {
@@ -128,25 +84,6 @@ impl Entropy for SystemEntropy {
         getrandom::fill(bytes).map_err(io::Error::other)
     }
 }
-/// A listed entry is either trusted public metadata or an explicit unsafe entry.
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub(crate) enum Listed {
-    /// A verified record, with its lossless management identifier.
-    Valid {
-        /// Lossless hexadecimal filename identifier for exact revocation.
-        entry: String,
-        /// Verified public identity and scopes, never the credential.
-        info: TokenInfo,
-    },
-    /// An untrusted entry that authenticates nobody; the identifier permits revocation.
-    Unsafe {
-        /// Lossless hexadecimal filename identifier, even for non-UTF-8 entries.
-        entry: String,
-        /// Untrusted UTF-8 filename including its suffix, when representable.
-        name: Option<String>,
-    },
-}
 type LoadedEntry = (Entry, Option<(String, Record)>);
 
 struct PendingRevoke<'a> {
@@ -215,7 +152,7 @@ impl TokenStore {
         }
         Ok(store)
     }
-    fn random<const N: usize>(&self) -> Result<String, TokenError> {
+    pub(crate) fn random<const N: usize>(&self) -> Result<String, TokenError> {
         let mut bytes = [0; N];
         let result = self
             .1
@@ -333,6 +270,24 @@ impl TokenStore {
             info: Self::info(name, &record),
             token: record.token.clone(),
         })
+    }
+    /// Reuse only the exact operator credential, or issue it without overwriting any entry.
+    pub(crate) fn operator_token(
+        &self,
+        authority: &LocalOperator<'_>,
+    ) -> Result<Bearer, TokenError> {
+        let scopes = BTreeSet::from([Scope::Read, Scope::Send, Scope::Answer, Scope::Operate]);
+        let guard = self.lock()?;
+        match self.load("operator") {
+            Ok(record) if record.scopes == scopes => Ok(record.token),
+            Ok(_) => Err(TokenError::Unsafe),
+            Err(TokenError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                drop(guard);
+                self.issue(authority, "operator", scopes)
+                    .map(|issued| issued.token)
+            }
+            Err(error) => Err(error),
+        }
     }
     /// List trusted metadata and explicit unsafe entries, never secrets.
     pub(crate) fn list(&self, _: &LocalOperator<'_>) -> Result<Vec<Listed>, TokenError> {
