@@ -30,6 +30,9 @@ pub enum Input<'a> {
     /// Every stdout event, including unknown lines, counts as stream progress.
     /// Stream consumers must use `Received::state_input` to include host closes.
     Event(&'a SessionEvent),
+    /// Stdout progress whose tool request was already reserved by a grant.
+    /// It never opens a needs-human entry.
+    Progress,
     /// The book durably closed this request (decision, cancel, result, interrupt
     /// or end). This is not an acknowledgment of stdin delivery.
     ControlAnswered(&'a str),
@@ -133,6 +136,10 @@ impl SessionState {
                 self.stdout = Some((now, unix_ms));
                 self.stalled = false;
                 self.event(event, now);
+            }
+            Input::Progress => {
+                self.stdout = Some((now, unix_ms));
+                self.stalled = false;
             }
             Input::ControlAnswered(id) => {
                 self.controls.remove(id);

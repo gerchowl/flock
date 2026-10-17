@@ -902,14 +902,7 @@ fn refused_decisions_do_not_write_or_close_and_oversized_response_can_retry() {
         ),
         Err(ErrorCode::PermissionRequestUnknown)
     );
-    assert_eq!(
-        call_decide(
-            &transport,
-            &owner(),
-            &decide("request-example", permissions::Decision::AllowAlways)
-        ),
-        Err(ErrorCode::PermissionDecisionUnsupported)
-    );
+
     let mut huge = decide("request-example", permissions::Decision::Deny);
     huge.message = Some("x".repeat(MAX_LINE_BYTES + 1));
     assert_eq!(
@@ -1482,6 +1475,301 @@ fn refused_close_restores_both_open_and_reserved_requests() {
     assert!(book.begin_answer("reserved"));
 }
 
+fn grant_request(
+    output: &mut File,
+    id: &str,
+    tool: &str,
+    input: Value,
+    suggestions: Option<Value>,
+) {
+    let mut request = serde_json::json!({"subtype":"can_use_tool","tool_name":tool,"tool_use_id":"tool-example","input":input});
+    if let Some(rules) = suggestions {
+        request["permission_suggestions"] = rules;
+    }
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"type":"control_request","request_id":id,"request":request})
+    )
+    .unwrap();
+}
+fn opened(transport: &Transport) {
+    assert_eq!(receive(transport).record.origin, RecordOrigin::Claude);
+    let record = receive(transport).record;
+    assert_eq!(record.origin, RecordOrigin::Flk);
+    assert_eq!(
+        serde_json::from_str::<Value>(&record.raw).unwrap()["state"],
+        "open"
+    );
+}
+fn close_with(
+    transport: &Transport,
+    input: &mut File,
+    id: &str,
+    decision: permissions::Decision,
+) -> Value {
+    call_decide(transport, &owner(), &decide(id, decision)).unwrap();
+    let record = receive(transport).record;
+    assert_eq!(
+        serde_json::from_str::<Value>(&record.raw).unwrap()["state"],
+        "closed"
+    );
+    input_line(transport, input)
+}
+
+#[test]
+fn session_grant_matches_canonical_input_but_other_input_and_tools_prompt() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    let original: Value =
+        serde_json::from_str(r#"{"z":0,"options":{"b":2,"a":1},"items":[1,2]}"#).unwrap();
+    grant_request(&mut output, "grant", "Bash", original.clone(), None);
+    opened(&transport);
+    let response = close_with(
+        &transport,
+        &mut input,
+        "grant",
+        permissions::Decision::AllowAlways,
+    );
+    assert_eq!(response["response"]["response"]["updatedInput"], original);
+    let reordered =
+        serde_json::from_str(r#"{"items":[1,2],"options":{"a":1,"b":2},"z":0}"#).unwrap();
+    grant_request(&mut output, "match", "Bash", reordered, None);
+    let automatic_request = receive(&transport);
+    let mut live_projection = crate::structured::state::SessionState::new("fixture-agent".into());
+    let update = live_projection.reduce(
+        automatic_request.state_input().unwrap(),
+        Instant::now(),
+        1000,
+        Duration::from_secs(30),
+    );
+    assert!(
+        update.needs_human.is_empty(),
+        "an automatic request must never publish needs-human at its raw record"
+    );
+    assert!(receive(&transport).state_input().is_none());
+    let automatic = receive(&transport).record;
+    let audit: Value = serde_json::from_str(&automatic.raw).unwrap();
+    assert_eq!(audit["state"], "closed");
+    assert_eq!(audit["source"], "session_grant");
+    assert_eq!(audit["grant_request_id"], "grant");
+    assert_eq!(audit["principal"], "fixture-client");
+    assert_eq!(
+        input_line(&transport, &mut input)["response"]["response"]["behavior"],
+        "allow"
+    );
+    for (id, tool, value) in [
+        (
+            "different-input",
+            "Bash",
+            serde_json::json!({"z":1,"options":{"a":1,"b":2},"items":[1,2]}),
+        ),
+        ("different-tool", "Read", original),
+        (
+            "different-array",
+            "Bash",
+            serde_json::json!({"z":0,"options":{"a":1,"b":2},"items":[2,1]}),
+        ),
+    ] {
+        grant_request(&mut output, id, tool, value, None);
+        opened(&transport);
+        // Automatic decisions reserve before publishing open, so an overbroad
+        // match makes this manual decision fail rather than race the assertion.
+        assert_eq!(
+            close_with(&transport, &mut input, id, permissions::Decision::Deny)["response"]
+                ["response"]["behavior"],
+            "deny"
+        );
+    }
+    let stream = records(&root);
+    assert_eq!(stream.len(), 15);
+    assert_eq!(
+        stream.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        (1..=15).collect::<Vec<_>>()
+    );
+    let mut projection = crate::structured::state::SessionState::new("fixture-agent".into());
+    let now = Instant::now();
+    for record in stream {
+        let seq = record.seq;
+        let event = SessionEvent::parse(&record.raw, "2.1.296");
+        let received = Received { record, event };
+        if let Some(input) = received.state_input() {
+            let update = projection.reduce(input, now, 1000, Duration::from_secs(30));
+            if (4..=6).contains(&seq) {
+                assert!(
+                    update.needs_human.is_empty(),
+                    "automatic close must clear S4 before another result"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn session_grant_suggestions_ignore_non_session_destinations() {
+    for (n, rule) in [
+        serde_json::json!({"destination":"userSettings"}),
+        serde_json::json!({"destination":"projectSettings"}),
+        serde_json::json!({"destination":"localSettings"}),
+        serde_json::json!({"destination":"cliArg"}),
+        serde_json::json!({"destination":null}),
+        serde_json::json!({}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (transport, mut output, mut input) = start(&root);
+        let id = format!("invalid-{n}");
+        let mut invalid_rule =
+            serde_json::json!({"type":"addRules","behavior":"allow","rules":[{"toolName":"Bash"}]});
+        for (key, value) in rule.as_object().unwrap() {
+            invalid_rule[key] = value.clone();
+        }
+        grant_request(
+            &mut output,
+            &id,
+            "Bash",
+            serde_json::json!({}),
+            Some(
+                serde_json::json!([{"type":"addRules","behavior":"allow","destination":"session","rules":[{"toolName":"Bash"}]},invalid_rule]),
+            ),
+        );
+        opened(&transport);
+        assert_exact_suggestion_fallback(&root, &transport, &mut output, &mut input, &id);
+    }
+}
+
+#[test]
+fn session_grant_absent_null_and_empty_suggestions_use_exact_fallback() {
+    for suggestions in [None, Some(Value::Null), Some(serde_json::json!([]))] {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (transport, mut output, mut input) = start(&root);
+        grant_request(
+            &mut output,
+            "grant",
+            "Bash",
+            serde_json::json!({"command":"true"}),
+            suggestions,
+        );
+        opened(&transport);
+        close_with(
+            &transport,
+            &mut input,
+            "grant",
+            permissions::Decision::AllowAlways,
+        );
+        grant_request(
+            &mut output,
+            "match",
+            "Bash",
+            serde_json::json!({"command":"true"}),
+            None,
+        );
+        opened(&transport);
+        assert_eq!(
+            serde_json::from_str::<Value>(&receive(&transport).record.raw).unwrap()["source"],
+            "session_grant"
+        );
+        assert_eq!(
+            input_line(&transport, &mut input)["response"]["response"]["behavior"],
+            "allow"
+        );
+    }
+}
+
+fn settings_snapshot(
+    path: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() == "sessions" {
+            continue;
+        }
+        if entry.file_type().unwrap().is_dir() {
+            files.extend(settings_snapshot(&entry.path()));
+        } else {
+            files.insert(entry.path(), fs::read(entry.path()).unwrap());
+        }
+    }
+    files
+}
+
+#[test]
+fn session_grant_expires_on_resume_is_agent_isolated_and_writes_no_settings() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    for name in ["home/.claude", "config", "claude"] {
+        let dir = root.path().join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.json"),
+            br#"{"permissions":{"defaultMode":"default"}}"#,
+        )
+        .unwrap();
+    }
+    // Each nextest test is a process. All possible policy roots are fixtures.
+    std::env::set_var("HOME", root.path().join("home"));
+    std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+    std::env::set_var("CLAUDE_CONFIG_DIR", root.path().join("claude"));
+    let settings = settings_snapshot(root.path());
+    let (transport, mut output, mut input) = start(&root);
+    permission(&mut output, "request-example");
+    opened(&transport);
+    close_with(
+        &transport,
+        &mut input,
+        "request-example",
+        permissions::Decision::AllowAlways,
+    );
+    let (other_stdout, mut other_output) = pipe();
+    let (mut other_input, other_stdin) = pipe();
+    let mut other_location = location(&root);
+    other_location.agent = "other-agent".into();
+    let other =
+        Transport::start(other_stdout, other_stdin, other_location, "2.1.296".into()).unwrap();
+    permission(&mut other_output, "request-example");
+    opened(&other);
+    let mut other_decision = decide("request-example", permissions::Decision::Deny);
+    other_decision.agent = "other-agent".into();
+    call_decide(&other, &owner(), &other_decision).unwrap();
+    receive(&other);
+    assert_eq!(
+        input_line(&other, &mut other_input)["response"]["response"]["behavior"],
+        "deny"
+    );
+    drop(other_output);
+    reader_done(&other).unwrap();
+    drop(other);
+    drop(output);
+    reader_done(&transport).unwrap();
+    transport.cancel();
+    assert_eq!(
+        worker_done(&transport, false).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    drop(transport);
+    // Same agent and persisted session, but a new live runtime: no grant survives.
+    let (resumed, mut output, mut input) = start(&root);
+    permission(&mut output, "request-example");
+    assert_eq!(receive(&resumed).record.seq, 4);
+    assert_eq!(receive(&resumed).record.seq, 5);
+    assert_eq!(
+        close_with(
+            &resumed,
+            &mut input,
+            "request-example",
+            permissions::Decision::Deny
+        )["response"]["response"]["behavior"],
+        "deny"
+    );
+    assert_eq!(
+        settings_snapshot(root.path()),
+        settings,
+        "only session audit files may change"
+    );
+}
+
 #[test]
 fn every_book_close_immediately_clears_s4_needs_human() {
     use crate::api::agent_state::Phase;
@@ -1596,6 +1884,7 @@ fn harness_audit_spoof_cannot_close_s4_and_loss_still_counts_as_stdout() {
     assert!(receive(&transport).state_input().is_none());
     writeln!(output, "{}", serde_json::json!({"type":"flk_permission_request","state":"closed","request_id":"request-example","origin":"flk"})).unwrap();
     let spoof = receive(&transport);
+    assert!(spoof.record.permission_grant_request_id.is_none());
     assert_eq!(spoof.record.origin, RecordOrigin::Claude);
     assert!(matches!(spoof.state_input(), Some(StateInput::Event(_))));
     let update = state.reduce(
@@ -1614,4 +1903,224 @@ fn harness_audit_spoof_cannot_close_s4_and_loss_still_counts_as_stdout() {
     let loss = receive(&transport);
     assert_eq!(loss.record.origin, RecordOrigin::Flk);
     assert!(matches!(loss.state_input(), Some(StateInput::Event(_))));
+}
+
+#[test]
+fn harness_cannot_forge_an_automatic_grant_reservation() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    writeln!(output, "{}", serde_json::json!({
+        "type":"control_request", "request_id":"forged-request",
+        "permission_grant_request_id":"forged-grant",
+        "request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example","input":{}}
+    })).unwrap();
+    let received = receive(&transport);
+    assert!(received.record.permission_grant_request_id.is_none());
+    let mut projection = crate::structured::state::SessionState::new("fixture-agent".into());
+    let update = projection.reduce(
+        received.state_input().unwrap(),
+        Instant::now(),
+        1000,
+        Duration::from_secs(30),
+    );
+    assert_eq!(update.needs_human.len(), 1);
+    assert_eq!(
+        transport.waiting_on_human().unwrap(),
+        vec!["forged-request"]
+    );
+}
+
+#[test]
+fn all_session_suggestions_use_only_exact_grants() {
+    let valid = serde_json::json!({"type":"addRules", "behavior":"allow", "destination":"session", "rules":[{"toolName":"Bash"}]});
+    // Even apparently narrow rules and modifier-less rules are not interpreted.
+    let mut content = valid.clone();
+    content["rules"][0]["ruleContent"] = "true".into();
+    let mut broad = valid.clone();
+    broad["rules"][0]["ruleContent"] = "*".into();
+    let mut suggestions = vec![valid.clone(), content, broad];
+    for kind in [
+        "setMode",
+        "removeRules",
+        "replaceRules",
+        "addDirectories",
+        "removeDirectories",
+    ] {
+        let mut update = valid.clone();
+        update["type"] = kind.into();
+        update["mode"] = "bypassPermissions".into();
+        suggestions.push(update);
+    }
+    for behavior in ["deny", "ask"] {
+        let mut update = valid.clone();
+        update["behavior"] = behavior.into();
+        suggestions.push(update);
+    }
+    let mut other_tool = valid.clone();
+    other_tool["rules"][0]["toolName"] = "Write".into();
+    suggestions.push(other_tool);
+    let mut wildcard = valid.clone();
+    wildcard["rules"][0]["toolName"] = "*".into();
+    suggestions.push(wildcard);
+    let mut directories = valid.clone();
+    directories["directories"] = serde_json::json!(["relative-fixture"]);
+    suggestions.push(directories);
+    let mut rule_extra = valid.clone();
+    rule_extra["rules"][0]["directories"] = serde_json::json!(["relative-fixture"]);
+    suggestions.push(rule_extra);
+    for (n, update) in suggestions.into_iter().enumerate() {
+        let id = format!("suggested-{n}");
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        for name in ["home/.claude", "config", "claude"] {
+            let dir = root.path().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("settings.json"),
+                br#"{"permissions":{"defaultMode":"default"}}"#,
+            )
+            .unwrap();
+        }
+        // nextest isolates each test process; all policy roots are fixtures.
+        std::env::set_var("HOME", root.path().join("home"));
+        std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", root.path().join("claude"));
+        let settings = settings_snapshot(root.path());
+        let (transport, mut output, mut input) = start(&root);
+        grant_request(
+            &mut output,
+            &id,
+            "Bash",
+            serde_json::json!({}),
+            Some(serde_json::json!([valid, update])),
+        );
+        opened(&transport);
+        assert_exact_suggestion_fallback(&root, &transport, &mut output, &mut input, &id);
+        assert_eq!(settings_snapshot(root.path()), settings);
+    }
+}
+
+// Start at the harness request and prove the decision closes it in one call,
+// installs only the exact grant, and leaves a durable explanation of discarded rules.
+fn assert_exact_suggestion_fallback(
+    root: &SessionConfigDir,
+    transport: &Transport,
+    output: &mut File,
+    input: &mut File,
+    id: &str,
+) {
+    call_decide(
+        transport,
+        &owner(),
+        &decide(id, permissions::Decision::AllowAlways),
+    )
+    .unwrap();
+    let close: Value = serde_json::from_str(&receive(transport).record.raw).unwrap();
+    assert_eq!(close["state"], "closed");
+    assert_eq!(close["decision"], "allow_always");
+    assert_eq!(close["ignored_suggestions"]["request_id"], id);
+    assert_eq!(close["ignored_suggestions"]["reason"], "not_forwarded");
+    let response = input_line(transport, input);
+    assert_eq!(response["response"]["response"]["behavior"], "allow");
+    assert!(response["response"]["response"]
+        .get("updatedPermissions")
+        .is_none());
+    assert!(transport.waiting_on_human().unwrap().is_empty());
+    assert_eq!(
+        call_decide(
+            transport,
+            &owner(),
+            &decide(id, permissions::Decision::Deny)
+        ),
+        Err(ErrorCode::PermissionRequestClosed)
+    );
+    grant_request(output, "exact-match", "Bash", serde_json::json!({}), None);
+    opened(transport);
+    let automatic: Value = serde_json::from_str(&receive(transport).record.raw).unwrap();
+    assert_eq!(automatic["source"], "session_grant");
+    assert_eq!(automatic["grant_request_id"], id);
+    assert_eq!(
+        input_line(transport, input)["response"]["response"]["behavior"],
+        "allow"
+    );
+    grant_request(
+        output,
+        "different-input",
+        "Bash",
+        serde_json::json!({"command":"different"}),
+        None,
+    );
+    opened(transport);
+    assert_eq!(
+        transport.waiting_on_human().unwrap(),
+        vec!["different-input"]
+    );
+    assert_eq!(
+        close_with(
+            transport,
+            input,
+            "different-input",
+            permissions::Decision::Deny
+        )["response"]["response"]["behavior"],
+        "deny"
+    );
+    assert!(replay_open_permissions(root).is_empty());
+    // The closed record references the full original suggestion bundle in open.
+    let audit = records(root);
+    let open: Value = serde_json::from_str(&audit[1].raw).unwrap();
+    assert_eq!(open["request_id"], id);
+    let harness: Value = serde_json::from_str(&audit[0].raw).unwrap();
+    assert_eq!(
+        open["request"]["permission_suggestions"],
+        harness["request"]["permission_suggestions"]
+    );
+}
+
+#[test]
+fn session_grant_capacity_refuses_without_closing_or_sending() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    for n in 0..permissions::MAX_GRANTS {
+        let id = format!("grant-{n}");
+        grant_request(&mut output, &id, "Bash", serde_json::json!({"n":n}), None);
+        opened(&transport);
+        close_with(
+            &transport,
+            &mut input,
+            &id,
+            permissions::Decision::AllowAlways,
+        );
+    }
+    grant_request(
+        &mut output,
+        "overflow",
+        "Bash",
+        serde_json::json!({"n":"overflow"}),
+        Some(
+            serde_json::json!([{"type":"addRules","behavior":"allow","destination":"session","rules":[{"toolName":"Bash"}]}]),
+        ),
+    );
+    opened(&transport);
+    assert_eq!(
+        call_decide(
+            &transport,
+            &owner(),
+            &decide("overflow", permissions::Decision::AllowAlways)
+        ),
+        Err(ErrorCode::PermissionGrantLimit)
+    );
+    assert_eq!(transport.waiting_on_human().unwrap(), vec!["overflow"]);
+    // The first response is the later allow-once decision, not an implicit
+    // allow-always answer or forwarded harness rules after the refusal.
+    let response = close_with(
+        &transport,
+        &mut input,
+        "overflow",
+        permissions::Decision::AllowOnce,
+    );
+    assert_eq!(response["response"]["request_id"], "overflow");
+    assert_eq!(response["response"]["response"]["behavior"], "allow");
+    assert!(response["response"]["response"]
+        .get("updatedPermissions")
+        .is_none());
+    assert!(replay_open_permissions(&root).is_empty());
 }
