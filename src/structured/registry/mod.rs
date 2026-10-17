@@ -174,6 +174,27 @@ impl Registry {
         Ok(generation)
     }
 
+    /// Start a fresh launch observation epoch while retaining the durable record.
+    /// A new generation fences all previous worker deliveries. Live follows readiness.
+    pub(crate) fn begin_launch(
+        &mut self,
+        agent_id: &str,
+        current: u64,
+    ) -> Result<u64, RegistryError> {
+        let entry = self
+            .entries
+            .get_mut(agent_id)
+            .filter(|entry| entry.generation == current)
+            .ok_or(RegistryError::StaleGeneration)?;
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(RegistryError::GenerationExhausted)?;
+        *entry = Entry::cold(entry.record.clone(), generation, entry.slot);
+        self.generation = generation;
+        Ok(generation)
+    }
+
     /// Address by stable identity, never by a placement or a caller-supplied pane.
     pub fn get(&self, agent_id: &str) -> Option<(&Record, &Projection, u64)> {
         self.entries

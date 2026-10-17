@@ -103,9 +103,23 @@ impl Drop for Runtime {
 pub fn run(
     state: &Path,
     profile: LaunchProfile,
+    lease: super::lease::Lease,
+    location: StreamLocation,
+    ready: impl FnOnce(Runtime),
+) -> Result<Exit, LaunchError> {
+    run_notified(state, profile, lease, location, ready, || {})
+}
+
+/// Worker assembly with a nonblocking wake after each queued stream notification.
+/// Ready/completion notifications remain the launch owner's responsibility.
+/// The callback must not perform I/O or wait for queue capacity.
+pub(crate) fn run_notified(
+    state: &Path,
+    profile: LaunchProfile,
     mut lease: super::lease::Lease,
     location: StreamLocation,
     ready: impl FnOnce(Runtime),
+    notify: impl Fn() + Send + 'static,
 ) -> Result<Exit, LaunchError> {
     if !lease.matches(&location.agent, &location.session)
         || profile.session_id() != location.session
@@ -141,6 +155,9 @@ pub fn run(
     profile.configure_environment(|key, value| {
         command.env(key, value);
     });
+    if let Some(cwd) = profile.cwd() {
+        command.current_dir(cwd);
+    }
     let (mut child, profile) = match profile.try_spawn(|| lease.spawn(|| command.spawn_traced())) {
         Ok(started) => started,
         Err(error) => {
@@ -196,7 +213,7 @@ pub fn run(
         .name("session-events".into())
         .spawn(move || {
             let facts = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                collect(&transport, &pump_stop, &pump_control, events_tx)
+                collect(&transport, &pump_stop, &pump_control, events_tx, &notify)
             }))
             .unwrap_or_else(|_| {
                 pump_stop.request();
@@ -339,6 +356,7 @@ fn collect(
     stop: &StopRequest,
     control: &StopHandle,
     output: mpsc::SyncSender<Received>,
+    notify: &impl Fn(),
 ) -> Facts {
     let mut facts = Facts::default();
     let mut done = [false; 2];
@@ -424,7 +442,7 @@ fn collect(
         }
         if let Some(received) = pending.take() {
             match output.try_send(received) {
-                Ok(()) => (),
+                Ok(()) => notify(),
                 Err(mpsc::TrySendError::Full(received)) => pending = Some(received),
                 Err(mpsc::TrySendError::Disconnected(_)) => {
                     stop.request();

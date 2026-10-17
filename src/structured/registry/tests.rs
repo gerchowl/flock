@@ -338,3 +338,30 @@ fn retained_names_refuse_new_admission_without_changing_raw_data() {
         assert_eq!(serde_json::to_value(&registry).unwrap(), raw);
     }
 }
+
+#[test]
+fn fresh_launch_resets_observations_and_fences_the_previous_generation() {
+    let id = "agent_fixture_a";
+    let mut registry = Registry::default();
+    let old = registry.register(record(id)).unwrap();
+    let now = Instant::now();
+    send(&mut registry, id, old, &fixture("control_request"), now);
+    let raw = serde_json::to_value(&registry).unwrap();
+    let current = registry.begin_launch(id, old).unwrap();
+    assert_ne!(current, old);
+    let (saved, view, generation) = registry.get(id).unwrap();
+    assert_eq!(generation, current);
+    assert_eq!(saved, &record(id));
+    assert!(view.update.needs_human.is_empty());
+    assert_eq!(view.update.state.lifecycle, Lifecycle::Offline);
+    assert!(view.update.observe_at.is_none());
+    assert_eq!(serde_json::to_value(&registry).unwrap(), raw);
+    assert!(matches!(
+        registry.apply(id, old, Input::Observe, now, 1000, Duration::from_secs(1)),
+        Err(RegistryError::StaleGeneration)
+    ));
+    assert!(matches!(
+        registry.begin_launch(id, old),
+        Err(RegistryError::StaleGeneration)
+    ));
+}
