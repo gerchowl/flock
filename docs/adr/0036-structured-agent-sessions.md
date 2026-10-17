@@ -1007,11 +1007,19 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   `POST /v1/client/exchange` with JSON `{ "code": "…" }`; the loopback-only,
   same-origin endpoint returns `{ "token": "…" }` exactly once, with
   `Cache-Control: no-store`. Used, expired and unknown codes get one uniform
-  401; failed exchanges are rate limited. Cross-origin and non-loopback
-  requests are refused, and neither codes nor tokens enter diagnostic logs.
+  401. There is no global failed-exchange gate: every caller reaches the
+  loopback listener locally, and local processes can forge Host/Origin.
+  Such a gate would let any local process, including an agent, lock out the
+  operator. Guessing a 256-bit, single-use code with a 60-second lifetime is
+  infeasible. Keep the store bounded at 128 live codes and request bodies at
+  1024 bytes. Cross-origin and non-loopback requests are refused, and neither
+  codes nor tokens enter diagnostic logs.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location
   (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.
+  `token add` prints the bearer only to terminal stdout unless `--json` or
+  `--show-token` explicitly permits redirected secret output. Without that
+  consent it refuses before issuance, so no undisclosed credential is created.
   Tokens follow the channel-token model of ADR-0028 §8
   (`src/channels.rs`): 32 random bytes as 64 hex digits, one file per client
   under `<data dir>/client-tokens/<name>.token`, mode 0600 in a 0700 dir,

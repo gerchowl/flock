@@ -68,7 +68,7 @@ impl Server {
             socket,
         }
     }
-    fn cli(&self, args: &[&str]) -> std::process::Output {
+    fn cli_command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_flk"));
         cmd.args(args);
         for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("FLOCK_")) {
@@ -77,7 +77,11 @@ impl Server {
         for (key, value) in support::environment::isolated_env(&self.config, &self.root.join("r")) {
             cmd.env(key, value);
         }
-        cmd.env("FLOCK_SOCKET_PATH", &self.socket).output().unwrap()
+        cmd.env("FLOCK_SOCKET_PATH", &self.socket);
+        cmd
+    }
+    fn cli(&self, args: &[&str]) -> std::process::Output {
+        self.cli_command(args).output().unwrap()
     }
     fn api(&self, method: &str, params: Value) -> Value {
         let mut socket = UnixStream::connect(&self.socket).unwrap();
@@ -199,6 +203,85 @@ fn client_token_cli_socket_roundtrip_private_files_and_fragment_url() {
     );
     assert!(!logs.contains(token));
     assert!(!logs.contains(code));
+}
+
+#[test]
+fn token_add_requires_terminal_stdout_or_explicit_secret_output() {
+    use std::io::{IsTerminal, Read};
+    let server = Server::start();
+    let args = ["client", "token", "add", "piped", "--scopes", "read"];
+    let refused = server.cli(&args);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(refused.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--show-token"));
+    assert!(!server.directory().join("piped.token").exists());
+
+    let disclosed = server.cli(&[
+        "client",
+        "token",
+        "add",
+        "explicit",
+        "--scopes",
+        "read",
+        "--show-token",
+    ]);
+    assert!(
+        disclosed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disclosed.stderr)
+    );
+    let explicit: Value = serde_json::from_slice(&disclosed.stdout).unwrap();
+    let stored: Value =
+        serde_json::from_slice(&fs::read(server.directory().join("explicit.token")).unwrap())
+            .unwrap();
+    assert_eq!(explicit["result"]["issued"]["token"], stored["token"]);
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let terminal = fs::OpenOptions::new()
+        .write(true)
+        .open(pair.master.tty_name().unwrap())
+        .unwrap();
+    assert!(terminal.is_terminal());
+    let mut command =
+        server.cli_command(&["client", "token", "add", "terminal", "--scopes", "read"]);
+    command.stdout(terminal);
+    let output = command.output().unwrap();
+    drop(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stages = support::readiness::Stages::new(Duration::from_secs(10));
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let mut bytes = Vec::new();
+    while !bytes.contains(&b'\n') {
+        stages
+            .readable(&[pair.master.as_raw_fd().unwrap()])
+            .unwrap();
+        let mut buffer = [0; 1024];
+        let count = reader.read(&mut buffer).unwrap();
+        assert!(
+            count > 0,
+            "terminal output closed before the issuance response"
+        );
+        bytes.extend_from_slice(&buffer[..count]);
+        assert!(bytes.len() <= 4096, "unexpected oversized terminal output");
+    }
+    // Keep the slave open until its buffered output is consumed on both platforms.
+    drop(pair.slave);
+    let printed: Value = serde_json::from_slice(&bytes).unwrap();
+    let stored: Value =
+        serde_json::from_slice(&fs::read(server.directory().join("terminal.token")).unwrap())
+            .unwrap();
+    assert_eq!(printed["result"]["issued"]["token"], stored["token"]);
 }
 
 #[test]

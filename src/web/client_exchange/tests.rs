@@ -77,8 +77,29 @@ fn actual_http_exchange_is_single_use_uniform_origin_guarded_and_secret_free() {
                 assert!(!refused.contains(&code));
                 assert!(!refused.contains(&token));
             }
-            let good = request(bind, &code, "", &origin).await;
-            assert!(good.starts_with("HTTP/1.1 200"), "{good}");
+            let (first, second) = tokio::join!(
+                request(bind, &code, "", &origin),
+                request(bind, &code, "", &origin),
+            );
+            let responses = [first, second];
+            assert_eq!(
+                responses
+                    .iter()
+                    .filter(|r| r.starts_with("HTTP/1.1 200"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                responses
+                    .iter()
+                    .filter(|r| r.starts_with("HTTP/1.1 401"))
+                    .count(),
+                1
+            );
+            let good = responses
+                .iter()
+                .find(|r| r.starts_with("HTTP/1.1 200"))
+                .unwrap();
             assert!(good.contains("cache-control: no-store"));
             let json: serde_json::Value =
                 serde_json::from_str(good.split_once("\r\n\r\n").unwrap().1).unwrap();

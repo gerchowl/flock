@@ -18,9 +18,6 @@ pub(crate) struct Codes(Arc<Mutex<Registry>>);
 #[derive(Default)]
 struct Registry {
     pending: HashMap<[u8; 32], (Instant, Bearer)>,
-    // Read only by the web-feature exchange.
-    #[cfg_attr(not(feature = "web"), allow(dead_code))]
-    failures: Option<(Instant, u8)>,
 }
 impl Codes {
     /// Retain at most 128 live handoffs, with a hard 60-second lifetime.
@@ -38,27 +35,17 @@ impl Codes {
     }
     // Slice 2 (#1828) mounts the exchange only in web-enabled builds.
     #[cfg_attr(not(feature = "web"), allow(dead_code))]
-    /// Consume once; unknown, expired and throttled failures are indistinguishable.
-    /// At most 16 failed exchanges per minute reach the lookup. No credential is logged.
+    /// Consume once; unknown and expired failures are indistinguishable.
+    /// Invalid attempts never lock out a valid code. No credential is logged.
     pub(crate) fn exchange(&self, code: &str, now: Instant) -> Option<Bearer> {
         let mut state = self.0.lock().ok()?;
-        let (start, failures) = state.failures.get_or_insert((now, 0));
-        if now.duration_since(*start) >= Duration::from_secs(60) {
-            (*start, *failures) = (now, 0);
-        }
-        if *failures >= 16 {
-            return None;
-        }
         let entry = state
             .pending
             .remove(&<[u8; 32]>::from(Sha256::digest(code.as_bytes())));
         state.pending.retain(|_, (expiry, _)| now < *expiry);
-        if let Some((_, token)) = entry.filter(|(expiry, _)| now < *expiry) {
-            Some(token)
-        } else {
-            state.failures.as_mut()?.1 += 1;
-            None
-        }
+        entry
+            .filter(|(expiry, _)| now < *expiry)
+            .map(|(_, token)| token)
     }
 }
 
@@ -86,21 +73,18 @@ mod tests {
         assert!(codes.exchange("unknown", now).is_none());
     }
     #[test]
-    fn failed_exchange_budget_resets_and_does_not_consume_a_throttled_code() {
+    fn junk_exchanges_cannot_lock_out_the_operator() {
         let codes = Codes::default();
         let now = Instant::now();
-        for _ in 0..16 {
+        codes.mint("valid".into(), token(), now).unwrap();
+        for _ in 0..4096 {
             assert!(codes.exchange("unknown", now).is_none());
         }
-        codes
-            .mint("valid".into(), token(), now + Duration::from_secs(1))
-            .unwrap();
-        assert!(codes
-            .exchange("valid", now + Duration::from_secs(1))
-            .is_none());
-        assert!(codes
-            .exchange("valid", now + Duration::from_secs(60))
-            .is_some());
+        assert_eq!(
+            codes.exchange("valid", now).unwrap().0,
+            "fixture credential"
+        );
+        assert!(codes.exchange("valid", now).is_none());
     }
     #[test]
     fn live_codes_are_bounded_and_expired_codes_are_reclaimed() {

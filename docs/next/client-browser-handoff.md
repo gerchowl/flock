@@ -23,7 +23,10 @@ flk client open
 flk client open --print
 ```
 
-Issuance prints the bearer only in the explicit successful issuance response.
+`token add` prints the bearer to terminal stdout. Redirected or piped stdout
+requires `--json` or `--show-token`; without either it refuses before issuing a
+credential. The explicit flag allows the usual issuance response to contain the
+bearer even in a pipe or file. Treat that destination as secret storage.
 List returns public metadata and identifies unsafe entries without their contents;
 `rm --entry` revokes an unsafe entry by its lossless hexadecimal filename identifier.
 Token files are mode 0600 under a mode-0700 `client-tokens` directory. Scopes are
@@ -55,11 +58,13 @@ Cross-origin, ambiguous Host/Origin, and non-loopback peer requests are refused.
 Host and Origin must identify the configured numeric loopback authority (HTTP's
 default port is normalized); forwarding headers grant no authority.
 
-Used, expired, unknown, revoked, and throttled codes receive the same 401 body.
-The registry permits 16 failed lookups per 60-second window, rejects further
-exchanges uniformly until the window resets, and holds at most 128 live codes.
-A throttled code is not consumed but its original expiry still applies. The
-request body is capped at 1024 bytes. Codes and tokens never enter diagnostic
+Used, expired, unknown, and revoked codes receive the same 401 body. Two
+concurrent exchanges of one code yield exactly one bearer. The registry holds
+at most 128 live codes, and request bodies are capped at 1024 bytes. There is
+no global failure budget: local processes can forge Host/Origin and could use
+such a gate to lock out the operator. Guessing a 256-bit, single-use code within
+60 seconds is infeasible. Codes and tokens never enter diagnostic
 logs; browser-launch argv redacts the code fragment. Tokens remain persisted
-until explicitly revoked. #1870 tracks admission/revocation lock fairness and
-waiter cleanup, and must be fixed before #1828 exposes admission.
+until explicitly revoked. #1870 tracks admission/revocation lock fairness,
+waiter cleanup, and moving exchange token-store reads off the async executor.
+It must be fixed before #1828 exposes admission.

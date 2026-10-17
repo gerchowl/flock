@@ -9,8 +9,9 @@ use crate::api::{
     client_tokens::{AddParams, RemoveParams},
     schema::{EmptyParams, Method, Request},
 };
+use std::io::IsTerminal;
 
-const USAGE: &str = "flk client token add NAME --scopes read,send,answer,operate | token rm NAME | token rm --entry ID | token list | open [--print]";
+const USAGE: &str = "flk client token add NAME --scopes read,send,answer,operate [--show-token] | token rm NAME | token rm --entry ID | token list | open [--print]";
 pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
     if super::help::asks_for_help(args) || args.first().is_some_and(|s| s == "help") {
         println!("usage: {USAGE}");
@@ -19,6 +20,13 @@ pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
     let Some(method) = parse(args) else {
         return Ok(output::failure(InvalidParams, USAGE, exit::USAGE));
     };
+    if matches!(method, Method::ClientTokenAdd(_))
+        && !std::io::stdout().is_terminal()
+        && !output::json()
+        && !args.iter().any(|s| s == "--show-token")
+    {
+        return Ok(output::failure(InvalidParams, "token add requires terminal stdout; use --json or --show-token to disclose the bearer to redirected output", exit::USAGE));
+    }
     let open = matches!(method, Method::ClientOpen(_));
     let response = super::send_request(&Request {
         id: "cli:client".into(),
@@ -56,7 +64,9 @@ fn parse(args: &[String]) -> Option<Method> {
             name: None,
             entry: Some((*entry).into()),
         }),
-        ["token", "add", name, "--scopes", scopes] if !scopes.is_empty() => {
+        ["token", "add", name, "--scopes", scopes, tail @ ..]
+            if !scopes.is_empty() && (tail.is_empty() || tail == ["--show-token"]) =>
+        {
             Method::ClientTokenAdd(AddParams {
                 name: (*name).into(),
                 scopes: scopes
@@ -84,6 +94,20 @@ mod tests {
         assert!(
             matches!(parse(&["token", "add", "phone", "--scopes", "read,operate"]), Some(Method::ClientTokenAdd(p)) if p.scopes.len() == 2)
         );
+        assert!(matches!(
+            parse(&["token", "add", "phone", "--scopes", "read", "--show-token"]),
+            Some(Method::ClientTokenAdd(_))
+        ));
+        assert!(parse(&[
+            "token",
+            "add",
+            "phone",
+            "--scopes",
+            "read",
+            "--show-token",
+            "--show-token"
+        ])
+        .is_none());
         assert!(parse(&["token", "add", "phone", "--scopes", "operator"]).is_none());
         assert!(parse(&["token", "rm", "phone", "--entry", "aa"]).is_none());
         assert!(parse(&["open", "--print", "http://example.test"]).is_none());
