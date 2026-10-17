@@ -11,7 +11,8 @@ import { expect } from "bun:test";
 import type { ClientFrame } from "../../src/gen/ClientFrame";
 import type { FixtureLine } from "../../src/gen/FixtureLine";
 import type { ServerFrame } from "../../src/gen/ServerFrame";
-import { WireConnection } from "../../src/wire/connection";
+import type { WireEvent } from "../../src/gen/WireEvent";
+import { WireConnection, type Refusal, type StreamName } from "../../src/wire/connection";
 import type { Clock, SocketLike, TimerHandle } from "../../src/wire/env";
 
 /**
@@ -154,6 +155,14 @@ export class FakeNetwork {
   }
 }
 
+/** What a subscribed handler saw, for assertions. */
+export type Seen =
+  | { readonly kind: "event"; readonly seq: number; readonly ev: WireEvent }
+  | { readonly kind: "gap"; readonly from: number; readonly to: number }
+  | { readonly kind: "snapshot"; readonly lines: readonly WireEvent[] }
+  | { readonly kind: "synced" | "reset" }
+  | { readonly kind: "refused"; readonly refusal: Refusal };
+
 type Step = FixtureLine;
 
 /** The fixture credential provider's tokens (S7a's README). */
@@ -180,6 +189,7 @@ export class Harness {
   clock = new VirtualClock();
   net = new FakeNetwork(this.clock);
   conn: WireConnection | null = null;
+  readonly seen = new Map<string, Seen[]>();
   readonly #random: () => number;
   #transitions: string[] = [];
   #changes = 0;
@@ -261,7 +271,6 @@ export class Harness {
     this.clock = new VirtualClock(step.now_ms ?? 0);
     this.net = new FakeNetwork(this.clock);
     if (step.outbox.length > 0) fail("the outbox is #1747's third slice");
-    if (Object.keys(step.cursors).length > 0) fail("streams are #1747's second slice");
     this.conn = new WireConnection({
       url: "ws://fixture.invalid/v1/ws",
       token: FIXTURE_TOKEN,
@@ -269,6 +278,7 @@ export class Harness {
       clock: this.clock,
       sockets: this.net.factory,
       random: this.#random,
+      cursors: step.cursors,
     });
     this.conn.onTransition((state) => this.#transitions.push(state));
     this.conn.onChange(() => this.#changes++);
@@ -287,9 +297,20 @@ export class Harness {
         return conn.networkChange();
       case "foreground":
         return conn.foreground();
-      case "subscribe":
+      case "subscribe": {
+        const seen: Seen[] = [];
+        this.seen.set(action.sub_id, seen);
+        return conn.subscribe(action.sub_id, action.stream as StreamName, {
+          event: (seq, ev) => seen.push({ kind: "event", seq, ev }),
+          gap: (from, to) => seen.push({ kind: "gap", from, to }),
+          synced: () => seen.push({ kind: "synced" }),
+          snapshot: (lines) => seen.push({ kind: "snapshot", lines }),
+          reset: () => seen.push({ kind: "reset" }),
+          refused: (refusal) => seen.push({ kind: "refused", refusal }),
+        });
+      }
       case "unsubscribe":
-        return fail("streams are #1747's second slice");
+        return conn.unsubscribe(action.sub_id);
       case "command":
         return fail("the outbox is #1747's third slice");
     }
@@ -351,8 +372,15 @@ export class Harness {
     const transitions = this.#transitions;
     this.#transitions = [];
     if (step.connection != null && conn.state !== step.connection) fail(`connection is ${conn.state}, expected ${step.connection}`);
-    if (Object.keys(step.streams ?? {}).length > 0 || (step.absent_streams ?? []).length > 0) fail("streams are #1747's second slice");
+    const streams = conn.streams();
+    for (const [id, want] of Object.entries(step.streams ?? {})) {
+      const got = streams.get(id) ?? fail(`no stream ${id}`);
+      if (got.state !== want.state || got.cursor !== want.cursor) {
+        fail(`stream ${id} is ${got.state}@${got.cursor}, expected ${want.state}@${want.cursor}`);
+      }
+    }
     if (Object.keys(step.outbox ?? {}).length > 0 || (step.absent_outbox ?? []).length > 0) fail("the outbox is #1747's third slice");
+    for (const id of step.absent_streams ?? []) if (streams.has(id)) fail(`stream ${id} should be absent`);
     if (step.connection_transitions != null && !deepEqual(transitions, step.connection_transitions)) {
       fail(`transitions ${JSON.stringify(transitions)}, expected ${JSON.stringify(step.connection_transitions)}`);
     }
@@ -366,8 +394,10 @@ export class Harness {
       }
       case "handshake":
         return this.#untilEffect(this.#openedAt + CEILINGS.handshake, "handshake deadline");
-      case "subscription":
-        return fail("streams are #1747's second slice");
+      case "subscription": {
+        const origin = this.#origins.get(`sub:${stage.sub_id}`) ?? fail(`no sub ${stage.sub_id} was sent`);
+        return this.#untilEffect(origin + CEILINGS.progress, `progress deadline of ${stage.sub_id}`);
+      }
       case "command_ack":
         return fail("the outbox is #1747's third slice");
     }
