@@ -50,6 +50,7 @@ pub struct Lease {
     agent: String,
     spawned: bool,
     released: bool,
+    cleanup_confirmed: bool,
 }
 impl SessionLeases {
     // ADR-0036 §1a: acquire both views before mutation; timeout leaves the
@@ -112,6 +113,7 @@ impl SessionLeases {
             agent: agent.into(),
             spawned: false,
             released: false,
+            cleanup_confirmed: false,
         })
     }
     /// Conservative live reservation counts, including pending agent-started launches.
@@ -260,6 +262,7 @@ impl Lease {
     }
     /// Release after the runtime confirms process-tree cleanup, including startup errors.
     pub(super) fn release(&mut self) {
+        self.cleanup_confirmed = true;
         if self.released {
             return;
         }
@@ -270,7 +273,11 @@ impl Lease {
         {
             self.released = true;
         } else {
-            tracing::warn!("structured lease retained: registry busy during release");
+            tracing::warn!(
+                session = self.session.as_str(),
+                agent = self.agent.as_str(),
+                "structured lease retained: registry busy during release"
+            );
         }
     }
 }
@@ -279,8 +286,12 @@ impl Drop for Lease {
         if !self.spawned && !self.released {
             self.release();
         }
-        if !self.released {
-            tracing::warn!("structured lease retained: process cleanup unconfirmed");
+        if !self.released && !self.cleanup_confirmed {
+            tracing::warn!(
+                session = self.session.as_str(),
+                agent = self.agent.as_str(),
+                "structured lease retained: process cleanup unconfirmed"
+            );
         }
     }
 }

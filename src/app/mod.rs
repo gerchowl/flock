@@ -4312,8 +4312,7 @@ sidebar_pane_gap = 99
         let pane_id = app.state.workspaces[ws_idx]
             .focused_pane_id()
             .expect("a pane to be sitting in");
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(app, pane_id);
         assert_eq!(
             app.spawn_caller().own_workspace(),
             Some(ws_idx),
@@ -4895,8 +4894,7 @@ sidebar_pane_gap = 99
                 .get_mut(&terminal_id)
                 .expect("terminal")
                 .launch_argv = Some(vec!["claude".into()]);
-            app.test_pane_child_pids.insert(pane_id, std::process::id());
-            app.current_api_peer_pid = Some(std::process::id());
+            crate::test_support::attest_pane_caller(&mut app, pane_id);
             app
         }
 

@@ -25,8 +25,12 @@ probes are scoped to the launcher's ancestry, with independently proven pane
 callers retaining their PTY identity. A launch keeps its uncertain launcher marker
 while fork/exec runs without registry locks. Binding captures process identity
 outside the locks, then publishes PID/birth before exposing a runtime handle.
-A bind failure or unconfirmed cleanup retains that root, so its descendants fail
-closed without denying unrelated operator and pane callers. If spawn panics before
+A failed birth lookup after PID publication retains that process root, so its
+descendants fail closed. If binding times out before publication, the root stays
+the server's launcher PID. If release also times out, every unproven server
+descendant stays uncertain until the retained reservation is cleared or the
+server restarts. Independently proven pane callers and unrelated ancestry remain
+available. If spawn panics before
 publishing a PID, its launcher ancestry remains uncertain. A proven PTY boundary
 retains today's pane identity. Registry reads wait at most 100 milliseconds for
 short contention on the primary table; after that deadline, the pre-spawn
@@ -51,6 +55,18 @@ This is server-local in-memory bookkeeping. Existing S3a supervision owns proces
 tree cleanup and stale-session recovery. It does not provide a persistent lease
 service across server restarts. The runtime's process identity is distinct from
 turn state; an exit code alone is not a successful turn.
+
+Pane authority binds the child PID to the birth captured at spawn. Live handoff
+carries that birth as optional metadata; old manifests with no birth cannot grant
+pane-based API authority. Missing or mismatched birth fails closed without
+promoting the process to operator. Granting pane authority requires birth
+validation. PID ancestry candidates still refuse pane callers as inbound relays and preserve
+self-kill, self-submit, bulk self-exclusion and restart-warning protections. An
+unproven candidate never proves that a caller is outside every pane.
+Named hook reconciliation retains its existing
+claim-healing behavior; an empty claim used for authority requires trusted birth.
+The Mac Nix package explicitly declares its C compiler, and `macos-process-facts`
+compiles the SDK helper using that package's compiler and SDK inputs.
 
 Public structured start, registry integration and structured `self` targets in
 agent restart/list remain #1439. #1629 must land before #1439. Kernel UID
