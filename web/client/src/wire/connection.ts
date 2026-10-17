@@ -5,7 +5,7 @@
  * **Connection states:** Disconnected, Connecting, Hello, Syncing, Live,
  * Stale, Reconnecting and NeedsToken, with §3's tables as the contract and
  * ADR-0036 §5a's parameters: connect 10 s, handshake 5 s, liveness 45 s,
- * subscription progress 30 s, backoff 500 ms × 2ⁿ capped
+ * subscription progress 30 s, command ack 30 s, backoff 500 ms × 2ⁿ capped
  * at 30 s with equal jitter and reset after 60 s of continuous Live.
  *
  * **Stream states:** Replaying, Resyncing, Current and Refused, per `sub`.
@@ -17,8 +17,7 @@
  * once. A newer snapshot `gap` supersedes an unfinished one, and `synced`
  * before the end is a protocol error.
  *
- * Commands and the outbox are #1747's third slice; until then an `ack` can
- * answer nothing this client sent, and is a protocol error.
+ * **The outbox:** see `outbox.ts`. Commands go out only in Live.
  *
  * Every timer runs on the injected {@link Clock}; every socket comes from the
  * injected {@link SocketFactory}. The connection is synchronous: each socket
@@ -44,9 +43,12 @@ import type { ClientFrame } from "../gen/ClientFrame";
 import type { ServerFrame } from "../gen/ServerFrame";
 import type { SubfailCode } from "../gen/SubfailCode";
 import type { WireClient } from "../gen/WireClient";
+import type { WireError } from "../gen/WireError";
 import type { WireEvent } from "../gen/WireEvent";
+import type { JsonValue } from "../gen/serde_json/JsonValue";
 import { decodeServerFrame } from "./decode";
-import { backoffDelay, type Clock, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
+import { backoffDelay, uuidv7, type Clock, type KeyValueStore, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
+import { Outbox, type OutboxEntry } from "./outbox";
 
 /**
  * The JSON wire version this client speaks: `WIRE_JSON_VERSION` in
@@ -60,6 +62,7 @@ export const DEADLINES = {
   handshake: 5_000,
   liveness: 45_000,
   progress: 30_000,
+  ack: 30_000,
   healthy: 60_000,
 } as const;
 
@@ -88,7 +91,11 @@ export function isHistoryStream(stream: string): boolean {
   return stream.startsWith("agent/") || stream === "events";
 }
 
-/** Receives one stream's progress. Each callback runs synchronously. */
+/**
+ * Receives one stream's progress. Each callback runs synchronously, and may
+ * {@link WireConnection.unsubscribe} its own subscription; nothing of that
+ * subscription follows.
+ */
 export interface StreamHandler {
   /** An event to apply. The cursor advances once this returns. */
   event(seq: number, ev: WireEvent): void;
@@ -118,8 +125,11 @@ export type ConnectionOptions = {
   readonly clock: Clock;
   readonly sockets: SocketFactory;
   readonly random: () => number;
+  readonly store: KeyValueStore;
   /** Applied cursors by stream, to resume from (in memory only, see above). */
   readonly cursors?: { readonly [stream: string]: number };
+  /** Mints `cmd_id`s; UUIDv7 from the wall clock by default. */
+  readonly newCommandId?: () => string;
 };
 
 type Sub = {
@@ -178,11 +188,13 @@ export class WireConnection {
   #listeners = new Set<() => void>();
   #transitions = new Set<(state: ConnectionState) => void>();
   readonly #options: ConnectionOptions;
+  readonly #outbox: Outbox;
 
   constructor(options: ConnectionOptions) {
     this.#options = options;
     this.#token = options.token;
     this.#cursors = new Map(Object.entries(options.cursors ?? {}));
+    this.#outbox = new Outbox(options.store, () => this.#changed());
   }
 
   /** The connection state. */
@@ -195,9 +207,14 @@ export class WireConnection {
     return this.#error;
   }
 
-  /** The principal of the last `welcome`. */
+  /** What restoring the stored outbox had to drop, or null (shown, never fatal). */
+  get outboxProblem(): string | null {
+    return this.#outbox.problem;
+  }
+
+  /** The principal of the last `welcome`, or of the restored outbox. */
   get principal(): string | null {
-    return this.#welcome?.principal ?? null;
+    return this.#welcome?.principal ?? this.#outbox.principal;
   }
 
   /** Every subscription's state and applied cursor, by sub id. */
@@ -205,7 +222,12 @@ export class WireConnection {
     return new Map([...this.#subs].map(([id, sub]) => [id, { stream: sub.stream, state: sub.state, cursor: sub.cursor }]));
   }
 
-  /** Calls `listener` after any change of state or streams. */
+  /** The outbox, oldest first. */
+  commands(): readonly OutboxEntry[] {
+    return this.#outbox.entries();
+  }
+
+  /** Calls `listener` after any change of state, streams or outbox. */
   onChange(listener: () => void): () => void {
     this.#listeners.add(listener);
     return () => this.#listeners.delete(listener);
@@ -222,7 +244,7 @@ export class WireConnection {
     if (this.#state === "Disconnected") this.#attemptNow();
   }
 
-  /** The user's `disconnect`: closes any socket and cancels retries. */
+  /** The user's `disconnect`: closes any socket, cancels retries, holds the outbox. */
   disconnect(): void {
     this.#abandon(NORMAL, "disconnect");
     this.#clear("backoff");
@@ -308,6 +330,23 @@ export class WireConnection {
     this.#settle();
   }
 
+  /**
+   * Queues a command (ADR-0038 §3's outbox). It is persisted as `pending`
+   * before any send, and sent in Live. Returns its `cmd_id`.
+   *
+   * @throws if no principal is known yet: a command is stored with the
+   *   principal that queued it, so none can be queued before a first
+   *   `welcome`.
+   */
+  command(verb: string, args: JsonValue, cmdId?: string): string {
+    const principal = this.principal;
+    if (principal === null) throw new Error("no principal yet: connect once before sending commands");
+    const id = cmdId ?? this.#options.newCommandId?.() ?? uuidv7(this.#options.clock.wallNow());
+    this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending" });
+    this.#flush();
+    return id;
+  }
+
   // --- lifecycle --------------------------------------------------------
 
   #connected(): boolean {
@@ -322,6 +361,7 @@ export class WireConnection {
     if (state === "Live") {
       this.#error = null;
       this.#arm("healthy", DEADLINES.healthy, () => (this.#attempt = 0));
+      this.#flush();
     }
     this.#changed();
   }
@@ -405,6 +445,7 @@ export class WireConnection {
     this.#generation++;
     for (const timer of ["connect", "handshake", "liveness"] as const) this.#clear(timer);
     for (const sub of this.#subs.values()) this.#stopProgress(sub);
+    this.#outbox.socketLost();
     this.#ended.clear();
     const socket = this.#socket;
     this.#socket = null;
@@ -439,7 +480,7 @@ export class WireConnection {
       case "ping":
         return this.#send({ t: "pong", nonce: frame.nonce });
       case "ack":
-        return this.#protocolError(`ack for ${frame.cmd_id}, but no command was sent`);
+        return this.#acked(frame);
       default:
         return this.#streamFrame(frame);
     }
@@ -455,6 +496,7 @@ export class WireConnection {
     }
     const previous = this.#welcome;
     this.#welcome = frame;
+    this.#outbox.adoptPrincipal(frame.principal);
     this.#renewLiveness();
     this.#enter("Syncing");
     for (const sub of this.#subs.values()) {
@@ -488,6 +530,14 @@ export class WireConnection {
     this.#startProgress(sub);
   }
 
+  /**
+   * The progress deadline: on expiry, `unsub`, then a re-sub from the
+   * applied cursor.
+   *
+   * Known limit: this re-sends `sub` with the same `sub_id`. ADR-0038 §3
+   * ("Sub ids and closed subs") and ADR-0036 §5a require a fresh id for
+   * every re-sub. G3b #1595 remaps it to a fresh id from `nextSubId`.
+   */
   #startProgress(sub: Sub): void {
     this.#stopProgress(sub);
     sub.progress = this.#options.clock.setTimeout(() => {
@@ -525,6 +575,7 @@ export class WireConnection {
         if (sub.snapshot !== null) return this.#snapshotLine(sub, sub.snapshot, frame.seq, frame.ev);
         if (sub.cursor !== null && frame.seq <= sub.cursor) return;
         sub.handler.event(frame.seq, frame.ev);
+        if (this.#subs.get(sub.id) !== sub) return this.#changed();
         this.#advance(sub, frame.seq);
         return;
       }
@@ -538,6 +589,11 @@ export class WireConnection {
         sub.settled = true;
         sub.handler.synced();
         return this.#settle();
+      /**
+       * Known limit: this re-sends `sub` with the same `sub_id`. ADR-0038 §3
+       * ("Sub ids and closed subs") and ADR-0036 §5a require a fresh id for
+       * every re-sub. G3b #1595 remaps it to a fresh id from `nextSubId`.
+       */
       case "lagged":
         this.#sendSub(sub);
         return this.#changed();
@@ -569,6 +625,7 @@ export class WireConnection {
     if (frame.snapshot_to === undefined) {
       if (sub.cursor !== null && frame.to <= sub.cursor) return;
       sub.handler.gap(sub.cursor === null ? frame.from : Math.max(frame.from, sub.cursor + 1), frame.to);
+      if (this.#subs.get(sub.id) !== sub) return this.#changed();
       return this.#advance(sub, frame.to);
     }
     if (frame.snapshot_to < frame.to) return this.#protocolError(`a snapshot on ${sub.stream} ending before its gap`);
@@ -598,12 +655,14 @@ export class WireConnection {
     sub.snapshot = null;
     sub.state = snapshot.resume;
     sub.handler.snapshot(snapshot.lines);
+    if (this.#subs.get(sub.id) !== sub) return this.#changed();
     this.#advance(sub, snapshot.end);
   }
 
   #subfail(sub: Sub, code: SubfailCode, message: string): void {
     if (code !== "cursor_ahead") return this.#refuse(sub, { code, message });
     sub.handler.reset();
+    if (this.#subs.get(sub.id) !== sub) return this.#changed();
     sub.cursor = null;
     this.#cursors.delete(sub.stream);
     this.#sendSub(sub);
@@ -617,5 +676,21 @@ export class WireConnection {
     sub.settled = true;
     sub.handler.refused(refusal);
     this.#settle();
+  }
+
+  // --- commands ---------------------------------------------------------
+
+  #flush(): void {
+    if (this.#state !== "Live") return;
+    for (const entry of this.#outbox.pending()) {
+      this.#send({ t: "cmd", cmd_id: entry.cmd_id, verb: entry.verb, args: entry.args, resume_only: false });
+      this.#outbox.sent(entry.cmd_id, this.#options.clock.wallNow(), this.#options.clock.setTimeout(() => this.#outbox.uncertain(entry.cmd_id), DEADLINES.ack), (handle) => this.#options.clock.clearTimeout(handle));
+    }
+  }
+
+  #acked(frame: Extract<ServerFrame, { t: "ack" }>): void {
+    const error: WireError | null = frame.error ?? null;
+    if (frame.ok === (error !== null)) return this.#protocolError(`ack ${frame.cmd_id} with ok=${frame.ok} and ${error === null ? "no" : "an"} error`);
+    if (!this.#outbox.settle(frame.cmd_id, error)) return this.#protocolError(`ack for ${frame.cmd_id}, which is not awaiting one on this socket`);
   }
 }
