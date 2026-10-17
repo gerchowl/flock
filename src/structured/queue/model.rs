@@ -237,7 +237,7 @@ pub enum Change {
 /// Dense per-agent sequence plus one durable change.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
-    /// Cursor within queue/<agent>, unrelated to the global event log.
+    /// Cursor within `queue/<agent>`, unrelated to the global event log.
     pub seq: u64,
     /// Item change.
     #[serde(flatten)]
