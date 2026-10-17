@@ -2,7 +2,7 @@ use super::*;
 use crate::structured::launch::SessionConfigDir;
 use serde_json::json;
 use std::fs;
-use std::os::unix::fs::{symlink, MetadataExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::Duration;
 
@@ -108,6 +108,7 @@ fn invalid_addresses_missing_corruption_and_symlinks_are_distinct() {
     fs::remove_file(&path).unwrap();
     let outside = root.path().join("outside");
     fs::write(&outside, b"abc").unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
     symlink(&outside, &path).unwrap();
     assert!(matches!(store.get(ABC), Err(BlobError::UnsafePath)));
     assert!(matches!(store.stat(ABC), Err(BlobError::UnsafePath)));
@@ -161,6 +162,9 @@ fn publication_is_atomic_for_concurrent_verified_readers() {
     }
     impl Read for Held {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.bytes.position() == 0 {
+                return self.bytes.read(&mut buffer[..1]);
+            }
             if let Some(tx) = self.started.take() {
                 tx.send(()).map_err(io::Error::other)?;
                 self.release
@@ -170,7 +174,7 @@ fn publication_is_atomic_for_concurrent_verified_readers() {
             self.bytes.read(buffer)
         }
     }
-    let (_root, store) = setup();
+    let (root, store) = setup();
     let store = Arc::new(store);
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -189,6 +193,13 @@ fn publication_is_atomic_for_concurrent_verified_readers() {
             .unwrap();
     });
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let temporary = names(&root);
+    assert_eq!(temporary.len(), 1);
+    assert!(temporary[0].starts_with(".tmp-"));
+    assert_eq!(
+        fs::read(root.path().join("blobs").join(&temporary[0])).unwrap(),
+        b"a"
+    );
     assert!(matches!(store.get(ABC), Err(BlobError::Missing)));
     release_tx.send(()).unwrap();
     assert_eq!(
@@ -284,7 +295,6 @@ fn projection_preserves_tool_input_unknown_payloads_and_live_only_deltas() {
 
 #[test]
 fn unsafe_namespace_and_file_permissions_fail_without_repair() {
-    use std::os::unix::fs::PermissionsExt;
     let (root, store) = setup();
     store.put(&b"abc"[..], 3).unwrap();
     let path = root.path().join("blobs").join(ABC);

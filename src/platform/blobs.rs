@@ -17,6 +17,12 @@ impl Directory {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(path)?;
         validate(&file.metadata()?, true)?;
+        // Make the namespace entry durable too, including a retry after failed sync.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?
+            .sync_all()?;
         Ok(Self(file))
     }
     fn name(name: &str) -> io::Result<CString> {

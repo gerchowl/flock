@@ -17,6 +17,7 @@ Previews are lossy UTF-8, bounded to 80 characters, and are not complete content
 
 Directories require mode 0700 and files 0600, owned by the current user. Operations
 pin the blob directory and reject symlinks, invalid addresses and unsafe entries.
+Opening the namespace syncs its parent so a newly created directory is durable.
 Puts publish a synced temporary file by same-directory atomic rename and sync the
 directory, including deduplicated puts. A failed put removes only its own temporary
 file; corruption is reported rather than repaired. Read/write/sync failures remain
