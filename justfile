@@ -105,6 +105,36 @@ website-build:
 client-check:
     cd web/client && bun install --frozen-lockfile && bun test && bun test ./e2e && bun x tsc --noEmit -p tsconfig.json && bun run build
 
+# Recompute nix/client-deps.json, the pinned hash of the client's
+# dependencies for `nix build .#flock-client` (#1731), after web/client/bun.lock
+# changes: it records the lock's sha256, fetches with a placeholder hash and
+# keeps the hash nix reports. Commit the file it writes. If the fetch fails for
+# any other reason (network, a lock bun refuses), the file is left as it was.
+client-deps-hash:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    backup=$(mktemp)
+    cp nix/client-deps.json "$backup"
+    restore() { cp "$backup" nix/client-deps.json; rm -f "$backup"; }
+    lock=$(nix-hash --type sha256 --flat web/client/bun.lock)
+    printf '{\n  "lock": "%s",\n  "hash": ""\n}\n' "$lock" > nix/client-deps.json
+    log=$(nix build .#flock-client.deps --no-link 2>&1 || true)
+    hash=$(printf '%s\n' "$log" | sed -n 's/^ *got: *//p' | tail -n 1)
+    if [ -z "$hash" ]; then
+      printf '%s\n' "$log" >&2
+      restore
+      echo "client-deps-hash: the fetch failed before nix reported a hash (see above); nix/client-deps.json is unchanged" >&2
+      exit 1
+    fi
+    printf '{\n  "lock": "%s",\n  "hash": "%s"\n}\n' "$lock" "$hash" > nix/client-deps.json
+    if ! nix build .#flock-client.deps --no-link; then
+      restore
+      echo "client-deps-hash: the fetch did not reproduce $hash; nix/client-deps.json is unchanged" >&2
+      exit 1
+    fi
+    rm -f "$backup"
+    echo "nix/client-deps.json: $hash"
+
 # Install the Chromium build the client's screenshot test drives (CI, or once
 # per machine). --with-deps adds its system libraries on Linux.
 client-browsers:
