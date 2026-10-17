@@ -114,3 +114,24 @@ describe("S7a scripts", () => {
     }
   }
 });
+
+describe("harness assertions", () => {
+  /** A synthetic script: `c0` is seeded in the outbox, then an observe names `absent`. */
+  const seeded = (absent: string): FixtureLine[] =>
+    parseScript(
+      [
+        { v: 1, step: "given", cursors: {}, outbox: [{ cmd_id: "c0", verb: "agent.send", args: { target: "a", text: "hi", submit: true }, principal: "fixture-principal", created_ms: 0, status: "pending", first_sent_ms: null }], covers: ["s7"] },
+        { v: 1, step: "observe", outbox: { c0: "pending" }, absent_outbox: [absent] },
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n"),
+    );
+
+  test("absent_outbox fails when the outbox holds the named command", () => {
+    expect(() => new Harness().run(seeded("c0"))).toThrow("command c0 should be absent");
+  });
+
+  test("absent_outbox passes for a command the outbox does not hold", () => {
+    expect(() => new Harness().run(seeded("c9"))).not.toThrow();
+  });
+});

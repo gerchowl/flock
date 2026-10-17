@@ -320,13 +320,14 @@ describe("a same-socket re-sub takes a fresh id (ADR-0038 §3, ADR-0036 §5a)", 
       h.step(step({ step: "send", frame: { t: "synced", sub_id: fresh, seq: 0 } }));
       expect(h.connection.state).toBe("Live");
       const state = h.connection.streams().get(fresh);
+      expect(state).toBeDefined();
       const before = calls.length;
       h.step(step({ step: "send", frame: { t: "synced", sub_id: "s1", seq: 7 } }));
       h.step(step({ step: "send", frame: { t: "gap", sub_id: "s1", from: 1, to: 6 } }));
       h.step(step({ step: "send", frame: { t: "subfail", sub_id: "s1", code: "scope", message: "late" } }));
       expect(h.connection.state).toBe("Live");
       expect(h.connection.error).toBeNull();
-      expect(h.connection.streams().get(fresh)).toEqual(state ?? { stream: "missing", state: "Refused", cursor: null });
+      expect(h.connection.streams().get(fresh)).toEqual(state);
       expect(h.connection.streams().has("s1")).toBe(false);
       expect(calls.length).toBe(before);
       expect(sentFrames(h).length).toBe(sent.length);
