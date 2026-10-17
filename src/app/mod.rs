@@ -540,8 +540,12 @@ impl App {
         config_diagnostic: Option<String>,
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
-        runtime_config: AppRuntimeConfig,
+        mut runtime_config: AppRuntimeConfig,
     ) -> Self {
+        // Absence is explicit policy, never an inference from a pending lookup.
+        if config.security.agent_account == crate::config::model::AgentAccount::None {
+            runtime_config.uid_policy.dedicated = Ok(None).into();
+        }
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
         crate::channels::issue_tokens(&config.channels, &short_host_name());
@@ -1883,6 +1887,10 @@ impl App {
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
+        if !invalid_section("security") && config.security != self.state.config.security {
+            diagnostics.push("security.agent_account changed: restart the server to apply socket account policy; keeping current policy".into());
+        }
+
         // Snapshot fields that need to detect a change relative to the
         // previous live config BEFORE any per-section replacement below.
         let previous_sound = self.state.config.ui.sound.clone();
@@ -2980,6 +2988,23 @@ mod tests {
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         restore_xdg_state_home(original_xdg_state_home);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn account_policy_reload_keeps_active_policy_and_requires_restart() {
+        let mut app = test_app();
+        let mut incoming = app.state.config.clone();
+        incoming.security.agent_account = crate::config::model::AgentAccount::None;
+        let report = app.apply_live_config(&incoming, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("security.agent_account changed: restart")));
+        assert_eq!(
+            app.state.config.security.agent_account,
+            crate::config::model::AgentAccount::FlkAgent
+        );
     }
 
     #[test]

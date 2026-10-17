@@ -326,6 +326,30 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   `caller_is_local_operator()` gains that uid check first; a detached
   (`setsid`) child of a structured agent is still `flk-agent` and still
   refused.
+  **Account policy (owner decisions, #1795).** File-only
+  `[security] agent_account = "flk-agent" | "none"` defaults to `"flk-agent"`.
+  Recognition is independent of `structured.run_as`: opting into operator-mode
+  launch does not disable it. With recognition enabled, a pending or failed
+  directory lookup classifies socket callers as `Unknown`, including callers
+  with the server UID: reads remain available but operator mutations, including
+  server stop, are refused. A resolved dedicated UID distinct from the server
+  UID permits the server UID to proceed to the existing ancestry checks; a
+  resolved absent account does too. A dedicated UID equal to the server UID
+  is a §1a misconfiguration, never operator authority. Report
+  `agent_account_uid_collision` once in the log and retain the typed diagnostic
+  in server status until restart.
+
+  Explicit `agent_account = "none"` declares that no dedicated account is used.
+  The server never starts the dedicated-account NSS lookup, and callers with
+  its own UID immediately pass the UID boundary. Lease, pane, birth and relay
+  checks still apply: known same-UID agents remain non-operator. Other or missing
+  UIDs remain unknown/read-only. This opt-in avoids the default directory-service
+  availability cost but gives up recognizing anonymous/detached callers as
+  `flk-agent` by UID. It cannot provide a dedicated-account isolation boundary;
+  same-UID callers without lease/pane ancestry remain cooperative under #1177.
+  Changing the setting requires a server restart; reload keeps the active policy
+  and reports that requirement.
+
 - **Which agent is calling.** The session lease (§1) records the process's
   pid and start time. A socket caller whose ancestry reaches a leased pid
   (with a matching `process_start_time`, so pid reuse cannot impersonate)
@@ -848,11 +872,12 @@ Messages are JSON text frames, one object each, tagged by `t`:
 ```text
 client → server
   hello   { protocol, client: { name, version }, token? }
-  sub     { sub_id, stream, after? }          stream ∈ agent/<id>, agent/<id>/live,
+  sub     { sub_id, stream, after? }          fresh sub_id on this connection;
+                                            stream ∈ agent/<id>, agent/<id>/live,
                                               queue/<id>, events, terminal/<pane>,
                                               fleet, inbox, artifacts, work
   pong    { nonce }                          echo the server ping nonce
-  unsub   { sub_id }
+  unsub   { sub_id }                         closes id; drop late frames for it
   cmd     { cmd_id, verb, args, resume_only } cmd_id is the idempotency key
 server → client
   welcome { protocol, server_version, capabilities, principal,
@@ -860,11 +885,30 @@ server → client
   ping    { nonce }                          application heartbeat (§5a)
   ev      { sub_id, stream, seq, ts_ms, ev }  ev is the typed event (§6)
   synced  { sub_id, seq }                    replay barrier on every seq stream
-  subfail { sub_id, code, message }          subscription refusal (§5a)
+  subfail { sub_id, code, message }          closes id; drop late frames (§5a)
   gap     { sub_id, from, to, snapshot_to? }  inline checkpoint (§4)
-  lagged  { sub_id, skipped_to }
+  lagged  { sub_id, skipped_to }              closes id; fresh sub, no unsub (§5a)
   ack     { cmd_id, ok, result? | error{ code, message, exit, retry } }
 ```
+
+**S7-min fleet and permission contracts (#1746).** The `fleet` snapshot stream
+lists structured agents as `FleetAgentRow { id, label, state: AgentState,
+activity?, waiting_on_human: string[] }`. `AgentState` is the shared S4 object,
+including axes, phase and sources, not a bare phase. Its per-field `or_unknown`
+reading follows ADR-0028 §3a: an unknown newer phase becomes `unknown` while the
+other axes survive; it must not discard the fleet delta. Snapshot rows use §5a's
+existing inline gap/checkpoint path. Fleet `ev` payloads are the closed tagged
+`FleetDelta` union: `{ type:"fleet.upsert", row: FleetAgentRow }` or
+`{ type:"fleet.remove", id }`, rather than session `WireEvent` payloads.
+
+`cmd agent.decide` takes `AgentDecide { agent, request_id, decision, message? }`,
+where decision is `allow_once`, `allow_always` or `deny`. Only a token-authenticated
+client principal may call it. The existing ack envelope echoes `cmd_id`; success
+returns `AgentDecideResult { request_id, decision }`, echoing the applied answer.
+Decision-specific failure names are `permission_request_unknown`,
+`permission_request_closed` and `not_authorized`, with retry class `never` in the
+existing error envelope. Their API error-code registration and command behavior
+are deferred to S6 (#1429); this types slice names the contracts only.
 
 - **Cursors and bootstrap (architect decisions iii/iv).** Every stream except
   `agent/<id>/live` has seqs, including `terminal/<pane>` and `events`.
@@ -880,11 +924,12 @@ server → client
   Send `synced { sub_id, seq }` exactly once on **every seq stream** per
   subscription, after replay through a captured head, including all announced
   snapshot lines. The barrier's seq is that head (zero only for a genuinely
-  new empty stream); all later frames are live. Re-subscription after `lagged`
-  gets its own barrier. Empty-checkpoint completion advances to `to` before
-  `synced`; a nonzero high-water never becomes zero merely because no items
-  remain. Delivery is at-least-once; dedupe on `(stream, seq)` and persist a
-  cursor only after applying its event or empty checkpoint. Persist a pending
+  new empty stream); all later frames are live. `lagged` closes the old ID;
+  re-subscription with a fresh ID gets its own barrier without an `unsub`.
+  Empty-checkpoint completion advances to `to` before `synced`; a nonzero
+  high-water never becomes zero merely because no items remain. Delivery is
+  at-least-once; dedupe on `(stream, seq)` and persist a cursor only after
+  applying its event or empty checkpoint. Persist a pending
   `snapshot_to` and unconfirmed-entity set with the cursor across disconnects.
   Resume unfinished snapshots before declaring Current. A new gap supersedes
   an old resync marker and marks all entities unconfirmed again.
@@ -1004,6 +1049,8 @@ WS close **4401** means auth refused during hello; **4403** means token revoked
 mid-session. Both enter NeedsToken, holding the outbox without reconnecting until
 a new token arrives. These codes differ from protocol failures (visible error,
 capped reconnect) and network loss (reconnect).
+Frames for a closed subscription ID are silently dropped. A frame for an ID
+never opened on the current connection is a protocol error, not a closed-ID case.
 Protocol errors close with a visible diagnosis and capped reconnect (a server
 upgrade can cure them). A newer client follows §5's ReadOnly capabilities and
 holds commands; it can keep reading and detecting stale transport.
@@ -1012,8 +1059,10 @@ holds commands; it can keep reading and detecting stale transport.
 stream's `sub { after:last_applied_seq }`, preserving any unfinished resync
 marker. Retained events are replayed in order before `synced`, and mutations
 concurrent with replay follow the captured barrier without a hole. `lagged`
-re-subscribes from the applied cursor, never `skipped_to`. A snapshot gap uses
-§4's inline checkpoint; no snapshot gap is allowed to omit `snapshot_to`.
+closes its old ID, like `subfail`: the server sends nothing more on that ID and
+the client silently drops late frames for it. Re-subscribe with a fresh ID from
+the applied cursor, never `skipped_to`; no `unsub` is needed for the closed ID.
+A snapshot gap uses §4's inline checkpoint; no snapshot gap may omit `snapshot_to`.
 A history gap on `agent/<id>` or `events` leaves an explicit missing-range marker
 and continues from `to+1`, without implying complete history.
 
@@ -1034,24 +1083,42 @@ the cursorless `agent/<id>/live` stream without `after`. Terminal recovery alway
 full-frame snapshot path; on cursor_ahead it clears that stream's state/cursor
 and bootstraps without `after` as specified below, never starts from a delta.
 
+**Subscription identity (architect decision, 2026-10-17).** Every `sub`
+uses a fresh `sub_id`, unique for the lifetime of that connection. IDs are
+never reused on that connection, including re-subscriptions of the same stream
+after `lagged` or the progress deadline. `unsub`, `subfail` and `lagged` each
+close the named ID; the server sends nothing more on a closed ID. Clients
+silently drop late frames for any closed ID, without advancing a cursor or
+renewing progress. After `lagged`, re-subscribe with a fresh ID without an
+`unsub`. After `subfail`, re-subscribe only where its code calls for it, using a
+fresh ID without `unsub`; otherwise stop until the code table's condition changes.
+A progress deadline first sends `unsub` to close the stalled ID. A frame for an
+ID never opened on the current connection is a protocol error. The server refuses
+a `sub` that reuses either a live or closed ID with typed
+`subfail { code:"sub_id_reused", ... }`. Preserve stream cursors and resync
+markers across replacement while allocating a new subscription identity.
+
 **Subscription refusal and progress.** `subfail { sub_id, code, message }`
-ends only the named subscription and supplies these typed codes (S7a defines
+closes only the named subscription ID, which receives no further server frames;
+clients drop late frames for it. It supplies these typed codes (S7a defines
 the wire enum; implementation registers any new API error codes where needed):
 
 | Code | Meaning and client action |
 | --- | --- |
-| `cursor_ahead` | Stored cursor exceeds the stream head. Clear only that stream's entities, cursor and resync marker, then re-subscribe without `after` through bootstrap; do not silently clamp. |
+| `cursor_ahead` | Stored cursor exceeds the stream head. Clear only that stream's entities, cursor and resync marker, then re-subscribe with a fresh ID without `after` through bootstrap; do not silently clamp. |
 | `operator_only` | Subscription requires the operator principal. Show refusal and stop that subscription until the principal changes; other streams stay up. |
 | `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
 | `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
+| `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
 
 Start the 30 s progress deadline at sub registration, or when a new gap starts
 resync of a Current stream. Reset it only on a frame advancing that sub: a newly
 applied seq, an advancing gap/cursor or snapshot boundary, or its synced barrier.
 Duplicates, repeated identical gaps, unrelated streams and heartbeat frames do
-not reset it. Expiry sends unsub, then a new sub from the applied cursor and
-stored resync marker; only that stream returns to Replaying/Resyncing. Keep the
-connection and other streams up and show the affected stream's recovery state.
+not reset it. Expiry sends unsub, then a new sub with a fresh ID from the applied
+cursor and stored resync marker; only that stream returns to Replaying/Resyncing.
+Keep the connection and other streams up and show the affected stream's
+recovery state.
 A replay that keeps advancing can exceed 30 s in total. No timeout marks Current.
 
 **Commands across a drop.** Persist the client's outbox before sending, keeping
@@ -1209,7 +1276,7 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | Reordered replay/barrier | A fault script delivering synced before its announced snapshot end or out-of-order seq is rejected, never marked Current. Every seq stream, specifically terminal and events, receives exactly one valid barrier. |
 | First subscription and empty state | fleet, inbox and queue bootstrap all use the inline gap/snapshot path; empty from=1,to=0,snapshot_to=0 completes without waiting. No client fetch or guessed end marker. |
 | Zero-line queue rewrite and restart | Append through H, empty the folded queue, rewrite with header high_water=H, restart, subscribe and process empty gap: cursor becomes H; next item is H+1 and is applied rather than deduped away. Crash before/after rename preserves one complete checkpoint. |
-| Disconnect during snapshot / lagged / another rewrite | Stored marker and applied cursor resume remaining lines; a newer checkpoint marks all entities unconfirmed again. Concurrent mutations are present after replay; removed entities disappear exactly at snapshot completion. |
+| Disconnect during snapshot / lagged / another rewrite | Stored marker and applied cursor resume remaining lines. Lagged closes the old ID; re-subscribe with a fresh ID without unsub and drop late old-ID frames. A newer checkpoint marks all entities unconfirmed again. Concurrent mutations are present after replay; removed entities disappear exactly at snapshot completion. |
 | Lost ack / duplicate cmd / restart at claim, effect or outcome | Same principal/key/payload yields one effect and first stored ack, or explicit uncertain pending outcome. All listed verbs, including fork/reload/interrupt, prove no automatic second dispatch. Different payload never executes. |
 | Permission prompt across drop | Prompt survives replay, stored answer retries once under the same request/key, closed prompt cannot receive a second answer or an answer intended for a newer prompt. |
 | Expired key / clock uncertainty / changed principal / revoked token | No automatic resend or new-id workaround; unknown outcome is visible, old-principal outbox drops, revoked token enters NeedsToken. |
@@ -1221,11 +1288,12 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | Scope shrink | Reduce a still-valid token's scope after hello; a newly unauthorized cmd and cached-result lookup both get scope error ack without admission/result disclosure. Socket remains open and an allowed operation still succeeds. |
 | Slow replay heartbeat priority | Queue replay in both directions on a constrained healthy link; ping/pong bypass waiting data and prevent false Stale from backlog. An actually blocked writer or missing pong still fails within the liveness ceiling. |
 | Terminal snapshot recovery | Lose delta history, then receive gap with snapshot_to and a full frame followed by deltas and synced. The old display remains stale until the full frame applies; a delta or early synced cannot clear it. Removed pane refuses unknown_stream. |
-| subfail cursor_ahead | A restored head below the saved cursor refuses; client clears only that stream's entities/cursor/marker and bootstraps without after. Other streams continue. |
+| subfail cursor_ahead | A restored head below the saved cursor refuses; client clears only that stream's entities/cursor/marker and bootstraps on a fresh ID without after. Other streams continue. |
+| Closed, unknown or reused subscription ID | Unsub/subfail/lagged close the ID. Client silently drops late frames for a closed ID, but treats a never-opened ID as a protocol error. Server refuses a sub reusing a live or closed ID with sub_id_reused. |
 | subfail operator_only | Non-operator subscription refuses and stops until principal changes; no reconnect loop or blocked sibling stream. |
 | subfail unknown_stream | Unknown kind/removed subject refuses and stops until a valid selection; no fake empty success. |
 | subfail scope | Insufficient token scope refuses only that sub until authorization changes; sibling streams remain live. |
-| Per-stream progress deadline | Replay exceeds 30 s overall but progresses within each window and succeeds. A stalled sub expires despite duplicate/unrelated/heartbeat traffic: unsub/re-sub only that sub from its applied cursor, retaining resync marker and the connection. |
+| Per-stream progress deadline | Replay exceeds 30 s overall but progresses within each window and succeeds. A stalled sub expires despite duplicate/unrelated/heartbeat traffic: unsub the stalled ID, then re-subscribe with a fresh ID from its applied cursor, retaining resync marker and the connection. |
 | Ack timeout and delayed original | Missing ack marks only that cmd uncertain; no same-socket resend or teardown. A late current-socket ack resolves it. After reconnect, deliver resume-only lookup before buffered original: show unknown outcome while the original may later execute once; never manufacture a new ID. Verify retry:later remains harmless with resume_only. |
 | Mobile suspend and remote outage | Foreground invalidates old socket and resumes. Local heartbeat does not clear remote stale state; cross-node cmd still refuses under VERSION 5. |
 

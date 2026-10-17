@@ -97,6 +97,7 @@ pub(crate) enum ServerRuntimeStatus {
         capabilities: Option<crate::api::schema::ServerCapabilities>,
         session_health: Option<crate::platform::SessionHealth>,
         api_listener: Option<crate::api::schema::ApiListenerHealth>,
+        agent_account_diagnostic: Option<crate::api::schema::AgentAccountDiagnostic>,
     },
     NotRunning,
 }
@@ -199,6 +200,7 @@ fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
             version,
             protocol,
             api_listener,
+            agent_account_diagnostic,
             capabilities,
             ..
         } => {
@@ -210,6 +212,11 @@ fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
             println!("{indent}protocol: {}", protocol_label(*protocol));
             println!("{indent}compatible: {}", compatibility_label(*protocol));
             println!("{indent}socket: {}", api::socket_path().display());
+            if let Some(diagnostic) = agent_account_diagnostic {
+                let crate::api::schema::AgentAccountDiagnostic::AgentAccountUidCollision { uid } =
+                    diagnostic;
+                println!("{indent}account policy: agent_account_uid_collision: flk-agent UID {uid} equals server UID; operator authority refused");
+            }
             if let Some(health) = api_listener {
                 println!("{indent}api listener stopped: {}", health.stopped);
                 println!("{indent}api accept errors: {}", health.accept_errors);
@@ -266,6 +273,7 @@ pub(crate) fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatu
             capabilities: status.capabilities,
             session_health: status.session_health,
             api_listener: status.api_listener,
+            agent_account_diagnostic: status.agent_account_diagnostic,
         }),
         Err(ApiClientError::Io(err)) if server_not_running_error(&err) => {
             Ok(ServerRuntimeStatus::NotRunning)
@@ -454,6 +462,7 @@ struct ServerStatusJson {
     /// nobody knows.
     session_health: Option<&'static str>,
     api_listener: Option<crate::api::schema::ApiListenerHealth>,
+    agent_account_diagnostic: Option<crate::api::schema::AgentAccountDiagnostic>,
 }
 
 #[derive(Serialize)]
@@ -488,6 +497,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             capabilities,
             session_health,
             api_listener,
+            agent_account_diagnostic,
         } => ServerStatusJson {
             status: "running",
             running: true,
@@ -506,6 +516,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             restart_needed: restart_needed_bool(server),
             session_health: session_health_label(*session_health),
             api_listener: api_listener.clone(),
+            agent_account_diagnostic: agent_account_diagnostic.clone(),
         },
         ServerRuntimeStatus::NotRunning => ServerStatusJson {
             status: "not_running",
@@ -519,6 +530,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             restart_needed: Some(false),
             session_health: None,
             api_listener: None,
+            agent_account_diagnostic: None,
         },
     }
 }
@@ -624,6 +636,7 @@ mod installed_tests {
             capabilities: None,
             session_health: None,
             api_listener: None,
+            agent_account_diagnostic: None,
         };
         let before = installed_status_at(Ok(launch.clone()), &server, &mut execute);
         assert_eq!(before.client_drift, Some(false), "{before:?}");
@@ -696,6 +709,9 @@ mod tests {
             protocol: None,
             capabilities: None,
             session_health: None,
+            agent_account_diagnostic: Some(
+                crate::api::schema::AgentAccountDiagnostic::AgentAccountUidCollision { uid: 7 },
+            ),
             api_listener: Some(crate::api::schema::ApiListenerHealth {
                 stopped: true,
                 accept_errors: 2,
@@ -703,6 +719,11 @@ mod tests {
             }),
         };
         let json = serde_json::to_value(server_status_json(&server)).unwrap();
+        assert_eq!(
+            json["agent_account_diagnostic"]["code"],
+            "agent_account_uid_collision"
+        );
+        assert_eq!(json["agent_account_diagnostic"]["uid"], 7);
         assert_eq!(json["api_listener"]["stopped"], true);
         assert_eq!(json["api_listener"]["accept_errors"], 2);
         assert_eq!(

@@ -45,12 +45,12 @@ Error codes are open strings from ADR-0029's full registry, with future codes
 accepted; data stays under `error.data`.
 
 The scripts cover clean replay; connect/handshake expiry; nonempty and empty
-snapshots; empty and nonempty bootstrap; lagged recovery from the applied cursor
-without an invented unsubscribe requirement; heartbeat/protocol reconnect;
+snapshots; empty and nonempty bootstrap; lagged closes its ID and recovery
+subscribes with a fresh ID from the applied cursor, without unsub; heartbeat/protocol reconnect;
 token refusal/revocation; read-only version skew; uncertain command recovery;
-ordinary command failure; all four subscription refusals; cursor_ahead followed
-by a sub explicitly **without after**; subscription-progress expiry that sends
-unsub then sub for only that stream; sibling stream independence; and abandoned
+ordinary command failure; stream subscription refusals; cursor_ahead followed
+by a fresh-ID sub explicitly **without after**; subscription-progress expiry that sends
+unsub then a fresh-ID sub for only that stream; sibling stream independence; and abandoned
 socket frames ignored for cursor, barrier, pong and liveness purposes.
 
 Snapshots finish at snapshot_to, independently of synced's captured replay
@@ -121,14 +121,41 @@ They validate the script assertions; they do not execute G3. G3 must consume the
 same scripts with its actual client, fake transport and virtual clock.
 
 
-Every script header has machine-readable `covers:["s7-min"]` or `covers:["s7"]`.
-S7-min (#1746) selects clean, agent-gap, agent-send, ping-pong, token-refused and
-token-revoked: hello/welcome/token, agent/<id> cursor replay with synced and gap
-(no entity snapshot), agent.send with ack, ping/pong and 4401/4403 closes. These
-scripts request no fleet/inbox/queue verb. All other scripts target full S7.
+Every script header has a machine-readable covers list containing s7-min, s7,
+or both when the script is required by both slices.
+S7-min (#1746) selects clean, agent-gap, agent-send, ping-pong, token-refused,
+token-revoked, heartbeat-missed, fleet-lite and unknown-subscription: hello/welcome/token, agent/<id> cursor replay with synced and gap
+(no entity snapshot), agent.send with ack, ping/pong, 4401/4403 closes and
+a protocol close (1002) for a never-opened subscription ID. These
+scripts use agent streams or fleet and only agent.send/agent.decide commands.
+The minimal verb check includes restored given.outbox entries. Heartbeat carries
+both labels because liveness belongs to both slices. Other scripts target full S7.
 The field defaults to an empty list only when reading older version-one scripts;
-the checked-in inventory requires exactly one of the two slice labels.
+the checked-in inventory requires the selected slice labels explicitly.
 
 The generator also emits FixtureExamples.ts from every JSONL line as a literal
 checked against FixtureLine. The strict ts-check recipe compiles that artifact;
 the Rust drift test ensures it cannot silently lag behind the scripts.
+
+The fleet-lite script uses the §5a inline checkpoint: gap with snapshot_to,
+full FleetAgentRow upserts, then synced. Live fleet.upsert/fleet.remove payloads
+are FleetDelta, not session WireEvent. A later gap supplies a fresh snapshot;
+rows absent from it must disappear. The script exercises both snapshot passes,
+activity and permission badges, a live replacement, and a live removal.
+
+Every sub uses a fresh ID for the connection's lifetime. Lagged and subfail
+close their ID: the server sends nothing more on it. Lagged recovery subscribes
+with a fresh ID without unsub while retaining the stream cursor. After subfail,
+follow the code's recovery rule; operator_only, unknown_stream and scope stop
+until their specified condition changes. Any permitted re-sub uses a fresh ID. A progress deadline
+sends unsub to close the stalled ID before subscribing with a fresh one. The lagged, deadline,
+cursor-ahead and fleet-lite scripts inject late synced frames for retired IDs;
+these must be silently ignored. A never-opened ID is a protocol error, while a
+server refuses reused live or closed IDs with subfail code sub_id_reused.
+
+FleetAgentRow.state is the shared S4 AgentState object, including its lenient
+per-axis reading (ADR-0028 §3a); it is not a phase string. unknown-subscription
+injects a frame for an ID never opened on the current connection and requires
+protocol close 1002. Rust contract tests also pin sub_id_reused for both live and
+closed IDs. The subscription guard models live-to-closed transitions on unsub,
+subfail and lagged, retaining closed IDs until the connection ends.

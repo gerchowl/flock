@@ -62,6 +62,9 @@ async fn fake_claude_calls(mcp: bool) {
         rx,
         crate::api::EventHub::default(),
     );
+    // An explicitly disabled account still cannot grant a leased same-UID agent
+    // operator authority. Keep a directory service out of this identity proof.
+    app.runtime_config.uid_policy.dedicated = Ok(None).into();
     app.state.workspaces = vec![crate::workspace::Workspace::test_new("recipient")];
     app.state.ensure_test_terminals();
     app.state.config.fleet.agent_spawn_enabled = true;
@@ -223,6 +226,9 @@ async fn fake_claude_calls(mcp: bool) {
         let caller = {
             app.current_api_peer_pid = msg.peer_pid;
             app.current_api_peer_birth = Some(msg.peer_birth);
+            assert_eq!(msg.peer_uid, Some(crate::platform::peer::effective_uid()));
+            app.current_api_peer_uid = Some(msg.peer_uid);
+            assert!(!app.caller_is_local_operator());
             app.spawn_caller()
         };
         attributed &= app.attested_sender_agent().as_deref() == Some(AGENT);
