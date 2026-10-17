@@ -4108,6 +4108,7 @@ impl AppState {
             }
             AppEvent::AgentSessionReported {
                 pane_id,
+                transcript_path,
                 source,
                 agent_label,
                 seq,
@@ -4115,13 +4116,20 @@ impl AppState {
                 session_start_source,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    let report = if source == "flock:codex" && agent_label == "codex" {
+                        session_ref.as_ref().map(|session| crate::agent_resume::CodexSessionStart {
+                            thread: session.value.clone(), transcript_path, source: session_start_source.clone(),
+                        })
+                    } else { None };
+                    let mutation = terminal.set_agent_session_ref_for_session_start(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
-                    )
+                    );
+                    if mutation.is_some() { terminal.codex_session_start = report; }
+                    mutation
                 })
                 .into_iter()
                 .collect(),
@@ -7249,6 +7257,7 @@ mod tests {
 
         let report = |pane_id| AppEvent::AgentSessionReported {
             pane_id,
+            transcript_path: None,
             source: "flock:claude".into(),
             agent_label: "claude".into(),
             seq: Some(1),
