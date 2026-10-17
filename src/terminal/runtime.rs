@@ -47,6 +47,10 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    /// Birth captured at spawn or imported with the owning pane runtime.
+    pub(crate) fn child_birth(&self) -> Option<u64> {
+        self.0.child_birth()
+    }
     /// The pane child's exit slot, where one exists (#178).
     pub fn child_exit(&self) -> Option<&crate::pane::ChildExit> {
         self.0.child_exit()
@@ -573,6 +577,17 @@ mod write_ack_tests {
 
     #[tokio::test]
     async fn s3b_api_to_native_actor_waits_for_final_write_and_notifies_once() {
+        native_api_write("pane.write_input", false).await;
+    }
+
+    #[tokio::test]
+    async fn s3c_native_text_write_precedes_encoded_paste_observation() {
+        for method in ["pane.send_text", "pane.write_text", "agent.send"] {
+            native_api_write(method, true).await;
+        }
+    }
+
+    async fn native_api_write(method: &str, paste: bool) {
         let (api_tx, api_rx) = mpsc::unbounded_channel();
         let mut app = crate::app::App::new(
             &crate::config::Config::default(),
@@ -581,6 +596,8 @@ mod write_ack_tests {
             api_rx,
             crate::api::EventHub::default(),
         );
+        let (event_tx, mut events) = mpsc::channel(8);
+        app.event_tx = event_tx;
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("write-ack")];
         app.state.ensure_test_terminals();
         let pane = app.state.workspaces[0].tabs[0].root_pane;
@@ -588,6 +605,9 @@ mod write_ack_tests {
         let (actor, mut peer) = crate::pty::actor::PtyIoActorHandle::test_spawn_on_socket_pair();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let runtime = TerminalRuntime(crate::pane::PaneRuntime::test_with_actor(actor));
+        if paste {
+            runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        }
         let now = Instant::now();
         assert!(runtime.begin_injection_lease("held", now + Duration::from_secs(2), now));
         app.state.workspaces[0].tabs[0]
@@ -595,8 +615,8 @@ mod write_ack_tests {
             .insert(pane, runtime);
         let (respond_to, response) = reply::channel();
         api_tx.send(crate::api::ApiRequestMessage {
-            request: serde_json::from_value(serde_json::json!({"id":"native","method":"pane.write_input","params":{"pane_id":public,"text":"é","keys":["Enter"],"raw":true}})).unwrap(),
-            respond_to, peer_pid:None, peer_birth:None,
+            request: serde_json::from_value(serde_json::json!({"id":"native","method":method,"params":{"pane_id":public,"target":public,"text":"é","keys":["Enter"],"raw":true,"write_timeout_ms":200}})).unwrap(),
+            respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
         }).unwrap();
         app.drain_api_requests();
         assert!(matches!(
@@ -607,16 +627,48 @@ mod write_ack_tests {
             .await
             .unwrap();
         assert!(app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held"));
-        let mut observed = [0; 3];
+        let expected = if paste {
+            "\x1b[200~é\x1b[201~"
+        } else {
+            "é\r"
+        };
+        let mut observed = vec![0; expected.len()];
         peer.read_exact(&mut observed).unwrap();
-        assert_eq!(&observed, "é\r".as_bytes());
+        assert_eq!(observed, expected.as_bytes());
         tokio::time::timeout(Duration::from_secs(2), app.input_writes.notify.notified())
             .await
             .unwrap();
-        app.input_writes.service();
+        if paste {
+            let deadline = app.input_writes.next_deadline();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.unwrap())),
+            )
+            .await
+            .unwrap();
+        }
+        app.service_input_writes();
+        if paste {
+            assert!(
+                response.try_recv().is_err(),
+                "completed writing still needs observation"
+            );
+            app.state.workspaces[0].tabs[0].runtimes[&pane]
+                .test_process_pty_bytes("\x1b[2J\x1b[Hé".as_bytes());
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle_internal_event(event);
+        }
         let value: serde_json::Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
-        assert!(value.get("result").is_some());
-        app.input_writes.service();
+        assert!(value.get("result").is_some(), "{value}");
+        if paste {
+            assert_eq!(value["result"]["type"], "paste");
+            assert_eq!(value["result"]["outcome"], "delivered");
+            assert_eq!(value["result"]["evidence"]["level"], "text_matched");
+        }
+        app.service_input_writes();
         assert!(response.try_recv().is_err());
     }
 }

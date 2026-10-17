@@ -957,7 +957,7 @@ impl HeadlessServer {
             };
 
             match event {
-                LoopEvent::InputWrites => self.app.input_writes.service(),
+                LoopEvent::InputWrites => self.app.service_input_writes(),
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
                     if self.handle_internal_event_with_forwarding(ev) {
@@ -2883,6 +2883,30 @@ impl HeadlessServer {
             return false;
         }
 
+        if matches!(
+            msg.request.method,
+            api::schema::Method::ServerLiveHandoff(_) | api::schema::Method::ServerReloadConfig(_)
+        ) {
+            let outer = (
+                self.app.current_api_peer_pid,
+                self.app.current_api_peer_birth,
+                self.app.current_api_peer_uid,
+            );
+            self.app.current_api_peer_pid = msg.peer_pid;
+            self.app.current_api_peer_birth = Some(msg.peer_birth);
+            self.app.current_api_peer_uid = Some(msg.peer_uid);
+            let refusal = self.app.peer_uid_refusal(&msg.request);
+            (
+                self.app.current_api_peer_pid,
+                self.app.current_api_peer_birth,
+                self.app.current_api_peer_uid,
+            ) = outer;
+            if let Some(response) = refusal {
+                let _ = msg.respond_to.send(response);
+                return false;
+            }
+        }
+
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
             self.handoff_skipped_undrained.clear();
             let outcome = self.perform_live_handoff(params.clone());
@@ -2994,11 +3018,13 @@ impl HeadlessServer {
         } else {
             self.app.current_api_peer_pid = msg.peer_pid;
             self.app.current_api_peer_birth = Some(msg.peer_birth);
+            self.app.current_api_peer_uid = Some(msg.peer_uid);
             let response = self
                 .app
                 .handle_api_request_after_internal_events_drained(msg.request);
             self.app.current_api_peer_pid = None;
             self.app.current_api_peer_birth = None;
+            self.app.current_api_peer_uid = None;
             response
         };
         self.app.respond_or_park(msg.respond_to, response);
@@ -3757,6 +3783,7 @@ impl HeadlessServer {
     /// would never see the fault that only the server can have.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         self.app.input_writes.service_due(now);
+        self.app.start_ready_pastes();
         let mut changed = false;
 
         self.app.sync_headless_animation_timer(now);
@@ -4721,7 +4748,7 @@ mod tests {
         let (respond_to, response) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true,"write_timeout_ms":200}})).unwrap(),
-            respond_to, peer_pid:None, peer_birth:None,
+            respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
         });
         assert!(matches!(
             response.try_recv(),
@@ -4765,7 +4792,7 @@ mod tests {
         let (respond_to, response) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true}})).unwrap(),
-            respond_to, peer_pid:None, peer_birth:None,
+            respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
         });
         assert!(matches!(
             response.try_recv(),
@@ -4869,6 +4896,39 @@ mod tests {
     }
 
     #[test]
+    fn headless_uid_boundary_precedes_live_handoff_fast_path() {
+        let mut server = test_headless_server();
+        server.app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: 7,
+            dedicated: Ok(Some(42)).into(),
+        };
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (respond_to, response) = std::sync::mpsc::channel();
+        let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "uid-handoff".into(),
+                method: api::schema::Method::ServerLiveHandoff(
+                    api::schema::ServerLiveHandoffParams {
+                        import_exe: Some(root.path().join("absent-importer").display().to_string()),
+                        ..Default::default()
+                    },
+                ),
+            },
+            peer_pid: Some(std::process::id()),
+            peer_birth: crate::platform::process_start_time(std::process::id()),
+            peer_uid: Some(42),
+            respond_to,
+        });
+        let response: serde_json::Value =
+            serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+        assert!(!changed);
+        assert_eq!(response["error"]["code"], "operator_only", "{response}");
+        assert!(server.app.current_api_peer_uid.is_none());
+        assert!(!server.app.state.should_quit);
+    }
+
+    #[test]
     fn headless_api_request_drains_all_pending_internal_events_before_reading_state() {
         let mut server = test_headless_server();
         for i in 0..=crate::app::APP_EVENT_DRAIN_LIMIT {
@@ -4890,8 +4950,9 @@ mod tests {
                     method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
                 },
                 respond_to,
-                peer_pid: None,
-                peer_birth: None,
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
             })
         );
         let response = response_rx
@@ -7607,8 +7668,9 @@ next_tab = ""
                     },),
                 },
                 respond_to,
-                peer_pid: None,
-                peer_birth: None,
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
             })
         );
         let _ = response_rx
@@ -9243,8 +9305,9 @@ next_tab = ""
                 }),
             },
             respond_to,
-            peer_pid: None,
-            peer_birth: None,
+            peer_pid: Some(std::process::id()),
+            peer_birth: crate::platform::process_start_time(std::process::id()),
+            peer_uid: Some(crate::platform::peer::effective_uid()),
         });
 
         assert!(changed);

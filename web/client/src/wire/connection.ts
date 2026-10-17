@@ -530,6 +530,14 @@ export class WireConnection {
     this.#startProgress(sub);
   }
 
+  /**
+   * The progress deadline: on expiry, `unsub`, then a re-sub from the
+   * applied cursor.
+   *
+   * Known limit: this re-sends `sub` with the same `sub_id`. ADR-0038 §3
+   * ("Sub ids and closed subs") and ADR-0036 §5a require a fresh id for
+   * every re-sub. G3b #1595 remaps it to a fresh id from `nextSubId`.
+   */
   #startProgress(sub: Sub): void {
     this.#stopProgress(sub);
     sub.progress = this.#options.clock.setTimeout(() => {
@@ -581,6 +589,11 @@ export class WireConnection {
         sub.settled = true;
         sub.handler.synced();
         return this.#settle();
+      /**
+       * Known limit: this re-sends `sub` with the same `sub_id`. ADR-0038 §3
+       * ("Sub ids and closed subs") and ADR-0036 §5a require a fresh id for
+       * every re-sub. G3b #1595 remaps it to a fresh id from `nextSubId`.
+       */
       case "lagged":
         this.#sendSub(sub);
         return this.#changed();

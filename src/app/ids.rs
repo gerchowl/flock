@@ -3,23 +3,50 @@ use super::App;
 impl App {
     /// Preserve socket attribution across queued or parked requests and lease release.
     pub(super) fn lease_caller(&self) -> crate::structured::lease::Caller {
-        if let Some(birth) = self.current_api_peer_birth {
-            if self.current_api_peer_pid.is_some()
-                && ((birth.is_none() && !self.session_leases.is_empty())
-                    || (birth.is_some()
-                        && self
-                            .current_api_peer_pid
-                            .and_then(crate::platform::process_start_time)
-                            != birth))
-            {
-                return crate::structured::lease::Caller::Uncertain;
-            }
+        use crate::structured::identity::Principal;
+        let principal = self
+            .current_api_peer_uid
+            .map(|uid| self.runtime_config.uid_policy.classify(uid));
+        if principal == Some(Principal::Unknown)
+            || (self.current_api_peer_uid.is_some() && self.current_api_peer_pid.is_none())
+        {
+            return crate::structured::lease::Caller::Uncertain;
         }
-        self.session_leases.caller_with_pane(
-            self.current_api_peer_pid,
-            self.caller_pane()
-                .and_then(|(_, pane)| self.pane_child_pid(pane)),
-        )
+        if !self.socket_birth_valid() {
+            return crate::structured::lease::Caller::Uncertain;
+        }
+        let evidence = self.caller_pane_evidence();
+        let pane = evidence
+            .as_ref()
+            .ok()
+            .copied()
+            .flatten()
+            .and_then(|(_, pane)| self.pane_child_pid(pane));
+        let caller = self
+            .session_leases
+            .caller_with_pane(self.current_api_peer_pid, pane);
+        if caller == crate::structured::lease::Caller::Unrelated
+            && (evidence.is_err() || (principal == Some(Principal::Agent) && pane.is_none()))
+        {
+            crate::structured::lease::Caller::Uncertain
+        } else {
+            caller
+        }
+    }
+
+    pub(super) fn socket_birth_valid(&self) -> bool {
+        let Some(birth) = self.current_api_peer_birth else {
+            return true;
+        };
+        self.current_api_peer_pid.is_none()
+            || match birth {
+                Some(birth) => {
+                    self.current_api_peer_pid
+                        .and_then(crate::platform::process_start_time)
+                        == Some(birth)
+                }
+                None => self.session_leases.is_empty(),
+            }
     }
 
     pub(crate) fn find_pane(
@@ -117,6 +144,9 @@ impl App {
             return parsed;
         };
         let chain = peer_ancestor_chain(peer);
+        if id.is_empty() {
+            return self.trusted_pane_in_chain(&chain);
+        }
         self.reconcile_pane_claim(id, parsed, &chain)
     }
 
@@ -186,11 +216,39 @@ impl App {
             .and_then(crate::terminal::TerminalRuntime::child_pid)
     }
 
-    /// The API caller's own pane by process ancestry alone, for a `self`
-    /// target. Unlike [`Self::parse_pane_id_or_peer`] it memoizes nothing.
+    /// ADR-0036 §1a: authority needs the pane child's original birth, not only PID.
+    fn trusted_pane_in_chain(&self, chain: &[u32]) -> Option<(usize, crate::layout::PaneId)> {
+        let pane = self.resolve_pane_in_chain(chain)?;
+        let (_, state) = self.find_pane(pane.1)?;
+        let runtime = self.terminal_runtimes.get(&state.attached_terminal_id)?;
+        let pid = runtime.child_pid()?;
+        let birth = runtime.child_birth()?;
+        (crate::platform::process_start_time(pid) == Some(birth)).then_some(pane)
+    }
+
+    /// A possible caller pane for refusal, self-protection and warning routing only.
+    /// PID ancestry is not identity evidence and must never grant authority.
+    pub(super) fn caller_pane_candidate(&self) -> Option<(usize, crate::layout::PaneId)> {
+        self.resolve_pane_in_chain(&peer_ancestor_chain(self.current_api_peer_pid?))
+    }
+
+    /// The API caller's own pane, bound to the child's original birth identity.
     pub(super) fn caller_pane(&self) -> Option<(usize, crate::layout::PaneId)> {
-        let chain = peer_ancestor_chain(self.current_api_peer_pid?);
-        self.resolve_pane_in_chain(&chain)
+        self.caller_pane_evidence().ok().flatten()
+    }
+
+    fn caller_pane_evidence(&self) -> Result<Option<(usize, crate::layout::PaneId)>, ()> {
+        let Some(peer) = self.current_api_peer_pid else {
+            return Ok(None);
+        };
+        let chain = peer_ancestor_chain(peer);
+        let candidate = self.resolve_pane_in_chain(&chain);
+        let trusted = self.trusted_pane_in_chain(&chain);
+        if candidate.is_some() && trusted.is_none() {
+            Err(())
+        } else {
+            Ok(trusted)
+        }
     }
 
     fn resolve_pane_in_chain(&self, chain: &[u32]) -> Option<(usize, crate::layout::PaneId)> {
@@ -425,5 +483,129 @@ mod tests {
         let resolved = app.reconcile_pane_claim("p_999999", None, &[33_333, 22_222]);
         assert_eq!(resolved.map(|(_, p)| p), Some(pane_b));
         assert_eq!(app.state.pane_id_aliases.get(&999_999), Some(&pane_b));
+    }
+    async fn pane_birth_handoff_case(metadata: &str) {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use std::time::Duration;
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("birth-handoff")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let terminal = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let runtime = crate::terminal::TerminalRuntime::spawn_shell_command(
+            pane,
+            24,
+            80,
+            root.path().to_owned(),
+            "read line",
+            &[],
+            4096,
+            Default::default(),
+            app.event_tx.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let pid = runtime.child_pid().unwrap();
+        let birth = crate::platform::process_start_time(pid).unwrap();
+        app.current_api_peer_pid = Some(pid);
+        app.current_api_peer_birth = Some(Some(birth));
+        let reservation = app
+            .session_leases
+            .reserve("agent", "pending", None)
+            .unwrap();
+        app.terminal_runtimes.insert(terminal.clone(), runtime);
+        let spawned_evidence = app.caller_pane();
+        let runtime = app.terminal_runtimes.remove(&terminal).unwrap();
+        let state = runtime.handoff_runtime_state(pane.raw());
+        let captured = state.child_birth;
+        let mut encoded = serde_json::to_value(&state).unwrap();
+        match metadata {
+            "legacy" => {
+                encoded.as_object_mut().unwrap().remove("child_birth");
+            }
+            "reused" => {
+                encoded["child_birth"] = serde_json::json!(birth.wrapping_add(1));
+            }
+            _ => {}
+        }
+        let transferred: crate::handoff_runtime::HandoffRuntimeState =
+            serde_json::from_value(encoded).unwrap();
+        runtime
+            .start_handoff_pause(Duration::from_secs(2), false)
+            .unwrap()
+            .wait()
+            .unwrap();
+        let fd = runtime.duplicate_handoff_fd().unwrap();
+        runtime.preserve_for_handoff();
+        let mut adopted = crate::terminal::TerminalRuntime::from_handoff_fd(
+            crate::handoff_runtime::ImportedHandoffRuntime {
+                master_fd: fd,
+                state: transferred,
+            },
+            4096,
+            Default::default(),
+            app.event_tx.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        adopted.assume_handoff_ownership();
+        adopted.set_handoff_reader_paused(false);
+        let imported = adopted.child_birth();
+        app.terminal_runtimes.insert(terminal.clone(), adopted);
+        let evidence = app.caller_pane();
+        let empty_claim = app.parse_pane_id_or_peer("", Some(pid));
+        let caller = app.lease_caller();
+        let named_claim = app.parse_pane_id_or_peer(&format!("p_{}", pane.raw()), Some(pid));
+        let runtime = app.terminal_runtimes.remove(&terminal).unwrap();
+        let stopped = runtime.shutdown_for_restart(vec![pid], Duration::ZERO);
+        assert!(tokio::time::timeout(Duration::from_secs(10), stopped)
+            .await
+            .unwrap()
+            .unwrap());
+        drop(reservation);
+        assert_eq!(captured, Some(birth));
+        assert_eq!(spawned_evidence, Some((0, pane)));
+        assert_eq!(
+            named_claim,
+            Some((0, pane)),
+            "named hook claim healing is preserved"
+        );
+        if metadata == "valid" {
+            assert_eq!(imported, Some(birth));
+            assert_eq!(evidence, Some((0, pane)));
+            assert_eq!(empty_claim, Some((0, pane)));
+            assert_eq!(caller, crate::structured::lease::Caller::Unrelated);
+        } else {
+            assert_eq!(evidence, None);
+            assert_eq!(empty_claim, None);
+            assert_eq!(caller, crate::structured::lease::Caller::Uncertain);
+            if metadata == "legacy" {
+                assert_eq!(imported, None);
+            }
+        }
+        assert!(app.test_pane_child_pids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn real_pane_birth_survives_serialized_handoff_and_grants_pane_evidence() {
+        pane_birth_handoff_case("valid").await;
+    }
+
+    #[tokio::test]
+    async fn legacy_handoff_without_birth_cannot_override_launcher_uncertainty() {
+        pane_birth_handoff_case("legacy").await;
+    }
+
+    #[tokio::test]
+    async fn reused_pane_birth_cannot_override_launcher_uncertainty() {
+        pane_birth_handoff_case("reused").await;
     }
 }
