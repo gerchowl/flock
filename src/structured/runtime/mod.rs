@@ -79,6 +79,16 @@ impl Runtime {
     ) -> Result<(), crate::api::error_code::ErrorCode> {
         self.transport.agent_decide(principal, args)
     }
+    /// Audit a host cancellation/result/interrupt without sending a tool decision.
+    /// The caller must carry an authenticated operate-token capability.
+    pub fn close_permissions(
+        &self,
+        principal: &super::permissions::Principal<'_>,
+        id: Option<&str>,
+        reason: super::permissions::CloseReason,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        self.transport.close_permissions(principal, id, reason)
+    }
     /// Current permission ids for S4 attention; a busy snapshot fails closed.
     pub fn waiting_on_human(&self) -> Result<Vec<String>, crate::api::error_code::ErrorCode> {
         self.transport.waiting_on_human()

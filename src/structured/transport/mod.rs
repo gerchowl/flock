@@ -11,6 +11,9 @@
 //! Any top-level result ends the input gate; its outcome remains adapter work.
 #![deny(missing_docs)]
 
+mod control;
+mod metadata;
+
 use super::claude::SessionEvent;
 use super::permissions::{self, AgentDecide, Book, Principal};
 use crate::api::error_code::ErrorCode;
@@ -40,9 +43,13 @@ enum Input {
     User(Vec<u8>),
     Decision(Control),
 }
+enum Command {
+    Decide(Control),
+    Close(Vec<permissions::Closing>),
+}
 struct ControlPlane {
     book: Permissions,
-    decisions: mpsc::Receiver<Control>,
+    decisions: mpsc::Receiver<Command>,
     input: mpsc::SyncSender<Input>,
 }
 
@@ -114,7 +121,7 @@ pub struct Transport {
 #[derive(Clone)]
 pub(super) struct InputHandle {
     input: Option<mpsc::SyncSender<Input>>,
-    decisions: mpsc::SyncSender<Control>,
+    decisions: mpsc::SyncSender<Command>,
     permissions: Permissions,
     busy: Arc<AtomicBool>,
     uncertain: Arc<AtomicBool>,
@@ -186,7 +193,7 @@ impl Transport {
         }
         private_fs::set_nonblocking(&stdout)?;
         private_fs::set_nonblocking(&stdin)?;
-        let (input, input_rx) = mpsc::sync_channel(4);
+        let (input, input_rx) = mpsc::sync_channel(permissions::MAX_OPEN + 1);
         let (decisions, decision_rx) = mpsc::sync_channel(4);
         let permissions = Arc::new(parking_lot::Mutex::new(Book::new(location.agent.clone())));
         let plane = ControlPlane {
@@ -286,6 +293,17 @@ impl Transport {
         self.input.agent_decide(principal, args)
     }
 
+    /// Audit a host cancellation, result or interrupt without inventing a decision.
+    /// `None` closes all open ids; token authorization precedes every lookup.
+    pub fn close_permissions(
+        &self,
+        principal: &Principal<'_>,
+        id: Option<&str>,
+        reason: permissions::CloseReason,
+    ) -> Result<(), ErrorCode> {
+        self.input.close_permissions(principal, id, reason)
+    }
+
     /// Open permission ids; contention fails closed rather than claiming no wait.
     pub fn waiting_on_human(&self) -> Result<Vec<String>, ErrorCode> {
         self.input.waiting_on_human()
@@ -341,6 +359,7 @@ impl InputHandle {
         principal: &Principal<'_>,
         args: &AgentDecide,
     ) -> Result<(), ErrorCode> {
+        principal.decision_subject()?;
         if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
             return Err(ErrorCode::AgentNotFound);
         }
@@ -353,13 +372,38 @@ impl InputHandle {
                 return Err(ErrorCode::InvalidParams);
             }
         };
-        if let Err(error) = self.decisions.try_send(Control { answer, bytes }) {
-            let control = match error {
-                mpsc::TrySendError::Full(control) | mpsc::TrySendError::Disconnected(control) => {
-                    control
-                }
-            };
-            book.aborted(&control.answer.id);
+        let id = answer.id.clone();
+        if self
+            .decisions
+            .try_send(Command::Decide(Control { answer, bytes }))
+            .is_err()
+        {
+            book.aborted(&id);
+            return Err(ErrorCode::SessionBusy);
+        }
+        Ok(())
+    }
+    pub(super) fn close_permissions(
+        &self,
+        principal: &Principal<'_>,
+        id: Option<&str>,
+        reason: permissions::CloseReason,
+    ) -> Result<(), ErrorCode> {
+        principal.decision_subject()?;
+        if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        let mut book = self.permissions.try_lock().ok_or(ErrorCode::SessionBusy)?;
+        let closings = book.close(id, reason)?;
+        if closings.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) = self.decisions.try_send(Command::Close(closings)) {
+            if let mpsc::TrySendError::Full(Command::Close(closings))
+            | mpsc::TrySendError::Disconnected(Command::Close(closings)) = error
+            {
+                book.close_aborted(&closings);
+            }
             return Err(ErrorCode::SessionBusy);
         }
         Ok(())
@@ -474,6 +518,9 @@ fn write_inputs(
             Ok(input) => {
                 let (bytes, answer) = match input {
                     Input::User(bytes) if permissions.lock().blocked() => {
+                        if pending.is_some() {
+                            return Err(io::Error::other(ErrorCode::PermissionInputAlreadyHeld));
+                        }
                         pending = Some(bytes);
                         continue;
                     }
@@ -593,124 +640,57 @@ fn pump(
     controls: &ControlPlane,
 ) -> io::Result<()> {
     let (mut file, mut seq) = open_stream(location, cancel)?;
-    let mut line = Vec::new();
-    let mut count = 0_u64;
-    let mut chunk = [0; 8192];
-    loop {
-        if cancel.load(Ordering::Acquire) {
-            return Err(cancelled());
-        }
-        while let Ok(control) = controls.decisions.try_recv() {
-            answer(
-                &mut file, &mut seq, control, version, &tx, busy, uncertain, cancel, controls,
-            )?;
-        }
-        let n = match pipe.read(&mut chunk) {
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(POLL);
-                continue;
+    let mut recorder = control::Recorder::new(
+        &mut file, &mut seq, version, &tx, busy, uncertain, cancel, controls,
+    );
+    let result = (|| {
+        let mut line = Vec::new();
+        let mut count = 0_u64;
+        let mut metadata = metadata::Line::default();
+        let mut chunk = [0; 8192];
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(cancelled());
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        for &byte in &chunk[..n] {
-            if byte == b'\n' {
-                observed(
-                    &mut file, &mut seq, &line, count, version, &tx, busy, uncertain, cancel,
-                    controls,
-                )?;
-                line.clear();
-                count = 0;
-            } else {
-                count = count.saturating_add(1);
-                if line.len() < MAX_LINE_BYTES {
-                    line.push(byte);
+            while let Ok(command) = controls.decisions.try_recv() {
+                recorder.command(command)?;
+            }
+            let n = match pipe.read(&mut chunk) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(POLL);
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            for part in chunk[..n].split_inclusive(|b| *b == b'\n') {
+                let ended = part.last() == Some(&b'\n');
+                let bytes = if ended { &part[..part.len() - 1] } else { part };
+                count = count.saturating_add(bytes.len() as u64);
+                metadata.feed(bytes);
+                let retained = bytes.len().min(MAX_LINE_BYTES - line.len());
+                line.extend_from_slice(&bytes[..retained]);
+                if ended {
+                    recorder.observed(&line, count, std::mem::take(&mut metadata))?;
+                    line.clear();
+                    count = 0;
                 }
             }
-        }
-        if n == 0 {
-            if count > 0 {
-                observed(
-                    &mut file, &mut seq, &line, count, version, &tx, busy, uncertain, cancel,
-                    controls,
-                )?;
+            if n == 0 {
+                if count > 0 {
+                    recorder.observed(&line, count, metadata)?;
+                }
+                return Ok(());
             }
-            return Ok(());
         }
+    })();
+    // Persist every terminal close even when cancellation prevents notification.
+    // Disk failures are surfaced; no cleanup can promise an unsuccessful fsync.
+    match recorder.finish() {
+        Ok(()) => result,
+        Err(error) => Err(error),
     }
-}
-
-fn observed(
-    file: &mut File,
-    seq: &mut u64,
-    line: &[u8],
-    count: u64,
-    version: &str,
-    tx: &mpsc::SyncSender<Received>,
-    busy: &AtomicBool,
-    uncertain: &AtomicBool,
-    cancel: &AtomicBool,
-    controls: &ControlPlane,
-) -> io::Result<()> {
-    let open = if count <= MAX_LINE_BYTES as u64 {
-        match std::str::from_utf8(line).map(|s| SessionEvent::parse(s, version)) {
-            Ok(SessionEvent::CanUseTool(event)) => {
-                let mut book = controls.book.lock();
-                Some(
-                    book.observe(&event.request_id, event.request)
-                        .map_err(|code| io::Error::other(code.as_str()))?,
-                )
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let mut publish = |line: &[u8], count, synthetic| {
-        emit(
-            file, seq, line, count, version, tx, busy, uncertain, cancel, synthetic,
-        )
-    };
-    publish(line, count, false)?;
-    if let Some(audit) = open {
-        let mut raw = encode(&audit)?;
-        raw.pop();
-        publish(&raw, raw.len() as u64, true)?;
-    }
-    Ok(())
-}
-
-fn answer(
-    file: &mut File,
-    seq: &mut u64,
-    control: Control,
-    version: &str,
-    tx: &mpsc::SyncSender<Received>,
-    busy: &AtomicBool,
-    uncertain: &AtomicBool,
-    cancel: &AtomicBool,
-    controls: &ControlPlane,
-) -> io::Result<()> {
-    let mut raw = encode(&control.answer.audit)?;
-    raw.pop();
-    emit(
-        file,
-        seq,
-        &raw,
-        raw.len() as u64,
-        version,
-        tx,
-        busy,
-        uncertain,
-        cancel,
-        true,
-    )?;
-    controls.book.lock().audited(&control.answer);
-    controls
-        .input
-        .try_send(Input::Decision(control))
-        .map_err(|_| io::Error::other("permission writer queue unavailable"))
 }
 
 /// Inspect a bounded JSON object prefix structurally, never matching nested
@@ -754,6 +734,20 @@ fn emit(
     cancel: &AtomicBool,
     synthetic: bool,
 ) -> io::Result<()> {
+    let received = persist(file, seq, line, count, version, busy, uncertain, synthetic)?;
+    publish(received, tx, cancel)
+}
+
+fn persist(
+    file: &mut File,
+    seq: &mut u64,
+    line: &[u8],
+    count: u64,
+    version: &str,
+    busy: &AtomicBool,
+    uncertain: &AtomicBool,
+    synthetic: bool,
+) -> io::Result<Received> {
     let origin = if synthetic || count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err()
     {
         RecordOrigin::Flk
@@ -818,7 +812,13 @@ fn emit(
     {
         uncertain.store(true, Ordering::Release);
     }
-    let mut received = Received { record, event };
+    Ok(Received { record, event })
+}
+fn publish(
+    mut received: Received,
+    tx: &mpsc::SyncSender<Received>,
+    cancel: &AtomicBool,
+) -> io::Result<()> {
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(cancelled());

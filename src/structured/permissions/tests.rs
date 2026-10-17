@@ -14,10 +14,10 @@ fn args(id: &str, decision: Decision) -> AgentDecide {
     }
 }
 fn token() -> Principal<'static> {
-    Principal::Token {
-        subject: "fixture-client",
-        operate: true,
-    }
+    Principal::Token(crate::structured::permissions::auth::fixture(
+        "fixture-client",
+        true,
+    ))
 }
 fn book() -> Book {
     let mut b = Book::new("fixture-agent".into());
@@ -32,14 +32,11 @@ fn only_an_authenticated_operate_token_can_decide() {
         Principal::Agent("fixture-agent"),
         Principal::Agent("other-agent"),
         Principal::Lease("fixture-agent"),
-        Principal::Token {
-            subject: "fixture-client",
-            operate: false,
-        },
-        Principal::Token {
-            subject: "",
-            operate: true,
-        },
+        Principal::Token(crate::structured::permissions::auth::fixture(
+            "fixture-client",
+            false,
+        )),
+        Principal::Token(crate::structured::permissions::auth::fixture("", true)),
     ] {
         let mut b = book();
         assert_eq!(

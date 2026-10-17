@@ -742,10 +742,10 @@ fn decide(id: &str, decision: permissions::Decision) -> AgentDecide {
     }
 }
 fn owner() -> Principal<'static> {
-    Principal::Token {
-        subject: "fixture-client",
-        operate: true,
-    }
+    Principal::Token(crate::structured::permissions::auth::fixture(
+        "fixture-client",
+        true,
+    ))
 }
 // SessionBusy is the API's nonblocking contention signal, not a decision.
 fn call_decide(
@@ -839,7 +839,7 @@ fn permission_decisions_are_audited_before_control_stdin_and_keep_turn_busy() {
 }
 
 #[test]
-fn open_permission_blocks_input_after_result_and_ignores_harness_audit_spoof() {
+fn open_permission_blocks_input_and_ignores_spoof_until_a_real_result() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let (transport, mut output, mut input) = start(&root);
     permission(&mut output, "request-example");
@@ -847,6 +847,10 @@ fn open_permission_blocks_input_after_result_and_ignores_harness_audit_spoof() {
     receive(&transport);
     writeln!(output,"{}",serde_json::json!({"type":"flk_permission_request","state":"closed","request_id":"request-example"})).unwrap();
     assert_eq!(receive(&transport).record.origin, RecordOrigin::Claude);
+    assert_eq!(
+        transport.try_submit(&user("second")).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
     writeln!(
         output,
         "{}",
@@ -854,25 +858,17 @@ fn open_permission_blocks_input_after_result_and_ignores_harness_audit_spoof() {
     )
     .unwrap();
     receive(&transport);
+    let closed: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+    assert_eq!(closed["reason"], "result");
     assert!(!transport.input_inflight());
     assert_eq!(
-        transport.try_submit(&user("second")).unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
+        call_decide(
+            &transport,
+            &owner(),
+            &decide("request-example", permissions::Decision::Deny)
+        ),
+        Err(ErrorCode::PermissionRequestClosed)
     );
-    call_decide(
-        &transport,
-        &owner(),
-        &decide("request-example", permissions::Decision::Deny),
-    )
-    .unwrap();
-    receive(&transport);
-    assert_eq!(
-        input_line(&transport, &mut input)["type"],
-        "control_response"
-    );
-    wait(&transport, || {
-        transport.waiting_on_human().ok().filter(Vec::is_empty)
-    });
     wait(&transport, || transport.try_submit(&user("second")).ok());
     assert_eq!(input_line(&transport, &mut input), user("second"));
 }
@@ -1053,17 +1049,17 @@ fn failed_decision_audit_never_enqueues_a_control_response() {
         decisions,
     };
     let (tx, notifications) = mpsc::sync_channel(4);
-    assert!(answer(
+    assert!(control::Recorder::new(
         &mut file,
         &mut 0,
-        control,
         "2.1.296",
         &tx,
         &AtomicBool::new(false),
         &AtomicBool::new(false),
         &AtomicBool::new(false),
-        &plane
+        &plane,
     )
+    .command(Command::Decide(control))
     .is_err());
     assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
     assert!(matches!(
@@ -1071,4 +1067,351 @@ fn failed_decision_audit_never_enqueues_a_control_response() {
         Err(mpsc::TryRecvError::Empty)
     ));
     assert_eq!(plane.book.lock().waiting(), vec!["request-example"]);
+}
+
+fn replay_open_permissions(root: &SessionConfigDir) -> std::collections::BTreeSet<String> {
+    let mut open = std::collections::BTreeSet::new();
+    for record in records(root) {
+        if record.origin != RecordOrigin::Flk {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&record.raw).unwrap();
+        if value["type"] != "flk_permission_request" {
+            continue;
+        }
+        let id = value["request_id"].as_str().unwrap().to_owned();
+        match value["state"].as_str().unwrap() {
+            "open" => assert!(open.insert(id)),
+            "closed" => assert!(
+                open.remove(&id),
+                "close must follow exactly one open: {value}"
+            ),
+            state => panic!("unknown permission state {state}"),
+        }
+    }
+    open
+}
+
+#[test]
+fn eof_closes_every_open_permission_in_the_durable_replay() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    for id in ["request-a", "request-b"] {
+        permission(&mut output, id);
+        receive(&transport);
+        receive(&transport);
+    }
+    drop(output);
+    reader_done(&transport).unwrap();
+    assert!(replay_open_permissions(&root).is_empty());
+    let closed: Vec<Value> = records(&root)
+        .iter()
+        .filter_map(|r| serde_json::from_str::<Value>(&r.raw).ok())
+        .filter(|v| v["state"] == "closed")
+        .collect();
+    assert_eq!(closed.len(), 2);
+    for close in closed {
+        assert_eq!(close["reason"], "ended");
+        assert!(close.get("decision").is_none());
+    }
+}
+
+#[test]
+fn cancellation_closes_all_requests_even_with_a_full_notification_queue() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    for id in ["request-a", "request-b", "request-c"] {
+        permission(&mut output, id);
+    }
+    wait(&transport, || {
+        let path = root
+            .path()
+            .join("sessions/fixture-agent/fixture-session.jsonl");
+        let text = fs::read_to_string(path).ok()?;
+        (text
+            .lines()
+            .filter_map(|s| serde_json::from_str::<StreamRecord>(s).ok())
+            .count()
+            >= 6)
+            .then_some(())
+    });
+    transport.cancel();
+    assert_eq!(
+        reader_done(&transport).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert!(replay_open_permissions(&root).is_empty());
+    assert_eq!(records(&root).len(), 9);
+}
+
+#[test]
+fn unauthorized_decisions_reveal_neither_contention_nor_lifecycle() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, _output, _input) = start(&root);
+    {
+        let _lock = transport.input.permissions.lock();
+        assert_eq!(
+            transport.agent_decide(
+                &Principal::Operator,
+                &decide("unknown", permissions::Decision::Deny)
+            ),
+            Err(ErrorCode::NotAuthorized)
+        );
+        assert_eq!(
+            transport.close_permissions(
+                &Principal::Operator,
+                None,
+                permissions::CloseReason::Interrupted
+            ),
+            Err(ErrorCode::NotAuthorized)
+        );
+    }
+    transport.cancel();
+    assert_eq!(
+        transport.agent_decide(
+            &Principal::Lease("fixture-agent"),
+            &decide("unknown", permissions::Decision::Deny)
+        ),
+        Err(ErrorCode::NotAuthorized)
+    );
+}
+
+#[test]
+fn second_held_input_is_a_typed_refusal_without_writing_either_input() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    permission(&mut output, "request-example");
+    receive(&transport);
+    receive(&transport);
+    for text in ["first", "second"] {
+        transport
+            .input
+            .input
+            .as_ref()
+            .unwrap()
+            .try_send(Input::User(encode(&user(text)).unwrap()))
+            .unwrap_or_else(|_| panic!("fixture input queue"));
+    }
+    let error = worker_done(&transport, false).unwrap_err();
+    assert_eq!(
+        error.get_ref().and_then(|e| e.downcast_ref::<ErrorCode>()),
+        Some(&ErrorCode::PermissionInputAlreadyHeld)
+    );
+    private_fs::set_nonblocking(&input).unwrap();
+    match input.read(&mut [0]) {
+        Ok(0) => (),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+        other => panic!("held input was written: {other:?}"),
+    }
+}
+
+fn close_permission(
+    transport: &Transport,
+    id: Option<&str>,
+    reason: permissions::CloseReason,
+) -> Result<(), ErrorCode> {
+    wait(transport, || {
+        match transport.close_permissions(&owner(), id, reason) {
+            Err(ErrorCode::SessionBusy) => None,
+            result => Some(result),
+        }
+    })
+}
+
+#[test]
+fn host_closures_audit_cancel_result_and_interrupt_without_sending_decisions() {
+    for reason in [
+        permissions::CloseReason::Cancelled,
+        permissions::CloseReason::Result,
+        permissions::CloseReason::Interrupted,
+    ] {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (transport, mut output, mut input) = start(&root);
+        for id in ["request-a", "request-b"] {
+            permission(&mut output, id);
+            receive(&transport);
+            receive(&transport);
+        }
+        close_permission(&transport, Some("request-a"), reason).unwrap();
+        let close: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+        assert_eq!(close["reason"], serde_json::to_value(reason).unwrap());
+        assert!(close.get("decision").is_none());
+        assert_eq!(
+            call_decide(
+                &transport,
+                &owner(),
+                &decide("request-a", permissions::Decision::AllowOnce)
+            ),
+            Err(ErrorCode::PermissionRequestClosed)
+        );
+        assert_eq!(transport.waiting_on_human().unwrap(), vec!["request-b"]);
+        close_permission(&transport, None, permissions::CloseReason::Interrupted).unwrap();
+        receive(&transport);
+        assert!(replay_open_permissions(&root).is_empty());
+        private_fs::set_nonblocking(&input).unwrap();
+        assert_eq!(
+            input.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
+fn a_cancelled_reservation_cannot_deliver_a_stale_control_response() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    permission(&mut output, "cancelled-request");
+    receive(&transport);
+    receive(&transport);
+    let stale = transport
+        .input
+        .permissions
+        .lock()
+        .prepare(
+            &owner(),
+            &decide("cancelled-request", permissions::Decision::AllowOnce),
+        )
+        .unwrap();
+    let bytes = encode(&stale.response).unwrap();
+    close_permission(
+        &transport,
+        Some("cancelled-request"),
+        permissions::CloseReason::Cancelled,
+    )
+    .unwrap();
+    receive(&transport);
+    transport
+        .input
+        .decisions
+        .try_send(Command::Decide(Control {
+            answer: stale,
+            bytes,
+        }))
+        .unwrap_or_else(|_| panic!("stale command admission"));
+    permission(&mut output, "next-request");
+    receive(&transport);
+    receive(&transport);
+    call_decide(
+        &transport,
+        &owner(),
+        &decide("next-request", permissions::Decision::Deny),
+    )
+    .unwrap();
+    receive(&transport);
+    assert_eq!(
+        input_line(&transport, &mut input)["response"]["request_id"],
+        "next-request"
+    );
+    assert!(replay_open_permissions(&root).is_empty());
+}
+
+#[test]
+fn nested_result_preserves_permissions_but_top_level_error_retires_them() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    permission(&mut output, "request-example");
+    receive(&transport);
+    receive(&transport);
+    writeln!(output,"{}",serde_json::json!({"type":"result","subtype":"success","is_error":false,"parent_tool_use_id":"parent-tool"})).unwrap();
+    receive(&transport);
+    assert_eq!(
+        transport.waiting_on_human().unwrap(),
+        vec!["request-example"]
+    );
+    writeln!(output,"{}",serde_json::json!({"type":"result","subtype":"error_during_execution","is_error":true,"errors":[]})).unwrap();
+    receive(&transport);
+    assert_eq!(
+        serde_json::from_str::<Value>(&receive(&transport).record.raw).unwrap()["reason"],
+        "result"
+    );
+    assert!(replay_open_permissions(&root).is_empty());
+}
+
+#[test]
+fn oversized_permission_is_denied_with_bounded_audit_and_runtime_continues() {
+    for target in [MAX_LINE_BYTES + 4096, MAX_LINE_BYTES] {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (transport, mut output, mut input) = start(&root);
+        // Put correlation after input: retaining only the prefix cannot answer.
+        let prefix = r#"{"request":{"input":{"data":""#;
+        let suffix = r#""},"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example"},"type":"control_request","request_id":"large-request"}"#;
+        let raw = format!(
+            "{prefix}{}{suffix}",
+            "x".repeat(target - prefix.len() - suffix.len())
+        );
+        assert_eq!(raw.len(), target);
+        let producer = thread::spawn(move || {
+            writeln!(output, "{raw}").unwrap();
+            output
+        });
+        assert!(receive(&transport).record.raw.len() <= MAX_LINE_BYTES);
+        let open: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+        assert_eq!(open["state"], "open");
+        assert_eq!(open["request"]["input"]["truncated"], true);
+        assert_eq!(open["request"]["input"]["wire_bytes"], target as u64);
+        assert_eq!(
+            open["request"]["input"]["wire_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        let closed: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+        assert_eq!(closed["decision"], "deny");
+        assert_eq!(
+            closed["error_code"],
+            ErrorCode::PermissionRequestTooLarge.as_str()
+        );
+        let response = input_line(&transport, &mut input);
+        assert_eq!(response["response"]["request_id"], "large-request");
+        assert_eq!(response["response"]["response"]["behavior"], "deny");
+        assert_eq!(
+            response["response"]["response"]["message"],
+            ErrorCode::PermissionRequestTooLarge.as_str()
+        );
+        let mut output = producer.join().unwrap();
+        permission(&mut output, "next-request");
+        receive(&transport);
+        receive(&transport);
+        call_decide(
+            &transport,
+            &owner(),
+            &decide("next-request", permissions::Decision::AllowOnce),
+        )
+        .unwrap();
+        receive(&transport);
+        assert_eq!(
+            input_line(&transport, &mut input)["response"]["request_id"],
+            "next-request"
+        );
+        assert!(replay_open_permissions(&root).is_empty());
+        assert!(records(&root).iter().all(|r| r.raw.len() <= MAX_LINE_BYTES));
+    }
+}
+
+#[test]
+fn refused_close_restores_both_open_and_reserved_requests() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, _output, _input) = start(&root);
+    let (tx, _rx) = mpsc::sync_channel(1);
+    let mut handle = transport.input.clone();
+    handle.decisions = tx;
+    for id in ["reserved", "open"] {
+        let request=serde_json::from_value(serde_json::json!({"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example","input":{}})).unwrap();
+        handle.permissions.lock().observe(id, request).unwrap();
+    }
+    handle
+        .agent_decide(&owner(), &decide("reserved", permissions::Decision::Deny))
+        .unwrap();
+    for id in ["open", "reserved"] {
+        assert_eq!(
+            handle.close_permissions(&owner(), Some(id), permissions::CloseReason::Cancelled),
+            Err(ErrorCode::SessionBusy)
+        );
+    }
+    let mut book = handle.permissions.lock();
+    assert!(book
+        .prepare(&owner(), &decide("open", permissions::Decision::Deny))
+        .is_ok());
+    assert!(book.begin_answer("reserved"));
 }
