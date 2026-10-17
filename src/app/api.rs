@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 mod agents;
 mod channels;
 mod checks;
+mod client_tokens;
 mod delegates;
 mod digest;
 mod edges;
@@ -152,7 +153,23 @@ fn run_pr_poll_round(
     })
 }
 
+/// Local-operator evidence borrowed from the classified API request.
+/// Only this dispatcher can construct it; it cannot outlive or mutate its caller.
+pub(crate) struct LocalOperator<'a> {
+    _app: &'a mut App,
+}
+
 impl App {
+    /// Mint token-management authority only from the existing kernel/lease policy.
+    pub(crate) fn client_token_authority(
+        &mut self,
+    ) -> Result<LocalOperator<'_>, crate::api::error_code::ErrorCode> {
+        if !self.caller_is_local_operator() {
+            return Err(crate::api::error_code::ErrorCode::OperatorOnly);
+        }
+        Ok(LocalOperator { _app: self })
+    }
+
     /// Arm and spawn a transcript read for `pane_id` at the currently
     /// selected panel detail (#246). Idempotent — the terminal's own guard
     /// short-circuits when the same `(session, detail)` pair is already
@@ -1390,7 +1407,13 @@ impl App {
         let uid = self.current_api_peer_uid?;
         let code = if matches!(
             request.method,
-            Method::ServerStop(_) | Method::ServerReloadConfig(_) | Method::ServerLiveHandoff(_)
+            Method::ServerStop(_)
+                | Method::ServerReloadConfig(_)
+                | Method::ServerLiveHandoff(_)
+                | Method::ClientTokenAdd(_)
+                | Method::ClientTokenRemove(_)
+                | Method::ClientTokenList(_)
+                | Method::ClientOpen(_)
         ) && !matches!(self.spawn_caller(), spawn::SpawnCaller::Operator { .. })
         {
             Some(ErrorCode::OperatorOnly)
@@ -1563,6 +1586,12 @@ impl App {
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
+            Method::ClientTokenAdd(_)
+            | Method::ClientTokenRemove(_)
+            | Method::ClientTokenList(_)
+            | Method::ClientOpen(_) => {
+                return self.handle_client_token(request.id, request.method);
+            }
             Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),
             Method::WaitPark(params) => return self.handle_wait_park(request.id, params),
             Method::WaitHold(predicate, hold_ms) => {
@@ -2360,6 +2389,83 @@ mod tests {
         let response = app.handle_peers_summary("req_peers".into());
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["result"]["workspaces"][0]["agent"], "researcher");
+    }
+
+    #[tokio::test]
+    async fn codex_session_report_retains_fork_path_without_changing_resume_id() {
+        let mut app = notification_test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("segment")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let id = app.state.workspaces[0].terminal_id(pane).cloned().unwrap();
+        app.state.terminals.get_mut(&id).unwrap().detected_agent = Some(Agent::Codex);
+        let route = app.public_pane_id(0, pane).unwrap();
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let path = root
+            .path()
+            .join("physical.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        for (seq, thread, source) in [(1, "original", "startup"), (2, "child", "fork")] {
+            let request = serde_json::from_value(serde_json::json!({
+                "id":"report", "method":"pane.report_agent_session", "params":{
+                    "pane_id":route,"source":"flock:codex","agent":"codex","seq":seq,
+                    "agent_session_id":thread,"agent_session_path":path,"session_start_source":source
+                }
+            })).unwrap();
+            let response = app.handle_api_request(request);
+            assert!(!response.contains("\"error\""), "{response}");
+            let terminal = &app.state.terminals[&id];
+            let report = terminal.codex_session_start.as_ref().unwrap();
+            assert_eq!(report.thread, thread);
+            assert_eq!(report.source.as_deref(), Some(source));
+            assert_eq!(report.transcript_path.as_deref(), Some(path.as_str()));
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .unwrap()
+                    .session_ref
+                    .value,
+                thread
+            );
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .unwrap()
+                    .session_ref
+                    .kind,
+                crate::agent_resume::AgentSessionRefKind::Id
+            );
+        }
+        assert_eq!(
+            crate::agent_resume::normalize_session_start_source("claude", Some("fork".into())),
+            None
+        );
+        // An older hook cannot overwrite the newer report or its path.
+        let response = app.handle_pane_report_agent_session(
+            "stale".into(),
+            crate::api::schema::PaneReportAgentSessionParams {
+                pane_id: route,
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                seq: Some(1),
+                agent_session_id: Some("original".into()),
+                agent_session_path: None,
+                session_start_source: Some("fork".into()),
+            },
+        );
+        assert!(!response.contains("\"error\""));
+        assert_eq!(
+            app.state.terminals[&id]
+                .codex_session_start
+                .as_ref()
+                .unwrap()
+                .thread,
+            "child"
+        );
     }
 
     fn notification_test_app() -> App {

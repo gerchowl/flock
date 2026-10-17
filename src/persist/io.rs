@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
@@ -46,18 +47,41 @@ pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::
 }
 
 fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
+    save_json_with_directory_sync(path, snapshot, |parent| {
+        std::fs::File::open(parent)?.sync_all()
+    })
+}
+
+// Keep the post-replacement durability operation explicit and independently fallible.
+fn save_json_with_directory_sync<T: serde::Serialize>(
+    path: &Path,
+    snapshot: &T,
+    sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let target = resolve_write_target(path)?;
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let parent = snapshot_parent(&target);
+    std::fs::create_dir_all(parent)?;
     let json = serde_json::to_string_pretty(snapshot)?;
     let tmp_path = target.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &json)?;
+    let mut temporary = std::fs::File::create(&tmp_path)?;
+    temporary.write_all(json.as_bytes())?;
+    temporary.sync_all()?;
+    drop(temporary);
     if let Err(err) = std::fs::rename(&tmp_path, &target) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
     }
+    if let Err(err) = sync_directory(parent) {
+        crate::logging::session_directory_sync_failed(parent, &err.to_string());
+    }
     Ok(())
+}
+
+fn snapshot_parent(target: &Path) -> &Path {
+    target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 pub(super) fn save_to_paths(
@@ -180,6 +204,51 @@ mod tests {
         PaneHistorySnapshot, TabHistorySnapshot, WorkspaceHistorySnapshot,
     };
 
+    #[test]
+    fn directory_sync_failure_after_replacement_is_nonfatal() {
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("session.json");
+        let expected = serde_json::json!({"new":true});
+        std::fs::write(&path, "old snapshot").unwrap();
+        let mut called = false;
+        save_json_with_directory_sync(&path, &expected, |parent| {
+            called = true;
+            assert_eq!(parent, root.path());
+            let replaced: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(replaced, expected, "rename precedes directory sync");
+            Err(std::io::Error::other("fixture directory fsync failed"))
+        })
+        .expect("a successful replacement must report success even if directory sync fails");
+        assert!(called);
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved, expected);
+    }
+
+    #[test]
+    fn bare_relative_snapshot_uses_current_directory_as_parent() {
+        struct RestoreCwd(PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).unwrap();
+            }
+        }
+        let root = crate::test_support::TempDir::socket();
+        let _restore = RestoreCwd(std::env::current_dir().unwrap()); // guardrails-ok(hermetic): restore cwd after using an owned fixture, never assert ambient cwd
+        std::env::set_current_dir(root.path()).unwrap();
+        save_json_to_path(
+            Path::new("session.json"),
+            &serde_json::json!({"relative":true}),
+        )
+        .unwrap();
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.path().join("session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved, serde_json::json!({"relative":true}));
+    }
+
     fn temp_session_path(name: &str) -> PathBuf {
         let unique = format!(
             "flock-session-tests-{}-{}-{}",
@@ -201,6 +270,7 @@ mod tests {
 
     fn empty_snapshot() -> SessionSnapshot {
         SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
             issue_draft: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![],

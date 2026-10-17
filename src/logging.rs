@@ -23,6 +23,18 @@ pub(crate) fn structured_sweep_outcome(entry: &crate::structured::supervision::S
     }
 }
 
+/// Report typed worker cleanup failures without reading session contents.
+pub(crate) fn structured_worker_shutdown_failed(error: &crate::structured::workers::ShutdownError) {
+    for (agent_id, code) in &error.0 {
+        tracing::error!(
+            event = "structured.worker.shutdown_failed",
+            agent_id = agent_id.as_str(),
+            code = code.as_str(),
+            "structured worker cleanup failed"
+        );
+    }
+}
+
 /// Report failed structured-session cleanup without reading session contents.
 pub(crate) fn structured_config_cleanup_failed(err: &io::Error) {
     tracing::error!(event = "structured.config.cleanup_failed", error = %err,
@@ -839,6 +851,17 @@ pub(crate) fn session_save_failed(path: &Path, err: &str) {
         path = %path.display(),
         err,
         "failed to save session"
+    );
+}
+
+pub(crate) fn session_directory_sync_failed(path: &Path, err: &str) {
+    tracing::warn!(
+        event = "persist.directory_sync",
+        subsystem = "persist",
+        outcome = "error",
+        path = %path.display(),
+        err,
+        "snapshot replaced but directory sync failed"
     );
 }
 
@@ -4886,6 +4909,15 @@ pub(crate) fn mesh_routing_failed(operation: &'static str, peer: &str, reason: &
 /// Custody errors expose a bounded code, never envelope bodies or return tokens.
 pub(crate) fn mesh_custody_failed(operation: &'static str, code: &'static str) {
     tracing::warn!(target: "flock::mesh", event = "mesh.custody.failed", operation, code, "mesh custody operation failed");
+}
+
+/// An untrusted client-token entry was ignored; never log its contents or bearer.
+pub(crate) fn client_token_entry_unsafe(entry: &str) {
+    tracing::warn!(
+        event = "client_token.entry.unsafe",
+        entry,
+        "untrusted client-token entry ignored"
+    );
 }
 
 #[cfg(test)]

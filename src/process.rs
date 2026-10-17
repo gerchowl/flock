@@ -567,6 +567,9 @@ impl TracedCommand {
 /// via `ps`); this is the backstop for when someone forgets, not the primary
 /// defence.
 fn redact_arg(arg: &str) -> String {
+    if let Some((url, _)) = arg.split_once("#code=") {
+        return format!("{url}#code=<redacted>");
+    }
     const SECRET_PREFIXES: [&str; 4] = [
         "authorization:",
         "proxy-authorization:",
@@ -742,6 +745,15 @@ mod tests {
     /// the backstop for when a caller forgets to use stdin.
     #[test]
     fn credential_headers_are_masked_before_they_reach_the_log() {
+        let code = "f".repeat(64);
+        let url = format!("http://127.0.0.1:8080/#code={code}");
+        let logs = crate::logging::capture_logs(|| {
+            let mut command = TracedCommand::new("true", "client-browser-fixture");
+            command.arg(&url);
+            let _ = command.status_traced();
+        });
+        assert!(logs.contains("process.exec"));
+        assert!(!logs.contains(&code), "{logs}");
         // Fixtures are COMPOSED rather than written as literals: a realistic
         // token literal trips the repo's own secret scanner, and a test that
         // needs an allowlist entry teaches the next person to add allowlist

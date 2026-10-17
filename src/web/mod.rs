@@ -19,6 +19,7 @@
 //!      `--allow-funnel`,
 //!   3. same-origin check on the WS upgrade (CSWSH defence).
 
+pub(crate) mod client_exchange;
 pub(crate) mod gui;
 
 use std::net::SocketAddr;
@@ -51,7 +52,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Local aliases for the defaults, now sourced from [`crate::config`] so the
-/// [`WebSectionConfig`](crate::config::model::WebSectionConfig) and this file agree on the same numbers (ADR-0002
+/// [`crate::config::model::WebSectionConfig`] and this file agree on the same numbers (ADR-0002
 /// phase e).
 const DEFAULT_BIND: &str = CONFIG_DEFAULT_BIND;
 const DEFAULT_MAX_SESSIONS: usize = CONFIG_DEFAULT_MAX_SESSIONS;
