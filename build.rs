@@ -38,6 +38,30 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
+/// Consume the GUI-owned dist output; building it belongs to #1731.
+fn gui_bundle(manifest_dir: &std::path::Path) {
+    println!("cargo:rerun-if-env-changed=FLOCK_GUI_DIST");
+    if env::var_os("CARGO_FEATURE_WEB").is_none() {
+        return;
+    }
+    let path = env::var_os("FLOCK_GUI_DIST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| manifest_dir.join("web/client/dist"));
+    let path = if path.is_absolute() {
+        path
+    } else {
+        manifest_dir.join(path)
+    };
+    println!("cargo:rerun-if-changed={}", path.display());
+    let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    // A missing artifact is an explicit HTTP refusal, not a different frontend.
+    let code = format!(
+        "#[derive(rust_embed::RustEmbed)]\n#[folder = {:?}]\n#[allow_missing = true]\nstruct GuiAssets;\n",
+        path.to_str().expect("FLOCK_GUI_DIST must be valid UTF-8")
+    );
+    fs::write(output.join("gui_assets.rs"), code).expect("write GUI embed declaration");
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendor/libghostty-vt.vendor.json");
@@ -56,6 +80,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ZIG");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    gui_bundle(&manifest_dir);
     let vendored_dir = manifest_dir.join("vendor/libghostty-vt");
     let optimize = env::var("LIBGHOSTTY_VT_OPTIMIZE").unwrap_or_else(|_| "ReleaseFast".into());
     let simd = env_bool("LIBGHOSTTY_VT_SIMD").unwrap_or(true);

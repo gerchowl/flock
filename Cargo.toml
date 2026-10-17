@@ -54,7 +54,8 @@ getrandom = "0.4"
 # Timed lease-table reads: short contention must not deny all API callers.
 parking_lot = "0.12"
 portable-pty = "0.9"
-rust-embed = { version = "8", optional = true }
+# Debug builds must exercise the same embedded bytes as release builds.
+rust-embed = { version = "8", optional = true, features = ["debug-embed", "deterministic-timestamps"] }
 png = "0.18"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 regex = "1"
