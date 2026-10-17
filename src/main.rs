@@ -36,6 +36,7 @@ mod checks;
 mod checksum;
 mod cli;
 mod client;
+mod client_open;
 // Pure rollout foundation; runtime consumers follow in #1662–#1664.
 #[allow(dead_code)]
 mod codex_rollout;
@@ -575,6 +576,7 @@ fn run() -> io::Result<()> {
         println!("       flk wait <subcommand> ...");
         println!("       flk events <read|wait> ...");
         println!("       flk adapter hello <binding> ...");
+        println!("       flk client <token|open> ...");
         println!("       flk owner policy <show|adopt> ...");
         println!("       flk session <subcommand> ...");
         println!("       flk integration <subcommand> ...");
@@ -653,6 +655,10 @@ fn run() -> io::Result<()> {
             (
                 "flk adapter hello <binding>",
                 "Check a channel adapter's binding token before it starts",
+            ),
+            (
+                "flk client <token|open>",
+                "Manage GUI credentials or open the GUI",
             ),
             (
                 "flk owner policy <show|adopt>",

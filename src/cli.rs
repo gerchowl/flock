@@ -16,6 +16,7 @@ use crate::api::schema::{
 mod adapter;
 mod agent;
 mod checks;
+mod client;
 mod compatibility;
 mod delegate;
 pub(crate) mod delegate_list;
@@ -116,6 +117,16 @@ fn run(args: &[String]) -> std::io::Result<CommandOutcome> {
     let Some(command) = args.get(1).map(|arg| arg.as_str()) else {
         return Ok(CommandOutcome::NotCli);
     };
+
+    // Bare client remains the internal terminal attachment command.
+    if command == "client"
+        && !matches!(
+            args.get(2).map(String::as_str),
+            Some("token" | "open" | "help" | "--help" | "-h")
+        )
+    {
+        return Ok(CommandOutcome::NotCli);
+    }
 
     // #455: `--help` / `-h` is answered here, above every verb parser, so it
     // cannot be read as one of a verb's arguments (`flk agent fork --help`
@@ -225,6 +236,7 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "goal" => goal::run_goal_command(&args[2..])?,
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
+        "client" => client::run(&args[2..])?,
         "web" => run_web_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),
     };

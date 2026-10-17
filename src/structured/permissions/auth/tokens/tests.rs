@@ -595,3 +595,33 @@ fn listed_entry_identifiers_cannot_revoke_outside_the_token_namespace_or_its_loc
     assert_eq!(store.authenticate(&issued.token).unwrap().info, issued.info);
     store.lock().unwrap();
 }
+
+#[test]
+fn operator_browser_token_is_reused_with_all_explicit_grants() {
+    let (_root, store, mut app) = setup();
+    let authority = app.client_token_authority().unwrap();
+    let first = store.operator_token(&authority).unwrap();
+    let second = store.operator_token(&authority).unwrap();
+    assert_eq!(first, second);
+    let session = store.authenticate(&first).unwrap();
+    assert_eq!(
+        session.info.scopes,
+        scopes(&[Scope::Read, Scope::Send, Scope::Answer, Scope::Operate])
+    );
+    store.revoke(&authority, "operator").unwrap();
+    assert!(store.authenticate(&first).is_err());
+    let replacement = store.operator_token(&authority).unwrap();
+    assert_ne!(replacement, first);
+}
+#[test]
+fn browser_open_does_not_widen_an_existing_operator_named_token() {
+    let (_root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "operator", &[Scope::Read]);
+    assert!(store
+        .operator_token(&app.client_token_authority().unwrap())
+        .is_err());
+    assert_eq!(
+        store.authenticate(&issued.token).unwrap().info.scopes,
+        scopes(&[Scope::Read])
+    );
+}
