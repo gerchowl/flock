@@ -5,6 +5,7 @@ pub mod claude;
 pub mod launch;
 pub mod lease;
 pub mod runtime;
+pub mod state;
 pub mod supervision;
 pub mod transport;
 

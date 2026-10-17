@@ -2,13 +2,13 @@
  * Replays S7a's structured-wire scripts (#1692) against the real
  * {@link WireConnection}, with a virtual clock and scripted sockets.
  *
- * **Selection.** Each script's header names its slice in `covers`:
- * `s7-min` (#1746) or full `s7`. Every `s7-min` script is replayed, and so
- * is every `s7` script whose behaviour G3a already implements; the rest are
- * listed with the G3b (#1595) feature they need. A script in no list, or
- * an `s7-min` script left to G3b, fails the suite, so nothing is skipped
- * silently. Fixtures are S7a's and never edited; where one asserts more
- * than S7-min may, the extra is dropped here, with the reason.
+ * **Selection.** Each script's header names the slices it covers in
+ * `covers`: `s7-min` (#1746), full `s7`, or both. Every script covering
+ * `s7-min` is replayed, and so is every `s7` script whose behaviour G3a
+ * already implements; the rest are listed with the G3b (#1595) feature
+ * they need. A script in no list, or an `s7-min` script left to G3b, fails
+ * the suite, so nothing is skipped silently. Fixtures are S7a's, replayed
+ * verbatim and never edited.
  *
  * Each script runs twice, with the jitter source at its lowest and highest
  * value, so both ends of every backoff interval are exercised.
@@ -35,6 +35,7 @@ const REPLAYED = [
   "connect-deadline",
   "empty-bootstrap",
   "empty-snapshot",
+  "fleet-lite",
   "foreground",
   "gap-snapshot",
   "handshake-deadline",
@@ -53,6 +54,7 @@ const REPLAYED = [
   "subscription-deadline",
   "token-refused",
   "token-revoked",
+  "unknown-subscription",
 ];
 
 /** Left to G3 #1595 (G3b), with the feature each one needs. */
@@ -72,32 +74,18 @@ const G3B: { readonly [script: string]: string } = {
   "outbox-window-expiry-syncing": "window expiry",
 };
 
-/**
- * Scripts replayed without their seeded outbox. `token-refused.jsonl` seeds
- * a pending `queue.add`, a verb S7-min scripts must not request (#1727), so
- * only its 4401/4403 path is asserted: the seed and its expected status are
- * both dropped.
- */
-const WITHOUT_SEEDED_OUTBOX = new Set(["token-refused"]);
-
-function withoutSeededOutbox(steps: FixtureLine[]): FixtureLine[] {
-  return steps.map((step) => {
-    if (step.step === "given") return { ...step, outbox: [] };
-    if (step.step === "observe") return { ...step, outbox: {} };
-    return step;
-  });
-}
-
 async function load(name: string): Promise<FixtureLine[]> {
   return parseScript(await Bun.file(`${SCRIPTS}/${name}.jsonl`).text());
 }
 
-/** The script's one slice label; anything else fails. */
-function coverage(name: string, steps: FixtureLine[]): FixtureCoverage {
+/** The script's slice labels: at least one, each named once; anything else fails. */
+function coverage(name: string, steps: FixtureLine[]): readonly FixtureCoverage[] {
   const given = steps[0];
   const covers = given?.step === "given" ? given.covers : undefined;
-  if (covers?.length !== 1 || covers[0] === undefined) throw new Error(`${name}: covers is ${JSON.stringify(covers)}, expected one slice label`);
-  return covers[0];
+  if (covers === undefined || covers.length === 0 || new Set(covers).size !== covers.length) {
+    throw new Error(`${name}: covers is ${JSON.stringify(covers)}, expected one or more distinct slice labels`);
+  }
+  return covers;
 }
 
 const JITTER = { low: () => 0, high: () => 0.999_999 } as const;
@@ -108,10 +96,11 @@ describe("S7a scripts", () => {
     expect([...REPLAYED, ...Object.keys(G3B)].sort()).toEqual(names.sort());
   });
 
-  test("every s7-min script is G3a's, and every script names one slice", async () => {
+  test("every s7-min script is G3a's, and every script names its slices", async () => {
     const names = (await readdir(SCRIPTS)).filter((name) => name.endsWith(".jsonl")).map((name) => name.slice(0, -6));
     const min: string[] = [];
-    for (const name of names) if (coverage(name, await load(name)) === "s7-min") min.push(name);
+    for (const name of names) if (coverage(name, await load(name)).includes("s7-min")) min.push(name);
+    expect(min.length).toBeGreaterThan(0);
     expect(min.filter((name) => Object.hasOwn(G3B, name))).toEqual([]);
     expect(min.filter((name) => !REPLAYED.includes(name))).toEqual([]);
   });
@@ -120,8 +109,29 @@ describe("S7a scripts", () => {
     for (const [jitter, random] of Object.entries(JITTER)) {
       test(`${name} (${jitter} jitter)`, async () => {
         const steps = await load(name);
-        new Harness(random).run(WITHOUT_SEEDED_OUTBOX.has(name) ? withoutSeededOutbox(steps) : steps);
+        new Harness(random).run(steps);
       });
     }
   }
+});
+
+describe("harness assertions", () => {
+  /** A synthetic script: `c0` is seeded in the outbox, then an observe names `absent`. */
+  const seeded = (absent: string): FixtureLine[] =>
+    parseScript(
+      [
+        { v: 1, step: "given", cursors: {}, outbox: [{ cmd_id: "c0", verb: "agent.send", args: { target: "a", text: "hi", submit: true }, principal: "fixture-principal", created_ms: 0, status: "pending", first_sent_ms: null }], covers: ["s7"] },
+        { v: 1, step: "observe", outbox: { c0: "pending" }, absent_outbox: [absent] },
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n"),
+    );
+
+  test("absent_outbox fails when the outbox holds the named command", () => {
+    expect(() => new Harness().run(seeded("c0"))).toThrow("command c0 should be absent");
+  });
+
+  test("absent_outbox passes for a command the outbox does not hold", () => {
+    expect(() => new Harness().run(seeded("c9"))).not.toThrow();
+  });
 });

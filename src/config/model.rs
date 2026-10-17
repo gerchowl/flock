@@ -620,11 +620,35 @@ pub enum SystemOneTier {
     Full,
 }
 
+/// Socket account policy, independent of structured launch identity.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// ADR-0036 §1a: default recognition fails closed while NSS is unavailable.
+    /// `none` explicitly forgoes dedicated-UID recognition and never queries NSS.
+    /// The setting is file-only and requires a server restart.
+    pub agent_account: AgentAccount,
+}
+
+/// Whether Unix callers are checked against the dedicated account.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum AgentAccount {
+    /// Recognize `flk-agent`, refusing operator authority on a UID collision.
+    #[default]
+    #[serde(rename = "flk-agent")]
+    FlkAgent,
+    /// No dedicated account is used; lease and pane checks still identify agents.
+    #[serde(rename = "none")]
+    None,
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     /// Structured persistence policy (ADR-0036 §4).
     pub sessions: crate::structured::blobs::StorageConfig,
+    /// Local socket identity policy (ADR-0036 §1a).
+    pub security: SecurityConfig,
     /// Structured Claude launch policy (ADR-0036 §1); activation is #1439.
     pub structured: crate::structured::launch::StructuredConfig,
     /// Friendly display name for THIS node (#42), shown on the local status
