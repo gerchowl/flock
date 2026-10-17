@@ -280,6 +280,11 @@ impl Binding {
         Ok(key)
     }
 
+    /// Reject stale worker callbacks before segment preparation or admission.
+    pub fn pending(&self, key: &Key) -> bool {
+        self.pending && self.key.as_ref() == Some(key)
+    }
+
     /// Complete exactly the still-pending capability. Rejected and superseded
     /// callbacks cannot install a file, even if all visible labels/paths match.
     pub fn finish(
