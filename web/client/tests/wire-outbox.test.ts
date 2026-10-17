@@ -92,6 +92,35 @@ describe("outbox", () => {
     expect(h.net.closes.at(-1)?.code).toBe(1002);
   });
 
+  test("the connection mints UUIDv7 cmd_ids, ordered by the clock", () => {
+    const h = new Harness();
+    live(h);
+    h.connection.command("agent.send", { target: "a", text: "one", submit: true });
+    h.clock.advanceTo(h.clock.now() + 5);
+    h.connection.command("agent.send", { target: "a", text: "two", submit: true });
+    const ids = sentFrames(h).flatMap((frame) => ((frame as { t: string }).t === "cmd" ? [(frame as { cmd_id: string }).cmd_id] : []));
+    expect(ids).toHaveLength(2);
+    for (const id of ids) expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    const [first, second] = ids as [string, string];
+    expect(first < second).toBe(true);
+    expect(parseInt(second.replace("-", "").slice(0, 12), 16) - parseInt(first.replace("-", "").slice(0, 12), 16)).toBe(5);
+  });
+
+  test("an unreadable stored record is dropped and named; the others restore", () => {
+    const good = { cmd_id: "c0", verb: "agent.send", args: {}, principal: "fixture-principal", created_ms: 0, status: "pending", first_sent_ms: null };
+    const h = new Harness();
+    h.store.setItem(OUTBOX_KEY, JSON.stringify({ principal: "fixture-principal", commands: [good, { cmd_id: "c1", verb: 3 }, "junk", { ...good, cmd_id: "c2", status: "lost" }] }));
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    expect(h.connection.commands().map((entry) => entry.cmd_id)).toEqual(["c0"]);
+    expect(h.connection.outboxProblem).toBe("Dropped unreadable stored commands: c1, record 3, c2.");
+
+    const broken = new Harness();
+    broken.store.setItem(OUTBOX_KEY, "{not json");
+    broken.step(step({ step: "given", cursors: {}, outbox: [] }));
+    expect(broken.connection.commands()).toEqual([]);
+    expect(broken.connection.outboxProblem).toBe(`The stored outbox (${OUTBOX_KEY}) is not JSON; its commands were dropped.`);
+  });
+
   test("generated cmd_ids are UUIDv7", () => {
     const id = uuidv7(0x0189_abcd_ef01, new Uint8Array(10).fill(0xff));
     expect(id).toBe("0189abcd-ef01-7fff-bfff-ffffffffffff");
