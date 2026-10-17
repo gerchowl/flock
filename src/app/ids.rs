@@ -3,17 +3,17 @@ use super::App;
 impl App {
     /// Preserve socket attribution across queued or parked requests and lease release.
     pub(super) fn lease_caller(&self) -> crate::structured::lease::Caller {
-        if let Some(birth) = self.current_api_peer_birth {
-            if self.current_api_peer_pid.is_some()
-                && ((birth.is_none() && !self.session_leases.is_empty())
-                    || (birth.is_some()
-                        && self
-                            .current_api_peer_pid
-                            .and_then(crate::platform::process_start_time)
-                            != birth))
-            {
-                return crate::structured::lease::Caller::Uncertain;
-            }
+        use crate::structured::identity::Principal;
+        let principal = self
+            .current_api_peer_uid
+            .map(|uid| self.runtime_config.uid_policy.classify(uid));
+        if principal == Some(Principal::Unknown)
+            || (self.current_api_peer_uid.is_some() && self.current_api_peer_pid.is_none())
+        {
+            return crate::structured::lease::Caller::Uncertain;
+        }
+        if !self.socket_birth_valid() {
+            return crate::structured::lease::Caller::Uncertain;
         }
         let evidence = self.caller_pane_evidence();
         let pane = evidence
@@ -25,11 +25,28 @@ impl App {
         let caller = self
             .session_leases
             .caller_with_pane(self.current_api_peer_pid, pane);
-        if caller == crate::structured::lease::Caller::Unrelated && evidence.is_err() {
+        if caller == crate::structured::lease::Caller::Unrelated
+            && (evidence.is_err() || (principal == Some(Principal::Agent) && pane.is_none()))
+        {
             crate::structured::lease::Caller::Uncertain
         } else {
             caller
         }
+    }
+
+    pub(super) fn socket_birth_valid(&self) -> bool {
+        let Some(birth) = self.current_api_peer_birth else {
+            return true;
+        };
+        self.current_api_peer_pid.is_none()
+            || match birth {
+                Some(birth) => {
+                    self.current_api_peer_pid
+                        .and_then(crate::platform::process_start_time)
+                        == Some(birth)
+                }
+                None => self.session_leases.is_empty(),
+            }
     }
 
     pub(crate) fn find_pane(

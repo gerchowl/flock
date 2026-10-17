@@ -68,12 +68,38 @@ claim-healing behavior; an empty claim used for authority requires trusted birth
 The Mac Nix package explicitly declares its C compiler, and `macos-process-facts`
 compiles the SDK helper using that package's compiler and SDK inputs.
 
+The Unix API captures the kernel peer UID (`getpeereid` on macOS,
+`SO_PEERCRED` on Linux) with PID and birth before queueing. That context is
+preserved across mesh recovery and lifecycle dispatch. Account resolution is lazy:
+construction and handoff import perform no NSS lookup. The first classification
+starts one process-wide helper and waits at most 100 milliseconds; concurrent
+first uses share that wait. Afterward calls never wait or launch another helper.
+Pending lookups and lookup errors classify
+all socket UIDs as `Unknown` (read-only); a late answer is cached when it arrives.
+A permanently stuck directory service retains at most one worker until process
+exit. Dedicated-user callers never become the
+operator, even from a shell pane or after detaching. A dedicated caller with no
+verified pane or lease may read, but sends (including raw terminal writes) return
+`msg_not_allowed`; other mutations return `operator_only`. Unknown UIDs, missing
+credentials and account-directory errors also fail closed for mutations. An
+absent dedicated account still permits the operator UID. Restart the server to
+pick up account-directory changes or recover from a lookup error.
+
+For a server running as a non-root operator, UID 0 (root) and UIDs outside the
+operator and dedicated accounts are `Unknown`, read-only; root has no special
+bypass. The operator UID is the server's effective UID. SSH-forwarded relays arrive
+as that operator UID, then remain subject to the existing pane exclusion and
+sshd ancestry/enrollment checks. UID alone never proves a relay or grants an
+agent the operator role.
+
+Pane candidates separate rate-limit and blocking-budget buckets without stamping
+sender identity or granting authority. Candidates with no birth proof still
+cannot send through the public API.
+
 Public structured start, registry integration and structured `self` targets in
-agent restart/list remain #1439. #1629 must land before #1439. Kernel UID
-attestation and detached anonymous-agent policy are #1629; blob storage is #1630.
-The UID slice can enforce the dedicated-user boundary. Operator mode remains
+agent restart/list remain #1439; blob storage is #1630. Operator mode remains
 cooperative under #1177: same-UID reparented children without lease ancestry
-resolve `Unrelated` until #1629; they cannot be distinguished from the operator. This slice does not enable structured
+cannot be distinguished from the operator. This slice does not enable structured
 launches or change the default dedicated-user launch policy.
 
 Tests use the S1-derived fake Claude with owned Unix sockets, PID/birth evidence,

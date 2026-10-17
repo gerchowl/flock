@@ -392,6 +392,22 @@ pub(crate) fn adopt_unproven_pane_caller(
     app.current_api_peer_birth = Some(Some(birth));
 }
 
+/// Owned fixture directory, removed even if the test unwinds.
+pub(crate) struct TempDir(crate::structured::launch::SessionConfigDir);
+impl TempDir {
+    /// Keep Unix socket paths below the macOS sockaddr_un limit.
+    pub(crate) fn socket() -> Self {
+        // guardrails-ok(hermetic): short socket fixture root, not an executed program.
+        Self(
+            crate::structured::launch::SessionConfigDir::create(std::path::Path::new("/tmp"))
+                .expect("owned short fixture directory"),
+        )
+    }
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
