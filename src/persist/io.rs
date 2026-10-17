@@ -48,9 +48,8 @@ pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::
 
 fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
     let target = resolve_write_target(path)?;
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let parent = snapshot_parent(&target);
+    std::fs::create_dir_all(parent)?;
     let json = serde_json::to_string_pretty(snapshot)?;
     let tmp_path = target.with_extension("json.tmp");
     let mut temporary = std::fs::File::create(&tmp_path)?;
@@ -61,10 +60,22 @@ fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io:
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
     }
-    if let Some(parent) = target.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
+    sync_replaced_snapshot_directory(parent);
     Ok(())
+}
+
+fn snapshot_parent(target: &Path) -> &Path {
+    target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+// Replacement has already succeeded: a durability warning cannot undo it.
+fn sync_replaced_snapshot_directory(parent: &Path) {
+    if let Err(err) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+        crate::logging::session_directory_sync_failed(parent, &err.to_string());
+    }
 }
 
 pub(super) fn save_to_paths(
@@ -186,6 +197,57 @@ mod tests {
     use crate::persist::snapshot::{
         PaneHistorySnapshot, TabHistorySnapshot, WorkspaceHistorySnapshot,
     };
+
+    #[test]
+    fn directory_sync_failure_after_replacement_is_nonfatal() {
+        use std::os::unix::fs::PermissionsExt;
+        struct RestorePermissions(PathBuf, std::fs::Permissions);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                std::fs::set_permissions(&self.0, self.1.clone()).unwrap();
+            }
+        }
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("session.json");
+        let _restore = RestorePermissions(
+            root.path().to_owned(),
+            std::fs::metadata(root.path()).unwrap().permissions(),
+        );
+        // Write/search permits replacement, but no directory read permits its open.
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+        assert_eq!(
+            std::fs::File::open(root.path()).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        save_json_to_path(&path, &serde_json::json!({"new":true}))
+            .expect("a successful replacement must report success even if directory sync fails");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved, serde_json::json!({"new":true}));
+    }
+
+    #[test]
+    fn bare_relative_snapshot_uses_current_directory_as_parent() {
+        struct RestoreCwd(PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).unwrap();
+            }
+        }
+        let root = crate::test_support::TempDir::socket();
+        let _restore = RestoreCwd(std::env::current_dir().unwrap()); // guardrails-ok(hermetic): restore cwd after using an owned fixture, never assert ambient cwd
+        std::env::set_current_dir(root.path()).unwrap();
+        save_json_to_path(
+            Path::new("session.json"),
+            &serde_json::json!({"relative":true}),
+        )
+        .unwrap();
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.path().join("session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved, serde_json::json!({"relative":true}));
+    }
 
     fn temp_session_path(name: &str) -> PathBuf {
         let unique = format!(

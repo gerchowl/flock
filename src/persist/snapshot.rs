@@ -991,20 +991,37 @@ mod tests {
             "harness" => future["harness"] = "future-harness".into(),
             "duplicate" => future["model"] = "different-second-record".into(),
             "invalid" => future = serde_json::json!({"runtime":"structured","broken":[1,2]}),
-            "pane" => {
-                let panes = json["workspaces"][0]["tabs"][0]["panes"]
-                    .as_object_mut()
-                    .unwrap();
-                let pane = panes.values_mut().next().unwrap();
-                pane["runtime"] = serde_json::json!({"future":"pane-runtime"});
-                pane["agent_session"] = serde_json::json!({
-                    "source":"flock:codex", "agent":"codex", "kind":"id",
-                    "value":"00000000-0000-4000-8000-000000000001",
-                });
+            "pane" | "pane-hibernated" => {
+                for (index, workspace) in json["workspaces"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .enumerate()
+                {
+                    let pane = workspace["tabs"][0]["panes"]
+                        .as_object_mut()
+                        .unwrap()
+                        .values_mut()
+                        .next()
+                        .unwrap();
+                    pane["agent_session"] = serde_json::json!({
+                        "source":"flock:codex", "agent":"codex", "kind":"id",
+                        "value":format!("00000000-0000-4000-8000-{:012}", index + 1),
+                    });
+                    if index == 0 {
+                        pane["runtime"] = serde_json::json!({"future":"pane-runtime"});
+                        if case == "pane-hibernated" {
+                            pane["hibernated"] = serde_json::json!({
+                                "agent":"codex", "argv":["codex","resume","fixture-session"],
+                                "dedupe_key":"fixture-hibernation",
+                            });
+                        }
+                    }
+                }
             }
             _ => unreachable!(),
         }
-        if case != "pane" {
+        if !case.starts_with("pane") {
             json["structured_agents"]
                 .as_array_mut()
                 .unwrap()
@@ -1023,15 +1040,40 @@ mod tests {
             0,
             &crate::test_support::no_op_program(),
             crate::config::ShellModeConfig::NonLogin,
-            case == "pane",
+            case.starts_with("pane"),
             events,
             std::sync::Arc::new(tokio::sync::Notify::new()),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         assert_eq!(workspaces.len(), 2);
-        assert!(terminals
-            .values()
-            .all(|terminal| terminal.pending_agent_resume_plan.is_none()));
+        if case.starts_with("pane") {
+            let unknown = terminals
+                .values()
+                .find(|terminal| terminal.persisted_runtime_tag.is_some())
+                .unwrap();
+            assert!(unknown.pending_agent_resume_plan.is_none());
+            if case == "pane-hibernated" {
+                assert_eq!(
+                    unknown.hibernated_resume_plan.as_ref().unwrap().dedupe_key,
+                    "fixture-hibernation"
+                );
+            } else {
+                assert!(unknown.hibernated_resume_plan.is_none());
+            }
+            let known = terminals
+                .values()
+                .find(|terminal| terminal.persisted_runtime_tag.is_none())
+                .unwrap();
+            assert!(
+                known.pending_agent_resume_plan.is_some(),
+                "only the unknown pane loses automatic resume"
+            );
+            assert!(known.hibernated_resume_plan.is_none());
+        } else {
+            assert!(terminals
+                .values()
+                .all(|terminal| terminal.pending_agent_resume_plan.is_none()));
+        }
         assert!(workspaces
             .iter()
             .all(|workspace| !workspace.tabs[0].panes.is_empty()));
@@ -1056,12 +1098,16 @@ mod tests {
             saved["structured_agents"], expected,
             "raw entries and order survive save"
         );
-        if case == "pane" {
+        if case.starts_with("pane") {
             assert!(saved["workspaces"][0]["tabs"][0]["panes"]
                 .as_object()
                 .unwrap()
                 .values()
-                .any(|pane| pane["runtime"] == serde_json::json!({"future":"pane-runtime"})));
+                .any(
+                    |pane| pane["runtime"] == serde_json::json!({"future":"pane-runtime"})
+                        && (case != "pane-hibernated"
+                            || pane["hibernated"]["dedupe_key"] == "fixture-hibernation")
+                ));
         }
     }
 
@@ -1084,6 +1130,11 @@ mod tests {
     #[tokio::test]
     async fn future_pane_runtime_preserves_workspace_and_tag_after_save() {
         assert_lenient_registry_round_trip("pane").await;
+    }
+
+    #[tokio::test]
+    async fn future_pane_runtime_preserves_hibernation_for_that_pane_only() {
+        assert_lenient_registry_round_trip("pane-hibernated").await;
     }
 
     fn capture_from_state(state: &AppState) -> SessionSnapshot {

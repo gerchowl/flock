@@ -82,12 +82,16 @@ mod tests {
                 std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR),
             ),
             ("XDG_STATE_HOME", std::env::var_os("XDG_STATE_HOME")),
+            ("XDG_CONFIG_HOME", std::env::var_os("XDG_CONFIG_HOME")),
         ]);
         std::env::set_var(
             crate::config::CONFIG_PATH_ENV_VAR,
             root.path().join("config.toml"),
         );
         std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+        std::fs::create_dir_all(crate::config::config_dir()).unwrap();
+        assert!(crate::session::data_dir().starts_with(root.path()));
         let config = crate::config::Config::default();
         let (_, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(&config, true, None, rx, crate::api::EventHub::default());
@@ -136,12 +140,16 @@ mod tests {
                 std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR),
             ),
             ("XDG_STATE_HOME", std::env::var_os("XDG_STATE_HOME")),
+            ("XDG_CONFIG_HOME", std::env::var_os("XDG_CONFIG_HOME")),
         ]);
         std::env::set_var(
             crate::config::CONFIG_PATH_ENV_VAR,
             root.path().join("config.toml"),
         );
         std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+        std::fs::create_dir_all(crate::config::config_dir()).unwrap();
+        assert!(crate::session::data_dir().starts_with(root.path()));
         let path = crate::session::data_dir().join("session.json");
         for raw in [
             serde_json::json!([{"runtime":"future-runtime","future_data":[1,{"kept":true}]}]),

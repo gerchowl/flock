@@ -539,7 +539,7 @@ fn restore_tab(
         // agent resumable, and a cold start is exactly when that request has
         // to hold: the old server's memory, where hibernation used to live, is
         // gone.
-        let saved_hibernation = if was_imported || unknown_runtime.is_some() {
+        let saved_hibernation = if was_imported {
             None
         } else {
             saved_pane

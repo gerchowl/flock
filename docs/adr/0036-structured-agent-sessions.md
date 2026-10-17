@@ -417,18 +417,24 @@ it remains resumable by explicit launch and is never resurrected automatically.
 Under ADR-0028 §3a, structured records deserialize individually. Unknown runtime
 or harness records, invalid entries and duplicates are skipped with a warning,
 without rejecting any PTY workspace. The first supported id/name/session wins.
-Every skipped entry and its position remain raw across saves, including
-additional fields, so rollback cannot erase newer records. Known records also
-retain their original extra fields. An unknown collection shape remains raw
+Skipped entries remain raw and in order across saves, including additional
+fields, so rollback cannot erase newer records. Explicit removal also discards
+retained entries sharing the removed id, name or session, preventing a shadowed
+duplicate from becoming active after restart. Removal compacts retained slots.
+Known records also retain their original extra fields. An unknown collection shape remains raw
 and inactive; new admission refuses until its shape is understood. Warnings
 contain an index and reason, never raw payloads. The registry exposes a retained
 entry count for diagnostics; structured status/doctor routing remains #1843.
 Unknown pane runtime tags also survive restore/save and disable automatic agent
-resume; their shell placements still restore. A registry-only session remains
+resume for that pane only; its hibernation request and shell placement survive,
+and other panes retain normal resume behavior. A registry-only session remains
 persistable even when it contains only inactive raw entries and no terminal
-workspaces. Both the temporary snapshot file before rename and its parent
-directory after rename are fsynced. Handoff restores structured metadata offline;
-this slice owns no workers to transfer.
+workspaces; #1853 tracks the lifetime of retained-only records. Both the temporary
+snapshot file before rename and its parent directory after rename are fsynced.
+A directory sync failure after successful replacement is logged as a durability
+warning and the save reports success because the new file is already installed.
+Handoff restores structured metadata offline; this slice owns no workers to
+transfer.
 
 #1842 owns runtime workers, actual lease ownership and observation scheduling.
 Its caller must mark session persistence dirty when durable metadata changes.

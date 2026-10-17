@@ -246,14 +246,14 @@ fn disk_duplicates_keep_first_and_retain_raw_order_after_mutation() {
         let generation = registry.get(&original.agent_id).unwrap().2;
         registry.remove(&original.agent_id, generation).unwrap();
         assert!(registry.records().is_empty());
+        assert!(registry.is_empty(), "explicit removal also removes shadows");
+        let saved = serde_json::to_vec(&registry.snapshot()).unwrap();
+        let restored: Registry = serde_json::from_slice(&saved).unwrap();
         assert!(
-            !registry.is_empty(),
-            "retained duplicate must not be cleared"
+            restored.records().is_empty(),
+            "removed agent must stay gone"
         );
-        assert_eq!(
-            serde_json::to_value(registry).unwrap(),
-            serde_json::json!([duplicate])
-        );
+        assert_eq!(registry.preserved.len(), 0, "removed slots are compacted");
     }
 }
 
@@ -268,4 +268,45 @@ fn opaque_prefix_and_known_extra_fields_survive_save_in_original_order() {
     assert_eq!(registry.records(), vec![record("agent_fixture_a")]);
     assert_eq!(registry.retained_count(), 2);
     assert_eq!(serde_json::to_value(registry.snapshot()).unwrap(), raw);
+}
+
+#[test]
+fn removal_compacts_slots_and_drops_future_conflicts_only() {
+    let first = record("agent_fixture_a");
+    let second = record("agent_fixture_b");
+    for field in ["agent_id", "name", "session_id"] {
+        let mut future = serde_json::to_value(record("agent_fixture_c")).unwrap();
+        future["runtime"] = "future-runtime".into();
+        future[field] = serde_json::to_value(&first).unwrap()[field].clone();
+        let opaque = serde_json::json!({"runtime":"future-runtime","opaque":[1,2]});
+        let mut registry: Registry =
+            serde_json::from_value(serde_json::json!([opaque, first, future, second])).unwrap();
+        let generation = registry.get(&first.agent_id).unwrap().2;
+        registry.remove(&first.agent_id, generation).unwrap();
+        assert_eq!(registry.preserved.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&registry).unwrap(),
+            serde_json::json!([opaque, second])
+        );
+        // Compaction must update the surviving entry's slot before later removal.
+        let generation = registry.get(&second.agent_id).unwrap().2;
+        registry.remove(&second.agent_id, generation).unwrap();
+        assert_eq!(registry.preserved.len(), 1);
+        let saved = serde_json::to_vec(&registry).unwrap();
+        let restored: Registry = serde_json::from_slice(&saved).unwrap();
+        assert!(restored.records().is_empty());
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::json!([opaque])
+        );
+        for _ in 0..100 {
+            let generation = registry.register(first.clone()).unwrap();
+            registry.remove(&first.agent_id, generation).unwrap();
+        }
+        assert_eq!(
+            registry.preserved.len(),
+            1,
+            "churn does not accumulate slots"
+        );
+    }
 }

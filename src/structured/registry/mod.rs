@@ -7,7 +7,8 @@
 //! Durable records contain identity and launch metadata only. Cold restore
 //! starts offline with unknown observations and no lease, never an auto-resume.
 //! Unknown/invalid/duplicate disk entries remain raw, inactive and in order across
-//! saves (ADR-0028 §3a). The first supported identity/name/session wins. Warnings
+//! saves (ADR-0028 §3a). The first supported identity/name/session wins.
+//! Explicit removal also drops retained conflicts and compacts storage. Warnings
 //! never log raw payloads. Gone processes remain `Lifecycle::Offline`, resumable by explicit
 //! launch only. Opaque retained data never supplies process, state or lease
 //! authority. Metadata admission cannot replace an unknown collection format.
@@ -194,7 +195,8 @@ impl Registry {
         Ok(&entry.projection.update)
     }
 
-    /// Remove only the matching generation. Runtime cleanup must precede this.
+    /// Remove the matching generation and retained entries sharing its id/name/session.
+    /// Compact storage so removed slots cannot accumulate. Runtime cleanup must precede this.
     pub fn remove(&mut self, agent_id: &str, generation: u64) -> Result<Record, RegistryError> {
         if self
             .get(agent_id)
@@ -206,8 +208,29 @@ impl Registry {
             .entries
             .remove(agent_id)
             .ok_or(RegistryError::StaleGeneration)?;
-        self.preserved[entry.slot] = None;
-        Ok(entry.record)
+        let record = entry.record;
+        let mut slots = vec![0; self.preserved.len()];
+        let mut compact = Vec::new();
+        for (slot, raw) in self.preserved.drain(..).enumerate() {
+            let Some(raw) = raw else { continue };
+            let conflicts = raw.get("agent_id").and_then(Value::as_str)
+                == Some(record.agent_id.as_str())
+                || raw.get("session_id").and_then(Value::as_str)
+                    == Some(record.session_id.as_str())
+                || record
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| raw.get("name").and_then(Value::as_str) == Some(name));
+            if slot != entry.slot && !conflicts {
+                slots[slot] = compact.len();
+                compact.push(Some(raw));
+            }
+        }
+        for entry in self.entries.values_mut() {
+            entry.slot = slots[entry.slot];
+        }
+        self.preserved = compact;
+        Ok(record)
     }
 
     /// Durable metadata in stable agent-id order, without observations or authority.
