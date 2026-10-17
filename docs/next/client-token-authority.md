@@ -7,7 +7,8 @@ WebSocket authentication and close-frame ordering. Public structured start stays
 gated by #1734.
 
 `TokenStore::open` uses an existing trusted data root and creates its private
-`client-tokens` namespace. Each lowercase client name (1–64 ASCII letters, digits,
+`client-tokens` namespace. Open it at startup and share its handle; hello
+verification operates on that already-open store. Each lowercase client name (1–64 ASCII letters, digits,
 dash or underscore) has one `<name>.token` JSON record: a 64-character lowercase
 hex bearer generated from 32 random bytes, a fresh opaque 128-bit principal,
 and explicit read/send/answer/operate scopes. Records are capped at 4096 bytes.

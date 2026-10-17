@@ -133,9 +133,19 @@ impl Entropy for SystemEntropy {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum Listed {
     /// A verified record, with its lossless management identifier.
-    Valid { entry: String, info: TokenInfo },
+    Valid {
+        /// Lossless hexadecimal filename identifier for exact revocation.
+        entry: String,
+        /// Verified public identity and scopes, never the credential.
+        info: TokenInfo,
+    },
     /// An untrusted entry that authenticates nobody; the identifier permits revocation.
-    Unsafe { entry: String, name: Option<String> },
+    Unsafe {
+        /// Lossless hexadecimal filename identifier, even for non-UTF-8 entries.
+        entry: String,
+        /// Untrusted UTF-8 filename including its suffix, when representable.
+        name: Option<String>,
+    },
 }
 type LoadedEntry = (Entry, Option<(String, Record)>);
 
