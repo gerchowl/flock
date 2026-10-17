@@ -755,8 +755,10 @@ impl App {
         };
         // Normalize once and use it twice: the identity event below, and the
         // self-compaction (#540), whose whole completion signal IS this field.
-        let session_start_source =
-            crate::agent_resume::normalize_claude_session_start_source(params.session_start_source);
+        let session_start_source = crate::agent_resume::normalize_session_start_source(
+            &agent_label,
+            params.session_start_source,
+        );
         if let Some(pane) = self.public_pane_id(ws_idx, pane_id) {
             // Done here rather than on the queued event, because the
             // continuation is a keystroke into a pane and this is the one
@@ -767,6 +769,7 @@ impl App {
                 std::time::Instant::now(),
             );
         }
+        let transcript_path = params.agent_session_path.clone();
         let session_ref = crate::agent_resume::session_ref_from_report(
             &params.source,
             &agent_label,
@@ -777,6 +780,7 @@ impl App {
         let reported_session = session_ref.as_ref().map(|r| r.value.clone());
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
+            transcript_path,
             session_ref,
             source: params.source,
             agent_label,
@@ -1547,6 +1551,9 @@ mod tests {
             let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
             let (event_tx, mut events) = tokio::sync::mpsc::channel(8);
             app.event_tx = event_tx;
+            // App::new makes Git refresh immediately due. Suppress its worker so
+            // GitStatusRefreshed cannot race the paste-observation assertions.
+            app.git_refresh_in_flight = true;
             let response = raw_request(
                 &mut app,
                 method,
@@ -1566,13 +1573,20 @@ mod tests {
             .await
             .unwrap();
             app.handle_scheduled_tasks(std::time::Instant::now(), false);
+            assert!(
+                app.git_refresh_health.last_attempt.is_none(),
+                "the deadline tick must not dispatch an unrelated Git refresh"
+            );
             let value: serde_json::Value =
                 serde_json::from_str(&response.try_recv().unwrap()).unwrap();
             assert_eq!(value["error"]["code"], "input_write_cancelled", "{value}");
             assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
             assert_eq!(value["error"]["data"]["input_write"]["bytes_total"], 2);
             assert_eq!(value["error"]["data"]["input_write"]["reason"], "deadline");
-            assert!(events.try_recv().is_err());
+            assert!(
+                events.try_recv().is_err(),
+                "expired held writes must bypass paste observation"
+            );
             app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held");
             assert!(
                 bytes.try_recv().is_err(),
