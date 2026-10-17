@@ -37,7 +37,7 @@ impl Compatibility {
             && self.writer_version.as_deref() == Some(TESTED_VERSION)
     }
 
-    /// Later binding code selects existing screen evidence on this reason;
+    /// Later binding code selects existing screen evidence on this reason.
     /// unavailable version evidence must never manufacture an idle state.
     pub fn screen_fallback_reason(&self) -> Option<&'static str> {
         (!self.supports_lifecycle()).then_some("unsupported_codex_version")
