@@ -398,6 +398,55 @@ or `agent.session_stalled` EventHub envelopes: `AgentPhaseEvent` and mesh v5
 stay unchanged. #1804 owns the mesh-versioned pane-free event contract.
 No placement is empty or fabricated, and list/side-pane wiring remains #1439.
 
+S3a-3 registry amendment (#1439, owner-approved split). #1841 owns pure
+records, runtime-tagged persistence and the S4 `StateSink` consumer. Each
+registered agent owns a reducer and a generation token. Admission rejects
+conflicting agent ids, names and native session ids without replacing another
+record. Removal and state delivery require the current generation, so late
+worker output cannot alter a replacement. The registry stores the complete S4
+publication, including phase edges, needs-human facts and the next observation
+deadline; it emits no EventHub envelopes (#1804).
+
+Session persistence stores `runtime: structured` identity/name/harness/session,
+cwd and requested model alongside `runtime: pty` pane records. Older snapshots
+without structured records remain valid; older pane records default to PTY.
+Cold restore retains metadata only: lifecycle is offline, observations are
+unknown, and no clock ages, outstanding questions, deadlines, process ids or
+lease proofs survive. An agent whose process is gone stays `Lifecycle::Offline`:
+it remains resumable by explicit launch and is never resurrected automatically.
+Under ADR-0028 §3a, structured records deserialize individually. Unknown runtime
+or harness records, invalid entries and duplicates are skipped with a warning,
+without rejecting any PTY workspace. The first supported id/name/session wins.
+Skipped entries remain raw and in order across saves, including additional
+fields, so rollback cannot erase newer records. Explicit removal also discards
+retained entries sharing the removed id, name or session, preventing a shadowed
+duplicate from becoming active after restart. Removal compacts retained slots.
+Known records also retain their original extra fields. An unknown collection shape remains raw
+and inactive; new admission refuses until its shape is understood. Warnings
+contain an index and reason, never raw payloads. The registry exposes a retained
+entry count for diagnostics; structured status/doctor routing remains #1843.
+Unknown pane runtime tags also survive restore/save and disable automatic agent
+resume for that pane only; its hibernation request and shell placement survive,
+and other panes retain normal resume behavior. A registry-only session remains
+persistable even when it contains only inactive raw entries and no terminal
+workspaces; #1853 tracks the lifetime of retained-only records. Both the temporary
+snapshot file before rename and its parent directory after rename are fsynced.
+A directory sync failure after successful replacement is logged as a durability
+warning and the save reports success because the new file is already installed.
+Handoff restores structured metadata offline; this slice owns no workers to
+transfer.
+
+#1842 owns runtime workers, actual lease ownership and observation scheduling.
+Its caller must mark session persistence dirty when durable metadata changes.
+#1843 owns the public `StructuredAgentInfo`, additive `structured_agents` list,
+get/status/stop routes and `runtime_unsupported` refusals. Existing PTY
+`AgentInfo` placement fields remain mandatory and unchanged; structured records
+have no fabricated placement. Mesh VERSION stays 5; remote directory rows
+remain #1380. Public structured start stays unreachable until #1843 and #1734
+have landed. The default remains the agent user (#1177); the owner-approved
+MVP exception permits explicit operator-mode opt-in only. #1843 supplies the
+public admission wiring and isolated manual dogfood runbook for that exception.
+
 The caller supplies monotonic observation time and its configured `stall_ms`;
 the reducer never starts a timer, polls a process or kills/retries a turn.
 Every stdout line, including an unknown line, proves progress but an unknown
@@ -1635,6 +1684,56 @@ P16 and P17 have no source in the stream today and are not promised;
   is refused with `operator_only` (exit 13). A switch down needs `send`
   scope. A `flk-agent` caller can switch its own agent down, never up.
 
+- **Per-request session grants (S6, #1429).** `agent.decide` accepts
+  `allow_once`, `allow_always` and `deny` only from an authenticated,
+  `operate`-scoped token principal. A local UID alone, pane input, an agent
+  message or a structured harness's MCP lease never authorizes a decision
+  (`not_authorized`, retry never). Identity comes from the authenticated
+  dispatcher context, never command arguments. Every decision is recorded
+  on `agent/<id>` in ordered open/closed permission audit records, including
+  automatic matches, with the originating token subject. Automatic closes also
+  reference the originating grant request ID. A raw request already reserved by
+  an exact grant carries that trusted reference into replay and counts as
+  stdout progress without ever opening S4 needs-human attention.
+- **`allow_always` lasts for one live harness runtime.** Its grant is held
+  only in memory for that structured agent. Exit, restart and resume into a
+  new runtime discard it, even when resuming the same persisted session.
+  Grants are never shared between agents, persisted in flk policy, or
+  written to a settings file. Persistent presets remain the separately
+  operator-edited policy described above (#1799).
+- **Match exactly; never forward harness rules.** `allow_always` always
+  installs an in-memory grant for only the exact tool name plus canonical
+  JSON input (recursively sorted object keys; array order and scalar values
+  preserved). Matching performs no Unicode normalization and treats `1` and
+  `1.0` as different. A different tool or input prompts again.
+  Harness permission suggestions are never interpreted or forwarded, even
+  when they appear limited to the requested tool: determining their scope
+  would require interpreting the harness rule grammar. The response allows
+  the current call with its original input and no `updatedPermissions`.
+  When nonempty suggestions are present, the closed audit records
+  `ignored_suggestions` with reason `not_forwarded` and the request ID linking
+  to the open audit record containing the full original suggestions.
+  Absent, null and empty suggestions produce the same exact grant.
+  Broader rules belong to the separately operator-edited policy in #1799.
+  The `MAX_GRANTS` constant in `src/structured/permissions.rs` bounds distinct
+  installed and reserved exact grant keys per runtime; exceeding that bound
+  returns `permission_grant_limit` (retry never, policy refusal) without
+  closing the request or sending a response. The operator may still allow
+  once or deny that request. Token authorization still applies to manual
+  decisions after a grant exists.
+- **Delivery and audit ordering.** A permission closes for attention only
+  after its decision audit is durable, and user input remains gated until
+  the control response is fully written. Admission success reserves a
+  decision and does not promise eventual pipe delivery. Audit or writer
+  failure stops delivery; runtime shutdown writes a reasoned terminal close
+  for each outstanding request before clearing the book, without inventing
+  an operator decision.
+  Harness cancellation closes its named request; top-level result and host
+  interruption also produce reasoned closes. A cancelled reservation cannot
+  deliver a stale answer. Disk errors are surfaced; failed persistence cannot
+  promise a durable close. Unknown and already accepted or closed request IDs are distinct `permission_request_unknown` and
+  `permission_request_closed` refusals, both retry never.
+
 ### 11. Harness neutrality
 
 One flk event model covers Claude, Codex and opencode at the level of §2:
@@ -1654,7 +1753,12 @@ four places that the schema must normalise rather than mirror:
    `completed` / `error`. flk stores a generic call with a typed `kind`.
 3. **Approvals.** Claude allow / deny with `updatedInput`; Codex accept /
    acceptForSession / decline / cancel; opencode once / always / reject. flk
-   keeps `allow | allow_always | deny{reason}` and maps down.
+   keeps `allow_once | allow_always | deny{reason}` and maps down.
+   `allow_always` obeys §10b's live-runtime lifetime, token-only authority
+   and audit contract. flk always uses exact in-memory grants and never
+   forwards harness permission suggestions or sends `updatedPermissions`.
+   Future adapters must preserve that scope rather than map an always
+   decision to a persistent harness rule.
 4. **Fork granularity.** Claude forks at a message uuid; opencode at a
    message id; Codex at a turn (`thread/fork{lastTurnId}`). `agent.fork`
    refuses a mid-turn point on Codex with `unsupported_for_agent`.

@@ -3,6 +3,8 @@
 pub mod claude;
 pub mod launch;
 pub mod lease;
+pub mod permissions;
+pub mod registry;
 pub mod runtime;
 pub mod state;
 pub mod supervision;

@@ -842,6 +842,17 @@ pub(crate) fn session_save_failed(path: &Path, err: &str) {
     );
 }
 
+pub(crate) fn session_directory_sync_failed(path: &Path, err: &str) {
+    tracing::warn!(
+        event = "persist.directory_sync",
+        subsystem = "persist",
+        outcome = "error",
+        path = %path.display(),
+        err,
+        "snapshot replaced but directory sync failed"
+    );
+}
+
 pub(crate) fn session_cleared(path: &Path) {
     tracing::info!(
         event = "persist.clear",
@@ -4886,6 +4897,15 @@ pub(crate) fn mesh_routing_failed(operation: &'static str, peer: &str, reason: &
 /// Custody errors expose a bounded code, never envelope bodies or return tokens.
 pub(crate) fn mesh_custody_failed(operation: &'static str, code: &'static str) {
     tracing::warn!(target: "flock::mesh", event = "mesh.custody.failed", operation, code, "mesh custody operation failed");
+}
+
+/// An untrusted client-token entry was ignored; never log its contents or bearer.
+pub(crate) fn client_token_entry_unsafe(entry: &str) {
+    tracing::warn!(
+        event = "client_token.entry.unsafe",
+        entry,
+        "untrusted client-token entry ignored"
+    );
 }
 
 #[cfg(test)]
