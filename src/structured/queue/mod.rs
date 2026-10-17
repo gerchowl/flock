@@ -12,7 +12,7 @@ use crate::platform::structured as private_fs;
 pub use model::{Change, Item, Record};
 use serde_json::{json, Value};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 const LINE_LIMIT: u64 = 2 * 1024 * 1024;
@@ -40,6 +40,7 @@ pub struct Cut {
 /// Blocking storage owned by one dedicated worker, not AppState or render code.
 pub struct Journal {
     path: PathBuf,
+    agent: String,
     directory: File,
     file: File,
     items: Vec<Item>,
@@ -71,21 +72,33 @@ fn encode(value: &impl serde::Serialize) -> io::Result<Vec<u8>> {
 }
 impl Journal {
     /// Acquire exclusive queue/<agent> ownership and recover committed state.
-    /// Components are lowercase ASCII identifiers, never paths. Root aliases resolve, but
+    /// Components are ASCII identifiers, never paths. Uppercase letters use an
+    /// injective, case-insensitive-safe encoding; the journal verifies the original
+    /// id. Root aliases resolve, but
     /// linked/private-namespace violations fail. Malformed complete lines or
     /// non-dense sequences fail; only an unterminated final tail is repaired.
     pub fn open(data: &Path, agent: &str) -> io::Result<Self> {
         if agent.is_empty()
             || !agent
                 .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-_".contains(&b))
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
         {
             return Err(problem("invalid queue agent component"));
         }
         let root = data.canonicalize()?;
         let sessions = root.join("sessions");
         private_fs::ensure_private_dir(&sessions)?;
-        let dir = sessions.join(agent);
+        let component: String = agent
+            .chars()
+            .map(|c| {
+                if c.is_ascii_uppercase() {
+                    format!("={}", c.to_ascii_lowercase())
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        let dir = sessions.join(component);
         private_fs::ensure_private_dir(&dir)?;
         let lease = open_file(&dir.join(".queue.lock"))?;
         lease.try_lock().map_err(|error| match error {
@@ -99,6 +112,7 @@ impl Journal {
         }
         let mut journal = Self {
             path,
+            agent: agent.to_owned(),
             directory: File::open(dir)?,
             file,
             items: Vec::new(),
@@ -170,6 +184,7 @@ impl Journal {
             this.file.sync_data()
         })?;
         self.items = items;
+        self.future |= record.change.has_unknown();
         self.seq = record.seq;
         self.records.push(value);
         Ok(record)
@@ -236,8 +251,10 @@ impl Journal {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let mut bytes =
-            encode(&json!({"kind":"queue_checkpoint","before":before,"high_water":high}))?;
+        let mut bytes = encode(&self.identity())?;
+        bytes.extend(encode(
+            &json!({"kind":"queue_checkpoint","before":before,"high_water":high}),
+        )?);
         for record in &records {
             bytes.extend(encode(record)?);
         }
@@ -259,10 +276,18 @@ impl Journal {
         self.checkpoint = Some((before, high));
         self.replay(before)
     }
+    fn identity(&self) -> Value {
+        json!({"kind":"queue_identity", "agent_id":self.agent})
+    }
     fn recover(&mut self) -> io::Result<()> {
         // A dead writer may have written complete lines without syncing them.
         // Make those bytes durable before publishing any recovered sequence.
         self.file.sync_all()?;
+        if self.file.metadata()?.len() == 0 {
+            self.file.write_all(&encode(&self.identity())?)?;
+            self.file.sync_all()?;
+        }
+        self.file.rewind()?;
         let mut reader = BufReader::new(&self.file);
         let mut good = 0;
         let mut line = Vec::new();
@@ -281,8 +306,15 @@ impl Journal {
                 break;
             }
             let value: Value = serde_json::from_slice(&line)?;
-            if value["kind"] == "queue_checkpoint" {
-                if good != 0 {
+            if good == 0 {
+                if value["kind"] != "queue_identity" || value["agent_id"] != self.agent {
+                    return Err(problem("missing or mismatched queue identity"));
+                }
+                self.future |= value != self.identity();
+            } else if value["kind"] == "queue_identity" {
+                return Err(problem("interior queue identity"));
+            } else if value["kind"] == "queue_checkpoint" {
+                if self.checkpoint.is_some() || !self.records.is_empty() {
                     return Err(problem("interior queue checkpoint"));
                 }
                 let before = value["before"]
@@ -302,18 +334,10 @@ impl Journal {
                     return Err(problem("non-dense queue sequence"));
                 }
                 if matches!(value["kind"].as_str(), Some("upsert" | "remove")) {
-                    match serde_json::from_value::<Record>(value.clone()) {
-                        Ok(record) => {
-                            self.future |= serde_json::to_value(&record)? != value;
-                            record.change.apply(&mut self.items)?;
-                        }
-                        // Serde distinguishes future enum variants from malformed
-                        // records. Preserve the former opaquely (ADR-0028 §3a).
-                        Err(error) if error.to_string().starts_with("unknown variant `") => {
-                            self.future = true;
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
+                    let record = serde_json::from_value::<Record>(value.clone())?;
+                    self.future |=
+                        record.change.has_unknown() || serde_json::to_value(&record)? != value;
+                    record.change.apply(&mut self.items)?;
                 } else if value["kind"].is_string() {
                     self.future = true;
                 } else {
@@ -323,6 +347,9 @@ impl Journal {
                 self.records.push(value);
             }
             good += n as u64;
+        }
+        if good == 0 {
+            return Err(problem("incomplete queue identity"));
         }
         if self.checkpoint.is_some_and(|(_, high)| self.seq < high) {
             return Err(problem("incomplete queue checkpoint"));

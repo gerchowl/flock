@@ -6,14 +6,25 @@ operator/CLI/message producers, the configured rewrite threshold and server
 publication are #1803. This storage slice does not expose a new send route.
 
 `Journal::open(data, agent)` acquires an exclusive OS lock on the stable
-`sessions/<agent>/.queue.lock` file. It keeps that lease across atomic replacement
+`sessions/<encoded-agent>/.queue.lock` file. It keeps that lease across atomic replacement
 of `queue.jsonl`. Drop the old journal before handing ownership to a successor;
 a cooperating second writer receives `WouldBlock` while the old lease exists. Agent
-path components permit only lowercase ASCII letters, digits, `-` and `_`. Uppercase
-identifiers are refused to prevent distinct identities aliasing on case-insensitive
-filesystems, including after a writer exits. Namespace directories
+path components permit ASCII letters of either case, digits, `-` and `_`.
+Each uppercase letter is encoded as `=` followed by its lowercase form; every
+other character stays unchanged. Thus `Foo` uses `=foo`, while `foo` uses `foo`.
+All encoded components are lowercase and `=` is outside the input charset,
+so the mapping is injective even on case-insensitive filesystems. The original
+agent ID stays unchanged in memory and in the journal identity header. Namespace directories
 are private and files are owner-only, with existing symlinks/nonregular files
 refused. The data root itself may be an alias such as a canonicalized temp root.
+
+Every journal begins with a synced `{"kind":"queue_identity","agent_id":"..."}`
+header containing the original, case-preserved ID. Open verifies it against the
+requested agent and refuses missing, mismatched, torn or repeated identity
+headers. Checkpoints preserve it. A new empty file receives its identity before
+open returns; this header consumes no sequence and is not a replay event. Earlier
+unreleased prototypes without this header are refused rather than adopted under
+an unverified identity.
 
 The journal persists dense per-agent sequences independently of the global
 event log. An `upsert` record contains the full typed item plus its final
@@ -41,7 +52,7 @@ a power cut.
 `items()` exposes the pure materialized queue. `bytes()` lets its owning worker
 check the configured rewrite threshold. `checkpoint()` and appends both require
 exclusive mutable ownership. For last committed sequence H and N retained items,
-the replacement contains a header
+the replacement contains the identity header, then a checkpoint header
 `{"kind":"queue_checkpoint","before":H,"high_water":H+N}` followed by
 snapshot records H+1 through H+N. `before` also lets recovery detect an incomplete
 snapshot. The header consumes no sequence and is never a queue event. The worker
@@ -61,15 +72,21 @@ immediately; no event is needed to complete it. An initial empty queue returns
 `from:1,to:0,snapshot_to:0`. A cursor ahead of the journal is refused. No cut
 shares a mutable record buffer with future appends or rewrites.
 
-On reopen, the journal is synced unconditionally; only an unterminated final tail
-is truncated and synced again. Malformed
+On reopen, the journal is synced unconditionally; only an unterminated final
+record tail after a verified identity is truncated and synced again. Malformed
 complete records, oversized lines, non-dense sequences, interior checkpoint
 headers and incomplete snapshots are corruption and fail without repair.
 Unknown string event kinds spend their cursors and remain available in replay,
 but do not change the known materialized state (ADR-0028 §3a). A writer that
 encounters such a kind refuses checkpointing rather than discard state it cannot
-interpret; it can still append known changes. Unknown enum variants inside known
-events are also retained opaquely and skipped without failing open. Unknown fields
+interpret; it can still append known changes. Unknown enum values inside known upserts are retained as typed `Unknown(raw)`
+variants on the item itself, at its recorded position, without failing open.
+They replace an older item with the same ID and preserve positions for later
+upserts, removes and updates. Serialization retains the original raw JSON value;
+rewriting is blocked by detecting `Unknown` variants, never by matching an error
+message. Appending such typed values also blocks rewriting. Unknown fields
 on known events survive in replay and block rewriting rather than being discarded.
-Malformed required fields and invalid known changes still fail open. Disk operations are blocking worker operations and
+Missing required fields and invalid known changes still fail open. While opaque
+future kinds, fields or enum values prevent rewrites, appends can grow the journal
+without bound; bounded handling of that condition is tracked in [#1820](https://github.com/gerchowl/flock/issues/1820). Disk operations are blocking worker operations and
 must never run on the server event loop or during render.

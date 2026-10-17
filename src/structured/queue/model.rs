@@ -22,6 +22,9 @@ pub enum Producer {
     System(String),
     /// Returning fork identity.
     Fork(String),
+    /// Future enum value retained verbatim for positional replay (ADR-0028 §3a).
+    #[serde(untagged)]
+    Unknown(Value),
 }
 
 /// Queue input purpose; scheduling is implemented in #1802.
@@ -46,6 +49,9 @@ pub enum Kind {
     Command,
     /// Input after an anchored command's result.
     Continuation,
+    /// Future enum value retained verbatim for positional replay (ADR-0028 §3a).
+    #[serde(untagged)]
+    Unknown(Value),
 }
 
 /// Persisted queue state; a completed write alone never means delivered.
@@ -66,6 +72,9 @@ pub enum State {
     Cancelled,
     /// Policy or operator dropped it.
     Dropped,
+    /// Future enum value retained verbatim for positional replay (ADR-0028 §3a).
+    #[serde(untagged)]
+    Unknown(Value),
 }
 
 /// Ordering, independent of delivery timing.
@@ -76,6 +85,9 @@ pub enum Priority {
     Normal,
     /// Before normal items at the same delivery point.
     Urgent,
+    /// Future enum value retained verbatim for positional replay (ADR-0028 §3a).
+    #[serde(untagged)]
+    Unknown(Value),
 }
 
 /// Timing only; the MVP scheduler accepts at_idle (#1802).
@@ -88,6 +100,9 @@ pub enum Delivery {
     Steer,
     /// Explicit future interrupt mode.
     Interrupt,
+    /// Future enum value retained verbatim for positional replay (ADR-0028 §3a).
+    #[serde(untagged)]
+    Unknown(Value),
 }
 
 /// Entire item state, used identically for appends and checkpoint snapshots.
@@ -145,6 +160,19 @@ pub struct Record {
 }
 
 impl Change {
+    pub(super) fn has_unknown(&self) -> bool {
+        match self {
+            Self::Upsert { item, .. } => {
+                matches!(item.producer, Producer::Unknown(_))
+                    || matches!(item.kind, Kind::Unknown(_))
+                    || matches!(item.state, State::Unknown(_))
+                    || matches!(item.priority, Priority::Unknown(_))
+                    || matches!(item.delivery, Delivery::Unknown(_))
+            }
+            Self::Remove { .. } => false,
+        }
+    }
+
     pub(super) fn apply(&self, items: &mut Vec<Item>) -> std::io::Result<()> {
         if let Self::Upsert { item, .. } = self {
             if item.metadata.keys().any(|k| {

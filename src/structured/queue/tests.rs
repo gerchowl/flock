@@ -20,6 +20,27 @@ impl Root {
     fn open(&self) -> Journal {
         Journal::open(&self.0, "fixture-agent").unwrap()
     }
+    fn identity_prefix(&self) -> Vec<u8> {
+        let bytes = fs::read(self.path()).unwrap();
+        let line = bytes
+            .split_inclusive(|b| *b == b'\n')
+            .next()
+            .unwrap_or_default();
+        if serde_json::from_slice::<Value>(line)
+            .ok()
+            .is_some_and(|v| v["kind"] == "queue_identity")
+        {
+            line.to_vec()
+        } else {
+            vec![]
+        }
+    }
+    fn write_records(&self, records: impl AsRef<[u8]>) -> Vec<u8> {
+        let mut bytes = self.identity_prefix();
+        bytes.extend(records.as_ref());
+        fs::write(self.path(), &bytes).unwrap();
+        bytes
+    }
     fn path(&self) -> PathBuf {
         self.0.join("sessions/fixture-agent/queue.jsonl")
     }
@@ -81,7 +102,10 @@ fn durable_append_reopen_preserves_item_changes_order_and_independent_sequences(
         .unwrap();
     let expected = journal.items().to_vec();
     assert!(journal.bytes().unwrap() > 0);
-    assert_eq!(fs::read_to_string(root.path()).unwrap().lines().count(), 4);
+    assert_eq!(
+        fs::read_to_string(root.path()).unwrap().lines().count(),
+        4 + usize::from(!root.identity_prefix().is_empty())
+    );
     let other = Journal::open(&root.0, "other-fixture-agent").unwrap();
     assert_eq!(other.seq, 0);
     drop(journal);
@@ -206,9 +230,9 @@ fn complete_corruption_gaps_and_incomplete_checkpoints_are_refused_without_repai
     ] {
         let root = Root::new();
         drop(root.open());
-        fs::write(root.path(), bytes).unwrap();
+        let expected = root.write_records(bytes);
         assert!(Journal::open(&root.0, "fixture-agent").is_err(), "{bytes}");
-        assert_eq!(fs::read(root.path()).unwrap(), bytes.as_bytes());
+        assert_eq!(fs::read(root.path()).unwrap(), expected);
     }
 }
 
@@ -237,7 +261,11 @@ fn checkpoints_publish_dense_snapshot_cuts_and_preserve_later_changes() {
         [3, 4]
     );
     let disk = fs::read_to_string(root.path()).unwrap();
-    let header: Value = serde_json::from_str(disk.lines().next().unwrap()).unwrap();
+    let header: Value = disk
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|v| v["kind"] == "queue_checkpoint")
+        .unwrap();
     assert_eq!(
         header,
         json!({"kind":"queue_checkpoint","before":2,"high_water":4})
@@ -301,7 +329,10 @@ fn empty_checkpoint_high_water_survives_restart_and_new_input() {
         })
     );
     assert!(cut.records.is_empty());
-    assert_eq!(fs::read_to_string(root.path()).unwrap().lines().count(), 1);
+    assert_eq!(
+        fs::read_to_string(root.path()).unwrap().lines().count(),
+        1 + usize::from(!root.identity_prefix().is_empty())
+    );
     drop(journal);
     let mut journal = root.open();
     assert!(journal.items().is_empty());
@@ -419,7 +450,10 @@ fn validation_limits_do_not_spend_sequences_or_poison_the_writer() {
             position: 0
         })
         .is_err());
-    assert_eq!(journal.bytes().unwrap(), 0);
+    assert_eq!(
+        journal.bytes().unwrap(),
+        root.identity_prefix().len() as u64
+    );
     assert_eq!(journal.append(upsert("valid", 0)).unwrap().seq, 1);
     for agent in ["", "..", "a/b", "a.b", "a\\b"] {
         assert!(Journal::open(&root.0, agent).is_err());
@@ -430,14 +464,10 @@ fn validation_limits_do_not_spend_sequences_or_poison_the_writer() {
 fn exhausted_sequences_never_wrap() {
     let root = Root::new();
     drop(root.open());
-    fs::write(
-        root.path(),
-        format!(
-            "{{\"kind\":\"queue_checkpoint\",\"before\":{0},\"high_water\":{0}}}\n",
-            u64::MAX
-        ),
-    )
-    .unwrap();
+    root.write_records(format!(
+        "{{\"kind\":\"queue_checkpoint\",\"before\":{0},\"high_water\":{0}}}\n",
+        u64::MAX
+    ));
     let mut journal = root.open();
     assert!(journal.append(upsert("no-wrap", 0)).is_err());
     assert_eq!(journal.seq, u64::MAX);
@@ -529,17 +559,144 @@ fn lease_probe_child() {
 }
 
 #[test]
-fn case_aliases_are_refused_even_after_the_original_writer_exits() {
+fn mixed_case_identity_round_trips_with_its_original_spelling() {
     let root = Root::new();
-    let mut journal = Journal::open(&root.0, "foo").unwrap();
+    let agent = "aGent-MiXeD_123";
+    let mut journal = Journal::open(&root.0, agent).unwrap();
     journal.append(upsert("original", 0)).unwrap();
-    assert!(Journal::open(&root.0, "Foo").is_err());
+    let path = journal.path.clone();
+    let identity: Value =
+        serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap()).unwrap();
+    assert_eq!(identity, json!({"kind":"queue_identity", "agent_id":agent}));
+    journal.checkpoint().unwrap();
     drop(journal);
-    assert!(Journal::open(&root.0, "Foo").is_err());
+    let journal = Journal::open(&root.0, agent).unwrap();
+    assert_eq!(journal.path, path);
+    assert_eq!(journal.items(), &[item("original")]);
+    assert_eq!(journal.seq, 2);
+}
+
+#[test]
+fn case_distinct_ids_have_distinct_journals_and_leases() {
+    let root = Root::new();
+    let mut upper = Journal::open(&root.0, "Foo").unwrap();
+    let mut lower = Journal::open(&root.0, "foo").unwrap();
+    upper.append(upsert("upper", 0)).unwrap();
+    lower.append(upsert("lower", 0)).unwrap();
+    assert_ne!(upper.path, lower.path);
+    assert_eq!(upper.path.parent().unwrap().file_name().unwrap(), "=foo");
+    assert_eq!(lower.path.parent().unwrap().file_name().unwrap(), "foo");
+    drop((upper, lower));
+    assert_eq!(
+        Journal::open(&root.0, "Foo").unwrap().items(),
+        &[item("upper")]
+    );
     assert_eq!(
         Journal::open(&root.0, "foo").unwrap().items(),
-        &[item("original")]
+        &[item("lower")]
     );
+    for invalid in ["=foo", "a=b", "Fo/o", "Fo.o"] {
+        assert!(Journal::open(&root.0, invalid).is_err());
+    }
+}
+
+#[test]
+fn mismatched_original_journal_identity_is_refused() {
+    let root = Root::new();
+    let mut journal = root.open();
+    journal.append(upsert("original", 0)).unwrap();
+    let bytes = fs::read_to_string(root.path()).unwrap();
+    let mut lines = bytes.lines();
+    let mut identity: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(identity["kind"], "queue_identity");
+    identity["agent_id"] = json!("another-agent");
+    let mut changed = encode(&identity).unwrap();
+    for line in lines {
+        changed.extend_from_slice(line.as_bytes());
+        changed.push(b'\n');
+    }
+    drop(journal);
+    fs::write(root.path(), &changed).unwrap();
+    assert!(Journal::open(&root.0, "fixture-agent").is_err());
+    assert_eq!(fs::read(root.path()).unwrap(), changed);
+}
+
+#[test]
+fn unknown_enum_items_keep_positions_through_later_updates_and_removals() {
+    for remove in [false, true] {
+        let root = Root::new();
+        drop(root.open());
+        let mut a = serde_json::to_value(Record {
+            seq: 1,
+            change: upsert("a", 0),
+        })
+        .unwrap();
+        a["item"]["state"] = json!("future_state");
+        let b = serde_json::to_value(Record {
+            seq: 2,
+            change: upsert("b", 1),
+        })
+        .unwrap();
+        let mut records = encode(&a).unwrap();
+        records.extend(encode(&b).unwrap());
+        root.write_records(&records);
+        let mut journal = root.open();
+        assert_eq!(
+            serde_json::to_value(&journal.items()[0]).unwrap(),
+            a["item"]
+        );
+        assert_eq!(journal.items()[1], item("b"));
+        assert!(journal.checkpoint().is_err());
+        journal
+            .append(if remove {
+                Change::Remove {
+                    item_id: "a".into(),
+                }
+            } else {
+                upsert("a", 0)
+            })
+            .unwrap();
+        assert_eq!(journal.seq, 3);
+        let expected = if remove {
+            vec![item("b")]
+        } else {
+            vec![item("a"), item("b")]
+        };
+        assert_eq!(journal.items(), expected);
+        drop(journal);
+        let mut journal = root.open();
+        assert_eq!(journal.items(), expected);
+        assert_eq!(journal.replay(0).unwrap().records[0], a);
+        assert!(
+            journal.checkpoint().is_err(),
+            "opaque history must remain preserved"
+        );
+    }
+}
+
+#[test]
+fn unknown_enum_update_replaces_a_stale_older_item() {
+    let root = Root::new();
+    let mut journal = root.open();
+    journal.append(upsert("a", 0)).unwrap();
+    drop(journal);
+    let mut a = serde_json::to_value(Record {
+        seq: 2,
+        change: upsert("a", 0),
+    })
+    .unwrap();
+    a["item"]["state"] = json!({"future_state":{"x":1}});
+    a["item"]["body"] = json!("new body, not the stale version");
+    let mut file = private_fs::open_append_file(&root.path()).unwrap();
+    file.write_all(&encode(&a).unwrap()).unwrap();
+    file.sync_all().unwrap();
+    let mut journal = root.open();
+    assert_eq!(
+        serde_json::to_value(&journal.items()[0]).unwrap(),
+        a["item"]
+    );
+    assert_eq!(journal.seq, 2);
+    assert!(journal.checkpoint().is_err());
 }
 
 #[test]
@@ -572,11 +729,52 @@ fn assert_future_data_preserved(extensions: &[&str]) {
                 value["item"][field] = json!("future_variant");
             }
         }
-        fs::write(root.path(), encode(&value).unwrap()).unwrap();
+        root.write_records(encode(&value).unwrap());
         let mut journal = root.open();
         assert_eq!(journal.replay(0).unwrap().records, [value.clone()]);
+        if value["kind"] == "upsert" {
+            assert_eq!(
+                serde_json::to_value(&journal.items()[0]).unwrap(),
+                value["item"]
+            );
+        }
         assert!(journal.checkpoint().is_err(), "cannot discard {extension}");
+        if !matches!(extension, "upsert" | "remove") {
+            let typed = serde_json::from_value::<Item>(value["item"].clone()).unwrap();
+            let fresh = Root::new();
+            let mut appended = fresh.open();
+            appended
+                .append(Change::Upsert {
+                    item: Box::new(typed),
+                    position: 0,
+                })
+                .unwrap();
+            assert!(
+                appended.checkpoint().is_err(),
+                "typed unknown values also block rewriting"
+            );
+            drop(appended);
+            assert_eq!(
+                serde_json::to_value(&fresh.open().items()[0]).unwrap(),
+                value["item"]
+            );
+        }
         drop(journal);
         assert_eq!(root.open().replay(0).unwrap().records, [value]);
+    }
+}
+
+#[test]
+fn missing_torn_or_interior_identity_is_refused_without_repair() {
+    for bytes in [
+        b"{\"kind\":\"queue_identity\",\"agent_id\":\"fixture-agent\"}".as_slice(),
+        b"{\"seq\":1,\"kind\":\"future\"}\n".as_slice(),
+        b"{\"kind\":\"queue_identity\",\"agent_id\":\"fixture-agent\"}\n{\"kind\":\"queue_identity\",\"agent_id\":\"fixture-agent\"}\n".as_slice(),
+    ] {
+        let root=Root::new();
+        drop(root.open());
+        fs::write(root.path(),bytes).unwrap();
+        assert!(Journal::open(&root.0,"fixture-agent").is_err());
+        assert_eq!(fs::read(root.path()).unwrap(),bytes);
     }
 }
