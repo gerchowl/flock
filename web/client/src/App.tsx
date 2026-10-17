@@ -1,23 +1,90 @@
 /**
  * The application root: picks what to show from the shell configuration.
  *
+ * Both modes render the same workbench (ADR-0038 §2a):
+ * - **fixture** replays the recorded session as the `fixture` agent, with
+ *   sample rows and inbox cards, under the replay badge (the owner preview);
+ * - **wire** connects to the configured server (G3a, #1747). Its agent list
+ *   is fleet-lite (#1746); the inbox stays empty until G5 (#1597).
+ *
+ * Each mode creates its fleet source and transport once, outside JSX: a
+ * prop expression is a getter that would run again on every read.
+ *
  * @module
  */
-import { Match, Switch, type JSX } from "solid-js";
+import { Match, Switch, createSignal, onCleanup, type JSX } from "solid-js";
 
 import { ReplayBadge } from "./components/ReplayBadge";
-import type { ConfigResult } from "./config";
-import { FIXTURE_STREAM, createFixtureTransport } from "./transport/fixture";
-import { Transcript } from "./views/Transcript";
+import type { ConfigResult, FixtureShellConfig, WireShellConfig } from "./config";
+import { createFixtureFleet } from "./fleet";
+import { emptyLayout } from "./layout/model";
+import { createLayoutStore } from "./layout/persistence";
+import { createFixtureTransport } from "./transport/fixture";
+import { WireConnection, type ConnectionOptions } from "./wire/connection";
+import { browserClock, browserSockets, endpointUrl } from "./wire/env";
+import { createWireFleet } from "./wire/fleet";
+import { createWireTransport } from "./wire/transport";
+import { SAMPLE_INBOX } from "./workbench/inbox";
+import { SAMPLE_AGENTS } from "./workbench/samples";
+import { Workbench } from "./workbench/Workbench";
 
-/** Props of {@link App}. */
-export type AppProps = { readonly config: ConfigResult };
+/** What a live connection runs on; tests inject virtual ones. */
+export type WireEnv = Pick<ConnectionOptions, "clock" | "sockets" | "random" | "store">;
 
-/**
- * Renders the configured mode, or the configuration error as an explicit
- * error state. The live wire transport arrives with G3 (#1595); until then
- * a wire configuration is reported, never silently replaced by fixtures.
- */
+/** Props of {@link App}. `env` defaults to the browser's. */
+export type AppProps = { readonly config: ConfigResult; readonly env?: WireEnv };
+
+/** This bundle's identity in `hello` (diagnostic only, ADR-0036 §5). */
+const CLIENT = { name: "flock-web", version: "0.0.0" } as const;
+
+function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element {
+  const store = createLayoutStore({ serverKey: "fixture" });
+  const { layout, notice } = store.load();
+  const fleet = createFixtureFleet(SAMPLE_AGENTS);
+  const transport = createFixtureTransport(props.config.fixtureJsonl);
+  return (
+    <>
+      <ReplayBadge source={props.config.source} />
+      <Workbench
+        fleet={fleet}
+        transport={transport}
+        inbox={SAMPLE_INBOX}
+        layout={layout}
+        saveLayout={(next) => store.save(next)}
+        status={() => notice}
+        source="replay"
+      />
+    </>
+  );
+}
+
+function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEnv }): JSX.Element {
+  const url = endpointUrl(props.config.serverUrl);
+  const connection = new WireConnection({ url, token: props.config.token, client: CLIENT, ...props.env });
+  const [status, setStatus] = createSignal<string | null>(null);
+  const describe = (): string => `${connection.state}${connection.error === null ? "" : ` · ${connection.error}`}`;
+  onCleanup(connection.onChange(() => setStatus(describe())));
+  connection.connect();
+  onCleanup(() => connection.disconnect());
+  const store = createLayoutStore({ serverKey: url, initial: emptyLayout });
+  const { layout, notice } = store.load();
+  // One fleet source and one transport per connection (ADR-0038 §3, sub ids).
+  const fleet = createWireFleet(connection);
+  const transport = createWireTransport(connection);
+  return (
+    <Workbench
+      fleet={fleet}
+      transport={transport}
+      inbox={[]}
+      layout={layout}
+      saveLayout={(next) => store.save(next)}
+      status={() => [notice, status()].filter((part) => part !== null).join(" · ")}
+      source="live"
+    />
+  );
+}
+
+/** Renders the configured mode, or the configuration error as an explicit error state. */
 export function App(props: AppProps): JSX.Element {
   return (
     <Switch>
@@ -32,19 +99,8 @@ export function App(props: AppProps): JSX.Element {
       <Match when={props.config.ok && props.config.config}>
         {(config) => {
           const current = config();
-          return current.transport === "fixture" ? (
-            <>
-              <ReplayBadge source={current.source} />
-              <main class="app-main">
-                <Transcript transport={createFixtureTransport(current.fixtureJsonl)} stream={FIXTURE_STREAM} />
-              </main>
-            </>
-          ) : (
-            <main class="state-error" role="alert" data-testid="config-error">
-              <h1>Live mode is not available yet</h1>
-              <p>This build has no wire transport; it arrives with #1595.</p>
-            </main>
-          );
+          if (current.transport === "fixture") return <FixtureApp config={current} />;
+          return <WireApp config={current} env={props.env ?? { clock: browserClock, sockets: browserSockets, random: Math.random, store: localStorage }} />;
         }}
       </Match>
     </Switch>
