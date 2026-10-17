@@ -96,6 +96,10 @@ pub struct StreamRecord {
     pub origin: RecordOrigin,
     /// Top-level result subtype, retained even when S1 does not model it.
     pub result_subtype: Option<Value>,
+    /// Book-authenticated grant reservation, never copied from harness JSON.
+    /// Retained on disk so replay cannot manufacture a transient human prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_grant_request_id: Option<String>,
     /// Exact line without its LF; synthetic summaries explicitly identify loss.
     pub raw: String,
 }
@@ -107,6 +111,34 @@ pub struct Received {
     pub record: StreamRecord,
     /// Interpretation using the observed harness version.
     pub event: SessionEvent,
+}
+
+impl Received {
+    /// Feed a durable stream record into S4, including book-owned close facts.
+    /// Permission audit opens are not extra stdout progress observations.
+    pub fn state_input(&self) -> Option<super::state::Input<'_>> {
+        if self.record.permission_grant_request_id.is_some()
+            && matches!(self.event, SessionEvent::CanUseTool(_))
+        {
+            return Some(super::state::Input::Progress);
+        }
+        if self.record.origin == RecordOrigin::Flk {
+            if let SessionEvent::Unknown { value, .. } = &self.event {
+                if value.get("type").and_then(Value::as_str) == Some("flk_permission_request") {
+                    return match (
+                        value.get("state").and_then(Value::as_str),
+                        value.get("request_id").and_then(Value::as_str),
+                    ) {
+                        (Some("closed"), Some(id)) => {
+                            Some(super::state::Input::ControlAnswered(id))
+                        }
+                        _ => None,
+                    };
+                }
+            }
+        }
+        Some(super::state::Input::Event(&self.event))
+    }
 }
 
 /// Worker termination, independent of the supervised process's outcome.
@@ -751,7 +783,9 @@ fn emit(
     cancel: &AtomicBool,
     synthetic: bool,
 ) -> io::Result<()> {
-    let received = persist(file, seq, line, count, version, busy, uncertain, synthetic)?;
+    let received = persist(
+        file, seq, line, count, version, busy, uncertain, synthetic, None,
+    )?;
     publish(received, tx, cancel)
 }
 
@@ -764,6 +798,7 @@ fn persist(
     busy: &AtomicBool,
     uncertain: &AtomicBool,
     synthetic: bool,
+    grant_request_id: Option<&str>,
 ) -> io::Result<Received> {
     let origin = if synthetic || count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err()
     {
@@ -813,6 +848,7 @@ fn persist(
             .as_millis(),
         origin,
         result_subtype,
+        permission_grant_request_id: grant_request_id.map(str::to_owned),
         raw,
     };
     let mut encoded = serde_json::to_vec(&record)?;

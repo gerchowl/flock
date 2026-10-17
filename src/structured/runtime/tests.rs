@@ -883,7 +883,7 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
 fn scripted_stream_drives_session_state_through_the_keyed_sink() {
     use crate::api::agent_state::{Phase, Turn};
     use crate::structured::claude::SessionEvent;
-    use crate::structured::state::{Input, SessionState, StateSink, Update};
+    use crate::structured::state::{SessionState, StateSink, Update};
     struct Sink(Vec<Update>);
     impl StateSink for Sink {
         fn publish(&mut self, update: Update) {
@@ -955,16 +955,16 @@ fn scripted_stream_drives_session_state_through_the_keyed_sink() {
                     running.result.try_recv()
                 )
             });
-        if received.record.origin == RecordOrigin::Flk {
+        let Some(input) = received.state_input() else {
             let audit: Value = serde_json::from_str(&received.record.raw).unwrap();
             assert_eq!(audit["type"], "flk_permission_request");
             assert_eq!(audit["state"], "open");
             assert!(stage == 2 || stage == 3, "audit at stage {stage}");
             assert_eq!(audit["request_id"], format!("p{}", stage - 1));
             continue;
-        }
+        };
         reducer.publish(
-            Input::Event(&received.event),
+            input,
             now,
             received.record.received_at_ms.try_into().unwrap(),
             Duration::from_secs(1),
