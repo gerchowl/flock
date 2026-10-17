@@ -16,6 +16,7 @@ import type { ConfigResult, FixtureShellConfig, WireShellConfig } from "./config
 import { createFixtureFleet } from "./fleet";
 import { emptyLayout } from "./layout/model";
 import { createLayoutStore } from "./layout/persistence";
+import { previewMode } from "./layout/phone";
 import { createFixtureTransport } from "./transport/fixture";
 import { WireConnection, type ConnectionOptions } from "./wire/connection";
 import { browserClock, browserSockets, endpointUrl } from "./wire/env";
@@ -47,6 +48,7 @@ function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element
         layout={layout}
         saveLayout={(next) => store.save(next)}
         status={() => notice}
+        mode={previewMode(location.search)}
         source="replay"
       />
     </>
@@ -71,6 +73,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
       layout={layout}
       saveLayout={(next) => store.save(next)}
       status={() => notice ?? status()}
+      mode={previewMode(location.search)}
       source="live"
     />
   );

@@ -3,7 +3,7 @@
  * fixture mode and in wire mode, the latter driven through the wire
  * transport's scripted replay (`tests/wire/harness.ts`).
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, onTestFinished, test } from "bun:test";
 import { render } from "solid-js/web";
 
 import { App } from "../src/App";
@@ -162,6 +162,78 @@ describe("wire mode", () => {
     const sub = sentFrames(h).at(-1) as { sub_id: string };
     h.step(step({ step: "send", frame: { t: "subfail", sub_id: sub.sub_id, code: "scope", message: "not for this token" } }));
     expect($(root, "focus-pane")?.querySelector('[role="alert"]')?.textContent).toBe("Couldn't load this agent's history: not for this token");
+  });
+});
+
+describe("phone", () => {
+  async function phone(source: "replay" | "live" = "replay"): Promise<HTMLElement> {
+    const root = mount(() => (
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={SAMPLE_INBOX} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source={source} />
+    ));
+    await tick();
+    return root;
+  }
+  const tab = (root: HTMLElement, label: string): HTMLButtonElement | undefined =>
+    [...root.querySelectorAll<HTMLButtonElement>(".tabbar > button")].find((button) => button.textContent === label);
+
+  test("opens on the Inbox tab, which says what is blocked on the person", async () => {
+    const root = await phone();
+    expect($(root, "workbench")).toBeNull();
+    expect(tab(root, "Inbox")?.getAttribute("aria-current")).toBe("page");
+    expect($(root, "inbox-headline")?.textContent).toBe("1 blocked on you.");
+    expect($$(root, "inbox-card").length).toBe(2);
+    const activity = [...root.querySelectorAll<HTMLButtonElement>(".tabbar button")].find((button) => button.textContent === "Activity");
+    expect(activity?.getAttribute("aria-disabled")).toBe("true");
+    expect(document.getElementById(activity?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Waits for the events stream (S7-rest)");
+  });
+
+  test("live, the headline never counts sample cards, and the cards stay labelled", async () => {
+    const root = await phone("live");
+    expect($(root, "inbox-headline")?.textContent).toBe("Your inbox arrives with G5 (#1597).");
+    expect($(root, "phone")?.textContent).toContain("Sample cards: the live inbox arrives with G5 (#1597).");
+    expect($(root, "phone")?.textContent).not.toContain("blocked on you");
+  });
+
+  test("the agent screen is a history entry: system back returns to its tab, and the URL is untouched", async () => {
+    // A push without a URL keeps the page's own, `?layout=` and fixture parameters included.
+    const pushes: unknown[][] = [];
+    const push = history.pushState.bind(history);
+    history.pushState = (...args: Parameters<History["pushState"]>) => (pushes.push(args), push(...args));
+    onTestFinished(() => void (history.pushState = push));
+    const root = await phone();
+    tab(root, "Agents")?.click();
+    const before = history.length;
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    await tick();
+    expect($(root, "phone-agent")).not.toBeNull();
+    expect(history.length).toBe(before + 1);
+    expect(pushes.map((args) => args.length)).toEqual([2]);
+    history.back();
+    await tick();
+    expect($(root, "phone-agent")).toBeNull();
+    expect(tab(root, "Agents")?.getAttribute("aria-current")).toBe("page");
+  });
+
+  test("Agents → an agent screen with its transcript; back returns to the tabs", async () => {
+    const root = await phone();
+    tab(root, "Agents")?.click();
+    expect($$(root, "agent-row").length).toBe(4);
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    await tick();
+    expect($(root, "phone-agent")?.querySelector("h1")?.textContent).toBe("fixture");
+    expect([...root.querySelectorAll(".segmented button")].map((button) => [button.textContent?.trim(), button.getAttribute("aria-disabled") === "true"])).toEqual([
+      ["Summary", true],
+      ["Transcript", false],
+      ["PR", true],
+      ["Terminal", true],
+    ]);
+    const terminal = [...root.querySelectorAll(".segmented button")].find((button) => button.textContent === "Terminal");
+    expect(document.getElementById(terminal?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Terminal waits for the terminal tile.");
+    expect($(root, "segmented-reasons")?.textContent).toContain("PR waits for a PR source.");
+    expect($(root, "transcript-synced")).not.toBeNull();
+    [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"))?.click();
+    expect($(root, "phone-agent")).toBeNull();
+    expect($$(root, "agent-row").length).toBe(4);
   });
 });
 
