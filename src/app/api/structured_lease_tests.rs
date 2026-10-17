@@ -410,3 +410,94 @@ async fn unreadable_peer_birth_with_active_leases_remains_uncertain() {
     );
     assert!(!app.caller_is_local_operator());
 }
+
+#[tokio::test]
+async fn self_submit_guard_protects_unproven_handoff_panes() {
+    for mismatch in [false, true] {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("self-submit")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        crate::test_support::adopt_unproven_pane_caller(&mut app, pane, mismatch);
+        assert_eq!(app.caller_pane(), None);
+        assert!(!app.caller_is_local_operator());
+        let target = app.public_pane_id(0, pane).unwrap();
+        let response = app.handle_pane_submit(
+            "self".into(),
+            PaneSubmitParams {
+                pane_id: target,
+                text: "owned fixture input".into(),
+                if_session: None,
+                min_age_secs: 0,
+                self_submit_confirmed: Some(false),
+            },
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["error"]["code"], "self_submit_unconfirmed",
+            "{response}"
+        );
+        assert!(app.pending_agent_submit.is_none());
+    }
+}
+
+#[tokio::test]
+async fn self_exclusion_reads_and_self_message_refusals_keep_unproven_candidates() {
+    for mismatch in [false, true] {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("self-exclusion")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        crate::test_support::adopt_unproven_pane_caller(&mut app, pane, mismatch);
+        let terminal = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&terminal).unwrap().launch_argv = Some(vec!["claude".into()]);
+        assert_eq!(app.caller_pane(), None);
+        assert!(app.attested_sender_agent().is_none());
+        let response: serde_json::Value = serde_json::from_str(&app.handle_agent_get(
+            "self".into(),
+            AgentTarget {
+                target: "self".into(),
+            },
+        ))
+        .unwrap();
+        assert!(
+            response.get("result").is_some(),
+            "bulk self-exclusion keeps its candidate: {response}"
+        );
+        let target = app.public_pane_id(0, pane).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&app.send_message(
+            "send".into(),
+            MsgSendParams {
+                to: MessageTarget::Pane { pane: target },
+                body: "fixture message".into(),
+                from_agent: None,
+                correlation_id: None,
+                in_reply_to: None,
+                intent: MsgIntent::Fyi,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            response["error"]["code"], "self_message_forbidden",
+            "{response}"
+        );
+    }
+}

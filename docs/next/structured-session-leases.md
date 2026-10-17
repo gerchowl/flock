@@ -59,7 +59,11 @@ turn state; an exit code alone is not a successful turn.
 Pane authority binds the child PID to the birth captured at spawn. Live handoff
 carries that birth as optional metadata; old manifests with no birth cannot grant
 pane-based API authority. Missing or mismatched birth fails closed without
-promoting the process to operator. Named hook reconciliation retains its existing
+promoting the process to operator. Granting pane authority requires birth
+validation. PID ancestry candidates still refuse pane callers as inbound relays and preserve
+self-kill, self-submit, bulk self-exclusion and restart-warning protections. An
+unproven candidate never proves that a caller is outside every pane.
+Named hook reconciliation retains its existing
 claim-healing behavior; an empty claim used for authority requires trusted birth.
 The Mac Nix package explicitly declares its C compiler, and `macos-process-facts`
 compiles the SDK helper using that package's compiler and SDK inputs.

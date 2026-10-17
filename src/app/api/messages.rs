@@ -272,7 +272,10 @@ impl App {
             );
         }
 
-        if from_pane.as_deref() == Some(to_pane.as_str()) {
+        let possible_sender = self.caller_pane_candidate();
+        if from_pane.as_deref() == Some(to_pane.as_str())
+            || possible_sender == Some((to_ws_idx, to_pane_id))
+        {
             return encode_error(id, "self_message_forbidden", "a pane cannot message itself");
         }
 

@@ -1039,10 +1039,10 @@ impl App {
     }
 
     /// The workspace holding the pane this API call is being made from, from
-    /// process ancestry. `None` for a caller in no pane — an ssh shell, a
-    /// supervisor script, a hand-run command.
+    /// process ancestry, including unproven birth, for self-guards only.
+    /// This candidate must never grant caller authority.
     pub(crate) fn caller_workspace_idx(&mut self) -> Option<usize> {
-        self.parse_pane_id_or_peer("", self.current_api_peer_pid)
+        self.caller_pane_candidate()
             .map(|(ws_idx, _pane_id)| ws_idx)
     }
 
@@ -4974,5 +4974,27 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(worktree_root);
         let _ = std::fs::remove_dir_all(repo);
+    }
+    #[tokio::test]
+    async fn self_kill_guard_protects_unproven_handoff_panes() {
+        for mismatch in [false, true] {
+            let mut app = app_with_parent(&std::env::temp_dir());
+            let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+            crate::test_support::adopt_unproven_pane_caller(&mut app, pane, mismatch);
+            assert_eq!(app.caller_pane(), None);
+            let target = KillTarget {
+                workspace_idx: Some(0),
+                repo_root: std::env::temp_dir(),
+                checkout: std::env::temp_dir(),
+            };
+            let params = WorktreeKillParams {
+                self_kill_confirmed: Some(false),
+                ..Default::default()
+            };
+            let error = app
+                .refuse_unguarded_self_kill(&target, &params)
+                .expect_err("unproven candidate still needs self confirmation");
+            assert_eq!(error.code, "self_kill_unconfirmed");
+        }
     }
 }

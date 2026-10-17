@@ -209,6 +209,12 @@ impl App {
         (crate::platform::process_start_time(pid) == Some(birth)).then_some(pane)
     }
 
+    /// A possible caller pane for refusal, self-protection and warning routing only.
+    /// PID ancestry is not identity evidence and must never grant authority.
+    pub(super) fn caller_pane_candidate(&self) -> Option<(usize, crate::layout::PaneId)> {
+        self.resolve_pane_in_chain(&peer_ancestor_chain(self.current_api_peer_pid?))
+    }
+
     /// The API caller's own pane, bound to the child's original birth identity.
     pub(super) fn caller_pane(&self) -> Option<(usize, crate::layout::PaneId)> {
         self.caller_pane_evidence().ok().flatten()
