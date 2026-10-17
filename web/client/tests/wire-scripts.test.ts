@@ -5,10 +5,10 @@
  * **Selection.** Each script's header names its slice in `covers`:
  * `s7-min` (#1746) or full `s7`. Every `s7-min` script is replayed, and so
  * is every `s7` script whose behaviour G3a already implements; the rest are
- * listed with the G3b (#1595) feature they need. A script in no
- * list, or an `s7-min` script left to G3b, fails the suite, so nothing is
- * skipped silently. Fixtures are S7a's and never edited; where one asserts
- * more than S7-min may, the extra is dropped here, with the reason.
+ * listed with the G3b (#1595) feature they need. A script in no list, or
+ * an `s7-min` script left to G3b, fails the suite, so nothing is skipped
+ * silently. Fixtures are S7a's and never edited; where one asserts more
+ * than S7-min may, the extra is dropped here, with the reason.
  *
  * Each script runs twice, with the jitter source at its lowest and highest
  * value, so both ends of every backoff interval are exercised.

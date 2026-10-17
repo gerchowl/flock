@@ -11,7 +11,9 @@
  *   the same socket; a late `ack` on that socket still settles it.
  *
  * Unsettled commands (`pending`, `sent`, `uncertain`) are persisted, so a
- * reload restores them with their status. Settled ones stay in memory for
+ * reload restores them with their status. A stored record that is not a
+ * readable command is dropped, never fatal: the others still restore, and
+ * {@link Outbox.problem} names what was dropped. Settled ones stay in memory for
  * display and are not persisted, which bounds the stored outbox.
  *
  * Known limit, G3b (#1595): a `sent` or `uncertain` command whose socket is
@@ -46,23 +48,66 @@ type Live = {
 
 const UNSETTLED: ReadonlySet<OutboxStatus> = new Set(["pending", "sent", "uncertain", "unknown_outcome"]);
 
+/** Typed against {@link OutboxStatus}, so a new status fails `tsc` until listed. */
+const STATUSES: { readonly [S in OutboxStatus]: true } = { pending: true, sent: true, uncertain: true, unknown_outcome: true, acked: true, failed: true };
+
+type Json = { readonly [key: string]: unknown };
+const isObject = (value: unknown): value is Json => typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** Whether a stored record is a readable {@link QueuedCommand}. */
+function isCommand(value: unknown): value is QueuedCommand {
+  return (
+    isObject(value) &&
+    typeof value["cmd_id"] === "string" &&
+    typeof value["verb"] === "string" &&
+    "args" in value &&
+    typeof value["principal"] === "string" &&
+    typeof value["created_ms"] === "number" &&
+    typeof value["status"] === "string" &&
+    Object.hasOwn(STATUSES, value["status"]) &&
+    (value["first_sent_ms"] === undefined || value["first_sent_ms"] === null || typeof value["first_sent_ms"] === "number")
+  );
+}
+
 /** The outbox; the connection drives it. */
 export class Outbox {
   #principal: string | null = null;
   #commands = new Map<string, Live>();
   readonly #store: KeyValueStore;
   readonly #changed: () => void;
+  #problem: string | null = null;
 
-  /** Restores the persisted outbox from `store`. A corrupt record throws. */
+  /** Restores the persisted outbox from `store`, dropping what it cannot read. */
   constructor(store: KeyValueStore, changed: () => void) {
     this.#store = store;
     this.#changed = changed;
     const raw = store.getItem(OUTBOX_KEY);
     if (raw === null) return;
-    const stored = JSON.parse(raw) as Stored;
-    if (!Array.isArray(stored.commands)) throw new Error(`${OUTBOX_KEY} holds no command list`);
-    this.#principal = stored.principal;
-    for (const entry of stored.commands) this.#commands.set(entry.cmd_id, { entry, timer: null, onSocket: false });
+    let stored: unknown;
+    try {
+      stored = JSON.parse(raw);
+    } catch {
+      this.#problem = `The stored outbox (${OUTBOX_KEY}) is not JSON; its commands were dropped.`;
+      return;
+    }
+    const commands = isObject(stored) ? stored["commands"] : undefined;
+    const principal = isObject(stored) ? stored["principal"] : undefined;
+    if (!Array.isArray(commands) || (principal !== null && typeof principal !== "string")) {
+      this.#problem = `The stored outbox (${OUTBOX_KEY}) holds no command list; it was dropped.`;
+      return;
+    }
+    this.#principal = principal;
+    const dropped: string[] = [];
+    commands.forEach((entry: unknown, index) => {
+      if (isCommand(entry)) this.#commands.set(entry.cmd_id, { entry, timer: null, onSocket: false });
+      else dropped.push(isObject(entry) && typeof entry["cmd_id"] === "string" ? entry["cmd_id"] : `record ${index + 1}`);
+    });
+    if (dropped.length > 0) this.#problem = `Dropped unreadable stored ${dropped.length === 1 ? "command" : "commands"}: ${dropped.join(", ")}.`;
+  }
+
+  /** What restoring the stored outbox had to drop, or null. */
+  get problem(): string | null {
+    return this.#problem;
   }
 
   /** The principal the stored commands were queued under. */
