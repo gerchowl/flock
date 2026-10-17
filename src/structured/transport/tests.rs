@@ -1257,6 +1257,72 @@ fn host_closures_audit_cancel_result_and_interrupt_without_sending_decisions() {
 }
 
 #[test]
+fn harness_cancel_closes_only_its_request_and_never_sends_a_decision() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    for id in ["request-a", "request-b"] {
+        permission(&mut output, id);
+        receive(&transport);
+        receive(&transport);
+    }
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "type": "control_cancel_request", "request_id": "request-a"
+        })
+    )
+    .unwrap();
+    assert!(matches!(
+        receive(&transport).event,
+        SessionEvent::ControlCancel(_)
+    ));
+    let close: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+    assert_eq!(close["state"], "closed");
+    assert_eq!(close["request_id"], "request-a");
+    assert_eq!(close["reason"], "cancelled");
+    assert!(close.get("decision").is_none());
+    assert_eq!(
+        call_decide(
+            &transport,
+            &owner(),
+            &decide("request-a", permissions::Decision::AllowOnce)
+        ),
+        Err(ErrorCode::PermissionRequestClosed)
+    );
+    assert_eq!(transport.waiting_on_human().unwrap(), vec!["request-b"]);
+    // Duplicate and unrelated cancellation must not fabricate another close.
+    for id in ["request-a", "unknown-request"] {
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({
+                "type": "control_cancel_request", "request_id": id
+            })
+        )
+        .unwrap();
+        assert!(matches!(
+            receive(&transport).event,
+            SessionEvent::ControlCancel(_)
+        ));
+    }
+    call_decide(
+        &transport,
+        &owner(),
+        &decide("request-b", permissions::Decision::Deny),
+    )
+    .unwrap();
+    let close: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+    assert_eq!(close["request_id"], "request-b");
+    // The following answer is a causal barrier: no cancelled answer preceded it.
+    assert_eq!(
+        input_line(&transport, &mut input)["response"]["request_id"],
+        "request-b"
+    );
+    assert!(replay_open_permissions(&root).is_empty());
+}
+
+#[test]
 fn a_cancelled_reservation_cannot_deliver_a_stale_control_response() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let (transport, mut output, mut input) = start(&root);
