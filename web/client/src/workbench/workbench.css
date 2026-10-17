@@ -229,3 +229,82 @@
   gap: 0.5rem;
   margin-top: 0.5rem;
 }
+
+.palette-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 1.5rem;
+  min-height: 44px;
+  padding: 0 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  justify-content: center;
+  padding-top: 15vh;
+  background: rgb(0 0 0 / 0.35);
+}
+
+.palette {
+  width: min(36rem, calc(100vw - 2rem));
+  max-height: 60vh;
+  overflow: hidden auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.palette__input {
+  width: 100%;
+  min-height: 48px;
+  padding: 0 1rem;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  color: inherit;
+  font: inherit;
+}
+
+.palette__list {
+  margin: 0;
+  padding: 0.25rem;
+  list-style: none;
+}
+
+.palette__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 0.75rem;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.palette__item[aria-selected="true"],
+.palette__item:hover {
+  background: var(--surface);
+}
+
+.palette__hint {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
