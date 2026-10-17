@@ -842,6 +842,17 @@ pub(crate) fn session_save_failed(path: &Path, err: &str) {
     );
 }
 
+pub(crate) fn session_directory_sync_failed(path: &Path, err: &str) {
+    tracing::warn!(
+        event = "persist.directory_sync",
+        subsystem = "persist",
+        outcome = "error",
+        path = %path.display(),
+        err,
+        "snapshot replaced but directory sync failed"
+    );
+}
+
 pub(crate) fn session_cleared(path: &Path) {
     tracing::info!(
         event = "persist.clear",
