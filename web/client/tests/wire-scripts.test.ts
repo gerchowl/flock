@@ -25,38 +25,38 @@ const SCRIPTS = `${import.meta.dir}/../test/fixtures/wire`;
 
 /** The scripts G3a (#1747) replays, so far. */
 const REPLAYED = [
+  "agent-gap",
   "backoff-cap",
   "backoff-reset",
+  "bootstrap-snapshot",
+  "clean",
   "connect-deadline",
+  "empty-bootstrap",
+  "empty-snapshot",
   "foreground",
+  "gap-snapshot",
   "handshake-deadline",
+  "heartbeat-missed",
+  "lagged",
   "network-change",
+  "old-socket",
   "ping-pong",
   "protocol-refusal",
+  "stream-independence",
+  "subfail-cursor_ahead",
+  "subfail-scope",
+  "subfail-unknown_stream",
+  "subscription-deadline",
   "token-refused",
 ];
 
 /** Scripts that need a later slice of #1747. */
 const LATER: { readonly [script: string]: string } = {
-  "agent-gap": "streams: #1747's second slice",
   "agent-send": "the outbox: #1747's third slice",
-  "bootstrap-snapshot": "streams: #1747's second slice",
-  "clean": "streams: #1747's second slice",
   "client-disconnect": "the outbox: #1747's third slice",
   "command-failure": "the outbox: #1747's third slice",
-  "empty-bootstrap": "streams: #1747's second slice",
-  "empty-snapshot": "streams: #1747's second slice",
-  "gap-snapshot": "streams: #1747's second slice",
-  "heartbeat-missed": "streams: #1747's second slice",
-  "lagged": "streams: #1747's second slice",
-  "old-socket": "streams: #1747's second slice",
   "set-token-changed-principal": "the outbox: #1747's third slice",
   "set-token-same-principal": "the outbox: #1747's third slice",
-  "stream-independence": "streams: #1747's second slice",
-  "subfail-cursor_ahead": "streams: #1747's second slice",
-  "subfail-scope": "streams: #1747's second slice",
-  "subfail-unknown_stream": "streams: #1747's second slice",
-  "subscription-deadline": "streams: #1747's second slice",
   "token-revoked": "the outbox: #1747's third slice",
 };
 
