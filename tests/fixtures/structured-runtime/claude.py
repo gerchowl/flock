@@ -39,6 +39,10 @@ if sys.argv[1:] == ["--version"]:
     sys.exit(0)
 assert sys.argv[1:] == json.loads((root / "argv.json").read_text()), "argv drift"
 assert environment == allowed, "model environment leak"
+if "cwd" in case:
+    assert pathlib.Path.cwd() == pathlib.Path(case["cwd"]).resolve(), "requested cwd ignored"
+if "model" in case:
+    assert sys.argv[-2:] == ["--model", case["model"]], "requested model ignored"
 assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == "fixture-token-not-a-credential", "token seam"
 assert "fixture-token-not-a-credential" not in json.dumps(sys.argv), "token in argv"
 settings = pathlib.Path(sys.argv[sys.argv.index("--settings") + 1])
