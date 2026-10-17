@@ -119,6 +119,13 @@ function KnownEvent(props: { readonly event: KnownSessionEvent }): JSX.Element {
 function Entry(props: { readonly entry: SessionEntry }): JSX.Element {
   const entry = props.entry;
   if (entry.kind === "unknown") return <UnknownBlock input={entry.unknown} />;
+  if (entry.kind === "gap") {
+    return (
+      <p class="transcript__gap" role="note" data-testid="transcript-gap">
+        Events {entry.from}–{entry.to} of this session are no longer stored.
+      </p>
+    );
+  }
   return (
     <ErrorBoundary fallback={() => <UnknownBlock input={{ raw: entry.event, shape: null }} />}>
       <KnownEvent event={entry.event} />
@@ -132,6 +139,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
   const [progress, setProgress] = createSignal<Progress>({ phase: "replaying" });
   const subscription = props.transport.subscribe(props.stream, null, {
     entry: (entry) => setEntries(entries.length, entry),
+    reset: () => setEntries([]),
     synced: () => setProgress({ phase: "synced" }),
     failed: (failure) => setProgress({ phase: "failed", failure }),
   });

@@ -69,6 +69,18 @@ describe("Transcript", () => {
     expect(root.textContent).toContain("q-example submitted for user feedback");
   });
 
+  test("a gap entry renders the fixed missing-range marker, and reset clears the list", async () => {
+    let observer: Parameters<Transport["subscribe"]>[2] | undefined;
+    const transport: Transport = { subscribe: (_stream, _after, given) => ((observer = given), { close: () => undefined }) };
+    const root = mount(() => <Transcript transport={transport} stream="agent/a" />);
+    observer?.entry({ seq: 1, kind: "unknown", unknown: { raw: "x", shape: "s" } });
+    observer?.entry({ seq: 9, kind: "gap", from: 2, to: 9 });
+    expect(root.querySelector('[data-testid="transcript-gap"]')?.textContent).toBe("Events 2–9 of this session are no longer stored.");
+    observer?.reset?.();
+    expect(root.querySelector('[data-testid="transcript-gap"]')).toBeNull();
+    expect(root.querySelector('[data-testid="unknown-event"]')).toBeNull();
+  });
+
   test("a failed subscription is shown, not swallowed", async () => {
     const root = mount(() => <Transcript transport={createFixtureTransport("")} stream="agent/other" />);
     await Promise.resolve();
