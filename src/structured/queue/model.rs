@@ -206,6 +206,11 @@ pub struct Item {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Change {
+    /// Apply a batch reservation or lifecycle transition as one durable record.
+    Batch {
+        /// Complete replacements of existing items, preserving their positions.
+        items: Vec<Item>,
+    },
     /// Add, edit, reorder or transition one item atomically.
     Upsert {
         /// Complete replacement state.
@@ -230,16 +235,21 @@ pub struct Record {
     pub change: Change,
 }
 
+impl Item {
+    pub(super) fn has_unknown(&self) -> bool {
+        matches!(self.producer, Producer::Unknown(_))
+            || matches!(self.kind, Kind::Unknown(_))
+            || matches!(self.state, State::Unknown(_))
+            || matches!(self.priority, Priority::Unknown(_))
+            || matches!(self.delivery, Delivery::Unknown(_))
+    }
+}
+
 impl Change {
     pub(super) fn has_unknown(&self) -> bool {
         match self {
-            Self::Upsert { item, .. } => {
-                matches!(item.producer, Producer::Unknown(_))
-                    || matches!(item.kind, Kind::Unknown(_))
-                    || matches!(item.state, State::Unknown(_))
-                    || matches!(item.priority, Priority::Unknown(_))
-                    || matches!(item.delivery, Delivery::Unknown(_))
-            }
+            Self::Batch { items } => items.iter().any(Item::has_unknown),
+            Self::Upsert { item, .. } => item.has_unknown(),
             Self::Remove { .. } => false,
         }
     }
@@ -263,6 +273,22 @@ impl Change {
             }
         }
         let id = match self {
+            Self::Batch {
+                items: replacements,
+            } => {
+                for item in replacements {
+                    let position = items
+                        .iter()
+                        .position(|old| old.item_id == item.item_id)
+                        .ok_or_else(|| std::io::Error::other("batch item does not exist"))?;
+                    Self::Upsert {
+                        item: Box::new(item.clone()),
+                        position,
+                    }
+                    .apply(items)?;
+                }
+                return Ok(());
+            }
             Self::Upsert { item, .. } => &item.item_id,
             Self::Remove { item_id } => item_id,
         };

@@ -641,6 +641,17 @@ same queue (owner decision 5): there is no second input path.
   that every item in it records; a one-item batch uses the `item_id` as its
   uuid, as before. `command_lifecycle` for that uuid moves all its items
   together. Up to `[queue] max_batch` (default 8) items go in one batch.
+
+  **Command exception (architect decision for #1802, 2026-10-17).** A harness
+  slash-command item is sent **verbatim**, as the sole text block of its own
+  isolated turn, without a producer label and never batched with another item.
+  The label would break command parsing. Attribution remains in the queue item
+  and its audit/lifecycle records. Only an operator may create command items:
+  the operator composer or `flk agent send` authenticated as operator/token
+  principal. Text from agents, MCP or relayed peers that starts with `/` remains
+  ordinary input, wrapped in the normal producer-labelled template, and cannot
+  become a harness command. Neither a slash prefix nor a claimed producer in
+  request JSON grants operator authority.
 - **Relatedness joins (owner decision 5).** After rules 1 to 4, when
   System One is configured (§2a's `[systemone]` client), the server asks
   it, in one call, one `noul` per candidate among the next
@@ -737,7 +748,10 @@ back-to-back turns. For a structured agent there is no polling at all:
 
 - **Trigger.** The turn end is the `result` event (E1). An armed self-compact
   (`flock_self_compact`, `flk pane arm-self-compact`) queues a `command`
-  item with body `/compact`, `delivery: at_idle`, `priority: urgent`. By
+  item with body `/compact`, `delivery: at_idle`, `priority: urgent`. The §3
+  command exception applies: operator authorization is required, the command
+  body is sent verbatim alone, and attribution stays in queue/audit records.
+  An agent's recap or supervisor text cannot manufacture that authority. By
   §3, `at_idle` means it is never written into a running turn, and `urgent`
   means it is the first item written after that `result`, ahead of any
   `normal` `at_idle` item. Background shells, held waits and subagents do not matter, because
