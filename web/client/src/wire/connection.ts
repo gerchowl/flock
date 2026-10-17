@@ -137,6 +137,9 @@ type Sub = {
 };
 
 type Snapshot = {
+  /** The gap that announced it, to recognise an identical repeat. */
+  readonly from: number;
+  readonly to: number;
   /** Its last seq, the gap's `snapshot_to`. */
   readonly end: number;
   /** The last seq received so far. */
@@ -282,7 +285,8 @@ export class WireConnection {
     this.#subs.delete(id);
     if (this.#connected()) {
       this.#ended.add(id);
-      this.#send({ t: "unsub", sub_id: id });
+      // A refused sub was already ended by the server's `subfail` (ADR-0036 §5a): nothing to unsub.
+      if (sub.state !== "Refused") this.#send({ t: "unsub", sub_id: id });
     }
     this.#settle();
   }
@@ -540,13 +544,22 @@ export class WireConnection {
     if (history !== (frame.snapshot_to === undefined)) {
       return this.#protocolError(`a ${history ? "snapshot" : "history"} gap on ${sub.stream}`);
     }
+    /*
+     * A gap already behind the applied cursor is a duplicate (ADR-0036 §5a):
+     * dropped, so it neither repeats a marker nor resets the progress
+     * deadline. So is an identical repeat of the snapshot being received.
+     */
     if (frame.snapshot_to === undefined) {
-      sub.handler.gap(frame.from, frame.to);
-      return this.#advance(sub, Math.max(sub.cursor ?? 0, frame.to));
+      if (sub.cursor !== null && frame.to <= sub.cursor) return;
+      sub.handler.gap(sub.cursor === null ? frame.from : Math.max(frame.from, sub.cursor + 1), frame.to);
+      return this.#advance(sub, frame.to);
     }
     if (frame.snapshot_to < frame.to) return this.#protocolError(`a snapshot on ${sub.stream} ending before its gap`);
-    const resume = sub.snapshot?.resume ?? sub.state;
-    sub.snapshot = { end: frame.snapshot_to, last: frame.to, lines: [], resume };
+    const current = sub.snapshot;
+    if (current !== null && current.from === frame.from && current.to === frame.to && current.end === frame.snapshot_to) return;
+    if (current === null && sub.cursor !== null && frame.snapshot_to <= sub.cursor) return;
+    const resume = current?.resume ?? sub.state;
+    sub.snapshot = { from: frame.from, to: frame.to, end: frame.snapshot_to, last: frame.to, lines: [], resume };
     if (frame.snapshot_to === frame.to) return this.#endSnapshot(sub, sub.snapshot);
     sub.state = "Resyncing";
     this.#startProgress(sub);
