@@ -1,6 +1,6 @@
 /**
- * What the wire connection needs from its host: a clock, sockets and
- * randomness (ADR-0038 §3, ADR-0037). Every one is injected, so tests drive
+ * What the wire connection needs from its host: a clock, sockets, randomness
+ * and storage (ADR-0038 §3, ADR-0037). Every one is injected, so tests drive
  * the whole lifecycle with a virtual clock and scripted sockets, and no test
  * waits on wall-clock time.
  *
@@ -52,6 +52,22 @@ export type SocketFactory = (url: string) => SocketLike;
  */
 export const browserSockets: SocketFactory = (url) => new WebSocket(url) as unknown as SocketLike;
 
+/** String storage for the outbox. `localStorage` satisfies it. */
+export interface KeyValueStore {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+/** An in-memory {@link KeyValueStore}, for tests and for hosts without storage. */
+export function memoryStore(): KeyValueStore & { readonly entries: Map<string, string> } {
+  const entries = new Map<string, string>();
+  return {
+    entries,
+    getItem: (key) => entries.get(key) ?? null,
+    setItem: (key, value) => void entries.set(key, value),
+  };
+}
+
 /**
  * The `/v1/ws` endpoint for a shell's `serverUrl` (ADR-0036 §5). The path is
  * resolved against the configured URL, never against the page's origin, and
@@ -71,4 +87,19 @@ export function endpointUrl(serverUrl: string): string {
 export function backoffDelay(n: number, random: () => number): number {
   const ceiling = Math.min(30_000, 500 * 2 ** Math.min(n, 16));
   return Math.floor(ceiling / 2 + random() * (ceiling / 2 + 1));
+}
+
+/** A UUIDv7 (RFC 9562): 48 bits of `wallMs`, then random bits. */
+export function uuidv7(wallMs: number, random: Uint8Array = crypto.getRandomValues(new Uint8Array(10))): string {
+  const bytes = new Uint8Array(16);
+  let ms = Math.floor(wallMs);
+  for (let index = 5; index >= 0; index--) {
+    bytes[index] = ms % 256;
+    ms = Math.floor(ms / 256);
+  }
+  bytes.set(random.subarray(0, 10), 6);
+  bytes[6] = 0x70 | ((bytes[6] ?? 0) & 0x0f);
+  bytes[8] = 0x80 | ((bytes[8] ?? 0) & 0x3f);
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }

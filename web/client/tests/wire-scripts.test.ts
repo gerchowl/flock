@@ -5,7 +5,7 @@
  * **Selection.** Each script's header names its slice in `covers`:
  * `s7-min` (#1746) or full `s7`. Every `s7-min` script is replayed, and so
  * is every `s7` script whose behaviour G3a already implements; the rest are
- * listed with the G3b (#1595) feature they need. Scripts that need a later slice of #1747 are listed with it. A script in no
+ * listed with the G3b (#1595) feature they need. A script in no
  * list, or an `s7-min` script left to G3b, fails the suite, so nothing is
  * skipped silently. Fixtures are S7a's and never edited; where one asserts
  * more than S7-min may, the extra is dropped here, with the reason.
@@ -22,13 +22,16 @@ import { Harness, parseScript } from "./wire/harness";
 
 const SCRIPTS = `${import.meta.dir}/../test/fixtures/wire`;
 
-/** The scripts G3a (#1747) replays, so far. */
+/** The scripts G3a (#1747) replays. */
 const REPLAYED = [
   "agent-gap",
+  "agent-send",
   "backoff-cap",
   "backoff-reset",
   "bootstrap-snapshot",
   "clean",
+  "client-disconnect",
+  "command-failure",
   "connect-deadline",
   "empty-bootstrap",
   "empty-snapshot",
@@ -41,23 +44,16 @@ const REPLAYED = [
   "old-socket",
   "ping-pong",
   "protocol-refusal",
+  "set-token-changed-principal",
+  "set-token-same-principal",
   "stream-independence",
   "subfail-cursor_ahead",
   "subfail-scope",
   "subfail-unknown_stream",
   "subscription-deadline",
   "token-refused",
+  "token-revoked",
 ];
-
-/** Scripts that need a later slice of #1747. */
-const LATER: { readonly [script: string]: string } = {
-  "agent-send": "the outbox: #1747's third slice",
-  "client-disconnect": "the outbox: #1747's third slice",
-  "command-failure": "the outbox: #1747's third slice",
-  "set-token-changed-principal": "the outbox: #1747's third slice",
-  "set-token-same-principal": "the outbox: #1747's third slice",
-  "token-revoked": "the outbox: #1747's third slice",
-};
 
 /** Left to G3 #1595 (G3b), with the feature each one needs. */
 const G3B: { readonly [script: string]: string } = {
@@ -109,7 +105,7 @@ const JITTER = { low: () => 0, high: () => 0.999_999 } as const;
 describe("S7a scripts", () => {
   test("every script is either replayed or skipped with a reason", async () => {
     const names = (await readdir(SCRIPTS)).filter((name) => name.endsWith(".jsonl")).map((name) => name.slice(0, -6));
-    expect([...REPLAYED, ...Object.keys(LATER), ...Object.keys(G3B)].sort()).toEqual(names.sort());
+    expect([...REPLAYED, ...Object.keys(G3B)].sort()).toEqual(names.sort());
   });
 
   test("every s7-min script is G3a's, and every script names one slice", async () => {
@@ -117,7 +113,7 @@ describe("S7a scripts", () => {
     const min: string[] = [];
     for (const name of names) if (coverage(name, await load(name)) === "s7-min") min.push(name);
     expect(min.filter((name) => Object.hasOwn(G3B, name))).toEqual([]);
-    expect(min.filter((name) => ![...REPLAYED, ...Object.keys(LATER)].includes(name))).toEqual([]);
+    expect(min.filter((name) => !REPLAYED.includes(name))).toEqual([]);
   });
 
   for (const name of REPLAYED) {

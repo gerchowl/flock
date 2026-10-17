@@ -13,7 +13,8 @@ import type { FixtureLine } from "../../src/gen/FixtureLine";
 import type { ServerFrame } from "../../src/gen/ServerFrame";
 import type { WireEvent } from "../../src/gen/WireEvent";
 import { WireConnection, type Refusal, type StreamName } from "../../src/wire/connection";
-import type { Clock, SocketLike, TimerHandle } from "../../src/wire/env";
+import { memoryStore, type Clock, type SocketLike, type TimerHandle } from "../../src/wire/env";
+import { OUTBOX_KEY } from "../../src/wire/outbox";
 
 /**
  * S7a's stage ceilings (its README), kept apart from the connection's own
@@ -188,6 +189,7 @@ function canonical(value: unknown): unknown {
 export class Harness {
   clock = new VirtualClock();
   net = new FakeNetwork(this.clock);
+  store = memoryStore();
   conn: WireConnection | null = null;
   readonly seen = new Map<string, Seen[]>();
   readonly #random: () => number;
@@ -270,7 +272,10 @@ export class Harness {
     if (step.idempotency_window_ms != null) fail("window expiry is G3b's (#1595)");
     this.clock = new VirtualClock(step.now_ms ?? 0);
     this.net = new FakeNetwork(this.clock);
-    if (step.outbox.length > 0) fail("the outbox is #1747's third slice");
+    if (step.outbox.length > 0) {
+      const principal = step.outbox[0]?.principal ?? null;
+      this.store.setItem(OUTBOX_KEY, JSON.stringify({ principal, commands: step.outbox }));
+    }
     this.conn = new WireConnection({
       url: "ws://fixture.invalid/v1/ws",
       token: FIXTURE_TOKEN,
@@ -278,6 +283,7 @@ export class Harness {
       clock: this.clock,
       sockets: this.net.factory,
       random: this.#random,
+      store: this.store,
       cursors: step.cursors,
     });
     this.conn.onTransition((state) => this.#transitions.push(state));
@@ -312,7 +318,8 @@ export class Harness {
       case "unsubscribe":
         return conn.unsubscribe(action.sub_id);
       case "command":
-        return fail("the outbox is #1747's third slice");
+        conn.command(action.verb, action.args, action.cmd_id);
+        return;
     }
   }
 
@@ -379,8 +386,12 @@ export class Harness {
         fail(`stream ${id} is ${got.state}@${got.cursor}, expected ${want.state}@${want.cursor}`);
       }
     }
-    if (Object.keys(step.outbox ?? {}).length > 0 || (step.absent_outbox ?? []).length > 0) fail("the outbox is #1747's third slice");
+    const outbox = new Map(conn.commands().map((entry) => [entry.cmd_id, entry.status]));
+    for (const [id, want] of Object.entries(step.outbox ?? {})) {
+      if (outbox.get(id) !== want) fail(`command ${id} is ${outbox.get(id) ?? "absent"}, expected ${want}`);
+    }
     for (const id of step.absent_streams ?? []) if (streams.has(id)) fail(`stream ${id} should be absent`);
+    for (const id of step.absent_outbox ?? []) if (outbox.has(id)) fail(`command ${id} should be absent`);
     if (step.connection_transitions != null && !deepEqual(transitions, step.connection_transitions)) {
       fail(`transitions ${JSON.stringify(transitions)}, expected ${JSON.stringify(step.connection_transitions)}`);
     }
@@ -398,8 +409,10 @@ export class Harness {
         const origin = this.#origins.get(`sub:${stage.sub_id}`) ?? fail(`no sub ${stage.sub_id} was sent`);
         return this.#untilEffect(origin + CEILINGS.progress, `progress deadline of ${stage.sub_id}`);
       }
-      case "command_ack":
-        return fail("the outbox is #1747's third slice");
+      case "command_ack": {
+        const origin = this.#origins.get(`cmd:${stage.cmd_id}`) ?? fail(`no cmd ${stage.cmd_id} was sent`);
+        return this.#untilEffect(origin + CEILINGS.ack, `ack deadline of ${stage.cmd_id}`);
+      }
     }
   }
 
