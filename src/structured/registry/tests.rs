@@ -271,42 +271,97 @@ fn opaque_prefix_and_known_extra_fields_survive_save_in_original_order() {
 }
 
 #[test]
-fn removal_compacts_slots_and_drops_future_conflicts_only() {
+fn removal_compacts_slots_and_drops_only_matching_retained_identities() {
     let first = record("agent_fixture_a");
     let second = record("agent_fixture_b");
-    for field in ["agent_id", "name", "session_id"] {
-        let mut future = serde_json::to_value(record("agent_fixture_c")).unwrap();
-        future["runtime"] = "future-runtime".into();
-        future[field] = serde_json::to_value(&first).unwrap()[field].clone();
-        let opaque = serde_json::json!({"runtime":"future-runtime","opaque":[1,2]});
-        let mut registry: Registry =
-            serde_json::from_value(serde_json::json!([opaque, first, future, second])).unwrap();
-        let generation = registry.get(&first.agent_id).unwrap().2;
-        registry.remove(&first.agent_id, generation).unwrap();
-        assert_eq!(registry.preserved.len(), 2);
-        assert_eq!(
-            serde_json::to_value(&registry).unwrap(),
-            serde_json::json!([opaque, second])
-        );
-        // Compaction must update the surviving entry's slot before later removal.
-        let generation = registry.get(&second.agent_id).unwrap().2;
-        registry.remove(&second.agent_id, generation).unwrap();
-        assert_eq!(registry.preserved.len(), 1);
-        let saved = serde_json::to_vec(&registry).unwrap();
-        let restored: Registry = serde_json::from_slice(&saved).unwrap();
-        assert!(restored.records().is_empty());
-        assert_eq!(
-            serde_json::to_value(restored).unwrap(),
-            serde_json::json!([opaque])
-        );
-        for _ in 0..100 {
-            let generation = registry.register(first.clone()).unwrap();
+    for runtime in ["structured", "future-runtime"] {
+        for field in ["agent_id", "name", "session_id"] {
+            let mut retained = serde_json::to_value(record("agent_fixture_c")).unwrap();
+            retained["runtime"] = runtime.into();
+            retained[field] = serde_json::to_value(&first).unwrap()[field].clone();
+            let opaque = serde_json::json!({"runtime":"future-runtime","opaque":[1,2]});
+            let mut registry: Registry =
+                serde_json::from_value(serde_json::json!([opaque, first, retained, second]))
+                    .unwrap();
+            let generation = registry.get(&first.agent_id).unwrap().2;
             registry.remove(&first.agent_id, generation).unwrap();
+            let distinct_future = runtime == "future-runtime" && field == "name";
+            let expected = if distinct_future {
+                serde_json::json!([opaque, retained, second])
+            } else {
+                serde_json::json!([opaque, second])
+            };
+            assert_eq!(serde_json::to_value(&registry).unwrap(), expected);
+            assert_eq!(registry.preserved.len(), expected.as_array().unwrap().len());
+            // Compaction must update the surviving entry's slot before later removal.
+            let generation = registry.get(&second.agent_id).unwrap().2;
+            registry.remove(&second.agent_id, generation).unwrap();
+            let expected = if distinct_future {
+                serde_json::json!([opaque, retained])
+            } else {
+                serde_json::json!([opaque])
+            };
+            let saved = serde_json::to_vec(&registry).unwrap();
+            let restored: Registry = serde_json::from_slice(&saved).unwrap();
+            assert!(restored.records().is_empty());
+            assert_eq!(serde_json::to_value(restored).unwrap(), expected);
+            for _ in 0..100 {
+                let mut fresh = first.clone();
+                fresh.name = Some("unrelated-name".into());
+                let generation = registry.register(fresh.clone()).unwrap();
+                registry.remove(&fresh.agent_id, generation).unwrap();
+            }
+            assert_eq!(
+                registry.preserved.len(),
+                expected.as_array().unwrap().len(),
+                "churn does not accumulate slots"
+            );
         }
-        assert_eq!(
-            registry.preserved.len(),
-            1,
-            "churn does not accumulate slots"
-        );
     }
+}
+
+#[test]
+fn retained_names_refuse_new_admission_without_changing_raw_data() {
+    for runtime in ["structured", "future-runtime"] {
+        let mut retained = serde_json::to_value(record("agent_fixture_c")).unwrap();
+        retained["runtime"] = runtime.into();
+        retained["harness"] = "future-harness".into();
+        let raw = serde_json::json!([retained]);
+        let mut registry: Registry = serde_json::from_value(raw.clone()).unwrap();
+        assert!(registry.records().is_empty());
+        let mut fresh = record("agent_fixture_d");
+        fresh.name = Some("name-agent_fixture_c".into());
+        assert!(matches!(
+            registry.register(fresh),
+            Err(RegistryError::Conflict)
+        ));
+        assert_eq!(serde_json::to_value(&registry).unwrap(), raw);
+    }
+}
+
+#[test]
+fn fresh_launch_resets_observations_and_fences_the_previous_generation() {
+    let id = "agent_fixture_a";
+    let mut registry = Registry::default();
+    let old = registry.register(record(id)).unwrap();
+    let now = Instant::now();
+    send(&mut registry, id, old, &fixture("control_request"), now);
+    let raw = serde_json::to_value(&registry).unwrap();
+    let current = registry.begin_launch(id, old).unwrap();
+    assert_ne!(current, old);
+    let (saved, view, generation) = registry.get(id).unwrap();
+    assert_eq!(generation, current);
+    assert_eq!(saved, &record(id));
+    assert!(view.update.needs_human.is_empty());
+    assert_eq!(view.update.state.lifecycle, Lifecycle::Offline);
+    assert!(view.update.observe_at.is_none());
+    assert_eq!(serde_json::to_value(&registry).unwrap(), raw);
+    assert!(matches!(
+        registry.apply(id, old, Input::Observe, now, 1000, Duration::from_secs(1)),
+        Err(RegistryError::StaleGeneration)
+    ));
+    assert!(matches!(
+        registry.begin_launch(id, old),
+        Err(RegistryError::StaleGeneration)
+    ));
 }
