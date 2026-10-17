@@ -132,9 +132,19 @@ if mode.startswith("init-socket"):
     else:
         init["messaging_socket_path"] = 42 if mode.endswith("wrong-type") else None
 emit(init)
-if mode in ("state-reducer", "worker-exit", "worker-exit-ok"):
+if mode in ("state-reducer", "worker-exit", "worker-exit-ok", "worker-stubborn"):
+    if mode == "worker-stubborn":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        descendant = os.fork()
+        if descendant == 0:
+            os.setsid()
+            parent_gone()
+            os._exit(0)
+        (root / "grandchild.pid").write_text(str(descendant))
     for event in (root / "state-events.jsonl").read_text().splitlines():
         emit(json.loads(event))
+    if mode == "worker-stubborn":
+        parent_gone()
     if mode.startswith("worker-exit"):
         sys.exit(0 if mode == "worker-exit-ok" else 7)
     sys.stdin.read()

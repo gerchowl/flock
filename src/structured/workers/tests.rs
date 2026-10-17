@@ -121,6 +121,34 @@ impl Case {
             factory,
         )
     }
+    pub(crate) fn assert_shutdown(&self, registry: &Registry, workers: &Workers) {
+        assert!(workers.entries[&self.id].thread.is_none(), "worker joined");
+        assert!(
+            !workers
+                .report(&self.id, self.generation)
+                .unwrap()
+                .authority_retained
+        );
+        assert!(!self.leases.is_reserved(&self.session).unwrap());
+        let view = &registry.get(&self.id).unwrap().1;
+        assert_eq!(view.update.state.lifecycle, Lifecycle::Offline);
+        assert!(view.update.needs_human.is_empty());
+        let stream = fs::read_to_string(
+            self.fixture
+                .root
+                .path()
+                .join("sessions")
+                .join(&self.id)
+                .join(format!("{}.jsonl", self.session)),
+        )
+        .unwrap();
+        let closed = stream.lines().any(|line| {
+            let envelope: Value = serde_json::from_str(line).unwrap();
+            let raw: Value = serde_json::from_str(envelope["raw"].as_str().unwrap()).unwrap();
+            raw["type"] == "flk_permission_request" && raw["state"] == "closed"
+        });
+        assert!(closed, "permission close survives runtime shutdown on disk");
+    }
     pub fn submit(&self, workers: &Workers) {
         workers.runtime(&self.id, self.generation).unwrap().try_submit(&json!({"type":"user","message":{"role":"user","content":"fixture turn"},"parent_tool_use_id":null,"session_id":""})).unwrap();
     }
@@ -179,6 +207,7 @@ impl Case {
             workers.report(&self.id, self.generation).is_some()
         })
         .await;
+        assert!(workers.entries[&self.id].thread.is_none());
         let report = workers.report(&self.id, self.generation).unwrap();
         assert!(!report.authority_retained, "{report:?}");
         if let Some(expected) = expected {
@@ -561,15 +590,20 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
             generation: a.generation,
             messages,
             runtime: None,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop: StopRequest::default(),
             report: None,
             finished: false,
             events_closed: false,
             stall_after: STALL,
-            _thread: std::thread::spawn(|| {}),
+            thread: Some(std::thread::spawn(|| {})),
         },
     );
-    assert!(workers.poll(&mut registry, now, 1000));
+    wait(&notify, || {
+        workers.poll(&mut registry, now, 1000);
+        workers.report(&a.id, a.generation).is_some()
+    })
+    .await;
+    assert!(workers.entries[&a.id].thread.is_none());
     let report = workers.report(&a.id, a.generation).unwrap();
     assert!(report.authority_retained);
     assert!(report.result.is_err());
@@ -582,7 +616,10 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
         Err(ErrorCode::SessionBusy)
     );
     assert_eq!(workers.next_deadline(&registry), None);
-    let _ = notify;
+    let error = workers.shutdown(&mut registry).unwrap_err();
+    assert!(error
+        .0
+        .contains(&(a.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
 }
 
 #[tokio::test]
@@ -616,4 +653,107 @@ async fn terminal_completion_cannot_overtake_the_queued_success_result() {
         Some(Outcome::Exited),
     )
     .await;
+}
+
+#[tokio::test]
+async fn shutdown_deadline_kills_the_owned_child_and_joins_before_reporting() {
+    use std::os::unix::process::ExitStatusExt;
+    let (mut registry, mut workers, notify, now) = owner();
+    let a = Case::start(
+        &mut registry,
+        &mut workers,
+        31,
+        "worker-stubborn",
+        vec![event("control_request")],
+    );
+    a.human(&mut registry, &mut workers, &notify, now).await;
+    let pid: u32 = fs::read_to_string(a.fixture.root.path().join("model.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let identity = super::super::supervision::ProcessIdentity::capture(pid).unwrap();
+    let descendant: u32 = fs::read_to_string(a.fixture.root.path().join("grandchild.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let descendant = super::super::supervision::ProcessIdentity::capture(descendant).unwrap();
+    let error = workers
+        .shutdown_until(&mut registry, Duration::ZERO, LIMIT)
+        .unwrap_err();
+    assert!(error
+        .0
+        .contains(&(a.id.clone(), ErrorCode::StructuredWorkerTimeout)));
+    assert!(
+        !identity.alive(),
+        "deadline must not leave the harness alive"
+    );
+    a.assert_shutdown(&registry, &workers);
+    assert!(!descendant.alive(), "detached descendant must also be gone");
+    assert!(!a.leases.is_reserved(&a.session).unwrap());
+    let exit = workers
+        .report(&a.id, a.generation)
+        .unwrap()
+        .result
+        .as_ref()
+        .unwrap();
+    assert_eq!(exit.status.unwrap().signal(), Some(9));
+    assert_eq!(
+        registry.get(&a.id).unwrap().1.update.state.lifecycle,
+        Lifecycle::Offline
+    );
+    assert!(registry.get(&a.id).unwrap().1.update.needs_human.is_empty());
+}
+
+#[tokio::test]
+async fn fake_harness_preparation_panic_has_a_distinct_typed_failure_and_is_joined() {
+    let (mut registry, mut workers, notify, now) = owner();
+    let (mut a, launch, factory) = Case::prepare(&mut registry, 32, "state-reducer", vec![]);
+    a.generation = workers
+        .start(&mut registry, launch, move |record| {
+            let profile = factory(record)?;
+            let mut harness =
+                crate::process::TracedCommand::new(profile.binary(), "fixture-worker-panic");
+            harness.arg("--version").env_clear();
+            profile.configure_environment(|key, value| {
+                if key != "CLAUDE_CODE_OAUTH_TOKEN" {
+                    harness.env(key, value);
+                }
+            });
+            let output = harness.output_traced_with_timeout(LIMIT).unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // Inject failure in the existing factory seam after the fake harness ran.
+            panic!("fake harness adapter panicked");
+        })
+        .unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, now, 1000);
+        workers.report(&a.id, a.generation).is_some()
+    })
+    .await;
+    assert_eq!(
+        workers
+            .report(&a.id, a.generation)
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap_err()
+            .0,
+        ErrorCode::StructuredWorkerPanicked
+    );
+    assert!(workers.entries[&a.id].thread.is_none());
+    assert!(!a.leases.is_reserved(&a.session).unwrap());
+    let pid: u32 = fs::read_to_string(a.fixture.root.path().join("version.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(crate::platform::process_start_time(pid).is_none());
+    assert!(!a.fixture.root.path().join("model.pid").exists());
+    assert_eq!(
+        registry.get(&a.id).unwrap().1.update.state.lifecycle,
+        Lifecycle::Offline
+    );
 }

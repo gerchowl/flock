@@ -1695,6 +1695,10 @@ impl App {
 
         self.input_writes
             .retire_all(crate::pty::write_receipt::WriteFailure::PaneGone);
+        self.structured_workers
+            .shutdown(&mut self.state.structured_agents)
+            .map_err(io::Error::other)?;
+
         // Save session on exit (skip in --no-session mode)
         if !self.no_session {
             self.save_session_now();

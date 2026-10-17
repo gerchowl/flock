@@ -140,10 +140,31 @@ pub fn run(
 pub(crate) fn run_notified(
     state: &Path,
     profile: LaunchProfile,
+    lease: super::lease::Lease,
+    location: StreamLocation,
+    ready: impl FnOnce(Runtime),
+    notify: impl Fn() + Send + 'static,
+) -> Result<Exit, LaunchError> {
+    run_controlled(
+        state,
+        profile,
+        lease,
+        location,
+        ready,
+        notify,
+        StopRequest::default(),
+    )
+}
+
+/// Worker-owned cancellation exists before spawn, including deadline escalation.
+pub(crate) fn run_controlled(
+    state: &Path,
+    profile: LaunchProfile,
     mut lease: super::lease::Lease,
     location: StreamLocation,
     ready: impl FnOnce(Runtime),
     notify: impl Fn() + Send + 'static,
+    stop: StopRequest,
 ) -> Result<Exit, LaunchError> {
     if !lease.matches(&location.agent, &location.session)
         || profile.session_id() != location.session
@@ -192,6 +213,9 @@ pub(crate) fn run_notified(
     let config = profile.config_dir().to_owned();
     let files = profile.into_session_files();
     let pid = child.id();
+    if let Ok(identity) = supervision::ProcessIdentity::capture(pid) {
+        stop.track(&[identity]);
+    }
     if let Err(error) = lease.bind(pid) {
         return Err(startup_failed(
             child, files, config, error, true, &mut lease,
@@ -229,7 +253,6 @@ pub(crate) fn run_notified(
     };
     let control = transport.stop_handle();
     let input = transport.input_handle();
-    let stop = StopRequest::default();
     let (events_tx, events) = mpsc::sync_channel(4);
     let (io_tx, io_rx) = mpsc::sync_channel(1);
     let (pump_stop, pump_control) = (stop.clone(), control.clone());

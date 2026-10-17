@@ -5,7 +5,9 @@
 //! Only `Received::state_input` adapts stream records, including book closes.
 //! Polling drains four records per agent and rearms the shared wake when full.
 //! Exact S4 deadlines share the app scheduler; silence never kills a process.
-//! Drop requests cancellation without joining. Unconfirmed cleanup retains lease
+//! Shutdown and pre-handoff stop, drain and join workers with bounded deadlines.
+//! Handoff stops sessions; explicit resume uses the stored session id.
+//! Unconfirmed cleanup retains lease
 //! authority and Unknown lifecycle, requiring explicit recovery rather than restart.
 #![deny(missing_docs)]
 use super::{
@@ -14,6 +16,7 @@ use super::{
     registry::{Record, Registry},
     runtime::{self, Exit, Runtime},
     state::Input,
+    supervision::StopRequest,
     transport::StreamLocation,
 };
 use crate::api::{agent_state::Lifecycle, error_code::ErrorCode};
@@ -21,10 +24,7 @@ use std::{
     collections::BTreeMap,
     io,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
-    },
+    sync::{mpsc, Arc},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -62,16 +62,32 @@ struct Worker {
     generation: u64,
     messages: mpsc::Receiver<Message>,
     runtime: Option<Runtime>,
-    stop: Arc<AtomicBool>,
+    stop: StopRequest,
     report: Option<Report>,
     finished: bool,
     events_closed: bool,
     stall_after: Duration,
-    _thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
 }
 impl Worker {
+    fn join_finished(&mut self) {
+        if self.thread.as_ref().is_some_and(JoinHandle::is_finished)
+            && self
+                .thread
+                .take()
+                .is_some_and(|thread| thread.join().is_err())
+        {
+            self.report = Some(Report {
+                result: Err((
+                    ErrorCode::StructuredWorkerPanicked,
+                    "structured worker panicked".into(),
+                )),
+                authority_retained: true,
+            });
+        }
+    }
     fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.request();
         if let Some(runtime) = &self.runtime {
             runtime.stop();
         }
@@ -89,17 +105,24 @@ impl Worker {
             .is_ok()
     }
 }
-/// Runtime ownership outside pure AppState; no pipe, disk or join waits here.
+/// Runtime ownership outside pure AppState. Polling never waits for a join.
+/// Explicit shutdown is bounded and must run before handoff or server exit.
 /// Completed reports are bounded to the latest launch per agent. Removed records
 /// discard confirmed completions, while uncertain ownership remains recoverable.
 pub struct Workers {
     entries: BTreeMap<String, Worker>,
     notify: Arc<Notify>,
+    // Coalesced wake for teardown while the async server loop is quiescent.
+    wake: mpsc::SyncSender<()>,
+    wakes: mpsc::Receiver<()>,
 }
 impl Workers {
     /// Share the app's event wake, including while no client is connected.
     pub fn new(notify: Arc<Notify>) -> Self {
+        let (wake, wakes) = mpsc::sync_channel(1);
         Self {
+            wake,
+            wakes,
             entries: BTreeMap::new(),
             notify,
         }
@@ -122,12 +145,17 @@ impl Workers {
             stall_after,
             lineage,
         } = launch;
-        if self
-            .entries
-            .get(&agent_id)
-            .is_some_and(|w| !w.finished || w.report.as_ref().is_some_and(|r| r.authority_retained))
-        {
-            return Err(ErrorCode::SessionBusy);
+        if let Some(previous) = self.entries.get_mut(&agent_id) {
+            previous.join_finished();
+            if !previous.finished
+                || previous.thread.is_some()
+                || previous
+                    .report
+                    .as_ref()
+                    .is_some_and(|r| r.authority_retained)
+            {
+                return Err(ErrorCode::SessionBusy);
+            }
         }
         let record = registry
             .get(&agent_id)
@@ -138,9 +166,10 @@ impl Workers {
             .begin_launch(&agent_id, current)
             .map_err(|_| ErrorCode::AgentStartFailed)?;
         let (tx, messages) = mpsc::sync_channel(2);
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = StopRequest::default();
         let cancelled = stop.clone();
         let notify = self.notify.clone();
+        let wake = self.wake.clone();
         let thread = std::thread::Builder::new()
             .name("structured-launch".into())
             .spawn(move || {
@@ -153,7 +182,7 @@ impl Workers {
                         )
                         .map_err(|code| (code, code.as_str().to_owned()))?;
                     let prepare = || -> Result<_, LaunchError> {
-                        if cancelled.load(Ordering::Acquire) {
+                        if cancelled.requested() {
                             return Err(io::Error::new(
                                 io::ErrorKind::Interrupted,
                                 "structured launch stopped",
@@ -162,7 +191,7 @@ impl Workers {
                         }
                         let profile =
                             prepare(&record)?.for_agent(&record.cwd, record.model.as_deref())?;
-                        if cancelled.load(Ordering::Acquire) {
+                        if cancelled.requested() {
                             return Err(io::Error::new(
                                 io::ErrorKind::Interrupted,
                                 "structured launch stopped",
@@ -177,26 +206,32 @@ impl Workers {
                         agent: record.agent_id.clone(),
                         session: record.session_id.clone(),
                     };
-                    let wake = notify.clone();
-                    runtime::run_notified(
+                    let event_notify = notify.clone();
+                    let event_wake = wake.clone();
+                    runtime::run_controlled(
                         &state,
                         profile,
                         lease,
                         location,
                         |runtime| {
-                            if cancelled.load(Ordering::Acquire) {
+                            if cancelled.requested() {
                                 runtime.stop();
                             }
                             let _ = tx.try_send(Message::Ready(runtime));
                             notify.notify_one();
+                            let _ = wake.try_send(());
                         },
-                        move || wake.notify_one(),
+                        move || {
+                            event_notify.notify_one();
+                            let _ = event_wake.try_send(());
+                        },
+                        cancelled.clone(),
                     )
                     .map_err(|error| (error.code(), error.to_string()))
                 }))
                 .unwrap_or_else(|_| {
                     Err((
-                        ErrorCode::AgentStartFailed,
+                        ErrorCode::StructuredWorkerPanicked,
                         "structured launch worker panicked".into(),
                     ))
                 });
@@ -206,6 +241,7 @@ impl Workers {
                     authority_retained,
                 }));
                 notify.notify_one();
+                let _ = wake.try_send(());
             })
             .map_err(|_| ErrorCode::AgentStartFailed)?;
         self.entries.insert(
@@ -219,7 +255,7 @@ impl Workers {
                 finished: false,
                 events_closed: false,
                 stall_after,
-                _thread: thread,
+                thread: Some(thread),
             },
         );
         Ok(generation)
@@ -266,7 +302,7 @@ impl Workers {
                 }
                 match worker.messages.try_recv() {
                     Ok(Message::Ready(runtime)) => {
-                        if worker.stop.load(Ordering::Acquire) {
+                        if worker.stop.requested() {
                             runtime.stop();
                         }
                         worker.runtime = Some(runtime);
@@ -329,9 +365,9 @@ impl Workers {
                 .filter(|_| worker.events_closed || worker.runtime.is_none())
             {
                 if !report.authority_retained {
-                    worker.reduce(registry, id, Input::ProcessExited, now, unix_ms);
+                    changed |= worker.reduce(registry, id, Input::ProcessExited, now, unix_ms);
                 }
-                worker.reduce(
+                changed |= worker.reduce(
                     registry,
                     id,
                     Input::Lifecycle(if report.authority_retained {
@@ -342,6 +378,11 @@ impl Workers {
                     now,
                     unix_ms,
                 );
+                worker.join_finished();
+                if worker.thread.is_some() {
+                    self.notify.notify_one();
+                    continue;
+                }
                 worker.finished = true;
                 worker.runtime = None;
                 changed = true;
@@ -349,7 +390,9 @@ impl Workers {
         }
         // Removed records need no completed handle; uncertain ownership must survive.
         self.entries.retain(|id, worker| {
-            !worker.finished
+            worker.join_finished();
+            worker.thread.is_some()
+                || !worker.finished
                 || registry.get(id).is_some()
                 || worker
                     .report
@@ -357,6 +400,78 @@ impl Workers {
                     .is_some_and(|report| report.authority_retained)
         });
         changed
+    }
+    /// Stop all sessions before shutdown or handoff. Drain durable book closes,
+    /// release confirmed leases, then join. Offline records resume only explicitly.
+    /// After the grace deadline kill confirmed child identities and allow a bounded
+    /// cleanup interval. Any diagnostic refuses handoff; uncertain owners stay fenced.
+    pub fn shutdown(&mut self, registry: &mut Registry) -> Result<(), ShutdownError> {
+        self.shutdown_until(registry, Duration::from_secs(10), Duration::from_secs(10))
+    }
+    fn shutdown_until(
+        &mut self,
+        registry: &mut Registry,
+        grace: Duration,
+        cleanup: Duration,
+    ) -> Result<(), ShutdownError> {
+        for worker in self.entries.values() {
+            worker.stop();
+        }
+        let mut deadline = Instant::now() + grace;
+        let mut failures = Vec::new();
+        let mut forced = false;
+        loop {
+            self.poll(
+                registry,
+                Instant::now(),
+                crate::app::notifications::now_ms(),
+            );
+            if self
+                .entries
+                .values()
+                .all(|w| w.thread.is_none() && w.finished)
+            {
+                for (id, worker) in &self.entries {
+                    if worker.report.as_ref().is_some_and(|r| r.authority_retained) {
+                        worker.stop.kill();
+                        failures.push((id.clone(), ErrorCode::StructuredWorkerCleanupFailed));
+                    }
+                }
+                return if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(ShutdownError(failures))
+                };
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                if forced {
+                    return Err(ShutdownError(failures));
+                }
+                for (id, worker) in &self.entries {
+                    if worker.thread.is_some() || !worker.finished {
+                        failures.push((id.clone(), ErrorCode::StructuredWorkerTimeout));
+                        worker.stop.kill();
+                    }
+                }
+                forced = true;
+                deadline = now + cleanup;
+                continue;
+            }
+            // End is sent just before the thread returns. Never block joining a
+            // running thread, even in that final publication/return interval.
+            if self
+                .entries
+                .values()
+                .any(|w| w.report.is_some() && w.thread.is_some())
+            {
+                std::thread::yield_now();
+            } else {
+                let _ = self
+                    .wakes
+                    .recv_timeout(deadline.saturating_duration_since(now));
+            }
+        }
     }
     /// Earliest exact S4 observation boundary for current unfinished launches.
     pub fn next_deadline(&self, registry: &Registry) -> Option<Instant> {
@@ -372,10 +487,23 @@ impl Workers {
             .min()
     }
 }
+/// Typed shutdown failures, paired with the affected stable agent identity.
+#[derive(Debug)]
+pub struct ShutdownError(pub Vec<(String, ErrorCode)>);
+impl std::fmt::Display for ShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("structured worker shutdown failed")?;
+        for (id, code) in &self.0 {
+            write!(f, "; {id}: {code}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for ShutdownError {}
 impl Drop for Workers {
     fn drop(&mut self) {
-        for worker in self.entries.values() {
-            worker.stop();
+        if let Err(error) = self.shutdown(&mut Registry::default()) {
+            crate::logging::structured_worker_shutdown_failed(&error);
         }
     }
 }

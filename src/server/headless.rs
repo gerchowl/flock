@@ -985,6 +985,8 @@ impl HeadlessServer {
             }
         }
 
+        self.stop_structured_before_handoff()?;
+
         // Save session on exit.
         if !self.app.no_session {
             self.app.save_session_now();
@@ -1155,6 +1157,15 @@ impl HeadlessServer {
         }
     }
 
+    /// S3a-3 deliberately stops structured sessions before transferring ownership.
+    /// Full single-writer session handoff belongs to S7-rest.
+    fn stop_structured_before_handoff(&mut self) -> io::Result<()> {
+        self.app
+            .structured_workers
+            .shutdown(&mut self.app.state.structured_agents)
+            .map_err(io::Error::other)
+    }
+
     #[cfg(unix)]
     fn perform_live_handoff(
         &mut self,
@@ -1180,6 +1191,7 @@ impl HeadlessServer {
             );
             return Err(HandoffError::SessionBroken);
         }
+        self.stop_structured_before_handoff()?;
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
@@ -4027,6 +4039,7 @@ impl HeadlessServer {
     fn complete_shutdown(&mut self) -> io::Result<()> {
         info!("completing server shutdown");
         self.app.settle_injections_for_exit();
+        let structured = self.stop_structured_before_handoff();
 
         // Send ServerShutdown to all remaining clients.
         if !self.clients.is_empty() {
@@ -4050,7 +4063,7 @@ impl HeadlessServer {
         // Remove socket files.
         self.cleanup_sockets()?;
 
-        Ok(())
+        structured
     }
 
     /// Removes socket files created by the server.
@@ -4732,6 +4745,76 @@ mod tests {
             server.app.session_health.probe_in_flight(),
             "the headless loop must drive the session probe"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_and_joins_all_structured_workers() {
+        assert_structured_workers_stopped(false).await;
+    }
+
+    #[tokio::test]
+    async fn pre_handoff_stops_and_joins_all_structured_workers() {
+        assert_structured_workers_stopped(true).await;
+    }
+
+    async fn assert_structured_workers_stopped(handoff: bool) {
+        use crate::api::agent_state::Lifecycle;
+        use crate::structured::{
+            supervision::ProcessIdentity,
+            workers::tests::{event, Case},
+        };
+        let mut server = test_headless_server();
+        let notify = server.app.render_notify.clone();
+        let now = Instant::now();
+        let mut cases = Vec::new();
+        let mut children = Vec::new();
+        for n in [33, 34] {
+            let case = Case::start(
+                &mut server.app.state.structured_agents,
+                &mut server.app.structured_workers,
+                n,
+                "state-reducer",
+                vec![event("control_request")],
+            );
+            case.human(
+                &mut server.app.state.structured_agents,
+                &mut server.app.structured_workers,
+                &notify,
+                now,
+            )
+            .await;
+            let pid = std::fs::read_to_string(case.fixture.root.path().join("model.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            children.push(ProcessIdentity::capture(pid).unwrap());
+            cases.push(case);
+        }
+        if handoff {
+            server.stop_structured_before_handoff().unwrap();
+        } else {
+            server.complete_shutdown().unwrap();
+        }
+        assert!(children.into_iter().all(|child| !child.alive()));
+        for case in cases {
+            case.assert_shutdown(
+                &server.app.state.structured_agents,
+                &server.app.structured_workers,
+            );
+            assert_eq!(
+                server
+                    .app
+                    .state
+                    .structured_agents
+                    .get(&case.id)
+                    .unwrap()
+                    .1
+                    .update
+                    .state
+                    .lifecycle,
+                Lifecycle::Offline
+            );
+        }
     }
 
     #[tokio::test]

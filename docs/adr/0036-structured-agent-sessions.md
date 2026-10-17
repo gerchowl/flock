@@ -458,13 +458,26 @@ observations are explicit host facts. Both TUI and headless schedulers service
 owner wakes and include S4's exact next observation boundary. No periodic
 structured-agent timer, kill-on-silence policy or EventHub emission is added.
 
-Stop latches cancellation and never joins on the app loop. A terminal report
+Ordinary stop latches cancellation without waiting; polling joins only finished threads. A terminal report
 becomes visible only after queued stream facts drain. Confirmed cleanup closes
 open requests and sets Offline; unconfirmed ownership instead retains authority
 and Unknown lifecycle, refuses restart, and requires explicit recovery. Reports
 retain actual exit status/outcome or typed preparation/worker failure; results
-remain turn facts rather than process-success evidence. Drop requests stop
-without waiting for an owning thread. The caller must mark session persistence
+remain turn facts rather than process-success evidence. Finished threads are joined
+before replacement or pruning. Shutdown and the pre-handoff step stop all workers,
+drain durable permission closes, release confirmed leases, and join before exit
+or ownership transfer. Handoff deliberately stops structured sessions in this
+slice (full single-writer transfer is S7-rest). Records remain Offline and resume
+only through an explicit start using their stored session id, never automatically.
+A shared 10-second graceful deadline is followed by identity-checked child-tree
+KILL and a bounded 10-second cleanup/join interval. Deadline overruns report
+`structured_worker_timeout`; unconfirmed cleanup reports
+`structured_worker_cleanup_failed` and refuses handoff. Unknown identities never
+grant permission to signal. An unjoined worker remains owned and fenced, and a
+later shutdown can finish joining it. Worker panics report the distinct
+`structured_worker_panicked` failure. These diagnostics require human inspection
+before retrying. Drop provides the same bounded stop/join fallback for error exits.
+The caller must mark session persistence
 dirty when durable metadata changes.
 #1843 owns the public `StructuredAgentInfo`, additive `structured_agents` list,
 get/status/stop routes and `runtime_unsupported` refusals. Existing PTY
