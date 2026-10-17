@@ -72,6 +72,8 @@ pub enum State {
     Cancelled,
     /// Policy or operator dropped it.
     Dropped,
+    /// Permanently refused by formation, with a registered refusal reason.
+    Failed,
     /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
     #[serde(untagged)]
     Unknown(Value),
@@ -171,7 +173,7 @@ deserialize_named_enum!(Kind {
 });
 deserialize_named_enum!(State {
     Queued => "queued", Held => "held", Stashed => "stashed", Delivered => "delivered",
-    Done => "done", Cancelled => "cancelled", Dropped => "dropped",
+    Done => "done", Cancelled => "cancelled", Dropped => "dropped", Failed => "failed",
 });
 deserialize_named_enum!(Priority { Normal => "normal", Urgent => "urgent" });
 deserialize_named_enum!(Delivery { AtIdle => "at_idle", Steer => "steer", Interrupt => "interrupt" });
@@ -218,6 +220,13 @@ pub enum Change {
         /// Final zero-based queue position.
         position: usize,
     },
+    /// Fail an unbounded existing item without rewriting its oversized payload.
+    Fail {
+        /// Existing identity whose position and body remain unchanged.
+        item_id: String,
+        /// Registered terminal refusal code.
+        reason: String,
+    },
     /// Remove retained state, leaving a durable removal for subscribers.
     Remove {
         /// Identity whose retained state is removed.
@@ -250,7 +259,7 @@ impl Change {
         match self {
             Self::Batch { items } => items.iter().any(Item::has_unknown),
             Self::Upsert { item, .. } => item.has_unknown(),
-            Self::Remove { .. } => false,
+            Self::Remove { .. } | Self::Fail { .. } => false,
         }
     }
 
@@ -273,6 +282,16 @@ impl Change {
             }
         }
         let id = match self {
+            Self::Fail { item_id, reason } => {
+                let item = items
+                    .iter_mut()
+                    .find(|item| &item.item_id == item_id)
+                    .ok_or_else(|| std::io::Error::other("failed item does not exist"))?;
+                item.state = State::Failed;
+                item.metadata
+                    .insert("refusal".into(), Value::String(reason.clone()));
+                return Ok(());
+            }
             Self::Batch {
                 items: replacements,
             } => {

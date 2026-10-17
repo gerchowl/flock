@@ -1,14 +1,17 @@
-//! Durable admission and pure batch formation (ADR-0036 §3/§4, #1878).
+//! Durable admission and bounded batch formation (ADR-0036 §3/§4, #1878).
 //!
 //! One blocking worker owns this value. Admission persists the authenticated
-//! producer and gate before acknowledging; formation has no runtime side effects.
+//! producer and gate before acknowledging; formation durably fails invalid or oversized heads.
 //! Runtime reservation/lifecycle belongs to the next S5b slice, server wiring to #1803.
 use super::model::{Delivery, Kind, Priority, Producer, State};
 use super::{Change, Item, Journal};
 use crate::api::error_code::ErrorCode;
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::io;
+
+type Entropy<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>;
 
 /// One persisted admission decision; no automatic re-gating exists.
 #[derive(Debug, Serialize)]
@@ -100,35 +103,28 @@ impl Admission {
             }
             _ => return Err(refuse(ErrorCode::OperatorOnly)),
         };
-        if !valid_id(&item.item_id)
-            || self
-                .journal
-                .items()
-                .iter()
-                .any(|i| i.item_id == item.item_id)
-            || [
-                "gate",
-                "batch_id",
-                "awaiting_result",
-                "refusal",
-                "stash",
-                "item_id",
-                "producer",
-                "kind",
-                "state",
-                "delivery",
-                "priority",
-                "body",
-                "attachments",
-            ]
-            .iter()
-            .any(|k| item.metadata.contains_key(*k))
+        self.journal.healthy()?;
+        if [
+            "admission_hash",
+            "gate",
+            "batch_id",
+            "awaiting_result",
+            "refusal",
+            "stash",
+            "item_id",
+            "producer",
+            "kind",
+            "state",
+            "delivery",
+            "priority",
+            "body",
+            "attachments",
+        ]
+        .iter()
+        .any(|k| item.metadata.contains_key(*k))
+            || (item.producer != Producer::Human && item.metadata.contains_key("edit_lease"))
             || (item.kind == Kind::Command
                 && (!item.body.starts_with('/') || !item.attachments.is_empty()))
-            || (item.kind == Kind::Reply
-                && metadata(&item, "anchor")["question_id"]
-                    .as_str()
-                    .is_none_or(str::is_empty))
             || (item.kind == Kind::Continuation
                 && metadata(&item, "anchor")["item_id"]
                     .as_str()
@@ -136,6 +132,7 @@ impl Admission {
         {
             return Err(refuse(ErrorCode::InvalidRequest));
         }
+        validate_content(&item)?;
         item.state = match &gate {
             Gate::Send => State::Queued,
             Gate::Hold => State::Held,
@@ -151,13 +148,32 @@ impl Admission {
         }
         item.metadata.insert(
             "gate".into(),
-            serde_json::to_value(gate).map_err(io::Error::from)?,
+            serde_json::to_value(gate).map_err(serialization)?,
         );
+        // Hash the normalized admitted request, before lifecycle edits. Retries
+        // compare durable identity without re-running a gate or spending a cursor.
+        let hash: String = Sha256::digest(serde_json::to_vec(&item).map_err(serialization)?)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if let Some(old) = self
+            .journal
+            .items()
+            .iter()
+            .find(|old| old.item_id == item.item_id)
+        {
+            return if metadata(old, "admission_hash") == &json!(hash) {
+                Ok(())
+            } else {
+                Err(refuse(ErrorCode::QueueItemConflict))
+            };
+        }
+        item.metadata.insert("admission_hash".into(), json!(hash));
         let probe = envelope(std::slice::from_ref(&item), &item.item_id)?;
         if !bounded(std::slice::from_ref(&item), &probe) {
             return Err(refuse(ErrorCode::InvalidRequest));
         }
-        self.journal.append(Change::Upsert {
+        self.commit(Change::Upsert {
             item: Box::new(item),
             position: self.journal.items().len(),
         })?;
@@ -183,81 +199,212 @@ impl Admission {
                             .is_none_or(|v| v == &Value::Bool(false))
                 }))
     }
-    /// Form one bounded FIFO candidate. Repeated calls have no storage effects.
+    /// Form one bounded FIFO candidate, durably failing invalid/oversized heads.
+    /// Other formation errors return without committing any queue changes.
     /// The runtime owner must reserve atomically and enforce S4/S6 before writing.
-    pub fn batch(&self, now_ms: u64) -> Result<Option<Batch>, Failure> {
+    pub fn batch(&mut self, now_ms: u64) -> Result<Option<Batch>, Failure> {
+        self.batch_with_entropy(now_ms, &mut getrandom::fill)
+    }
+    /// Form through the same worker path with caller-supplied entropy.
+    pub(super) fn batch_with_entropy(
+        &mut self,
+        now_ms: u64,
+        fill: Entropy<'_>,
+    ) -> Result<Option<Batch>, Failure> {
         self.journal.healthy()?;
-        let mut eligible = self
-            .journal
-            .items()
-            .iter()
-            .filter(|i| self.eligible(i, now_ms));
-        let Some(head) = eligible.next() else {
-            return Ok(None);
-        };
-        let mut items = vec![head.clone()];
-        if head.producer == Producer::Human && head.kind != Kind::Command {
-            items.extend(
-                eligible
-                    .take_while(|i| i.producer == Producer::Human && i.kind != Kind::Command)
-                    .take(self.max_batch - 1)
-                    .cloned(),
-            );
-        }
-        let (id, user) = loop {
-            let id = if items.len() == 1 {
-                items[0].item_id.clone()
-            } else {
-                batch_uuid()?
+        let mut failed: Vec<(String, ErrorCode)> = Vec::new();
+        let candidate = loop {
+            let mut eligible = self.journal.items().iter().filter(|i| {
+                self.eligible(i, now_ms) && !failed.iter().any(|(id, _)| id == &i.item_id)
+            });
+            let Some(head) = eligible.next() else {
+                break None;
             };
-            let user = envelope(&items, &id)?;
-            if bounded(&items, &user) {
-                break (id, user);
+            let mut items = vec![head.clone()];
+            if head.producer == Producer::Human && head.kind != Kind::Command {
+                items.extend(
+                    eligible
+                        .take_while(|i| i.producer == Producer::Human && i.kind != Kind::Command)
+                        .take(self.max_batch - 1)
+                        .cloned(),
+                );
             }
-            if items.len() == 1 {
-                return Err(refuse(ErrorCode::InvalidRequest));
+            let (id, user) = loop {
+                let id = if items.len() == 1 {
+                    items[0].item_id.clone()
+                } else {
+                    batch_uuid(fill)?
+                };
+                let refusal = match envelope_with_entropy(&items, &id, fill) {
+                    Ok(user) if bounded(&items, &user) => break (id, user),
+                    Ok(_) => ErrorCode::QueueItemTooLarge,
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            ErrorCode::InvalidRequest | ErrorCode::QueueItemTooLarge
+                        ) =>
+                    {
+                        error.code
+                    }
+                    Err(error) => return Err(error),
+                };
+                if items.len() == 1 {
+                    failed.push((items[0].item_id.clone(), refusal));
+                    break (id, Value::Null);
+                }
+                items.pop();
+            };
+            if !user.is_null() {
+                break Some(Batch {
+                    id,
+                    envelope: user,
+                    items,
+                });
             }
-            items.pop();
         };
-        Ok(Some(Batch {
-            id,
-            envelope: user,
-            items,
-        }))
+        // A transient formation error must not commit even earlier data refusals.
+        for (item_id, code) in failed {
+            self.commit(Change::Fail {
+                item_id,
+                reason: code.as_str().into(),
+            })?;
+        }
+        Ok(candidate)
     }
     /// Replace existing items together, retaining order; no success precedes sync.
     pub fn replace(&mut self, items: Vec<Item>) -> Result<(), Failure> {
+        for item in &items {
+            let old = self
+                .journal
+                .items()
+                .iter()
+                .find(|old| old.item_id == item.item_id)
+                .ok_or_else(|| refuse(ErrorCode::InvalidRequest))?;
+            if old.producer != item.producer
+                || old.kind != item.kind
+                || metadata(old, "admission_hash") != metadata(item, "admission_hash")
+                || item.has_unknown()
+                || item.delivery != Delivery::AtIdle
+                || item.priority != Priority::Normal
+                || (item.kind == Kind::Command
+                    && (!item.body.starts_with('/') || !item.attachments.is_empty()))
+                || (item.kind == Kind::Continuation
+                    && metadata(item, "anchor")["item_id"]
+                        .as_str()
+                        .is_none_or(|id| !valid_id(id)))
+                || (item.producer != Producer::Human && item.metadata.contains_key("edit_lease"))
+            {
+                return Err(refuse(ErrorCode::InvalidRequest));
+            }
+            validate_content(item)?;
+            let probe = envelope(std::slice::from_ref(item), &item.item_id)?;
+            if !bounded(std::slice::from_ref(item), &probe) {
+                return Err(refuse(ErrorCode::InvalidRequest));
+            }
+        }
         if !items.is_empty() {
-            self.journal.append(Change::Batch { items })?;
+            self.commit(Change::Batch { items })?;
         }
         Ok(())
     }
+    // Classify all deterministic failures before append. Only an actual append
+    // I/O failure (or an already poisoned journal) has uncertain durability.
+    fn commit(&mut self, change: Change) -> Result<(), Failure> {
+        self.journal.healthy()?;
+        let mut items = self.journal.items().to_vec();
+        change
+            .apply(&mut items)
+            .map_err(|_| refuse(ErrorCode::InvalidRequest))?;
+        let seq = self
+            .journal
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| refuse(ErrorCode::InternalError))?;
+        super::encode(&super::Record {
+            seq,
+            change: change.clone(),
+        })
+        .map_err(|_| refuse(ErrorCode::InvalidRequest))?;
+        self.journal.append(change)?;
+        Ok(())
+    }
 }
-fn render(item: &Item) -> Result<String, Failure> {
+// Intake and edits share the same validation. Rendering repeats it so legacy
+// or otherwise malformed durable items are failed instead of wedging a worker.
+fn validate_content(item: &Item) -> Result<(), Failure> {
+    if !valid_id(&item.item_id)
+        || (item.kind == Kind::Reply
+            && metadata(item, "anchor")["question_id"]
+                .as_str()
+                .is_none_or(|id| !canonical_uuid(id)))
+        || item.attachments.iter().any(|reference| {
+            !reference.strip_prefix("blob:").is_some_and(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+        })
+    {
+        return Err(refuse(ErrorCode::InvalidRequest));
+    }
+    Ok(())
+}
+fn header_json(value: &impl Serialize) -> Result<String, Failure> {
+    Ok(serde_json::to_string(value)
+        .map_err(serialization)?
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+        .replace('\u{85}', "\\u0085"))
+}
+fn render(item: &Item, fill: Entropy<'_>) -> Result<String, Failure> {
+    validate_content(item)?;
     if item.kind == Kind::Command {
         return Ok(item.body.clone());
     }
-    let producer = json!(item.producer);
     let reply = if item.kind == Kind::Reply {
         let question = metadata(item, "anchor")["question_id"]
             .as_str()
+            .filter(|id| canonical_uuid(id))
             .ok_or_else(|| refuse(ErrorCode::InvalidRequest))?;
-        format!("Answer to {question}:\n")
+        format!(" Answer to {question};")
     } else {
         String::new()
     };
+    let nonce = nonce(&item.body, fill)?;
     Ok(format!(
-        "From {producer}:\n{reply}{}\nAttachments (blob refs): {}",
-        item.body,
-        json!(item.attachments)
+        "From {} (item {}):{reply} Attachments (blob refs): {}\n<<<flk-item {nonce}\n{}\nflk-item {nonce}>>>",
+        header_json(&item.producer)?, item.item_id, header_json(&item.attachments)?, item.body
     ))
 }
-fn batch_uuid() -> io::Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let h: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+// The callback is the entropy source, kept local so collision/failure handling
+// can be exercised without changing process-global random state.
+fn nonce(
+    body: &str,
+    mut fill: impl FnMut(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> Result<String, Failure> {
+    loop {
+        let mut bytes = [0u8; 16];
+        fill(&mut bytes).map_err(|e| Failure {
+            code: ErrorCode::InternalError,
+            source: Some(io::Error::other(e)),
+        })?;
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        if !body.contains(&hex) {
+            return Ok(hex);
+        }
+    }
+}
+fn batch_uuid(fill: Entropy<'_>) -> Result<String, Failure> {
+    let mut h = nonce("", fill)?.into_bytes();
+    h[12] = b'4';
+    h[16] = match h[16] {
+        b'0'..=b'3' => b'8',
+        b'4'..=b'7' => b'9',
+        b'8'..=b'b' => b'a',
+        _ => b'b',
+    };
+    let h = String::from_utf8(h).map_err(|_| refuse(ErrorCode::InternalError))?;
     Ok(format!(
         "{}-{}-{}-{}-{}",
         &h[..8],
@@ -266,6 +413,15 @@ fn batch_uuid() -> io::Result<String> {
         &h[16..20],
         &h[20..]
     ))
+}
+fn serialization(error: serde_json::Error) -> Failure {
+    Failure {
+        code: ErrorCode::SerializationError,
+        source: Some(error.into()),
+    }
+}
+fn canonical_uuid(id: &str) -> bool {
+    valid_id(id) && !id.bytes().any(|b| b.is_ascii_uppercase())
 }
 
 fn metadata<'a>(item: &'a Item, key: &str) -> &'a Value {
@@ -282,9 +438,12 @@ fn valid_id(id: &str) -> bool {
         })
 }
 fn envelope(items: &[Item], id: &str) -> Result<Value, Failure> {
+    envelope_with_entropy(items, id, &mut getrandom::fill)
+}
+fn envelope_with_entropy(items: &[Item], id: &str, fill: Entropy<'_>) -> Result<Value, Failure> {
     let content = items
         .iter()
-        .map(|i| Ok(json!({"type":"text", "text":render(i)?})))
+        .map(|i| Ok(json!({"type":"text", "text":render(i, fill)?})))
         .collect::<Result<Vec<_>, Failure>>()?;
     Ok(json!({"type":"user", "uuid":id, "message":{"role":"user", "content":content}}))
 }
@@ -308,4 +467,26 @@ fn bounded(items: &[Item], user: &Value) -> bool {
     })
     .is_ok()
         && super::encode(user).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonce_regenerates_on_collision_and_entropy_failure_is_precise() {
+        let mut calls = 0;
+        let body = "00000000000000000000000000000000";
+        let chosen = nonce(body, |bytes| {
+            bytes.fill(calls);
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(chosen, "01010101010101010101010101010101");
+        let error = nonce("", |_| Err(getrandom::Error::UNSUPPORTED)).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InternalError);
+        assert!(error.source.is_some());
+    }
 }
