@@ -93,7 +93,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   /** A failed code while a session works on: a dismissible notice, never NeedsToken. */
   const [linkNotice, setLinkNotice] = createSignal<string | null>(null);
   const describe = (): string => {
-    if (exchanging() && connection.state === "Disconnected") return "Signing in…";
+    if (exchanging() && (connection.state === "Disconnected" || connection.state === "NeedsToken")) return "Signing in…";
     const ask = connection.state === "NeedsToken" ? (failed() ? EXCHANGE_FAILED : RUN_CLIENT_OPEN) : null;
     const parts = [connection.state, connection.error, ask].filter((part) => part !== null);
     return `${parts[0]}${parts.length > 1 ? ` · ${parts.slice(1).join(" ")}` : ""}`;
@@ -120,11 +120,14 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
    * (ADR-0038 §3). A new code replaces the stored token only on success; a
    * failure leaves the token and a working session as they are.
    */
+  let latest = 0;
   const signInWith = (code: string): void => {
+    // Only the latest code's result counts: a slower, older exchange is ignored.
+    const generation = ++latest;
     setExchanging(true);
     refresh();
     void exchangeCode(code, props.config.serverUrl, request).then((exchanged) => {
-      if (disposed) return;
+      if (disposed || generation !== latest) return;
       setExchanging(false);
       if (exchanged !== null) {
         tokens.set(exchanged);

@@ -72,6 +72,14 @@ export function createTokenStore(session: () => SessionLike | undefined): TokenS
   };
 }
 
+/** A well-formed one-time code: lowercase hex of 32 random bytes (slice 7b). */
+const CODE_SHAPE = /^[0-9a-f]{64}$/;
+
+/** Whether `code` has the one-time code's shape; anything else is refused without a request. */
+export function isCode(code: string): boolean {
+  return CODE_SHAPE.test(code);
+}
+
 /** The parts of `location` {@link takeCode} reads. */
 export type CodeLocation = { readonly hash: string; readonly pathname: string; readonly search: string };
 
@@ -79,23 +87,25 @@ export type CodeLocation = { readonly hash: string; readonly pathname: string; r
 export type CodeHistory = { readonly state: unknown; replaceState(state: unknown, unused: string, url: string): void };
 
 /**
- * The one-time code in the fragment, or null. When there is one, the
- * fragment loses its `code` parameter at once (`history.replaceState`, so
- * no history entry is added); the path, the query and the rest of the
- * fragment stay byte for byte.
+ * The one-time code in the fragment, or null. When there is one, every
+ * `code=` parameter leaves the fragment at once (`history.replaceState`,
+ * so no history entry is added); the path, the query and the rest of the
+ * fragment stay byte for byte. Of several codes, the first well-formed one
+ * ({@link isCode}) is returned, else the first one, which
+ * {@link exchangeCode} then refuses without a request.
  *
  * The fragment is parsed by hand, not with `URLSearchParams`, which would
  * decode `+` as a space and rewrite the rest (`#view` to `#view=`, `/` to
- * `%2F`). The code is the first `code=` parameter's value, verbatim, up to
- * the next `&` or the end.
+ * `%2F`). A code is a `code=` parameter's value, verbatim, up to the next
+ * `&` or the end.
  */
 export function takeCode(location: CodeLocation, history: CodeHistory): string | null {
   const parts = location.hash.replace(/^#/, "").split("&");
-  const at = parts.findIndex((part) => part.startsWith("code="));
-  if (at < 0) return null;
-  const code = (parts[at] ?? "").slice("code=".length);
-  const rest = parts.filter((_part, index) => index !== at).join("&");
+  const codes = parts.filter((part) => part.startsWith("code=")).map((part) => part.slice("code=".length));
+  if (codes.length === 0) return null;
+  const rest = parts.filter((part) => !part.startsWith("code=")).join("&");
   history.replaceState(history.state, "", `${location.pathname}${location.search}${rest === "" ? "" : `#${rest}`}`);
+  const code = codes.find(isCode) ?? codes[0] ?? "";
   return code === "" ? null : code;
 }
 
@@ -127,13 +137,15 @@ export function exchangeUrl(serverUrl: string): string {
 }
 
 /**
- * Trades `code` for a token, once: the token, or null for any failure.
+ * Trades `code` for a token, once: the token, or null for any failure. A
+ * code without the one-time code's shape fails without a request.
  * The request enforces the ADR's same-origin rule without reading the
  * page's location: `mode: "same-origin"` refuses another origin,
  * `redirect: "error"` refuses any redirect, only same-origin credentials go
  * out, and nothing is cached. Nothing about the reply or the error is kept.
  */
 export async function exchangeCode(code: string, serverUrl: string, request: ExchangeRequest): Promise<string | null> {
+  if (!isCode(code)) return null;
   try {
     const reply = await request(exchangeUrl(serverUrl), {
       method: "POST",

@@ -8,6 +8,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { render } from "solid-js/web";
 
 import { App } from "../src/App";
+import { readShellConfig, type ConfigResult } from "../src/config";
 import { captureCode } from "../src/capture-code";
 import { EXCHANGE_FAILED, RUN_CLIENT_OPEN, TOKEN_KEY, createTokenStore, takeCode, type ExchangeRequest, type SessionLike } from "../src/wire/token";
 import { Harness, WELCOME, sentFrames, step } from "./wire/harness";
@@ -21,6 +22,12 @@ afterEach(() => {
 });
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+/** Well-formed one-time codes: lowercase hex of 32 random bytes. */
+const CODE = "a".repeat(64);
+const PASTED = "b".repeat(64);
+const USED = "c".repeat(64);
+const FRESH = "d".repeat(64);
+const sentCode = (code: string): string => JSON.stringify({ code });
 const config = { ok: true, config: { transport: "wire", serverUrl: "https://flk.invalid" } } as const;
 
 /** A `sessionStorage` stand-in that records what is kept. */
@@ -76,13 +83,13 @@ function page(hash: string) {
   };
 }
 
-function mountApp(options: { code?: string | null; session?: () => SessionLike | undefined; request?: ExchangeRequest; page?: ReturnType<typeof page> }): { h: Harness; root: HTMLElement } {
+function mountApp(options: { code?: string | null; session?: () => SessionLike | undefined; request?: ExchangeRequest; page?: ReturnType<typeof page>; config?: ConfigResult }): { h: Harness; root: HTMLElement } {
   const h = new Harness();
   h.step(step({ step: "given", cursors: {}, outbox: [] }));
   const root = document.createElement("div");
   document.body.append(root);
   const env = { clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store, session: options.session ?? (() => undefined), request: options.request ?? exchange({ status: 500 }), page: options.page ?? page("") };
-  dispose = render(() => <App config={config} env={env} code={options.code ?? null} />, root);
+  dispose = render(() => <App config={options.config ?? config} env={env} code={options.code ?? null} />, root);
   return { h, root };
 }
 
@@ -92,8 +99,8 @@ const hello = (h: Harness): { token?: string } | undefined => sentFrames(h).find
 describe("the fragment code", () => {
   test("is taken out of the fragment, keeping the path, the query and the other parameters", () => {
     const calls: unknown[][] = [];
-    const code = takeCode({ hash: "#view=inbox&code=abc123", pathname: "/app/", search: "?layout=phone" }, { state: { kept: 1 }, replaceState: (...args: unknown[]) => void calls.push(args) });
-    expect(code).toBe("abc123");
+    const code = takeCode({ hash: `#view=inbox&code=${CODE}`, pathname: "/app/", search: "?layout=phone" }, { state: { kept: 1 }, replaceState: (...args: unknown[]) => void calls.push(args) });
+    expect(code).toBe(CODE);
     expect(calls).toEqual([[{ kept: 1 }, "", "/app/?layout=phone#view=inbox"]]);
   });
 
@@ -104,7 +111,7 @@ describe("the fragment code", () => {
   });
 
   test("is already gone from the fragment when the exchange request is issued", async () => {
-    const at = page("#code=abc");
+    const at = page(`#code=${CODE}`);
     const hashes: string[] = [];
     const code = captureCode(at);
     mountApp({ code, page: at, request: exchange({ status: 200, body: { token: "tok-1" } }, [], () => void hashes.push(at.location.hash)) });
@@ -130,11 +137,11 @@ describe("the fragment code", () => {
     const { h } = mountApp({ session: () => storage, page: at, request });
     h.step(step({ step: "open" }));
     expect(hello(h)?.token).toBe("old");
-    at.paste("#view&code=pasted");
+    at.paste(`#view&code=${PASTED}`);
     await tick();
     at.paste("#view");
     await tick();
-    expect(request.calls.map((call) => call.body)).toEqual(['{"code":"pasted"}']);
+    expect(request.calls.map((call) => call.body)).toEqual([sentCode(PASTED)]);
     expect(hashes).toEqual(["#view"]);
     expect(at.location.hash).toBe("#view");
     expect(storage.entries.get(TOKEN_KEY)).toBe("new");
@@ -148,14 +155,87 @@ describe("the fragment code", () => {
   });
 });
 
+describe("codes", () => {
+  test("every code= part leaves the fragment, and the first well-formed one is used", () => {
+    const urls: string[] = [];
+    const replace = { state: null, replaceState: (_state: unknown, _unused: string, url: string) => void urls.push(url) };
+    expect(takeCode({ hash: `#code=nothex&x&code=${PASTED}&code=${CODE}`, pathname: "/", search: "" }, replace)).toBe(PASTED);
+    expect(takeCode({ hash: "#code=a&x&code=b", pathname: "/", search: "" }, replace)).toBe("a");
+    expect(urls).toEqual(["/#x", "/#x"]);
+  });
+
+  for (const [name, code] of [
+    ["too short", "abc"],
+    ["upper case", "A".repeat(64)],
+    ["not hex", "g".repeat(64)],
+    ["too long", "a".repeat(65)],
+  ] as const) {
+    test(`a malformed code (${name}) is refused with the one message and no request`, async () => {
+      const request = exchange({ status: 200, body: { token: "tok-1" } });
+      const { h, root } = mountApp({ code, request });
+      await tick();
+      expect(request.calls).toHaveLength(0);
+      expect(status(root)).toBe(`NeedsToken · ${EXCHANGE_FAILED}`);
+      expect(h.net.attempts).toHaveLength(0);
+    });
+  }
+
+  test("a pasted malformed code is stripped from the fragment, and nothing is requested", async () => {
+    const at = page("");
+    const request = exchange({ status: 200, body: { token: "tok-1" } });
+    mountApp({ page: at, request });
+    at.paste("#view&code=zz");
+    await tick();
+    expect(at.location.hash).toBe("#view");
+    expect(request.calls).toHaveLength(0);
+  });
+
+  test("when two pasted codes race, only the latest one's result counts", async () => {
+    const storage = session();
+    const at = page("");
+    const replies: ((token: string) => void)[] = [];
+    const request: ExchangeRequest = () =>
+      new Promise((resolve) => {
+        replies.push((token) => resolve({ status: 200, json: async () => ({ token }) }));
+      });
+    const { h, root } = mountApp({ session: () => storage, page: at, request });
+    at.paste(`#code=${CODE}`);
+    at.paste(`#code=${PASTED}`);
+    expect(replies).toHaveLength(2);
+    replies[1]?.("second");
+    await tick();
+    expect(storage.entries.get(TOKEN_KEY)).toBe("second");
+    expect(status(root)).not.toBe("Signing in…");
+    replies[0]?.("first");
+    await tick();
+    expect(storage.entries.get(TOKEN_KEY)).toBe("second");
+    expect(h.net.attempts).toHaveLength(1);
+    h.step(step({ step: "open" }));
+    expect(hello(h)?.token).toBe("second");
+  });
+});
+
+describe("no config script: same-origin defaults", () => {
+  test("the app mounts, exchanges at the page's origin and connects to its /v1/ws", async () => {
+    const shell = readShellConfig({ location: { origin: "http://flk.invalid:7777" } });
+    const request = exchange({ status: 200, body: { token: "tok-1" } });
+    const { h } = mountApp({ config: shell, code: CODE, request });
+    await tick();
+    expect(request.calls.map((call) => call.url)).toEqual(["http://flk.invalid:7777/v1/client/exchange"]);
+    expect(h.net.attempts.map((attempt) => attempt.url)).toEqual(["ws://flk.invalid:7777/v1/ws"]);
+    h.step(step({ step: "open" }));
+    expect(hello(h)?.token).toBe("tok-1");
+  });
+});
+
 describe("the exchange", () => {
   test("a successful exchange stores the token, and hello carries it", async () => {
     const storage = session();
     const request = exchange({ status: 200, body: { token: "tok-1" } });
-    const { h } = mountApp({ code: "abc", session: () => storage, request });
+    const { h } = mountApp({ code: CODE, session: () => storage, request });
     expect(status(mountedRoot())).toBe("Signing in…");
     await tick();
-    expect(request.calls).toEqual([{ url: "https://flk.invalid/v1/client/exchange", body: '{"code":"abc"}' }]);
+    expect(request.calls).toEqual([{ url: "https://flk.invalid/v1/client/exchange", body: sentCode(CODE) }]);
     expect(storage.entries.get(TOKEN_KEY)).toBe("tok-1");
     h.step(step({ step: "open" }));
     expect(hello(h)?.token).toBe("tok-1");
@@ -169,7 +249,7 @@ describe("the exchange", () => {
   ] as const) {
     test(`${name} shows the one message and makes no second request`, async () => {
       const request = exchange(reply);
-      const { h, root } = mountApp({ code: "abc", session: () => session(), request });
+      const { h, root } = mountApp({ code: CODE, session: () => session(), request });
       await tick();
       expect(status(root)).toBe(`NeedsToken · ${EXCHANGE_FAILED}`);
       h.clock.advanceTo(h.clock.now() + 120_000);
@@ -181,10 +261,10 @@ describe("the exchange", () => {
 
   test("the request is same-origin, refuses redirects, sends same-origin credentials only and is never cached", async () => {
     const request = exchange({ status: 200, body: { token: "tok-1" } });
-    mountApp({ code: "abc", request });
+    mountApp({ code: CODE, request });
     await tick();
     expect(request.inits).toEqual([
-      { method: "POST", headers: { "content-type": "application/json" }, body: '{"code":"abc"}', mode: "same-origin", redirect: "error", credentials: "same-origin", cache: "no-store" },
+      { method: "POST", headers: { "content-type": "application/json" }, body: sentCode(CODE), mode: "same-origin", redirect: "error", credentials: "same-origin", cache: "no-store" },
     ]);
   });
 
@@ -206,7 +286,7 @@ describe("the exchange", () => {
     test(`${name} is the one failure`, async () => {
       const storage = session();
       const request = browser(refuses);
-      const { h, root } = mountApp({ code: "abc", session: () => storage, request });
+      const { h, root } = mountApp({ code: CODE, session: () => storage, request });
       await tick();
       expect(status(root)).toBe(`NeedsToken · ${EXCHANGE_FAILED}`);
       expect(storage.entries.has(TOKEN_KEY)).toBe(false);
@@ -218,7 +298,7 @@ describe("the exchange", () => {
   test("a new code replaces a stored token", async () => {
     const storage = session();
     storage.setItem(TOKEN_KEY, "old");
-    const { h } = mountApp({ code: "abc", session: () => storage, request: exchange({ status: 200, body: { token: "new" } }) });
+    const { h } = mountApp({ code: CODE, session: () => storage, request: exchange({ status: 200, body: { token: "new" } }) });
     await tick();
     expect(storage.entries.get(TOKEN_KEY)).toBe("new");
     h.step(step({ step: "open" }));
@@ -245,7 +325,7 @@ describe("a pasted link in a connected tab", () => {
 
   test("a failed code leaves the stored token and the Live connection alone, and says so in a dismissible notice", async () => {
     const { h, root, storage, at } = connected({ status: 401 });
-    at.paste("#code=used");
+    at.paste(`#code=${USED}`);
     expect(storage.entries.get(TOKEN_KEY)).toBe("old");
     await tick();
     expect(storage.entries.get(TOKEN_KEY)).toBe("old");
@@ -260,7 +340,7 @@ describe("a pasted link in a connected tab", () => {
   test("a page loaded with a failed code keeps the tab's stored token and connects with it", async () => {
     const storage = session();
     storage.setItem(TOKEN_KEY, "old");
-    const { h, root } = mountApp({ code: "used", session: () => storage, request: exchange({ status: 401 }) });
+    const { h, root } = mountApp({ code: USED, session: () => storage, request: exchange({ status: 401 }) });
     await tick();
     expect(storage.entries.get(TOKEN_KEY)).toBe("old");
     h.step(step({ step: "open" }));
@@ -270,7 +350,7 @@ describe("a pasted link in a connected tab", () => {
 
   test("a good code replaces the token only on success, and reconnects with it", async () => {
     const { h, root, storage, at } = connected({ status: 200, body: { token: "new" } });
-    at.paste("#code=fresh");
+    at.paste(`#code=${FRESH}`);
     // While the exchange runs, the working session is untouched.
     expect(storage.entries.get(TOKEN_KEY)).toBe("old");
     expect(status(root)).toBe("Live");
@@ -311,7 +391,7 @@ describe("the stored token", () => {
     const throwing = (): SessionLike => {
       throw new DOMException("The operation is insecure.", "SecurityError");
     };
-    const { h, root } = mountApp({ code: "abc", session: throwing, request: exchange({ status: 200, body: { token: "tok-1" } }) });
+    const { h, root } = mountApp({ code: CODE, session: throwing, request: exchange({ status: 200, body: { token: "tok-1" } }) });
     await tick();
     h.step(step({ step: "open" }));
     expect(hello(h)?.token).toBe("tok-1");
@@ -340,7 +420,7 @@ test("the token appears only in hello: never in the page, the URL, a log, an err
   history.pushState = (state, unused, url) => (urls.push(String(url)), push(state, unused, url));
   try {
     const storage = session();
-    const code = takeCode({ hash: "#code=abc", pathname: "/", search: "" }, history);
+    const code = takeCode({ hash: `#code=${CODE}`, pathname: "/", search: "" }, history);
     const { h, root } = mountApp({ code, session: () => storage, request: exchange({ status: 200, body: { token: sentinel } }) });
     await tick();
     h.step(step({ step: "open" }));

@@ -2,25 +2,27 @@
  * Shell configuration: the contract between a shell and this bundle
  * (ADR-0038 §6).
  *
- * The bundle makes no same-origin assumption. It never reads
- * `location.origin`, never issues a relative `fetch`, and never invents a
- * default server. Everything it needs to reach a server comes from the shell
- * that hosts it, through one global, {@link SHELL_CONFIG_GLOBAL}, which the
- * shell sets before the bundle's module script runs:
+ * The bundle never issues a relative `fetch`, and reads the page's location
+ * in exactly one place, {@link sameOriginDefaults}. A shell that hosts it
+ * may set one global, {@link SHELL_CONFIG_GLOBAL}, before the bundle's
+ * module script runs, and a present global always wins:
  *
- * - **Browser shell** (`flk` with the `web` feature): an external script
- *   that the page loads before the bundle assigns the global, without a
- *   token. The served page enforces `script-src 'self'` with no inline
- *   script or eval (#1875), so nothing here relies on either. The token
- *   comes from the one-time code exchange (`src/wire/token.ts`).
+ * - **Browser shell** (`flk` with the `web` feature): `flk` serves no config
+ *   script, so the global is absent and the bundle takes same-origin
+ *   defaults: the server is the page's origin, `ws:` for `http:` and `wss:`
+ *   for `https:` (main's decision on #1880). The served page enforces
+ *   `script-src 'self'` with no inline script or eval (#1875), so nothing
+ *   here relies on either. The token comes from the one-time code exchange
+ *   (`src/wire/token.ts`).
  * - **Tauri v2 shell** (#1601): an initialization script assigns it before
  *   the page loads, with the token read from the keychain.
  * - **Fixture build** (`vite build --mode fixture`, `just client-preview`):
  *   `src/fixture-shell.ts` runs first and assigns a fixture configuration
  *   with the recorded session bundled in, so the page needs no server.
  *
- * A missing or malformed configuration is an explicit {@link ConfigError},
- * which the app renders as an error state. It never falls back silently.
+ * A malformed configuration, or no global on a page not served over
+ * `http:`/`https:`, is an explicit {@link ConfigError}, which the app
+ * renders as an error state.
  *
  * @module
  */
@@ -72,6 +74,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * The browser shell's configuration when no global is set: the server is
+ * the page's own origin (main's decision on #1880: `flk` serves no config
+ * script, so the page it serves configures itself). This is the only place
+ * the bundle reads the page's location; `tests/config.test.ts` allows it
+ * here and nowhere else.
+ */
+export function sameOriginDefaults(scope: object): ConfigResult {
+  const page = scope as { readonly location?: { readonly origin?: unknown } };
+  if (page.location === undefined) {
+    return refuse(`No shell configuration: the shell did not set ${SHELL_CONFIG_GLOBAL}, and there is no page to take defaults from.`);
+  }
+  const origin = page.location.origin;
+  if (typeof origin !== "string" || !URL.canParse(origin) || !["http:", "https:"].includes(new URL(origin).protocol)) {
+    return refuse(`No shell configuration: the shell did not set ${SHELL_CONFIG_GLOBAL}, and the page is not served over http(s).`);
+  }
+  return { ok: true, config: { transport: "wire", serverUrl: origin } };
+}
+
+/**
  * Reads and validates the shell-injected configuration from `scope`
  * (normally `globalThis`).
  *
@@ -81,9 +102,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 export function readShellConfig(scope: object): ConfigResult {
   const raw: unknown = Reflect.get(scope, SHELL_CONFIG_GLOBAL);
-  if (raw === undefined) {
-    return refuse(`No shell configuration: the shell did not set ${SHELL_CONFIG_GLOBAL}.`);
-  }
+  if (raw === undefined) return sameOriginDefaults(scope);
   if (!isRecord(raw)) {
     return refuse(`${SHELL_CONFIG_GLOBAL} must be an object.`);
   }
