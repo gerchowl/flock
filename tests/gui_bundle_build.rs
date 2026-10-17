@@ -34,6 +34,11 @@ fn missing_dist_is_not_watched_and_unchanged_declarations_are_not_rewritten() {
         fs::metadata(&generated).unwrap().modified().unwrap(),
         pinned
     );
+    assert!(bundle_build::prepare(&dist.join("."), &output).unwrap());
+    assert_eq!(
+        fs::metadata(&generated).unwrap().modified().unwrap(),
+        pinned
+    );
     let other = root.path().join("other");
     fs::create_dir(&other).unwrap();
     assert!(bundle_build::prepare(&other, &output).unwrap());
@@ -46,13 +51,20 @@ fn dist_root_files_directories_and_dangling_symlinks_are_refused() {
     let outside = root.path().join("outside");
     fs::create_dir(&outside).unwrap();
     fs::write(outside.join("secret.txt"), "outside the chosen dist").unwrap();
-    for case in ["root", "file", "directory", "dangling"] {
+    for case in [
+        "root",
+        "root-slash",
+        "root-dot",
+        "file",
+        "directory",
+        "dangling",
+    ] {
         let base = root.path().join(case);
         fs::create_dir(&base).unwrap();
         let dist = base.join("dist");
         let output = base.join("out");
         fs::create_dir(&output).unwrap();
-        if case == "root" {
+        if case.starts_with("root") {
             symlink(&outside, &dist);
         } else {
             fs::create_dir(&dist).unwrap();
@@ -63,7 +75,13 @@ fn dist_root_files_directories_and_dangling_symlinks_are_refused() {
             };
             symlink(&target, &dist.join("escape"));
         }
-        let error = bundle_build::prepare(&dist, &output).unwrap_err();
+        let mut spelling = dist.clone().into_os_string();
+        match case {
+            "root-slash" => spelling.push("/"),
+            "root-dot" => spelling.push("/."),
+            _ => {}
+        }
+        let error = bundle_build::prepare(Path::new(&spelling), &output).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{case}");
         assert!(error.to_string().contains("GUI dist refuses symlink"));
         assert!(!output.join("gui_assets.rs").exists());

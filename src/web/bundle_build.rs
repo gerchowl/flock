@@ -10,6 +10,10 @@ use std::{fs, io, path::Path};
 /// links. Inputs must remain unchanged during compilation (Nix store outputs
 /// provide that guarantee). No dependency fetching or frontend build runs here.
 pub fn prepare(path: &Path, output: &Path) -> io::Result<bool> {
+    // Trailing separators or '/.' make lstat follow a directory symlink.
+    // Normalize components lexically without resolving any symlink target.
+    let normalized = path.components().collect::<std::path::PathBuf>();
+    let path = normalized.as_path();
     let exists = match fs::symlink_metadata(path) {
         Ok(_) => {
             reject_symlinks(path)?;
