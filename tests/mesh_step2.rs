@@ -759,33 +759,27 @@ fn direct_pinned_edge_delivers_reply_without_route_generation() {
 // With no subsequent topology change, only collection can invalidate it again.
 #[test]
 fn lease_time_clears_stale_assignment_after_route_pass() {
-    let c = Conversation::to(fleet::LAPTOP_TWO_HUBS, "noded.example");
-    cut(&c.fleet, "nodea", "nodec");
-    fleet::wait_until("return route uses first hub", DEADLINE, || {
-        routes(c.fleet.node("noded.example"))
-            .iter()
-            .any(|r| {
-                r["node"] == fleet::node_id(c.fleet.node("nodea"))
-                    && r["next_hop"] == fleet::node_id(c.fleet.node("nodeb"))
-            })
-            .then_some(())
-    });
+    // One collector owns the acknowledged gate. In the diamond, the other
+    // hub can still lease a reply or deliver a late withdrawal advert after
+    // the first hub's route disappears. Route absence is not gossip completion.
+    // The chain isolates lease-time validation from that independent traffic.
+    let c = Conversation::to(fleet::LAPTOP_HUB_SPOKE, "nodec");
     c.send();
     fleet::wait_until("request imported before gating leases", DEADLINE, || {
         (scalar(
-            c.fleet.node("noded.example"),
+            c.fleet.node("nodec"),
             "SELECT count(*) FROM envelopes WHERE correlation='question' AND state='inbox'",
         ) == 1)
             .then_some(())
     });
-    let gate = c.fleet.gate_outbound_poll("nodeb", "noded.example");
+    let gate = c.fleet.gate_outbound_poll("nodeb", "nodec");
     c.read_question();
     // Entry proves every poll forwarded before arming the gate has completed.
     // Mint only inside that window, so the reply cannot have an earlier lease.
     gate.wait_entered(DEADLINE);
     let reply = c.reply();
     let correlation = reply["correlation_id"].as_str().unwrap();
-    let spoke = c.fleet.node("noded.example");
+    let spoke = c.fleet.node("nodec");
     let initial: (String, i64, String) = db(spoke)
         .query_row(
             "SELECT next_hop,collect_attempts,state FROM envelopes WHERE correlation=?1",
@@ -801,7 +795,7 @@ fn lease_time_clears_stale_assignment_after_route_pass() {
     cut(&c.fleet, "nodea", "nodeb");
     c.fleet.wait_route("nodea", "nodeb", false);
     c.fleet.wait_route("nodeb", "nodea", false);
-    c.fleet.wait_route("noded.example", "nodea", false);
+    c.fleet.wait_route("nodec", "nodea", false);
     wait_unrouted_reply(spoke, correlation);
     let generation = api(spoke, "peers.enrollment", json!({}))["route_generation"].clone();
     assert_eq!(db(spoke).execute(
@@ -829,8 +823,8 @@ fn lease_time_clears_stale_assignment_after_route_pass() {
         ),
         0
     );
-    reconnect(&c.fleet, "nodea", "nodec");
-    c.fleet.wait_route("noded.example", "nodea", true);
+    reconnect(&c.fleet, "nodea", "nodeb");
+    c.fleet.wait_route("nodec", "nodea", true);
     c.answer_once();
     once(spoke, "question");
 }
