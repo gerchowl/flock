@@ -1012,6 +1012,14 @@ impl App {
         id: String,
         params: PaneSendTextParams,
     ) -> String {
+        let Some(deadline) = crate::app::input_writes::deadline(params.write_timeout_ms.as_ref())
+        else {
+            return encode_error(
+                id,
+                "invalid_params",
+                "write_timeout_ms must be an integer in 1..=30000",
+            );
+        };
         let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
             Ok(target) => target,
             Err(error) => return target_refusal(id, error),
@@ -1031,7 +1039,7 @@ impl App {
             pane_id,
             params.text,
             ("pane_not_found", format!("pane {public} not found")),
-            "pane_send_failed",
+            deadline,
         )
     }
 
@@ -1040,6 +1048,14 @@ impl App {
         id: String,
         params: PaneSendInputParams,
     ) -> String {
+        let Some(deadline) = crate::app::input_writes::deadline(params.write_timeout_ms.as_ref())
+        else {
+            return encode_error(
+                id,
+                "invalid_params",
+                "write_timeout_ms must be an integer in 1..=30000",
+            );
+        };
         let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
             Ok(target) => target,
             Err(error) => return target_refusal(id, error),
@@ -1051,25 +1067,36 @@ impl App {
             return self.raw_text_refusal_response(id, ws_idx, pane_id, reason);
         }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+            let public = self
+                .public_pane_id(ws_idx, pane_id)
+                .unwrap_or_else(|| pane_id.raw().to_string());
+            return pane_not_found(id, &public);
         };
         let encoded_keys = match encode_api_keys(runtime, &params.keys) {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        if !params.text.is_empty() {
-            let text_bytes = encode_api_text(runtime, &params.text);
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(text_bytes)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
-            }
-        }
-        for bytes in encoded_keys {
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
-            }
-        }
-
-        encode_success(id, ResponseResult::Ok {})
+        let mut bytes = if params.text.is_empty() {
+            Vec::new()
+        } else {
+            encode_api_text(runtime, &params.text)
+        };
+        let operator_interrupt = crate::pane::is_input_interrupt(&bytes)
+            || encoded_keys
+                .iter()
+                .any(|key| crate::pane::is_input_interrupt(key));
+        bytes.extend(encoded_keys.into_iter().flatten());
+        self.begin_input_write(
+            id,
+            ws_idx,
+            pane_id,
+            crate::app::input_writes::InputPayload {
+                bytes: Bytes::from(bytes),
+                deadline,
+                operator_interrupt,
+                paste: None,
+            },
+        )
     }
 
     /// `pane.arm_self_compact` — an agent asking to shorten its own context
@@ -1341,27 +1368,16 @@ impl App {
         id: String,
         params: PaneSendKeysParams,
     ) -> String {
-        let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
-            Ok(target) => target,
-            Err(error) => return target_refusal(id, error),
-        };
-        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            let public = self
-                .public_pane_id(ws_idx, pane_id)
-                .unwrap_or_else(|| pane_id.raw().to_string());
-            return pane_not_found(id, &public);
-        };
-        let encoded_keys = match encode_api_keys(runtime, &params.keys) {
-            Ok(encoded_keys) => encoded_keys,
-            Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
-        };
-        for bytes in encoded_keys {
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
-            }
-        }
-
-        encode_success(id, ResponseResult::Ok {})
+        self.handle_pane_send_input(
+            id,
+            PaneSendInputParams {
+                pane_id: params.pane_id,
+                text: String::new(),
+                keys: params.keys,
+                raw: true,
+                write_timeout_ms: params.write_timeout_ms,
+            },
+        )
     }
 }
 
@@ -1461,6 +1477,653 @@ mod tests {
     use super::*;
     use crate::{api::schema::SuccessResponse, config::Config, workspace::Workspace};
 
+    fn raw_request(
+        app: &mut App,
+        method: &str,
+        params: serde_json::Value,
+    ) -> std::sync::mpsc::Receiver<String> {
+        let (respond_to, response) = std::sync::mpsc::channel();
+        app.handle_api_request_message(crate::api::ApiRequestMessage {
+            request: serde_json::from_value(
+                serde_json::json!({"id":"same", "method":method, "params":params}),
+            )
+            .unwrap(),
+            respond_to,
+            peer_pid: Some(std::process::id()),
+            peer_birth: crate::platform::process_start_time(std::process::id()),
+            peer_uid: Some(crate::platform::peer::effective_uid()),
+        });
+        response
+    }
+
+    #[tokio::test]
+    async fn s3c_invalid_timeouts_and_submit_budgets_refuse_without_effect() {
+        for method in ["pane.send_text", "pane.write_text", "agent.send"] {
+            for timeout in [
+                serde_json::json!(null),
+                serde_json::json!(0),
+                serde_json::json!(30001),
+                serde_json::json!(-1),
+                serde_json::json!(true),
+                serde_json::json!(1.5),
+                serde_json::json!("100"),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                let (mut app, _, public, mut bytes) = s3b_leased_app(8);
+                let response = raw_request(
+                    &mut app,
+                    method,
+                    serde_json::json!({"pane_id":public,"target":public,"text":"never","raw":true,"write_timeout_ms":timeout}),
+                );
+                let value: serde_json::Value =
+                    serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+                assert_eq!(
+                    value["error"]["code"], "invalid_params",
+                    "{method}: {value}"
+                );
+                assert!(bytes.try_recv().is_err());
+                assert!(app.input_writes.next_deadline().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn s3c_submit_refuses_raw_budget_before_any_input() {
+        let (mut app, _, public, mut bytes) = s3b_leased_app(8);
+        let response = raw_request(
+            &mut app,
+            "agent.send",
+            serde_json::json!({"target":public,"text":"never","submit":true,"write_timeout_ms":200}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_params");
+        assert!(bytes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn s3c_held_deadline_bypasses_observation_and_removes_payload() {
+        for method in ["pane.send_text", "pane.write_text", "agent.send"] {
+            let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
+            let (event_tx, mut events) = tokio::sync::mpsc::channel(8);
+            app.event_tx = event_tx;
+            let response = raw_request(
+                &mut app,
+                method,
+                serde_json::json!({"pane_id":public,"target":public,"text":"é","raw":true,"write_timeout_ms":200}),
+            );
+            app.state.workspaces[0].tabs[0].runtimes[&pane]
+                .test_process_pty_bytes(b"unrelated repaint");
+            assert!(response.try_recv().is_err());
+            assert!(
+                events.try_recv().is_err(),
+                "observation cannot start at admission"
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::app::sleep_until_or_pending(app.input_writes.next_deadline()),
+            )
+            .await
+            .unwrap();
+            app.handle_scheduled_tasks(std::time::Instant::now(), false);
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(value["error"]["code"], "input_write_cancelled", "{value}");
+            assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
+            assert_eq!(value["error"]["data"]["input_write"]["bytes_total"], 2);
+            assert_eq!(value["error"]["data"]["input_write"]["reason"], "deadline");
+            assert!(events.try_recv().is_err());
+            app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held");
+            assert!(
+                bytes.try_recv().is_err(),
+                "expired paste must never surface after release"
+            );
+            assert!(response.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3c_observation_remains_bounded_and_retirement_concludes_once() {
+        let (mut app, pane, public, mut bytes) = s3b_leased_app(64);
+        app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held");
+        let (event_tx, mut events) = tokio::sync::mpsc::channel(64);
+        app.event_tx = event_tx;
+        let mut replies = Vec::new();
+        for _ in 0..32 {
+            replies.push(raw_request(
+                &mut app,
+                "pane.write_text",
+                serde_json::json!({"pane_id":public,"text":"é","raw":true,"write_timeout_ms":200}),
+            ));
+        }
+        assert!(replies.iter().all(|reply| reply.try_recv().is_err()));
+        let refused = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"refused","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&refused.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            value["error"]["data"]["input_write"]["reason"],
+            "admission_limit"
+        );
+        assert!(
+            app.input_writes.next_deadline().is_none(),
+            "completed observations must not spin on the write deadline"
+        );
+        for _ in 0..32 {
+            assert_eq!(bytes.try_recv().unwrap(), "é".as_bytes());
+        }
+        assert!(bytes.try_recv().is_err());
+        app.input_writes
+            .retire_all(crate::pty::write_receipt::WriteFailure::OwnerChanged);
+        for reply in &replies {
+            let value: serde_json::Value =
+                serde_json::from_str(&reply.try_recv().unwrap()).unwrap();
+            assert_eq!(value["result"]["type"], "paste");
+            assert_eq!(value["result"]["outcome"], "unconfirmed");
+            assert_eq!(value["result"]["reason"], "owner_changed");
+        }
+        for _ in 0..32 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle_internal_event(event);
+        }
+        assert!(
+            replies.iter().all(|reply| reply.try_recv().is_err()),
+            "stale observation must never send a second result"
+        );
+        let reused = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"later","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&reused.try_recv().unwrap()).unwrap();
+        assert_eq!(value["result"]["type"], "ok");
+        assert_eq!(bytes.try_recv().unwrap(), b"later".as_slice());
+    }
+
+    #[tokio::test]
+    async fn s3c_closed_writer_reports_zero_encoded_bytes_without_observation() {
+        for method in ["pane.send_text", "pane.write_text", "agent.send"] {
+            let (mut app, pane, public, bytes) = s3b_leased_app(8);
+            app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held");
+            app.state.workspaces[0].tabs[0].runtimes[&pane].test_process_pty_bytes(b"\x1b[?2004h");
+            drop(bytes);
+            let (event_tx, mut events) = tokio::sync::mpsc::channel(4);
+            app.event_tx = event_tx;
+            let response = raw_request(
+                &mut app,
+                method,
+                serde_json::json!({"pane_id":public,"target":public,"text":"é","raw":true,"write_timeout_ms":200}),
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(value["error"]["code"], "input_write_cancelled", "{value}");
+            assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
+            assert_eq!(value["error"]["data"]["input_write"]["bytes_total"], 14);
+            assert_eq!(
+                value["error"]["data"]["input_write"]["remainder_discarded"],
+                true
+            );
+            assert!(events.try_recv().is_err());
+            assert!(app.input_writes.next_deadline().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3c_final_observation_releases_its_quota_before_next_admission() {
+        let (mut app, pane, public, mut bytes) = s3b_leased_app(64);
+        app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held");
+        let (event_tx, mut events) = tokio::sync::mpsc::channel(64);
+        app.event_tx = event_tx;
+        let mut replies = Vec::new();
+        for _ in 0..32 {
+            replies.push(raw_request(&mut app, "pane.write_text", serde_json::json!({"pane_id":public,"text":"done","raw":true,"write_timeout_ms":200})));
+        }
+        let refused = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"refused","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&refused.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "input_write_cancelled");
+        for _ in 0..32 {
+            let crate::events::AppEvent::PasteConfirm {
+                mut paste,
+                respond_to,
+            } = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected paste observation")
+            };
+            paste.deadline = std::time::Instant::now();
+            app.advance_paste(paste, respond_to);
+            assert_eq!(bytes.try_recv().unwrap(), b"done".as_slice());
+        }
+        for reply in replies {
+            let value: serde_json::Value =
+                serde_json::from_str(&reply.try_recv().unwrap()).unwrap();
+            assert_eq!(value["result"]["type"], "paste");
+            assert!(reply.try_recv().is_err());
+        }
+        let next = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"next","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&next.try_recv().unwrap()).unwrap();
+        assert_eq!(value["result"]["type"], "ok");
+        assert_eq!(bytes.try_recv().unwrap(), b"next".as_slice());
+    }
+
+    #[tokio::test]
+    async fn s3c_text_routes_hold_the_reply_and_validate_deadlines_before_admission() {
+        for method in ["pane.send_text", "agent.send"] {
+            let (mut app, _, public, mut bytes) = s3b_leased_app(8);
+            let mut params = serde_json::json!({"pane_id":public,"target":public,"text":"hello","raw":true,"write_timeout_ms":200});
+            let response = raw_request(&mut app, method, params.clone());
+            assert!(
+                matches!(
+                    response.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "lease-held text must retain its response owner"
+            );
+            assert!(bytes.try_recv().is_err());
+            params["write_timeout_ms"] = serde_json::json!(null);
+            let refused = raw_request(&mut app, method, params);
+            let value: serde_json::Value =
+                serde_json::from_str(&refused.try_recv().unwrap()).unwrap();
+            assert_eq!(value["error"]["code"], "invalid_params");
+        }
+    }
+
+    #[tokio::test]
+    async fn s3c_write_text_tag_is_contract_bound() {
+        let (mut app, _, public, mut bytes) = s3b_leased_app(8);
+        let response = raw_request(
+            &mut app,
+            "pane.write_text",
+            serde_json::json!({"pane_id":public,"text":"hello","raw":true,"write_timeout_ms":200}),
+        );
+        assert!(matches!(
+            response.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(bytes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn s3b_held_raw_input_cannot_reply_at_queue_admission() {
+        let (mut app, _, public) = app_with_terminal();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, _consumer) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let now = std::time::Instant::now();
+        assert!(runtime.begin_injection_lease(
+            "held",
+            now + std::time::Duration::from_secs(2),
+            now
+        ));
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let response = raw_request(
+            &mut app,
+            "pane.send_input",
+            serde_json::json!({"pane_id":public,"text":"queued","raw":true}),
+        );
+        assert!(
+            matches!(
+                response.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "queue admission must retain the response owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3b_invalid_write_timeout_refuses_before_effect() {
+        for timeout in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(0),
+            serde_json::json!(30001),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("1"),
+        ] {
+            let (mut app, _, public) = app_with_terminal();
+            let pane = app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            app.state.workspaces[0].tabs[0]
+                .runtimes
+                .insert(pane, runtime);
+            let response = raw_request(
+                &mut app,
+                "pane.send_keys",
+                serde_json::json!({"pane_id":public,"keys":["Enter"],"write_timeout_ms":timeout}),
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(value["error"]["code"], "invalid_params");
+            assert!(bytes.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3b_contract_tags_complete_empty_requests() {
+        for method in ["pane.write_keys", "pane.write_input"] {
+            let (mut app, _, public) = app_with_terminal();
+            let pane = app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            app.state.workspaces[0].tabs[0]
+                .runtimes
+                .insert(pane, runtime);
+            let response = raw_request(
+                &mut app,
+                method,
+                serde_json::json!({"pane_id":public,"keys":[],"write_timeout_ms":200}),
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert!(value.get("result").is_some(), "{value}");
+            assert!(bytes.try_recv().is_err());
+        }
+    }
+
+    fn s3b_leased_app(
+        capacity: usize,
+    ) -> (
+        App,
+        crate::layout::PaneId,
+        String,
+        tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) {
+        let (mut app, _, public) = app_with_terminal();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, bytes) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, capacity);
+        let now = std::time::Instant::now();
+        assert!(runtime.begin_injection_lease(
+            "held",
+            now + std::time::Duration::from_secs(2),
+            now
+        ));
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        (app, pane, public, bytes)
+    }
+
+    #[tokio::test]
+    async fn s3b_dispatch_aggregates_encoded_bytes_and_preserves_fifo_with_duplicate_ids() {
+        let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
+        let first = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"é","keys":["Enter"],"raw":true}),
+        );
+        let second = raw_request(
+            &mut app,
+            "pane.write_keys",
+            serde_json::json!({"pane_id":public,"keys":["Tab"]}),
+        );
+        assert!(first.try_recv().is_err());
+        assert!(second.try_recv().is_err());
+        let unrelated = raw_request(&mut app, "workspace.list", serde_json::json!({}));
+        let value: serde_json::Value =
+            serde_json::from_str(&unrelated.try_recv().unwrap()).unwrap();
+        assert!(value.get("result").is_some());
+        assert!(app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held"));
+        app.input_writes.service();
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), "é\r".as_bytes());
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"\t");
+        for response in [first, second] {
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(value["id"], "same");
+            assert!(value.get("result").is_some());
+            assert!(response.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3b_dispatch_deadline_removes_lease_payload_before_reply_and_release() {
+        let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
+        let response = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"dead","raw":true,"write_timeout_ms":200}),
+        );
+        let disconnected = raw_request(
+            &mut app,
+            "pane.send_input",
+            serde_json::json!({"pane_id":public,"text":"gone","raw":true,"write_timeout_ms":200}),
+        );
+        drop(disconnected);
+        let live = raw_request(
+            &mut app,
+            "pane.send_input",
+            serde_json::json!({"pane_id":public,"text":"live","raw":true}),
+        );
+        app.next_resize_poll = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        app.next_auto_update_check = None;
+        app.checks_heartbeat_deadline = None;
+        app.session_save_deadline = None;
+        app.git_refresh_in_flight = true;
+        assert_eq!(
+            app.next_loop_deadline(std::time::Instant::now(), false),
+            app.input_writes.next_deadline()
+        );
+        let expiry_ceiling = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(deadline) = app
+                .input_writes
+                .next_deadline()
+                .filter(|deadline| *deadline < expiry_ceiling)
+            {
+                crate::app::sleep_until_or_pending(Some(deadline)).await;
+                app.handle_scheduled_tasks(std::time::Instant::now(), false);
+                assert!(
+                    app.input_writes
+                        .next_deadline()
+                        .is_none_or(|next| next > deadline),
+                    "deadline service made no progress"
+                );
+            }
+        })
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "input_write_cancelled");
+        assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
+        assert!(app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held"));
+        app.input_writes.service();
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"live");
+        assert!(bytes.try_recv().is_err());
+        assert!(live.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn s3b_dispatch_quota_refuses_before_retaining_input_and_reuses_slots() {
+        let (mut app, pane, public, mut bytes) = s3b_leased_app(64);
+        let mut replies = Vec::new();
+        for _ in 0..32 {
+            let response = raw_request(
+                &mut app,
+                "pane.write_input",
+                serde_json::json!({"pane_id":public,"text":"x","raw":true}),
+            );
+            assert!(response.try_recv().is_err());
+            replies.push(response);
+        }
+        let refused = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"refused","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&refused.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "input_write_cancelled");
+        assert_eq!(
+            value["error"]["data"]["input_write"]["reason"],
+            "admission_limit"
+        );
+        assert_eq!(value["error"]["data"]["input_write"]["bytes_total"], 7);
+        assert!(app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held"));
+        let reused = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"new","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&reused.try_recv().unwrap()).unwrap();
+        assert!(
+            value.get("result").is_some(),
+            "completed requests must release their quota: {value}"
+        );
+        for response in replies {
+            assert!(response.try_recv().is_ok());
+            assert_eq!(bytes.try_recv().unwrap().as_ref(), b"x");
+        }
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"new");
+        assert!(bytes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn s3b_dispatch_owner_and_pane_loss_answer_each_held_request() {
+        for owner_changed in [true, false] {
+            let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
+            let response = raw_request(
+                &mut app,
+                "pane.write_input",
+                serde_json::json!({"pane_id":public,"text":"never","raw":true}),
+            );
+            if owner_changed {
+                app.state.workspaces[0].tabs[0].runtimes[&pane].end_all_injection_leases();
+            } else {
+                app.state.workspaces[0].tabs[0].runtimes.remove(&pane);
+            }
+            app.input_writes.service();
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(
+                value["error"]["data"]["input_write"]["reason"],
+                if owner_changed {
+                    "owner_changed"
+                } else {
+                    "pane_gone"
+                }
+            );
+            assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
+            assert!(bytes.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3b_keys_only_never_emit_empty_bracketed_paste_markers() {
+        let (mut app, _, public) = app_with_terminal();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let reply = raw_request(
+            &mut app,
+            "pane.write_keys",
+            serde_json::json!({"pane_id":public,"keys":["Enter"]}),
+        );
+        assert!(reply.try_recv().is_ok());
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"\r");
+        assert!(bytes.try_recv().is_err());
+        let reply = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"é","keys":["Enter"],"raw":true}),
+        );
+        assert!(reply.try_recv().is_ok());
+        assert_eq!(
+            bytes.try_recv().unwrap().as_ref(),
+            "\x1b[200~é\x1b[201~\r".as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn s3b_api_interrupt_keys_keep_operator_priority_and_fifo() {
+        for (method, mut params, expected) in [
+            (
+                "pane.write_keys",
+                serde_json::json!({"keys":["Esc"]}),
+                b"\x1b",
+            ),
+            (
+                "pane.write_keys",
+                serde_json::json!({"keys":["C-c"]}),
+                b"\x03",
+            ),
+            (
+                "pane.write_input",
+                serde_json::json!({"text":"\u{1b}","raw":true}),
+                b"\x1b",
+            ),
+            (
+                "pane.write_input",
+                serde_json::json!({"text":"\u{3}","raw":true}),
+                b"\x03",
+            ),
+        ] {
+            let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
+            let held = raw_request(
+                &mut app,
+                "pane.write_input",
+                serde_json::json!({"pane_id":public,"text":"held","raw":true}),
+            );
+            assert!(held.try_recv().is_err());
+            params["pane_id"] = public.into();
+            let interrupt = raw_request(&mut app, method, params);
+            app.input_writes.service();
+            assert!(held.try_recv().is_ok());
+            assert!(interrupt.try_recv().is_ok());
+            assert_eq!(bytes.try_recv().unwrap().as_ref(), b"held");
+            assert_eq!(bytes.try_recv().unwrap().as_ref(), expected);
+            assert!(app.state.workspaces[0].tabs[0].runtimes[&pane]
+                .injection_lease_until()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3b_empty_admission_checks_the_original_deadline() {
+        let (mut app, _, _) = app_with_terminal();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let response = app.begin_input_write(
+            "empty".into(),
+            0,
+            pane,
+            crate::app::input_writes::InputPayload {
+                bytes: Bytes::new(),
+                deadline: std::time::Instant::now() - std::time::Duration::from_nanos(1),
+                operator_interrupt: false,
+                paste: None,
+            },
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["error"]["code"], "input_write_cancelled");
+        assert_eq!(value["error"]["data"]["input_write"]["bytes_total"], 0);
+        assert_eq!(value["error"]["data"]["input_write"]["reason"], "deadline");
+        assert!(bytes.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn pane_verbs_accept_agent_targets() {
         for target_kind in ["name", "terminal", "pane", "legacy"] {
@@ -1496,13 +2159,27 @@ mod tests {
             ] {
                 let mut params = extra;
                 params["pane_id"] = target.clone().into();
+                let (event_tx, mut events) = tokio::sync::mpsc::channel(4);
+                app.event_tx = event_tx;
+                let response = raw_request(&mut app, method, params);
+                if method == "pane.send_text" {
+                    let crate::events::AppEvent::PasteConfirm {
+                        mut paste,
+                        respond_to,
+                    } = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                    else {
+                        panic!("expected paste observation")
+                    };
+                    paste.deadline = std::time::Instant::now();
+                    app.advance_paste(paste, respond_to);
+                }
                 let response: serde_json::Value = serde_json::from_str(
-                    &app.handle_api_request(
-                        serde_json::from_value(serde_json::json!({
-                            "id": "targets", "method": method, "params": params,
-                        }))
+                    &response
+                        .recv_timeout(std::time::Duration::from_secs(1))
                         .unwrap(),
-                    ),
                 )
                 .unwrap();
                 assert!(response.get("result").is_some(), "{method}: {response}");
@@ -1575,8 +2252,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn self_resolves_to_the_callers_pane_by_ancestry() {
+    #[tokio::test]
+    async fn self_resolves_to_the_callers_pane_by_ancestry() {
         let (mut app, _, public) = app_with_terminal();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
         let get = |app: &mut App| {
@@ -1589,8 +2266,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&response).unwrap()
         };
         assert_eq!(get(&mut app)["error"]["code"], "pane_not_found");
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(&mut app, pane_id);
         assert_eq!(get(&mut app)["result"]["pane"]["pane_id"], public.as_str());
     }
 

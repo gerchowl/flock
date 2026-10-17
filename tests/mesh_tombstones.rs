@@ -39,8 +39,13 @@ fn start(node: &Node) -> Value {
     start_at(node, &node.repo, Path::new("/bin/sh"))
 }
 fn db(node: &Node) -> rusqlite::Connection {
-    let connection =
-        rusqlite::Connection::open(node.home.join("state/flock-dev/mesh-mail.sqlite")).unwrap();
+    let connection = rusqlite::Connection::open(
+        node.home
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
+    )
+    .unwrap();
     connection.busy_timeout(Duration::from_secs(5)).unwrap();
     connection
 }
@@ -138,7 +143,12 @@ fn assert_harness_restart(harness: &str, screen: &str) {
         json!({"target":target["pane_id"], "reason":"fixture harness restart"}),
     );
     fleet::wait_until("harness restart verified", DEADLINE, || {
-        let log = fs::read_to_string(node.config_home.join("flock-dev/event-log.jsonl")).ok()?;
+        let log = fs::read_to_string(
+            node.config_home
+                .join(support::paths::app_dir_name())
+                .join("event-log.jsonl"),
+        )
+        .ok()?;
         log.lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .any(|event| {
@@ -450,7 +460,12 @@ fn restart_resume_582_keeps_identity_and_delivers_without_tombstone() {
         json!({"target":target["pane_id"], "reason":"fixture restart"}),
     );
     fleet::wait_until("restart completed", DEADLINE, || {
-        let log = fs::read_to_string(node.config_home.join("flock-dev/event-log.jsonl")).ok()?;
+        let log = fs::read_to_string(
+            node.config_home
+                .join(support::paths::app_dir_name())
+                .join("event-log.jsonl"),
+        )
+        .ok()?;
         log.lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .any(|e| {

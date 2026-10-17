@@ -32,6 +32,7 @@ struct WriteState {
     payload: Bytes,
     progress: WriteProgress,
     deadline: Option<Instant>,
+    notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl WriteState {
@@ -54,6 +55,7 @@ impl WriteState {
     /// Record the actual final-write instant before deciding whether it is timely.
     fn finish_write(&mut self, at: Instant) -> bool {
         self.progress.completed_at = Some(at);
+        self.notify();
         self.payload = Bytes::new();
         if self.expired(at) {
             self.fail(WriteFailure::Deadline);
@@ -62,10 +64,17 @@ impl WriteState {
         true
     }
 
+    fn notify(&self) {
+        if let Some(notify) = &self.notify {
+            notify.notify_one();
+        }
+    }
+
     fn fail(&mut self, reason: WriteFailure) {
         self.progress.failure.get_or_insert(reason);
         self.payload = Bytes::new();
         self.progress.remainder_discarded = true;
+        self.notify();
     }
 }
 
@@ -81,6 +90,7 @@ pub(crate) struct WriteReceipt(Arc<SharedWrite>);
 /// The queued ticket retains authority, but the gate owns the only payload.
 #[derive(Debug)]
 pub(crate) struct WriteCompletion {
+    pub(crate) operator_interrupt: bool,
     completion: mpsc::Sender<Instant>,
     shared: Arc<SharedWrite>,
 }
@@ -93,6 +103,21 @@ pub(crate) enum WriteDisposition {
 }
 
 impl WriteReceipt {
+    /// Retire a response owner's pending authority under the same syscall gate.
+    pub(crate) fn retire(&self, reason: WriteFailure) {
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.progress.completed_at.is_none() {
+            state.fail(reason);
+        }
+    }
+
+    /// Register under the writer gate and wake once to cover pre-registration completion.
+    pub(crate) fn notify_on_change(&self, notify: Arc<tokio::sync::Notify>) {
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.notify = Some(notify);
+        state.notify();
+    }
+
     pub(crate) fn channel(bytes: Bytes, deadline: Option<Instant>) -> (WriteCompletion, Self) {
         let (tx, rx) = mpsc::channel();
         let progress = WriteProgress {
@@ -108,10 +133,12 @@ impl WriteReceipt {
                 payload: bytes,
                 progress,
                 deadline,
+                notify: None,
             }),
         });
         (
             WriteCompletion {
+                operator_interrupt: false,
                 completion: tx,
                 shared: shared.clone(),
             },

@@ -9,32 +9,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use support::environment::Command;
-
-struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("f634-{}-{nanos}", std::process::id()));
-        std::fs::create_dir(&path).unwrap();
-        Self(path)
-    }
-
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn run(
     args: &[&str],
@@ -42,7 +18,7 @@ fn run(
     error: Option<serde_json::Value>,
     ping_stalls: bool,
 ) -> (std::process::Output, Vec<String>) {
-    let dir = TempDir::new();
+    let dir = support::socket_dir::SocketDir::reserve("dc1683");
     let socket = dir.path().join("api.sock");
     let brief = dir.path().join("brief.md");
     std::fs::write(&brief, "fixture task").unwrap();

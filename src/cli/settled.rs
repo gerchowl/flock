@@ -1720,6 +1720,7 @@ mod tests {
     use super::*;
 
     const TERM: &str = "term_1f2e3";
+
     fn cursor(epoch: u64, entries: u64, seq: u64, working: bool) -> Cursor {
         Cursor {
             terminal_id: TERM.to_string(),

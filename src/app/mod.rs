@@ -37,6 +37,7 @@ pub(crate) mod goals;
 pub(crate) mod handoffs;
 mod ids;
 mod input;
+mod input_writes;
 pub(crate) mod issue_drop;
 pub(crate) mod line_editor;
 pub(crate) mod mailboxes;
@@ -140,11 +141,18 @@ impl PaneClickState {
     }
 }
 
+/// Socket attribution preserved across recovery continuations.
+#[derive(Clone, Copy)]
+pub(crate) struct ApiCaller {
+    pid: Option<u32>,
+    birth: Option<Option<u64>>,
+    uid: Option<Option<u32>>,
+}
+
 /// An API request held back until the mesh store finishes recovering.
 struct ParkedApiRequest {
     request: crate::api::schema::Request,
-    peer_pid: Option<u32>,
-    peer_birth: Option<Option<u64>>,
+    caller: ApiCaller,
     respond_to: std::sync::mpsc::Sender<String>,
     deadline: Instant,
 }
@@ -163,6 +171,8 @@ pub(crate) const RECOVERY_PARK_LIMIT: Duration = Duration::from_secs(5);
 pub(crate) struct AppRuntimeConfig {
     /// Command used by every app merge-evidence query, including workers.
     pub(crate) merge_gate: crate::worktree::MergeGateContext,
+    /// Account lookup captured once, independent of caller-controlled requests.
+    pub(crate) uid_policy: crate::structured::identity::UidPolicy,
 }
 
 pub struct App {
@@ -175,6 +185,8 @@ pub struct App {
     pub(crate) current_api_peer_pid: Option<u32>,
     /// Internal call, captured socket birth, or captured-but-unavailable birth.
     pub(crate) current_api_peer_birth: Option<Option<u64>>,
+    /// Internal call, captured UID, or captured-but-unavailable UID.
+    pub(crate) current_api_peer_uid: Option<Option<u32>>,
     pub(crate) session_leases: crate::structured::lease::SessionLeases,
     /// Test-only override for pane child PIDs so ancestry reconciliation can
     /// be exercised without spawning real PTYs.
@@ -220,11 +232,7 @@ pub struct App {
     /// then would read an empty projection, so they wait for the rebuild.
     recovery_parked: Vec<ParkedApiRequest>,
     /// Set by dispatch, taken by `respond_or_park`, which owns the responder.
-    pub(crate) pending_recovery_park: Option<(
-        crate::api::schema::Request,
-        Option<u32>,
-        Option<Option<u64>>,
-    )>,
+    pub(crate) pending_recovery_park: Option<(crate::api::schema::Request, ApiCaller)>,
     pub(crate) mesh_enrollment_generation: u64,
     pub(crate) mesh_forward_generation: Option<u64>,
     pub(crate) mesh_forward_cursor: Option<(u64, crate::mesh::key::MessageKey)>,
@@ -245,7 +253,6 @@ pub struct App {
     /// Operator drafts an injection could not type back (#850).
     pub(crate) kept_drafts: std::cell::RefCell<draft_stash::KeptDrafts>,
     /// Plain paste observation parked by `respond_or_park` after dispatch.
-    pub(crate) pending_paste: Option<paste_confirm::Paste>,
     /// `integration.install`, answered from a worker thread by
     /// `respond_or_park`, because installing Claude probes `claude --version`.
     pub(crate) pending_integration_install: Option<api::integrations::PendingInstall>,
@@ -347,6 +354,7 @@ pub struct App {
     pub(crate) last_render_at: Option<Instant>,
     pub(crate) suppressed_repeat_keys:
         HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+    pub(crate) input_writes: input_writes::InputWrites,
     pub render_notify: Arc<Notify>,
     pub render_dirty: Arc<AtomicBool>,
     pub(crate) full_redraw_pending: bool,
@@ -398,6 +406,7 @@ pub(crate) const APP_EVENT_DRAIN_LIMIT: usize = 64;
 
 pub(crate) enum LoopEvent {
     Timer,
+    InputWrites,
     Internal(AppEvent),
     Api(crate::api::ApiRequestMessage),
     RawInput(crate::raw_input::RawInputEvent),
@@ -973,6 +982,7 @@ impl App {
             event_tx,
             current_api_peer_pid: None,
             current_api_peer_birth: None,
+            current_api_peer_uid: None,
             session_leases: Default::default(),
             #[cfg(test)]
             test_pane_child_pids: std::collections::HashMap::new(),
@@ -1045,7 +1055,6 @@ impl App {
             inbound: Default::default(),
             message_relays: Default::default(),
             pending_agent_submit: None,
-            pending_paste: None,
             pending_integration_install: None,
             claude_version_probe: std::sync::Arc::new(crate::integration::probe_claude_version),
             active_submissions: Default::default(),
@@ -1088,6 +1097,7 @@ impl App {
             no_session,
             input_rx: None,
             last_terminal_size: terminal::size().ok(),
+            input_writes: input_writes::InputWrites::default(),
             render_notify,
             render_dirty,
             full_redraw_pending: false,
@@ -1254,12 +1264,16 @@ impl App {
         request: crate::api::schema::Request,
         peer_pid: Option<u32>,
         peer_birth: Option<Option<u64>>,
+        peer_uid: Option<Option<u32>>,
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
         self.recovery_parked.push(ParkedApiRequest {
             request,
-            peer_pid,
-            peer_birth,
+            caller: ApiCaller {
+                pid: peer_pid,
+                birth: peer_birth,
+                uid: peer_uid,
+            },
             respond_to,
             deadline: Instant::now() + RECOVERY_PARK_LIMIT,
         });
@@ -1283,14 +1297,23 @@ impl App {
 
     /// Answer parked mail requests in arrival order, each with its own caller.
     fn replay_recovery_parked(&mut self) {
-        let caller = (self.current_api_peer_pid, self.current_api_peer_birth);
+        let caller = (
+            self.current_api_peer_pid,
+            self.current_api_peer_birth,
+            self.current_api_peer_uid,
+        );
         for parked in std::mem::take(&mut self.recovery_parked) {
-            self.current_api_peer_pid = parked.peer_pid;
-            self.current_api_peer_birth = parked.peer_birth;
+            self.current_api_peer_pid = parked.caller.pid;
+            self.current_api_peer_birth = parked.caller.birth;
+            self.current_api_peer_uid = parked.caller.uid;
             let response = self.handle_api_request_after_internal_events_drained(parked.request);
             self.respond_or_park(parked.respond_to, response);
         }
-        (self.current_api_peer_pid, self.current_api_peer_birth) = caller;
+        (
+            self.current_api_peer_pid,
+            self.current_api_peer_birth,
+            self.current_api_peer_uid,
+        ) = caller;
     }
 
     #[cfg(unix)]
@@ -1625,11 +1648,13 @@ impl App {
                         None => LoopEvent::InputClosed,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
+                    _ = self.input_writes.notify.notified() => LoopEvent::InputWrites,
                     _ = self.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
 
             match event {
+                LoopEvent::InputWrites => self.service_input_writes(),
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
                     self.handle_internal_event_with_prefix_sync(ev);
@@ -1656,6 +1681,8 @@ impl App {
             }
         }
 
+        self.input_writes
+            .retire_all(crate::pty::write_receipt::WriteFailure::PaneGone);
         // Save session on exit (skip in --no-session mode)
         if !self.no_session {
             self.save_session_now();
@@ -4306,8 +4333,7 @@ sidebar_pane_gap = 99
         let pane_id = app.state.workspaces[ws_idx]
             .focused_pane_id()
             .expect("a pane to be sitting in");
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(app, pane_id);
         assert_eq!(
             app.spawn_caller().own_workspace(),
             Some(ws_idx),
@@ -4889,8 +4915,7 @@ sidebar_pane_gap = 99
                 .get_mut(&terminal_id)
                 .expect("terminal")
                 .launch_argv = Some(vec!["claude".into()]);
-            app.test_pane_child_pids.insert(pane_id, std::process::id());
-            app.current_api_peer_pid = Some(std::process::id());
+            crate::test_support::attest_pane_caller(&mut app, pane_id);
             app
         }
 

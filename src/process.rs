@@ -100,6 +100,22 @@ fn read_command_pipe(
     Ok(bytes)
 }
 
+fn receive_command_pipe(
+    reader: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    reader
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                io::Error::new(io::ErrorKind::TimedOut, "output pipes timed out")
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                io::Error::other("output pipe reader disconnected")
+            }
+        })?
+}
+
 /// Own the group id only until its direct child is reaped. Keeping the leader
 /// unreaped while collecting pipes prevents its numeric id from being reused.
 struct CommandGroup<K: Fn(u32)> {
@@ -112,19 +128,9 @@ impl<K: Fn(u32)> CommandGroup<K> {
         let Some(child) = self.child.as_mut() else {
             return Err(io::Error::other("command already reaped"));
         };
-        let status = match child.try_wait() {
-            Ok(status) => status,
-            Err(error) => {
-                // No successful reap relinquished ownership. Kill and reap
-                // the direct child before propagating the polling failure.
-                if let Some(mut child) = self.child.take() {
-                    (self.kill)(child.id());
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                return Err(error);
-            }
-        };
+        // Drop retains the unreaped child on polling error, kills its owned
+        // group and reaps off-thread without extending the caller's deadline.
+        let status = child.try_wait()?;
         if status.is_some() {
             self.child = None;
         }
@@ -392,15 +398,8 @@ impl TracedCommand {
             };
             // Collect both pipes before try_wait can reap the leader. Every
             // error below drops the still-owned group and schedules its reap.
-            let read_output = |reader: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>| {
-                reader
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::TimedOut, "output pipes timed out")
-                    })?
-            };
-            let stdout = read_output(stdout_rx)?;
-            let stderr = read_output(stderr_rx)?;
+            let stdout = receive_command_pipe(stdout_rx, deadline)?;
+            let stderr = receive_command_pipe(stderr_rx, deadline)?;
             let status = loop {
                 group.check_deadline(deadline)?;
                 match group.try_wait()? {
@@ -654,6 +653,25 @@ fn shape_args(command: &Command) -> String {
 mod tests {
     use super::*;
     use crate::logging::capture_logs;
+
+    #[test]
+    fn disconnected_output_reader_is_a_read_failure_not_a_timeout() {
+        let (sender, receiver) = std::sync::mpsc::channel::<io::Result<Vec<u8>>>();
+        drop(sender);
+        assert_eq!(
+            receive_command_pipe(receiver, Instant::now() + Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Other
+        );
+        let (_sender, receiver) = std::sync::mpsc::channel::<io::Result<Vec<u8>>>();
+        assert_eq!(
+            receive_command_pipe(receiver, Instant::now())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 
     #[test]
     fn strict_expiry_after_reap_and_pipe_eof_never_kills_the_group() {

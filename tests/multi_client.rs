@@ -132,11 +132,13 @@ fn wait_for_file(path: &Path, timeout: Duration) {
 }
 
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket_path: &Path) -> SpawnedFlock {
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -209,11 +211,7 @@ fn spawn_client_process(
 }
 
 fn server_log_path(config_home: &Path) -> PathBuf {
-    let app_dir = if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    };
+    let app_dir = support::paths::app_dir_name();
     config_home.join(app_dir).join("flock-server.log")
 }
 

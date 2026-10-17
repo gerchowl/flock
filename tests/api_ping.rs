@@ -137,11 +137,13 @@ fn spawn_flock_with_options(
     path_override: Option<&Path>,
     shell: &str,
 ) -> SpawnedFlock {
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -359,11 +361,7 @@ fn server_state_is_isolated_between_fixtures() {
         let socket = runtime.join("flock.sock");
         servers.push(spawn_flock(&config, &runtime, &socket));
 
-        let app = if cfg!(debug_assertions) {
-            "flock-dev"
-        } else {
-            "flock"
-        };
+        let app = support::paths::app_dir_name();
         wait_for_path(
             &config.join("state").join(app).join("mesh-mail.sqlite"),
             Duration::from_secs(5),

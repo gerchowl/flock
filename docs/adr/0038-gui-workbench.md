@@ -115,6 +115,62 @@ Operations, the same in every shell:
 
 **Phone.** One tile is visible at a time. A tile switcher replaces splits, and the rail becomes a bottom sheet. `expand_into_second` pushes the second tile with a back gesture to its origin. The keyboard accessory bar of #1402 belongs to the composer, not to the tile manager.
 
+### 2a. The MVP workbench: what the person sees and does
+
+§2 defines the tile mechanics. This section defines the screen they serve. The first client preview built §2 literally: a subject/kind/placement form and per-tile buttons. The owner rejected its look and UX, and on 2026-10-17 chose the "Mission control" wireframes for the MVP (owner decision 11: typed by the owner, relayed by the GUI architect). The rule that follows: **the tile manager is machinery under the screen, never the screen itself.** No raw subject, kind or placement field appears in the product.
+
+**Desktop: three regions.**
+
+| Region | Content | Behaviour |
+|---|---|---|
+| **Sidebar** (left, fixed width, collapsible) | §1's trees. A *Projects / Nodes* toggle, then groups (a project's agents, *Architects*, other projects folded to one row each with a count such as "3 idle" or "2 blocked"). | Each agent row: a status mark, the agent name and its task, one line of current activity, and a count of its open inbox items. A click focuses the agent in the centre. |
+| **Focus pane** (centre) | The focused agent's tile (§2), by default one `transcript` tile. | A header line: agent, task and goal, PR, branch, model, a state chip with its age, and the actions *Terminal*, *Diff* and *Fork*. The transcript reads as turns. A tool run is one line (command, exit code, duration) that expands on demand. Older turns fold to "N earlier turns". A composer sits at the bottom and says what will happen to a message: queued until the turn ends, or delivered now. |
+| **Inbox** (right, fixed width, collapsible) | §1's attention queue: questions, permission prompts, feedback requests and question threads (#1717), blocking first. | Every card answers in place: one button per choice, plus *Edit…* for free text and *Take as thread*. A thread card shows its message count and, once the fork has an answer, *Review and merge back*. Below the cards, *Recent* lists the last few landed or notable events. |
+
+- **One command palette** (⌘K, and a search field in the top bar) jumps to any agent, issue or PR and runs commands. It is the only way to "open a subject" by name.
+- **Splits are an advanced action.** `split_right`, `tab` and `expand_into_second` are reached from a tile's menu, the palette, or by following a reference (an artifact link in a transcript opens beside it). The default is one tile. The rail holds collapsed tiles as chips in the focus pane's header strip.
+- **Top bar:** product mark, search/palette, node summary ("2 nodes live"), agent summary ("9 agents · 7 working") and *New agent*.
+
+**Phone: inbox first.**
+- A bottom tab bar: **Inbox** (the default screen), **Agents** and **Activity**.
+- **Inbox:** cards as on desktop, with primary actions as full-width 48 px buttons. A header line says whether anything is blocked on the person.
+- **Agent screen:** a back control, the agent's name and state, and a segmented control *Summary · Transcript · PR · Terminal*. *Summary* shows the goal with step chips (done, running, next), the latest turn, and any open thread with its *Merge back* action. The composer is pinned to the bottom.
+- No splits on a phone. `expand_into_second` pushes a screen, and back returns to its origin (§2 Phone).
+
+**Status marks** differ in lightness and in shape, never in hue alone:
+
+| State | Mark | Use |
+|---|---|---|
+| working | filled circle, blue | turn in progress |
+| needs you | filled circle, amber, with a count badge | an open blocking item |
+| idle or held | square, grey | no turn, nothing open |
+| done or passed | check, green | a settled step or check |
+| failed or blocked | outlined circle, dark red | a failed step, or a blocked agent with no open item |
+
+**Visual baseline:**
+- Light and dark themes from one token set: ground, surface, ink, muted ink, border, plus the four status colours. Text meets 4.5:1 contrast in both themes.
+- The system UI font stack and a system monospace. §6's bundle rule (no web fonts at runtime) stands. The wireframes' typeface is not a requirement.
+- 14 px body text on desktop and 15 px on the phone. Every touch target is at least 44 px.
+
+**What provides each part, and what waits.** The MVP is what S7-min (#1746), G3a (#1747) and G2 deliver. The rest of the screen is drawn now and filled later:
+
+| Part | Provided by | In the MVP |
+|---|---|---|
+| Sidebar agent rows (status, task, activity) | S7-min's fleet-lite list, live before G4. The full trees, node grouping and *Projects / Nodes* come with G4 #1596. | yes, flat list of local structured agents |
+| Focus pane transcript and composer | G3a over S7-min (`agent/<id>`, `agent.send`) | yes |
+| Inbox cards with in-place answers | G5 #1597 (inbox stream); S6-MVP for permission prompts | fixture data until G5 |
+| *Take as thread*, *Review and merge back* | #1717 (question threads) | post-MVP |
+| *Terminal* and *Diff* actions, phone *Terminal* tab | the `terminal` tile (no slice yet) and the reserved `diff` kind | post-MVP |
+| *Fork* | ADR-0036 S12 (forks at any boundary) | post-MVP |
+| Phone *PR* tab, palette search over issues and PRs | a PR/issue source (no slice yet) | post-MVP: the MVP palette searches agents only |
+| Phone *Activity* tab and *Recent* list | the `events` stream (S7-rest) | post-MVP |
+| *New agent* | ADR-0036 S17 (harness, model and effort picker) | post-MVP |
+| Node summary ("2 nodes live") | G4 #1596 and the mesh | post-MVP: the MVP shows this node only |
+
+A post-MVP part is either hidden in the MVP, or shown disabled with the name of what it waits for. It is never a button that does nothing.
+
+**Out of the MVP:** an *Agent board* (agents as cards in columns: needs you, working, idle) was the rejected alternative for the main screen. It may return later as a second view of the same data (Alternatives considered).
+
 ### 3. The client state machine
 
 The client follows ADR-0036 §5: **it holds no session logic and computes nothing the server has not sent.** This record makes that line precise.
@@ -245,7 +301,8 @@ The **progress deadline** runs while a stream waits for `synced` or for a snapsh
       - Recovery for a reader who needs the missing turns is outside the client: the operator restores the session stream from a backup, if one exists. Otherwise the range is gone.
 - **`*/live` streams** (partial deltas, no cursor) are re-subscribed after every reconnect, with no `after`. In-flight blocks are dropped (§4).
 - **Stale.**
-  - Entered when no valid server frame, `ping` included, has arrived within the liveness window (45 s). A stalled stream or a missing `ack` never tears the connection down. Only a missed heartbeat, a lost socket, a protocol error, an expired connect or handshake deadline, or a close with 4401 or 4403 does.
+  - Entered when no valid server frame, `ping` included, has arrived within the liveness window (45 s). A stalled stream or a missing `ack` never tears the connection down. Only a missed heartbeat, a lost socket, a protocol error, an expired connect or handshake deadline, or a close with 4401 (auth refused at `hello`) or 4403 (token revoked) does.
+  - **A server handoff** is not a teardown cause of its own. Under ADR-0036 §5a's single-writer handoff, the old server keeps serving reads until the fenced ownership transfer. Its 10 s deadline covers the whole handoff. Meanwhile, new commands get an error `ack` with `restart_pending`, which fails them like any other error `ack`. At the transfer, the old server closes every `/v1/ws` socket. The client sees that as socket lost → Reconnecting, and resends under the outbox rules below. A failed handoff (`handoff_failed`) keeps the old server serving, and the connection never notices it.
   - Tiles keep their content with a visible stale marker. The outbox is **held**.
   - Reconnecting uses the backoff in the parameter table. A network-change or foreground event cancels it for one immediate attempt, and a foreground event first closes a socket that may have been suspended.
   - The client always offers `disconnect`, which cancels the attempt and its timer. While it reconnects it shows the latest failure.
@@ -266,12 +323,14 @@ The **progress deadline** runs while a stream waits for `synced` or for a snapsh
 | Command state | Meaning | Exits |
 |---|---|---|
 | `pending` | queued, not yet sent | Live → sent with `resume_only: false` → `sent` |
-| `sent` | on the current socket, waiting for its `ack`: a first send (`resume_only: false`) or a resend (`resume_only: true`) | `ack` ok → `acked`; an error `ack` refusing a resume-only lookup as uncertain (`session_unconfirmed`, or an absent or expired key) → `unknown outcome`; any other error `ack` → `failed`; the ack deadline (30 s) → `uncertain`; socket lost → waits for the resend below |
+| `sent` | on the current socket, waiting for its `ack`: a first send (`resume_only: false`) or a resend (`resume_only: true`) | `ack` ok → `acked`; an error `ack` refusing a resume-only lookup as uncertain (`session_unconfirmed`, or an absent or expired key) → `unknown_outcome`; any other error `ack` → `failed`; the ack deadline (30 s) → `uncertain`; socket lost → waits for the resend below |
 | `uncertain` | its delivery is unknown; the connection stays up, and nothing is resent on the same socket | a late `ack` on the same socket → as for `sent`; socket lost → waits for the resend below |
-| `unknown outcome` | the client cannot learn whether it ran | none automatic: the user inspects the subject's server state and decides on any new command |
+| `unknown_outcome` | the client cannot learn whether it ran ("unknown outcome" in the prose below and in the UI) | none automatic: the user inspects the subject's server state and decides on any new command |
 | `acked`, `failed` | settled by the server | none |
 
-- **Resend after a reconnect.** A `sent` or `uncertain` command whose socket was lost is resent when the connection is next Live, and becomes `sent` again (if that socket is lost too, it is resent again after the next reconnect, still within the window), under the same principal, with the same `cmd_id`, `verb` and `args` and `resume_only: true`, and only within the `idempotency_window_ms` that `welcome` reports, counted from the first send. The server answers with the first `ack`, or refuses the lookup when it holds no claim (`session_unconfirmed`), which makes the command `unknown outcome`.
+- **State tokens.** The client-observable command states are this closed set: `pending`, `sent`, `uncertain`, `unknown_outcome`, `acked`, `failed`. Fixtures, the store and generated types use exactly these tokens. ADR-0036 §5a uses "uncertain" in two senses, neither of them a seventh state: the ack deadline passing, which is the client's `uncertain` state, and a resume-only lookup the server refuses "as uncertain" (`session_unconfirmed`, or an absent or expired key), which makes the command `unknown_outcome`, as in the `sent` row.
+- **Window expiry runs in every connection state.** For each `sent` or `uncertain` command, the client checks its age against `idempotency_window_ms` (from the last `welcome`, persisted with the outbox) in every connection state: Connecting, Hello, Syncing, Live, ReadOnly, Stale, Reconnecting, NeedsToken, and after a user `disconnect`. It does not check only when a resend would go out. A command is expired when its age is **at least** `idempotency_window_ms` (age ≥ window, where age is measured from its first send). Age is evaluated at the instant of each event that could change the command, such as the actual reconnect attempt or the `welcome` that follows it, never at a deadline's upper bound. A connect attempt that happens before the window edge still resends the command, even if the connect deadline would have run past it. At expiry the command becomes `unknown_outcome` at once, so the UI never shows a command as "will be resent" after its window has passed. A `pending` command has no first send, so no window applies to it. It waits for Live, unless a changed principal drops the outbox (ADR-0036 §5a). An `uncertain` command that expires while its socket is still up also becomes `unknown_outcome`, so a very late `ack` on that same socket is dropped. This is intended: the window defaults to 24 h, and the client has already told the person that the outcome is unknown.
+- **Resend after a reconnect.** A `sent` or `uncertain` command whose socket was lost is resent when the connection is next Live, and becomes `sent` again (if that socket is lost too, it is resent again after the next reconnect, still within the window), under the same principal, with the same `cmd_id`, `verb` and `args` and `resume_only: true`, and only within the `idempotency_window_ms` that `welcome` reports, counted from the first send. The server answers with the first `ack`, or refuses the lookup when it holds no claim (`session_unconfirmed`), which makes the command `unknown_outcome`.
 - **Unknown outcome** also follows, without a resend, when the window has passed by the time the resend would go out, or when the client cannot establish a command's age after a restart. It is never resent automatically and never re-sent under a new `cmd_id`: the original may still run once, because it can arrive late on the dead socket after the lookup was refused. So the client says "unknown outcome", never "cancelled" or "not run". `session_unconfirmed`'s `retry: later` permits only the same resume-only resend, never a first send.
 - **Optimism is visual only.** A pending command marks its subject "pending" and never changes an entity. The entity changes when the server's event arrives.
 - **Answers are atomic.** An answer to a question or a permission prompt is the server's atomic verify-then-apply (ADR-0011 §6: same question id, index not text). A stale answer comes back as `failed` with the question's current state.
@@ -522,7 +581,7 @@ Each slice is at most about 400 production lines; TypeScript counts the same. **
 | S8a | `ts` feature and ts-rs derives for types that exist today: the socket API types the client needs first (agents, workspaces, panes, questions) and ADR-0036 S1's `SessionEvent` (landed). Drift test, `just gen-ts`. This splits ADR-0036 S8. | — | yes | 200 |
 | S7a | The §5 wire message types as Rust types with ts derives: `hello`, `welcome`, `sub`, `unsub`, `cmd`, `ev`, `synced`, `gap` (with `snapshot_to`), `lagged`, `ack`, and what ADR-0036 §5a adds: `ping`, `pong`, `subfail`, the 4401 and 4403 close codes, and `welcome`'s recovery fields. Also the scripted fake-server fixture format. Types only, with no endpoint. This splits ADR-0036 S7. | #1546 settled (ADR-0036 §5a) | yes | 200 |
 | G1 | Client shell skeleton (Solid, built with Vite + `vite-plugin-solid`, Bun as package manager and test runner), with a fixture transport that replays recorded S1 session fixtures (#1379) as `SessionEvent`s through the S8a types. No wire frames. | S8a | yes | 400 TS |
-| G2 | Tile manager: layout tree, stacks, rail, the open/expand/collapse/close operations, per-device persistence, the phone mode | G1 | yes | 400 TS |
+| G2 | Tile manager: layout tree, stacks, rail, the open/expand/collapse/close operations, per-device persistence, the phone mode, rendered as §2a's MVP workbench (three regions on desktop, inbox-first tabs on the phone, command palette; the sidebar and inbox regions show fixture data until G4 and G5) | G1 | yes | 400 TS |
 | G3 | Client state machine: the §3 lifecycle, cursors, store, outbox; tested against a scripted fake server built on S7a's types: each §3 deadline, heartbeat and stale, gap with snapshot (including the empty and bootstrap forms), lagged, each `subfail` code, the progress deadline, protocol and version gaps, 4401 and 4403, and an `uncertain` command resent with `resume_only` | G1, S7a | yes | 400 TS |
 | S7 | The wire endpoint (ADR-0036), implementing S7a's types, with ADR-0036 §5a's liveness and recovery | S3 (S3a #1518/#1439, S3b #1426), S7a | no | 350 |
 | S8b | ts derives for the cmd params and result types and the §5 stream payloads the endpoint adds | S7 | no | 150 |
@@ -544,7 +603,7 @@ The first end-to-end milestone is **"a structured agent in a browser tile"**: G1
 
 ### 11. Owner decisions (decided by the owner, 2026-10-16, recorded on #1591)
 
-Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day.
+Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day. Item 11 was added on 2026-10-17, when the owner chose between two wireframe directions after rejecting the first preview.
 
 | # | Decision | Outcome | Consequence |
 |---|---|---|---|
@@ -558,6 +617,7 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 | 8 | A separate versioned graph engine for goals and work | **Decided: not now.** The event log covers typed nodes and edges, actors and history. | No branch and merge of plans for now. |
 | 9 | Layout persistence | **Decided: client-local per device**; server-synced named layouts later | A layout doesn't follow you between devices. |
 | 10 | Client build tool (added 2026-10-16) | **Decided: Vite with `vite-plugin-solid`.** Bun remains the package manager and test runner. Output stays static assets embedded by `rust-embed`, and the Tauri v2 shell loads the same bundle. | Hot reload in development and the standard Tauri v2 setup. A Vite config joins the toolchain, pinned through `bun.lock`. ADR-0036 §7 is amended to match. |
+| 11 | MVP workbench design (added 2026-10-17, after the owner rejected the first preview's look and UX) | **Decided: "Mission control"** (§2a): sidebar, focus pane and inbox on desktop; inbox-first tabs on the phone | The tile manager becomes machinery under that screen. G2's views follow §2a. |
 
 ## Failure modes and known limits
 
@@ -599,6 +659,7 @@ vig-os/revkit (Apache-2.0) is an HTML-first review surface: rendered docs and AD
 - **Amend ADR-0036 instead of a new record.** Rejected. ADR-0036 is the session runtime's record. A GUI record also has to reconcile ADR-0011 and ADR-0012, and add records for artifacts and work that are not session concerns.
 - **A server-rendered UI (htmx or similar).** Rejected. ADR-0036 decided client rendering, and it would need a second render path for Tauri.
 - **Layout synced through the server from day one.** Deferred. There is no multi-device demand yet, and a layout would become state that someone must migrate.
+- **An agent board as the main screen (§2a).** Agents as cards in columns (needs you, working, idle), with the selected agent in a side panel; on the phone, a filtered card feed. Not chosen for the MVP (owner decision 11): it shows every agent at once but makes the person hunt for what needs them, and it has no standing inbox. It may return as a second view of the same data.
 - **Artifacts on a second hostname (ADR-0011 §5).** Superseded by the opaque-origin sandbox. A second hostname needs DNS or a tailnet node per install and doesn't exist in Tauri.
 
 ## Consequences

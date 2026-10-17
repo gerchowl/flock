@@ -59,6 +59,43 @@ jobs:
     with:
       leg: ubuntu-latest
 
+  # The web client (ADR-0038 G1): lockfile install, bun tests, the fixture
+  # screenshots, the strict type check and the Vite build. One platform is
+  # enough: the bundle is static assets. It reports as its own `client` check.
+  client:
+    name: client
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust tools
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: just
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install Chromium for the screenshot test
+        run: just client-browsers
+
+      - name: Client check
+        run: just client-check
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: client-screenshots
+          path: web/client/artifacts/screenshots/
+          if-no-files-found: error
+
   # Pinned to macos-15, NOT macos-latest: GitHub rotated macos-latest to the
   # macOS 26 ("Tahoe") image, whose SDK the vendored libghostty-vt zig 0.15.2
   # build can't link against (undefined libSystem symbols like
