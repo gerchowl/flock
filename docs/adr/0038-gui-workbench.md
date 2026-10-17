@@ -252,6 +252,8 @@ Seq streams come in two kinds, and a `gap` means something different on each:
 
 A `gap` of the wrong kind for its stream is a protocol error: close → Reconnecting.
 
+**Sub ids and closed subs.** A `sub_id` is unique for the life of a connection: the client never reuses one, even for the same stream, so one transport and one id counter serve every view on that connection. `unsub` crosses the wire, so the server may still deliver frames for a sub the client has already closed (`ev`, `gap`, `synced`, `lagged` or `subfail`). After the client sends `unsub`, or receives `subfail`, it silently drops every frame for that `sub_id`. Such a frame is not a protocol error and never touches another stream's state. A frame for a `sub_id` the client never opened on this connection is still a protocol error.
+
 The **progress deadline** runs while a stream waits for `synced` or for a snapshot's end. It starts when the `sub` is sent, or when a `gap` starts Resyncing on a Current stream. Only a frame that advances that `sub` resets it: a newly applied seq, an advancing `gap` or snapshot boundary, or its `synced`. Duplicates, a repeated identical `gap`, other streams' frames and heartbeats do not. On expiry the client sends `unsub`, then a new `sub` from the applied cursor and the stored resync marker. The connection and the other streams stay up, and the stream's tiles show it recovering. A replay that keeps advancing may take longer than 30 s in total.
 
 | Stream state | Exits |
