@@ -1,10 +1,11 @@
 //! Monotonic transport clock and bounded heartbeat state (ADR-0036 §5a).
 use crate::structured_wire::{HEARTBEAT_INTERVAL_MS, LIVENESS_WINDOW_MS};
 use futures_util::future::BoxFuture;
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
+/// Valid-pong and outstanding-nonce lifetime on the monotonic clock.
+const LIVENESS_WINDOW: Duration = Duration::from_millis(LIVENESS_WINDOW_MS);
+/// Maximum retained outstanding ping identities per socket.
+const MAX_OUTSTANDING_PINGS: usize = 3;
 /// Supplied monotonic clock; deadlines share the same origin as received frames.
 pub(crate) trait Clock: Send + Sync {
     /// Current monotonic instant, in the same domain as every deadline.
@@ -26,7 +27,7 @@ impl Clock for SystemClock {
 pub(super) struct Heartbeat {
     pub last_pong: Instant,
     pub next_ping: Instant,
-    pending: VecDeque<(String, Instant)>,
+    pending: Vec<(String, Instant)>,
     sequence: u64,
 }
 impl Heartbeat {
@@ -34,30 +35,31 @@ impl Heartbeat {
         Self {
             last_pong: now,
             next_ping: now + Duration::from_millis(HEARTBEAT_INTERVAL_MS),
-            pending: VecDeque::new(),
+            pending: Vec::new(),
             sequence: 0,
         }
     }
     pub fn expires(&self) -> Instant {
-        self.last_pong + Duration::from_millis(LIVENESS_WINDOW_MS)
+        self.last_pong + LIVENESS_WINDOW
     }
     pub fn ping(&mut self, now: Instant, prefix: &str) -> Option<String> {
         self.sequence = self.sequence.checked_add(1)?;
         let nonce = format!("{prefix}/{}", self.sequence);
-        self.pending.retain(|(_, sent)| {
-            now.duration_since(*sent).as_millis() < u128::from(LIVENESS_WINDOW_MS)
-        });
-        if self.pending.len() == 3 {
-            self.pending.pop_front();
+        self.pending
+            .retain(|(_, sent)| now < *sent + LIVENESS_WINDOW);
+        if self.pending.len() == MAX_OUTSTANDING_PINGS {
+            self.pending.remove(0);
         }
-        self.pending.push_back((nonce.clone(), now));
+        self.pending.push((nonce.clone(), now));
         self.next_ping = now + Duration::from_millis(HEARTBEAT_INTERVAL_MS);
         Some(nonce)
     }
     pub fn pong(&mut self, nonce: &str, now: Instant) {
-        if let Some(at) = self.pending.iter().position(|(n, sent)| {
-            n == nonce && now.duration_since(*sent).as_millis() < u128::from(LIVENESS_WINDOW_MS)
-        }) {
+        if let Some(at) = self
+            .pending
+            .iter()
+            .position(|(n, sent)| n == nonce && now < *sent + LIVENESS_WINDOW)
+        {
             self.pending.remove(at);
             self.last_pong = now;
         }

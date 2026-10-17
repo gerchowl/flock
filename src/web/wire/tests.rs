@@ -90,7 +90,7 @@ impl Clock for TestClock {
     }
 }
 struct Server {
-    core: Core,
+    core: Arc<Core>,
     bind: std::net::SocketAddr,
     task: tokio::task::JoinHandle<()>,
     clock: TestClock,
@@ -98,6 +98,9 @@ struct Server {
 }
 impl Server {
     async fn new() -> Self {
+        Self::with_clock(|clock| Arc::new(clock)).await
+    }
+    async fn with_clock(wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>) -> Self {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let dir = root.path().join("client-tokens");
@@ -109,11 +112,8 @@ impl Server {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         let clock = TestClock::new();
-        let core = Core::with_clock(
-            TokenStore::open(root.path()).unwrap(),
-            Arc::new(clock.clone()),
-        )
-        .unwrap();
+        let core =
+            Core::with_clock(TokenStore::open(root.path()).unwrap(), wrap(clock.clone())).unwrap();
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind = socket.local_addr().unwrap();
         let router = core.router();
@@ -121,7 +121,7 @@ impl Server {
             axum::serve(socket, router).await.unwrap();
         });
         Self {
-            core,
+            core: Arc::new(core),
             bind,
             task,
             clock,
@@ -355,7 +355,7 @@ fn heartbeat_matches_only_current_non_replayed_nonces_and_expiry_is_exact() {
         server.clock.advance(15_000);
         assert!(matches!(
             client.receive().await,
-            Received::Close(_) | Received::End
+            Received::Close(GOING_AWAY_CLOSE)
         ));
         server.finish().await;
     });
@@ -380,7 +380,7 @@ fn old_socket_nonce_and_control_pongs_cannot_renew_json_liveness() {
         server.clock.advance(30_000);
         assert!(matches!(
             second.receive().await,
-            Received::Close(_) | Received::End
+            Received::Close(GOING_AWAY_CLOSE)
         ));
         server.finish().await;
     });
@@ -790,7 +790,10 @@ fn unknown_post_hello_operations_and_binary_frames_execute_nothing() {
         let mut binary = Socket::open(&server).await;
         binary.hello(1, &"a".repeat(64)).await;
         binary.raw(b"binary", 0x82).await;
-        assert!(matches!(binary.receive().await, Received::Close(1001)));
+        assert!(matches!(
+            binary.receive().await,
+            Received::Close(POLICY_VIOLATION_CLOSE)
+        ));
         server.finish().await;
     });
 }
@@ -860,4 +863,87 @@ fn abandoned_writer_releases_the_sink_without_waiting_for_the_peer() {
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(clock.0.elapsed.load(Ordering::SeqCst), 0);
     });
+}
+
+/// A pending deadline is dropped when its protected producer completes.
+struct OnVerified(Option<Box<dyn FnOnce() + Send>>);
+impl Drop for OnVerified {
+    fn drop(&mut self) {
+        if let Some(action) = self.0.take() {
+            action();
+        }
+    }
+}
+type Revocation = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+struct RevokeClock {
+    clock: TestClock,
+    calls: AtomicU64,
+    action: Revocation,
+    at: u64,
+}
+impl Clock for RevokeClock {
+    fn now(&self) -> Instant {
+        self.clock.now()
+    }
+    fn until(&self, end: Instant) -> BoxFuture<'_, ()> {
+        let guard = OnVerified(if self.calls.fetch_add(1, Ordering::SeqCst) == self.at {
+            self.action.lock().unwrap().take()
+        } else {
+            None
+        });
+        let deadline = self.clock.until(end);
+        Box::pin(async move {
+            let _guard = guard;
+            deadline.await
+        })
+    }
+}
+#[test]
+fn revocation_between_verification_and_registration_never_welcomes() {
+    runtime(revoke_during_hello(1, 0));
+}
+#[test]
+fn revocation_after_storage_recheck_never_welcomes() {
+    runtime(revoke_during_hello(3, 1));
+}
+async fn revoke_during_hello(at: u64, registered: usize) {
+    let action = Arc::new(Mutex::new(None));
+    let server = Server::with_clock(|clock| {
+        Arc::new(RevokeClock {
+            clock,
+            calls: AtomicU64::new(0),
+            at,
+            action: action.clone(),
+        })
+    })
+    .await;
+    let core = Arc::downgrade(&server.core);
+    let session = server
+        .core
+        .shared
+        .store
+        .authenticate(&Bearer("a".repeat(64)))
+        .unwrap();
+    let path = server._root.path().join("client-tokens/one.token");
+    let fired = Arc::new(AtomicU64::new(0));
+    let observed = fired.clone();
+    *action.lock().unwrap() = Some(Box::new(move || {
+        let core = core.upgrade().expect("transport owner must remain live");
+        assert_eq!(
+            core.shared.clients.lock().unwrap().len(),
+            registered,
+            "revocation must fire at the requested handshake stage"
+        );
+        fs::remove_file(path).unwrap();
+        core.revoke(&session);
+        observed.fetch_add(1, Ordering::SeqCst);
+    }));
+    let mut client = Socket::open(&server).await;
+    client.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
+    assert!(matches!(
+        client.receive().await,
+        Received::Close(AUTH_REVOKED_CLOSE)
+    ));
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+    server.finish().await;
 }

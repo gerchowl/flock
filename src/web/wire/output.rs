@@ -8,12 +8,10 @@ pub(super) async fn writer<S: Sink<Message> + Unpin>(
     mut priority: mpsc::Receiver<Message>,
     mut data: mpsc::Receiver<ServerFrame>,
 ) {
-    loop {
-        let frame = tokio::select! { biased;
+    while let Some(frame) = tokio::select! { biased;
             frame = priority.recv() => frame,
             frame = data.recv() => match frame { Some(frame) => encode(frame), None => return },
-        };
-        let Some(frame) = frame else { return };
+    } {
         let closing = matches!(frame, Message::Close(_));
         if !matches!(
             before(
@@ -23,10 +21,8 @@ pub(super) async fn writer<S: Sink<Message> + Unpin>(
             )
             .await,
             Some(Ok(()))
-        ) {
-            return;
-        }
-        if closing {
+        ) || closing
+        {
             return;
         }
     }

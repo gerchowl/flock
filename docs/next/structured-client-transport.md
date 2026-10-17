@@ -20,7 +20,8 @@ random server epoch and 24-hour idempotency-window metadata. The epoch is fresh
 per core and never resets durable cursors. A newer client receives the server's
 wire version and no command capability. This transport-only slice advertises no
 capabilities to any client; subscriptions and command dispatch arrive in their
-already assigned later slices. Other post-hello data operations close with 1008.
+already assigned later slices. Binary frames and other non-protocol post-hello
+data operations are policy violations and close with 1008.
 There is no command admission, structured start or claim of durable journaling.
 
 Application JSON pings run every 15 seconds independently of other traffic. Each
@@ -31,8 +32,11 @@ No valid pong for 45 seconds ends the socket and releases its resources. The
 initial baseline is the successful welcome. A supplied monotonic clock governs
 handshake, write and heartbeat deadlines; wall-clock changes grant no liveness.
 
-There are at most 16 upgraded sockets, including unauthenticated hellos. Each
-connection has an eight-message data queue and a four-message priority queue.
+There are at most 16 upgraded sockets, including unauthenticated hellos.
+A single token, or 16 slow unauthenticated hellos, can occupy all 16 slots.
+This slot-hogging limit needs the hosting guards in #1894; the core applies no
+per-token fairness or pending-hello quota. Each connection has an eight-message
+data queue and a four-message priority queue.
 The writer checks priority between data writes. Frames and reassembled messages
 are capped at 64 KiB, and outgoing serialization stops at that cap rather than
 first allocating an arbitrarily large JSON string. Compression is never
@@ -43,8 +47,10 @@ rather than growing a backlog. Oversized server output also ends the socket.
 The core owns verified token-to-socket identities until teardown. The future
 command slice calls its 4403 fan-out only after the triggering auth_revoked ack
 has been written, within the existing write/liveness bound. The primitive closes
-all currently registered sockets for that principal, leaving other principals
-alone. No filesystem watcher or automatic command-time revocation route is added
+all registered sockets for that principal, leaving other principals alone.
+A verified socket registers before welcome and rechecks current token storage
+after registration; revocation in that gap closes 4403 without welcome. No
+filesystem watcher or automatic command-time revocation route is added
 here; the command slice must recheck storage before dispatch as ADR-0036 requires.
 Closing the core cancels pending hellos and authenticated sockets. Explicit
 shutdown waits up to five seconds for connection leases and reports failure to
