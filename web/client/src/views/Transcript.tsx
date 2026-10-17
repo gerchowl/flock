@@ -44,7 +44,21 @@ export type TranscriptProps = {
   readonly transport: Transport;
   readonly stream: SessionStream;
   readonly source: TranscriptSource;
+  /** Told each person's message the stream shows: its seq and text. */
+  readonly onUserText?: (seq: number, text: string) => void;
 };
+
+/** A person's message text: a `user` event's string content, or its text blocks. */
+function userText(entry: SessionEntry): string | null {
+  if (entry.kind !== "known" || entry.event.type !== "user") return null;
+  const content = entry.event.message["content"];
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return null;
+  const texts = content.flatMap((block) =>
+    typeof block === "object" && block !== null && !Array.isArray(block) && block["type"] === "text" && typeof block["text"] === "string" ? [block["text"]] : [],
+  );
+  return texts.length > 0 ? texts.join("\n") : null;
+}
 
 const WORDING = {
   replay: { loading: "Replaying…", synced: (count: number) => `End of recording · ${count} events`, failed: "Replay failed" },
@@ -184,7 +198,11 @@ export function Transcript(props: TranscriptProps): JSX.Element {
   const [entries, setEntries] = createStore<SessionEntry[]>([]);
   const [progress, setProgress] = createSignal<Progress>({ phase: "replaying" });
   const subscription = props.transport.subscribe(props.stream, null, {
-    entry: (entry) => setEntries(entries.length, entry),
+    entry: (entry) => {
+      setEntries(entries.length, entry);
+      const text = userText(entry);
+      if (text !== null) props.onUserText?.(entry.seq, text);
+    },
     reset: () => setEntries([]),
     synced: () => setProgress({ phase: "synced" }),
     failed: (failure) => setProgress({ phase: "failed", failure }),

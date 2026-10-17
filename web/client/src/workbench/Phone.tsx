@@ -11,6 +11,7 @@ import { For, Match, Show, Switch, createSignal, createUniqueId, onCleanup, type
 import type { AgentRow } from "../fleet";
 import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
+import { Composer, type ComposerState, type Sender } from "./Composer";
 import type { InboxCard } from "./inbox";
 import { AgentRowButton, AgentTitle, InboxCards, Waits } from "./parts";
 
@@ -26,6 +27,8 @@ export type PhoneProps = {
   readonly transport: Transport;
   readonly source: TranscriptSource;
   readonly inbox: readonly InboxCard[];
+  readonly sender: Sender | null;
+  readonly composer: ComposerState;
 };
 
 type Tab = "inbox" | "agents";
@@ -114,8 +117,14 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
               <span id={terminal}>Terminal waits for the terminal tile.</span>
             </p>
             <div class="phone__body">
-              <Transcript transport={props.transport} stream={`agent/${agent}`} source={props.source} />
+              <Transcript
+                transport={props.transport}
+                stream={`agent/${agent}`}
+                source={props.source}
+                onUserText={(seq, text) => props.composer.echo(agent, seq, text)}
+              />
             </div>
+            <Composer agent={agent} row={props.row()} sender={props.sender} state={props.composer} />
           </main>
           );
         }}
