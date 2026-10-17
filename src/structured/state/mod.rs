@@ -2,12 +2,12 @@
 //!
 //! Own one reducer per `agent_id` and launch generation. #1439 feeds its stream
 //! and publishes snapshots through agent.get/list; #1746 consumes the same seam
-//! for agent/<id> and fleet-lite. Control answers are host facts, not stdout
+//! for `agent/<id>` and fleet-lite. Control answers are host facts, not stdout
 //! control_response events (those answer requests initiated by the host).
 //! Exit and top-level result retire all open requests; CLI control_cancel_request
 //! retires only its named id. The S0 catalogue lacks cancellation, but the CLI
 //! emits it and the official SDK receiver handles it by request_id:
-//! https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py
+//! <https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py>
 //! Only rejected establishes a provider limit. allowed/allowed_warning clear it.
 //! Unknown statuses are ignored, preserving the last known observation (ADR-0028 §3a).
 //!
@@ -101,7 +101,7 @@ impl SessionState {
     }
 
     /// Reduce one fact using monotonic time for ages and Unix ms for reset times.
-    /// `stall_after` is the caller's [sessions] stall_ms policy, not a guessed
+    /// `stall_after` is the caller's `[sessions] stall_ms` policy, not a guessed
     /// turn timeout. Call Observe at its boundary; never poll or kill on silence.
     pub fn reduce(
         &mut self,
