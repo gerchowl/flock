@@ -2391,6 +2391,83 @@ mod tests {
         assert_eq!(value["result"]["workspaces"][0]["agent"], "researcher");
     }
 
+    #[tokio::test]
+    async fn codex_session_report_retains_fork_path_without_changing_resume_id() {
+        let mut app = notification_test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("segment")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let id = app.state.workspaces[0].terminal_id(pane).cloned().unwrap();
+        app.state.terminals.get_mut(&id).unwrap().detected_agent = Some(Agent::Codex);
+        let route = app.public_pane_id(0, pane).unwrap();
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let path = root
+            .path()
+            .join("physical.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        for (seq, thread, source) in [(1, "original", "startup"), (2, "child", "fork")] {
+            let request = serde_json::from_value(serde_json::json!({
+                "id":"report", "method":"pane.report_agent_session", "params":{
+                    "pane_id":route,"source":"flock:codex","agent":"codex","seq":seq,
+                    "agent_session_id":thread,"agent_session_path":path,"session_start_source":source
+                }
+            })).unwrap();
+            let response = app.handle_api_request(request);
+            assert!(!response.contains("\"error\""), "{response}");
+            let terminal = &app.state.terminals[&id];
+            let report = terminal.codex_session_start.as_ref().unwrap();
+            assert_eq!(report.thread, thread);
+            assert_eq!(report.source.as_deref(), Some(source));
+            assert_eq!(report.transcript_path.as_deref(), Some(path.as_str()));
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .unwrap()
+                    .session_ref
+                    .value,
+                thread
+            );
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .unwrap()
+                    .session_ref
+                    .kind,
+                crate::agent_resume::AgentSessionRefKind::Id
+            );
+        }
+        assert_eq!(
+            crate::agent_resume::normalize_session_start_source("claude", Some("fork".into())),
+            None
+        );
+        // An older hook cannot overwrite the newer report or its path.
+        let response = app.handle_pane_report_agent_session(
+            "stale".into(),
+            crate::api::schema::PaneReportAgentSessionParams {
+                pane_id: route,
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                seq: Some(1),
+                agent_session_id: Some("original".into()),
+                agent_session_path: None,
+                session_start_source: Some("fork".into()),
+            },
+        );
+        assert!(!response.contains("\"error\""));
+        assert_eq!(
+            app.state.terminals[&id]
+                .codex_session_start
+                .as_ref()
+                .unwrap()
+                .thread,
+            "child"
+        );
+    }
+
     fn notification_test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
