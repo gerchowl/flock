@@ -79,7 +79,8 @@ impl SessionLeases {
                 .map(|entries| entries.clone())
         }
     }
-    /// Reserve a session before preparation/spawn, or return `session_busy`.
+    /// Reserve before preparation/spawn; an existing session returns `session_busy`.
+    /// Registry contention returns `agent_start_failed` without changing either view.
     /// Forks use a new session id; resume and in-place fork cannot share a lease.
     /// `lineage` supplies the parent id and parent depth; None is an operator start.
     pub(crate) fn reserve(

@@ -335,16 +335,16 @@ fn assert_mutation_wait_is_bounded(action: u8) {
         };
         let _ = tx.send(result);
     });
-    // Always release and join before asserting, so an unbounded regression
-    // fails rather than leaving a waiting worker behind.
+    // Release the guard before asserting, so a blocked mutation can finish.
+    // Assert before joining, so a live silent worker cannot hang the test.
     let result = rx.recv_timeout(Duration::from_secs(1));
     drop(guard);
-    worker.join().unwrap();
     assert_eq!(
         result,
         Ok(true),
         "mutation {action} exceeded its fail ceiling"
     );
+    worker.join().unwrap();
 }
 
 #[test]
@@ -385,8 +385,8 @@ fn snapshot_contention_leaves_reservations_unchanged() {
     });
     let result = rx.recv_timeout(Duration::from_secs(1));
     drop(guard);
-    worker.join().unwrap();
     assert_eq!(result, Ok((true, true)));
+    worker.join().unwrap();
 }
 
 #[test]
