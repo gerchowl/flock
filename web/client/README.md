@@ -35,3 +35,13 @@ Run `just client-deps-hash` and commit `nix/client-deps.json`. The file
 records the sha256 of the `bun.lock` its hash was computed from, so a lock
 changed without it fails evaluation with a message that names the file and
 this command. `dist/` is never committed.
+
+### Known limits
+
+- Only x86_64-linux (CI's `nix flake check`) and aarch64-darwin are built.
+  aarch64-linux and x86_64-darwin are only evaluated.
+- A new optional native package is kept for every platform, because only the
+  rolldown and lightningcss bindings are pruned. That costs size, and on
+  Darwin it goes unnoticed, since nothing there needs patching.
+- The hash covers the lock and bun's version (both are in the fetch's name),
+  but not the rest of nixpkgs.

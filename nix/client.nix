@@ -38,7 +38,7 @@ let
   pinned = lib.importJSON ./client-deps.json;
   lockSha256 = builtins.hashFile "sha256" lock;
 
-  # The native packages this platform's build loads (vite's lightningcss and
+  # The native packages the build platform loads while building (vite's lightningcss and
   # rolldown's bindings, and fsevents on macOS); every other platform's are
   # removed before the build.
   suffixes = {
@@ -48,14 +48,15 @@ let
     x86_64-linux = "linux-x64-gnu";
   };
   hostSuffix =
-    suffixes.${stdenv.hostPlatform.system}
-      or (throw "flock-client: no native bindings are known for ${stdenv.hostPlatform.system}");
+    suffixes.${stdenv.buildPlatform.system}
+      or (throw "flock-client: no native bindings are known for ${stdenv.buildPlatform.system}");
 
   deps = stdenvNoCC.mkDerivation {
     pname = "flock-client-deps";
-    # The lock's digest is in the name, so a changed lock never reuses an
-    # output fetched for another one.
-    version = builtins.substring 0 16 lockSha256;
+    # The fetching bun's version and the lock's digest are in the name, so
+    # neither a changed lock nor a bun bump (which may lay node_modules out
+    # differently) reuses an output fetched for another.
+    version = "${bun.version}-${builtins.substring 0 16 lockSha256}";
     src = lib.fileset.toSource {
       inherit root;
       fileset = lib.fileset.unions [
@@ -120,8 +121,9 @@ stdenv.mkDerivation {
     bun
     nodejs
   ]
-  ++ lib.optional stdenv.hostPlatform.isLinux autoPatchelfHook;
-  buildInputs = lib.optional stdenv.hostPlatform.isLinux stdenv.cc.cc.lib;
+  # The bindings run during the build, so the build platform decides.
+  ++ lib.optional stdenv.buildPlatform.isLinux autoPatchelfHook;
+  buildInputs = lib.optional stdenv.buildPlatform.isLinux stdenv.cc.cc.lib;
   configurePhase = ''
     runHook preConfigure
     cp -R ${deps}/node_modules node_modules
@@ -132,8 +134,8 @@ stdenv.mkDerivation {
         *) rm -rf "$binding" ;;
       esac
     done
-    ${lib.optionalString (!stdenv.hostPlatform.isDarwin) "rm -rf node_modules/fsevents"}
-    ${lib.optionalString stdenv.hostPlatform.isLinux "autoPatchelf node_modules"}
+    ${lib.optionalString (!stdenv.buildPlatform.isDarwin) "rm -rf node_modules/fsevents"}
+    ${lib.optionalString stdenv.buildPlatform.isLinux "autoPatchelf node_modules"}
     patchShebangs node_modules
     runHook postConfigure
   '';
