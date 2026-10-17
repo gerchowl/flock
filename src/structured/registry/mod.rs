@@ -131,7 +131,16 @@ impl Registry {
     /// Admit a record before a worker exists. It starts offline, without authority.
     /// A worker must explicitly supply Live after acquiring its actual lease.
     /// Duplicate identity/name/session and unsupported harnesses are refused.
+    /// Retained names are reserved too, without interpreting unknown runtime data.
     pub fn register(&mut self, record: Record) -> Result<u64, RegistryError> {
+        if record.name.as_deref().is_some_and(|name| {
+            self.preserved
+                .iter()
+                .flatten()
+                .any(|raw| raw.get("name").and_then(Value::as_str) == Some(name))
+        }) {
+            return Err(RegistryError::Conflict);
+        }
         let raw = serde_json::to_value(&record).map_err(|_| RegistryError::InvalidRecord)?;
         self.register_raw(record, raw)
     }
@@ -195,7 +204,9 @@ impl Registry {
         Ok(&entry.projection.update)
     }
 
-    /// Remove the matching generation and retained entries sharing its id/name/session.
+    /// Remove the matching generation and retained entries sharing its id/session.
+    /// Known-runtime shadows also match by name; future-runtime names alone do not
+    /// prove identity and must survive removal (#1858).
     /// Compact storage so removed slots cannot accumulate. Runtime cleanup must precede this.
     pub fn remove(&mut self, agent_id: &str, generation: u64) -> Result<Record, RegistryError> {
         if self
@@ -213,14 +224,14 @@ impl Registry {
         let mut compact = Vec::new();
         for (slot, raw) in self.preserved.drain(..).enumerate() {
             let Some(raw) = raw else { continue };
-            let conflicts = raw.get("agent_id").and_then(Value::as_str)
-                == Some(record.agent_id.as_str())
-                || raw.get("session_id").and_then(Value::as_str)
-                    == Some(record.session_id.as_str())
-                || record
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| raw.get("name").and_then(Value::as_str) == Some(name));
+            let conflicts =
+                raw.get("agent_id").and_then(Value::as_str) == Some(record.agent_id.as_str())
+                    || raw.get("session_id").and_then(Value::as_str)
+                        == Some(record.session_id.as_str())
+                    || (raw.get("runtime").and_then(Value::as_str) == Some("structured")
+                        && record.name.as_deref().is_some_and(|name| {
+                            raw.get("name").and_then(Value::as_str) == Some(name)
+                        }));
             if slot != entry.slot && !conflicts {
                 slots[slot] = compact.len();
                 compact.push(Some(raw));

@@ -419,8 +419,11 @@ or harness records, invalid entries and duplicates are skipped with a warning,
 without rejecting any PTY workspace. The first supported id/name/session wins.
 Skipped entries remain raw and in order across saves, including additional
 fields, so rollback cannot erase newer records. Explicit removal also discards
-retained entries sharing the removed id, name or session, preventing a shadowed
-duplicate from becoming active after restart. Removal compacts retained slots.
+retained entries sharing the removed id or session, preventing a shadowed
+duplicate from becoming active after restart. Known-runtime shadows also match
+by name; a future-runtime record sharing only a name has a separate identity
+and survives removal (#1858). Explicit admission refuses any retained name.
+Removal compacts retained slots.
 Known records also retain their original extra fields. An unknown collection shape remains raw
 and inactive; new admission refuses until its shape is understood. Warnings
 contain an index and reason, never raw payloads. The registry exposes a retained
