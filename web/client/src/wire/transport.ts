@@ -46,8 +46,7 @@ export function createWireTransport(connection: WireConnection): Transport {
         open = false;
         unsubscribe();
       };
-      unsubscribe = connection.subscribe(
-        connection.nextSubId("t"),
+      const subscription = connection.subscribe(
         stream,
         {
           event: (seq, ev) => open && observer.entry(sessionEntry(seq, ev)),
@@ -68,6 +67,7 @@ export function createWireTransport(connection: WireConnection): Transport {
         },
         after,
       );
+      unsubscribe = subscription.close;
       return { close };
     },
   };
