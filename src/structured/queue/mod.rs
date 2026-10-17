@@ -349,7 +349,14 @@ impl Journal {
             good += n as u64;
         }
         if good == 0 {
-            return Err(problem("incomplete queue identity"));
+            // No complete first line means there can be no subsequent records.
+            // The identity is only created in an empty file, so rewrite it safely.
+            self.file.set_len(0)?;
+            self.file.rewind()?;
+            self.file.write_all(&encode(&self.identity())?)?;
+            self.file.sync_all()?;
+            tracing::warn!("repaired unterminated queue identity");
+            return Ok(());
         }
         if self.checkpoint.is_some_and(|(_, high)| self.seq < high) {
             return Err(problem("incomplete queue checkpoint"));

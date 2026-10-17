@@ -20,8 +20,10 @@ refused. The data root itself may be an alias such as a canonicalized temp root.
 
 Every journal begins with a synced `{"kind":"queue_identity","agent_id":"..."}`
 header containing the original, case-preserved ID. Open verifies it against the
-requested agent and refuses missing, mismatched, torn or repeated identity
-headers. Checkpoints preserve it. A new empty file receives its identity before
+requested agent and refuses missing, mismatched or repeated complete identity
+headers. An unterminated first line with no records following it is rewritten
+and synced: identity creation only writes into an empty file, so no records
+can be lost. Checkpoints preserve it. A new empty file receives its identity before
 open returns; this header consumes no sequence and is not a replay event. Earlier
 unreleased prototypes without this header are refused rather than adopted under
 an unverified identity.
@@ -72,21 +74,26 @@ immediately; no event is needed to complete it. An initial empty queue returns
 `from:1,to:0,snapshot_to:0`. A cursor ahead of the journal is refused. No cut
 shares a mutable record buffer with future appends or rewrites.
 
-On reopen, the journal is synced unconditionally; only an unterminated final
-record tail after a verified identity is truncated and synced again. Malformed
+On reopen, the journal is synced unconditionally; an unterminated final
+record tail after a verified identity is truncated and synced again. An
+unterminated first identity line is repaired as described above. Malformed
 complete records, oversized lines, non-dense sequences, interior checkpoint
 headers and incomplete snapshots are corruption and fail without repair.
 Unknown string event kinds spend their cursors and remain available in replay,
 but do not change the known materialized state (ADR-0028 §3a). A writer that
 encounters such a kind refuses checkpointing rather than discard state it cannot
-interpret; it can still append known changes. Unknown enum values inside known upserts are retained as typed `Unknown(raw)`
+interpret; it can still append known changes. Unknown enum variant names inside known upserts are retained as typed `Unknown(raw)`
 variants on the item itself, at its recorded position, without failing open.
 They replace an older item with the same ID and preserve positions for later
 upserts, removes and updates. Serialization retains the original raw JSON value;
 rewriting is blocked by detecting `Unknown` variants, never by matching an error
 message. Appending such typed values also blocks rewriting. Unknown fields
 on known events survive in replay and block rewriting rather than being discarded.
-Missing required fields and invalid known changes still fail open. While opaque
+Deserialization inspects the variant name before decoding a known payload.
+Known names with malformed payloads (such as a numeric `system` producer or a
+`channel` without its user), values without a variant name (such as numeric
+state), missing required fields and invalid known changes cause open to fail
+with a corruption error. While opaque
 future kinds, fields or enum values prevent rewrites, appends can grow the journal
 without bound; bounded handling of that condition is tracked in [#1820](https://github.com/gerchowl/flock/issues/1820). Disk operations are blocking worker operations and
 must never run on the server event loop or during render.

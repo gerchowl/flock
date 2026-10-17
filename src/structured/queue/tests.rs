@@ -765,9 +765,8 @@ fn assert_future_data_preserved(extensions: &[&str]) {
 }
 
 #[test]
-fn missing_torn_or_interior_identity_is_refused_without_repair() {
+fn missing_or_interior_identity_is_refused_without_repair() {
     for bytes in [
-        b"{\"kind\":\"queue_identity\",\"agent_id\":\"fixture-agent\"}".as_slice(),
         b"{\"seq\":1,\"kind\":\"future\"}\n".as_slice(),
         b"{\"kind\":\"queue_identity\",\"agent_id\":\"fixture-agent\"}\n{\"kind\":\"queue_identity\",\"agent_id\":\"fixture-agent\"}\n".as_slice(),
     ] {
@@ -777,4 +776,86 @@ fn missing_torn_or_interior_identity_is_refused_without_repair() {
         assert!(Journal::open(&root.0,"fixture-agent").is_err());
         assert_eq!(fs::read(root.path()).unwrap(),bytes);
     }
+}
+
+#[test]
+fn torn_first_identity_is_rewritten_without_losing_records() {
+    for torn in [
+        b"{".as_slice(),
+        b"{\"kind\":\"queue_identity\",\"agent_id\":\"fi".as_slice(),
+    ] {
+        let root = Root::new();
+        drop(root.open());
+        fs::write(root.path(), torn).unwrap();
+        let mut journal = root.open();
+        assert!(journal.items().is_empty());
+        assert_eq!(journal.replay(0).unwrap().through, 0);
+        assert_eq!(
+            fs::read(root.path()).unwrap(),
+            encode(&journal.identity()).unwrap()
+        );
+        assert_eq!(journal.append(upsert("first", 0)).unwrap().seq, 1);
+        drop(journal);
+        assert_eq!(root.open().items()[0].item_id, "first");
+    }
+}
+
+fn assert_corrupt_item_refused(field: &str, malformed: Value) {
+    let root = Root::new();
+    drop(root.open());
+    let mut record = serde_json::to_value(Record {
+        seq: 1,
+        change: upsert("bad", 0),
+    })
+    .unwrap();
+    record["item"][field] = malformed;
+    let original = root.write_records(encode(&record).unwrap());
+    assert!(Journal::open(&root.0, "fixture-agent").is_err());
+    assert_eq!(fs::read(root.path()).unwrap(), original);
+}
+
+#[test]
+fn known_system_tag_with_bad_payload_refuses_open() {
+    assert_corrupt_item_refused("producer", json!({"system":42}));
+}
+
+#[test]
+fn known_channel_tag_without_user_refuses_open() {
+    assert_corrupt_item_refused("producer", json!({"channel":{"binding":"x"}}));
+}
+
+#[test]
+fn state_without_a_variant_name_refuses_open() {
+    assert_corrupt_item_refused("state", json!(7));
+}
+
+#[test]
+fn known_variant_names_never_fall_back_to_unknown() {
+    for field in ["state", "kind", "priority", "delivery"] {
+        let value = serde_json::to_value(item("known")).unwrap();
+        let tag = value[field].as_str().unwrap();
+        assert_corrupt_item_refused(field, json!({tag:42}));
+        assert_corrupt_item_refused(field, json!(7));
+    }
+    for malformed in [json!("agent"), json!({"human":42}), json!({"fork":false})] {
+        assert_corrupt_item_refused("producer", malformed);
+    }
+}
+
+#[test]
+fn unknown_producer_tag_preserves_its_uninterpreted_payload() {
+    let root = Root::new();
+    drop(root.open());
+    let mut record = serde_json::to_value(Record {
+        seq: 1,
+        change: upsert("future", 0),
+    })
+    .unwrap();
+    let raw = json!({"future_source":{"arbitrary":42}});
+    record["item"]["producer"] = raw.clone();
+    root.write_records(encode(&record).unwrap());
+    let mut journal = root.open();
+    assert_eq!(journal.items()[0].producer, Producer::Unknown(raw));
+    assert_eq!(journal.replay(0).unwrap().records, [record]);
+    assert!(journal.checkpoint().is_err());
 }

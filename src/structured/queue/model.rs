@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// Authenticated origin, supplied by the server rather than prompt text.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Producer {
     /// Operator composer.
@@ -22,13 +22,13 @@ pub enum Producer {
     System(String),
     /// Returning fork identity.
     Fork(String),
-    /// Future enum value retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
     #[serde(untagged)]
     Unknown(Value),
 }
 
 /// Queue input purpose; scheduling is implemented in #1802.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     /// Human input.
@@ -49,13 +49,13 @@ pub enum Kind {
     Command,
     /// Input after an anchored command's result.
     Continuation,
-    /// Future enum value retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
     #[serde(untagged)]
     Unknown(Value),
 }
 
 /// Persisted queue state; a completed write alone never means delivered.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     /// Awaiting delivery.
@@ -72,26 +72,26 @@ pub enum State {
     Cancelled,
     /// Policy or operator dropped it.
     Dropped,
-    /// Future enum value retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
     #[serde(untagged)]
     Unknown(Value),
 }
 
 /// Ordering, independent of delivery timing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     /// Default FIFO order.
     Normal,
     /// Before normal items at the same delivery point.
     Urgent,
-    /// Future enum value retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
     #[serde(untagged)]
     Unknown(Value),
 }
 
 /// Timing only; the MVP scheduler accepts at_idle (#1802).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Delivery {
     /// Wait for the current result.
@@ -100,10 +100,81 @@ pub enum Delivery {
     Steer,
     /// Explicit future interrupt mode.
     Interrupt,
-    /// Future enum value retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
     #[serde(untagged)]
     Unknown(Value),
 }
+
+// Unknown names are forward compatible; malformed known payloads are corruption.
+// Inspect the externally tagged representation before invoking a strict decoder.
+fn variant_name(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(name) => Some(name),
+        Value::Object(fields) if fields.len() == 1 => fields.keys().next().map(String::as_str),
+        _ => None,
+    }
+}
+
+impl<'de> Deserialize<'de> for Producer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Known {
+            Human,
+            Agent(String),
+            Channel { binding: String, user: String },
+            System(String),
+            Fork(String),
+        }
+        let value = Value::deserialize(deserializer)?;
+        let name = variant_name(&value)
+            .ok_or_else(|| serde::de::Error::custom("queue producer requires a variant name"))?;
+        if !matches!(name, "human" | "agent" | "channel" | "system" | "fork") {
+            return Ok(Self::Unknown(value));
+        }
+        let known = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(match known {
+            Known::Human => Self::Human,
+            Known::Agent(id) => Self::Agent(id),
+            Known::Channel { binding, user } => Self::Channel { binding, user },
+            Known::System(source) => Self::System(source),
+            Known::Fork(id) => Self::Fork(id),
+        })
+    }
+}
+
+macro_rules! deserialize_named_enum {
+    ($enum:ident { $($variant:ident => $name:literal),+ $(,)? }) => {
+        impl<'de> Deserialize<'de> for $enum {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "snake_case")]
+                enum Known { $($variant),+ }
+                let value = Value::deserialize(deserializer)?;
+                let name = variant_name(&value).ok_or_else(|| {
+                    serde::de::Error::custom("queue enum requires a variant name")
+                })?;
+                if !matches!(name, $($name)|+) {
+                    return Ok(Self::Unknown(value));
+                }
+                let known = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                Ok(match known { $(Known::$variant => Self::$variant),+ })
+            }
+        }
+    };
+}
+
+deserialize_named_enum!(Kind {
+    Prompt => "prompt", Message => "message", Reply => "reply",
+    DelegateResult => "delegate_result", Wake => "wake", ReloadNotice => "reload_notice",
+    Finding => "finding", Command => "command", Continuation => "continuation",
+});
+deserialize_named_enum!(State {
+    Queued => "queued", Held => "held", Stashed => "stashed", Delivered => "delivered",
+    Done => "done", Cancelled => "cancelled", Dropped => "dropped",
+});
+deserialize_named_enum!(Priority { Normal => "normal", Urgent => "urgent" });
+deserialize_named_enum!(Delivery { AtIdle => "at_idle", Steer => "steer", Interrupt => "interrupt" });
 
 /// Entire item state, used identically for appends and checkpoint snapshots.
 /// Extension metadata preserves anchors, leases, gate decisions and future
