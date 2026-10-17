@@ -50,6 +50,8 @@ impl Checkpoint {
 
 /// New bytes from one verified read, including any partial final record. Deliver
 /// exactly once and in order to the selected segment parser, not to a fresh reducer.
+/// Only newline-terminated records are validated. Partial final bytes remain
+/// unvalidated and must stay buffered until their terminating newline arrives.
 pub(crate) struct Update {
     pub bytes: Vec<u8>,
     pub from: u64,
@@ -212,6 +214,8 @@ fn first_ordinal(record: &Value) -> Result<Option<u64>, Reason> {
         _ => Err(Reason::OrdinalDiscontinuity),
     }
 }
+
+pub(crate) mod segment;
 
 #[cfg(test)]
 mod tests;
