@@ -24,7 +24,7 @@ timestamp?: JsonValue | null,
 /**
  * Raw SSE body, including the API message.
  */
-event: { [key in string]: JsonValue },
+event: { type: "message_start", } & ({ [key in string]: number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null }),
 /**
  * Harness `api_message_id` metadata from Appendix A.
  */
