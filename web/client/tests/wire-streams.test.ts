@@ -95,6 +95,22 @@ describe("streams", () => {
     }
   });
 
+  test("repeated identical snapshot gaps do not reset the progress deadline", () => {
+    const h = new Harness();
+    live(h);
+    h.step(step({ step: "client", action: { kind: "subscribe", sub_id: "s1", stream: "fleet" } }));
+    const gap: ServerFrame = { t: "gap", sub_id: "s1", from: 1, to: 2, snapshot_to: 4 };
+    h.step(step({ step: "send", frame: gap }));
+    for (let i = 0; i < 3; i++) {
+      h.clock.advanceTo(h.clock.now() + 10_000);
+      h.step(step({ step: "send", frame: gap }));
+    }
+    expect(sentFrames(h).slice(-2)).toEqual([
+      { t: "unsub", sub_id: "s1" },
+      { t: "sub", sub_id: "s1", stream: "fleet" },
+    ]);
+  });
+
   test("a stalled snapshot re-subscribes at the progress deadline", () => {
     const h = new Harness();
     live(h);
@@ -170,6 +186,28 @@ describe("wire transport", () => {
       "synced",
       "failed: agent removed",
     ]);
+    expect(sentFrames(h).filter((frame) => (frame as { t: string }).t === "unsub")).toEqual([]);
+    expect(h.connection.state).toBe("Live");
+  });
+
+  test("a stale gap after a lagged re-sub is dropped, so seqs only increase and no marker repeats", () => {
+    const h = new Harness();
+    live(h);
+    const seen: SessionEntry[] = [];
+    createWireTransport(h.connection).subscribe("agent/a", null, { entry: (entry) => seen.push(entry), synced: () => undefined, failed: () => undefined });
+    const sub = (sentFrames(h).at(-1) as { sub_id: string }).sub_id;
+    const send = (frame: ServerFrame): void => h.step(step({ step: "send", frame }));
+    send({ t: "gap", sub_id: sub, from: 1, to: 4 });
+    send({ t: "ev", sub_id: sub, stream: "agent/a", seq: 5, ts_ms: 0, ev: { type: "user", message: {} } });
+    send({ t: "lagged", sub_id: sub, skipped_to: 9 });
+    send({ t: "gap", sub_id: sub, from: 1, to: 4 });
+    send({ t: "gap", sub_id: sub, from: 3, to: 7 });
+    expect(seen.map((entry) => [entry.kind, entry.seq])).toEqual([
+      ["gap", 4],
+      ["known", 5],
+      ["gap", 7],
+    ]);
+    expect(seen[2]).toEqual({ seq: 7, kind: "gap", from: 6, to: 7 });
   });
 
   test("subscribes from the caller's cursor, and survives a reconnect from the applied one", () => {

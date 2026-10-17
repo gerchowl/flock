@@ -47,7 +47,7 @@ import type { WireError } from "../gen/WireError";
 import type { WireEvent } from "../gen/WireEvent";
 import type { JsonValue } from "../gen/serde_json/JsonValue";
 import { decodeServerFrame } from "./decode";
-import { backoffDelay, type Clock, type KeyValueStore, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
+import { backoffDelay, uuidv7, type Clock, type KeyValueStore, type SocketFactory, type SocketLike, type TimerHandle } from "./env";
 import { Outbox, type OutboxEntry } from "./outbox";
 
 /**
@@ -147,6 +147,9 @@ type Sub = {
 };
 
 type Snapshot = {
+  /** The gap that announced it, to recognise an identical repeat. */
+  readonly from: number;
+  readonly to: number;
   /** Its last seq, the gap's `snapshot_to`. */
   readonly end: number;
   /** The last seq received so far. */
@@ -199,6 +202,11 @@ export class WireConnection {
   /** The latest failure, shown while reconnecting or stopped; never a token. */
   get error(): string | null {
     return this.#error;
+  }
+
+  /** What restoring the stored outbox had to drop, or null (shown, never fatal). */
+  get outboxProblem(): string | null {
+    return this.#outbox.problem;
   }
 
   /** The principal of the last `welcome`, or of the restored outbox. */
@@ -299,7 +307,8 @@ export class WireConnection {
     this.#subs.delete(id);
     if (this.#connected()) {
       this.#ended.add(id);
-      this.#send({ t: "unsub", sub_id: id });
+      // A refused sub was already ended by the server's `subfail` (ADR-0036 §5a): nothing to unsub.
+      if (sub.state !== "Refused") this.#send({ t: "unsub", sub_id: id });
     }
     this.#settle();
   }
@@ -315,7 +324,7 @@ export class WireConnection {
   command(verb: string, args: JsonValue, cmdId?: string): string {
     const principal = this.principal;
     if (principal === null) throw new Error("no principal yet: connect once before sending commands");
-    const id = cmdId ?? this.#options.newCommandId?.() ?? crypto.randomUUID();
+    const id = cmdId ?? this.#options.newCommandId?.() ?? uuidv7(this.#options.clock.wallNow());
     this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending" });
     this.#flush();
     return id;
@@ -578,14 +587,23 @@ export class WireConnection {
     if (history !== (frame.snapshot_to === undefined)) {
       return this.#protocolError(`a ${history ? "snapshot" : "history"} gap on ${sub.stream}`);
     }
+    /*
+     * A gap already behind the applied cursor is a duplicate (ADR-0036 §5a):
+     * dropped, so it neither repeats a marker nor resets the progress
+     * deadline. So is an identical repeat of the snapshot being received.
+     */
     if (frame.snapshot_to === undefined) {
-      sub.handler.gap(frame.from, frame.to);
+      if (sub.cursor !== null && frame.to <= sub.cursor) return;
+      sub.handler.gap(sub.cursor === null ? frame.from : Math.max(frame.from, sub.cursor + 1), frame.to);
       if (this.#subs.get(sub.id) !== sub) return this.#changed();
-      return this.#advance(sub, Math.max(sub.cursor ?? 0, frame.to));
+      return this.#advance(sub, frame.to);
     }
     if (frame.snapshot_to < frame.to) return this.#protocolError(`a snapshot on ${sub.stream} ending before its gap`);
-    const resume = sub.snapshot?.resume ?? sub.state;
-    sub.snapshot = { end: frame.snapshot_to, last: frame.to, lines: [], resume };
+    const current = sub.snapshot;
+    if (current !== null && current.from === frame.from && current.to === frame.to && current.end === frame.snapshot_to) return;
+    if (current === null && sub.cursor !== null && frame.snapshot_to <= sub.cursor) return;
+    const resume = current?.resume ?? sub.state;
+    sub.snapshot = { from: frame.from, to: frame.to, end: frame.snapshot_to, last: frame.to, lines: [], resume };
     if (frame.snapshot_to === frame.to) return this.#endSnapshot(sub, sub.snapshot);
     sub.state = "Resyncing";
     this.#startProgress(sub);
