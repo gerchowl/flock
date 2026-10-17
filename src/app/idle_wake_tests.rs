@@ -1604,6 +1604,7 @@ async fn delivery_attempt_handoff_import_restores_interrupted_evidence() {
     assert!(!drain(&mut pty).is_empty());
     let id = app.delivery_attempts()[0].attempt_id.clone();
     let snapshot = crate::persist::capture(
+        &app.state.structured_agents,
         &[],
         &Default::default(),
         &Default::default(),
