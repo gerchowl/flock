@@ -171,7 +171,7 @@ describe("the exchange", () => {
       const request = exchange(reply);
       const { h, root } = mountApp({ code: "abc", session: () => session(), request });
       await tick();
-      expect(status(root)).toBe(EXCHANGE_FAILED);
+      expect(status(root)).toBe(`NeedsToken · ${EXCHANGE_FAILED}`);
       h.clock.advanceTo(h.clock.now() + 120_000);
       await tick();
       expect(request.calls).toHaveLength(1);
@@ -208,7 +208,7 @@ describe("the exchange", () => {
       const request = browser(refuses);
       const { h, root } = mountApp({ code: "abc", session: () => storage, request });
       await tick();
-      expect(status(root)).toBe(EXCHANGE_FAILED);
+      expect(status(root)).toBe(`NeedsToken · ${EXCHANGE_FAILED}`);
       expect(storage.entries.has(TOKEN_KEY)).toBe(false);
       expect(request.calls).toBe(1);
       expect(h.net.attempts).toHaveLength(0);
@@ -223,6 +223,63 @@ describe("the exchange", () => {
     expect(storage.entries.get(TOKEN_KEY)).toBe("new");
     h.step(step({ step: "open" }));
     expect(hello(h)?.token).toBe("new");
+  });
+});
+
+describe("a pasted link in a connected tab", () => {
+  /** A tab Live on the stored token `old`, with a page a link can be pasted into. */
+  function connected(reply: Reply): { h: Harness; root: HTMLElement; storage: ReturnType<typeof session>; at: ReturnType<typeof page>; request: ReturnType<typeof exchange> } {
+    const storage = session();
+    storage.setItem(TOKEN_KEY, "old");
+    const at = page("");
+    const request = exchange(reply);
+    const { h, root } = mountApp({ session: () => storage, page: at, request });
+    h.step(step({ step: "open" }));
+    h.step(step({ step: "send", frame: WELCOME }));
+    const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
+    h.step(step({ step: "send", frame: { t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: 0 } }));
+    h.step(step({ step: "send", frame: { t: "synced", sub_id: fleet, seq: 0 } }));
+    expect(status(root)).toBe("Live");
+    return { h, root, storage, at, request };
+  }
+
+  test("a failed code leaves the stored token and the Live connection alone, and says so in a dismissible notice", async () => {
+    const { h, root, storage, at } = connected({ status: 401 });
+    at.paste("#code=used");
+    expect(storage.entries.get(TOKEN_KEY)).toBe("old");
+    await tick();
+    expect(storage.entries.get(TOKEN_KEY)).toBe("old");
+    expect(status(root)).toBe("Live");
+    expect(h.net.attempts).toHaveLength(1);
+    const notice = root.querySelector('[data-testid="exchange-notice"]');
+    expect(notice?.textContent).toContain(EXCHANGE_FAILED);
+    (notice?.querySelector("button") as HTMLButtonElement).click();
+    expect(root.querySelector('[data-testid="exchange-notice"]')).toBeNull();
+  });
+
+  test("a page loaded with a failed code keeps the tab's stored token and connects with it", async () => {
+    const storage = session();
+    storage.setItem(TOKEN_KEY, "old");
+    const { h, root } = mountApp({ code: "used", session: () => storage, request: exchange({ status: 401 }) });
+    await tick();
+    expect(storage.entries.get(TOKEN_KEY)).toBe("old");
+    h.step(step({ step: "open" }));
+    expect(hello(h)?.token).toBe("old");
+    expect(root.querySelector('[data-testid="exchange-notice"]')?.textContent).toContain(EXCHANGE_FAILED);
+  });
+
+  test("a good code replaces the token only on success, and reconnects with it", async () => {
+    const { h, root, storage, at } = connected({ status: 200, body: { token: "new" } });
+    at.paste("#code=fresh");
+    // While the exchange runs, the working session is untouched.
+    expect(storage.entries.get(TOKEN_KEY)).toBe("old");
+    expect(status(root)).toBe("Live");
+    await tick();
+    expect(storage.entries.get(TOKEN_KEY)).toBe("new");
+    expect(h.net.attempts).toHaveLength(2);
+    h.step(step({ step: "open" }));
+    expect(sentFrames(h).filter((frame) => (frame as { t: string }).t === "hello").map((frame) => (frame as { token?: string }).token)).toEqual(["old", "new"]);
+    expect([...storage.entries.values()]).toEqual(["new"]);
   });
 });
 

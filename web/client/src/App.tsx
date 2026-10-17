@@ -15,7 +15,7 @@
  *
  * @module
  */
-import { Match, Switch, createSignal, onCleanup, type JSX } from "solid-js";
+import { Match, Show, Switch, createSignal, onCleanup, type JSX } from "solid-js";
 
 import { ReplayBadge } from "./components/ReplayBadge";
 import type { ConfigResult, FixtureShellConfig, WireShellConfig } from "./config";
@@ -82,41 +82,64 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const { session = () => sessionStorage, request = globalThis.fetch.bind(globalThis), page = window, ...options } = props.env;
   const url = endpointUrl(props.config.serverUrl);
   const tokens = createTokenStore(session);
-  // A new code replaces whatever token this tab held.
-  if (props.code !== null) tokens.clear();
-  const token = props.code === null ? (tokens.get() ?? props.config.token ?? null) : null;
-  const connection = new WireConnection({ url, token, client: CLIENT, ...options });
-  const [signIn, setSignIn] = createSignal<"exchanging" | "failed" | null>(props.code === null ? null : "exchanging");
+  /** The token to fall back on: this tab's stored one, or the shell's (Tauri). */
+  const held = (): string | null => tokens.get() ?? props.config.token ?? null;
+  // With a code, nothing connects until its exchange settles.
+  let current = props.code === null ? held() : null;
+  const connection = new WireConnection({ url, token: current, client: CLIENT, ...options });
+  const [exchanging, setExchanging] = createSignal(props.code !== null);
+  /** The last code failed: NeedsToken says so instead of only asking for one. */
+  const [failed, setFailed] = createSignal(false);
+  /** A failed code while a session works on: a dismissible notice, never NeedsToken. */
+  const [linkNotice, setLinkNotice] = createSignal<string | null>(null);
   const describe = (): string => {
-    if (signIn() === "failed") return EXCHANGE_FAILED;
-    if (signIn() === "exchanging") return "Signing in…";
-    const parts = [connection.state, connection.error, connection.state === "NeedsToken" ? RUN_CLIENT_OPEN : null].filter((part) => part !== null);
+    if (exchanging() && connection.state === "Disconnected") return "Signing in…";
+    const ask = connection.state === "NeedsToken" ? (failed() ? EXCHANGE_FAILED : RUN_CLIENT_OPEN) : null;
+    const parts = [connection.state, connection.error, ask].filter((part) => part !== null);
     return `${parts[0]}${parts.length > 1 ? ` · ${parts.slice(1).join(" ")}` : ""}`;
   };
   const [status, setStatus] = createSignal<string>(describe());
-  onCleanup(connection.onChange(() => setStatus(describe())));
+  const refresh = (): void => void setStatus(describe());
+  onCleanup(connection.onChange(refresh));
   onCleanup(connection.onTransition((state) => state === "NeedsToken" && tokens.clear()));
   let disposed = false;
   onCleanup(() => {
     disposed = true;
     connection.disconnect();
   });
-  /** Exchanges `code`, exactly once: a failed code is never retried (ADR-0038 §3). */
+  /** Connects with `token`, reconnecting when the connection runs on another one. */
+  const use = (token: string | null): void => {
+    if (connection.state !== "Disconnected" && connection.state !== "NeedsToken" && token === current) return;
+    current = token;
+    if (connection.state !== "Disconnected" && connection.state !== "NeedsToken") connection.disconnect();
+    if (token !== null) connection.setToken(token);
+    if (connection.state === "Disconnected") connection.connect();
+  };
+  /**
+   * Exchanges `code`, exactly once: a failed code is never retried
+   * (ADR-0038 §3). A new code replaces the stored token only on success; a
+   * failure leaves the token and a working session as they are.
+   */
   const signInWith = (code: string): void => {
+    setExchanging(true);
+    refresh();
     void exchangeCode(code, props.config.serverUrl, request).then((exchanged) => {
       if (disposed) return;
-      if (exchanged === null) {
-        setSignIn("failed");
-        setStatus(describe());
-        return;
-      }
-      tokens.set(exchanged);
-      setSignIn(null);
-      // A new token is a new identity: reconnect with it (a changed principal drops the outbox).
-      connection.disconnect();
-      connection.setToken(exchanged);
-      connection.connect();
-      setStatus(describe());
+      setExchanging(false);
+      if (exchanged !== null) {
+        tokens.set(exchanged);
+        setFailed(false);
+        setLinkNotice(null);
+        // A new token is a new identity (a changed principal drops the outbox).
+        use(exchanged);
+      } else if (connection.state === "Disconnected" || connection.state === "NeedsToken") {
+        setFailed(true);
+        // Nothing works on yet: fall back on a held token, or wait in NeedsToken.
+        const fallback = held();
+        if (fallback !== null) setLinkNotice(EXCHANGE_FAILED);
+        use(fallback);
+      } else setLinkNotice(EXCHANGE_FAILED);
+      refresh();
     });
   };
   if (props.code === null) connection.connect();
@@ -124,11 +147,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   // A pasted `flk client open` link changes only the fragment: take its code the same way.
   const onHashChange = (): void => {
     const code = captureCode(page);
-    if (code === null) return;
-    tokens.clear();
-    setSignIn("exchanging");
-    setStatus(describe());
-    signInWith(code);
+    if (code !== null) signInWith(code);
   };
   page.addEventListener("hashchange", onHashChange);
   onCleanup(() => page.removeEventListener("hashchange", onHashChange));
@@ -138,15 +157,27 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const fleet = createWireFleet(connection);
   const transport = createWireTransport(connection);
   return (
-    <Workbench
-      fleet={fleet}
-      transport={transport}
-      inbox={[]}
-      layout={layout}
-      saveLayout={(next) => store.save(next)}
-      status={() => [notice, status()].filter((part) => part !== null).join(" · ")}
-      source="live"
-    />
+    <>
+      <Show when={linkNotice()}>
+        {(message) => (
+          <div class="notice" role="status" data-testid="exchange-notice">
+            <span>{message()}</span>
+            <button type="button" class="action" onClick={() => setLinkNotice(null)}>
+              Dismiss
+            </button>
+          </div>
+        )}
+      </Show>
+      <Workbench
+        fleet={fleet}
+        transport={transport}
+        inbox={[]}
+        layout={layout}
+        saveLayout={(next) => store.save(next)}
+        status={() => [notice, status()].filter((part) => part !== null).join(" · ")}
+        source="live"
+      />
+    </>
   );
 }
 
