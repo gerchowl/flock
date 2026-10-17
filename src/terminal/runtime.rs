@@ -363,14 +363,13 @@ impl TerminalRuntime {
     }
 
     /// Retain a write ticket through an operator lease and any channel backlog.
-    // #1638 connects this transport foundation to API response ownership.
-    #[allow(dead_code)]
     pub(crate) fn try_send_tracked(
         &self,
         bytes: Bytes,
         deadline: std::time::Instant,
+        operator_interrupt: bool,
     ) -> crate::pty::write_receipt::WriteReceipt {
-        self.0.try_send_tracked(bytes, deadline)
+        self.0.try_send_tracked(bytes, deadline, operator_interrupt)
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
@@ -560,5 +559,64 @@ impl TerminalRuntime {
             channel_capacity,
         );
         (Self(runtime), rx)
+    }
+}
+
+#[cfg(test)]
+mod write_ack_tests {
+    use super::*;
+    use std::{
+        io::Read,
+        sync::mpsc as reply,
+        time::{Duration, Instant},
+    };
+
+    #[tokio::test]
+    async fn s3b_api_to_native_actor_waits_for_final_write_and_notifies_once() {
+        let (api_tx, api_rx) = mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("write-ack")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let public = app.state.public_pane_id(0, pane).unwrap();
+        let (actor, mut peer) = crate::pty::actor::PtyIoActorHandle::test_spawn_on_socket_pair();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let runtime = TerminalRuntime(crate::pane::PaneRuntime::test_with_actor(actor));
+        let now = Instant::now();
+        assert!(runtime.begin_injection_lease("held", now + Duration::from_secs(2), now));
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let (respond_to, response) = reply::channel();
+        api_tx.send(crate::api::ApiRequestMessage {
+            request: serde_json::from_value(serde_json::json!({"id":"native","method":"pane.write_input","params":{"pane_id":public,"text":"é","keys":["Enter"],"raw":true}})).unwrap(),
+            respond_to, peer_pid:None, peer_birth:None,
+        }).unwrap();
+        app.drain_api_requests();
+        assert!(matches!(
+            response.try_recv(),
+            Err(reply::TryRecvError::Empty)
+        ));
+        tokio::time::timeout(Duration::from_secs(2), app.input_writes.notify.notified())
+            .await
+            .unwrap();
+        assert!(app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held"));
+        let mut observed = [0; 3];
+        peer.read_exact(&mut observed).unwrap();
+        assert_eq!(&observed, "é\r".as_bytes());
+        tokio::time::timeout(Duration::from_secs(2), app.input_writes.notify.notified())
+            .await
+            .unwrap();
+        app.input_writes.service();
+        let value: serde_json::Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert!(value.get("result").is_some());
+        app.input_writes.service();
+        assert!(response.try_recv().is_err());
     }
 }
