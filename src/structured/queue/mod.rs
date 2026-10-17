@@ -73,7 +73,7 @@ fn encode(value: &impl serde::Serialize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 impl Journal {
-    /// Acquire exclusive queue/<agent> ownership and recover committed state.
+    /// Acquire exclusive `queue/<agent>` ownership and recover committed state.
     /// Components are ASCII identifiers, never paths. Uppercase letters use an
     /// injective, case-insensitive-safe encoding; the journal verifies the original
     /// id. Root aliases resolve, but
