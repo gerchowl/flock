@@ -29,12 +29,13 @@ pub(crate) fn credentials(stream: &UnixStream) -> Credentials {
         }
         let mut pid: libc::pid_t = 0;
         let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+        // SOL_LOCAL / LOCAL_PEERPID are the socket-local peer PID query.
         // SAFETY: LOCAL_PEERPID writes at most the supplied scalar buffer.
         if unsafe {
             libc::getsockopt(
                 stream.as_raw_fd(),
-                0,
-                2,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
                 (&mut pid as *mut libc::pid_t).cast(),
                 &mut len,
             )
@@ -74,7 +75,7 @@ pub(crate) fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions or memory arguments.
     unsafe { libc::geteuid() }
 }
-/// Resolve the dedicated account once at server construction. Missing accounts
+/// Blocking NSS lookup: only call on the lazy account worker. Missing accounts
 /// differ from directory errors, which must fail closed. No global passwd buffer.
 pub(crate) fn dedicated_uid() -> io::Result<Option<u32>> {
     let mut storage = vec![0u8; 65536];

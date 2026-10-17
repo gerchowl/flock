@@ -4900,7 +4900,7 @@ mod tests {
         let mut server = test_headless_server();
         server.app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
             operator: 7,
-            dedicated: Ok(Some(42)),
+            dedicated: Ok(Some(42)).into(),
         };
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();

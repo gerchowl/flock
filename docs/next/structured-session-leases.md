@@ -70,14 +70,27 @@ compiles the SDK helper using that package's compiler and SDK inputs.
 
 The Unix API captures the kernel peer UID (`getpeereid` on macOS,
 `SO_PEERCRED` on Linux) with PID and birth before queueing. That context is
-preserved across mesh recovery and lifecycle dispatch. The server resolves
-`flk-agent` once at construction. Dedicated-user callers never become the
+preserved across mesh recovery and lifecycle dispatch. Account resolution is lazy:
+construction and handoff import perform no NSS lookup. The first classification
+starts one process-wide helper and waits at most 100 milliseconds; concurrent
+first uses share that wait. Afterward calls never wait or launch another helper.
+Pending lookups and lookup errors classify
+all socket UIDs as `Unknown` (read-only); a late answer is cached when it arrives.
+A permanently stuck directory service retains at most one worker until process
+exit. Dedicated-user callers never become the
 operator, even from a shell pane or after detaching. A dedicated caller with no
 verified pane or lease may read, but sends (including raw terminal writes) return
 `msg_not_allowed`; other mutations return `operator_only`. Unknown UIDs, missing
 credentials and account-directory errors also fail closed for mutations. An
 absent dedicated account still permits the operator UID. Restart the server to
 pick up account-directory changes or recover from a lookup error.
+
+For a server running as a non-root operator, UID 0 (root) and UIDs outside the
+operator and dedicated accounts are `Unknown`, read-only; root has no special
+bypass. The operator UID is the server's effective UID. SSH-forwarded relays arrive
+as that operator UID, then remain subject to the existing pane exclusion and
+sshd ancestry/enrollment checks. UID alone never proves a relay or grants an
+agent the operator role.
 
 Pane candidates separate rate-limit and blocking-budget buckets without stamping
 sender identity or granting authority. Candidates with no birth proof still

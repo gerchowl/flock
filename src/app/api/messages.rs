@@ -280,7 +280,8 @@ impl App {
         }
 
         let now = now_ms();
-        // Candidate identity separates quotas only; sender stamps stay attested.
+        // Candidates and proven panes share a rate bucket for throttling only.
+        // Sender stamps and authority still require attestation.
         let quota_pane = from_pane
             .clone()
             .or_else(|| possible_sender.and_then(|(ws, pane)| self.public_pane_id(ws, pane)));

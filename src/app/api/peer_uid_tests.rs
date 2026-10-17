@@ -15,7 +15,7 @@ fn fixture(uid: Option<u32>) -> App {
     );
     app.runtime_config.uid_policy = UidPolicy {
         operator: 7,
-        dedicated: Ok(Some(42)),
+        dedicated: Ok(Some(42)).into(),
     };
     app.current_api_peer_pid = Some(std::process::id());
     app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
@@ -96,7 +96,7 @@ async fn anonymous_dedicated_and_unknown_uid_callers_can_read_but_not_send_or_op
         "operator_only"
     );
     app.current_api_peer_pid = Some(std::process::id());
-    app.runtime_config.uid_policy.dedicated = Err(());
+    app.runtime_config.uid_policy.dedicated = Err(()).into();
     assert!(!app.caller_is_local_operator());
     assert_eq!(
         response(&mut app, send())["error"]["code"],
@@ -187,7 +187,7 @@ async fn detached_socket_client_carries_kernel_uid_through_production_dispatch()
     // role; this never changes the machine's accounts or needs a privileged test.
     app.runtime_config.uid_policy = UidPolicy {
         operator: uid.wrapping_add(1),
-        dedicated: Ok(Some(uid)),
+        dedicated: Ok(Some(uid)).into(),
     };
     let script = r#"
 import os, socket, json, sys
@@ -304,7 +304,7 @@ async fn unknown_uid_cannot_use_even_proven_pane_evidence_as_authority() {
 #[tokio::test]
 async fn operator_without_a_dedicated_account_keeps_normal_mutations() {
     let mut app = fixture(Some(7));
-    app.runtime_config.uid_policy.dedicated = Ok(None);
+    app.runtime_config.uid_policy.dedicated = Ok(None).into();
     let result = response(
         &mut app,
         Request {
