@@ -7,7 +7,8 @@
   2026-10-16 (#1606, ADR-0038): the Vite client build (§7), the `synced`
   frame and the `gap` frame's `snapshot_to` (§4, §5), and the owner's
   decision that flk's log, metric and trace output goes through vig-os/vigil,
-  which resolves #1323 so it no longer gates S7 (§5, decision 6, S7)
+  which resolves #1323 so it no longer gates S7 (§5, decision 6, S7);
+  transport liveness and recovery are specified in §5a
 - Amendment accepted by the architect, 2026-10-16 (#1546, #1641): §4/§5/§7
   define transport recovery, snapshot bootstrap and `synced` before S7a.
   Numeric parameters in §5a are proposals with rationale for review; no
@@ -1028,8 +1029,8 @@ a delta cannot reconstruct a missing base. As for other snapshots, synced
 follows its completion and never substitutes for the frame. Cursors and
 identity survive reconnect; neither a new socket nor a new server epoch resets
 seqs. A cursor ahead of the restored stream head is refused as `cursor_ahead`,
-not clamped or treated as caught up. Re-subscribe only the cursorless
-`agent/<id>/live` stream without `after`. Terminal recovery always uses its
+not clamped or treated as caught up. On ordinary reconnect, re-subscribe only
+the cursorless `agent/<id>/live` stream without `after`. Terminal recovery always uses its
 full-frame snapshot path; on cursor_ahead it clears that stream's state/cursor
 and bootstraps without `after` as specified below, never starts from a delta.
 
@@ -1124,7 +1125,9 @@ claims, and flushes producers within that one deadline; none of these steps may
 wait indefinitely. Do not close existing wire sockets or release ownership until
 all readiness evidence has arrived. At the final fenced transfer, close the old
 `/v1/ws` sockets, stop all old writes, and transfer ownership before the new
-server loads/replays files and accepts. No old callback may write afterward.
+server loads/replays files and accepts. Check deadline/cancellation before closing
+old sockets too: a failed final commit must not needlessly drop those clients.
+No old callback may write afterward.
 Crash recovery acquires exclusive ownership before loading as the new owner.
 
 If a producer, flush or ownership-readiness step remains stuck at the deadline,
@@ -1158,8 +1161,10 @@ implementation registers new API codes where needed. Check hello against the
 file too, with 4401 on refusal. This command-time check
 is chosen because it does not rely on portable filesystem-watch delivery. Its
 limit is explicit: deletion alone does not proactively close a read-only idle
-socket; the next cmd or reconnect detects it. Revocation prevents subsequent
-admission, not cancellation of an already admitted command; report its outcome
+socket; the next cmd or reconnect detects it. Read scopes are checked at sub
+registration (`subfail scope`), not continuously on existing subscriptions;
+shrinking read scope alone does not terminate those subscriptions.
+Revocation prevents subsequent admission, not cancellation of an already admitted command; report its outcome
 through the journal and existing state rather than implying it was rolled back.
 
 **Compression and secrets (architect decision, round 2).**
@@ -1245,6 +1250,33 @@ supplies these literals to ts-rs; no TypeScript wire declarations are maintained
 by hand. Extra JSON fields stay flattened as an index signature. Unknown events
 reach clients only through §8's `UnknownEvent` wrapper and use §8's rendering.
 
+S7a (#1604) defines separate `ClientFrame` and `ServerFrame` enums tagged by
+`t`, with unknown transport tags rejected as protocol errors and additive fields
+ignored. `WireEvent = UnknownEvent | KnownSessionEvent | JsonValue`: the known-only
+projection is the S8a catalogue type supplied by #1723. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
+client-version-ineligible event uses `{type:"unknown", raw, shape}`. `raw` is
+the exact original line as a string (including non-JSON diagnostics); `shape`
+is the sender's §8 canonical key, never recomputed with the client version.
+This wrapper reconciles the adapter's lossless raw serializer with §8's
+frontend rendering contract. Other stream payloads and cmd args/results stay
+explicitly opaque JSON until S8b #1677. No new payload interpretation lives in
+S7a. The server supplies the wrapper before sending, not the frontend reducer.
+
+The initial `WIRE_JSON_VERSION` is 1. Wire streams are strings using §5's paths;
+unknown paths decode so the server can return `subfail unknown_stream`. The
+`welcome` principal is the token name and capabilities are operation strings;
+a newer client's read-only welcome advertises no command capability. `ev.seq`
+is omitted only for `agent/<id>/live`; its timestamp is still present. Ack
+success/error fields are exclusive; successful void commands may omit result.
+Ack error codes are open strings covering the full ADR-0029 registry and future
+codes; transport additions have documented constants rather than a closed enum.
+Fixture scripts require initial `given`, separate caller `client` actions,
+state `observe` assertions and final bounded `quiet`. `expect.absent` requires
+omission, `expect_connect` asserts reconnect timing, and `send.socket:previous`
+injects abandoned-generation callbacks without granting them authority.
+S7a's scripts and validators are test-only until S7 consumes the contracts, so
+there is no endpoint or default-binary behavior change.
+
 Absent metadata and explicit null remain distinct: `Option<Option<T>>` is
 exported as `?: T | null`. Typed 64-bit durations, timestamps and counters use
 JSON numbers, with exact JavaScript integer precision only below 2^53, documented
@@ -1255,8 +1287,9 @@ only reads files, so a normal test run cannot repair stale generated output.
 The generator normalises trailing whitespace, and checks the complete TS file
 inventory as well as contents. ts-rs reports unsupported custom deserializers;
 these affect lenient input reading, while the emitted types describe serialization.
-`Unknown.raw` retains the exact line. The existing serde_json serializer preserves
-JSON token spelling and interior whitespace, trims surrounding whitespace, and
+The adapter's `Unknown.raw` retains the exact line; its `shape` is Rust metadata
+until the server constructs the explicit wire wrapper. The existing serde_json
+serializer preserves JSON token spelling and interior whitespace, trims surrounding whitespace, and
 encodes non-JSON diagnostics as a JSON string.
 
 ### 7. The Bun/TypeScript reference client
@@ -1290,6 +1323,15 @@ encodes non-JSON diagnostics as a JSON string.
   `SessionEvent::Unknown { raw, shape }`, with `raw` kept byte-for-byte. The
   parser never errors past the JSON layer; a line that is not JSON is
   `Unknown` too, with `raw` as a string.
+- **S7 wire wrapper.** On S7's `/v1/ws`, unknown, incompatible or
+  client-version-ineligible agent events are sent only as
+  `UnknownEvent = {type:"unknown", raw:string, shape:string}` inside `ev.ev`.
+  `raw` is the exact original line, including non-JSON diagnostics; `shape` is
+  the sender's canonical shape key, never recomputed by the client. The server
+  constructs this wrapper before sending. It is distinct from the internal
+  `SessionEvent::Unknown { raw, shape }` and its lossless raw serializer. The
+  legacy API keeps that existing raw JSON behavior; it does not emit this S7
+  wrapper. This is the explicit client envelope referenced by §6.
 - **Shape key.** `shape = harness + harness_version + type + subtype +
   sorted top-level keys`. A known event whose `extra` is non-empty is also a
   new shape.

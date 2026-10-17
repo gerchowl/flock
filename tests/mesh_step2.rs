@@ -254,7 +254,7 @@ fn custody(node: &Node) -> String {
     nodes
         .iter()
         .map(|entry| {
-            let rows = rusqlite::Connection::open(entry.path().join("state/flock-dev/mesh-mail.sqlite"))
+            let rows = rusqlite::Connection::open(entry.path().join("state").join(support::paths::app_dir_name()).join("mesh-mail.sqlite"))
                 .and_then(|db| {
                     db.prepare(
                         "SELECT correlation,kind,state,next_hop,retry_at,collect_attempts,collect_error FROM envelopes ORDER BY rowid",
@@ -280,8 +280,13 @@ fn custody(node: &Node) -> String {
 }
 
 fn db(node: &Node) -> rusqlite::Connection {
-    let db =
-        rusqlite::Connection::open(node.home.join("state/flock-dev/mesh-mail.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(
+        node.home
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
+    )
+    .unwrap();
     db.busy_timeout(Duration::from_secs(5)).unwrap();
     db
 }
@@ -1561,7 +1566,8 @@ fn audit_rotation_during_multihop_conversation_loses_nothing() {
         .fleet
         .node("nodec")
         .config_home
-        .join("flock-dev/event-log.jsonl");
+        .join(support::paths::app_dir_name())
+        .join("event-log.jsonl");
     // ADR-0005 has fixed rotation bounds, not a configuration knob. JSON
     // whitespace seeds the real byte threshold without inventing audit events.
     let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -1641,7 +1647,12 @@ fn restart_resume_582_keeps_identity_without_tombstone() {
         json!({"target":target["pane_id"], "reason":"fixture restart"}),
     );
     fleet::wait_until("restart completed", DEADLINE, || {
-        let log = fs::read_to_string(node.config_home.join("flock-dev/event-log.jsonl")).ok()?;
+        let log = fs::read_to_string(
+            node.config_home
+                .join(support::paths::app_dir_name())
+                .join("event-log.jsonl"),
+        )
+        .ok()?;
         log.lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .any(|e| {
@@ -1665,7 +1676,10 @@ fn restart_resume_582_keeps_identity_without_tombstone() {
 }
 
 fn warned_config(node: &Node, content: &str, key: &str) {
-    let path = node.config_home.join("flock-dev/config.toml");
+    let path = node
+        .config_home
+        .join(support::paths::app_dir_name())
+        .join("config.toml");
     let original = fs::read_to_string(&path).unwrap();
     fs::write(&path, content).unwrap();
     let output = operator(node, &["config", "check", "--json"]);

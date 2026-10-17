@@ -1,0 +1,14 @@
+{"v":1,"step":"given","cursors":{},"outbox":[],"covers":["s7"]}
+{"v":1,"step":"client","action":{"kind":"connect"}}
+{"v":1,"step":"expect_connect","within_ms":1,"not_before_ms":0}
+{"v":1,"step":"open"}
+{"v":1,"step":"expect","frame":{"t":"hello","protocol":2,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol","token"],"absent":[]}
+{"v":1,"step":"send","frame":{"t":"welcome","protocol":1,"server_version":"fixture","capabilities":["read"],"principal":"fixture-principal","server_epoch":"fixture-epoch","idempotency_window_ms":86400000}}
+{"v":1,"step":"client","action":{"kind":"subscribe","sub_id":"s1","stream":"fleet"}}
+{"v":1,"step":"expect","frame":{"t":"sub","sub_id":"s1","stream":"fleet"},"fields":["sub_id","stream"],"absent":["after"]}
+{"v":1,"step":"send","frame":{"t":"gap","sub_id":"s1","from":1,"to":0,"snapshot_to":0}}
+{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s1","seq":0}}
+{"v":1,"step":"observe","connection":"ReadOnly","streams":{"s1":{"state":"Current","cursor":0}},"outbox":{}}
+{"v":1,"step":"client","action":{"kind":"command","cmd_id":"c1","verb":"queue.add","args":{}}}
+{"v":1,"step":"observe","connection":"ReadOnly","streams":{},"outbox":{"c1":"pending"}}
+{"v":1,"step":"quiet","ceiling_ms":1000}
