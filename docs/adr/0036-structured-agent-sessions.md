@@ -326,6 +326,30 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   `caller_is_local_operator()` gains that uid check first; a detached
   (`setsid`) child of a structured agent is still `flk-agent` and still
   refused.
+  **Account policy (owner decisions, #1795).** File-only
+  `[security] agent_account = "flk-agent" | "none"` defaults to `"flk-agent"`.
+  Recognition is independent of `structured.run_as`: opting into operator-mode
+  launch does not disable it. With recognition enabled, a pending or failed
+  directory lookup classifies socket callers as `Unknown`, including callers
+  with the server UID: reads remain available but operator mutations, including
+  server stop, are refused. A resolved dedicated UID distinct from the server
+  UID permits the server UID to proceed to the existing ancestry checks; a
+  resolved absent account does too. A dedicated UID equal to the server UID
+  is a §1a misconfiguration, never operator authority. Report
+  `agent_account_uid_collision` once in the log and retain the typed diagnostic
+  in server status until restart.
+
+  Explicit `agent_account = "none"` declares that no dedicated account is used.
+  The server never starts the dedicated-account NSS lookup, and callers with
+  its own UID immediately pass the UID boundary. Lease, pane, birth and relay
+  checks still apply: known same-UID agents remain non-operator. Other or missing
+  UIDs remain unknown/read-only. This opt-in avoids the default directory-service
+  availability cost but gives up recognizing anonymous/detached callers as
+  `flk-agent` by UID. It cannot provide a dedicated-account isolation boundary;
+  same-UID callers without lease/pane ancestry remain cooperative under #1177.
+  Changing the setting requires a server restart; reload keeps the active policy
+  and reports that requirement.
+
 - **Which agent is calling.** The session lease (§1) records the process's
   pid and start time. A socket caller whose ancestry reaches a leased pid
   (with a matching `process_start_time`, so pid reuse cannot impersonate)
@@ -355,10 +379,144 @@ screen detector is not run.
 | `control_request{can_use_tool}` (any other tool) | `hook.decide{point: permission.request}` (ADR-0034 §1); `pass` answers allow, `deny` answers deny with the reason; `defer` holds the request open and makes it a question |
 | `control_request{other subtype}` | answered with an error and logged as an unknown shape (§8) |
 | flk's own `deny` answer to a `can_use_tool`; `system/permission_denied`, `result.permission_denials` | `agent.permission_denied{tool, reason}`, once per `tool_use_id`. A stdio `deny` that flk sends emits no `system/permission_denied` event (A.12, A.17), so for those the fact comes from flk's own answer; `system/permission_denied` and `result.permission_denials` add only the denials the harness made itself. Carve-out: the `deny` that carries a question deferral (§2a) is not a permission denial. flk records the `tool_use_id` of every deferral, and neither its answer nor that id's entry in `result.permission_denials` emits anything here |
-| `rate_limit_event{status != allowed}` | `Attention::Blocked{ProviderLimit, retry_after_ms}` from `resetsAt` |
-| `result` | queue items `done`; `Turn::Idle`; usage recorded; outcome per §1 |
-| process exit without `result` | `Lifecycle` unchanged, `Attention::Blocked{crashed}` |
+| `rate_limit_event{status: rejected}` | `Attention::Blocked{ProviderLimit, retry_after_ms}` from `resetsAt` |
+| `rate_limit_event{status: allowed or allowed_warning}` | clear provider-limit attention; a warning does not block |
+| `rate_limit_event{unknown status}` | ignore the status, preserving the last known observation (ADR-0028 §3a) |
+| `control_cancel_request{request_id}` | close that incoming permission/question request only |
+| `result` | close open permission/question requests; queue items `done`; `Turn::Idle`; usage recorded; outcome per §1 |
+| process exit without `result` | close open permission/question requests; `Lifecycle` unchanged, `Attention::Blocked{crashed}` |
 | anything unknown | §8 |
+
+S4 integration boundary (architect ruling, #1427). One pure reducer per
+`agent_id` and launch generation consumes S1 events and explicit host facts.
+Its `StateSink` publishes `AgentState` snapshots, immediate phase transitions,
+all open needs-human request ids/reasons, and one stall observation per silent
+interval. #1439 connects this seam to the registry and agent.get/list; S7-min
+#1746 connects it to agent/<id> and fleet-lite. These immediate facts are not
+settled supervisor events. S4 emits no `agent.phase_changed`, `agent.needs_human`
+or `agent.session_stalled` EventHub envelopes: `AgentPhaseEvent` and mesh v5
+stay unchanged. #1804 owns the mesh-versioned pane-free event contract.
+No placement is empty or fabricated, and list/side-pane wiring remains #1439.
+
+S3a-3 registry amendment (#1439, owner-approved split). #1841 owns pure
+records, runtime-tagged persistence and the S4 `StateSink` consumer. Each
+registered agent owns a reducer and a generation token. Admission rejects
+conflicting agent ids, names and native session ids without replacing another
+record. Removal and state delivery require the current generation, so late
+worker output cannot alter a replacement. The registry stores the complete S4
+publication, including phase edges, needs-human facts and the next observation
+deadline; it emits no EventHub envelopes (#1804).
+
+Session persistence stores `runtime: structured` identity/name/harness/session,
+cwd and requested model alongside `runtime: pty` pane records. Older snapshots
+without structured records remain valid; older pane records default to PTY.
+Cold restore retains metadata only: lifecycle is offline, observations are
+unknown, and no clock ages, outstanding questions, deadlines, process ids or
+lease proofs survive. An agent whose process is gone stays `Lifecycle::Offline`:
+it remains resumable by explicit launch and is never resurrected automatically.
+Under ADR-0028 §3a, structured records deserialize individually. Unknown runtime
+or harness records, invalid entries and duplicates are skipped with a warning,
+without rejecting any PTY workspace. The first supported id/name/session wins.
+Skipped entries remain raw and in order across saves, including additional
+fields, so rollback cannot erase newer records. Explicit removal also discards
+retained entries sharing the removed id or session, preventing a shadowed
+duplicate from becoming active after restart. Known-runtime shadows also match
+by name; a future-runtime record sharing only a name has a separate identity
+and survives removal (#1858). Explicit admission refuses any retained name.
+Removal compacts retained slots.
+Known records also retain their original extra fields. An unknown collection shape remains raw
+and inactive; new admission refuses until its shape is understood. Warnings
+contain an index and reason, never raw payloads. The registry exposes a retained
+entry count for diagnostics; structured status/doctor routing remains #1843.
+Unknown pane runtime tags also survive restore/save and disable automatic agent
+resume for that pane only; its hibernation request and shell placement survive,
+and other panes retain normal resume behavior. A registry-only session remains
+persistable even when it contains only inactive raw entries and no terminal
+workspaces; #1853 tracks the lifetime of retained-only records. Both the temporary
+snapshot file before rename and its parent directory after rename are fsynced.
+A directory sync failure after successful replacement is logged as a durability
+warning and the save reports success because the new file is already installed.
+Handoff restores structured metadata offline; this slice owns no workers to
+transfer.
+
+#1842 owns runtime workers, actual lease ownership and observation scheduling.
+The app owns `structured::workers::Workers` outside pure `AppState`. Each launch
+reserves its native session before running the admission-supplied, bounded
+profile factory on an owning thread, then binds the registered cwd/model.
+Preparation is cancellable at its boundaries; an in-progress factory must finish
+within its own bound. One blocked factory cannot block another agent or the app.
+A new launch advances the observation generation, without modifying durable
+metadata. Live/unconfirmed workers refuse replacement. Cold restore remains
+offline and never starts a worker automatically.
+
+Ready/completion share a bounded two-message channel. Runtime stream queues are
+bounded separately; an app pass drains at most four records per worker and
+rearms its existing event wake when it reaches that budget. Every stream record
+enters S4 only via `Received::state_input`, so durable permission-book closes
+clear attention without waiting for a result (#1846/#1849). Lifecycle and due
+observations are explicit host facts. Both TUI and headless schedulers service
+owner wakes and include S4's exact next observation boundary. No periodic
+structured-agent timer, kill-on-silence policy or EventHub emission is added.
+
+Ordinary stop latches cancellation without waiting; polling joins only finished threads. A terminal report
+becomes visible only after queued stream facts drain. Confirmed cleanup closes
+open requests and sets Offline; unconfirmed ownership instead retains authority
+and Unknown lifecycle, refuses restart, and requires explicit recovery. Reports
+retain actual exit status/outcome or typed preparation/worker failure; results
+remain turn facts rather than process-success evidence. Finished threads are joined
+before replacement or pruning. Shutdown and the pre-handoff step attempt to stop
+all workers, drain durable permission closes, release confirmed leases, and join
+within the stated bound. Handoff deliberately stops structured sessions in this
+slice (full single-writer transfer is S7-rest). Records remain Offline and resume
+only through an explicit start using their stored session id, never automatically.
+A shared 10-second graceful deadline is followed by identity-checked child-tree
+KILL and a bounded 10-second cleanup/join interval. Deadline overruns report
+`structured_worker_timeout`; unconfirmed cleanup reports
+`structured_worker_cleanup_failed`. Worker diagnostics never veto handoff: kill,
+report the typed codes and proceed once the real handoff preconditions hold.
+An additive, optional handoff-manifest list carries uncertain agent identities,
+restored as Unknown without lease or process authority; confirmed cleanup stays
+Offline. Cold disk restore still defaults to Offline. Unknown identities never
+grant permission to signal. An unjoined worker remains owned and fenced, and
+later owner polls can finish joining it. Worker panics report the distinct
+`structured_worker_panicked` failure. These diagnostics require human inspection
+before retrying an uncertain session. Shutdown runs once per worker set and caches its typed result.
+Both TUI and headless quit always save the session before returning a shutdown
+error. Drop runs bounded teardown only if it has not already been attempted;
+after success or failure it joins only finished threads, without another wait.
+A newly admitted worker resets that cached result. The caller must mark session persistence
+dirty when durable metadata changes.
+#1843 owns the public `StructuredAgentInfo`, additive `structured_agents` list,
+get/status/stop routes and `runtime_unsupported` refusals. Existing PTY
+`AgentInfo` placement fields remain mandatory and unchanged; structured records
+have no fabricated placement. Mesh VERSION stays 5; remote directory rows
+remain #1380. Public structured start stays unreachable until #1843 and #1734
+have landed. The default remains the agent user (#1177); the owner-approved
+MVP exception permits explicit operator-mode opt-in only. #1843 supplies the
+public admission wiring and isolated manual dogfood runbook for that exception.
+
+The caller supplies monotonic observation time and its configured `stall_ms`;
+the reducer never starts a timer, polls a process or kills/retries a turn.
+Every stdout line, including an unknown line, proves progress but an unknown
+event never changes the axes. A host-sent answer closes only its incoming
+`request_id`; stdout control responses acknowledge host-initiated controls
+and cannot close incoming permission requests. A CLI `control_cancel_request`
+closes only its named request; a top-level result or process exit closes all
+open permission/question requests, including an interrupted or errored turn.
+A tool remains open past its
+argument `content_block_stop`, until its matching `tool_result` or a top-level
+`result`. No stall is reported while any tool is open, however long it runs.
+Subagent results never end the parent turn. A late result ends a
+stalled turn normally; the observation itself leaves the phase unchanged.
+Unavailable background and registered-wait evidence stays `unknown`, so idle
+alone cannot manufacture `finished`. Provider reset timestamps are Unix seconds
+converted to an optional duration against receive-time Unix milliseconds;
+missing, null, incompatible or overflowing reset metadata gives no duration.
+Lifecycle comes explicitly from the registry and retains ADR-0028 precedence.
+While attention is set, public `turn` is `unknown` per ADR-0028 §1; the
+underlying turn boundary is retained for when attention clears. A known provider
+limit outranks crashed attention while lifecycle remains live; a registry-owned
+offline/hibernated/gone lifecycle outranks both.
 
 Phase derivation is ADR-0028 §1's unchanged; only the inputs differ. A
 question answered while its control request is still open becomes the
@@ -848,11 +1006,12 @@ Messages are JSON text frames, one object each, tagged by `t`:
 ```text
 client → server
   hello   { protocol, client: { name, version }, token? }
-  sub     { sub_id, stream, after? }          stream ∈ agent/<id>, agent/<id>/live,
+  sub     { sub_id, stream, after? }          fresh sub_id on this connection;
+                                            stream ∈ agent/<id>, agent/<id>/live,
                                               queue/<id>, events, terminal/<pane>,
                                               fleet, inbox, artifacts, work
   pong    { nonce }                          echo the server ping nonce
-  unsub   { sub_id }
+  unsub   { sub_id }                         closes id; drop late frames for it
   cmd     { cmd_id, verb, args, resume_only } cmd_id is the idempotency key
 server → client
   welcome { protocol, server_version, capabilities, principal,
@@ -860,11 +1019,30 @@ server → client
   ping    { nonce }                          application heartbeat (§5a)
   ev      { sub_id, stream, seq, ts_ms, ev }  ev is the typed event (§6)
   synced  { sub_id, seq }                    replay barrier on every seq stream
-  subfail { sub_id, code, message }          subscription refusal (§5a)
+  subfail { sub_id, code, message }          closes id; drop late frames (§5a)
   gap     { sub_id, from, to, snapshot_to? }  inline checkpoint (§4)
-  lagged  { sub_id, skipped_to }
+  lagged  { sub_id, skipped_to }              closes id; fresh sub, no unsub (§5a)
   ack     { cmd_id, ok, result? | error{ code, message, exit, retry } }
 ```
+
+**S7-min fleet and permission contracts (#1746).** The `fleet` snapshot stream
+lists structured agents as `FleetAgentRow { id, label, state: AgentState,
+activity?, waiting_on_human: string[] }`. `AgentState` is the shared S4 object,
+including axes, phase and sources, not a bare phase. Its per-field `or_unknown`
+reading follows ADR-0028 §3a: an unknown newer phase becomes `unknown` while the
+other axes survive; it must not discard the fleet delta. Snapshot rows use §5a's
+existing inline gap/checkpoint path. Fleet `ev` payloads are the closed tagged
+`FleetDelta` union: `{ type:"fleet.upsert", row: FleetAgentRow }` or
+`{ type:"fleet.remove", id }`, rather than session `WireEvent` payloads.
+
+`cmd agent.decide` takes `AgentDecide { agent, request_id, decision, message? }`,
+where decision is `allow_once`, `allow_always` or `deny`. Only a token-authenticated
+client principal may call it. The existing ack envelope echoes `cmd_id`; success
+returns `AgentDecideResult { request_id, decision }`, echoing the applied answer.
+Decision-specific failure names are `permission_request_unknown`,
+`permission_request_closed` and `not_authorized`, with retry class `never` in the
+existing error envelope. Their API error-code registration and command behavior
+are deferred to S6 (#1429); this types slice names the contracts only.
 
 - **Cursors and bootstrap (architect decisions iii/iv).** Every stream except
   `agent/<id>/live` has seqs, including `terminal/<pane>` and `events`.
@@ -880,11 +1058,12 @@ server → client
   Send `synced { sub_id, seq }` exactly once on **every seq stream** per
   subscription, after replay through a captured head, including all announced
   snapshot lines. The barrier's seq is that head (zero only for a genuinely
-  new empty stream); all later frames are live. Re-subscription after `lagged`
-  gets its own barrier. Empty-checkpoint completion advances to `to` before
-  `synced`; a nonzero high-water never becomes zero merely because no items
-  remain. Delivery is at-least-once; dedupe on `(stream, seq)` and persist a
-  cursor only after applying its event or empty checkpoint. Persist a pending
+  new empty stream); all later frames are live. `lagged` closes the old ID;
+  re-subscription with a fresh ID gets its own barrier without an `unsub`.
+  Empty-checkpoint completion advances to `to` before `synced`; a nonzero
+  high-water never becomes zero merely because no items remain. Delivery is
+  at-least-once; dedupe on `(stream, seq)` and persist a cursor only after
+  applying its event or empty checkpoint. Persist a pending
   `snapshot_to` and unconfirmed-entity set with the cursor across disconnects.
   Resume unfinished snapshots before declaring Current. A new gap supersedes
   an old resync marker and marks all entities unconfirmed again.
@@ -911,10 +1090,34 @@ server → client
   type the client's protocol predates without the §8 unknown wrapper.
 - **Auth.** Every client presents a bearer token in `hello`; the address it
   connects from grants nothing (§1a). The operator's own browser gets an
-  `operator`-scoped token through `flk client open`, which runs over the
+  `operate`-scoped token through `flk client open`, which runs over the
   unix socket (so `caller_is_local_operator()` and the uid check of §1a
-  apply), mints a one-time code, and opens the client with it; the client
-  exchanges the code for its session token once. Tokens follow the channel-token model of ADR-0028 §8
+  apply), mints a one-time code, and opens the client in a new browser tab or
+  window; the client
+  exchanges the code for its session token once. The code contains 256 bits of
+  randomness encoded as 64 lowercase hex characters, is bound to that token,
+  exists only in server memory, is single
+  use, and expires at age 60 seconds. `flk client open --print` prints the
+  loopback URL rather than launching the browser. The code is carried only in
+  the URL fragment (`#code=…`), never the query, so it is absent from HTTP
+  request targets and Referer. The browser consumes that fragment and sends
+  `POST /v1/client/exchange` with JSON `{ "code": "…" }`; the loopback-only,
+  same-origin endpoint returns `{ "token": "…" }` exactly once, with
+  `Cache-Control: no-store`. Used, expired and unknown codes get one uniform
+  401. There is no global failed-exchange gate: every caller reaches the
+  loopback listener locally, and local processes can forge Host/Origin.
+  Such a gate would let any local process, including an agent, lock out the
+  operator. Guessing a 256-bit, single-use code with a 60-second lifetime is
+  infeasible. Keep the store bounded at 128 live codes and request bodies at
+  1024 bytes. Cross-origin and non-loopback requests are refused, and neither
+  codes nor tokens enter diagnostic logs.
+  The token then travels in the unchanged normal `hello` frame.
+  The served client derives its server and transport from its own location
+  (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.
+  `token add` prints the bearer only to terminal stdout unless `--json` or
+  `--show-token` explicitly permits redirected secret output. Without that
+  consent it refuses before issuance, so no undisclosed credential is created.
+  Tokens follow the channel-token model of ADR-0028 §8
   (`src/channels.rs`): 32 random bytes as 64 hex digits, one file per client
   under `<data dir>/client-tokens/<name>.token`, mode 0600 in a 0700 dir,
   compared as SHA-256 digests in constant time, never logged, revoked by
@@ -1004,6 +1207,8 @@ WS close **4401** means auth refused during hello; **4403** means token revoked
 mid-session. Both enter NeedsToken, holding the outbox without reconnecting until
 a new token arrives. These codes differ from protocol failures (visible error,
 capped reconnect) and network loss (reconnect).
+Frames for a closed subscription ID are silently dropped. A frame for an ID
+never opened on the current connection is a protocol error, not a closed-ID case.
 Protocol errors close with a visible diagnosis and capped reconnect (a server
 upgrade can cure them). A newer client follows §5's ReadOnly capabilities and
 holds commands; it can keep reading and detecting stale transport.
@@ -1012,8 +1217,10 @@ holds commands; it can keep reading and detecting stale transport.
 stream's `sub { after:last_applied_seq }`, preserving any unfinished resync
 marker. Retained events are replayed in order before `synced`, and mutations
 concurrent with replay follow the captured barrier without a hole. `lagged`
-re-subscribes from the applied cursor, never `skipped_to`. A snapshot gap uses
-§4's inline checkpoint; no snapshot gap is allowed to omit `snapshot_to`.
+closes its old ID, like `subfail`: the server sends nothing more on that ID and
+the client silently drops late frames for it. Re-subscribe with a fresh ID from
+the applied cursor, never `skipped_to`; no `unsub` is needed for the closed ID.
+A snapshot gap uses §4's inline checkpoint; no snapshot gap may omit `snapshot_to`.
 A history gap on `agent/<id>` or `events` leaves an explicit missing-range marker
 and continues from `to+1`, without implying complete history.
 
@@ -1034,24 +1241,42 @@ the cursorless `agent/<id>/live` stream without `after`. Terminal recovery alway
 full-frame snapshot path; on cursor_ahead it clears that stream's state/cursor
 and bootstraps without `after` as specified below, never starts from a delta.
 
+**Subscription identity (architect decision, 2026-10-17).** Every `sub`
+uses a fresh `sub_id`, unique for the lifetime of that connection. IDs are
+never reused on that connection, including re-subscriptions of the same stream
+after `lagged` or the progress deadline. `unsub`, `subfail` and `lagged` each
+close the named ID; the server sends nothing more on a closed ID. Clients
+silently drop late frames for any closed ID, without advancing a cursor or
+renewing progress. After `lagged`, re-subscribe with a fresh ID without an
+`unsub`. After `subfail`, re-subscribe only where its code calls for it, using a
+fresh ID without `unsub`; otherwise stop until the code table's condition changes.
+A progress deadline first sends `unsub` to close the stalled ID. A frame for an
+ID never opened on the current connection is a protocol error. The server refuses
+a `sub` that reuses either a live or closed ID with typed
+`subfail { code:"sub_id_reused", ... }`. Preserve stream cursors and resync
+markers across replacement while allocating a new subscription identity.
+
 **Subscription refusal and progress.** `subfail { sub_id, code, message }`
-ends only the named subscription and supplies these typed codes (S7a defines
+closes only the named subscription ID, which receives no further server frames;
+clients drop late frames for it. It supplies these typed codes (S7a defines
 the wire enum; implementation registers any new API error codes where needed):
 
 | Code | Meaning and client action |
 | --- | --- |
-| `cursor_ahead` | Stored cursor exceeds the stream head. Clear only that stream's entities, cursor and resync marker, then re-subscribe without `after` through bootstrap; do not silently clamp. |
+| `cursor_ahead` | Stored cursor exceeds the stream head. Clear only that stream's entities, cursor and resync marker, then re-subscribe with a fresh ID without `after` through bootstrap; do not silently clamp. |
 | `operator_only` | Subscription requires the operator principal. Show refusal and stop that subscription until the principal changes; other streams stay up. |
 | `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
 | `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
+| `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
 
 Start the 30 s progress deadline at sub registration, or when a new gap starts
 resync of a Current stream. Reset it only on a frame advancing that sub: a newly
 applied seq, an advancing gap/cursor or snapshot boundary, or its synced barrier.
 Duplicates, repeated identical gaps, unrelated streams and heartbeat frames do
-not reset it. Expiry sends unsub, then a new sub from the applied cursor and
-stored resync marker; only that stream returns to Replaying/Resyncing. Keep the
-connection and other streams up and show the affected stream's recovery state.
+not reset it. Expiry sends unsub, then a new sub with a fresh ID from the applied
+cursor and stored resync marker; only that stream returns to Replaying/Resyncing.
+Keep the connection and other streams up and show the affected stream's
+recovery state.
 A replay that keeps advancing can exceed 30 s in total. No timeout marks Current.
 
 **Commands across a drop.** Persist the client's outbox before sending, keeping
@@ -1209,7 +1434,7 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | Reordered replay/barrier | A fault script delivering synced before its announced snapshot end or out-of-order seq is rejected, never marked Current. Every seq stream, specifically terminal and events, receives exactly one valid barrier. |
 | First subscription and empty state | fleet, inbox and queue bootstrap all use the inline gap/snapshot path; empty from=1,to=0,snapshot_to=0 completes without waiting. No client fetch or guessed end marker. |
 | Zero-line queue rewrite and restart | Append through H, empty the folded queue, rewrite with header high_water=H, restart, subscribe and process empty gap: cursor becomes H; next item is H+1 and is applied rather than deduped away. Crash before/after rename preserves one complete checkpoint. |
-| Disconnect during snapshot / lagged / another rewrite | Stored marker and applied cursor resume remaining lines; a newer checkpoint marks all entities unconfirmed again. Concurrent mutations are present after replay; removed entities disappear exactly at snapshot completion. |
+| Disconnect during snapshot / lagged / another rewrite | Stored marker and applied cursor resume remaining lines. Lagged closes the old ID; re-subscribe with a fresh ID without unsub and drop late old-ID frames. A newer checkpoint marks all entities unconfirmed again. Concurrent mutations are present after replay; removed entities disappear exactly at snapshot completion. |
 | Lost ack / duplicate cmd / restart at claim, effect or outcome | Same principal/key/payload yields one effect and first stored ack, or explicit uncertain pending outcome. All listed verbs, including fork/reload/interrupt, prove no automatic second dispatch. Different payload never executes. |
 | Permission prompt across drop | Prompt survives replay, stored answer retries once under the same request/key, closed prompt cannot receive a second answer or an answer intended for a newer prompt. |
 | Expired key / clock uncertainty / changed principal / revoked token | No automatic resend or new-id workaround; unknown outcome is visible, old-principal outbox drops, revoked token enters NeedsToken. |
@@ -1221,11 +1446,12 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | Scope shrink | Reduce a still-valid token's scope after hello; a newly unauthorized cmd and cached-result lookup both get scope error ack without admission/result disclosure. Socket remains open and an allowed operation still succeeds. |
 | Slow replay heartbeat priority | Queue replay in both directions on a constrained healthy link; ping/pong bypass waiting data and prevent false Stale from backlog. An actually blocked writer or missing pong still fails within the liveness ceiling. |
 | Terminal snapshot recovery | Lose delta history, then receive gap with snapshot_to and a full frame followed by deltas and synced. The old display remains stale until the full frame applies; a delta or early synced cannot clear it. Removed pane refuses unknown_stream. |
-| subfail cursor_ahead | A restored head below the saved cursor refuses; client clears only that stream's entities/cursor/marker and bootstraps without after. Other streams continue. |
+| subfail cursor_ahead | A restored head below the saved cursor refuses; client clears only that stream's entities/cursor/marker and bootstraps on a fresh ID without after. Other streams continue. |
+| Closed, unknown or reused subscription ID | Unsub/subfail/lagged close the ID. Client silently drops late frames for a closed ID, but treats a never-opened ID as a protocol error. Server refuses a sub reusing a live or closed ID with sub_id_reused. |
 | subfail operator_only | Non-operator subscription refuses and stops until principal changes; no reconnect loop or blocked sibling stream. |
 | subfail unknown_stream | Unknown kind/removed subject refuses and stops until a valid selection; no fake empty success. |
 | subfail scope | Insufficient token scope refuses only that sub until authorization changes; sibling streams remain live. |
-| Per-stream progress deadline | Replay exceeds 30 s overall but progresses within each window and succeeds. A stalled sub expires despite duplicate/unrelated/heartbeat traffic: unsub/re-sub only that sub from its applied cursor, retaining resync marker and the connection. |
+| Per-stream progress deadline | Replay exceeds 30 s overall but progresses within each window and succeeds. A stalled sub expires despite duplicate/unrelated/heartbeat traffic: unsub the stalled ID, then re-subscribe with a fresh ID from its applied cursor, retaining resync marker and the connection. |
 | Ack timeout and delayed original | Missing ack marks only that cmd uncertain; no same-socket resend or teardown. A late current-socket ack resolves it. After reconnect, deliver resume-only lookup before buffered original: show unknown outcome while the original may later execute once; never manufacture a new ID. Verify retry:later remains harmless with resume_only. |
 | Mobile suspend and remote outage | Foreground invalidates old socket and resumes. Local heartbeat does not clear remote stale state; cross-node cmd still refuses under VERSION 5. |
 
@@ -1530,6 +1756,56 @@ P16 and P17 have no source in the stream today and are not promised;
   is refused with `operator_only` (exit 13). A switch down needs `send`
   scope. A `flk-agent` caller can switch its own agent down, never up.
 
+- **Per-request session grants (S6, #1429).** `agent.decide` accepts
+  `allow_once`, `allow_always` and `deny` only from an authenticated,
+  `operate`-scoped token principal. A local UID alone, pane input, an agent
+  message or a structured harness's MCP lease never authorizes a decision
+  (`not_authorized`, retry never). Identity comes from the authenticated
+  dispatcher context, never command arguments. Every decision is recorded
+  on `agent/<id>` in ordered open/closed permission audit records, including
+  automatic matches, with the originating token subject. Automatic closes also
+  reference the originating grant request ID. A raw request already reserved by
+  an exact grant carries that trusted reference into replay and counts as
+  stdout progress without ever opening S4 needs-human attention.
+- **`allow_always` lasts for one live harness runtime.** Its grant is held
+  only in memory for that structured agent. Exit, restart and resume into a
+  new runtime discard it, even when resuming the same persisted session.
+  Grants are never shared between agents, persisted in flk policy, or
+  written to a settings file. Persistent presets remain the separately
+  operator-edited policy described above (#1799).
+- **Match exactly; never forward harness rules.** `allow_always` always
+  installs an in-memory grant for only the exact tool name plus canonical
+  JSON input (recursively sorted object keys; array order and scalar values
+  preserved). Matching performs no Unicode normalization and treats `1` and
+  `1.0` as different. A different tool or input prompts again.
+  Harness permission suggestions are never interpreted or forwarded, even
+  when they appear limited to the requested tool: determining their scope
+  would require interpreting the harness rule grammar. The response allows
+  the current call with its original input and no `updatedPermissions`.
+  When nonempty suggestions are present, the closed audit records
+  `ignored_suggestions` with reason `not_forwarded` and the request ID linking
+  to the open audit record containing the full original suggestions.
+  Absent, null and empty suggestions produce the same exact grant.
+  Broader rules belong to the separately operator-edited policy in #1799.
+  The `MAX_GRANTS` constant in `src/structured/permissions.rs` bounds distinct
+  installed and reserved exact grant keys per runtime; exceeding that bound
+  returns `permission_grant_limit` (retry never, policy refusal) without
+  closing the request or sending a response. The operator may still allow
+  once or deny that request. Token authorization still applies to manual
+  decisions after a grant exists.
+- **Delivery and audit ordering.** A permission closes for attention only
+  after its decision audit is durable, and user input remains gated until
+  the control response is fully written. Admission success reserves a
+  decision and does not promise eventual pipe delivery. Audit or writer
+  failure stops delivery; runtime shutdown writes a reasoned terminal close
+  for each outstanding request before clearing the book, without inventing
+  an operator decision.
+  Harness cancellation closes its named request; top-level result and host
+  interruption also produce reasoned closes. A cancelled reservation cannot
+  deliver a stale answer. Disk errors are surfaced; failed persistence cannot
+  promise a durable close. Unknown and already accepted or closed request IDs are distinct `permission_request_unknown` and
+  `permission_request_closed` refusals, both retry never.
+
 ### 11. Harness neutrality
 
 One flk event model covers Claude, Codex and opencode at the level of §2:
@@ -1549,7 +1825,12 @@ four places that the schema must normalise rather than mirror:
    `completed` / `error`. flk stores a generic call with a typed `kind`.
 3. **Approvals.** Claude allow / deny with `updatedInput`; Codex accept /
    acceptForSession / decline / cancel; opencode once / always / reject. flk
-   keeps `allow | allow_always | deny{reason}` and maps down.
+   keeps `allow_once | allow_always | deny{reason}` and maps down.
+   `allow_always` obeys §10b's live-runtime lifetime, token-only authority
+   and audit contract. flk always uses exact in-memory grants and never
+   forwards harness permission suggestions or sends `updatedPermissions`.
+   Future adapters must preserve that scope rather than map an always
+   decision to a persistent harness rule.
 4. **Fork granularity.** Claude forks at a message uuid; opencode at a
    message id; Codex at a turn (`thread/fork{lastTurnId}`). `agent.fork`
    refuses a mid-turn point on Codex with `unsupported_for_agent`.
@@ -1770,7 +2051,7 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S1 | `SessionEvent` types for Claude stream-json: known variants with `extra`, `Unknown{raw, shape}`, shape key; redacted probe fixtures as tests | — | 350 |
 | S2 | `session.unknown_shape` persisted kind (skip test per ADR-0028 §3a), once-per-shape registry logging through `tracing` only (#1300), `flk report --unknown-events` | S1 | 250 |
 | S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (the login from the 0600 `setup-token` file g-fleet renders (g-fleet#476), passed as `CLAUDE_CODE_OAUTH_TOKEN` in the session env and never logged, owner decision 1; `--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
-| S4 | State mapping: `StateSource::Session`, turn / attention / limit from events, stall observation, `agent.phase_changed` | S3 | 300 |
+| S4 | Pure per-agent state reducer: `StateSource::Session`, turn / attention / limit from events, stall observation and in-process phase/needs-human facts; registry seam for #1439 and S7-min #1746. Pane-free EventHub events deferred to #1804 | S3 | 300 |
 | S5 | Input queue: `queue/<agent>` stream, producers, gate, `command_lifecycle` acks, independent `delivery` (`at_idle` / `steer` / `interrupt`) and `priority` ordering, one batch per turn with the FIFO rules 1 to 4 and batch messages, `flk agent send` and msg delivery routed to it | S3 | 400 |
 | S5c | Queue UX: `queue.update` / `edit` leases / `move` / `delete`, named stashes with `stash` / `pop` / `clear` / `stashes`, `send_now` (`steer`, or `interrupt` through the harness's `interrupt{send_now}`), `take_back` through `cancel_async_message` (§3, A.14, owner decision 4) | S0, S5 | 300 |
 | S5d | System One for the queue: relatedness joins at idle and the relevance check during a turn, `[queue] relevance` (whose `force` sends through S5c's `send_now`), recorded for rating (§3, owner decisions 4 and 5) | S5, S5c | 200 |

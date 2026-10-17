@@ -38,16 +38,15 @@ export function sessionEntry(seq: number, ev: WireEvent): SessionEntry {
 export function createWireTransport(connection: WireConnection): Transport {
   return {
     subscribe(stream: SessionStream, after: Cursor, observer: SessionObserver): Subscription {
-      const id = connection.nextSubId("t");
       let open = true;
       let synced = false;
+      let unsubscribe = (): void => undefined;
       const close = (): void => {
         if (!open) return;
         open = false;
-        connection.unsubscribe(id);
+        unsubscribe();
       };
-      connection.subscribe(
-        id,
+      const subscription = connection.subscribe(
         stream,
         {
           event: (seq, ev) => open && observer.entry(sessionEntry(seq, ev)),
@@ -68,6 +67,7 @@ export function createWireTransport(connection: WireConnection): Transport {
         },
         after,
       );
+      unsubscribe = subscription.close;
       return { close };
     },
   };

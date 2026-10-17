@@ -19,7 +19,7 @@ client: WireClient,
  */
 token?: string | null, } | { "t": "sub",
 /**
- * Connection-local subscription identity.
+ * Fresh connection-local identity, never reused even after this sub closes.
  */
 sub_id: string,
 /**

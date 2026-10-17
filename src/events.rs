@@ -232,13 +232,15 @@ pub enum AppEvent {
     },
     /// Agent session identity was reported without state authority.
     AgentSessionReported {
+        /// Unvalidated primary rollout path, never a resume ID or authority.
+        transcript_path: Option<String>,
         pane_id: PaneId,
         source: String,
         agent_label: String,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
-        /// Normalized Claude Code `SessionStart` source field
-        /// (`startup`/`resume`/`clear`/`compact`). `startup` reports are
+        /// Normalized harness `SessionStart` source field (Codex also accepts
+        /// `fork`). A report alone grants no lifecycle authority. `startup` reports are
         /// treated as nested session noise and never replace an existing
         /// restored session id; the other values are real identity changes.
         session_start_source: Option<String>,

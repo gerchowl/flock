@@ -59,9 +59,13 @@
             buildCommit = self.rev or self.dirtyRev or null;
             withWeb = true;
           };
+          # The web client's production bundle (web/client/dist), built offline
+          # from a fixed-output fetch of bun.lock (#1731). Only the bundle:
+          # S7-min slice 7a embeds it in `flk`.
+          flock-client = pkgs.callPackage ./nix/client.nix { };
         in
         {
-          inherit flock flock-web;
+          inherit flock flock-web flock-client;
           default = flock;
         }
       );
@@ -81,6 +85,7 @@
         in
         {
           flock = self.packages.${system}.default;
+          flock-client = self.packages.${system}.flock-client;
           sccache =
             pkgs.runCommand "flock-sccache-probe"
               {
@@ -134,6 +139,14 @@
                   && touch $out
               '';
           default = self.checks.${system}.flock;
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          macos-process-facts = pkgs.runCommand "flock-process-c-toolchain-check" {
+            nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
+            SDKROOT = self.packages.${system}.default.SDKROOT;
+          } ''
+            "$CC" -Werror -c ${./src/platform/macos_process.c} -o "$out"
+          '';
         }
       );
 

@@ -1,5 +1,6 @@
 pub mod agent_state;
 pub mod client;
+pub mod client_tokens;
 pub(crate) mod compatibility;
 pub(crate) mod error_code;
 mod event_hub;
@@ -81,6 +82,8 @@ pub struct ApiRequestMessage {
     pub peer_pid: Option<u32>,
     /// Process birth captured with socket credentials, before queueing the request.
     pub peer_birth: Option<u64>,
+    /// Effective UID captured from kernel socket credentials.
+    pub peer_uid: Option<u32>,
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;

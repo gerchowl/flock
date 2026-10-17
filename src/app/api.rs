@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod peer_uid_tests;
+#[cfg(test)]
 mod structured_lease_tests;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -6,6 +8,7 @@ use std::time::{Duration, Instant};
 mod agents;
 mod channels;
 mod checks;
+mod client_tokens;
 mod delegates;
 mod digest;
 mod edges;
@@ -150,7 +153,23 @@ fn run_pr_poll_round(
     })
 }
 
+/// Local-operator evidence borrowed from the classified API request.
+/// Only this dispatcher can construct it; it cannot outlive or mutate its caller.
+pub(crate) struct LocalOperator<'a> {
+    _app: &'a mut App,
+}
+
 impl App {
+    /// Mint token-management authority only from the existing kernel/lease policy.
+    pub(crate) fn client_token_authority(
+        &mut self,
+    ) -> Result<LocalOperator<'_>, crate::api::error_code::ErrorCode> {
+        if !self.caller_is_local_operator() {
+            return Err(crate::api::error_code::ErrorCode::OperatorOnly);
+        }
+        Ok(LocalOperator { _app: self })
+    }
+
     /// Arm and spawn a transcript read for `pane_id` at the currently
     /// selected panel detail (#246). Idempotent — the terminal's own guard
     /// short-circuits when the same `(session, detail)` pair is already
@@ -1379,12 +1398,50 @@ impl App {
         response
     }
 
+    /// Apply ADR-0036 §1a before normal dispatch or headless lifecycle fast paths.
+    pub(crate) fn peer_uid_refusal(
+        &mut self,
+        request: &crate::api::schema::Request,
+    ) -> Option<String> {
+        use crate::api::{error_code::ErrorCode, schema::Method};
+        let uid = self.current_api_peer_uid?;
+        let code = if matches!(
+            request.method,
+            Method::ServerStop(_)
+                | Method::ServerReloadConfig(_)
+                | Method::ServerLiveHandoff(_)
+                | Method::ClientTokenAdd(_)
+                | Method::ClientTokenRemove(_)
+                | Method::ClientTokenList(_)
+                | Method::ClientOpen(_)
+        ) && !matches!(self.spawn_caller(), spawn::SpawnCaller::Operator { .. })
+        {
+            Some(ErrorCode::OperatorOnly)
+        } else {
+            let uid = if self.current_api_peer_pid.is_some() && self.socket_birth_valid() {
+                uid
+            } else {
+                None
+            };
+            let attributed = self.runtime_config.uid_policy.classify(uid)
+                == crate::structured::identity::Principal::Agent
+                && self.lease_caller() != crate::structured::lease::Caller::Uncertain;
+            self.runtime_config
+                .uid_policy
+                .refusal(uid, attributed, &request.method)
+        }?;
+        Some(responses::encode_error(
+            request.id.clone(),
+            code.as_str(),
+            "socket caller lacks authority for this operation",
+        ))
+    }
+
     fn dispatch_api_request(&mut self, request: crate::api::schema::Request) -> String {
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
         self.input_writes.abandon_staged();
-        self.pending_paste = None;
         self.pending_integration_install = None;
         self.detach_pending_message_relay();
         debug_assert!(
@@ -1400,11 +1457,17 @@ impl App {
             self.active_submissions.remove(&pane);
         }
         self.pending_recovery_park = None;
+        if let Some(response) = self.peer_uid_refusal(&request) {
+            return response;
+        }
         if self.waits_for_mesh_recovery(&request.method) {
             self.pending_recovery_park = Some((
                 request,
-                self.current_api_peer_pid,
-                self.current_api_peer_birth,
+                super::ApiCaller {
+                    pid: self.current_api_peer_pid,
+                    birth: self.current_api_peer_birth,
+                    uid: self.current_api_peer_uid,
+                },
             ));
             return String::new();
         }
@@ -1523,6 +1586,12 @@ impl App {
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
+            Method::ClientTokenAdd(_)
+            | Method::ClientTokenRemove(_)
+            | Method::ClientTokenList(_)
+            | Method::ClientOpen(_) => {
+                return self.handle_client_token(request.id, request.method);
+            }
             Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),
             Method::WaitPark(params) => return self.handle_wait_park(request.id, params),
             Method::WaitHold(predicate, hold_ms) => {
@@ -1600,7 +1669,9 @@ impl App {
             Method::PaneReleaseAgent(params) => {
                 return self.handle_pane_release_agent(request.id, params);
             }
-            Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
+            Method::PaneSendText(params) | Method::PaneWriteText(params) => {
+                return self.handle_pane_send_text(request.id, params)
+            }
             Method::PaneSendInput(params) | Method::PaneWriteInput(params) => {
                 return self.handle_pane_send_input(request.id, params)
             }
@@ -2318,6 +2389,83 @@ mod tests {
         let response = app.handle_peers_summary("req_peers".into());
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["result"]["workspaces"][0]["agent"], "researcher");
+    }
+
+    #[tokio::test]
+    async fn codex_session_report_retains_fork_path_without_changing_resume_id() {
+        let mut app = notification_test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("segment")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let id = app.state.workspaces[0].terminal_id(pane).cloned().unwrap();
+        app.state.terminals.get_mut(&id).unwrap().detected_agent = Some(Agent::Codex);
+        let route = app.public_pane_id(0, pane).unwrap();
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let path = root
+            .path()
+            .join("physical.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        for (seq, thread, source) in [(1, "original", "startup"), (2, "child", "fork")] {
+            let request = serde_json::from_value(serde_json::json!({
+                "id":"report", "method":"pane.report_agent_session", "params":{
+                    "pane_id":route,"source":"flock:codex","agent":"codex","seq":seq,
+                    "agent_session_id":thread,"agent_session_path":path,"session_start_source":source
+                }
+            })).unwrap();
+            let response = app.handle_api_request(request);
+            assert!(!response.contains("\"error\""), "{response}");
+            let terminal = &app.state.terminals[&id];
+            let report = terminal.codex_session_start.as_ref().unwrap();
+            assert_eq!(report.thread, thread);
+            assert_eq!(report.source.as_deref(), Some(source));
+            assert_eq!(report.transcript_path.as_deref(), Some(path.as_str()));
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .unwrap()
+                    .session_ref
+                    .value,
+                thread
+            );
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .unwrap()
+                    .session_ref
+                    .kind,
+                crate::agent_resume::AgentSessionRefKind::Id
+            );
+        }
+        assert_eq!(
+            crate::agent_resume::normalize_session_start_source("claude", Some("fork".into())),
+            None
+        );
+        // An older hook cannot overwrite the newer report or its path.
+        let response = app.handle_pane_report_agent_session(
+            "stale".into(),
+            crate::api::schema::PaneReportAgentSessionParams {
+                pane_id: route,
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                seq: Some(1),
+                agent_session_id: Some("original".into()),
+                agent_session_path: None,
+                session_start_source: Some("fork".into()),
+            },
+        );
+        assert!(!response.contains("\"error\""));
+        assert_eq!(
+            app.state.terminals[&id]
+                .codex_session_start
+                .as_ref()
+                .unwrap()
+                .thread,
+            "child"
+        );
     }
 
     fn notification_test_app() -> App {

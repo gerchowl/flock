@@ -12,7 +12,7 @@ import type { ClientFrame } from "../../src/gen/ClientFrame";
 import type { FixtureLine } from "../../src/gen/FixtureLine";
 import type { ServerFrame } from "../../src/gen/ServerFrame";
 import type { WireEvent } from "../../src/gen/WireEvent";
-import { WireConnection, type Refusal, type StreamName } from "../../src/wire/connection";
+import { WireConnection, type Refusal, type StreamName, type Subscription } from "../../src/wire/connection";
 import { memoryStore, type Clock, type SocketLike, type TimerHandle } from "../../src/wire/env";
 import { OUTBOX_KEY } from "../../src/wire/outbox";
 
@@ -192,6 +192,8 @@ export class Harness {
   store = memoryStore();
   conn: WireConnection | null = null;
   readonly seen = new Map<string, Seen[]>();
+  /** The script's subscriptions, which follow their ids across re-subs. */
+  readonly #subscriptions: Subscription[] = [];
   readonly #random: () => number;
   #transitions: string[] = [];
   #changes = 0;
@@ -306,7 +308,7 @@ export class Harness {
       case "subscribe": {
         const seen: Seen[] = [];
         this.seen.set(action.sub_id, seen);
-        return conn.subscribe(action.sub_id, action.stream as StreamName, {
+        const subscription = conn.subscribe(action.stream as StreamName, {
           event: (seq, ev) => seen.push({ kind: "event", seq, ev }),
           gap: (from, to) => seen.push({ kind: "gap", from, to }),
           synced: () => seen.push({ kind: "synced" }),
@@ -314,9 +316,14 @@ export class Harness {
           reset: () => seen.push({ kind: "reset" }),
           refused: (refusal) => seen.push({ kind: "refused", refusal }),
         });
+        // The connection allocates every id; a script names the one it expects, in order.
+        if (subscription.id !== action.sub_id) fail(`the script subscribes ${action.sub_id}, but the connection allocated ${subscription.id}`);
+        this.#subscriptions.push(subscription);
+        return;
       }
       case "unsubscribe":
-        return conn.unsubscribe(action.sub_id);
+        // The script names the id on the wire now, which a re-sub may have moved.
+        return this.#subscriptions.find((subscription) => subscription.id === action.sub_id)?.close();
       case "command":
         conn.command(action.verb, action.args, action.cmd_id);
         return;

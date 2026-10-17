@@ -183,6 +183,8 @@ pub enum Method {
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.send_text")]
     PaneSendText(PaneSendTextParams),
+    #[serde(rename = "pane.write_text")]
+    PaneWriteText(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]
     PaneSendKeys(PaneSendKeysParams),
     #[serde(rename = "pane.send_input")]
@@ -232,6 +234,14 @@ pub enum Method {
     EventsWait(EventsWaitParams),
     #[serde(rename = "events.read")]
     EventsRead(EventsReadParams),
+    #[serde(rename = "client.token.add")]
+    ClientTokenAdd(super::client_tokens::AddParams),
+    #[serde(rename = "client.token.rm")]
+    ClientTokenRemove(super::client_tokens::RemoveParams),
+    #[serde(rename = "client.token.list")]
+    ClientTokenList(EmptyParams),
+    #[serde(rename = "client.open")]
+    ClientOpen(EmptyParams),
     #[serde(rename = "channel.hello")]
     ChannelHello(ChannelHelloParams),
     /// ADR-0028 §5 (#1031): park the calling agent on a registered wait and
@@ -331,6 +341,7 @@ impl Method {
     /// Can this request be sent again after a transport error that left its
     /// fate unknown (#910)?
     ///
+    /// The anonymous-UID boundary also relies on this being reads/previews only.
     /// Only reads qualify: a read timeout on a write says nothing about
     /// whether the server applied it, and sending a `pane.close` twice turns
     /// "closed" into `pane_not_found`. `msg.read` is left out on purpose, it
@@ -472,6 +483,10 @@ impl Method {
             | Self::PaneSplit(_)
             | Self::PaneMove(_)
             | Self::PaneRename(_)
+            | Self::ClientTokenAdd(_)
+            | Self::ClientTokenRemove(_)
+            | Self::ClientTokenList(_)
+            | Self::ClientOpen(_)
             | Self::ChannelHello(_)
             | Self::WaitPark(_)
             | Self::OwnerBind(_)
@@ -481,6 +496,7 @@ impl Method {
             | Self::GoalResume(_)
             | Self::GoalStop(_)
             | Self::PaneSendText(_)
+            | Self::PaneWriteText(_)
             | Self::PaneSendKeys(_)
             | Self::PaneSendInput(_)
             | Self::PaneWriteKeys(_)
@@ -1077,6 +1093,13 @@ pub const AGENT_HISTORY_MAX_TURNS: u32 = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSendParams {
+    /// Raw-write milliseconds: integer 1..=30000, default 10000. Not a submit budget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub target: String,
     pub text: String,
     /// Guard an empty idle composer, send delayed Enter and confirm with one retry.
@@ -1956,6 +1979,13 @@ pub struct PaneRenameParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSendTextParams {
+    /// Raw-write milliseconds: integer 1..=30000, default 10000. Not a submit budget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub pane_id: String,
     pub text: String,
     /// Type even when the target is an agent pane whose composer holds a
@@ -2925,6 +2955,14 @@ pub struct ServerCapabilities {
     pub agent_questions: bool,
 }
 
+/// Confirmed local account-policy fault, retained until server restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum AgentAccountDiagnostic {
+    /// The dedicated agent and server share a UID and cannot be distinguished.
+    AgentAccountUidCollision { uid: u32 },
+}
+
 /// Accept failures retained for the lifetime of the API listener.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiListenerHealth {
@@ -2937,6 +2975,15 @@ pub struct ApiListenerHealth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    ClientTokenIssued {
+        issued: super::client_tokens::Issued,
+    },
+    ClientTokenList {
+        entries: Vec<super::client_tokens::Listed>,
+    },
+    ClientOpen {
+        url: super::client_tokens::Bearer,
+    },
     Paste {
         outcome: String,
         reason: String,
@@ -2970,6 +3017,9 @@ pub enum ResponseResult {
         session_health: Option<crate::platform::SessionHealth>,
         #[serde(default)]
         api_listener: Option<ApiListenerHealth>,
+        /// Missing on older servers; observing status never starts an NSS lookup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_account_diagnostic: Option<AgentAccountDiagnostic>,
     },
     NotificationShow {
         shown: bool,
@@ -5661,6 +5711,7 @@ mod tests {
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
+                agent_account_diagnostic: None,
             },
         };
 

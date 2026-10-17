@@ -36,9 +36,16 @@ mod checks;
 mod checksum;
 mod cli;
 mod client;
+mod client_open;
 // Pure rollout foundation; runtime consumers follow in #1662–#1664.
 #[allow(dead_code)]
 mod codex_rollout;
+// Binding foundation, connected to the reader and authority in #1663/#1664.
+#[allow(dead_code)]
+mod codex_binding;
+// File/cursor foundation; segment admission and supervision follow in #1856/#1857.
+#[allow(dead_code)]
+mod codex_reader;
 mod codex_transcript;
 // Version eligibility foundation; binding and runtime consumers follow in #1662/#1664.
 #[allow(dead_code)]
@@ -569,6 +576,7 @@ fn run() -> io::Result<()> {
         println!("       flk wait <subcommand> ...");
         println!("       flk events <read|wait> ...");
         println!("       flk adapter hello <binding> ...");
+        println!("       flk client <token|open> ...");
         println!("       flk owner policy <show|adopt> ...");
         println!("       flk session <subcommand> ...");
         println!("       flk integration <subcommand> ...");
@@ -647,6 +655,10 @@ fn run() -> io::Result<()> {
             (
                 "flk adapter hello <binding>",
                 "Check a channel adapter's binding token before it starts",
+            ),
+            (
+                "flk client <token|open>",
+                "Manage GUI credentials or open the GUI",
             ),
             (
                 "flk owner policy <show|adopt>",

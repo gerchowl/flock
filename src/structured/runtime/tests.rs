@@ -21,6 +21,11 @@ impl Fixture {
     pub(crate) fn new() -> Self {
         Self::under(&std::env::temp_dir())
     }
+    /// Owned short root for Unix sockets, independent of the caller's TMPDIR.
+    pub(crate) fn for_socket() -> Self {
+        // guardrails-ok(hermetic): Unix sockets need a short base on macOS.
+        Self::under(std::path::Path::new("/tmp"))
+    }
     pub(crate) fn under(parent: &std::path::Path) -> Self {
         let root = SessionConfigDir::create(parent).expect("fixture root");
         let path = root.path().join("lifetime");
@@ -76,6 +81,9 @@ impl Fixture {
         path
     }
     pub(crate) fn profile(&self, mode: &str, version: &str) -> LaunchProfile {
+        self.profile_at(mode, version, SESSION)
+    }
+    pub(crate) fn profile_at(&self, mode: &str, version: &str, session: &str) -> LaunchProfile {
         self.file(
             "case.json",
             serde_json::json!({"mode":mode,"version":version})
@@ -96,7 +104,7 @@ impl Fixture {
             LaunchProfile::prepare(
                 &config,
                 self.root.path(),
-                SESSION,
+                session,
                 binary,
                 |key| match key {
                     "HOME" | "TMPDIR" => Some(self.root.path().as_os_str().to_owned()),
@@ -476,7 +484,7 @@ fn missing_child_pipes_without_workers_allows_confirmed_cleanup() {
         .leases
         .reserve("fixture-agent", SESSION, None)
         .unwrap();
-    lease.spawned();
+    lease.spawned().unwrap();
     lease.bind(child.id()).unwrap();
     let error = startup_failed(child, files, persistent.clone(), error, true, &mut lease);
     assert!(error.to_string().contains("missing stdout pipe"));
@@ -871,5 +879,251 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
             "{error}"
         );
         assert!(fixture.leases.reserve(agent, session, None).is_ok());
+    }
+}
+
+#[test]
+fn scripted_stream_drives_session_state_through_the_keyed_sink() {
+    use crate::api::agent_state::{Phase, Turn};
+    use crate::structured::claude::SessionEvent;
+    use crate::structured::state::{SessionState, StateSink, Update};
+    struct Sink(Vec<Update>);
+    impl StateSink for Sink {
+        fn publish(&mut self, update: Update) {
+            self.0.push(update);
+        }
+    }
+    let fixture = Fixture::new();
+    let catalogue: Vec<Value> = include_str!("../../../tests/fixtures/claude-session/events.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let start = catalogue
+        .iter()
+        .find(|e| e["state"] == "started")
+        .unwrap()
+        .clone();
+    let mut permission = catalogue
+        .iter()
+        .find(|e| e["type"] == "control_request")
+        .unwrap()
+        .clone();
+    permission["request_id"] = "p1".into();
+    let mut second = permission.clone();
+    second["request_id"] = "p2".into();
+    let mut limit = catalogue
+        .iter()
+        .find(|e| e["type"] == "rate_limit_event")
+        .unwrap()
+        .clone();
+    limit["rate_limit_info"]["status"] = "rejected".into();
+    let result = catalogue
+        .iter()
+        .find(|e| e["type"] == "result")
+        .unwrap()
+        .clone();
+    // Extra init/hook traffic must not change which state transitions are asserted.
+    let extra_init = catalogue
+        .iter()
+        .find(|e| e["type"] == "system" && e["subtype"] == "init")
+        .unwrap()
+        .clone();
+    let extra_hook = catalogue
+        .iter()
+        .find(|e| e["subtype"] == "hook_response")
+        .unwrap()
+        .clone();
+    let lines = [
+        extra_init, start, permission, extra_hook, second, limit, result,
+    ]
+    .iter()
+    .map(|e| format!("{e}\n"))
+    .collect::<String>();
+    fixture.file("state-events.jsonl", lines.as_bytes(), 0o600);
+    let mut running = fixture.launch("state-reducer", "2.1.296").expect("launch");
+    running.receive();
+    running.submit();
+    let now = Instant::now();
+    let mut reducer = SessionState::new("fixture-agent".into());
+    let mut sink = Sink(Vec::new());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stage = 0;
+    loop {
+        let received = running
+            .runtime
+            .receive_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "state stream stage {stage}: {error}; worker: {:?}",
+                    running.result.try_recv()
+                )
+            });
+        let Some(input) = received.state_input() else {
+            let audit: Value = serde_json::from_str(&received.record.raw).unwrap();
+            assert_eq!(audit["type"], "flk_permission_request");
+            assert_eq!(audit["state"], "open");
+            assert!(stage == 2 || stage == 3, "audit at stage {stage}");
+            assert_eq!(audit["request_id"], format!("p{}", stage - 1));
+            continue;
+        };
+        reducer.publish(
+            input,
+            now,
+            received.record.received_at_ms.try_into().unwrap(),
+            Duration::from_secs(1),
+            &mut sink,
+        );
+        let update = sink.0.last().unwrap();
+        match received.event {
+            SessionEvent::Init(_)
+            | SessionEvent::HookStarted(_)
+            | SessionEvent::HookResponse(_) => continue,
+            SessionEvent::CommandLifecycle(e) if e.state == "started" => {
+                assert_eq!(stage, 0);
+                assert_eq!(update.state.turn, Turn::Working);
+                assert_eq!(update.phase_changed, Some((Phase::Unknown, Phase::Working)));
+            }
+            SessionEvent::CanUseTool(e) => {
+                assert!(
+                    stage == 1 || stage == 2,
+                    "unexpected request at stage {stage}"
+                );
+                assert_eq!(e.request_id, format!("p{stage}"));
+                assert_eq!(update.state.phase, Phase::NeedsHuman);
+                assert_eq!(update.needs_human.len(), stage);
+                if stage == 1 {
+                    assert_eq!(
+                        update.phase_changed,
+                        Some((Phase::Working, Phase::NeedsHuman))
+                    );
+                }
+            }
+            SessionEvent::RateLimit(_) => {
+                assert_eq!(stage, 3);
+                assert_eq!(update.state.phase, Phase::LimitReached);
+                assert_eq!(update.needs_human.len(), 2);
+            }
+            SessionEvent::Success(_) => {
+                assert_eq!(stage, 4);
+                assert_eq!(update.state.phase, Phase::LimitReached);
+                assert_eq!(update.state.turn, Turn::Unknown);
+                assert!(update.needs_human.is_empty());
+                break;
+            }
+            other => panic!("unexpected state stream event: {other:?}"),
+        }
+        stage += 1;
+    }
+    assert!(sink.0.iter().all(|u| u.agent_id == "fixture-agent"));
+    running.runtime.stop();
+    assert_eq!(running.finish().outcome, Outcome::Stopped);
+}
+
+#[test]
+fn registry_launch_metadata_reaches_the_child_and_events_wake_the_owner() {
+    let fixture = Fixture::new();
+    let cwd = fixture.root.path().join("project");
+    fs::create_dir(&cwd).unwrap();
+    let profile = fixture
+        .profile("idle", "2.1.296")
+        .for_agent(&cwd, Some("fixture-requested-model"))
+        .unwrap();
+    fixture.file(
+        "argv.json",
+        &serde_json::to_vec(
+            &profile
+                .args()
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
+        0o600,
+    );
+    fixture.file(
+        "case.json",
+        &serde_json::to_vec(&serde_json::json!({
+            "mode":"idle", "version":"2.1.296", "cwd":cwd, "model":"fixture-requested-model"
+        }))
+        .unwrap(),
+        0o600,
+    );
+    let settings_index = profile
+        .args()
+        .iter()
+        .position(|arg| arg == "--settings")
+        .unwrap();
+    let generated = PathBuf::from(&profile.args()[settings_index + 1])
+        .parent()
+        .unwrap()
+        .to_owned();
+    let persistent = profile.config_dir().to_owned();
+    let state = fixture.root.path().to_owned();
+    let location = StreamLocation {
+        data_dir: state.clone(),
+        agent: "fixture-agent".into(),
+        session: SESSION.into(),
+    };
+    let lease = fixture
+        .leases
+        .reserve("fixture-agent", SESSION, None)
+        .unwrap();
+    assert!(fixture.leases.is_reserved(SESSION).unwrap());
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let result = run_notified(
+            &state,
+            profile,
+            lease,
+            location,
+            |runtime| {
+                ready_tx.try_send(runtime).ok();
+            },
+            move || {
+                wake_tx.try_send(()).ok();
+            },
+        );
+        result_tx.try_send(result).ok();
+    });
+    let runtime = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let mut running = Running {
+        runtime,
+        result: result_rx,
+        worker: Some(worker),
+        finished: false,
+        generated,
+        persistent,
+    };
+    wake_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("queued stdout must wake its owner");
+    let received = running
+        .runtime
+        .try_receive()
+        .expect("notification follows event publication");
+    assert!(matches!(
+        received.event,
+        crate::structured::claude::SessionEvent::HookStarted { .. }
+    ));
+    let result = running.finish();
+    assert_eq!(result.outcome, Outcome::Exited, "{result:?}");
+    assert!(
+        !fixture.leases.is_reserved(SESSION).unwrap(),
+        "reaped runtime releases the lease"
+    );
+}
+
+#[test]
+fn launch_metadata_refuses_invalid_cwd_or_empty_model() {
+    let fixture = Fixture::new();
+    for (cwd, model) in [
+        (PathBuf::from("fixture-relative"), None),
+        (fixture.root.path().join("missing"), None),
+        (fixture.root.path().to_owned(), Some(" ")),
+    ] {
+        let result = fixture.profile("idle", "2.1.296").for_agent(&cwd, model);
+        assert!(matches!(result, Err(LaunchError::Io(_))));
     }
 }

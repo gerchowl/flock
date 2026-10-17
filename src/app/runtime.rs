@@ -65,9 +65,11 @@ impl App {
         let changed = crate::api::request_changes_ui(&msg.request);
         self.current_api_peer_pid = msg.peer_pid;
         self.current_api_peer_birth = Some(msg.peer_birth);
+        self.current_api_peer_uid = Some(msg.peer_uid);
         let response = self.handle_api_request(msg.request);
         self.current_api_peer_pid = None;
         self.current_api_peer_birth = None;
+        self.current_api_peer_uid = None;
         self.respond_or_park(msg.respond_to, response);
         self.sync_prefix_input_source(previous_mode);
         changed
@@ -209,11 +211,22 @@ impl App {
         true
     }
 
+    /// Drain structured facts on an owner wake or exact reducer boundary.
+    pub(crate) fn service_structured_workers(&mut self, now: Instant) -> bool {
+        self.structured_workers.poll(
+            &mut self.state.structured_agents,
+            now,
+            crate::app::notifications::now_ms(),
+        )
+    }
+
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
         let mut resized = false;
+        changed |= self.service_structured_workers(now);
 
         self.input_writes.service_due(now);
+        self.start_ready_pastes();
         self.sync_animation_timer(now);
         changed |= self.refresh_session_health(now);
 
@@ -721,6 +734,8 @@ impl App {
             // ADR-0028 §5: a wait expires on time in a quiet loop.
             self.waits.next_deadline(),
             self.input_writes.next_deadline(),
+            self.structured_workers
+                .next_deadline(&self.state.structured_agents),
             // #540: the same, for an armed self-compaction — the Enter of a
             // typed write, a settle that lifts, or a timeout coming due.
             self.self_compact_deadline,

@@ -23,6 +23,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "questions",
     "remote",
     "session",
+    "security",
     "slots",
     "spawn",
     "structured",
@@ -33,6 +34,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "ui",
     "update",
     "web",
+    "client",
     "worktrees",
 ];
 
@@ -525,6 +527,14 @@ fn load_live_config_from_table(
 
     load_live_section(
         &table,
+        "security",
+        "socket account policy",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.security = section,
+    );
+    load_live_section(
+        &table,
         "structured",
         "structured launch config",
         &mut diagnostics,
@@ -634,6 +644,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.web = section,
+    );
+    load_live_section(
+        &table,
+        "client",
+        "client config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.client = section,
     );
     load_live_section(
         &table,
@@ -1525,6 +1543,29 @@ mouse_capture = false
                  — add it there AND wire it into load_live_config_from_table"
             );
         }
+    }
+
+    #[test]
+    fn security_account_policy_is_explicit_and_survives_loading() {
+        use crate::config::model::AgentAccount;
+        assert_eq!(
+            Config::default().security.agent_account,
+            AgentAccount::FlkAgent
+        );
+        for (value, expected) in [
+            ("none", AgentAccount::None),
+            ("flk-agent", AgentAccount::FlkAgent),
+        ] {
+            let text = format!(
+                "[security]\nagent_account = '{value}'\n[structured]\nrun_as = 'operator'\n"
+            );
+            let parsed: Config = toml::from_str(&text).unwrap();
+            assert_eq!(parsed.security.agent_account, expected);
+            let loaded = load_live_config_from_table(toml::from_str(&text).unwrap()).unwrap();
+            assert_eq!(loaded.config.security.agent_account, expected);
+            assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        }
+        assert!(toml::from_str::<Config>("[security]\nagent_account = 'invalid'\n").is_err());
     }
 
     #[test]

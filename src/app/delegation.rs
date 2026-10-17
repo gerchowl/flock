@@ -441,7 +441,7 @@ pub(crate) mod handler_tests {
         app
     }
 
-    /// Make workspace 0's pane an agent this process is running inside.
+    /// Give workspace 0 an owned agent pane and make its child the caller.
     pub(crate) fn caller_is_an_agent(app: &mut App) -> String {
         let pane_id = app.state.workspaces[0]
             .focused_pane_id()
@@ -454,8 +454,7 @@ pub(crate) mod handler_tests {
         let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
         terminal.launch_argv = Some(vec!["claude".into()]);
         let agent_id = terminal.agent_id.to_string();
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(app, pane_id);
         agent_id
     }
 

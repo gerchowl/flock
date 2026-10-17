@@ -957,7 +957,7 @@ impl HeadlessServer {
             };
 
             match event {
-                LoopEvent::InputWrites => self.app.input_writes.service(),
+                LoopEvent::InputWrites => self.app.service_input_writes(),
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
                     if self.handle_internal_event_with_forwarding(ev) {
@@ -983,11 +983,6 @@ impl HeadlessServer {
                     }
                 }
             }
-        }
-
-        // Save session on exit.
-        if !self.app.no_session {
-            self.app.save_session_now();
         }
 
         info!("headless server exiting");
@@ -1155,6 +1150,19 @@ impl HeadlessServer {
         }
     }
 
+    /// S3a-3 deliberately stops structured sessions before transferring ownership.
+    /// Full single-writer session handoff belongs to S7-rest.
+    fn stop_structured_before_handoff(&mut self) -> Vec<String> {
+        if let Err(error) = self
+            .app
+            .structured_workers
+            .shutdown(&mut self.app.state.structured_agents)
+        {
+            crate::logging::structured_worker_shutdown_failed(&error);
+        }
+        self.app.state.structured_agents.handoff_unknown()
+    }
+
     #[cfg(unix)]
     fn perform_live_handoff(
         &mut self,
@@ -1180,6 +1188,7 @@ impl HeadlessServer {
             );
             return Err(HandoffError::SessionBroken);
         }
+        let structured_unknown = self.stop_structured_before_handoff();
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
@@ -1296,6 +1305,7 @@ impl HeadlessServer {
         }
 
         let snapshot = crate::persist::capture(
+            &self.app.state.structured_agents,
             &self.app.state.workspaces,
             &self.app.state.terminals,
             &self.app.terminal_runtimes,
@@ -1347,6 +1357,7 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
         );
+        manifest.structured_unknown = structured_unknown;
         manifest.store_generation = store_generation;
         manifest.kept_drafts = self.app.kept_drafts.borrow().export();
         if cfg!(debug_assertions)
@@ -2883,6 +2894,30 @@ impl HeadlessServer {
             return false;
         }
 
+        if matches!(
+            msg.request.method,
+            api::schema::Method::ServerLiveHandoff(_) | api::schema::Method::ServerReloadConfig(_)
+        ) {
+            let outer = (
+                self.app.current_api_peer_pid,
+                self.app.current_api_peer_birth,
+                self.app.current_api_peer_uid,
+            );
+            self.app.current_api_peer_pid = msg.peer_pid;
+            self.app.current_api_peer_birth = Some(msg.peer_birth);
+            self.app.current_api_peer_uid = Some(msg.peer_uid);
+            let refusal = self.app.peer_uid_refusal(&msg.request);
+            (
+                self.app.current_api_peer_pid,
+                self.app.current_api_peer_birth,
+                self.app.current_api_peer_uid,
+            ) = outer;
+            if let Some(response) = refusal {
+                let _ = msg.respond_to.send(response);
+                return false;
+            }
+        }
+
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
             self.handoff_skipped_undrained.clear();
             let outcome = self.perform_live_handoff(params.clone());
@@ -2994,11 +3029,13 @@ impl HeadlessServer {
         } else {
             self.app.current_api_peer_pid = msg.peer_pid;
             self.app.current_api_peer_birth = Some(msg.peer_birth);
+            self.app.current_api_peer_uid = Some(msg.peer_uid);
             let response = self
                 .app
                 .handle_api_request_after_internal_events_drained(msg.request);
             self.app.current_api_peer_pid = None;
             self.app.current_api_peer_birth = None;
+            self.app.current_api_peer_uid = None;
             response
         };
         self.app.respond_or_park(msg.respond_to, response);
@@ -3757,7 +3794,9 @@ impl HeadlessServer {
     /// would never see the fault that only the server can have.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         self.app.input_writes.service_due(now);
-        let mut changed = false;
+        let structured_changed = self.app.service_structured_workers(now);
+        self.app.start_ready_pastes();
+        let mut changed = structured_changed;
 
         self.app.sync_headless_animation_timer(now);
         changed |= self.app.refresh_session_health(now);
@@ -3998,6 +4037,7 @@ impl HeadlessServer {
     fn complete_shutdown(&mut self) -> io::Result<()> {
         info!("completing server shutdown");
         self.app.settle_injections_for_exit();
+        let structured = self.app.finish_session();
 
         // Send ServerShutdown to all remaining clients.
         if !self.clients.is_empty() {
@@ -4021,7 +4061,7 @@ impl HeadlessServer {
         // Remove socket files.
         self.cleanup_sockets()?;
 
-        Ok(())
+        structured.map_err(io::Error::other)
     }
 
     /// Removes socket files created by the server.
@@ -4191,7 +4231,10 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     event_hub.set_read_max_wait_ms(loaded_config.config.events.read_max_wait_ms);
 
     let mut imports = HashMap::new();
-    for (pane, fd) in received.manifest.panes.into_iter().zip(received.fds) {
+    for (pane, fd) in std::mem::take(&mut received.manifest.panes)
+        .into_iter()
+        .zip(received.fds)
+    {
         let pane_id = pane.pane_id;
         imports.insert(
             pane_id,
@@ -4229,6 +4272,9 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
                 return Err(err);
             }
         };
+        received
+            .manifest
+            .restore_structured_unknown(&mut app.state.structured_agents);
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
         app.kept_drafts
@@ -4706,6 +4752,322 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_stops_and_joins_all_structured_workers() {
+        assert_structured_workers_stopped(false).await;
+    }
+
+    #[tokio::test]
+    async fn pre_handoff_stops_and_joins_all_structured_workers() {
+        assert_structured_workers_stopped(true).await;
+    }
+
+    async fn assert_structured_workers_stopped(handoff: bool) {
+        use crate::api::agent_state::Lifecycle;
+        use crate::structured::{
+            supervision::ProcessIdentity,
+            workers::tests::{event, Case},
+        };
+        let mut server = test_headless_server();
+        let notify = server.app.render_notify.clone();
+        let now = Instant::now();
+        let mut cases = Vec::new();
+        let mut children = Vec::new();
+        for n in [33, 34] {
+            let case = Case::start(
+                &mut server.app.state.structured_agents,
+                &mut server.app.structured_workers,
+                n,
+                "state-reducer",
+                vec![event("control_request")],
+            );
+            case.human(
+                &mut server.app.state.structured_agents,
+                &mut server.app.structured_workers,
+                &notify,
+                now,
+            )
+            .await;
+            let pid = std::fs::read_to_string(case.fixture.root.path().join("model.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            children.push(ProcessIdentity::capture(pid).unwrap());
+            cases.push(case);
+        }
+        if handoff {
+            assert!(server.stop_structured_before_handoff().is_empty());
+        } else {
+            server.complete_shutdown().unwrap();
+        }
+        assert!(children.into_iter().all(|child| !child.alive()));
+        for case in cases {
+            case.assert_shutdown(
+                &server.app.state.structured_agents,
+                &server.app.structured_workers,
+            );
+            assert_eq!(
+                server
+                    .app
+                    .state
+                    .structured_agents
+                    .get(&case.id)
+                    .unwrap()
+                    .1
+                    .update
+                    .state
+                    .lifecycle,
+                Lifecycle::Offline
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_worker_reports_but_does_not_veto_handoff_and_crosses_as_unknown() {
+        use crate::api::{agent_state::Lifecycle, error_code::ErrorCode};
+        use crate::structured::workers::tests::Case;
+        let _guard = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        struct SavedEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for SavedEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+        let _env = SavedEnv(
+            [
+                crate::config::CONFIG_PATH_ENV_VAR,
+                "XDG_STATE_HOME",
+                "XDG_CONFIG_HOME",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+        );
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+        let mut server = test_headless_server();
+        let notify = server.app.render_notify.clone();
+        let case = Case::uncertain(
+            &mut server.app.state.structured_agents,
+            &mut server.app.structured_workers,
+            42,
+            &notify,
+        )
+        .await;
+        let (offline, _, _) = Case::prepare(
+            &mut server.app.state.structured_agents,
+            43,
+            "state-reducer",
+            vec![],
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                server.stop_structured_before_handoff(),
+                vec![case.id.clone()]
+            );
+            let error = server
+                .app
+                .structured_workers
+                .shutdown(&mut server.app.state.structured_agents)
+                .unwrap_err();
+            assert!(error
+                .0
+                .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
+            let result = server.perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
+                import_exe: Some(
+                    root.path()
+                        .join("missing-importer")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                expected_protocol: None,
+                expected_version: None,
+                skip_undrained: false,
+            });
+            match result {
+                Err(HandoffError::Failed(error)) => assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::NotFound,
+                    "worker diagnostics must reach the real importer precondition"
+                ),
+                other => panic!("unexpected handoff outcome: {other:?}"),
+            }
+        }
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "workspaces":[],"active":null,"selected":0,"structured_agents":server.app.state.structured_agents,
+        })).unwrap();
+        let mut manifest = crate::server::handoff::manifest_for(snapshot, Vec::new(), None, None);
+        manifest.structured_unknown = server.stop_structured_before_handoff();
+        let manifest: crate::server::handoff::HandoffManifest =
+            serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut restored = crate::app::App::new_from_handoff(
+            &crate::config::Config::default(),
+            None,
+            rx,
+            crate::api::EventHub::default(),
+            &manifest.snapshot,
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        manifest.restore_structured_unknown(&mut restored.state.structured_agents);
+        assert_eq!(
+            restored
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle,
+            Lifecycle::Unknown
+        );
+        assert_eq!(
+            restored
+                .state
+                .structured_agents
+                .get(&offline.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle,
+            Lifecycle::Offline
+        );
+        assert_eq!(
+            restored.state.structured_agents.handoff_unknown(),
+            vec![case.id.clone()],
+            "the next handoff must preserve Unknown without a restored worker"
+        );
+        assert!(restored
+            .structured_workers
+            .runtime(&case.id, case.generation)
+            .is_none());
+        let error = server.complete_shutdown().unwrap_err();
+        let diagnostic = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::structured::workers::ShutdownError>())
+            .expect("quit must keep the typed shutdown diagnostic as its source");
+        assert!(diagnostic
+            .0
+            .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
+    }
+
+    #[tokio::test]
+    async fn structured_worker_notifications_and_exact_deadlines_reach_the_scheduler() {
+        use crate::api::agent_state::{Lifecycle, Phase};
+        use crate::structured::workers::tests::{event, wait, Case};
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        let notify = server.app.render_notify.clone();
+        server.app.state.workspaces.clear();
+        server.app.state.config.checks.enable = false;
+        server.app.next_auto_update_check = None;
+        server.app.checks_heartbeat_deadline = None;
+        server.app.checks_next_deadline = None;
+        server.app.next_animation_tick = None;
+        server.app.session_save_deadline = None;
+        let (mut case, mut launch, factory) = Case::prepare(
+            &mut server.app.state.structured_agents,
+            11,
+            "state-reducer",
+            vec![event("command_lifecycle")],
+        );
+        // Choose an explicit fixture policy earlier than unrelated app deadlines.
+        launch.stall_after = Duration::from_millis(1);
+        case.generation = server
+            .app
+            .structured_workers
+            .start(&mut server.app.state.structured_agents, launch, factory)
+            .unwrap();
+        wait(&notify, || {
+            server.handle_scheduled_tasks_headless(now, false);
+            assert!(server
+                .app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            server
+                .app
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle
+                == Lifecycle::Live
+        })
+        .await;
+        case.submit(&server.app.structured_workers);
+        wait(&notify, || {
+            server.handle_scheduled_tasks_headless(now, false);
+            assert!(server
+                .app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            server
+                .app
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .phase
+                == Phase::Working
+        })
+        .await;
+        server.app.checks_next_deadline = None;
+        server.app.checks_heartbeat_deadline = None;
+        let due = server
+            .app
+            .structured_workers
+            .next_deadline(&server.app.state.structured_agents)
+            .unwrap();
+        assert_eq!(
+            server
+                .app
+                .next_headless_loop_deadline_with_git_refresh(now, false, false),
+            Some(due)
+        );
+        let now = due;
+        server.handle_scheduled_tasks_headless(now, false);
+        let update = &server
+            .app
+            .state
+            .structured_agents
+            .get(&case.id)
+            .unwrap()
+            .1
+            .update;
+        assert_eq!(update.state.phase, Phase::Working);
+        assert!(update.stalled_since_ms.is_some());
+        case.finish(
+            &mut server.app.state.structured_agents,
+            &mut server.app.structured_workers,
+            &notify,
+            now,
+            Some(crate::structured::runtime::Outcome::Stopped),
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn s3b_headless_dispatch_deadline_cancels_held_input_without_traffic() {
         let mut server = test_headless_server();
         server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("write-ack")];
@@ -4721,7 +5083,7 @@ mod tests {
         let (respond_to, response) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true,"write_timeout_ms":200}})).unwrap(),
-            respond_to, peer_pid:None, peer_birth:None,
+            respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
         });
         assert!(matches!(
             response.try_recv(),
@@ -4765,7 +5127,7 @@ mod tests {
         let (respond_to, response) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true}})).unwrap(),
-            respond_to, peer_pid:None, peer_birth:None,
+            respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
         });
         assert!(matches!(
             response.try_recv(),
@@ -4869,6 +5231,39 @@ mod tests {
     }
 
     #[test]
+    fn headless_uid_boundary_precedes_live_handoff_fast_path() {
+        let mut server = test_headless_server();
+        server.app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: 7,
+            dedicated: Ok(Some(42)).into(),
+        };
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (respond_to, response) = std::sync::mpsc::channel();
+        let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "uid-handoff".into(),
+                method: api::schema::Method::ServerLiveHandoff(
+                    api::schema::ServerLiveHandoffParams {
+                        import_exe: Some(root.path().join("absent-importer").display().to_string()),
+                        ..Default::default()
+                    },
+                ),
+            },
+            peer_pid: Some(std::process::id()),
+            peer_birth: crate::platform::process_start_time(std::process::id()),
+            peer_uid: Some(42),
+            respond_to,
+        });
+        let response: serde_json::Value =
+            serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+        assert!(!changed);
+        assert_eq!(response["error"]["code"], "operator_only", "{response}");
+        assert!(server.app.current_api_peer_uid.is_none());
+        assert!(!server.app.state.should_quit);
+    }
+
+    #[test]
     fn headless_api_request_drains_all_pending_internal_events_before_reading_state() {
         let mut server = test_headless_server();
         for i in 0..=crate::app::APP_EVENT_DRAIN_LIMIT {
@@ -4890,8 +5285,9 @@ mod tests {
                     method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
                 },
                 respond_to,
-                peer_pid: None,
-                peer_birth: None,
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
             })
         );
         let response = response_rx
@@ -7607,8 +8003,9 @@ next_tab = ""
                     },),
                 },
                 respond_to,
-                peer_pid: None,
-                peer_birth: None,
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
             })
         );
         let _ = response_rx
@@ -9243,8 +9640,9 @@ next_tab = ""
                 }),
             },
             respond_to,
-            peer_pid: None,
-            peer_birth: None,
+            peer_pid: Some(std::process::id()),
+            peer_birth: crate::platform::process_start_time(std::process::id()),
+            peer_uid: Some(crate::platform::peer::effective_uid()),
         });
 
         assert!(changed);
