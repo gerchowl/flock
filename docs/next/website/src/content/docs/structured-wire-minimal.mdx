@@ -1,0 +1,52 @@
+---
+title: Minimal structured wire contracts
+description: Generated fleet and permission-decision contracts for GUI clients.
+---
+
+The S7-min types are generated from Rust into `web/client/src/gen/`. They define
+contracts for the GUI and server work in #1746; this types slice does not enable
+a WebSocket endpoint or execute commands.
+
+`FleetAgentRow` contains `id`, `label`, `state`, optional `activity`, and required
+`waiting_on_human: string[]`. State is the shared S4 `AgentState` object: axes, derived phase and sources.
+Its per-field `or_unknown` deserializers follow ADR-0028 §3a, so an unknown
+phase from a newer server becomes `unknown` while the other axes survive and
+the fleet delta remains usable. The waiting IDs identify permission requests on `agent/<id>`;
+there is no separate inbox stream in S7-min. Rows represent structured agents.
+
+The `fleet` stream carries the closed `FleetDelta` union inside `ev`:
+
+```json
+{"type":"fleet.upsert","row":{"id":"example-agent","label":"Example","state":{"turn":"idle","background":"none","attention":{"needs_human":{"reason":"permission"}},"waiting":"none","lifecycle":"live","phase":"needs_human","source":{}},"activity":"Permission needed","waiting_on_human":["request-one"]}}
+{"type":"fleet.remove","id":"example-agent"}
+```
+
+Decode fleet payloads as `FleetDelta`, rather than session `WireEvent`. Bootstrap
+and recovery use ADR-0036 §5a's existing inline snapshot format: a `gap` announces
+`snapshot_to`, complete row upserts follow, then `synced`. This is the snapshot's
+collection of `FleetAgentRow` values, not a new transport frame. On snapshot
+completion, remove previously displayed rows absent from the fresh snapshot.
+A `lagged` notification closes its subscription ID, like `subfail`. The server
+sends nothing more on it; the client drops late frames and subscribes with a
+fresh ID from the last applied cursor, without unsub. The new subscription gets
+a gap/snapshot and its own synced barrier. Every subscription uses a fresh
+ID on the connection, including recovery. After unsub, subfail or lagged, late frames
+for the retired ID are silently dropped; frames for never-opened IDs are protocol
+errors. Reusing a live or closed ID is refused with subfail code `sub_id_reused`. The `fleet-lite.jsonl` fixture pins
+bootstrap, live updates/removal and recovery.
+
+`agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, `decision`
+(`allow_once`, `allow_always` or `deny`), and optional `message`. Only a
+token-authenticated client principal can submit this command. The ack uses the
+same envelope as `agent.send`, echoes `cmd_id`, and on success returns
+`AgentDecideResult`, echoing the applied request ID and decision:
+
+```json
+{"t":"ack","cmd_id":"decision-one","ok":true,"result":{"request_id":"request-one","decision":"allow_once"}}
+```
+
+Failures use `ok: false` and the existing `WireError` envelope without `result`.
+`AgentDecideErrorCode` names `permission_request_unknown`,
+`permission_request_closed` and `not_authorized`, with retry class `never`.
+These names are contracts for S6 (#1429) to register before serving them; this
+slice adds no API error registrations or authorization behavior.
