@@ -1015,3 +1015,5 @@ fn scripted_stream_drives_session_state_through_the_keyed_sink() {
     running.runtime.stop();
     assert_eq!(running.finish().outcome, Outcome::Stopped);
 }
+
+mod queue;

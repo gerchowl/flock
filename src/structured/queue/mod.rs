@@ -9,6 +9,7 @@
 #![deny(missing_docs)]
 pub(crate) mod admission;
 pub mod model;
+pub(crate) mod scheduler;
 use crate::platform::structured as private_fs;
 pub use model::{Change, Item, Record};
 use serde_json::{json, Value};
@@ -375,4 +376,4 @@ impl Journal {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
