@@ -33,3 +33,4 @@ ContentBlockStart
 ContentBlockStart
 Success
 ExecutionError
+ControlCancel
