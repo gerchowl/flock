@@ -4,7 +4,7 @@ import type { JsonValue } from "./serde_json/JsonValue";
 /**
  * A tool result or replayed user input (A.2, A.11-A.12).
  */
-export type User = { type: "user", subtype?: string,
+export type User = { type: "user", subtype?: never,
 /**
  * Harness session identifier, if emitted on this envelope.
  */

@@ -4,7 +4,7 @@ import type { JsonValue } from "./serde_json/JsonValue";
 /**
  * A complete assistant content block (A.2).
  */
-export type Assistant = { type: "assistant", subtype?: string,
+export type Assistant = { type: "assistant", subtype?: never,
 /**
  * Harness session identifier, if emitted on this envelope.
  */

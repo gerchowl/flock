@@ -22,8 +22,13 @@ fn api(node: &Node, method: &str, params: Value) -> Value {
     .unwrap()
 }
 fn db(node: &Node) -> rusqlite::Connection {
-    let connection =
-        rusqlite::Connection::open(node.home.join("state/flock-dev/mesh-mail.sqlite")).unwrap();
+    let connection = rusqlite::Connection::open(
+        node.home
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
+    )
+    .unwrap();
     connection.busy_timeout(Duration::from_secs(5)).unwrap();
     connection
 }

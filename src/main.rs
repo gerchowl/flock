@@ -36,6 +36,9 @@ mod checks;
 mod checksum;
 mod cli;
 mod client;
+// Pure rollout foundation; runtime consumers follow in #1662–#1664.
+#[allow(dead_code)]
+mod codex_rollout;
 mod codex_transcript;
 // Version eligibility foundation; binding and runtime consumers follow in #1662/#1664.
 #[allow(dead_code)]
@@ -89,6 +92,8 @@ mod release_notes;
 mod remote;
 mod render_prof;
 mod report;
+#[cfg(test)]
+mod structured_wire;
 #[cfg(test)]
 mod test_support;
 // #175 phase 5 / S3 commit 4 (ops): `flk revert-run` trailer-scan.

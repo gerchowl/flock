@@ -597,6 +597,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
+        Method::PaneWriteKeys(_) => "pane.write_keys",
+        Method::PaneWriteInput(_) => "pane.write_input",
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneSubmit(_) => "pane.submit",
         Method::PaneArmSelfCompact(_) => "pane.arm_self_compact",

@@ -62,8 +62,13 @@ fn read(node: &Node, pane: &Value) -> Value {
 }
 
 fn database(node: &Node) -> rusqlite::Connection {
-    let db =
-        rusqlite::Connection::open(node.home.join("state/flock-dev/mesh-mail.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(
+        node.home
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
+    )
+    .unwrap();
     db.busy_timeout(Duration::from_secs(5)).unwrap();
     db
 }
@@ -589,7 +594,8 @@ fn collection_policy_uses_the_stored_origin_name_not_the_current_ssh_alias() {
     let (sender, _) = question(&fleet, "alias-answer");
     // The trusted node gains a new transport alias. Its stable policy name
     // remains the earlier configured pin, just as on mesh.deliver ingress.
-    for app in ["flock", "flock-dev"] {
+    {
+        let app = support::paths::app_dir_name();
         let path = fleet
             .node("nodea")
             .config_home
@@ -749,7 +755,8 @@ fn idle_held_answers_make_no_commits_and_push_when_a_reverse_edge_enrolls() {
         );
         (idle.elapsed() >= Duration::from_secs(3)).then_some(())
     });
-    for app in ["flock", "flock-dev"] {
+    {
+        let app = support::paths::app_dir_name();
         let path = fleet
             .node("nodeb")
             .config_home
@@ -988,7 +995,8 @@ fn custody_status_read_receipt_and_wait_survive_audit_rotation_and_restart() {
     let log = fleet
         .node("nodea")
         .config_home
-        .join("flock-dev/event-log.jsonl");
+        .join(support::paths::app_dir_name())
+        .join("event-log.jsonl");
     assert!(log.exists(), "{}", log.display());
     std::fs::remove_file(log).unwrap();
     fleet.node_mut("nodea").restart();

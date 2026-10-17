@@ -26,17 +26,24 @@ def steps(document):
 
 class ActionsCachePolicy(unittest.TestCase):
     def test_zig_build_caches_are_disabled_in_every_build_workflow(self):
-        count = 0
+        found = set()
         for name in ('ci-leg.yml', 'preview.yml', 'release.yml', 'build-artifacts-manual.yml'):
-            for step in steps(workflow(name)):
-                if step.get('uses', '').startswith('mlugg/setup-zig@'):
-                    count += 1
-                    with self.subTest(workflow=name):
-                        self.assertIs(step['with'].get('use-cache'), False)
-        self.assertEqual(count, 7)
+            for job_name, job in workflow(name)['jobs'].items():
+                for step in job.get('steps', []):
+                    if step.get('uses', '').startswith('mlugg/setup-zig@'):
+                        self.assertNotIn((name, job_name), found)
+                        found.add((name, job_name))
+                        with self.subTest(workflow=name, job=job_name):
+                            self.assertIs(step['with'].get('use-cache'), False)
+        self.assertEqual(found, {
+            ('ci-leg.yml', 'build'), ('preview.yml', 'preflight'),
+            ('preview.yml', 'build'), ('release.yml', 'build'),
+            ('build-artifacts-manual.yml', 'build-linux'),
+            ('build-artifacts-manual.yml', 'build-macos'),
+        })
 
     def test_ci_zig_cache_has_stable_keys_and_dev_only_save(self):
-        for name in ('lint', 'build'):
+        for name in ('build',):
             job = workflow('ci-leg.yml')['jobs'][name]
             restore, = [s for s in job['steps']
                         if s.get('uses', '').startswith('actions/cache/restore@')]
@@ -68,16 +75,51 @@ class ActionsCachePolicy(unittest.TestCase):
                 self.assertLess(compile_index, save_index)
 
     def test_rust_caches_restore_on_prs_and_only_save_on_dev(self):
-        count = 0
+        found = set()
         for name in ('ci-leg.yml', 'preview.yml', 'release.yml'):
-            for step in steps(workflow(name)):
-                if step.get('uses', '').startswith('Swatinem/rust-cache@'):
-                    count += 1
-                    with self.subTest(workflow=name):
-                        self.assertRegex(step['uses'], r'@[a-f0-9]{40}$')
-                        self.assertEqual(step['with'].get('save-if'), DEV)
-                        self.assertNotIn('github.ref', step.get('if', ''))
-        self.assertEqual(count, 5)
+            for job_name, job in workflow(name)['jobs'].items():
+                for step in job.get('steps', []):
+                    if step.get('uses', '').startswith('Swatinem/rust-cache@'):
+                        self.assertNotIn((name, job_name), found)
+                        found.add((name, job_name))
+                        with self.subTest(workflow=name, job=job_name):
+                            self.assertRegex(step['uses'], r'@[a-f0-9]{40}$')
+                            self.assertEqual(step['with'].get('save-if'), DEV)
+                            self.assertNotIn('github.ref', step.get('if', ''))
+        self.assertEqual(found, {
+            ('ci-leg.yml', 'build'), ('preview.yml', 'preflight'),
+            ('preview.yml', 'build'), ('release.yml', 'build'),
+        })
+
+    def test_ci_lint_uses_the_dev_shell_and_bounded_dev_only_store_cache(self):
+        document = workflow('ci-leg.yml')
+        job = document['jobs']['lint']
+        install, = [s for s in job['steps']
+                    if s.get('uses', '').startswith('cachix/install-nix-action@')]
+        cache, = [s for s in job['steps']
+                  if s.get('uses', '').startswith('nix-community/cache-nix-action@')]
+        for step in (install, cache):
+            self.assertRegex(step['uses'], r'@[a-f0-9]{40}$')
+            self.assertNotIn('if', step)
+        self.assertEqual(job.get('permissions', document['permissions']), {'contents': 'read'})
+        inputs = cache['with']
+        self.assertEqual(inputs['save'], DEV)
+        self.assertFalse(inputs.get('purge', False))
+        for platform in ('linux', 'macos'):
+            self.assertEqual(inputs[f'gc-max-store-size-{platform}'], '2G')
+        self.assertIn('runner.os', inputs['primary-key'])
+        self.assertIn("hashFiles('flake.lock', 'flake.nix', 'nix/**')", inputs['primary-key'])
+        for unstable in ('github.run', 'github.sha', 'github.ref'):
+            self.assertNotIn(unstable, inputs['primary-key'])
+        self.assertEqual(inputs['restore-prefixes-first-match'], 'nix-v1-${{ runner.os }}-')
+        commands = {step['run'] for step in job['steps'] if 'run' in step}
+        self.assertEqual(commands, {
+            'nix develop -c just lint', 'nix develop -c just doc-check',
+            'nix develop -c just script-tests',
+        })
+        lint = next(step for step in job['steps'] if step.get('run') == 'nix develop -c just lint')
+        self.assertLess(job['steps'].index(install), job['steps'].index(cache))
+        self.assertLess(job['steps'].index(cache), job['steps'].index(lint))
 
     def test_nix_cache_is_bounded_pinned_and_written_only_by_dev(self):
         document = workflow('nix.yml')

@@ -75,10 +75,12 @@ impl Harness {
         let base = PathBuf::from(format!("/tmp/fs-{label}-{}-{nanos}", std::process::id()));
         let config_home = base.join("cfg");
         let runtime_dir = base.join("rt");
-        fs::create_dir_all(config_home.join("flock")).expect("config home");
+        fs::create_dir_all(config_home.join(support::paths::app_dir_name())).expect("config home");
         fs::create_dir_all(&runtime_dir).expect("runtime dir");
         fs::write(
-            config_home.join("flock/config.toml"),
+            config_home
+                .join(support::paths::app_dir_name())
+                .join("config.toml"),
             "onboarding = false\n",
         )
         .expect("seed config");
@@ -312,7 +314,10 @@ fn a_broken_session_is_logged_once_not_repeated() {
     // Past one TTL (5s), so at least two probes have happened: the one at
     // startup and one refresh. A per-probe log line would make this 2+.
     std::thread::sleep(Duration::from_secs(7));
-    let log = harness.config_home.join("flock-dev/flock-server.log");
+    let log = harness
+        .config_home
+        .join(support::paths::app_dir_name())
+        .join("flock-server.log");
     let text = fs::read_to_string(&log).unwrap_or_default();
     let count = text
         .lines()

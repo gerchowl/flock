@@ -24,4 +24,4 @@ timestamp?: JsonValue | null,
 /**
  * Request identifier and verb-specific result.
  */
-response: { [key in string]: JsonValue }, } & ({ [key in string]: number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null });
+response: { subtype: "success", } & ({ [key in string]: number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null }), } & ({ [key in string]: number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null });

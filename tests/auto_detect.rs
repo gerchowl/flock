@@ -124,11 +124,13 @@ fn spawn_server(
     api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedFlock {
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -170,11 +172,13 @@ fn spawn_flock_auto(
     api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedFlock {
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -215,11 +219,13 @@ fn spawn_flock_no_session(
     runtime_dir: &Path,
     api_socket_path: &Path,
 ) -> SpawnedFlock {
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -763,11 +769,7 @@ fn auto_detect_default_socket_path_from_config_dir() {
 
     // Don't set FLOCK_SOCKET_PATH or FLOCK_CLIENT_SOCKET_PATH.
     // The default paths should come from the app config directory, not XDG_RUNTIME_DIR.
-    let app_dir_name = if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    };
+    let app_dir_name = support::paths::app_dir_name();
     let api_socket = config_home.join(app_dir_name).join("flock.sock");
     let client_socket = config_home.join(app_dir_name).join("flock-client.sock");
 
@@ -844,11 +846,7 @@ fn auto_detect_writes_client_and_server_logs_to_separate_files() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
-    let app_dir_name = if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    };
+    let app_dir_name = support::paths::app_dir_name();
     let log_dir = config_home.join(app_dir_name);
     let client_log = log_dir.join("flock-client.log");
     let server_log = log_dir.join("flock-server.log");
@@ -897,11 +895,7 @@ fn no_session_writes_startup_logs_to_monolith_file() {
     let spawned = spawn_flock_no_session(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
 
-    let app_dir_name = if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    };
+    let app_dir_name = support::paths::app_dir_name();
     let log_dir = config_home.join(app_dir_name);
     let monolith_log = log_dir.join("flock.log");
 

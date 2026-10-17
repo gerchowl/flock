@@ -1,0 +1,15 @@
+{"v":1,"step":"given","cursors":{},"outbox":[],"covers":["s7"]}
+{"v":1,"step":"client","action":{"kind":"connect"}}
+{"v":1,"step":"expect_connect","within_ms":1,"not_before_ms":0}
+{"v":1,"step":"open"}
+{"v":1,"step":"expect","frame":{"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol","token"],"absent":[]}
+{"v":1,"step":"send","frame":{"t":"welcome","protocol":1,"server_version":"fixture","capabilities":["read","send"],"principal":"fixture-principal","server_epoch":"fixture-epoch","idempotency_window_ms":86400000}}
+{"v":1,"step":"drop"}
+{"v":1,"step":"observe","connection":"Reconnecting"}
+{"v":1,"step":"client","action":{"kind":"network_change"}}
+{"v":1,"step":"expect_connect","not_before_ms":0,"within_ms":1}
+{"v":1,"step":"open"}
+{"v":1,"step":"expect","frame":{"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol","token"],"absent":[]}
+{"v":1,"step":"send","frame":{"t":"welcome","protocol":1,"server_version":"fixture","capabilities":["read","send"],"principal":"fixture-principal","server_epoch":"fixture-epoch","idempotency_window_ms":86400000}}
+{"v":1,"step":"observe","connection":"Live"}
+{"v":1,"step":"quiet","ceiling_ms":1000}
