@@ -34,11 +34,11 @@ struct HeldWait<'a> {
 }
 
 impl<'a> HeldWait<'a> {
-    /// Register the hold. The App attests the caller from `peer_pid` and
+    /// Register the hold. The App attests the caller from captured socket credentials and
     /// records nothing when it runs in no agent pane.
     fn open(
         api_tx: &'a ApiRequestSender,
-        peer_pid: Option<u32>,
+        peer: crate::platform::peer::Credentials,
         predicate: WaitPredicate,
         hold: Duration,
     ) -> Self {
@@ -50,7 +50,7 @@ impl<'a> HeldWait<'a> {
             },
             api_tx,
             None,
-            peer_pid,
+            peer,
         );
         let wait_id = serde_json::from_str::<serde_json::Value>(&response)
             .ok()
@@ -75,6 +75,7 @@ impl Drop for HeldWait<'_> {
             respond_to,
             peer_pid: None,
             peer_birth: None,
+            peer_uid: None,
         });
     }
 }
@@ -116,7 +117,7 @@ pub(super) fn read_events(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     api_tx: &ApiRequestSender,
-    peer_pid: Option<u32>,
+    peer: crate::platform::peer::Credentials,
 ) -> std::io::Result<Option<String>> {
     if let Some(kind) = params.kinds.iter().find(|kind| !kind.is_persisted()) {
         return Ok(Some(refuse(
@@ -180,7 +181,7 @@ pub(super) fn read_events(
                 subjects: params.subjects.clone(),
                 after: params.after,
             };
-            held = Some(HeldWait::open(api_tx, peer_pid, predicate, wait));
+            held = Some(HeldWait::open(api_tx, peer, predicate, wait));
         }
         if should_stop_connection(stream, running)? {
             return Ok(None);

@@ -1411,3 +1411,23 @@ async fn restart_codex_concatenated_config_refusal_omits_key_and_value() {
     );
     assert!(rig.app.state.agent_restarts.is_empty());
 }
+
+#[tokio::test]
+async fn restart_warning_requester_keeps_unproven_handoff_candidates() {
+    for mismatch in [false, true] {
+        let mut rig = rig();
+        let (ws, pane) = rig.app.parse_pane_id(&rig.pane).unwrap();
+        crate::test_support::adopt_unproven_pane_caller(&mut rig.app, pane, mismatch);
+        assert_eq!(rig.app.caller_pane(), None);
+        let agent = rig.app.state.terminals
+            [rig.app.state.workspaces[ws].terminal_id(pane).unwrap()]
+        .agent_id
+        .to_string();
+        let response = request(&mut rig);
+        assert!(response.get("result").is_some(), "{response}");
+        assert_eq!(
+            rig.app.state.agent_restarts.pending[&rig.id].requester,
+            Some(agent)
+        );
+    }
+}

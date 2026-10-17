@@ -2059,8 +2059,25 @@ mod tests {
                 "params": {"pane_id": format!("{workspace}:p1"), "text": " "}
             }))
             .expect("input request");
+            let (event_tx, mut events) = tokio::sync::mpsc::channel(8);
+            app.event_tx = event_tx;
             let raw = app.handle_api_request(request);
-            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            app.respond_or_park(sender, raw);
+            let response = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if let Ok(raw) = receiver.try_recv() { break serde_json::from_str::<serde_json::Value>(&raw).unwrap(); }
+                    tokio::select! {
+                        _ = app.input_writes.notify.notified() => app.service_input_writes(),
+                        event = events.recv() => {
+                            let crate::events::AppEvent::PasteConfirm { mut paste, respond_to } = event.expect("observation producer") else { panic!("expected paste observation") };
+                            // This fixture checks placement after typing, not screen confirmation.
+                            paste.deadline = std::time::Instant::now();
+                            app.advance_paste(paste, respond_to);
+                        }
+                    }
+                }
+            }).await.expect("completed write and bounded paste observation");
             assert!(response.get("error").is_none(), "{response}");
             let mut request = targeted_start_request(&workspace, None);
             if let Method::AgentStart(params) = &mut request.method {

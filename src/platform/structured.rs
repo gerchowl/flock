@@ -54,6 +54,47 @@ pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Open a resolved local path beneath an anchored home directory. Each component
+/// is opened relative to the preceding descriptor without following symlinks,
+/// so a concurrent directory replacement cannot redirect the open outside home.
+pub(crate) fn open_regular_beneath(home: &Path, relative: &Path) -> io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(home)?;
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(io::Error::other("non-local rollout path component"));
+        };
+        let name = CString::new(name.as_bytes()).map_err(io::Error::other)?;
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_CLOEXEC
+            | if components.peek().is_some() {
+                libc::O_DIRECTORY
+            } else {
+                0
+            };
+        // SAFETY: the directory descriptor is owned and the C string is terminated.
+        let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful openat transfers a fresh descriptor exclusively here.
+        file = unsafe { File::from_raw_fd(fd) };
+    }
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("rollout path is not a regular file"));
+    }
+    Ok(file)
+}
+
 /// Create a new owner-only directory, without a permissive creation window.
 pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;
