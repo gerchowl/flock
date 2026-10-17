@@ -18,6 +18,8 @@ function variant(event: KnownSessionEvent): string {
       return "RateLimit";
     case "control_request":
       return "CanUseTool";
+    case "control_cancel_request":
+      return "ControlCancel";
     case "control_response":
       return event.response.subtype === "success" ? "ControlSuccess" : "ControlError";
     case "result":
@@ -90,20 +92,21 @@ describe("fixture transport", () => {
   });
 
   test("resumes after a cursor and fails a cursor past the end", async () => {
-    const jsonl = await readFixture();
+    const [jsonl, variants] = await Promise.all([readFixture(), readVariants()]);
+    const end = variants.length;
     const transport = createFixtureTransport(jsonl);
     const tail = await new Promise<number[]>((resolve, reject) => {
       const seqs: number[] = [];
-      transport.subscribe(FIXTURE_STREAM, 33, {
+      transport.subscribe(FIXTURE_STREAM, end - 2, {
         entry: (entry) => seqs.push(entry.seq),
         synced: () => resolve(seqs),
         failed: (failure) => reject(new Error(failure.message)),
       });
     });
-    expect(tail).toEqual([34, 35]);
+    expect(tail).toEqual([end - 1, end]);
     await expect(
       new Promise((resolve, reject) =>
-        transport.subscribe(FIXTURE_STREAM, 36, { entry: resolve, synced: () => resolve(null), failed: (f) => reject(new Error(f.message)) }),
+        transport.subscribe(FIXTURE_STREAM, end + 1, { entry: resolve, synced: () => resolve(null), failed: (f) => reject(new Error(f.message)) }),
       ),
     ).rejects.toThrow("past the recording's last seq");
   });
