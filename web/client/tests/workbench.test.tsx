@@ -189,11 +189,14 @@ describe("phone", () => {
     expect(document.getElementById(activity?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Waits for the events stream (S7-rest)");
   });
 
-  test("live, the headline never counts sample cards, and the cards stay labelled", async () => {
-    const root = await phone("live");
+  test("live, as the wire App mounts it, the inbox shows no sample cards and says it arrives with G5", async () => {
+    const root = mount(() => (
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source="live" />
+    ));
+    await tick();
     expect($(root, "inbox-headline")?.textContent).toBe("Your inbox arrives with G5 (#1597).");
-    expect($(root, "phone")?.textContent).toContain("Sample cards: the live inbox arrives with G5 (#1597).");
-    expect($(root, "phone")?.textContent).not.toContain("blocked on you");
+    expect($$(root, "inbox-card")).toHaveLength(0);
+    expect($(root, "phone")?.textContent).not.toMatch(/Sample|blocked on you/);
   });
 
   test("the agent screen is a history entry: system back returns to its tab, and the URL is untouched", async () => {
@@ -273,8 +276,74 @@ describe("phone", () => {
     expect($(root, "segmented-reasons")?.textContent).toContain("PR waits for a PR source.");
     expect($(root, "transcript-synced")).not.toBeNull();
     [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"))?.click();
+    await tick();
     expect($(root, "phone-agent")).toBeNull();
     expect($$(root, "agent-row").length).toBe(4);
+  });
+
+  test("unmounting the workbench with the agent screen open, without crossing the breakpoint, leaves history alone", async () => {
+    const root = await phone();
+    tab(root, "Agents")?.click();
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    await tick();
+    const entry = { "flock.phone-agent": "atlas" };
+    expect(history.state).toEqual(entry);
+    dispose?.();
+    dispose = undefined;
+    await tick();
+    expect(history.state).toEqual(entry);
+    // Consume the entry this test left, so later tests start from their own.
+    history.back();
+    await tick();
+  });
+
+  test("the wire phone path shares one transport: open, close, reopen, widen; sub ids stay unique and late frames are ignored", async () => {
+    const width = Object.getOwnPropertyDescriptor(window, "innerWidth");
+    const setWidth = (value: number): void => void Object.defineProperty(window, "innerWidth", { value, configurable: true, writable: true });
+    onTestFinished(() => void (width === undefined ? Reflect.deleteProperty(window, "innerWidth") : Object.defineProperty(window, "innerWidth", width)));
+    setWidth(375);
+    const h = new Harness();
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    const send = (frame: ServerFrame): void => h.step(step({ step: "send", frame }));
+    h.step(step({ step: "open" }));
+    send(WELCOME);
+    const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
+    send({ t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: 1 });
+    send({ t: "ev", sub_id: fleet, stream: "fleet", seq: 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id: "atlas", label: "atlas", state: "working", waiting_on_human: [] } } });
+    send({ t: "synced", sub_id: fleet, seq: 1 });
+    expect($(root, "phone")).not.toBeNull();
+    const backButton = (): HTMLButtonElement | undefined => [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"));
+    tab(root, "Agents")?.click();
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    await tick();
+    backButton()?.click();
+    await tick();
+    expect($(root, "phone-agent")).toBeNull();
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    await tick();
+    expect($(root, "phone-agent")).not.toBeNull();
+    setWidth(1024);
+    window.dispatchEvent(new Event("resize"));
+    await tick();
+    expect($(root, "workbench")).not.toBeNull();
+    const subs = sentFrames(h).flatMap((frame) => {
+      const f = frame as { t: string; sub_id: string; stream?: string };
+      return f.t === "sub" && f.stream === "agent/atlas" ? [f.sub_id] : [];
+    });
+    expect(subs).toHaveLength(3);
+    expect(new Set(subs).size).toBe(3);
+    const [first, second, current] = subs as [string, string, string];
+    send({ t: "ev", sub_id: current, stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "the current line" } } });
+    send({ t: "synced", sub_id: current, seq: 1 });
+    const pane = $(root, "focus-pane")?.textContent ?? "";
+    send({ t: "ev", sub_id: first, stream: "agent/atlas", seq: 2, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "a late line" } } });
+    send({ t: "synced", sub_id: second, seq: 0 });
+    send({ t: "subfail", sub_id: second, code: "unknown_stream", message: "gone" });
+    expect(root.querySelector(".topbar__status")?.textContent).toBe("Live");
+    expect(pane).toContain("the current line");
+    expect($(root, "focus-pane")?.textContent).toBe(pane);
   });
 });
 
