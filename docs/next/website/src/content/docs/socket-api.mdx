@@ -138,7 +138,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove`, `worktree.kill` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
-| Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.stash_show`, `pane.stash_restore`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.write_keys`, `pane.write_input`, `pane.stash_show`, `pane.stash_restore`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.history`, `agent.result`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.restart`, `agent.lineage` |
 | Delegate | `delegate.list` |
 | Message | `msg.send`, `msg.reply`, `msg.list`, `msg.read`, `msg.status`, `msg.wait_reply`, `msg.wake`, `msg.mute` |
@@ -305,6 +305,37 @@ An explicit kill, or a permanent pane close/exit without a resumable session, re
 {"id":"req_n1","method":"notification.list","params":{"unread_only":true,"limit":20}}
 {"id":"req_n2","method":"notification.ack","params":{"notification_id":"ntf:19a2f:3"}}
 ```
+
+### Completed raw input writes
+
+`pane.send_keys` and `pane.send_input`, and their contract-bound counterparts
+`pane.write_keys` and `pane.write_input`, return the existing `Ok` envelope only
+once every encoded byte has reached the PTY master through successful writes.
+This does not prove the child read the input or accepted a command. Empty input
+completes without a write. Text and keys in one `pane.write_input` request share
+one ordered payload and one final outcome, including UTF-8 and bracketed-paste
+encoding. Target, key and raw-input policy refusals still happen before admission.
+
+These four methods accept optional `write_timeout_ms`: an integer from `1` to
+`30000`, default `10000`. Queue, injection-lease and write time consume that same
+budget. Choose a value strictly below the remaining caller response budget minus
+`1000` ms for the reply. A caller timeout or lost connection leaves the effect
+unknown; it does not prove cancellation, and input must not be automatically
+replayed. An unobserved caller disconnect remains bounded by the write deadline,
+so bytes can still reach the PTY before expiry.
+
+At most 32 input requests per terminal and 1024 per server can remain outstanding.
+An admission refusal or expired untouched request returns `input_write_cancelled`
+with zero bytes and its payload retired. A positive prefix returns
+`input_write_failed`; inspect the pane before taking another action. Both include
+`error.data.input_write` with exact `bytes_written`, `bytes_total`, `reason` and
+`remainder_discarded`. Retirement removes the unsent payload, including input held
+by an injection, so it cannot appear when that lease releases. Completion by the
+deadline remains successful if the writer subsequently fails.
+
+`pane_input_write_ack` remains false during rollout: completed paste/text replies
+follow in #1688 and client capability enforcement in #1639. This slice does not
+add `pane.write_text` or a write timeout to `pane.send_text` or `agent.send`.
 
 ## Checks
 
