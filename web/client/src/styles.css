@@ -183,3 +183,51 @@ details > summary::-webkit-details-marker {
   color: var(--muted);
   font-size: 0.875rem;
 }
+
+/* Turns and tool runs (ADR-0038 §2a). */
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.turn + .turn {
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.transcript__fold {
+  min-height: 44px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.tool-run > summary {
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.tool-run__name {
+  font-weight: 600;
+}
+
+.tool-run__command {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-run__outcome {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+.tool-run__outcome--error {
+  color: var(--error);
+}
