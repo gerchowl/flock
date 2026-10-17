@@ -223,3 +223,68 @@ describe("wire transport", () => {
     expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "t1", stream: "agent/a", after: 8 });
   });
 });
+
+describe("sub ids (ADR-0038 §3, sub ids and closed subs)", () => {
+  const quiet = { entry: () => undefined, synced: () => undefined, failed: () => undefined };
+  const subIds = (h: Harness): string[] => sentFrames(h).flatMap((frame) => ((frame as { t: string }).t === "sub" ? [(frame as { sub_id: string }).sub_id] : []));
+
+  test("transports on one connection never reuse a sub id, even across agent switches", () => {
+    const h = new Harness();
+    live(h);
+    createWireTransport(h.connection).subscribe("agent/a", null, quiet).close();
+    createWireTransport(h.connection).subscribe("agent/b", null, quiet).close();
+    createWireTransport(h.connection).subscribe("agent/c", null, quiet);
+    const ids = subIds(h);
+    expect(ids).toHaveLength(3);
+    expect(new Set(ids).size).toBe(3);
+  });
+
+  test("a sub id is never opened twice on a connection, even after its unsub", () => {
+    const h = new Harness();
+    live(h);
+    const handler = { event: () => undefined, gap: () => undefined, synced: () => undefined, snapshot: () => undefined, reset: () => undefined, refused: () => undefined };
+    h.connection.subscribe("s1", "agent/a", handler);
+    h.connection.unsubscribe("s1");
+    expect(() => h.connection.subscribe("s1", "agent/b", handler)).toThrow("s1");
+    expect(h.connection.nextSubId("s")).not.toBe("s1");
+  });
+
+  test("late frames for a closed sub are dropped: the connection stays Live and the next agent is untouched", () => {
+    const h = new Harness();
+    live(h);
+    const send = (frame: ServerFrame): void => h.step(step({ step: "send", frame }));
+    const a: string[] = [];
+    const first = createWireTransport(h.connection).subscribe("agent/a", null, { entry: (e) => a.push(e.kind), synced: () => a.push("synced"), failed: () => a.push("failed") });
+    const old = subIds(h)[0] ?? "";
+    send({ t: "synced", sub_id: old, seq: 0 });
+    first.close();
+    const b: string[] = [];
+    createWireTransport(h.connection).subscribe("agent/b", null, { entry: (e) => b.push(`${e.kind} ${e.seq}`), synced: () => b.push("synced"), failed: () => b.push("failed") });
+    const next = subIds(h)[1] ?? "";
+    send({ t: "ev", sub_id: next, stream: "agent/b", seq: 1, ts_ms: 0, ev: { type: "user", message: {} } });
+    send({ t: "synced", sub_id: next, seq: 1 });
+    const before = h.connection.streams().get(next);
+    send({ t: "ev", sub_id: old, stream: "agent/a", seq: 2, ts_ms: 0, ev: { type: "user", message: {} } });
+    send({ t: "gap", sub_id: old, from: 3, to: 4 });
+    send({ t: "synced", sub_id: old, seq: 4 });
+    send({ t: "lagged", sub_id: old, skipped_to: 9 });
+    send({ t: "subfail", sub_id: old, code: "unknown_stream", message: "gone" });
+    expect(h.connection.state).toBe("Live");
+    expect(h.connection.error).toBeNull();
+    expect(h.connection.streams().get(next)).toEqual(before ?? fail());
+    expect(b).toEqual(["known 1", "synced"]);
+    expect(a).toEqual(["synced"]);
+  });
+
+  test("a frame for a sub id never opened on this connection is a protocol error", () => {
+    const h = new Harness();
+    live(h);
+    h.step(step({ step: "send", frame: { t: "synced", sub_id: "t9", seq: 0 } }));
+    expect(h.connection.state).toBe("Reconnecting");
+    expect(h.connection.error).toContain("unknown subscription t9");
+  });
+});
+
+function fail(): never {
+  throw new Error("missing stream");
+}

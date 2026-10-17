@@ -101,3 +101,23 @@ describe("wire fleet", () => {
     expect(closed.seen).toEqual([]);
   });
 });
+
+test("fleet sources on one connection never reuse a sub id, and a closed one's late frames are dropped", () => {
+  const h = new Harness();
+  live(h);
+  const quiet = { rows: () => undefined, failed: () => undefined };
+  createWireFleet(h.connection).subscribe(quiet)();
+  const seen: string[][] = [];
+  createWireFleet(h.connection).subscribe({ rows: (rows) => seen.push(rows.map((r) => r.id)), failed: (message) => seen.push([message]) });
+  const subs = sentFrames(h).flatMap((frame) => ((frame as { t: string }).t === "sub" ? [(frame as { sub_id: string }).sub_id] : []));
+  expect(new Set(subs).size).toBe(2);
+  const current = subs[1] ?? "";
+  send(h, { t: "gap", sub_id: current, from: 1, to: 0, snapshot_to: 1 });
+  send(h, { ...upsert(1, row("kite")), sub_id: current } as ServerFrame);
+  send(h, { t: "synced", sub_id: current, seq: 1 });
+  expect(h.connection.state).toBe("Live");
+  send(h, { t: "gap", sub_id: "f1", from: 1, to: 0, snapshot_to: 1 });
+  send(h, upsert(1, row("stale")));
+  expect(h.connection.state).toBe("Live");
+  expect(seen).toEqual([["kite"]]);
+});
