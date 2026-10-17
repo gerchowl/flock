@@ -272,6 +272,22 @@ describe("command palette", () => {
     expect(document.activeElement).toBe(trigger);
   });
 
+  test("Tab and Shift+Tab stay in the dialog, and options hold no nested controls", async () => {
+    const root = await workbench(createFixtureFleet(SAMPLE_AGENTS));
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    await tick();
+    const input = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    for (const shiftKey of [false, true]) {
+      const tab = new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true });
+      input.dispatchEvent(tab);
+      expect(tab.defaultPrevented).toBe(true);
+      expect(document.activeElement).toBe(input);
+    }
+    expect($(root, "palette")?.querySelectorAll('[role="option"] button, [role="option"] a, [role="option"] input').length).toBe(0);
+    expect($$(root, "palette-item").every((item) => item.getAttribute("role") === "option")).toBe(true);
+  });
+
   test("the shortcut reads ⌘K on Apple platforms and Ctrl K elsewhere", () => {
     expect(["MacIntel", "iPhone", "Win32", "Linux x86_64"].map(shortcutLabel)).toEqual(["⌘K", "⌘K", "Ctrl K", "Ctrl K"]);
   });
@@ -283,7 +299,7 @@ describe("command palette", () => {
     input.value = "agent-7";
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
     expect($$(root, "palette-item").map((item) => item.textContent)).toEqual(["Open agent agent-7by id"]);
-    ($$(root, "palette-item")[0] as HTMLButtonElement).click();
+    ($$(root, "palette-item")[0] as HTMLElement).click();
     expect($(root, "focus-pane")?.querySelector("h1")?.textContent).toBe("agent-7");
     key(document, { key: "k", ctrlKey: true });
     key($(root, "palette")?.querySelector("input") as HTMLInputElement, { key: "Escape" });
