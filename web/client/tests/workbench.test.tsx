@@ -234,7 +234,7 @@ describe("phone", () => {
     const saved: Layout = structuredClone(manager.state);
     const layouts: Layout[] = [];
     const root = mount(() => (
-      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={saved} saveLayout={(next) => void layouts.push(next)} mode="phone" source="replay" />
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={saved} saveLayout={(next) => void layouts.push(next)} mode="phone" source="replay" />
     ));
     await tick();
     tab(root, "Agents")?.click();
@@ -251,7 +251,7 @@ describe("phone", () => {
   test("widening past the breakpoint with the agent screen open consumes its history entry", async () => {
     const [mode, setMode] = createSignal<"phone" | "desktop">("phone");
     const root = mount(() => (
-      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} mode={mode()} source="replay" />
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} mode={mode()} source="replay" />
     ));
     await tick();
     const prior: unknown = history.state;
