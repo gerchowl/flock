@@ -63,11 +63,7 @@ fn start_server() -> Server {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let socket = runtime_dir.join("flock.sock");
-    let app_dir = if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    };
+    let app_dir = support::paths::app_dir_name();
     fs::create_dir_all(config_home.join(app_dir)).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     for dir in ["work", "home", "state", "data"] {

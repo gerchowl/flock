@@ -307,6 +307,8 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
         "ping-pong",
         "token-refused",
         "token-revoked",
+        "heartbeat-missed",
+        "fleet-lite",
     ];
     let files = fixtures();
     let mut seen = BTreeSet::new();
@@ -315,14 +317,25 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let expected = if minimal.contains(&name.as_str()) {
-            "s7-min"
+        let expected = if name == "heartbeat-missed" {
+            json!(["s7", "s7-min"])
+        } else if minimal.contains(&name.as_str()) {
+            json!(["s7-min"])
         } else {
-            "s7"
+            json!(["s7"])
         };
-        assert_eq!(rows[0]["covers"], json!([expected]), "{name}");
-        if expected == "s7-min" {
-            for row in rows {
+        assert_eq!(rows[0]["covers"], expected, "{name}");
+        if rows[0]["covers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "s7-min")
+        {
+            assert!(
+                minimal_commands_valid(&rows),
+                "{name}: unsupported minimal verb"
+            );
+            for row in &rows {
                 if let Some(tag) = row["frame"]["t"].as_str() {
                     seen.insert(tag.to_owned());
                     if tag == "sub" && row["frame"].get("after").is_some() {
@@ -332,9 +345,17 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
                         seen.insert("ack_ok".into());
                     }
                     if tag == "gap" {
-                        assert!(
-                            row["frame"].get("snapshot_to").is_none(),
-                            "{name}: agent gaps have no entity snapshot"
+                        let sub = rows
+                            .iter()
+                            .find(|candidate| {
+                                candidate["frame"]["t"] == "sub"
+                                    && candidate["frame"]["sub_id"] == row["frame"]["sub_id"]
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            row["frame"].get("snapshot_to").is_some(),
+                            sub["frame"]["stream"] == "fleet",
+                            "{name}: only fleet gaps have entity snapshots"
                         );
                     }
                 }
@@ -344,12 +365,16 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
                 for payload in [&row["action"], &row["frame"]] {
                     if let Some(stream) = payload.get("stream").and_then(Value::as_str) {
                         assert!(
-                            stream.starts_with("agent/") && !stream.ends_with("/live"),
+                            stream == "fleet"
+                                || (stream.starts_with("agent/") && !stream.ends_with("/live")),
                             "{name}: {stream}"
                         );
                     }
                     if let Some(verb) = payload.get("verb").and_then(Value::as_str) {
-                        assert_eq!(verb, "agent.send", "{name}");
+                        assert!(
+                            matches!(verb, "agent.send" | "agent.decide"),
+                            "{name}: {verb}"
+                        );
                     }
                 }
             }
@@ -376,5 +401,191 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
     }
     for name in minimal {
         assert!(files.iter().any(|(found, _)| found == name), "{name}");
+    }
+}
+
+fn minimal_commands_valid(rows: &[Value]) -> bool {
+    rows.iter().all(|row| {
+        [&row["action"], &row["frame"]]
+            .into_iter()
+            .chain(row["outbox"].as_array().into_iter().flatten())
+            .all(|payload| {
+                payload
+                    .get("verb")
+                    .is_none_or(|verb| verb == "agent.send" || verb == "agent.decide")
+            })
+    })
+}
+
+#[test]
+fn minimal_selection_rejects_unsupported_restored_outbox_verbs() {
+    let queued = |verb: &str| vec![json!({"step":"given","outbox":[{"verb":verb}]})];
+    assert!(!minimal_commands_valid(&queued("queue.add")));
+    assert!(minimal_commands_valid(&queued("agent.send")));
+    assert!(minimal_commands_valid(&queued("agent.decide")));
+}
+
+#[test]
+fn minimal_fleet_fixture_has_typed_rows_deltas_and_fresh_snapshot_recovery() {
+    let script = fixtures()
+        .into_iter()
+        .find(|(name, _)| name == "fleet-lite")
+        .unwrap()
+        .1;
+    let rows: Vec<Value> = script
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let mut agents = std::collections::BTreeMap::new();
+    let mut unconfirmed = BTreeSet::new();
+    let mut snapshot_to = None;
+    let mut snapshots = 0;
+    let mut removes = 0;
+    let mut barriers = Vec::new();
+    let mut retired = BTreeSet::new();
+    for row in rows {
+        let frame = &row["frame"];
+        if (row["step"] == "expect" && frame["t"] == "unsub")
+            || (row["step"] == "send" && matches!(frame["t"].as_str(), Some("lagged" | "subfail")))
+        {
+            retired.insert(frame["sub_id"].as_str().unwrap().to_owned());
+        }
+        if row["step"] == "send"
+            && frame["sub_id"]
+                .as_str()
+                .is_some_and(|id| retired.contains(id))
+        {
+            continue;
+        }
+        match frame["t"].as_str() {
+            Some("gap") => {
+                snapshot_to = frame["snapshot_to"].as_u64();
+                unconfirmed = agents.keys().cloned().collect();
+                snapshots += 1;
+            }
+            Some("ev") => {
+                assert_eq!(frame["stream"], "fleet");
+                match serde_json::from_value::<FleetDelta>(frame["ev"].clone()).unwrap() {
+                    FleetDelta::Upsert { row } => {
+                        unconfirmed.remove(&row.id);
+                        agents.insert(row.id.clone(), row);
+                    }
+                    FleetDelta::Remove { id } => {
+                        assert!(
+                            snapshot_to.is_none(),
+                            "snapshot contains only complete rows"
+                        );
+                        agents.remove(&id);
+                        removes += 1;
+                    }
+                }
+                if frame["seq"].as_u64() == snapshot_to {
+                    agents.retain(|id, _| !unconfirmed.contains(id));
+                    snapshot_to = None;
+                }
+            }
+            Some("synced") => {
+                assert!(snapshot_to.is_none());
+                barriers.push(frame["seq"].as_u64().unwrap());
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(snapshots, 2);
+    assert_eq!(removes, 1);
+    assert_eq!(barriers, [2, 8]);
+    assert_eq!(agents.len(), 1);
+    assert_eq!(
+        agents["second-fixture-agent"].waiting_on_human,
+        ["request-one"]
+    );
+    assert!(
+        !agents.contains_key("fixture-agent"),
+        "fresh snapshot removes absent rows"
+    );
+}
+
+fn subscription_ids_are_fresh(rows: &[Value]) -> bool {
+    let mut used = BTreeSet::new();
+    for row in rows {
+        if row["step"] == "open" {
+            used.clear();
+        }
+        if row["step"] == "expect"
+            && row["frame"]["t"] == "sub"
+            && !used.insert(row["frame"]["sub_id"].as_str().unwrap())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[test]
+fn every_fixture_uses_fresh_subscription_ids_on_each_connection() {
+    for (name, script) in fixtures() {
+        let rows: Vec<Value> = script
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            subscription_ids_are_fresh(&rows),
+            "{name}: reused subscription ID"
+        );
+    }
+}
+
+#[test]
+fn subscription_id_guard_remembers_retired_ids_until_the_next_connection() {
+    let sub = json!({"step":"expect","frame":{"t":"sub","sub_id":"s1"}});
+    for retirement in [
+        json!({"step":"expect","frame":{"t":"unsub","sub_id":"s1"}}),
+        json!({"step":"send","frame":{"t":"subfail","sub_id":"s1","code":"scope"}}),
+        json!({"step":"send","frame":{"t":"lagged","sub_id":"s1","skipped_to":9}}),
+    ] {
+        assert!(!subscription_ids_are_fresh(&[
+            sub.clone(),
+            retirement,
+            sub.clone()
+        ]));
+    }
+    assert!(subscription_ids_are_fresh(&[
+        sub.clone(),
+        json!({"step":"open"}),
+        sub
+    ]));
+}
+
+#[test]
+fn lagged_recovery_uses_a_fresh_id_without_unsubscribing_the_closed_id() {
+    for name in ["lagged", "fleet-lite"] {
+        let script = fixtures()
+            .into_iter()
+            .find(|(found, _)| found == name)
+            .unwrap()
+            .1;
+        let rows: Vec<Value> = script
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let closed = rows
+            .iter()
+            .position(|row| row["step"] == "send" && row["frame"]["t"] == "lagged")
+            .unwrap();
+        let old_id = &rows[closed]["frame"]["sub_id"];
+        let next = rows[closed + 1..]
+            .iter()
+            .find(|row| row["step"] == "expect")
+            .unwrap();
+        assert_eq!(
+            next["frame"]["t"], "sub",
+            "{name}: lagged already closed the old ID"
+        );
+        assert_ne!(&next["frame"]["sub_id"], old_id);
+        assert!(rows[closed + 1..]
+            .iter()
+            .all(|row| !(row["step"] == "expect"
+                && row["frame"]["t"] == "unsub"
+                && &row["frame"]["sub_id"] == old_id)));
     }
 }

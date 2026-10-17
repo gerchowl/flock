@@ -151,8 +151,9 @@ fn create_workspace_reporting_pane(api_socket: &Path, cwd: &Path) -> String {
 }
 
 fn write_config(config_home: &Path, contents: &str) {
-    // Debug builds read the flock-dev app dir; release builds read flock.
-    for app_dir in ["flock", "flock-dev"] {
+    // Seed only the namespace used by the compiled CLI.
+    {
+        let app_dir = support::paths::app_dir_name();
         let dir = config_home.join(app_dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config.toml"), contents).unwrap();

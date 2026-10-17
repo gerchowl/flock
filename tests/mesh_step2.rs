@@ -254,7 +254,7 @@ fn custody(node: &Node) -> String {
     nodes
         .iter()
         .map(|entry| {
-            let rows = rusqlite::Connection::open(entry.path().join("state/flock-dev/mesh-mail.sqlite"))
+            let rows = rusqlite::Connection::open(entry.path().join("state").join(support::paths::app_dir_name()).join("mesh-mail.sqlite"))
                 .and_then(|db| {
                     db.prepare(
                         "SELECT correlation,kind,state,next_hop,retry_at,collect_attempts,collect_error FROM envelopes ORDER BY rowid",
@@ -280,8 +280,13 @@ fn custody(node: &Node) -> String {
 }
 
 fn db(node: &Node) -> rusqlite::Connection {
-    let db =
-        rusqlite::Connection::open(node.home.join("state/flock-dev/mesh-mail.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(
+        node.home
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
+    )
+    .unwrap();
     db.busy_timeout(Duration::from_secs(5)).unwrap();
     db
 }
@@ -754,33 +759,27 @@ fn direct_pinned_edge_delivers_reply_without_route_generation() {
 // With no subsequent topology change, only collection can invalidate it again.
 #[test]
 fn lease_time_clears_stale_assignment_after_route_pass() {
-    let c = Conversation::to(fleet::LAPTOP_TWO_HUBS, "noded.example");
-    cut(&c.fleet, "nodea", "nodec");
-    fleet::wait_until("return route uses first hub", DEADLINE, || {
-        routes(c.fleet.node("noded.example"))
-            .iter()
-            .any(|r| {
-                r["node"] == fleet::node_id(c.fleet.node("nodea"))
-                    && r["next_hop"] == fleet::node_id(c.fleet.node("nodeb"))
-            })
-            .then_some(())
-    });
+    // One collector owns the acknowledged gate. In the diamond, the other
+    // hub can still lease a reply or deliver a late withdrawal advert after
+    // the first hub's route disappears. Route absence is not gossip completion.
+    // The chain isolates lease-time validation from that independent traffic.
+    let c = Conversation::to(fleet::LAPTOP_HUB_SPOKE, "nodec");
     c.send();
     fleet::wait_until("request imported before gating leases", DEADLINE, || {
         (scalar(
-            c.fleet.node("noded.example"),
+            c.fleet.node("nodec"),
             "SELECT count(*) FROM envelopes WHERE correlation='question' AND state='inbox'",
         ) == 1)
             .then_some(())
     });
-    let gate = c.fleet.gate_outbound_poll("nodeb", "noded.example");
+    let gate = c.fleet.gate_outbound_poll("nodeb", "nodec");
     c.read_question();
     // Entry proves every poll forwarded before arming the gate has completed.
     // Mint only inside that window, so the reply cannot have an earlier lease.
     gate.wait_entered(DEADLINE);
     let reply = c.reply();
     let correlation = reply["correlation_id"].as_str().unwrap();
-    let spoke = c.fleet.node("noded.example");
+    let spoke = c.fleet.node("nodec");
     let initial: (String, i64, String) = db(spoke)
         .query_row(
             "SELECT next_hop,collect_attempts,state FROM envelopes WHERE correlation=?1",
@@ -796,7 +795,7 @@ fn lease_time_clears_stale_assignment_after_route_pass() {
     cut(&c.fleet, "nodea", "nodeb");
     c.fleet.wait_route("nodea", "nodeb", false);
     c.fleet.wait_route("nodeb", "nodea", false);
-    c.fleet.wait_route("noded.example", "nodea", false);
+    c.fleet.wait_route("nodec", "nodea", false);
     wait_unrouted_reply(spoke, correlation);
     let generation = api(spoke, "peers.enrollment", json!({}))["route_generation"].clone();
     assert_eq!(db(spoke).execute(
@@ -824,8 +823,8 @@ fn lease_time_clears_stale_assignment_after_route_pass() {
         ),
         0
     );
-    reconnect(&c.fleet, "nodea", "nodec");
-    c.fleet.wait_route("noded.example", "nodea", true);
+    reconnect(&c.fleet, "nodea", "nodeb");
+    c.fleet.wait_route("nodec", "nodea", true);
     c.answer_once();
     once(spoke, "question");
 }
@@ -1561,7 +1560,8 @@ fn audit_rotation_during_multihop_conversation_loses_nothing() {
         .fleet
         .node("nodec")
         .config_home
-        .join("flock-dev/event-log.jsonl");
+        .join(support::paths::app_dir_name())
+        .join("event-log.jsonl");
     // ADR-0005 has fixed rotation bounds, not a configuration knob. JSON
     // whitespace seeds the real byte threshold without inventing audit events.
     let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
@@ -1641,7 +1641,12 @@ fn restart_resume_582_keeps_identity_without_tombstone() {
         json!({"target":target["pane_id"], "reason":"fixture restart"}),
     );
     fleet::wait_until("restart completed", DEADLINE, || {
-        let log = fs::read_to_string(node.config_home.join("flock-dev/event-log.jsonl")).ok()?;
+        let log = fs::read_to_string(
+            node.config_home
+                .join(support::paths::app_dir_name())
+                .join("event-log.jsonl"),
+        )
+        .ok()?;
         log.lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
             .any(|e| {
@@ -1665,7 +1670,10 @@ fn restart_resume_582_keeps_identity_without_tombstone() {
 }
 
 fn warned_config(node: &Node, content: &str, key: &str) {
-    let path = node.config_home.join("flock-dev/config.toml");
+    let path = node
+        .config_home
+        .join(support::paths::app_dir_name())
+        .join("config.toml");
     let original = fs::read_to_string(&path).unwrap();
     fs::write(&path, content).unwrap();
     let output = operator(node, &["config", "check", "--json"]);

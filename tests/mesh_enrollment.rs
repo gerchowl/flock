@@ -125,7 +125,8 @@ fn mutual_enrollment_and_restart_keep_pins() {
 fn changed_key_is_refused_until_operator_reset() {
     let mut fleet = fleet::spawn("mesh-rekey", PAIR);
     let old = enrollment(fleet.node("dialer.test"), "acceptor.test", "pinned");
-    for app in ["flock", "flock-dev"] {
+    {
+        let app = support::paths::app_dir_name();
         let key = fleet
             .node("acceptor.test")
             .home
@@ -259,7 +260,8 @@ fn forged_acceptor_challenge_is_refused() {
 }
 
 fn remove_identity(node: &Node) {
-    for app in ["flock", "flock-dev"] {
+    {
+        let app = support::paths::app_dir_name();
         let key = node.home.join("state").join(app).join("mesh/identity.json");
         if key.exists() {
             std::fs::remove_file(key).unwrap();
@@ -427,7 +429,8 @@ fn old_server_keeps_status_output_when_enrollment_method_is_missing() {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
-    let dir = std::env::temp_dir().join(format!("ml-{}", std::process::id()));
+    let socket_dir = support::socket_dir::SocketDir::reserve("me1683");
+    let dir = socket_dir.path().to_path_buf();
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.as_path().join("api.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -512,7 +515,8 @@ fn old_server_keeps_status_output_when_enrollment_method_is_missing() {
 }
 
 fn rename_node(node: &Node, name: &str) {
-    for app in ["flock", "flock-dev"] {
+    {
+        let app = support::paths::app_dir_name();
         let path = node.config_home.join(app).join("config.toml");
         let config = std::fs::read_to_string(&path).unwrap();
         let original = config
@@ -543,7 +547,8 @@ const ALIAS_B_TO_A: &str = "[[peers]]\nname = \"a-ts.test\"\nssh = \"a.test\"\n"
 
 fn add_peer(node: &Node, config: &str) {
     use std::io::Write;
-    for app in ["flock", "flock-dev"] {
+    {
+        let app = support::paths::app_dir_name();
         let path = node.config_home.join(app).join("config.toml");
         let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
         writeln!(file, "\n{config}").unwrap();
@@ -746,13 +751,12 @@ fn configured_name_first_contact_is_tofu_but_later_impersonation_is_refused() {
 
 fn identity_id(node: &Node) -> String {
     // Derive the identity independently of the node's claimed name.
-    let e_id = ["flock", "flock-dev"]
-        .into_iter()
-        .find_map(|app| {
-            let path = node.home.join("state").join(app).join("mesh/identity.json");
-            std::fs::read_to_string(path).ok()
-        })
-        .unwrap();
+    let path = node
+        .home
+        .join("state")
+        .join(support::paths::app_dir_name())
+        .join("mesh/identity.json");
+    let e_id = std::fs::read_to_string(path).unwrap();
     let e_id: Value = serde_json::from_str(&e_id).unwrap();
     use sha2::{Digest, Sha256};
     let public_key: Vec<u8> = serde_json::from_value(e_id["public_key"].clone()).unwrap();
@@ -999,7 +1003,9 @@ fn status_shows_quarantine_count() {
         fleet
             .node("quarantine.test")
             .home
-            .join("state/flock-dev/mesh-mail.sqlite"),
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
     )
     .unwrap();
     assert_eq!(

@@ -139,7 +139,10 @@ impl InjectionLease {
             return None;
         }
         let mut held = self.held.borrow_mut();
-        let interrupt = matches!(&input, QueuedInput::Operator(bytes) if is_interrupt(bytes));
+        let interrupt = match &input {
+            QueuedInput::Operator(bytes) => is_interrupt(bytes),
+            QueuedInput::Tracked(ticket) => ticket.operator_interrupt,
+        };
         if let Some(lease) = held.as_mut() {
             lease.buffered.retain(QueuedInput::pending);
             let len: usize = lease.buffered.iter().map(QueuedInput::len).sum();

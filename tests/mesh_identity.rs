@@ -8,27 +8,29 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use support::environment::Command;
 
 use serde_json::{json, Value};
 
-struct Fixture(PathBuf);
+struct Fixture {
+    base: PathBuf,
+    _socket_dir: support::socket_dir::SocketDir,
+}
 
 impl Fixture {
     fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("mi-{}-{nonce:x}", std::process::id()));
-        fs::create_dir_all(&base).unwrap();
-        Self(base)
+        let socket_dir = support::socket_dir::SocketDir::reserve("mi1683");
+        Self {
+            base: socket_dir.path().to_path_buf(),
+            _socket_dir: socket_dir,
+        }
     }
 
     fn command(&self, session: &str, state: &Path) -> Command {
-        let config = self.0.join("config");
-        for app_dir in ["flock", "flock-dev"] {
+        let config = self.base.join("config");
+        {
+            let app_dir = support::paths::app_dir_name();
             fs::create_dir_all(config.join(app_dir).join("sessions").join(session)).unwrap();
             fs::write(
                 config.join(app_dir).join("config.toml"),
@@ -36,18 +38,21 @@ impl Fixture {
             )
             .unwrap();
         }
-        let runtime = self.0.join("run");
+        let runtime = self.base.join("run");
         fs::create_dir_all(&runtime).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_flk"));
         cmd.env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .envs(support::environment::isolated_env(&config, &runtime))
-            .env("HOME", &self.0)
+            .env("HOME", &self.base)
             .env("XDG_STATE_HOME", state)
-            .env("FLOCK_SOCKET_PATH", self.0.join(format!("{session}.sock")))
+            .env(
+                "FLOCK_SOCKET_PATH",
+                self.base.join(format!("{session}.sock")),
+            )
             .env(
                 "FLOCK_CLIENT_SOCKET_PATH",
-                self.0.join(format!("{session}-c.sock")),
+                self.base.join(format!("{session}-c.sock")),
             )
             .env("FLOCK_HOST_NAME", "node.example")
             .env("SHELL", "/bin/sh")
@@ -68,7 +73,7 @@ impl Fixture {
         support::register_spawned_flock_pid(Some(child.id()));
         let mut server = Server {
             child,
-            socket: self.0.join(format!("{session}.sock")),
+            socket: self.base.join(format!("{session}.sock")),
         };
         let deadline = Instant::now() + Duration::from_secs(20);
         // Binding creates the path before the server repairs a restrictive umask.
@@ -84,18 +89,14 @@ impl Fixture {
     }
 
     fn identity_path(&self) -> PathBuf {
-        let app = if cfg!(debug_assertions) {
-            "flock-dev"
-        } else {
-            "flock"
-        };
-        self.0.join("state").join(app).join("mesh/identity.json")
+        let app = support::paths::app_dir_name();
+        self.base.join("state").join(app).join("mesh/identity.json")
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.base);
     }
 }
 
@@ -147,7 +148,7 @@ impl Drop for Server {
 #[test]
 fn mesh_identity_survives_server_restart_and_is_shared_by_named_sessions() {
     let fixture = Fixture::new();
-    let state = fixture.0.join("state");
+    let state = fixture.base.join("state");
     let first = fixture.start("first", &state);
     let id = first.identity();
     let second = fixture.start("second", &state);
@@ -163,14 +164,14 @@ fn mesh_identity_survives_server_restart_and_is_shared_by_named_sessions() {
             & 0o777,
         0o600
     );
-    let independent = fixture.start("independent", &fixture.0.join("other-state"));
+    let independent = fixture.start("independent", &fixture.base.join("other-state"));
     assert_ne!(independent.identity(), id);
 }
 
 #[test]
 fn mesh_identity_boot_refuses_corrupt_file_with_its_path() {
     let fixture = Fixture::new();
-    let state = fixture.0.join("state");
+    let state = fixture.base.join("state");
     drop(fixture.start("first", &state));
     let path = fixture.identity_path();
     fs::write(&path, b"corrupt identity").unwrap();
@@ -182,13 +183,13 @@ fn mesh_identity_boot_refuses_corrupt_file_with_its_path() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains(&path.display().to_string()));
-    assert!(!fixture.0.join("refused.sock").exists());
+    assert!(!fixture.base.join("refused.sock").exists());
 }
 
 #[test]
 fn mesh_identity_strict_umask_still_creates_private_writable_files() {
     let fixture = Fixture::new();
-    let state = fixture.0.join("state");
+    let state = fixture.base.join("state");
     let mut cmd = fixture.command("strict", &state);
     // SAFETY: umask is async-signal-safe and changes only the forked child.
     unsafe {
@@ -213,7 +214,7 @@ fn mesh_identity_strict_umask_still_creates_private_writable_files() {
 #[test]
 fn mesh_identity_unbound_warning_reaches_ping_summary_and_status() {
     let fixture = Fixture::new();
-    let state = fixture.0.join("state");
+    let state = fixture.base.join("state");
     let initial = fixture.start("initial", &state);
     let id = initial.identity();
     drop(initial);
@@ -256,14 +257,10 @@ fn mesh_identity_unbound_warning_reaches_ping_summary_and_status() {
         }
     }
 
-    let app_dir = if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    };
+    let app_dir = support::paths::app_dir_name();
     let log = fs::read_to_string(
         fixture
-            .0
+            .base
             .join("config")
             .join(app_dir)
             .join("sessions/unbound/flock-server.log"),
