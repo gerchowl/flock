@@ -152,7 +152,27 @@ fn run_pr_poll_round(
     })
 }
 
+/// Local-operator evidence borrowed from the classified API request.
+/// Only this dispatcher can construct it; it cannot outlive or mutate its caller.
+// Slice 7b (#1827) connects the token-management socket handlers.
+#[allow(dead_code)]
+pub(crate) struct LocalOperator<'a> {
+    _app: &'a mut App,
+}
+
 impl App {
+    /// Mint token-management authority only from the existing kernel/lease policy.
+    // Slice 7b (#1827) calls this from token-management socket handlers.
+    #[allow(dead_code)]
+    pub(crate) fn client_token_authority(
+        &mut self,
+    ) -> Result<LocalOperator<'_>, crate::api::error_code::ErrorCode> {
+        if !self.caller_is_local_operator() {
+            return Err(crate::api::error_code::ErrorCode::OperatorOnly);
+        }
+        Ok(LocalOperator { _app: self })
+    }
+
     /// Arm and spawn a transcript read for `pane_id` at the currently
     /// selected panel detail (#246). Idempotent — the terminal's own guard
     /// short-circuits when the same `(session, detail)` pair is already
