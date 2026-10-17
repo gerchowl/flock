@@ -35,6 +35,7 @@ function narrow(event: KnownSessionEvent): void {
     case "command_lifecycle": event satisfies import("../src/gen/CommandLifecycle").CommandLifecycle; break;
     case "rate_limit_event": event satisfies import("../src/gen/RateLimit").RateLimit; break;
     case "control_request": event.request.subtype satisfies "can_use_tool"; break;
+    case "control_cancel_request": event satisfies import("../src/gen/ControlCancel").ControlCancel; break;
     case "system":
       switch (event.subtype) {
         case "init": event satisfies import("../src/gen/Init").Init; break;

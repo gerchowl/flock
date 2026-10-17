@@ -178,6 +178,12 @@ if mode == "mcp-lease-calls":
     emit(find("result", "success"))
     sys.stdin.read()
     sys.exit(0)
+if mode == "state-reducer":
+    for event in (root / "state-events.jsonl").read_text().splitlines():
+        emit(json.loads(event))
+
+    sys.stdin.read()
+    sys.exit(0)
 if mode == "lease-calls":
     tool = os.fork()
     if tool == 0:
