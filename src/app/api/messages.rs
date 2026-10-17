@@ -2472,9 +2472,7 @@ mod tests {
             assert!(response.get("error").is_none(), "{response}");
         }
         let sender_pane = app.state.workspaces[0].focused_pane_id().unwrap();
-        app.test_pane_child_pids
-            .insert(sender_pane, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(&mut app, sender_pane);
         let response = claimed_send(&mut app, &pane, serde_json::json!({}));
         assert!(response.get("error").is_none(), "{response}");
         app.current_api_peer_pid = None;
@@ -3322,9 +3320,7 @@ mod tests {
                 intent: MsgIntent::NeedsReply,
             });
         let answerer_pane = app.state.workspaces[1].focused_pane_id().unwrap();
-        app.test_pane_child_pids
-            .insert(answerer_pane, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(&mut app, answerer_pane);
         let response = app.handle_api_request(wire_request(serde_json::json!({
             "id": "req",
             "method": "msg.reply",
@@ -3371,9 +3367,7 @@ mod tests {
             });
         // The caller sits in the ASKER's pane, not the recipient's.
         let asker_pane = app.state.workspaces[0].focused_pane_id().unwrap();
-        app.test_pane_child_pids
-            .insert(asker_pane, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(&mut app, asker_pane);
         let _ = app.handle_api_request(wire_request(serde_json::json!({
             "id": "req",
             "method": "msg.reply",

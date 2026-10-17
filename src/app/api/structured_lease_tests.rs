@@ -40,8 +40,7 @@ const SESSION: &str = "00000000-0000-4000-8000-000000000001";
 
 #[tokio::test]
 async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption() {
-    // guardrails-ok(hermetic): Unix socket fixtures require a short owned root independent of TMPDIR.
-    let fixture = runtime::tests::Fixture::under(std::path::Path::new("/tmp"));
+    let fixture = runtime::tests::Fixture::for_socket();
     let root = fixture.root.path().to_owned();
     let socket = root.join("api.sock");
     assert!(socket.as_os_str().as_encoded_bytes().len() < 104);
@@ -355,19 +354,41 @@ async fn real_pane_ancestry_survives_an_unrelated_pending_lease() {
         .attached_terminal_id
         .clone();
     app.state.terminals.get_mut(&terminal).unwrap().launch_argv = Some(vec!["claude".into()]);
-    app.test_pane_child_pids.insert(pane, std::process::id());
-    app.current_api_peer_pid = Some(std::process::id());
-    app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
+    let root = crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let runtime = crate::terminal::TerminalRuntime::spawn_shell_command(
+        pane,
+        24,
+        80,
+        root.path().to_owned(),
+        "read line",
+        &[],
+        4096,
+        Default::default(),
+        app.event_tx.clone(),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
+    let pid = runtime.child_pid().unwrap();
+    app.current_api_peer_pid = Some(pid);
+    app.current_api_peer_birth = Some(crate::platform::process_start_time(pid));
+    app.terminal_runtimes.insert(terminal.clone(), runtime);
     let _pending = app.session_leases.reserve(AGENT, SESSION, None).unwrap();
-    assert_eq!(
-        app.lease_caller(),
-        crate::structured::lease::Caller::Unrelated
-    );
-    assert!(matches!(
-        app.spawn_caller(),
-        super::spawn::SpawnCaller::Agent { .. }
-    ));
-    assert!(!app.caller_is_local_operator());
+    let caller = app.lease_caller();
+    let agent = matches!(app.spawn_caller(), super::spawn::SpawnCaller::Agent { .. });
+    let operator = app.caller_is_local_operator();
+    let runtime = app.terminal_runtimes.remove(&terminal).unwrap();
+    assert!(tokio::time::timeout(
+        Duration::from_secs(10),
+        runtime.shutdown_for_restart(vec![pid], Duration::ZERO)
+    )
+    .await
+    .unwrap()
+    .unwrap());
+    assert_eq!(caller, crate::structured::lease::Caller::Unrelated);
+    assert!(agent);
+    assert!(!operator);
+    assert!(app.test_pane_child_pids.is_empty());
 }
 
 #[tokio::test]

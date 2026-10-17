@@ -352,8 +352,7 @@ mod tests {
         let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
         terminal.launch_argv = Some(vec!["claude".into()]);
         let agent_id = terminal.agent_id.to_string();
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(&mut app, pane_id);
         let screen = concat!(
             "\u{25cf} Started the wait in the background.\n\n",
             "\u{273b} Crunched for 4s \u{b7} done 4:32 PM \u{b7} 1 shell still running\n",
@@ -427,8 +426,8 @@ mod tests {
     /// Acceptance (#1031): `flk events wait` started under Claude
     /// `run_in_background` makes the pane `waiting_on_event`, not
     /// `finished_with_background`, for as long as the read is held.
-    #[test]
-    fn a_held_read_under_a_background_shell_reads_waiting_on_event() {
+    #[tokio::test]
+    async fn a_held_read_under_a_background_shell_reads_waiting_on_event() {
         let (mut app, agent_id) = settled_claude_with_a_background_shell();
         assert_eq!(state(&mut app, &agent_id).0, Phase::FinishedWithBackground);
 
@@ -456,8 +455,8 @@ mod tests {
     /// The derived phase events follow the wait (ADR-0028 §2): opening it
     /// and closing it each mark the pane, and each phase is announced once it
     /// has held for the settle window.
-    #[test]
-    fn the_derived_phase_events_follow_a_held_read() {
+    #[tokio::test]
+    async fn the_derived_phase_events_follow_a_held_read() {
         let (mut app, agent_id) = settled_claude_with_a_background_shell();
         let announced = |app: &App| -> Vec<Phase> {
             app.event_hub
@@ -502,8 +501,8 @@ mod tests {
     /// clears the wait.
     /// A held read whose release never arrived (its connection thread died)
     /// expires at its hold plus the grace.
-    #[test]
-    fn a_held_read_whose_release_is_lost_expires_once() {
+    #[tokio::test]
+    async fn a_held_read_whose_release_is_lost_expires_once() {
         let (mut app, agent_id) = settled_claude_with_a_background_shell();
         let held = call(&mut app, Method::WaitHold(any_events(), 1_000));
         let wait_id = held["result"]["wait_id"].clone();
@@ -545,8 +544,8 @@ mod tests {
 
     /// Acceptance (#1031): a parked agent reads `waiting_on_event`, with
     /// its predicate in canonical form.
-    #[test]
-    fn a_parked_agent_reads_waiting_on_event() {
+    #[tokio::test]
+    async fn a_parked_agent_reads_waiting_on_event() {
         let (mut app, agent_id) = settled_claude_with_a_background_shell();
         // The fixture's only agent is the caller, so it is the local delegate.
         let until = format!("delegate:{agent_id} phase in [gone,finished,  needs_human]");
@@ -564,8 +563,8 @@ mod tests {
     /// Acceptance (#1031): a predicate the grammar does not have, or one the
     /// ADR names that this slice cannot register, is refused with its typed
     /// code, which the CLI exits 2 on. Nothing is parked.
-    #[test]
-    fn an_unknown_or_unsupported_predicate_is_refused_with_its_code() {
+    #[tokio::test]
+    async fn an_unknown_or_unsupported_predicate_is_refused_with_its_code() {
         let (mut app, _) = settled_claude_with_a_background_shell();
         let code = |app: &mut App, until: &str| {
             call(app, park_until(until, 60_000))["error"]["code"].clone()
@@ -597,8 +596,8 @@ mod tests {
 
     /// A delegate on another host cannot be observed here (ADR-0028 §3a),
     /// and an id no server knows is not a delegate.
-    #[test]
-    fn a_remote_or_unknown_delegate_is_refused() {
+    #[tokio::test]
+    async fn a_remote_or_unknown_delegate_is_refused() {
         let (mut app, _) = settled_claude_with_a_background_shell();
         let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
             name: "kiln".into(),
@@ -658,8 +657,8 @@ mod tests {
 
     /// A park is bounded in length and in number per agent. Held reads do
     /// not count against the parks.
-    #[test]
-    fn parks_are_bounded_in_deadline_and_count() {
+    #[tokio::test]
+    async fn parks_are_bounded_in_deadline_and_count() {
         let (mut app, _) = settled_claude_with_a_background_shell();
         let longest = u64::try_from(super::MAX_PARK_DEADLINE.as_millis()).unwrap();
         assert_eq!(
@@ -680,8 +679,8 @@ mod tests {
 
     /// Acceptance (#1031): an expired deadline emits `wait.expired` once and
     /// clears the wait.
-    #[test]
-    fn an_expired_park_is_announced_once_and_cleared() {
+    #[tokio::test]
+    async fn an_expired_park_is_announced_once_and_cleared() {
         let (mut app, agent_id) = settled_claude_with_a_background_shell();
         let parked = call(&mut app, park(1_000));
         let wait_id = parked["result"]["wait_id"].clone();
@@ -718,8 +717,8 @@ mod tests {
     }
 
     /// A caller in no agent pane has no agent state to put a wait on.
-    #[test]
-    fn a_caller_outside_an_agent_pane_cannot_park_and_holds_nothing() {
+    #[tokio::test]
+    async fn a_caller_outside_an_agent_pane_cannot_park_and_holds_nothing() {
         let (mut app, _) = settled_claude_with_a_background_shell();
         app.current_api_peer_pid = None;
         assert_eq!(
@@ -731,8 +730,8 @@ mod tests {
         assert_eq!(app.waits.next_deadline(), None);
     }
 
-    #[test]
-    fn a_park_needs_a_deadline() {
+    #[tokio::test]
+    async fn a_park_needs_a_deadline() {
         let (mut app, _) = settled_claude_with_a_background_shell();
         assert_eq!(call(&mut app, park(0))["error"]["code"], "invalid_params");
     }

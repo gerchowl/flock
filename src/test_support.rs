@@ -312,6 +312,44 @@ fn describe_event(event: &crate::events::AppEvent) -> String {
     text
 }
 
+/// Attach an owned live pane process for tests of caller ancestry and authority.
+/// Production spawn captures its birth; no authority-specific test override is used.
+pub(crate) fn attest_pane_caller(app: &mut crate::app::App, pane: crate::layout::PaneId) {
+    use std::sync::{atomic::AtomicBool, Arc};
+    let (_, state) = app.find_pane(pane).expect("fixture pane");
+    let terminal = state.attached_terminal_id.clone();
+    if let Some(pid) = app
+        .terminal_runtimes
+        .get(&terminal)
+        .and_then(|runtime| runtime.child_pid())
+    {
+        let runtime = app.terminal_runtimes.get(&terminal).expect("owned runtime");
+        assert_eq!(
+            crate::platform::process_start_time(pid),
+            runtime.child_birth(),
+            "owned caller is alive with its original birth"
+        );
+        app.current_api_peer_pid = Some(pid);
+        return;
+    }
+    let runtime = crate::terminal::TerminalRuntime::spawn_shell_command(
+        pane,
+        24,
+        80,
+        std::env::temp_dir(),
+        "while IFS= read -r line; do :; done",
+        &[],
+        4096,
+        Default::default(),
+        app.event_tx.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .expect("owned fixture pane");
+    app.current_api_peer_pid = runtime.child_pid();
+    app.terminal_runtimes.insert(terminal, runtime);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

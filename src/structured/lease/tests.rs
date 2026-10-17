@@ -339,6 +339,12 @@ fn assert_mutation_wait_is_bounded(action: u8) {
     // Assert before joining, so a live silent worker cannot hang the test.
     let result = rx.recv_timeout(Duration::from_secs(1));
     drop(guard);
+    if action == 4 {
+        assert!(
+            leases.0.lock().contains_key("session"),
+            "busy mutation must retain its reservation"
+        );
+    }
     assert_eq!(
         result,
         Ok(true),
@@ -400,4 +406,57 @@ fn fork_exec_callback_holds_neither_registry_lock() {
     });
     assert!(result.is_err());
     lease.release();
+}
+
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn retained_lease_log(confirmed: bool) -> String {
+    let capture = LogCapture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let leases = SessionLeases::default();
+        let mut lease = leases.reserve("agent", "session", None).unwrap();
+        lease.spawned().unwrap();
+        let _guard = leases.0.lock();
+        if confirmed {
+            lease.release();
+        }
+        drop(lease);
+    });
+    let bytes = capture.0.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
+}
+
+#[test]
+fn busy_release_logs_reservation_and_confirmed_cleanup_cause() {
+    let output = retained_lease_log(true);
+    assert!(output.contains("session=\"session\""), "{output}");
+    assert!(output.contains("agent=\"agent\""), "{output}");
+    assert_eq!(output.matches("registry busy during release").count(), 1);
+    assert!(!output.contains("process cleanup unconfirmed"));
+}
+
+#[test]
+fn unconfirmed_cleanup_logs_reservation_identity() {
+    let output = retained_lease_log(false);
+    assert!(output.contains("session=\"session\""), "{output}");
+    assert!(output.contains("agent=\"agent\""), "{output}");
+    assert_eq!(output.matches("process cleanup unconfirmed").count(), 1);
+    assert!(!output.contains("registry busy during release"));
 }

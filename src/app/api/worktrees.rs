@@ -3440,8 +3440,7 @@ mod tests {
         let mut app = app_with_parent(&repo);
         let ws_id = push_worktree_workspace(&mut app, &repo, &checkout);
         let pane_id = app.state.workspaces[1].focused_pane_id().unwrap();
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(&mut app, pane_id);
 
         // These are the socket requests produced by MCP. Both addresses must
         // resolve to the attested peer's workspace before anything is removed.
@@ -4376,8 +4375,7 @@ mod tests {
             .expect("test terminal");
         terminal.launch_argv = Some(vec!["claude".into()]);
         let agent_id = terminal.agent_id.to_string();
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(app, pane_id);
         agent_id
     }
 

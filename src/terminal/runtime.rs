@@ -47,6 +47,10 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    /// Birth captured at spawn or imported with the owning pane runtime.
+    pub(crate) fn child_birth(&self) -> Option<u64> {
+        self.0.child_birth()
+    }
     /// The pane child's exit slot, where one exists (#178).
     pub fn child_exit(&self) -> Option<&crate::pane::ChildExit> {
         self.0.child_exit()
