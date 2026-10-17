@@ -70,6 +70,29 @@ impl Runtime {
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
         self.transport.try_submit(user)
     }
+    /// Server entry for a dispatcher-authenticated agent.decide command.
+    /// Token identity is context, never a field decoded from command arguments.
+    pub fn agent_decide(
+        &self,
+        principal: &super::permissions::Principal<'_>,
+        args: &super::permissions::AgentDecide,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        self.transport.agent_decide(principal, args)
+    }
+    /// Audit a host cancellation/result/interrupt without sending a tool decision.
+    /// The caller must carry an authenticated operate-token capability.
+    pub fn close_permissions(
+        &self,
+        principal: &super::permissions::Principal<'_>,
+        id: Option<&str>,
+        reason: super::permissions::CloseReason,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        self.transport.close_permissions(principal, id, reason)
+    }
+    /// Current permission ids for S4 attention; a busy snapshot fails closed.
+    pub fn waiting_on_human(&self) -> Result<Vec<String>, crate::api::error_code::ErrorCode> {
+        self.transport.waiting_on_human()
+    }
     /// Poll persisted events. Empty is not EOF; monitor the owning worker result too.
     pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
         self.events.try_recv()
