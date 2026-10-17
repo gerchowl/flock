@@ -282,6 +282,7 @@
 
 .palette__item {
   display: flex;
+  align-items: center;
   justify-content: space-between;
   gap: 1rem;
   width: 100%;
@@ -296,7 +297,7 @@
   cursor: pointer;
 }
 
-[aria-selected="true"] > .palette__item,
+.palette__item[aria-selected="true"],
 .palette__item:hover {
   background: var(--surface);
 }

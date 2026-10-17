@@ -83,7 +83,19 @@ export function Palette(props: PaletteProps): JSX.Element {
       </button>
       <Show when={open()}>
         <div class="palette-backdrop" onClick={(event) => event.target === event.currentTarget && hide()}>
-          <div class="palette" role="dialog" aria-modal="true" aria-label="Command palette" data-testid="palette">
+          <div
+            class="palette"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Command palette"
+            data-testid="palette"
+            onKeyDown={(event) => {
+              // The search field is the dialog's only focusable control: Tab and Shift+Tab stay on it.
+              if (event.key !== "Tab") return;
+              event.preventDefault();
+              input?.focus();
+            }}
+          >
             <input
               ref={input}
               class="palette__input"
@@ -103,11 +115,16 @@ export function Palette(props: PaletteProps): JSX.Element {
             <ul id={listId} class="palette__list" role="listbox">
               <For each={items()}>
                 {(item, index) => (
-                  <li id={optionId(index())} role="option" aria-selected={index() === selected()}>
-                    <button type="button" class="palette__item" onClick={() => choose(item)} data-testid="palette-item">
-                      <span>{item.label}</span>
-                      <span class="palette__hint">{item.hint}</span>
-                    </button>
+                  <li
+                    id={optionId(index())}
+                    role="option"
+                    class="palette__item"
+                    aria-selected={index() === selected()}
+                    onClick={() => choose(item)}
+                    data-testid="palette-item"
+                  >
+                    <span>{item.label}</span>
+                    <span class="palette__hint">{item.hint}</span>
                   </li>
                 )}
               </For>
