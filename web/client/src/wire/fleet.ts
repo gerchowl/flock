@@ -76,10 +76,9 @@ function agentRow(row: FleetAgentRow): AgentRow {
 
 /** Creates a {@link FleetSource} whose subscriptions run on `connection`. */
 export function createWireFleet(connection: WireConnection): FleetSource {
-  let next = 0;
   return {
     subscribe(observer) {
-      const id = `f${++next}`;
+      const id = connection.nextSubId("f");
       let open = true;
       let rows = new Map<string, AgentRow>();
       const end = (message: string): void => {
