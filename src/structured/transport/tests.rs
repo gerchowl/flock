@@ -76,6 +76,7 @@ fn worker_done(transport: &Transport, reader: bool) -> io::Result<()> {
 fn location(root: &SessionConfigDir) -> StreamLocation {
     StreamLocation {
         data_dir: root.path().to_owned(),
+        storage: Default::default(),
         agent: "fixture-agent".into(),
         session: "fixture-session".into(),
     }
@@ -511,7 +512,11 @@ fn failed_persistence_never_publishes_or_reopens_idle_gate() {
         &tx,
         &busy,
         &AtomicBool::new(false),
-        &cancel
+        &cancel,
+        (
+            &super::super::blobs::BlobStore::open(root.path()).expect("store"),
+            2048
+        )
     )
     .is_err());
     assert!(busy.load(Ordering::Acquire));
@@ -705,4 +710,73 @@ fn condition_wait_surfaces_the_dead_workers_error() {
         !message.contains("deadline"),
         "worker death is not a timeout"
     );
+}
+
+#[test]
+fn blob_references_resolve_while_partial_deltas_are_live_only_and_restart_seq_is_dense() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut stdout, _input) = start(&root);
+    let partial = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"text":"partial"}}}"#;
+    writeln!(stdout, "{partial}").unwrap();
+    let live = receive(&transport);
+    assert!(!live.persisted);
+    assert_eq!(live.record.seq, 0);
+    assert_eq!(live.record.raw, partial);
+    assert!(records(&root).is_empty());
+    let block = serde_json::json!({"type":"thinking","thinking":"x".repeat(3000)});
+    let raw =
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","content":[block]}})
+            .to_string();
+    writeln!(stdout, "{raw}").unwrap();
+    let live = receive(&transport);
+    assert!(live.persisted);
+    assert_eq!(live.record.seq, 1);
+    assert_eq!(live.record.raw, raw, "live data stays complete");
+    let stored = records(&root);
+    assert_eq!(stored.len(), 1);
+    let projected: Value = serde_json::from_str(&stored[0].raw).unwrap();
+    let reference: super::super::blobs::BlobRef =
+        serde_json::from_value(projected["message"]["content"][0].clone()).unwrap();
+    let bytes = super::super::blobs::BlobStore::open(root.path())
+        .unwrap()
+        .get(&reference.blob)
+        .unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), block);
+    drop(stdout);
+    reader_done(&transport).unwrap();
+    drop(transport);
+    let (transport, mut stdout, _input) = start(&root);
+    writeln!(stdout, "{}", user("after restart")).unwrap();
+    assert_eq!(receive(&transport).record.seq, 2);
+    drop(stdout);
+    reader_done(&transport).unwrap();
+    assert_eq!(
+        records(&root).iter().map(|r| r.seq).collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
+
+#[test]
+fn oversized_and_invalid_utf8_partial_summaries_never_enter_durable_stream() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut stdout, _input) = start(&root);
+    let prefix = br#"{"type":"stream_event","event":{"type":"content_block_delta","text":""#;
+    let mut oversized = prefix.to_vec();
+    oversized.resize(MAX_LINE_BYTES + 1, b'x');
+    oversized.extend_from_slice(b"\"}}\n");
+    stdout.write_all(&oversized).unwrap();
+    let live = receive(&transport);
+    assert!(!live.persisted);
+    assert_eq!(live.record.origin, RecordOrigin::Flk);
+    assert_eq!(live.record.seq, 0);
+    let mut invalid = prefix.to_vec();
+    invalid.extend_from_slice(b"\xff\"}}\n");
+    stdout.write_all(&invalid).unwrap();
+    let live = receive(&transport);
+    assert!(!live.persisted);
+    assert_eq!(live.record.origin, RecordOrigin::Flk);
+    assert_eq!(live.record.seq, 0);
+    drop(stdout);
+    reader_done(&transport).unwrap();
+    assert!(records(&root).is_empty());
 }

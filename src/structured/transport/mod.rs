@@ -33,6 +33,8 @@ const POLL: Duration = Duration::from_millis(2);
 pub struct StreamLocation {
     /// Existing flock data root (not the harness profile).
     pub data_dir: PathBuf,
+    /// Storage threshold captured from `[sessions]` at launch.
+    pub storage: super::blobs::StorageConfig,
     /// Agent identifier, containing only ASCII letters, digits, '-' or '_'.
     pub agent: String,
     /// Session identifier with the same restrictions; `queue` is reserved (any case).
@@ -64,10 +66,12 @@ pub struct StreamRecord {
     pub raw: String,
 }
 
-/// A persisted record paired with S1's infallible adapter interpretation.
+/// A live event paired with its envelope and explicit persistence status.
 #[derive(Debug)]
 pub struct Received {
-    /// Durable envelope; written before this notification is offered.
+    /// False for live-only partial deltas; their seq must not advance a cursor.
+    pub persisted: bool,
+    /// Durable envelope, or a live-only delta with the preceding durable seq.
     pub record: StreamRecord,
     /// Interpretation using the observed harness version.
     pub event: SessionEvent,
@@ -473,6 +477,8 @@ fn pump(
     uncertain: &AtomicBool,
     cancel: &AtomicBool,
 ) -> io::Result<()> {
+    let blobs = super::blobs::BlobStore::open(&location.data_dir).map_err(io::Error::other)?;
+    let threshold = location.storage.blob_min_bytes;
     let (mut file, mut seq) = open_stream(location, cancel)?;
     let mut line = Vec::new();
     let mut count = 0_u64;
@@ -493,7 +499,16 @@ fn pump(
         for &byte in &chunk[..n] {
             if byte == b'\n' {
                 emit(
-                    &mut file, &mut seq, &line, count, version, &tx, busy, uncertain, cancel,
+                    &mut file,
+                    &mut seq,
+                    &line,
+                    count,
+                    version,
+                    &tx,
+                    busy,
+                    uncertain,
+                    cancel,
+                    (&blobs, threshold),
                 )?;
                 line.clear();
                 count = 0;
@@ -507,7 +522,16 @@ fn pump(
         if n == 0 {
             if count > 0 {
                 emit(
-                    &mut file, &mut seq, &line, count, version, &tx, busy, uncertain, cancel,
+                    &mut file,
+                    &mut seq,
+                    &line,
+                    count,
+                    version,
+                    &tx,
+                    busy,
+                    uncertain,
+                    cancel,
+                    (&blobs, threshold),
                 )?;
             }
             return Ok(());
@@ -554,6 +578,7 @@ fn emit(
     busy: &AtomicBool,
     uncertain: &AtomicBool,
     cancel: &AtomicBool,
+    storage: (&super::blobs::BlobStore, usize),
 ) -> io::Result<()> {
     let origin = if count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err() {
         RecordOrigin::Flk
@@ -591,10 +616,21 @@ fn emit(
         }
         _ => (false, None),
     };
-    *seq = seq
-        .checked_add(1)
-        .ok_or_else(|| io::Error::other("session sequence exhausted"))?;
-    let record = StreamRecord {
+    let stored_raw = if kind.as_deref() == Some("stream_event") {
+        None
+    } else {
+        storage
+            .0
+            .project(&raw, storage.1)
+            .map_err(io::Error::other)?
+    };
+    let persisted = stored_raw.is_some();
+    if persisted {
+        *seq = seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("session sequence exhausted"))?;
+    }
+    let mut record = StreamRecord {
         seq: *seq,
         received_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -604,17 +640,25 @@ fn emit(
         result_subtype,
         raw,
     };
-    let mut encoded = serde_json::to_vec(&record)?;
-    encoded.push(b'\n');
-    file.write_all(&encoded)?;
-    file.sync_data()?;
+    if let Some(raw) = stored_raw {
+        let live_raw = std::mem::replace(&mut record.raw, raw);
+        let mut encoded = serde_json::to_vec(&record)?;
+        encoded.push(b'\n');
+        file.write_all(&encoded)?;
+        file.sync_data()?;
+        record.raw = live_raw;
+    }
     if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {
         uncertain.store(false, Ordering::Release);
         busy.store(false, Ordering::Release);
     } else if origin == RecordOrigin::Flk && turn_end == "unknown" && busy.load(Ordering::Acquire) {
         uncertain.store(true, Ordering::Release);
     }
-    let mut received = Received { record, event };
+    let mut received = Received {
+        persisted,
+        record,
+        event,
+    };
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(cancelled());

@@ -70,11 +70,11 @@ impl Runtime {
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
         self.transport.try_submit(user)
     }
-    /// Poll persisted events. Empty is not EOF; monitor the owning worker result too.
+    /// Poll complete events and live-only partial deltas. Empty is not EOF; monitor the owning worker result too.
     pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
         self.events.try_recv()
     }
-    /// Wait for a persisted event on a worker, with a finite deadline.
+    /// Wait for a complete event or live-only delta on a worker, with a finite deadline.
     /// Server-loop callers must use `try_receive` instead.
     pub fn receive_timeout(&self, timeout: Duration) -> Result<Received, mpsc::RecvTimeoutError> {
         self.events.recv_timeout(timeout)
