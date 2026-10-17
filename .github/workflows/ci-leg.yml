@@ -128,6 +128,12 @@ jobs:
         id: archive
         run: just ci-archive '${{ inputs.leg }}' nextest-archive.tar.zst
 
+      # Reuse the build toolchain and cache for both GUI feature variants.
+      # The required Linux leg includes this result; macOS PR policy is unchanged.
+      - name: Check GUI embedding and feature exclusion
+        if: runner.os == 'Linux' && inputs.run-tests
+        run: just gui-check
+
       - name: Save Zig build cache from dev
         if: github.ref == 'refs/heads/dev' && steps.zig-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
