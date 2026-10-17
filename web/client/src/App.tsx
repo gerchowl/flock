@@ -5,7 +5,10 @@
  * - **fixture** replays the recorded session as the `fixture` agent, with
  *   sample rows and inbox cards, under the replay badge (the owner preview);
  * - **wire** connects to the configured server (G3a, #1747). Its agent list
- *   is fleet-lite (#1746); the inbox shows sample cards until G5.
+ *   is fleet-lite (#1746); the inbox stays empty until G5 (#1597).
+ *
+ * Each mode creates its fleet source and transport once, outside JSX: a
+ * prop expression is a getter that would run again on every read.
  *
  * @module
  */
@@ -37,12 +40,14 @@ const CLIENT = { name: "flock-web", version: "0.0.0" } as const;
 function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element {
   const store = createLayoutStore({ serverKey: "fixture" });
   const { layout, notice } = store.load();
+  const fleet = createFixtureFleet(SAMPLE_AGENTS);
+  const transport = createFixtureTransport(props.config.fixtureJsonl);
   return (
     <>
       <ReplayBadge source={props.config.source} />
       <Workbench
-        fleet={createFixtureFleet(SAMPLE_AGENTS)}
-        transport={createFixtureTransport(props.config.fixtureJsonl)}
+        fleet={fleet}
+        transport={transport}
         inbox={SAMPLE_INBOX}
         layout={layout}
         saveLayout={(next) => store.save(next)}
@@ -63,14 +68,17 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   onCleanup(() => connection.disconnect());
   const store = createLayoutStore({ serverKey: url, initial: emptyLayout });
   const { layout, notice } = store.load();
+  // One fleet source and one transport per connection (ADR-0038 §3, sub ids).
+  const fleet = createWireFleet(connection);
+  const transport = createWireTransport(connection);
   return (
     <Workbench
-      fleet={createWireFleet(connection)}
-      transport={createWireTransport(connection)}
-      inbox={SAMPLE_INBOX}
+      fleet={fleet}
+      transport={transport}
+      inbox={[]}
       layout={layout}
       saveLayout={(next) => store.save(next)}
-      status={() => notice ?? status()}
+      status={() => [notice, status()].filter((part) => part !== null).join(" · ")}
       source="live"
     />
   );
