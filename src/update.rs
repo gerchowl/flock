@@ -2654,6 +2654,7 @@ mod tests {
             capabilities: None,
             session_health: None,
             api_listener: None,
+            agent_account_diagnostic: None,
         };
         let compatible_release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
@@ -2717,6 +2718,7 @@ mod tests {
                 }),
                 session_health: None,
                 api_listener: None,
+                agent_account_diagnostic: None,
             },
         };
 
@@ -2914,6 +2916,7 @@ mod tests {
             capabilities: None,
             session_health: None,
             api_listener: None,
+            agent_account_diagnostic: None,
         };
         let release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
