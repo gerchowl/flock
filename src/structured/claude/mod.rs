@@ -56,7 +56,11 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Optio
     T::deserialize(d).map(Some)
 }
 
+/// The known tool-request subtype, generated from the event catalogue.
+pub use event_types::CanUseTool::NestedKind as ToolRequestSubtype;
+
 /// A stdio permission request, including AskUserQuestion (A.6, A.12-A.13).
+/// Its Rust and TypeScript discriminator comes from the known request catalogue entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ToolRequest {
@@ -67,7 +71,8 @@ pub struct ToolRequest {
     /// Correlation with the assistant tool call.
     pub tool_use_id: String,
     /// Required control discriminator; null is an unknown wire shape (§8).
-    pub subtype: String,
+    #[cfg_attr(feature = "ts", ts(inline))]
+    pub subtype: ToolRequestSubtype,
     /// Harness `display_name` metadata from Appendix A.
     #[serde(
         default,
@@ -137,10 +142,13 @@ pub struct RateLimitInfo {
 // The top-level subtype is required only when the catalogue fixes that key.
 macro_rules! event_type {
     ($name:ident, $kind:literal, "/subtype", $sub:literal, $($body:tt)*) => {
-        event_type!(@build $name, $kind, $sub, [#[cfg_attr(feature = "ts", ts(optional = false))]], enum, $($body)*);
+        event_type!(@build $name, $kind, "/subtype", $sub, [#[cfg_attr(feature = "ts", ts(optional = false))]], enum, $($body)*);
     };
-    ($name:ident, $kind:literal, $path:literal, $sub:literal, $($body:tt)*) => {
-        event_type!(@build $name, $kind, $sub, [#[cfg_attr(feature = "ts", ts(optional))]], alias, $($body)*);
+    ($name:ident, $kind:literal, "", $sub:literal, $($body:tt)*) => {
+        event_type!(@build $name, $kind, "", $sub, [#[cfg_attr(feature = "ts", ts(optional))]], absent, $($body)*);
+    };
+    ($name:ident, $kind:literal, $path:tt, $sub:literal, $($body:tt)*) => {
+        event_type!(@build $name, $kind, $path, $sub, [#[cfg_attr(feature = "ts", ts(optional))]], alias, $($body)*);
     };
     (@subtype enum, $sub:literal) => {
         #[cfg(feature = "ts")]
@@ -153,7 +161,46 @@ macro_rules! event_type {
         #[cfg(feature = "ts")]
         type Subtype = Option<String>;
     };
-    (@build $name:ident, $kind:literal, $sub:literal, [$($attrs:tt)*], $mode:ident,
+    (@subtype absent, $sub:literal) => {
+        #[cfg(feature = "ts")]
+        #[derive(ts_rs::TS)]
+        enum AbsentSubtype {}
+        #[cfg(feature = "ts")]
+        type Subtype = Option<AbsentSubtype>;
+    };
+    (@nested "/event/type", $sub:literal) => {
+        event_type!(@payload "type", $sub);
+    };
+    (@nested "/response/subtype", $sub:literal) => {
+        event_type!(@payload "subtype", $sub);
+    };
+    (@nested "/request/subtype", $sub:literal) => {
+        /// The request discriminator accepted by the catalogue parser.
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+        pub enum NestedKind {
+            /// The catalogue's recognized permission request.
+            #[serde(rename = $sub)]
+            Value,
+        }
+    };
+    (@nested $path:literal, $sub:literal) => {};
+    (@payload $key:literal, $sub:literal) => {
+        #[cfg(feature = "ts")]
+        #[derive(ts_rs::TS)]
+        enum NestedKind { #[ts(rename = $sub)] Value }
+        #[cfg(feature = "ts")]
+        const _: NestedKind = NestedKind::Value;
+        #[cfg(feature = "ts")]
+        #[derive(ts_rs::TS)]
+        struct NestedPayload {
+            #[ts(rename = $key, inline)]
+            kind: NestedKind,
+            #[ts(flatten)]
+            extra: Map<String, Value>,
+        }
+    };
+    (@build $name:ident, $kind:literal, $path:tt, $sub:literal, [$($attrs:tt)*], $mode:ident,
         $(#[$doc:meta])* { $($(#[$field_doc:meta])* $field:ident: $ty:ty),* }
         optional { $($(#[$optional_doc:meta])* $optional:ident: $optional_ty:ty),* }
     ) => {
@@ -167,6 +214,7 @@ macro_rules! event_type {
             #[cfg(feature = "ts")]
             const _: Kind = Kind::Value;
             event_type!(@subtype $mode, $sub);
+            event_type!(@nested $path, $sub);
             $(#[$doc])*
             #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
             #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -229,16 +277,15 @@ macro_rules! events {
         /// A known discriminator with incompatible fields also becomes Unknown.
         /// Heterogeneous API messages, SSE bodies and SDK metadata stay JSON;
         /// state interpretation belongs to S4, not this wire adapter.
-        /// Clients narrow known events on `type` and the catalogue's nested
-        /// discriminator; anything else uses ADR-0036 §8's unknown rendering.
-        /// The TS union mirrors the untagged custom serializer, including unknown JSON.
+        /// This is the adapter's stored form: known events or arbitrary JSON.
+        /// Clients narrow `KnownSessionEvent` on the catalogue discriminators.
+        /// Unknowns reach clients only in ADR-0036 §8's `UnknownEvent` wrapper.
         #[derive(Debug, Clone, PartialEq)]
         #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-        #[cfg_attr(feature = "ts", ts(untagged))]
+        #[cfg_attr(feature = "ts", ts(as = "StoredSessionEvent"))]
         pub enum SessionEvent {
             $($(#[$doc])* $name(Box<$name>),)*
             /// An unrecognised or incompatible JSON shape, preserved in full.
-            #[cfg_attr(feature = "ts", ts(type = "unknown"))]
             Unknown {
                 /// Exact original input line, including whitespace and number spelling.
                 raw: String,
@@ -247,6 +294,90 @@ macro_rules! events {
                 /// Version-scoped identity for the shape registry in S2.
                 shape: ShapeKey,
             },
+        }
+
+        /// Known adapter events, narrowable on the catalogue's literal discriminators.
+        /// Nested switches narrow payloads; TypeScript does not correlate that
+        /// refinement back to the containing envelope.
+        /// Unknown events reach clients only through ADR-0036 §8's wrapper.
+        /// Deserialization uses the adapter parser and rejects unknown payloads;
+        /// those require the separate unknown wrapper, including its shape key.
+        #[cfg(any(test, feature = "ts"))]
+        #[derive(Debug, Clone, PartialEq, Serialize)]
+        #[serde(untagged)]
+        #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+        pub(crate) enum KnownSessionEvent {
+            $($(#[$doc])* $name(Box<$name>),)*
+        }
+
+        #[cfg(any(test, feature = "ts"))]
+        impl<'de> Deserialize<'de> for KnownSessionEvent {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let value = Value::deserialize(d)?;
+                match SessionEvent::parse(&value.to_string(), "wire") {
+                    $(SessionEvent::$name(event) => Ok(Self::$name(event)),)*
+                    SessionEvent::Unknown { .. } => Err(serde::de::Error::custom(
+                        "unknown agent payload requires {type:unknown,raw,shape}")),
+                }
+            }
+        }
+
+        #[cfg(test)]
+        #[test]
+        fn known_session_event_catalogue_round_trips_recorded_fixtures() {
+            let mut seen = std::collections::BTreeSet::new();
+            for line in include_str!("../../../tests/fixtures/claude-session/events.jsonl").lines() {
+                let original: Value = serde_json::from_str(line).unwrap();
+                let parsed = SessionEvent::parse(line, "wire");
+                let known: KnownSessionEvent = serde_json::from_str(line).unwrap();
+                assert_eq!(serde_json::to_value(&known).unwrap(), original);
+                assert_eq!(serde_json::to_string(&known).unwrap(),
+                    serde_json::to_string(&parsed).unwrap());
+                match parsed {
+                    $(SessionEvent::$name(_) => { seen.insert(stringify!($name)); },)*
+                    SessionEvent::Unknown { .. } => panic!("recorded fixture must remain known: {line}"),
+                }
+            }
+            assert_eq!(seen, [$(stringify!($name)),*].into_iter().collect());
+        }
+
+        #[cfg(test)]
+        #[test]
+        fn known_session_event_rejects_unknown_and_incompatible_payloads() {
+            for raw in [
+                serde_json::json!({"type":"future"}),
+                serde_json::json!({"type":"assistant", "message":{ }, "subtype":"future"}),
+                serde_json::json!({"type":"assistant"}),
+                Value::Null,
+                serde_json::json!("diagnostic"),
+            ] {
+                let error = serde_json::from_value::<KnownSessionEvent>(raw).unwrap_err();
+                assert!(error.to_string().contains(
+                    "unknown agent payload requires {type:unknown,raw,shape}"));
+            }
+        }
+
+        #[cfg(test)]
+        #[test]
+        fn tool_request_subtype_rejects_other_catalogue_values() {
+            let mut raw = include_str!("../../../tests/fixtures/claude-session/events.jsonl")
+                .lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|raw| raw["type"] == "control_request").unwrap();
+            let request: ToolRequest = serde_json::from_value(raw["request"].clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), raw["request"]);
+            raw["request"]["subtype"] = serde_json::json!("future");
+            assert!(serde_json::from_value::<ToolRequest>(raw["request"].clone()).is_err());
+            assert!(matches!(SessionEvent::parse(&raw.to_string(), "wire"),
+                SessionEvent::Unknown { .. }));
+        }
+
+        #[cfg(feature = "ts")]
+        #[derive(ts_rs::TS)]
+        #[ts(untagged)]
+        #[allow(dead_code)] // Type-only mirrors of the custom serializer for ts-rs.
+        enum StoredSessionEvent {
+            Known(KnownSessionEvent),
+            Json(Value),
         }
 
         impl SessionEvent {
@@ -286,6 +417,7 @@ macro_rules! events {
         #[cfg(all(test, feature = "ts"))]
         /// Collect every catalogue member and the custom serialized union.
         pub(crate) fn ts_events(collector: &mut crate::ts::Collector) {
+            collector.add::<ToolRequest>();
             $(collector.add::<$name>();)*
             collector.add::<SessionEvent>();
         }
@@ -295,8 +427,9 @@ macro_rules! events {
         fn session_event_ts_matches_serialization() {
             let cfg = ts_rs::Config::default();
             let union = <SessionEvent as ts_rs::TS>::decl(&cfg);
-            assert_eq!(union, format!("type SessionEvent = {} | unknown;",
-                [$(stringify!($name)),*].join(" | ")));
+            assert_eq!(union, "type SessionEvent = KnownSessionEvent | JsonValue;");
+            assert_eq!(<KnownSessionEvent as ts_rs::TS>::decl(&cfg),
+                format!("type KnownSessionEvent = {};", [$(stringify!($name)),*].join(" | ")));
 
             let raw = "{ \"type\" : \"future\", \"counter\": 1e2 }";
             let unknown = SessionEvent::parse(raw, "fixture");
@@ -316,6 +449,12 @@ macro_rules! events {
                         assert!(decl.contains(&format!("type: \"{}\"", $kind)), "{decl}");
                         if $path == "/subtype" {
                             assert!(decl.contains(&format!("subtype: \"{}\"", $sub)), "{decl}");
+                        }
+                        if $path.is_empty() {
+                            assert!(decl.contains("subtype?: never"), "{decl}");
+                        } else {
+                            let key = $path.rsplit('/').next().unwrap();
+                            assert!(decl.contains(&format!("{key}: \"{}\"", $sub)), "{decl}");
                         }
                         assert!(decl.contains("session_id?: string | null"), "{decl}");
                     },)*
@@ -525,24 +664,28 @@ events! {
         /// Identifier the host must echo in its response.
         request_id: String,
         /// Tool name, input, suggestions and interaction requirements.
+        #[cfg_attr(feature = "ts", ts(inline))]
         request: ToolRequest,
     } optional {
     }
     /// Successful response to a host control request (A.5, A.14-A.15).
     ControlSuccess("control_response", "/response/subtype", "success") {
         /// Request identifier and verb-specific result.
+        #[cfg_attr(feature = "ts", ts(as = "NestedPayload", inline))]
         response: Map<String, Value>,
     } optional {
     }
     /// Rejected or unsupported host control request (A.14-A.15).
     ControlError("control_response", "/response/subtype", "error") {
         /// Request identifier, error text and optional error code.
+        #[cfg_attr(feature = "ts", ts(as = "NestedPayload", inline))]
         response: Map<String, Value>,
     } optional {
     }
     /// Start of an API message (A.2).
     MessageStart("stream_event", "/event/type", "message_start") {
         /// Raw SSE body, including the API message.
+        #[cfg_attr(feature = "ts", ts(as = "NestedPayload", inline))]
         event: Map<String, Value>,
     } optional {
         /// Harness `api_message_id` metadata from Appendix A.
@@ -559,6 +702,7 @@ events! {
     /// Start of a text, thinking or tool block (A.2).
     ContentBlockStart("stream_event", "/event/type", "content_block_start") {
         /// Raw SSE body, including block index and content_block.
+        #[cfg_attr(feature = "ts", ts(as = "NestedPayload", inline))]
         event: Map<String, Value>,
     } optional {
         /// Harness `api_message_id` metadata from Appendix A.
@@ -575,6 +719,7 @@ events! {
     /// Text, thinking, signature or tool-input delta (A.2).
     ContentBlockDelta("stream_event", "/event/type", "content_block_delta") {
         /// Raw SSE body, including block index and delta.
+        #[cfg_attr(feature = "ts", ts(as = "NestedPayload", inline))]
         event: Map<String, Value>,
     } optional {
         /// Harness `api_message_id` metadata from Appendix A.
@@ -591,6 +736,7 @@ events! {
     /// End of one content block (A.2).
     ContentBlockStop("stream_event", "/event/type", "content_block_stop") {
         /// Raw SSE body with its block index.
+        #[cfg_attr(feature = "ts", ts(as = "NestedPayload", inline))]
         event: Map<String, Value>,
     } optional {
         /// Harness `api_message_id` metadata from Appendix A.
@@ -607,6 +753,7 @@ events! {
     /// API message usage and stop metadata (A.2).
     MessageDelta("stream_event", "/event/type", "message_delta") {
         /// Raw SSE body, including usage and stop reason.
+        #[cfg_attr(feature = "ts", ts(as = "NestedPayload", inline))]
         event: Map<String, Value>,
     } optional {
         /// Harness `api_message_id` metadata from Appendix A.
@@ -623,6 +770,7 @@ events! {
     /// End of an API message (A.2).
     MessageStop("stream_event", "/event/type", "message_stop") {
         /// Raw SSE body.
+        #[cfg_attr(feature = "ts", ts(as = "NestedPayload", inline))]
         event: Map<String, Value>,
     } optional {
         /// Harness `api_message_id` metadata from Appendix A.

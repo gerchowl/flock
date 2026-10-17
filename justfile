@@ -37,9 +37,8 @@ test-one filter:
     cargo nextest run --locked --features ts "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
 # Run every guardrails gate over the tree (same set `nix flake check` runs).
-# Standalone, NOT chained into `lint`: the host-bound CI runners (ci.yml) skip
-# the guardrails devShell, so prek isn't on their PATH — gate enforcement in CI
-# lives in nix.yml's `flake check` (checks.gates), locally in the git hooks.
+# Standalone, NOT chained into `lint`: CI gate enforcement lives in nix.yml's
+# `flake check` (checks.gates), locally in the git hooks.
 gates:
     prek run --all-files
 
@@ -52,8 +51,9 @@ log-budget seconds='60':
     guardrails-log-budget
 
 # Run fast local lint checks
-lint:
+lint: ts-check
     cargo fmt --check
+    cargo clippy --all-targets --locked -- -D warnings
     cargo clippy --all-targets --locked --features ts -- -D warnings
 
 # Build internal API docs and reject broken links, markup and other warnings.
@@ -191,3 +191,8 @@ default-config:
 # Rewrite the Rust-derived client contracts (ADR-0036 §6).
 gen-ts:
     cargo nextest run --locked --features ts --run-ignored ignored-only generate_wire_ts_types
+
+# Strict contract checks, including the Rust-classified recorded fixtures.
+ts-check:
+    # G1 #1593 moves the compiler pin into the workspace lockfile.
+    bunx --bun --package typescript@7.0.2 tsc --noEmit -p web/client/tsconfig.json

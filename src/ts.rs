@@ -54,7 +54,22 @@ fn contracts() -> BTreeMap<PathBuf, String> {
     collector.add::<WorkspaceInfo>();
     collector.add::<PaneInfo>();
     crate::structured::claude::ts_events(&mut collector);
-    collector.files
+    let mut files = collector.files;
+    // Classification comes from the adapter, so new fixtures cannot silently be skipped.
+    let mut fixtures = String::from(
+        "// Generated from Rust-classified Claude fixtures by just gen-ts. Do not edit.\n\
+         import type { KnownSessionEvent } from './KnownSessionEvent';\n",
+    );
+    for line in include_str!("../tests/fixtures/claude-session/events.jsonl").lines() {
+        if !matches!(
+            crate::structured::claude::SessionEvent::parse(line, "fixture"),
+            crate::structured::claude::SessionEvent::Unknown { .. }
+        ) {
+            fixtures.push_str(&format!("({line}) satisfies KnownSessionEvent;\n"));
+        }
+    }
+    files.insert(PathBuf::from("known-session-fixtures.ts"), fixtures);
+    files
 }
 
 fn generated_paths(root: &std::path::Path) -> Vec<PathBuf> {

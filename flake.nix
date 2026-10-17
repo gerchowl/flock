@@ -161,6 +161,7 @@
               just
               ninja
               nodejs
+              bun
               perl
               pkg-config
               rustc
