@@ -23,6 +23,18 @@ pub(crate) fn structured_sweep_outcome(entry: &crate::structured::supervision::S
     }
 }
 
+/// Report typed worker cleanup failures without reading session contents.
+pub(crate) fn structured_worker_shutdown_failed(error: &crate::structured::workers::ShutdownError) {
+    for (agent_id, code) in &error.0 {
+        tracing::error!(
+            event = "structured.worker.shutdown_failed",
+            agent_id = agent_id.as_str(),
+            code = code.as_str(),
+            "structured worker cleanup failed"
+        );
+    }
+}
+
 /// Report failed structured-session cleanup without reading session contents.
 pub(crate) fn structured_config_cleanup_failed(err: &io::Error) {
     tracing::error!(event = "structured.config.cleanup_failed", error = %err,
