@@ -900,6 +900,13 @@ Every mutation returns typed `queue_journal_newer { found, supported }`;
 queue status exposes the refusal, which requires a compatible writer and must
 never be retried in a loop. Opaque checkpoint passthrough is forbidden because
 an older writer cannot preserve unknown records' interleaving semantics.
+Owner clarification (#1820): unknown kinds/fields/enum names follow lenient
+recovery, with raw bytes preserved and unknown semantics never delivered.
+Malformed known records in supported formats load read-only as
+`queue_journal_corrupt { seq, offset, reason }`: stop folding, refuse every
+mutation/checkpoint and preserve the whole file. Operator recovery is outside
+this slice. A crash-torn final line keeps the existing truncation/sync path;
+it is not corruption. Neither read-only mode permits tail repair.
 The fsync-temp, rename, fsync-directory rule below is unchanged.
 
 

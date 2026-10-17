@@ -880,6 +880,15 @@ fn cancelled_without_result_reports_pending_until_real_result_or_exit() {
 
 #[test]
 fn newer_journal_status_survives_scheduler_open_and_every_runtime_mutation_is_refused() {
+    readonly_runtime(false);
+}
+
+#[test]
+fn corrupt_journal_status_survives_scheduler_open_and_every_runtime_mutation_is_refused() {
+    readonly_runtime(true);
+}
+
+fn readonly_runtime(corrupt: bool) {
     let mut run = QueueRun::mode("queue-silent");
     run.send(1, Producer::Human);
     run.offer().unwrap().unwrap();
@@ -893,10 +902,16 @@ fn newer_journal_status_survives_scheduler_open_and_every_runtime_mutation_is_re
     let old = fs::read(&path).unwrap();
     let mut lines = old.split_inclusive(|b| *b == b'\n');
     let mut header: Value = serde_json::from_slice(lines.next().unwrap()).unwrap();
-    header["format_version"] = json!(999);
+    if !corrupt {
+        header["format_version"] = json!(999);
+    }
     let mut bytes = serde_json::to_vec(&header).unwrap();
     bytes.push(b'\n');
     bytes.extend(lines.flatten());
+    let offset = bytes.len() as u64;
+    if corrupt {
+        bytes.extend(b"{\"seq\":3,\"kind\":\"upsert\",\"item\":42}\ntorn tail");
+    }
     fs::write(&path, &bytes).unwrap();
     let admission = Admission::new(
         Journal::open(run.fixture.root.path(), "fixture-agent").unwrap(),
@@ -905,17 +920,37 @@ fn newer_journal_status_survives_scheduler_open_and_every_runtime_mutation_is_re
     .unwrap();
     let mut scheduler = Scheduler::new(admission).unwrap();
     let status = scheduler.status(&run.running.runtime).unwrap();
-    assert_eq!(
-        status.cause,
-        PendingCause::QueueJournalNewer {
-            found: 999,
-            supported: 2
-        }
-    );
-    assert_eq!(
-        serde_json::to_value(&status).unwrap()["cause"]["queue_journal_newer"]["found"],
-        999
-    );
+    let code = if corrupt {
+        ErrorCode::QueueJournalCorrupt
+    } else {
+        ErrorCode::QueueJournalNewer
+    };
+    if corrupt {
+        assert_eq!(
+            status.cause,
+            PendingCause::QueueJournalCorrupt(crate::structured::queue::QueueJournalCorrupt {
+                seq: Some(3),
+                offset,
+                reason: "malformed_known_record"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["cause"]["queue_journal_corrupt"]["offset"],
+            offset
+        );
+    } else {
+        assert_eq!(
+            status.cause,
+            PendingCause::QueueJournalNewer {
+                found: 999,
+                supported: 2
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["cause"]["queue_journal_newer"]["found"],
+            999
+        );
+    }
     let event = crate::structured::claude::SessionEvent::parse(
         &catalogue("result", Some("success")).to_string(),
         "fixture",
@@ -931,7 +966,7 @@ fn newer_journal_status_survives_scheduler_open_and_every_runtime_mutation_is_re
             .unwrap_err(),
     ];
     for error in errors {
-        assert_eq!(error.code, ErrorCode::QueueJournalNewer);
+        assert_eq!(error.code, code);
     }
     assert_eq!(scheduler.status(&run.running.runtime).unwrap(), status);
     assert_eq!(fs::read(path).unwrap(), bytes);

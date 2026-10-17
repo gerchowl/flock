@@ -9,6 +9,10 @@
 #![deny(missing_docs)]
 pub(crate) mod admission;
 pub mod model;
+mod readonly;
+use readonly::corrupt;
+pub use readonly::{QueueJournalCorrupt, QueueJournalNewer, ReadOnly};
+use std::collections::HashSet;
 pub(crate) mod scheduler;
 use crate::platform::structured as private_fs;
 pub use model::{Change, Item, Record};
@@ -20,26 +24,6 @@ use std::path::{Path, PathBuf};
 /// Journal format understood by this writer. Unstamped journals are version 1.
 /// Bump for every new record kind, top-level field or enum variant name.
 pub const FORMAT_VERSION: u64 = 2;
-
-/// A newer journal is inspectable but must only be served by a compatible writer.
-/// Retrying without upgrading the writer cannot make this refusal succeed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct QueueJournalNewer {
-    /// Version declared by the journal identity header.
-    pub found: u64,
-    /// Highest format version understood by this writer.
-    pub supported: u64,
-}
-impl std::fmt::Display for QueueJournalNewer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "queue_journal_newer: found {}, supported {}",
-            self.found, self.supported
-        )
-    }
-}
-impl std::error::Error for QueueJournalNewer {}
 
 const LINE_LIMIT: u64 = 2 * 1024 * 1024;
 
@@ -75,6 +59,8 @@ pub struct Journal {
     checkpoint: Option<(u64, u64)>,
     version: u64,
     future: bool,
+    corrupt: Option<QueueJournalCorrupt>,
+    opaque: HashSet<String>,
     poisoned: bool,
     _lease: File,
 }
@@ -97,13 +83,31 @@ fn encode(value: &impl serde::Serialize) -> io::Result<Vec<u8>> {
     }
     Ok(bytes)
 }
+fn track_opaque(change: &Change, unknown: bool, opaque: &mut HashSet<String>) {
+    let items = match change {
+        Change::Upsert { item, .. } => std::slice::from_ref(item.as_ref()),
+        Change::Batch { items } => items.as_slice(),
+        Change::Remove { item_id } => {
+            opaque.remove(item_id);
+            return;
+        }
+        Change::Fail { .. } => return,
+    };
+    for item in items {
+        if unknown {
+            opaque.insert(item.item_id.clone());
+        } else {
+            opaque.remove(&item.item_id);
+        }
+    }
+}
 impl Journal {
     /// Acquire exclusive `queue/<agent>` ownership and recover committed state.
     /// Components are ASCII identifiers, never paths. Uppercase letters use an
     /// injective, case-insensitive-safe encoding; the journal verifies the original
     /// id. Root aliases resolve, but linked/private-namespace violations fail.
-    /// Newer versions open read-only without repair. Invalid individual records
-    /// are logged and preserved raw; supported-format framing corruption fails.
+    /// Newer versions and corrupt supported records open read-only without repair.
+    /// Unknown data are logged and preserved raw, never interpreted for delivery.
     /// Only a supported journal's unterminated final tail is repaired.
     pub fn open(data: &Path, agent: &str) -> io::Result<Self> {
         if agent.is_empty()
@@ -149,10 +153,22 @@ impl Journal {
             checkpoint: None,
             version: FORMAT_VERSION,
             future: false,
+            corrupt: None,
+            opaque: HashSet::new(),
             poisoned: false,
             _lease: lease,
         };
-        journal.recover()?;
+        if let Err(error) = journal.recover() {
+            journal.corrupt = error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<QueueJournalCorrupt>())
+                .copied();
+            if let Some(reason) = journal.corrupt {
+                crate::logging::structured_queue_corrupt(&reason);
+            } else {
+                return Err(error);
+            }
+        }
         if journal.read_only().is_some() {
             return Ok(journal);
         }
@@ -173,7 +189,8 @@ impl Journal {
         Ok(journal)
     }
     /// Current materialized state, in queue order; contains no runtime handles.
-    /// For newer journals this is best-effort inspection, never schedulable state.
+    /// Read-only state is for inspection; opaque items retain positions but are
+    /// never eligible for delivery.
     pub fn items(&self) -> &[Item] {
         &self.items
     }
@@ -187,16 +204,18 @@ impl Journal {
         self.version
     }
     /// Typed read-only status. Reads remain available; mutations must not retry.
-    pub fn read_only(&self) -> Option<QueueJournalNewer> {
-        (self.version > FORMAT_VERSION).then_some(QueueJournalNewer {
-            found: self.version,
-            supported: FORMAT_VERSION,
+    pub fn read_only(&self) -> Option<ReadOnly> {
+        self.corrupt.map(ReadOnly::Corrupt).or_else(|| {
+            (self.version > FORMAT_VERSION).then_some(ReadOnly::Newer(QueueJournalNewer {
+                found: self.version,
+                supported: FORMAT_VERSION,
+            }))
         })
     }
     fn writable(&self) -> io::Result<()> {
         self.healthy()?;
         if let Some(reason) = self.read_only() {
-            return Err(io::Error::other(reason));
+            return Err(reason.into());
         }
         Ok(())
     }
@@ -217,7 +236,8 @@ impl Journal {
     }
     /// Append and sync before folding state or publishing the returned record.
     /// Validation failures do not write or spend a sequence; I/O failures poison.
-    /// Newer journals return [`QueueJournalNewer`] without writing. Older formats
+    /// Read-only journals return [`QueueJournalNewer`] or [`QueueJournalCorrupt`]
+    /// without writing. Older formats
     /// checkpoint to this writer's version before appending any new-format data.
     /// Publish replay from the previous cursor to include this upgrade's gap and
     /// snapshot, rather than assuming append always advances by exactly one.
@@ -248,6 +268,11 @@ impl Journal {
             this.file.sync_data()
         })?;
         self.items = items;
+        track_opaque(
+            &record.change,
+            record.change.has_unknown(),
+            &mut self.opaque,
+        );
         self.future |= record.change.has_unknown();
         self.seq = record.seq;
         self.records.push(value);
@@ -361,7 +386,6 @@ impl Journal {
         let mut reader = BufReader::new(&self.file);
         let mut good = 0;
         let mut line = Vec::new();
-        let mut skipped_sequence = false;
         loop {
             line.clear();
             let mut n = Read::by_ref(&mut reader)
@@ -371,9 +395,6 @@ impl Journal {
                 break;
             }
             if n as u64 > LINE_LIMIT {
-                if self.read_only().is_none() {
-                    return Err(problem("oversize queue record"));
-                }
                 while !line.ends_with(b"\n") {
                     line.clear();
                     let chunk = Read::by_ref(&mut reader)
@@ -383,6 +404,13 @@ impl Journal {
                     if chunk == 0 {
                         break;
                     }
+                }
+                if self.version <= FORMAT_VERSION {
+                    return Err(if good == 0 || !line.ends_with(b"\n") {
+                        problem("oversize queue record")
+                    } else {
+                        corrupt(good, None, "oversized_record")
+                    });
                 }
                 crate::logging::structured_queue_record_skipped(None, "oversized_record");
                 good += n as u64;
@@ -394,8 +422,10 @@ impl Journal {
             let value: Value = match serde_json::from_slice(&line) {
                 Ok(value) => value,
                 Err(_error) if good > 0 => {
+                    if self.version <= FORMAT_VERSION {
+                        return Err(corrupt(good, None, "invalid_json"));
+                    }
                     self.future = true;
-                    skipped_sequence = true;
                     crate::logging::structured_queue_record_skipped(None, "invalid_json");
                     good += n as u64;
                     continue;
@@ -432,33 +462,32 @@ impl Journal {
                     crate::logging::structured_queue_record_skipped(None, "unknown_checkpoint");
                 }
             } else if value["kind"] == "queue_identity" && self.read_only().is_none() {
-                return Err(problem("interior queue identity"));
+                return Err(corrupt(good, None, "interior_identity"));
             } else if value["kind"] == "queue_checkpoint" {
                 if self.checkpoint.is_some() || !self.records.is_empty() {
-                    return Err(problem("interior queue checkpoint"));
+                    return Err(corrupt(good, None, "interior_checkpoint"));
                 }
                 let before = value["before"]
                     .as_u64()
-                    .ok_or_else(|| problem("invalid checkpoint before"))?;
+                    .ok_or_else(|| corrupt(good, None, "invalid_checkpoint_before"))?;
                 let high = value["high_water"]
                     .as_u64()
                     .filter(|n| *n >= before)
-                    .ok_or_else(|| problem("invalid checkpoint high-water"))?;
+                    .ok_or_else(|| corrupt(good, None, "invalid_checkpoint_high_water"))?;
                 self.seq = before;
                 self.checkpoint = Some((before, high));
             } else {
                 let Some(seq) = value["seq"].as_u64() else {
+                    if self.version <= FORMAT_VERSION {
+                        return Err(corrupt(good, None, "missing_sequence"));
+                    }
                     self.future = true;
-                    skipped_sequence = true;
                     crate::logging::structured_queue_record_skipped(None, "missing_sequence");
                     good += n as u64;
                     continue;
                 };
-                if self.read_only().is_none()
-                    && Some(seq) != self.seq.checked_add(1)
-                    && !(skipped_sequence && seq > self.seq)
-                {
-                    return Err(problem("non-dense queue sequence"));
+                if self.read_only().is_none() && Some(seq) != self.seq.checked_add(1) {
+                    return Err(corrupt(good, Some(seq), "non_dense_sequence"));
                 }
                 let known = matches!(
                     value["kind"].as_str(),
@@ -470,8 +499,16 @@ impl Journal {
                         .and_then(|record| {
                             let mut items = self.items.clone();
                             record.change.apply(&mut items)?;
-                            self.future |= record.change.has_unknown()
+                            let unknown = record.change.has_unknown()
                                 || serde_json::to_value(&record)? != value;
+                            self.future |= unknown;
+                            track_opaque(&record.change, unknown, &mut self.opaque);
+                            if unknown {
+                                crate::logging::structured_queue_record_skipped(
+                                    Some(seq),
+                                    "unknown_data",
+                                );
+                            }
                             self.items = items;
                             Ok(())
                         })
@@ -479,6 +516,12 @@ impl Journal {
                     Err(problem("unknown queue kind"))
                 };
                 if recovered.is_err() {
+                    if known && self.version <= FORMAT_VERSION {
+                        return Err(corrupt(good, Some(seq), "malformed_known_record"));
+                    }
+                    if !known && !value["kind"].is_string() && self.version <= FORMAT_VERSION {
+                        return Err(corrupt(good, Some(seq), "missing_kind"));
+                    }
                     self.future = true;
                     crate::logging::structured_queue_record_skipped(
                         Some(seq),
@@ -489,7 +532,6 @@ impl Journal {
                         },
                     );
                 }
-                skipped_sequence = false;
                 self.seq = self.seq.max(seq);
                 self.records.push(value);
             }
@@ -510,7 +552,7 @@ impl Journal {
             return Ok(());
         }
         if self.checkpoint.is_some_and(|(_, high)| self.seq < high) {
-            return Err(problem("incomplete queue checkpoint"));
+            return Err(corrupt(good, None, "incomplete_checkpoint"));
         }
         if good < self.file.metadata()?.len() {
             self.file.set_len(good)?;

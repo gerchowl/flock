@@ -20,8 +20,8 @@ refused. The data root itself may be an alias such as a canonicalized temp root.
 
 Every journal begins with a synced
 `{"kind":"queue_identity","agent_id":"...","format_version":2}` header containing the original, case-preserved ID. Open verifies it against the
-requested agent and refuses missing, mismatched or repeated complete identity
-headers. An unterminated first line with no records following it is rewritten
+requested agent and refuses missing or mismatched first identity headers.
+A repeated identity header opens read-only as structural corruption. An unterminated first line with no records following it is rewritten
 and synced: identity creation only writes into an empty file, so no records
 can be lost. Checkpoints preserve it. A new empty file receives its identity before
 open returns; this header consumes no sequence and is not a replay event. Earlier
@@ -83,8 +83,7 @@ Before appending to an older format, the writer checkpoints it into its own
 format, so no newer-format record can enter a journal with an older stamp.
 Sequence and encoded-size validation include the snapshot's sequences and happen
 before this upgrade. Callers publish `replay(previous_cursor)` after an append,
-so an upgrade's gap/snapshot is published together with the new record. An older journal containing opaque
-records still cannot be checkpointed or upgraded automatically.
+so an upgrade's gap/snapshot is published together with the new record. An older journal containing opaque records still cannot be checkpointed or upgraded automatically.
 
 **Bump the format version for every new record kind, new top-level field or
 new enum variant name.** A writer may append or checkpoint only when the
@@ -110,30 +109,49 @@ Server publication remains the separate #1803 slice.
 
 This forbids serving a valid newer journal with an older writer. Unknown
 records cannot be passed through a checkpoint: their interleaving semantics
-cannot be reconstructed by an older reader. A present stamp whose value is not a positive
-integer is invalid, and identity mismatches remain namespace corruption;
+cannot be reconstructed by an older reader. A present stamp whose value is not a positive integer is invalid, and identity mismatches remain namespace corruption;
 these header failures refuse open rather than invent a writable version.
 
-For supported versions, reopen syncs unconditionally and repairs an
-unterminated final tail after a verified identity. An unterminated first
-identity line is repaired as described above. Structural corruption (oversized
-lines, non-dense sequences, interior identity/checkpoint headers and incomplete
-snapshots) still fails without repair. An invalid individual record is logged
-and skipped, with its bytes retained and checkpointing blocked (ADR-0028 §3a).
-Unparseable/unsequenced records cannot supply a replay cursor; the next valid
-sequence restores the high-water. Valid JSON records with sequences remain
-available in replay even when their contents are unknown or invalid.
+## Unknown data, corruption and torn tails
 
-Unknown enum variant names inside known upserts remain typed `Unknown(raw)`
-values at their recorded positions. They replace older versions of an item and
-preserve positions for later changes. Known variant names with malformed
-payloads remain deserialization errors, never `Unknown`; the enclosing record
-is skipped rather than failing the entire load. Folding uses an isolated copy,
-so an invalid change cannot partially edit materialized state. Unknown kinds,
-fields or enum names in a same-version, hand-edited journal retain the existing
-checkpoint protection and raw replay. Known appends remain possible in the
-current format, but do not authorize discarding opaque state. This exceptional
-corruption path does not infer or raise a version stamp from unknown contents.
+The ADR-0036 §4 owner clarification for #1820 separates three cases:
+
+1. **Unknown data are forward compatibility.** Unknown kinds are logged and
+   skipped when folding state; their cursors, raw replay and original bytes are
+   retained. Known records with unknown top-level fields or enum names retain
+   their known projection and queue position for inspection, as before. Unknown
+   enum names remain `Unknown(raw)`; uninterpreted items cannot be scheduled.
+   This preserves positions for later known updates/removals without executing
+   unknown semantics. A same-version journal remains writable for known inputs
+   (unknown contents imply a hand-edit or writer bug), while its existing
+   checkpoint protection prevents discarding raw state. A newer-stamped journal
+   uses `QueueJournalNewer` read-only mode instead. There is no opaque checkpoint
+   passthrough and no inference of a version from unknown contents.
+2. **Malformed known records are corruption.** A supported-version journal still
+   loads, but opens read-only with `QueueJournalCorrupt { seq, offset, reason }`.
+   The cursor is optional when it cannot be parsed; the byte offset always
+   identifies the first corruption. Reasons are stable diagnostic identifiers
+   without input payload text. Recovery stops folding at that record: it never
+   skips a corrupted enqueue or delivery-state transition and then serves later
+   state. Known enum names with invalid payloads remain errors, never `Unknown`.
+   Invalid JSON, invalid known changes and structural sequence/checkpoint damage
+   also fail closed this way. All mutations and checkpoints return the registered
+   `queue_journal_corrupt` refusal, including empty replacements and idempotent
+   admission. Original bytes, subsequent records, torn suffixes and temporary
+   replacement files remain unchanged. Inspection/status are available, but the
+   recovered prefix is not schedulable. Status includes the same location/reason
+   with no reservation clock (`since_ms: 0`). This is an `after_human` refusal;
+   recovery requires an explicit operator action, tracked in [#1915](https://github.com/gerchowl/flock/issues/1915),
+   and is outside this PR. No
+   automatic rewrite, resend or retry can resolve corruption.
+3. **An unterminated final line is a crash tail, not corruption.** For supported,
+   otherwise healthy journals, the existing recovery path truncates that tail
+   and syncs before another append. A torn first identity with no later records
+   is repaired as described above. Newer or corrupt read-only journals are never
+   repaired. The pre-existing 2 MiB fail-ceiling still refuses an oversized torn
+   line rather than repairing it. A complete oversized supported record opens
+   read-only as corrupt. Recovery sync failures and unverified identity/version
+   bootstrap failures still refuse open; they cannot invent a trusted journal.
 
 Persistence remains fsync of the temporary file, rename, then fsync of the
 directory. Disk operations are blocking worker operations and must never run

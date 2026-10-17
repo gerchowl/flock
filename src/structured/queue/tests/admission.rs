@@ -504,7 +504,7 @@ fn future_lifecycle_record_budget_is_reserved_before_acceptance() {
 }
 
 #[test]
-fn missing_metadata_is_ineligible_and_future_journals_are_refused() {
+fn missing_metadata_is_ineligible_and_unknown_journals_remain_writable() {
     let root = Root::new();
     let mut j = root.open();
     j.append(upsert("legacy", 0)).unwrap();
@@ -513,7 +513,7 @@ fn missing_metadata_is_ineligible_and_future_journals_are_refused() {
     let future = Root::new();
     drop(future.open());
     future.write_records(encode(&json!({"seq":1,"kind":"future"})).unwrap());
-    assert!(Admission::new(future.open(), MAX_BATCH).is_err());
+    assert!(Admission::new(future.open(), MAX_BATCH).is_ok());
     let empty = Root::new();
     assert!(Admission::new(empty.open(), 0).is_err());
 }
@@ -1298,4 +1298,106 @@ fn newer_journal_refuses_all_admission_mutations_with_a_typed_version_error() {
         assert_eq!(error.code.retry().as_str(), "after_handoff");
     }
     assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn same_version_unknown_kind_is_writable_through_admission() {
+    let root = Root::new();
+    drop(root.open());
+    let bytes = root.write_records(b"{\"seq\":1,\"kind\":\"future\",\"body\":42}\n");
+    let mut opened = None;
+    let logs = crate::logging::capture_logs(|| {
+        opened = Some(Admission::new(root.open(), MAX_BATCH).unwrap());
+    });
+    assert!(logs.contains("structured.queue.record_skipped"));
+    assert!(logs.contains("unknown_kind"));
+    let mut admission = opened.unwrap();
+    admission
+        .enqueue(input(1), Principal::Operator, Gate::Send)
+        .unwrap();
+    assert_eq!(
+        admission.batch(100).unwrap().unwrap().items[0].item_id,
+        id(1)
+    );
+    assert!(fs::read(root.path()).unwrap().starts_with(&bytes));
+}
+
+#[test]
+fn corrupt_journal_loads_in_admission_but_all_mutations_refuse() {
+    let root = Root::new();
+    drop(root.open());
+    let bytes = root.write_records(b"{\"seq\":1,\"kind\":\"upsert\",\"item\":42}\n");
+    let mut admission = Admission::new(root.open(), MAX_BATCH).unwrap();
+    let failures = [
+        admission
+            .enqueue(input(1), Principal::Operator, Gate::Send)
+            .unwrap_err(),
+        admission.batch(100).unwrap_err(),
+        admission.replace(vec![]).unwrap_err(),
+        admission.replace(vec![input(1)]).unwrap_err(),
+    ];
+    for error in failures {
+        assert_eq!(error.code, ErrorCode::QueueJournalCorrupt);
+        assert_eq!(error.code.retry().as_str(), "after_human");
+        assert_eq!(error.code.exit(), crate::cli::exit::FAILURE);
+        assert!(error
+            .source
+            .unwrap()
+            .get_ref()
+            .unwrap()
+            .is::<QueueJournalCorrupt>());
+    }
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn unknown_item_data_keep_positions_but_are_never_automatically_delivered() {
+    for extension in ["field", "enum"] {
+        let root = Root::new();
+        let mut q = queue(&root);
+        q.enqueue(input(1), Principal::Operator, Gate::Send)
+            .unwrap();
+        q.enqueue(input(2), Principal::Operator, Gate::Send)
+            .unwrap();
+        drop(q);
+        let raw = fs::read_to_string(root.path()).unwrap();
+        let mut lines: Vec<Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if extension == "field" {
+            lines[1]["future_field"] = json!(true);
+        } else {
+            lines[1]["item"]["kind"] = json!("future_kind");
+        }
+        let bytes: Vec<u8> = lines
+            .iter()
+            .flat_map(|line| encode(line).unwrap())
+            .collect();
+        fs::write(root.path(), &bytes).unwrap();
+        let mut q = queue(&root);
+        assert!(q.journal().read_only().is_none());
+        assert_eq!(q.journal().items().len(), 2);
+        assert_eq!(
+            q.batch(100)
+                .unwrap()
+                .unwrap()
+                .items
+                .iter()
+                .map(|i| i.item_id.clone())
+                .collect::<Vec<_>>(),
+            vec![id(2)]
+        );
+        q.replace(vec![{
+            let mut b = q.journal().items()[1].clone();
+            b.state = State::Done;
+            b
+        }])
+        .unwrap();
+        assert!(q.batch(100).unwrap().is_none());
+        drop(q);
+        let mut q = queue(&root);
+        assert!(q.batch(100).unwrap().is_none());
+        assert!(fs::read(root.path()).unwrap().starts_with(&bytes));
+    }
 }

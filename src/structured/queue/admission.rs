@@ -44,13 +44,14 @@ pub(crate) struct Failure {
 impl From<io::Error> for Failure {
     fn from(source: io::Error) -> Self {
         Self {
-            code: if source
-                .get_ref()
-                .is_some_and(|error| error.is::<super::QueueJournalNewer>())
-            {
-                ErrorCode::QueueJournalNewer
-            } else {
-                ErrorCode::InputWriteUnknown
+            code: match source.get_ref() {
+                Some(error) if error.is::<super::QueueJournalNewer>() => {
+                    ErrorCode::QueueJournalNewer
+                }
+                Some(error) if error.is::<super::QueueJournalCorrupt>() => {
+                    ErrorCode::QueueJournalCorrupt
+                }
+                _ => ErrorCode::InputWriteUnknown,
             },
             source: Some(source),
         }
@@ -77,11 +78,11 @@ pub(crate) struct Admission {
     max_batch: usize,
 }
 impl Admission {
-    /// Refuse same-version opaque data whose scheduling meaning is unknown.
-    /// A newer journal remains inspectable through this read-only handle.
+    /// Open inspection for read-only journals and admit known inputs otherwise.
+    /// Unknown item semantics remain excluded from automatic batch formation.
     pub fn new(journal: Journal, max_batch: usize) -> Result<Self, Failure> {
         journal.healthy()?;
-        if (journal.future && journal.read_only().is_none()) || max_batch == 0 {
+        if max_batch == 0 {
             return Err(refuse(ErrorCode::InvalidRequest));
         }
         Ok(Self { journal, max_batch })
@@ -188,7 +189,8 @@ impl Admission {
         Ok(())
     }
     fn eligible(&self, item: &Item, now_ms: u64) -> bool {
-        item.state == State::Queued
+        !self.journal.opaque.contains(&item.item_id)
+            && item.state == State::Queued
             && item.delivery == Delivery::AtIdle
             && item.priority == Priority::Normal
             && metadata(item, "gate")["decision"] == "send"
