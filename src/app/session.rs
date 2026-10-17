@@ -16,6 +16,20 @@ impl App {
         }
     }
 
+    /// Finish owned workers and always save before returning their typed diagnostics.
+    pub(crate) fn finish_session(
+        &mut self,
+    ) -> Result<(), crate::structured::workers::ShutdownError> {
+        let result = self
+            .structured_workers
+            .shutdown(&mut self.state.structured_agents);
+        if let Err(error) = &result {
+            crate::logging::structured_worker_shutdown_failed(error);
+        }
+        self.save_session_now();
+        result
+    }
+
     pub(crate) fn save_session_now(&mut self) {
         if self.no_session {
             self.session_save_deadline = None;
@@ -130,6 +144,87 @@ mod tests {
         assert!(view.update.needs_human.is_empty());
         assert!(view.update.observe_at.is_none());
     }
+    #[tokio::test]
+    async fn worker_timeout_still_saves_the_whole_session_before_returning() {
+        use crate::api::error_code::ErrorCode;
+        use crate::structured::workers::tests::{event, Case};
+        let _guard = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        let _env = SavedEnv(vec![
+            (
+                crate::config::CONFIG_PATH_ENV_VAR,
+                std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR),
+            ),
+            ("XDG_STATE_HOME", std::env::var_os("XDG_STATE_HOME")),
+            ("XDG_CONFIG_HOME", std::env::var_os("XDG_CONFIG_HOME")),
+        ]);
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        let notify = app.render_notify.clone();
+        let case = Case::start(
+            &mut app.state.structured_agents,
+            &mut app.structured_workers,
+            41,
+            "worker-stubborn",
+            vec![event("control_request")],
+        );
+        case.human(
+            &mut app.state.structured_agents,
+            &mut app.structured_workers,
+            &notify,
+            Instant::now(),
+        )
+        .await;
+        let timeout = case.force_shutdown(
+            &mut app.state.structured_agents,
+            &mut app.structured_workers,
+        );
+        assert!(timeout
+            .0
+            .contains(&(case.id.clone(), ErrorCode::StructuredWorkerTimeout)));
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("worker-save")];
+        app.state.ensure_test_terminals();
+        app.no_session = false;
+        let error = app.finish_session().unwrap_err();
+        assert!(error
+            .0
+            .contains(&(case.id.clone(), ErrorCode::StructuredWorkerTimeout)));
+        let saved = crate::persist::load().expect("timeout must not skip the session save");
+        assert_eq!(saved.workspaces.len(), 1);
+        assert_eq!(
+            saved.workspaces[0].id.as_deref(),
+            Some(app.state.workspaces[0].id.as_str())
+        );
+        assert_eq!(
+            saved.structured_agents.records(),
+            app.state.structured_agents.records()
+        );
+        assert_eq!(
+            saved
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle,
+            Lifecycle::Offline
+        );
+        case.assert_shutdown(&app.state.structured_agents, &app.structured_workers);
+    }
+
     #[test]
     fn unknown_only_session_survives_real_startup_and_save() {
         let _guard = crate::config::test_config_env_guard();

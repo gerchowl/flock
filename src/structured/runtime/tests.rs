@@ -81,6 +81,9 @@ impl Fixture {
         path
     }
     pub(crate) fn profile(&self, mode: &str, version: &str) -> LaunchProfile {
+        self.profile_at(mode, version, SESSION)
+    }
+    pub(crate) fn profile_at(&self, mode: &str, version: &str, session: &str) -> LaunchProfile {
         self.file(
             "case.json",
             serde_json::json!({"mode":mode,"version":version})
@@ -101,7 +104,7 @@ impl Fixture {
             LaunchProfile::prepare(
                 &config,
                 self.root.path(),
-                SESSION,
+                session,
                 binary,
                 |key| match key {
                     "HOME" | "TMPDIR" => Some(self.root.path().as_os_str().to_owned()),
@@ -1017,3 +1020,112 @@ fn scripted_stream_drives_session_state_through_the_keyed_sink() {
 }
 
 mod queue;
+
+#[test]
+fn registry_launch_metadata_reaches_the_child_and_events_wake_the_owner() {
+    let fixture = Fixture::new();
+    let cwd = fixture.root.path().join("project");
+    fs::create_dir(&cwd).unwrap();
+    let profile = fixture
+        .profile("idle", "2.1.296")
+        .for_agent(&cwd, Some("fixture-requested-model"))
+        .unwrap();
+    fixture.file(
+        "argv.json",
+        &serde_json::to_vec(
+            &profile
+                .args()
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
+        0o600,
+    );
+    fixture.file(
+        "case.json",
+        &serde_json::to_vec(&serde_json::json!({
+            "mode":"idle", "version":"2.1.296", "cwd":cwd, "model":"fixture-requested-model"
+        }))
+        .unwrap(),
+        0o600,
+    );
+    let settings_index = profile
+        .args()
+        .iter()
+        .position(|arg| arg == "--settings")
+        .unwrap();
+    let generated = PathBuf::from(&profile.args()[settings_index + 1])
+        .parent()
+        .unwrap()
+        .to_owned();
+    let persistent = profile.config_dir().to_owned();
+    let state = fixture.root.path().to_owned();
+    let location = StreamLocation {
+        data_dir: state.clone(),
+        agent: "fixture-agent".into(),
+        session: SESSION.into(),
+    };
+    let lease = fixture
+        .leases
+        .reserve("fixture-agent", SESSION, None)
+        .unwrap();
+    assert!(fixture.leases.is_reserved(SESSION).unwrap());
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let result = run_notified(
+            &state,
+            profile,
+            lease,
+            location,
+            |runtime| {
+                ready_tx.try_send(runtime).ok();
+            },
+            move || {
+                wake_tx.try_send(()).ok();
+            },
+        );
+        result_tx.try_send(result).ok();
+    });
+    let runtime = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let mut running = Running {
+        runtime,
+        result: result_rx,
+        worker: Some(worker),
+        finished: false,
+        generated,
+        persistent,
+    };
+    wake_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("queued stdout must wake its owner");
+    let received = running
+        .runtime
+        .try_receive()
+        .expect("notification follows event publication");
+    assert!(matches!(
+        received.event,
+        crate::structured::claude::SessionEvent::HookStarted { .. }
+    ));
+    let result = running.finish();
+    assert_eq!(result.outcome, Outcome::Exited, "{result:?}");
+    assert!(
+        !fixture.leases.is_reserved(SESSION).unwrap(),
+        "reaped runtime releases the lease"
+    );
+}
+
+#[test]
+fn launch_metadata_refuses_invalid_cwd_or_empty_model() {
+    let fixture = Fixture::new();
+    for (cwd, model) in [
+        (PathBuf::from("fixture-relative"), None),
+        (fixture.root.path().join("missing"), None),
+        (fixture.root.path().to_owned(), Some(" ")),
+    ] {
+        let result = fixture.profile("idle", "2.1.296").for_agent(&cwd, model);
+        assert!(matches!(result, Err(LaunchError::Io(_))));
+    }
+}

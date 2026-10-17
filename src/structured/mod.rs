@@ -10,5 +10,6 @@ pub mod runtime;
 pub mod state;
 pub mod supervision;
 pub mod transport;
+pub mod workers;
 
 pub(crate) mod identity;
