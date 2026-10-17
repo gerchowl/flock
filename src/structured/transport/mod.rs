@@ -57,7 +57,7 @@ struct ControlPlane {
 pub struct StreamLocation {
     /// Existing flock data root (not the harness profile).
     pub data_dir: PathBuf,
-    /// Storage threshold captured from `[sessions]` at launch.
+    /// Caller-supplied persistence policy captured for this session.
     pub storage: super::blobs::StorageConfig,
     /// Agent identifier, containing only ASCII letters, digits, '-' or '_'.
     pub agent: String,
