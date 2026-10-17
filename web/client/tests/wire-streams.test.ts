@@ -18,6 +18,9 @@ test("auth refusal → NeedsToken from Syncing too", () => {
   }
 });
 
+/** The id of the latest `sub` sent: a same-socket re-sub moves a stream to a fresh one. */
+const lastSub = (h: Harness): string => (sentFrames(h).filter((frame) => (frame as { t: string }).t === "sub").at(-1) as { sub_id: string }).sub_id;
+
 /** A fleet snapshot line or delta; the connection does not look inside. */
 const fleetLine = (seq: number, id: string): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { id } });
 
@@ -76,10 +79,10 @@ describe("streams", () => {
     h.step(step({ step: "send", frame: { t: "gap", sub_id: "s1", from: 1, to: 2, snapshot_to: 4 } }));
     h.step(step({ step: "send", frame: fleetLine(3, "a") }));
     h.step(step({ step: "send", frame: { t: "lagged", sub_id: "s1", skipped_to: 9 } }));
-    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s1", stream: "fleet" });
-    expect(h.connection.streams().get("s1")).toEqual({ stream: "fleet", state: "Replaying", cursor: null });
-    h.step(step({ step: "send", frame: { t: "gap", sub_id: "s1", from: 1, to: 8, snapshot_to: 9 } }));
-    h.step(step({ step: "send", frame: fleetLine(9, "b") }));
+    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s2", stream: "fleet" });
+    expect(h.connection.streams().get("s2")).toEqual({ stream: "fleet", state: "Replaying", cursor: null });
+    h.step(step({ step: "send", frame: { t: "gap", sub_id: "s2", from: 1, to: 8, snapshot_to: 9 } }));
+    h.step(step({ step: "send", frame: { ...fleetLine(9, "b"), sub_id: "s2" } as ServerFrame }));
     expect(h.seen.get("s1")).toEqual([{ kind: "snapshot", lines: [{ id: "b" }] }]);
   });
 
@@ -107,7 +110,7 @@ describe("streams", () => {
     }
     expect(sentFrames(h).slice(-2)).toEqual([
       { t: "unsub", sub_id: "s1" },
-      { t: "sub", sub_id: "s1", stream: "fleet" },
+      { t: "sub", sub_id: "s2", stream: "fleet" },
     ]);
   });
 
@@ -123,7 +126,7 @@ describe("streams", () => {
     h.clock.advanceTo(h.clock.now() + 1);
     expect(sentFrames(h).slice(-2)).toEqual([
       { t: "unsub", sub_id: "s1" },
-      { t: "sub", sub_id: "s1", stream: "fleet" },
+      { t: "sub", sub_id: "s2", stream: "fleet" },
     ]);
   });
 
@@ -154,7 +157,8 @@ describe("streams", () => {
     h.step(step({ step: "send", frame: { t: "synced", sub_id: "s1", seq: 0 } }));
     h.step(step({ step: "send", frame: { t: "lagged", sub_id: "s1", skipped_to: 9 } }));
     expect(h.connection.state).toBe("Live");
-    expect(h.connection.streams().get("s1")?.state).toBe("Replaying");
+    expect(h.connection.streams().get("s1")).toBeUndefined();
+    expect(h.connection.streams().get("s2")?.state).toBe("Replaying");
   });
 });
 
@@ -176,9 +180,11 @@ describe("wire transport", () => {
     send({ t: "ev", sub_id: sub, stream: "agent/a", seq: 4, ts_ms: 0, ev: { type: "unknown", raw: "x y", shape: "claude/2:x" } });
     send({ t: "synced", sub_id: sub, seq: 4 });
     send({ t: "lagged", sub_id: sub, skipped_to: 9 });
-    send({ t: "synced", sub_id: sub, seq: 4 });
-    send({ t: "subfail", sub_id: sub, code: "unknown_stream", message: "agent removed" });
-    send({ t: "ev", sub_id: sub, stream: "agent/a", seq: 5, ts_ms: 0, ev: { type: "user", message: {} } });
+    const resub = lastSub(h);
+    expect(resub).not.toBe(sub);
+    send({ t: "synced", sub_id: resub, seq: 4 });
+    send({ t: "subfail", sub_id: resub, code: "unknown_stream", message: "agent removed" });
+    send({ t: "ev", sub_id: resub, stream: "agent/a", seq: 5, ts_ms: 0, ev: { type: "user", message: {} } });
     expect(seen).toEqual([
       { seq: 2, kind: "gap", from: 1, to: 2 },
       { seq: 3, kind: "known", event: { type: "user", message: {} } as never },
@@ -200,8 +206,8 @@ describe("wire transport", () => {
     send({ t: "gap", sub_id: sub, from: 1, to: 4 });
     send({ t: "ev", sub_id: sub, stream: "agent/a", seq: 5, ts_ms: 0, ev: { type: "user", message: {} } });
     send({ t: "lagged", sub_id: sub, skipped_to: 9 });
-    send({ t: "gap", sub_id: sub, from: 1, to: 4 });
-    send({ t: "gap", sub_id: sub, from: 3, to: 7 });
+    send({ t: "gap", sub_id: lastSub(h), from: 1, to: 4 });
+    send({ t: "gap", sub_id: lastSub(h), from: 3, to: 7 });
     expect(seen.map((entry) => [entry.kind, entry.seq])).toEqual([
       ["gap", 4],
       ["known", 5],
@@ -288,3 +294,42 @@ describe("sub ids (ADR-0038 §3, sub ids and closed subs)", () => {
 function fail(): never {
   throw new Error("missing stream");
 }
+
+describe("a same-socket re-sub takes a fresh id (ADR-0038 §3, ADR-0036 §5a)", () => {
+  const triggers = {
+    "the progress deadline": (h: Harness) => h.clock.advanceTo(h.clock.now() + 30_000),
+    lagged: (h: Harness) => {
+      h.step(step({ step: "send", frame: { t: "synced", sub_id: "s1", seq: 0 } }));
+      h.step(step({ step: "send", frame: { t: "lagged", sub_id: "s1", skipped_to: 9 } }));
+    },
+    cursor_ahead: (h: Harness) => h.step(step({ step: "send", frame: { t: "subfail", sub_id: "s1", code: "cursor_ahead", message: "ahead" } })),
+  } as const;
+
+  for (const [name, trigger] of Object.entries(triggers)) {
+    test(`after ${name}, late synced, gap and subfail for the old id leave the new sub alone and the connection Live`, () => {
+      const h = new Harness();
+      live(h);
+      const calls: string[] = [];
+      const record = (kind: string) => () => void calls.push(kind);
+      h.connection.subscribe("s1", "agent/a", { event: record("event"), gap: record("gap"), synced: record("synced"), snapshot: record("snapshot"), reset: record("reset"), refused: record("refused") });
+      trigger(h);
+      const fresh = lastSub(h);
+      expect(fresh).not.toBe("s1");
+      const sent = sentFrames(h);
+      expect(sent.filter((frame) => (frame as { t: string }).t === "unsub")).toEqual(name === "the progress deadline" ? [{ t: "unsub", sub_id: "s1" }] : []);
+      h.step(step({ step: "send", frame: { t: "synced", sub_id: fresh, seq: 0 } }));
+      expect(h.connection.state).toBe("Live");
+      const state = h.connection.streams().get(fresh);
+      const before = calls.length;
+      h.step(step({ step: "send", frame: { t: "synced", sub_id: "s1", seq: 7 } }));
+      h.step(step({ step: "send", frame: { t: "gap", sub_id: "s1", from: 1, to: 6 } }));
+      h.step(step({ step: "send", frame: { t: "subfail", sub_id: "s1", code: "scope", message: "late" } }));
+      expect(h.connection.state).toBe("Live");
+      expect(h.connection.error).toBeNull();
+      expect(h.connection.streams().get(fresh)).toEqual(state ?? { stream: "missing", state: "Refused", cursor: null });
+      expect(h.connection.streams().has("s1")).toBe(false);
+      expect(calls.length).toBe(before);
+      expect(sentFrames(h).length).toBe(sent.length);
+    });
+  }
+});

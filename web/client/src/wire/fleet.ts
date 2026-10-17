@@ -78,13 +78,13 @@ function agentRow(row: FleetAgentRow): AgentRow {
 export function createWireFleet(connection: WireConnection): FleetSource {
   return {
     subscribe(observer) {
-      const id = connection.nextSubId("f");
       let open = true;
+      let unsubscribe = (): void => undefined;
       let rows = new Map<string, AgentRow>();
       const end = (message: string): void => {
         if (!open) return;
         open = false;
-        connection.unsubscribe(id);
+        unsubscribe();
         observer.failed(message);
       };
       /** Applies `ev` to `into`; false once the subscription has ended. */
@@ -98,7 +98,7 @@ export function createWireFleet(connection: WireConnection): FleetSource {
         else into.delete(delta.id);
         return true;
       };
-      connection.subscribe(id, "fleet", {
+      unsubscribe = connection.subscribe(connection.nextSubId("f"), "fleet", {
         event: (_seq, ev) => open && apply(rows, ev) && observer.rows([...rows.values()]),
         snapshot: (lines) => {
           const fresh = new Map<string, AgentRow>();
@@ -119,7 +119,7 @@ export function createWireFleet(connection: WireConnection): FleetSource {
       return () => {
         if (!open) return;
         open = false;
-        connection.unsubscribe(id);
+        unsubscribe();
       };
     },
   };

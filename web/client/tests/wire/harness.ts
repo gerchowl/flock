@@ -306,7 +306,7 @@ export class Harness {
       case "subscribe": {
         const seen: Seen[] = [];
         this.seen.set(action.sub_id, seen);
-        return conn.subscribe(action.sub_id, action.stream as StreamName, {
+        conn.subscribe(action.sub_id, action.stream as StreamName, {
           event: (seq, ev) => seen.push({ kind: "event", seq, ev }),
           gap: (from, to) => seen.push({ kind: "gap", from, to }),
           synced: () => seen.push({ kind: "synced" }),
@@ -314,8 +314,10 @@ export class Harness {
           reset: () => seen.push({ kind: "reset" }),
           refused: (refusal) => seen.push({ kind: "refused", refusal }),
         });
+        return;
       }
       case "unsubscribe":
+        // The script names the id on the wire now, which a re-sub may have moved.
         return conn.unsubscribe(action.sub_id);
       case "command":
         conn.command(action.verb, action.args, action.cmd_id);
