@@ -98,6 +98,26 @@ build:
 website-build:
     cd website && bun install --frozen-lockfile && bun run build
 
+# Check the web client (ADR-0038 G1) from its lockfile: the unit and DOM
+# tests, the fixture-preview screenshot test (needs `just client-browsers`;
+# writes web/client/artifacts/screenshots/), the strict type check and the
+# Vite build.
+client-check:
+    cd web/client && bun install --frozen-lockfile && bun test && bun test ./e2e && bun x tsc --noEmit -p tsconfig.json && bun run build
+
+# Install the Chromium build the client's screenshot test drives (CI, or once
+# per machine). --with-deps adds its system libraries on Linux.
+client-browsers:
+    cd web/client && bun install --frozen-lockfile && bun x playwright install --with-deps chromium
+
+# Build the client in fixture mode (a replay of the recorded session; no flk
+# server needed) and serve it with `vite preview` on the loopback address.
+# To try it from a phone on the local network, opt in explicitly:
+# `just client-preview --host`. The page in web/client/dist/index.html also
+# opens on its own, as a single self-contained file.
+client-preview *args:
+    cd web/client && bun install --frozen-lockfile && bun run build:fixture && bun x vite preview {{args}}
+
 # Build the vendored libghostty-vt source dist
 build-libghostty-vt:
     scripts/build_vendored_libghostty_vt.sh
@@ -192,7 +212,7 @@ default-config:
 gen-ts:
     cargo nextest run --locked --features ts --run-ignored ignored-only generate_wire_ts_types
 
-# Strict contract checks, including the Rust-classified recorded fixtures.
+# Strict contract checks, including the Rust-classified recorded fixtures,
+# with the TypeScript compiler pinned in web/client/bun.lock.
 ts-check:
-    # G1 #1593 moves the compiler pin into the workspace lockfile.
-    bunx --bun --package typescript@7.0.2 tsc --noEmit -p web/client/tsconfig.json
+    cd web/client && bun install --frozen-lockfile && bun x tsc --noEmit -p tsconfig.json
