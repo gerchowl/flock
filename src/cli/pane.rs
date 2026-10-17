@@ -532,7 +532,12 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
     let text = args[1..].join(" ");
     super::print_send_response(&super::send_request(&Request {
         id: "cli:pane:send-text".into(),
-        method: Method::PaneSendText(PaneSendTextParams { pane_id, text, raw }),
+        method: Method::PaneSendText(PaneSendTextParams {
+            write_timeout_ms: None,
+            pane_id,
+            text,
+            raw,
+        }),
     })?)
 }
 

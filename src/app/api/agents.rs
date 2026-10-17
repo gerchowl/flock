@@ -678,6 +678,21 @@ impl App {
     }
 
     pub(super) fn handle_agent_send(&mut self, id: String, params: AgentSendParams) -> String {
+        if params.submit && params.write_timeout_ms.is_some() {
+            return encode_error(
+                id,
+                "invalid_params",
+                "write_timeout_ms is for non-submit agent.send; submission uses its guarded budget",
+            );
+        }
+        let Some(deadline) = crate::app::input_writes::deadline(params.write_timeout_ms.as_ref())
+        else {
+            return encode_error(
+                id,
+                "invalid_params",
+                "write_timeout_ms must be an integer in 1..=30000",
+            );
+        };
         let resolved = match self.resolve_terminal_target(&params.target) {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -715,7 +730,7 @@ impl App {
                 "agent_not_found",
                 format!("agent target {} not found", params.target),
             ),
-            "agent_send_failed",
+            deadline,
         )
     }
 }

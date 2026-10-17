@@ -183,6 +183,8 @@ pub enum Method {
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.send_text")]
     PaneSendText(PaneSendTextParams),
+    #[serde(rename = "pane.write_text")]
+    PaneWriteText(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]
     PaneSendKeys(PaneSendKeysParams),
     #[serde(rename = "pane.send_input")]
@@ -481,6 +483,7 @@ impl Method {
             | Self::GoalResume(_)
             | Self::GoalStop(_)
             | Self::PaneSendText(_)
+            | Self::PaneWriteText(_)
             | Self::PaneSendKeys(_)
             | Self::PaneSendInput(_)
             | Self::PaneWriteKeys(_)
@@ -1077,6 +1080,13 @@ pub const AGENT_HISTORY_MAX_TURNS: u32 = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSendParams {
+    /// Raw-write milliseconds: integer 1..=30000, default 10000. Not a submit budget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub target: String,
     pub text: String,
     /// Guard an empty idle composer, send delayed Enter and confirm with one retry.
@@ -1956,6 +1966,13 @@ pub struct PaneRenameParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSendTextParams {
+    /// Raw-write milliseconds: integer 1..=30000, default 10000. Not a submit budget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub pane_id: String,
     pub text: String,
     /// Type even when the target is an agent pane whose composer holds a

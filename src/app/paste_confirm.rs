@@ -13,9 +13,10 @@ use crate::api::schema::ResponseResult;
 use crate::detect::Agent;
 use crate::layout::PaneId;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Paste {
     id: String,
+    pub(super) ticket: u64,
     pane: String,
     text: String,
     before: String,
@@ -23,6 +24,44 @@ pub(crate) struct Paste {
     child_pid: Option<u32>,
     operator_input: Option<Instant>,
     pub(super) deadline: Instant,
+}
+
+impl Paste {
+    /// Canonical target retained by the observation continuation.
+    pub(super) fn pane_id(&self) -> &str {
+        &self.pane
+    }
+    /// Start the separate confirmation window at the authoritative final-write instant.
+    pub(super) fn written(&mut self, at: Instant, operator_input: Option<Instant>) {
+        self.deadline = at + CONFIRM_WINDOW;
+        // A release stamps before the write; later operator activity still interrupts.
+        if operator_input.is_none_or(|input| input <= at) {
+            self.operator_input = operator_input;
+        }
+    }
+
+    /// Preserve the legacy paste envelope for completed writes and interrupted observation.
+    pub(super) fn response(
+        &self,
+        reason: &str,
+        after: Option<&str>,
+        level: Option<&str>,
+    ) -> String {
+        encode_success(
+            self.id.clone(),
+            ResponseResult::Paste {
+                outcome: if reason == "change_observed" {
+                    "delivered"
+                } else {
+                    "unconfirmed"
+                }
+                .into(),
+                reason: reason.into(),
+                evidence: json!({"pane_id":self.pane, "before_digest":digest(&self.before),
+                "after_digest":after.map(digest), "level":if reason == "change_observed" { level } else { None }}),
+            },
+        )
+    }
 }
 
 fn digest(screen: &str) -> String {
@@ -164,7 +203,7 @@ impl App {
         pane_id: PaneId,
         text: String,
         not_found: (&str, String),
-        write_failed: &str,
+        deadline: Instant,
     ) -> String {
         let Some(pane) = self.public_pane_id(ws, pane_id) else {
             return encode_error(id, not_found.0, not_found.1);
@@ -172,7 +211,8 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws, pane_id) else {
             return encode_error(id, not_found.0, not_found.1);
         };
-        let mut paste = Paste {
+        let paste = Paste {
+            ticket: 0,
             id: id.clone(),
             pane,
             text: text.clone(),
@@ -182,34 +222,25 @@ impl App {
                 .and_then(|t| t.effective_known_agent()),
             child_pid: runtime.child_pid(),
             operator_input: runtime.last_operator_input_at(),
-            deadline: Instant::now() + CONFIRM_WINDOW,
+            deadline,
         };
-        // An injection holds the pane (#850): the paste waits behind it and
-        // the screen meanwhile shows flock's typing, so nothing observed now
-        // could be evidence about the paste.
-        let held = runtime.injection_lease_until().is_some();
-        let encoded = super::api_helpers::encode_api_text(runtime, &text);
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(encoded)) {
-            return encode_error(id, write_failed, err.to_string());
-        }
-        if held {
-            return encode_success(
-                id,
-                ResponseResult::Paste {
-                    outcome: "unconfirmed".into(),
-                    reason: "held_by_injection".into(),
-                    evidence: json!({
-                        "pane_id": paste.pane,
-                        "before_digest": digest(&paste.before),
-                        "after_digest": null,
-                        "level": null,
-                    }),
-                },
-            );
-        }
-        paste.operator_input = runtime.last_operator_input_at();
-        self.pending_paste = Some(paste);
-        encode_success(id, ResponseResult::Ok {})
+        let encoded = if text.is_empty() {
+            Vec::new()
+        } else {
+            super::api_helpers::encode_api_text(runtime, &text)
+        };
+        let operator_interrupt = crate::pane::is_input_interrupt(&encoded);
+        self.begin_input_write(
+            id,
+            ws,
+            pane_id,
+            super::input_writes::InputPayload {
+                bytes: Bytes::from(encoded),
+                deadline,
+                operator_interrupt,
+                paste: Some(paste),
+            },
+        )
     }
 
     pub(crate) fn schedule_paste(&self, paste: Paste, respond_to: Sender<String>) {
@@ -222,7 +253,10 @@ impl App {
         });
     }
 
-    pub(crate) fn advance_paste(&self, paste: Paste, respond_to: Sender<String>) {
+    pub(crate) fn advance_paste(&mut self, paste: Paste, respond_to: Sender<String>) {
+        if !self.input_writes.paste_is_live(paste.ticket) {
+            return;
+        }
         let current = self.parse_pane_id(&paste.pane).and_then(|(ws, pane)| {
             let runtime = self.lookup_runtime_sender(ws, pane)?;
             let terminal = self.terminal_for_pane(ws, pane)?;
@@ -252,24 +286,9 @@ impl App {
                 return;
             }
         };
-        let _ = respond_to.send(encode_success(
-            paste.id,
-            ResponseResult::Paste {
-                outcome: if reason == "change_observed" {
-                    "delivered"
-                } else {
-                    "unconfirmed"
-                }
-                .into(),
-                reason: reason.into(),
-                evidence: json!({
-                    "pane_id": paste.pane,
-                    "before_digest": digest(&paste.before),
-                    "after_digest": after.as_deref().map(digest),
-                    "level": if reason == "change_observed" { level } else { None },
-                }),
-            },
-        ));
+        if self.input_writes.finish_paste(paste.ticket) {
+            let _ = respond_to.send(paste.response(reason, after.as_deref(), level));
+        }
     }
 }
 
