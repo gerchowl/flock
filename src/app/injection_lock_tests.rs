@@ -890,6 +890,7 @@ fn typing_verbs(pane: &str, raw: bool) -> Vec<(&'static str, Method)> {
         (
             "pane run",
             Method::PaneSendInput(crate::api::schema::PaneSendInputParams {
+                write_timeout_ms: None,
                 pane_id: pane.into(),
                 text: "note".into(),
                 keys: Vec::new(),

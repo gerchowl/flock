@@ -151,6 +151,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         row={focusedRow}
         open={openAgent}
         back={back}
+        widened={() => !phone()}
         transport={props.transport}
         source={props.source}
         inbox={props.inbox}

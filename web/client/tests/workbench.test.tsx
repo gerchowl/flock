@@ -8,6 +8,7 @@ import { createSignal } from "solid-js";
 import { render } from "solid-js/web";
 
 import { App } from "../src/App";
+import type { ServerFrame } from "../src/gen/ServerFrame";
 import { createFixtureFleet, type AgentRow, type FleetObserver, type FleetSource } from "../src/fleet";
 import { createManager, emptyLayout, type Layout } from "../src/layout/model";
 import { createFixtureTransport } from "../src/transport/fixture";
@@ -40,6 +41,9 @@ function mount(view: () => ReturnType<typeof App>): HTMLElement {
 const $ = (root: ParentNode, id: string): Element | null => root.querySelector(`[data-testid="${id}"]`);
 const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAll(`[data-testid="${id}"]`)];
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+/** The sub id of the latest `sub` for `agent`: ids are unique per connection, not per view. */
+const agentSub = (h: Harness, agent: string): string =>
+  (sentFrames(h).filter((frame) => (frame as { t: string; stream?: string }).t === "sub" && (frame as { stream?: string }).stream === `agent/${agent}`).at(-1) as { sub_id: string }).sub_id;
 
 describe("fixture mode", () => {
   test("renders the top bar, sidebar, focus pane and inbox under the replay badge", async () => {
@@ -200,11 +204,14 @@ describe("phone", () => {
     expect(document.getElementById(activity?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Waits for the events stream (S7-rest)");
   });
 
-  test("live, the headline never counts sample cards, and the cards stay labelled", async () => {
-    const root = await phone("live");
+  test("live, as the wire App mounts it, the inbox shows no sample cards and says it arrives with G5", async () => {
+    const root = mount(() => (
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source="live" />
+    ));
+    await tick();
     expect($(root, "inbox-headline")?.textContent).toBe("Your inbox arrives with G5 (#1597).");
-    expect($(root, "phone")?.textContent).toContain("Sample cards: the live inbox arrives with G5 (#1597).");
-    expect($(root, "phone")?.textContent).not.toContain("blocked on you");
+    expect($$(root, "inbox-card")).toHaveLength(0);
+    expect($(root, "phone")?.textContent).not.toMatch(/Sample|blocked on you/);
   });
 
   test("the agent screen is a history entry: system back returns to its tab, and the URL is untouched", async () => {
@@ -284,8 +291,74 @@ describe("phone", () => {
     expect($(root, "segmented-reasons")?.textContent).toContain("PR waits for a PR source.");
     expect($(root, "transcript-synced")).not.toBeNull();
     [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"))?.click();
+    await tick();
     expect($(root, "phone-agent")).toBeNull();
     expect($$(root, "agent-row").length).toBe(4);
+  });
+
+  test("unmounting the workbench with the agent screen open, without crossing the breakpoint, leaves history alone", async () => {
+    const root = await phone();
+    tab(root, "Agents")?.click();
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    await tick();
+    const entry = { "flock.phone-agent": "atlas" };
+    expect(history.state).toEqual(entry);
+    dispose?.();
+    dispose = undefined;
+    await tick();
+    expect(history.state).toEqual(entry);
+    // Consume the entry this test left, so later tests start from their own.
+    history.back();
+    await tick();
+  });
+
+  test("the wire phone path shares one transport: open, close, reopen, widen; sub ids stay unique and late frames are ignored", async () => {
+    const width = Object.getOwnPropertyDescriptor(window, "innerWidth");
+    const setWidth = (value: number): void => void Object.defineProperty(window, "innerWidth", { value, configurable: true, writable: true });
+    onTestFinished(() => void (width === undefined ? Reflect.deleteProperty(window, "innerWidth") : Object.defineProperty(window, "innerWidth", width)));
+    setWidth(375);
+    const h = new Harness();
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    const send = (frame: ServerFrame): void => h.step(step({ step: "send", frame }));
+    h.step(step({ step: "open" }));
+    send(WELCOME);
+    const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
+    send({ t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: 1 });
+    send({ t: "ev", sub_id: fleet, stream: "fleet", seq: 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id: "atlas", label: "atlas", state: "working", waiting_on_human: [] } } });
+    send({ t: "synced", sub_id: fleet, seq: 1 });
+    expect($(root, "phone")).not.toBeNull();
+    const backButton = (): HTMLButtonElement | undefined => [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"));
+    tab(root, "Agents")?.click();
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    await tick();
+    backButton()?.click();
+    await tick();
+    expect($(root, "phone-agent")).toBeNull();
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    await tick();
+    expect($(root, "phone-agent")).not.toBeNull();
+    setWidth(1024);
+    window.dispatchEvent(new Event("resize"));
+    await tick();
+    expect($(root, "workbench")).not.toBeNull();
+    const subs = sentFrames(h).flatMap((frame) => {
+      const f = frame as { t: string; sub_id: string; stream?: string };
+      return f.t === "sub" && f.stream === "agent/atlas" ? [f.sub_id] : [];
+    });
+    expect(subs).toHaveLength(3);
+    expect(new Set(subs).size).toBe(3);
+    const [first, second, current] = subs as [string, string, string];
+    send({ t: "ev", sub_id: current, stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "the current line" } } });
+    send({ t: "synced", sub_id: current, seq: 1 });
+    const pane = $(root, "focus-pane")?.textContent ?? "";
+    send({ t: "ev", sub_id: first, stream: "agent/atlas", seq: 2, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "a late line" } } });
+    send({ t: "synced", sub_id: second, seq: 0 });
+    send({ t: "subfail", sub_id: second, code: "unknown_stream", message: "gone" });
+    expect(root.querySelector(".connection-bar__state")?.textContent).toBe("Live");
+    expect(pane).toContain("the current line");
+    expect($(root, "focus-pane")?.textContent).toBe(pane);
   });
 });
 
@@ -392,7 +465,7 @@ describe("composer", () => {
     // Opening atlas made the connection Syncing: the command waits for Live.
     expect($$(root, "sent-message").map((item) => item.getAttribute("data-status"))).toEqual(["pending"]);
     expect(sentFrames(h).some((frame) => (frame as { t: string }).t === "cmd")).toBe(false);
-    h.net.current().deliver({ t: "synced", sub_id: "t1", seq: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: 0 });
     const cmd = sentFrames(h).find((frame) => (frame as { t: string }).t === "cmd") as { cmd_id: string };
     expect(cmd).toMatchObject({ t: "cmd", verb: "agent.send", args: { target: "atlas", text: "please rebase", submit: true }, resume_only: false });
     expect($$(root, "sent-message").map((item) => item.getAttribute("data-status"))).toEqual(["sent"]);
@@ -415,7 +488,7 @@ describe("composer", () => {
     search.value = "atlas";
     search.dispatchEvent(new InputEvent("input", { bubbles: true }));
     ($$(root, "palette-item")[0] as HTMLButtonElement).click();
-    h.net.current().deliver({ t: "synced", sub_id: "t1", seq: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: 0 });
     const box = $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
     box.value = "please rebase";
     box.dispatchEvent(new InputEvent("input", { bubbles: true }));
@@ -424,7 +497,7 @@ describe("composer", () => {
     h.net.current().deliver({ t: "ack", cmd_id: cmd.cmd_id, ok: true });
     expect($$(root, "sent-message").map((item) => item.textContent)).toEqual(["please rebaseaccepted"]);
     expect(root.querySelector(".transcript")?.textContent).not.toContain("please rebase");
-    h.net.current().deliver({ t: "ev", sub_id: "t1", stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "please rebase" } } });
+    h.net.current().deliver({ t: "ev", sub_id: agentSub(h, "atlas"), stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "please rebase" } } });
     expect(root.querySelector(".transcript")?.textContent).toContain("please rebase");
     expect($(root, "focus-pane")?.textContent?.split("please rebase").length).toBe(2);
     expect($$(root, "sent-message")).toEqual([]);
@@ -446,9 +519,9 @@ describe("composer", () => {
     search.dispatchEvent(new InputEvent("input", { bubbles: true }));
     ($$(root, "palette-item")[0] as HTMLElement).click();
     const said = (seq: number, text: string): void =>
-      h.net.current().deliver({ t: "ev", sub_id: "t1", stream: "agent/atlas", seq, ts_ms: 0, ev: { type: "user", message: { role: "user", content: text } } });
+      h.net.current().deliver({ t: "ev", sub_id: agentSub(h, "atlas"), stream: "agent/atlas", seq, ts_ms: 0, ev: { type: "user", message: { role: "user", content: text } } });
     history.forEach((text, index) => said(index + 1, text));
-    h.net.current().deliver({ t: "synced", sub_id: "t1", seq: history.length });
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: history.length });
     const send = (text: string): string => {
       const box = $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
       box.value = text;
@@ -533,6 +606,72 @@ describe("composer", () => {
     expect(textarea(root).value).toBe("half a thought");
     expect($(root, "send-hint")?.textContent).toMatch(/^(⌘|Ctrl) \+ Enter to send$/);
     expect(["MacIntel", "Win32"].map(sendHint)).toEqual(["⌘ + Enter to send", "Ctrl + Enter to send"]);
+  });
+});
+
+describe("wire mode, one transport per connection", () => {
+  const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+  const send = (h: Harness, frame: ServerFrame): void => h.step(step({ step: "send", frame }));
+  const agentSubs = (h: Harness): string[] =>
+    sentFrames(h).flatMap((frame) => {
+      const f = frame as { t: string; sub_id: string; stream?: string };
+      return f.t === "sub" && f.stream?.startsWith("agent/") ? [f.sub_id] : [];
+    });
+
+  /** Mounts the wire App, Live with fleet rows atlas, kite and ember. */
+  function liveApp(): { h: Harness; root: HTMLElement } {
+    const h = new Harness();
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.step(step({ step: "open" }));
+    h.step(step({ step: "send", frame: WELCOME }));
+    const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
+    const ids = ["atlas", "kite", "ember"];
+    send(h, { t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: ids.length });
+    ids.forEach((id, i) => send(h, { t: "ev", sub_id: fleet, stream: "fleet", seq: i + 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id, label: id, state: "working", waiting_on_human: [] } } }));
+    send(h, { t: "synced", sub_id: fleet, seq: ids.length });
+    return { h, root };
+  }
+
+  test("switching agents twice opens three distinct sub ids, and the old subs' late frames are ignored", () => {
+    const { h, root } = liveApp();
+    const rows = (): HTMLButtonElement[] => $$(root, "agent-row") as HTMLButtonElement[];
+    rows()[0]?.click();
+    rows()[1]?.click();
+    rows()[2]?.click();
+    const subs = agentSubs(h);
+    expect(subs).toHaveLength(3);
+    expect(new Set(subs).size).toBe(3);
+    const [first, second, current] = subs as [string, string, string];
+    send(h, { t: "ev", sub_id: current, stream: "agent/ember", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "ember's own line" } } });
+    send(h, { t: "synced", sub_id: current, seq: 1 });
+    expect(root.querySelector(".connection-bar__state")?.textContent).toBe("Live");
+    const pane = $(root, "focus-pane")?.textContent;
+    send(h, { t: "ev", sub_id: first, stream: "agent/atlas", seq: 2, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "late atlas line" } } });
+    send(h, { t: "synced", sub_id: second, seq: 0 });
+    send(h, { t: "subfail", sub_id: first, code: "unknown_stream", message: "gone" });
+    expect(root.querySelector(".connection-bar__state")?.textContent).toBe("Live");
+    expect($(root, "focus-pane")?.textContent).toBe(pane ?? "");
+    expect(pane).toContain("ember's own line");
+  });
+
+  test("a layout-load notice does not hide the connection status: after 4401 it shows NeedsToken", () => {
+    localStorage.setItem(`flock.layout:${encodeURIComponent("wss://fixture.invalid/v1/ws")}`, "not json");
+    const h = new Harness();
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.step(step({ step: "open" }));
+    h.step(step({ step: "token_refused", code: 4401 }));
+    expect(root.querySelector(".topbar__status")?.textContent).toContain("Saved layout could not be loaded");
+    expect(root.querySelector(".connection-bar__state")?.textContent).toBe("NeedsToken");
+    expect($(root, "connection-bar")?.textContent).toContain("The server refused the token.");
+  });
+
+  test("wire mode shows no sample inbox cards; the inbox says it arrives with G5", () => {
+    const { root } = liveApp();
+    expect($$(root, "inbox-card")).toHaveLength(0);
+    expect($(root, "inbox")?.textContent).toContain("The live inbox arrives with G5 (#1597).");
+    expect($(root, "inbox")?.textContent).not.toMatch(/Sample/);
   });
 });
 

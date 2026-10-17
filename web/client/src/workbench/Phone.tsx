@@ -25,6 +25,8 @@ export type PhoneProps = {
   /** Focuses the agent; true when that pushed a layout tile. */
   readonly open: (agentId: string) => boolean;
   readonly back: () => void;
+  /** Whether the workbench has left phone mode: read when this screen unmounts. */
+  readonly widened: () => boolean;
   readonly transport: Transport;
   readonly source: TranscriptSource;
   readonly inbox: readonly InboxCard[];
@@ -39,7 +41,7 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
   const [tab, setTab] = createSignal<Tab>("inbox");
   const [onAgent, setOnAgent] = createSignal(false);
   const blocked = (): number => props.inbox.filter((card) => card.blocking).length;
-  // Live mode has no inbox source until G5: its cards are samples, so the headline never counts them.
+  // Live mode has no inbox source until G5 and shows no cards, so the headline counts nothing.
   const headline = (): string =>
     props.source === "live" ? "Your inbox arrives with G5 (#1597)." : blocked() === 0 ? "Nothing is blocked on you." : `${blocked()} blocked on you.`;
   /*
@@ -61,9 +63,10 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
   window.addEventListener("popstate", onPop);
   onCleanup(() => {
     window.removeEventListener("popstate", onPop);
-    // Unmounted with the agent screen open (the window widened past the phone
-    // breakpoint): consume its history entry, so the next back is not a no-op.
-    if (onAgent() && ownEntry()) history.back();
+    // The window widened past the phone breakpoint with the agent screen open:
+    // consume its history entry, so the next back is not a no-op. Any other
+    // unmount (the whole app going away) leaves history to the page.
+    if (props.widened() && onAgent() && ownEntry()) history.back();
   });
   const open = (id: string): void => {
     pushedTile = props.open(id);
