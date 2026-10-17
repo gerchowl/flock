@@ -398,6 +398,7 @@ impl Drop for SessionConfigDir {
 #[derive(Debug)]
 pub struct LaunchProfile {
     session_id: String,
+    cwd: Option<PathBuf>,
     args: Vec<OsString>,
     binary: VerifiedBinary,
     environment: EnvironmentAllowlist,
@@ -460,6 +461,7 @@ impl LaunchProfile {
         let environment = EnvironmentAllowlist::capture(read_env, token);
         Ok(Self {
             session_id: session_id.into(),
+            cwd: None,
             args,
             binary,
             environment,
@@ -487,6 +489,34 @@ impl LaunchProfile {
         let next = self.directory.write("mcp.next.json", &registration)?;
         fs::rename(next, self.directory.path().join("mcp.json"))?;
         Ok(())
+    }
+
+    /// Bind registry launch metadata on the preparation worker, before spawn.
+    /// Cwd must be an existing absolute directory; a requested model is explicit argv.
+    pub(crate) fn for_agent(
+        mut self,
+        cwd: &Path,
+        model: Option<&str>,
+    ) -> Result<Self, LaunchError> {
+        if !cwd.is_absolute() || !cwd.is_dir() || model.is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid structured cwd or model",
+            )
+            .into());
+        }
+        self.cwd = Some(cwd.canonicalize()?);
+        if let Some(model) = model {
+            self.args
+                .extend([OsString::from("--model"), OsString::from(model)]);
+        }
+        Ok(self)
+    }
+
+    /// Worker-validated cwd; older runtime-only callers retain their supplied process cwd.
+    pub(crate) fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
     }
 
     /// Canonical session id passed to Claude, also used by the lease and stream.
