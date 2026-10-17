@@ -15,9 +15,10 @@
 {"v":1,"step":"expect","frame":{"t":"pong","nonce":"unrelated"},"fields":["nonce"],"absent":[]}
 {"v":1,"step":"deadline","stage":{"kind":"subscription","sub_id":"s1"}}
 {"v":1,"step":"expect","frame":{"t":"unsub","sub_id":"s1"},"fields":["sub_id"],"absent":[]}
-{"v":1,"step":"expect","frame":{"t":"sub","sub_id":"s1","stream":"fleet"},"fields":["sub_id","stream"],"absent":["after"]}
-{"v":1,"step":"observe","connection":"Syncing","streams":{"s1":{"state":"Replaying","cursor":null},"s2":{"state":"Current","cursor":0}},"outbox":{}}
-{"v":1,"step":"send","frame":{"t":"gap","sub_id":"s1","from":1,"to":0,"snapshot_to":0}}
-{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s1","seq":0}}
-{"v":1,"step":"observe","connection":"Live","streams":{"s1":{"state":"Current","cursor":0},"s2":{"state":"Current","cursor":0}},"outbox":{}}
+{"v":1,"step":"expect","frame":{"t":"sub","sub_id":"s3","stream":"fleet"},"fields":["sub_id","stream"],"absent":["after"]}
+{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s1","seq":99}}
+{"v":1,"step":"observe","connection":"Syncing","streams":{"s2":{"state":"Current","cursor":0},"s3":{"state":"Replaying","cursor":null}},"outbox":{},"absent_streams":["s1"]}
+{"v":1,"step":"send","frame":{"t":"gap","sub_id":"s3","from":1,"to":0,"snapshot_to":0}}
+{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s3","seq":0}}
+{"v":1,"step":"observe","connection":"Live","streams":{"s2":{"state":"Current","cursor":0},"s3":{"state":"Current","cursor":0}},"outbox":{},"absent_streams":["s1"]}
 {"v":1,"step":"quiet","ceiling_ms":1000}
