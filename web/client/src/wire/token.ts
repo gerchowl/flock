@@ -81,15 +81,20 @@ export type CodeHistory = { readonly state: unknown; replaceState(state: unknown
 /**
  * The one-time code in the fragment, or null. When there is one, the
  * fragment loses its `code` parameter at once (`history.replaceState`, so
- * no history entry is added); the path, the query and any other fragment
- * parameters stay.
+ * no history entry is added); the path, the query and the rest of the
+ * fragment stay byte for byte.
+ *
+ * The fragment is parsed by hand, not with `URLSearchParams`, which would
+ * decode `+` as a space and rewrite the rest (`#view` to `#view=`, `/` to
+ * `%2F`). The code is the first `code=` parameter's value, verbatim, up to
+ * the next `&` or the end.
  */
 export function takeCode(location: CodeLocation, history: CodeHistory): string | null {
-  const params = new URLSearchParams(location.hash.replace(/^#/, ""));
-  if (!params.has("code")) return null;
-  const code = params.get("code");
-  params.delete("code");
-  const rest = params.toString();
+  const parts = location.hash.replace(/^#/, "").split("&");
+  const at = parts.findIndex((part) => part.startsWith("code="));
+  if (at < 0) return null;
+  const code = (parts[at] ?? "").slice("code=".length);
+  const rest = parts.filter((_part, index) => index !== at).join("&");
   history.replaceState(history.state, "", `${location.pathname}${location.search}${rest === "" ? "" : `#${rest}`}`);
   return code === "" ? null : code;
 }
@@ -97,7 +102,15 @@ export function takeCode(location: CodeLocation, history: CodeHistory): string |
 /** The request {@link exchangeCode} makes; normally `fetch`. */
 export type ExchangeRequest = (
   url: string,
-  init: { readonly method: "POST"; readonly headers: Readonly<Record<string, string>>; readonly body: string },
+  init: {
+    readonly method: "POST";
+    readonly headers: Readonly<Record<string, string>>;
+    readonly body: string;
+    readonly mode: "same-origin";
+    readonly redirect: "error";
+    readonly credentials: "same-origin";
+    readonly cache: "no-store";
+  },
 ) => Promise<{ readonly status: number; json(): Promise<unknown> }>;
 
 /**
@@ -115,8 +128,10 @@ export function exchangeUrl(serverUrl: string): string {
 
 /**
  * Trades `code` for a token, once: the token, or null for any failure.
- * The request carries no credentials beyond the defaults of a same-origin
- * request, and nothing about the reply or the error is kept.
+ * The request enforces the ADR's same-origin rule without reading the
+ * page's location: `mode: "same-origin"` refuses another origin,
+ * `redirect: "error"` refuses any redirect, only same-origin credentials go
+ * out, and nothing is cached. Nothing about the reply or the error is kept.
  */
 export async function exchangeCode(code: string, serverUrl: string, request: ExchangeRequest): Promise<string | null> {
   try {
@@ -124,6 +139,10 @@ export async function exchangeCode(code: string, serverUrl: string, request: Exc
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ code }),
+      mode: "same-origin",
+      redirect: "error",
+      credentials: "same-origin",
+      cache: "no-store",
     });
     if (reply.status !== 200) return null;
     const body: unknown = await reply.json();

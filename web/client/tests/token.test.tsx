@@ -8,6 +8,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { render } from "solid-js/web";
 
 import { App } from "../src/App";
+import { captureCode } from "../src/capture-code";
 import { EXCHANGE_FAILED, RUN_CLIENT_OPEN, TOKEN_KEY, createTokenStore, takeCode, type ExchangeRequest, type SessionLike } from "../src/wire/token";
 import { Harness, WELCOME, sentFrames, step } from "./wire/harness";
 
@@ -30,12 +31,15 @@ function session(): SessionLike & { readonly entries: Map<string, string> } {
 
 type Reply = { readonly status: number; readonly body?: unknown; readonly bodyThrows?: boolean } | "network-error";
 
-/** An exchange request that answers `reply` and records every call. */
-function exchange(reply: Reply, log: string[] = []): ExchangeRequest & { readonly calls: { url: string; body: string }[] } {
+/** An exchange request that answers `reply` and records every call; `onCall` runs as it is issued. */
+function exchange(reply: Reply, log: string[] = [], onCall: () => void = () => undefined): ExchangeRequest & { readonly calls: { url: string; body: string }[]; readonly inits: unknown[] } {
   const calls: { url: string; body: string }[] = [];
+  const inits: unknown[] = [];
   const request = async (url: string, init: { body: string }) => {
+    onCall();
     log.push("request");
     calls.push({ url, body: init.body });
+    inits.push(init);
     if (reply === "network-error") throw new TypeError("Failed to fetch");
     return {
       status: reply.status,
@@ -45,15 +49,39 @@ function exchange(reply: Reply, log: string[] = []): ExchangeRequest & { readonl
       },
     };
   };
-  return Object.assign(request, { calls });
+  return Object.assign(request, { calls, inits });
 }
 
-function mountApp(options: { code?: string | null; session?: () => SessionLike | undefined; request?: ExchangeRequest }): { h: Harness; root: HTMLElement } {
+/** A page whose location, history and `hashchange` events the test drives. */
+function page(hash: string) {
+  const listeners = new Set<() => void>();
+  const location = { hash, pathname: "/", search: "" };
+  const history = {
+    state: null,
+    replaceState: (_state: unknown, _unused: string, url: string) => {
+      const at = url.indexOf("#");
+      location.hash = at < 0 ? "" : url.slice(at);
+    },
+  };
+  return {
+    location,
+    history,
+    addEventListener: (_type: "hashchange", listener: () => void) => void listeners.add(listener),
+    removeEventListener: (_type: "hashchange", listener: () => void) => void listeners.delete(listener),
+    /** Navigates to `next` the way pasting a link does: only the fragment changes. */
+    paste: (next: string) => {
+      location.hash = next;
+      listeners.forEach((listener) => listener());
+    },
+  };
+}
+
+function mountApp(options: { code?: string | null; session?: () => SessionLike | undefined; request?: ExchangeRequest; page?: ReturnType<typeof page> }): { h: Harness; root: HTMLElement } {
   const h = new Harness();
   h.step(step({ step: "given", cursors: {}, outbox: [] }));
   const root = document.createElement("div");
   document.body.append(root);
-  const env = { clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store, session: options.session ?? (() => undefined), request: options.request ?? exchange({ status: 500 }) };
+  const env = { clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store, session: options.session ?? (() => undefined), request: options.request ?? exchange({ status: 500 }), page: options.page ?? page("") };
   dispose = render(() => <App config={config} env={env} code={options.code ?? null} />, root);
   return { h, root };
 }
@@ -75,12 +103,43 @@ describe("the fragment code", () => {
     expect(calls).toEqual([]);
   });
 
-  test("is cleared before the exchange request goes out", async () => {
-    const log: string[] = [];
-    const code = takeCode({ hash: "#code=abc", pathname: "/", search: "" }, { state: null, replaceState: () => void log.push("fragment cleared") });
-    mountApp({ code, request: exchange({ status: 200, body: { token: "tok-1" } }, log) });
+  test("is already gone from the fragment when the exchange request is issued", async () => {
+    const at = page("#code=abc");
+    const hashes: string[] = [];
+    const code = captureCode(at);
+    mountApp({ code, page: at, request: exchange({ status: 200, body: { token: "tok-1" } }, [], () => void hashes.push(at.location.hash)) });
     await tick();
-    expect(log).toEqual(["fragment cleared", "request"]);
+    expect(hashes).toEqual([""]);
+  });
+
+  test("keeps the rest of the fragment byte for byte, and the code verbatim", () => {
+    const urls: string[] = [];
+    const replace = { state: null, replaceState: (_state: unknown, _unused: string, url: string) => void urls.push(url) };
+    expect(takeCode({ hash: "#view&code=a+b/c%2Fd", pathname: "/", search: "" }, replace)).toBe("a+b/c%2Fd");
+    expect(takeCode({ hash: "#code=x+y&tab=a/b+c&view", pathname: "/p", search: "?q=1" }, replace)).toBe("x+y");
+    expect(takeCode({ hash: "#code=only", pathname: "/", search: "" }, replace)).toBe("only");
+    expect(urls).toEqual(["/#view", "/p?q=1#tab=a/b+c&view", "/"]);
+  });
+
+  test("a pasted link (only the fragment changes) is cleared and exchanged exactly once", async () => {
+    const storage = session();
+    storage.setItem(TOKEN_KEY, "old");
+    const at = page("");
+    const hashes: string[] = [];
+    const request = exchange({ status: 200, body: { token: "new" } }, [], () => void hashes.push(at.location.hash));
+    const { h } = mountApp({ session: () => storage, page: at, request });
+    h.step(step({ step: "open" }));
+    expect(hello(h)?.token).toBe("old");
+    at.paste("#view&code=pasted");
+    await tick();
+    at.paste("#view");
+    await tick();
+    expect(request.calls.map((call) => call.body)).toEqual(['{"code":"pasted"}']);
+    expect(hashes).toEqual(["#view"]);
+    expect(at.location.hash).toBe("#view");
+    expect(storage.entries.get(TOKEN_KEY)).toBe("new");
+    h.step(step({ step: "open" }));
+    expect(sentFrames(h).filter((frame) => (frame as { t: string }).t === "hello").map((frame) => (frame as { token?: string }).token)).toEqual(["old", "new"]);
   });
 
   test("is captured by the first module the entry imports", async () => {
@@ -116,6 +175,42 @@ describe("the exchange", () => {
       h.clock.advanceTo(h.clock.now() + 120_000);
       await tick();
       expect(request.calls).toHaveLength(1);
+      expect(h.net.attempts).toHaveLength(0);
+    });
+  }
+
+  test("the request is same-origin, refuses redirects, sends same-origin credentials only and is never cached", async () => {
+    const request = exchange({ status: 200, body: { token: "tok-1" } });
+    mountApp({ code: "abc", request });
+    await tick();
+    expect(request.inits).toEqual([
+      { method: "POST", headers: { "content-type": "application/json" }, body: '{"code":"abc"}', mode: "same-origin", redirect: "error", credentials: "same-origin", cache: "no-store" },
+    ]);
+  });
+
+  /** A browser's fetch: it follows a redirect, or reaches another origin, unless the options forbid it. */
+  const browser = (refuses: (init: Record<string, unknown>) => boolean): ExchangeRequest & { calls: number } => {
+    const request = async (_url: string, init: Record<string, unknown>) => {
+      request.calls++;
+      if (refuses(init)) throw new TypeError("Failed to fetch");
+      return { status: 200, json: async () => ({ token: "from-elsewhere" }) };
+    };
+    request.calls = 0;
+    return request as unknown as ExchangeRequest & { calls: number };
+  };
+
+  for (const [name, refuses] of [
+    ["a redirect", (init: Record<string, unknown>) => init["redirect"] === "error"],
+    ["a cross-origin reply", (init: Record<string, unknown>) => init["mode"] === "same-origin"],
+  ] as const) {
+    test(`${name} is the one failure`, async () => {
+      const storage = session();
+      const request = browser(refuses);
+      const { h, root } = mountApp({ code: "abc", session: () => storage, request });
+      await tick();
+      expect(status(root)).toBe(EXCHANGE_FAILED);
+      expect(storage.entries.has(TOKEN_KEY)).toBe(false);
+      expect(request.calls).toBe(1);
       expect(h.net.attempts).toHaveLength(0);
     });
   }

@@ -26,6 +26,7 @@ import { createFixtureTransport } from "./transport/fixture";
 import { WireConnection, type ConnectionOptions } from "./wire/connection";
 import { browserClock, browserSockets, endpointUrl } from "./wire/env";
 import { createWireFleet } from "./wire/fleet";
+import { captureCode, type CodePage } from "./capture-code";
 import { EXCHANGE_FAILED, RUN_CLIENT_OPEN, createTokenStore, exchangeCode, type ExchangeRequest, type SessionLike } from "./wire/token";
 import { createWireTransport } from "./wire/transport";
 import { SAMPLE_INBOX } from "./workbench/inbox";
@@ -38,6 +39,11 @@ export type WireEnv = Pick<ConnectionOptions, "clock" | "sockets" | "random" | "
   readonly session?: () => SessionLike | undefined;
   /** The code exchange's request. Defaults to `fetch`. */
   readonly request?: ExchangeRequest;
+  /** Where a pasted link's code arrives (`hashchange`). Defaults to `window`. */
+  readonly page?: CodePage & {
+    addEventListener(type: "hashchange", listener: () => void): void;
+    removeEventListener(type: "hashchange", listener: () => void): void;
+  };
 };
 
 /** Props of {@link App}. `env` defaults to the browser's. */
@@ -73,7 +79,7 @@ function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element
 }
 
 function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEnv; readonly code: string | null }): JSX.Element {
-  const { session = () => sessionStorage, request = globalThis.fetch.bind(globalThis), ...options } = props.env;
+  const { session = () => sessionStorage, request = globalThis.fetch.bind(globalThis), page = window, ...options } = props.env;
   const url = endpointUrl(props.config.serverUrl);
   const tokens = createTokenStore(session);
   // A new code replaces whatever token this tab held.
@@ -95,10 +101,9 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
     disposed = true;
     connection.disconnect();
   });
-  if (props.code === null) connection.connect();
-  else {
-    // Exactly once: a failed code is never retried (ADR-0038 §3).
-    void exchangeCode(props.code, props.config.serverUrl, request).then((exchanged) => {
+  /** Exchanges `code`, exactly once: a failed code is never retried (ADR-0038 §3). */
+  const signInWith = (code: string): void => {
+    void exchangeCode(code, props.config.serverUrl, request).then((exchanged) => {
       if (disposed) return;
       if (exchanged === null) {
         setSignIn("failed");
@@ -107,11 +112,26 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
       }
       tokens.set(exchanged);
       setSignIn(null);
+      // A new token is a new identity: reconnect with it (a changed principal drops the outbox).
+      connection.disconnect();
       connection.setToken(exchanged);
       connection.connect();
       setStatus(describe());
     });
-  }
+  };
+  if (props.code === null) connection.connect();
+  else signInWith(props.code);
+  // A pasted `flk client open` link changes only the fragment: take its code the same way.
+  const onHashChange = (): void => {
+    const code = captureCode(page);
+    if (code === null) return;
+    tokens.clear();
+    setSignIn("exchanging");
+    setStatus(describe());
+    signInWith(code);
+  };
+  page.addEventListener("hashchange", onHashChange);
+  onCleanup(() => page.removeEventListener("hashchange", onHashChange));
   const store = createLayoutStore({ serverKey: url, initial: emptyLayout });
   const { layout, notice } = store.load();
   // One fleet source and one transport per connection (ADR-0038 §3, sub ids).
