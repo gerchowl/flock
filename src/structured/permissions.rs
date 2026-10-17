@@ -13,6 +13,7 @@
 pub mod auth;
 
 pub(super) const MAX_OPEN: usize = 16;
+const MAX_GRANTS: usize = 16;
 
 use super::claude::ToolRequest;
 use crate::api::error_code::ErrorCode;
@@ -90,16 +91,22 @@ enum Stage {
     Closing,
     Closed,
 }
+#[derive(Clone)]
+struct Grant {
+    subject: String,
+    request_id: String,
+}
 pub(super) struct Open {
     request: ToolRequest,
     stage: Stage,
+    automatic: bool,
     grant: Option<String>,
 }
 pub(super) struct Answer {
     pub id: String,
     pub response: Value,
     pub audit: Value,
-    grant: Option<(String, String)>,
+    grant: Option<(String, Grant)>,
 }
 pub(super) struct Closing {
     pub id: String,
@@ -111,7 +118,7 @@ pub(super) struct Book {
     active: bool,
     open: BTreeMap<String, Open>,
     seen: BTreeSet<String>,
-    grants: BTreeMap<String, String>,
+    grants: BTreeMap<String, Grant>,
 }
 pub(super) fn open_record(id: &str, request: &ToolRequest) -> Value {
     json!({"type":"flk_permission_request","state":"open","request_id":id,"request":request})
@@ -133,7 +140,7 @@ impl Book {
     pub fn waiting(&self) -> Vec<String> {
         self.open
             .iter()
-            .filter(|(_, r)| r.stage != Stage::Closed)
+            .filter(|(_, r)| r.stage != Stage::Closed && !r.automatic)
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -160,6 +167,7 @@ impl Book {
             Open {
                 request,
                 stage: Stage::Open,
+                automatic: false,
                 grant: None,
             },
         );
@@ -167,15 +175,29 @@ impl Book {
         Ok(audit)
     }
     pub fn automatic(&mut self, id: &str) -> Result<Option<Answer>, ErrorCode> {
-        let subject = self
+        let grant = self
             .open
             .get(id)
             .and_then(|open| self.grants.get(&key(&open.request)))
             .cloned();
-        subject
-            .map(|subject| self.answer(id, Decision::AllowOnce, None, &subject, "session_grant"))
+        grant
+            .map(|grant| {
+                let mut answer = self.answer(
+                    id,
+                    Decision::AllowOnce,
+                    None,
+                    &grant.subject,
+                    "session_grant",
+                )?;
+                if let Some(open) = self.open.get_mut(id) {
+                    open.automatic = true;
+                }
+                answer.audit["grant_request_id"] = json!(grant.request_id);
+                Ok(answer)
+            })
             .transpose()
     }
+
     fn missing(&self, id: &str) -> ErrorCode {
         if self.seen.contains(id) {
             ErrorCode::PermissionRequestClosed
@@ -228,10 +250,11 @@ impl Book {
                     .filter(|r| !r.is_empty())
                 {
                     Some(rules) => {
-                        if rules.iter().any(|r| {
-                            r.get("destination").and_then(Value::as_str) != Some("session")
-                        }) {
-                            return Err(ErrorCode::InvalidParams);
+                        if rules
+                            .iter()
+                            .any(|rule| !safe_suggestion(rule, &open.request.tool_name))
+                        {
+                            return Err(ErrorCode::PermissionSuggestionsRefused);
                         }
                         response["updatedPermissions"] = json!(rules);
                     }
@@ -243,13 +266,19 @@ impl Book {
                             .filter_map(|r| r.grant.as_ref())
                             .filter(|key| !self.grants.contains_key(*key))
                             .collect();
-                        if self.grants.len() + reserved.len() >= 16
+                        if self.grants.len() + reserved.len() >= MAX_GRANTS
                             && !self.grants.contains_key(&k)
                             && !reserved.contains(&k)
                         {
                             return Err(ErrorCode::InvalidParams);
                         }
-                        grant = Some((k, subject.into()));
+                        grant = Some((
+                            k,
+                            Grant {
+                                subject: subject.into(),
+                                request_id: id.into(),
+                            },
+                        ));
                     }
                 }
             }
@@ -280,6 +309,7 @@ impl Book {
     pub fn aborted(&mut self, id: &str) {
         if let Some(open) = self.open.get_mut(id).filter(|r| r.stage == Stage::Reserved) {
             open.stage = Stage::Open;
+            open.automatic = false;
             open.grant = None;
         }
     }
@@ -305,8 +335,8 @@ impl Book {
         {
             open.stage = Stage::Closed;
             open.grant = None;
-            if let Some((key, subject)) = &answer.grant {
-                self.grants.insert(key.clone(), subject.clone());
+            if let Some((key, grant)) = &answer.grant {
+                self.grants.insert(key.clone(), grant.clone());
             }
         }
     }
@@ -351,6 +381,36 @@ impl Book {
     pub fn closed(&mut self, id: &str) {
         self.open.remove(id);
     }
+}
+
+fn safe_suggestion(value: &Value, tool: &str) -> bool {
+    let Some(update) = value.as_object() else {
+        return false;
+    };
+    if tool.is_empty()
+        || tool.contains(['*', '?'])
+        || !update
+            .keys()
+            .all(|key| matches!(key.as_str(), "type" | "behavior" | "destination" | "rules"))
+        || value["type"] != "addRules"
+        || value["behavior"] != "allow"
+        || value["destination"] != "session"
+    {
+        return false;
+    }
+    value
+        .get("rules")
+        .and_then(Value::as_array)
+        .is_some_and(|rules| {
+            !rules.is_empty()
+                && rules.iter().all(|rule| {
+                    rule.as_object().is_some_and(|rule| {
+                        rule.keys()
+                            .all(|key| matches!(key.as_str(), "toolName" | "ruleContent"))
+                    }) && rule["toolName"].as_str() == Some(tool)
+                        && rule.get("ruleContent").is_none_or(Value::is_string)
+                })
+        })
 }
 
 fn key(request: &ToolRequest) -> String {

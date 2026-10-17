@@ -1642,7 +1642,10 @@ P16 and P17 have no source in the stream today and are not promised;
   (`not_authorized`, retry never). Identity comes from the authenticated
   dispatcher context, never command arguments. Every decision is recorded
   on `agent/<id>` in ordered open/closed permission audit records, including
-  automatic matches, with the originating token subject.
+  automatic matches, with the originating token subject. Automatic closes also
+  reference the originating grant request ID. A raw request already reserved by
+  an exact grant carries that trusted reference into replay and counts as
+  stdout progress without ever opening S4 needs-human attention.
 - **`allow_always` lasts for one live harness runtime.** Its grant is held
   only in memory for that structured agent. Exit, restart and resume into a
   new runtime discard it, even when resuming the same persisted session.
@@ -1652,12 +1655,17 @@ P16 and P17 have no source in the stream today and are not promised;
 - **Match exactly or use the harness's session rules.** When a
   `can_use_tool` request includes nonempty permission suggestions,
   `allow_always` responds with allow and those `updatedPermissions` only
-  if every rule has destination exactly `session`. Any other or missing
-  destination is refused with `invalid_params`, leaving the request open.
+  if each suggestion is exactly an `addRules` update with behavior `allow`,
+  destination `session`, and nonempty rules naming the requested tool only.
+  Mode changes, rule removal/replacement, deny/ask rules, directory updates,
+  other tools, wildcard tool names and unknown modifiers are refused with
+  `permission_suggestions_refused`, leaving the request open and recording the
+  refusal. No unsafe suggestion is forwarded.
   The harness matches the suggested rules. When suggestions are absent,
   null or empty, flk grants only the exact tool name plus canonical JSON
   input (recursively sorted object keys; array order and scalar values
-  preserved). A different tool or input prompts again. At most 16 exact
+  preserved). Matching performs no Unicode normalization and treats `1` and
+  `1.0` as different. A different tool or input prompts again. At most 16 exact
   grants are retained in a runtime; exceeding that bound is refused,
   without changing the open request. Token authorization still applies to
   manual decisions after a grant exists.

@@ -212,3 +212,49 @@ fn cancelled_grant_reservation_cannot_install_a_grant_after_its_close() {
     b.observe("following-request", request()).unwrap();
     assert!(b.automatic("following-request").unwrap().is_none());
 }
+
+#[test]
+fn automatic_reservations_hold_input_without_requesting_human_attention() {
+    let mut b = book();
+    let grant = b
+        .prepare(&token(), &args("request-example", Decision::AllowAlways))
+        .unwrap();
+    assert!(b.begin_answer(&grant.id));
+    b.audited(&grant);
+    b.written(grant);
+    b.observe("automatic-request", request()).unwrap();
+    let answer = b.automatic("automatic-request").unwrap().unwrap();
+    assert!(b.waiting().is_empty());
+    assert!(
+        b.blocked(),
+        "grant reservation must still hold user input until delivery"
+    );
+    assert_eq!(answer.audit["grant_request_id"], "request-example");
+    b.aborted("automatic-request");
+    assert_eq!(b.waiting(), vec!["automatic-request"]);
+}
+
+#[test]
+fn exact_grants_preserve_numeric_representation_and_unicode() {
+    let mut b = Book::new("fixture-agent".into());
+    let mut original = request();
+    original.input.insert("number".into(), json!(1));
+    original.input.insert("text".into(), json!("é"));
+    b.observe("grant", original.clone()).unwrap();
+    let grant = b
+        .prepare(&token(), &args("grant", Decision::AllowAlways))
+        .unwrap();
+    assert!(b.begin_answer(&grant.id));
+    b.audited(&grant);
+    b.written(grant);
+    let mut float = original.clone();
+    float.input.insert("number".into(), json!(1.0));
+    let mut decomposed = original.clone();
+    decomposed.input.insert("text".into(), json!("e\u{301}"));
+    for (id, request) in [("float", float), ("decomposed", decomposed)] {
+        b.observe(id, request).unwrap();
+        assert!(b.automatic(id).unwrap().is_none(), "{id} must prompt again");
+    }
+    b.observe("exact", original).unwrap();
+    assert!(b.automatic("exact").unwrap().is_some());
+}

@@ -34,7 +34,13 @@ impl<'a> Recorder<'a> {
             controls,
         }
     }
-    fn record(&mut self, raw: &[u8], count: u64, synthetic: bool) -> io::Result<Received> {
+    fn record(
+        &mut self,
+        raw: &[u8],
+        count: u64,
+        synthetic: bool,
+        grant_request_id: Option<&str>,
+    ) -> io::Result<Received> {
         persist(
             self.file,
             self.seq,
@@ -44,17 +50,22 @@ impl<'a> Recorder<'a> {
             self.busy,
             self.uncertain,
             synthetic,
+            grant_request_id,
         )
     }
     fn audit(&mut self, value: &Value) -> io::Result<Received> {
         let mut raw = encode(value)?;
         raw.pop();
-        self.record(&raw, raw.len() as u64, true)
+        self.record(&raw, raw.len() as u64, true, None)
     }
     pub fn command(&mut self, command: Command) -> io::Result<()> {
         match command {
             Command::Decide(control) => self.answer(control),
             Command::Close(closings) => self.close(closings),
+            Command::Refused(audit) => {
+                let event = self.audit(&audit)?;
+                publish(event, self.tx, self.cancel)
+            }
         }
     }
     fn answer(&mut self, control: Control) -> io::Result<()> {
@@ -70,22 +81,36 @@ impl<'a> Recorder<'a> {
             .try_send(Input::Decision(control))
             .map_err(|_| io::Error::other("permission writer queue unavailable"))
     }
-    fn close(&mut self, closings: Vec<Closing>) -> io::Result<()> {
+    fn close_records(&mut self, closings: Vec<Closing>) -> io::Result<Vec<Received>> {
         let mut events = Vec::with_capacity(closings.len());
         for closing in closings {
             events.push(self.audit(&closing.audit)?);
             self.controls.book.lock().closed(&closing.id);
         }
-        // Durability and gate updates precede notification, so a full queue or
-        // cancelled receiver cannot leave a replay with half its requests open.
-        for event in events {
+        Ok(events)
+    }
+    fn close(&mut self, closings: Vec<Closing>) -> io::Result<()> {
+        // Persist every close before any notification can block or be cancelled.
+        for event in self.close_records(closings)? {
             publish(event, self.tx, self.cancel)?;
         }
         Ok(())
     }
     pub fn finish(&mut self) -> io::Result<()> {
+        // Terminal reservation excludes new decisions/refusals under the same
+        // book lock used by admission, so all admitted refusals are now queued.
         let closings = self.controls.book.lock().terminal();
-        self.close(closings)
+        let mut events = Vec::new();
+        while let Ok(command) = self.controls.decisions.try_recv() {
+            if let Command::Refused(audit) = command {
+                events.push(self.audit(&audit)?);
+            }
+        }
+        events.extend(self.close_records(closings)?);
+        for event in events {
+            publish(event, self.tx, self.cancel)?;
+        }
+        Ok(())
     }
     pub fn observed(
         &mut self,
@@ -182,17 +207,17 @@ impl<'a> Recorder<'a> {
                 _ => (),
             }
         }
-        let raw = self.record(line, count, false)?;
+        let grant_request_id = pending_answer
+            .as_ref()
+            .and_then(|answer| answer.audit.get("grant_request_id"))
+            .and_then(Value::as_str);
+        let raw = self.record(line, count, false, grant_request_id)?;
         // Persist open before publishing raw: cancellation at either notification
         // must still leave an open record for the terminal close to match.
         let opened = open.as_ref().map(|audit| self.audit(audit)).transpose()?;
         // Result/cancel retire requests before their raw notification is visible.
         // close() persists every close before attempting its first notification.
-        let mut closed = Vec::new();
-        for closing in closings {
-            closed.push(self.audit(&closing.audit)?);
-            self.controls.book.lock().closed(&closing.id);
-        }
+        let closed = self.close_records(closings)?;
         publish(raw, self.tx, self.cancel)?;
         if let Some(event) = opened {
             publish(event, self.tx, self.cancel)?;

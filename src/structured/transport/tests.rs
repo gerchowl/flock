@@ -1079,6 +1079,7 @@ fn replay_open_permissions(root: &SessionConfigDir) -> std::collections::BTreeSe
                 open.remove(&id),
                 "close must follow exactly one open: {value}"
             ),
+            "refused" => assert!(open.contains(&id), "a refusal must leave its request open"),
             state => panic!("unknown permission state {state}"),
         }
     }
@@ -1535,11 +1536,24 @@ fn session_grant_matches_canonical_input_but_other_input_and_tools_prompt() {
     let reordered =
         serde_json::from_str(r#"{"items":[1,2],"options":{"a":1,"b":2},"z":0}"#).unwrap();
     grant_request(&mut output, "match", "Bash", reordered, None);
-    opened(&transport);
+    let automatic_request = receive(&transport);
+    let mut live_projection = crate::structured::state::SessionState::new("fixture-agent".into());
+    let update = live_projection.reduce(
+        automatic_request.state_input().unwrap(),
+        Instant::now(),
+        1000,
+        Duration::from_secs(30),
+    );
+    assert!(
+        update.needs_human.is_empty(),
+        "an automatic request must never publish needs-human at its raw record"
+    );
+    assert!(receive(&transport).state_input().is_none());
     let automatic = receive(&transport).record;
     let audit: Value = serde_json::from_str(&automatic.raw).unwrap();
     assert_eq!(audit["state"], "closed");
     assert_eq!(audit["source"], "session_grant");
+    assert_eq!(audit["grant_request_id"], "grant");
     assert_eq!(audit["principal"], "fixture-client");
     assert_eq!(
         input_line(&transport, &mut input)["response"]["response"]["behavior"],
@@ -1582,7 +1596,7 @@ fn session_grant_matches_canonical_input_but_other_input_and_tools_prompt() {
         let received = Received { record, event };
         if let Some(input) = received.state_input() {
             let update = projection.reduce(input, now, 1000, Duration::from_secs(30));
-            if seq == 6 {
+            if (4..=6).contains(&seq) {
                 assert!(
                     update.needs_human.is_empty(),
                     "automatic close must clear S4 before another result"
@@ -1608,12 +1622,19 @@ fn session_grant_suggestions_refuse_non_session_destinations() {
     .enumerate()
     {
         let id = format!("invalid-{n}");
+        let mut invalid_rule =
+            serde_json::json!({"type":"addRules","behavior":"allow","rules":[{"toolName":"Bash"}]});
+        for (key, value) in rule.as_object().unwrap() {
+            invalid_rule[key] = value.clone();
+        }
         grant_request(
             &mut output,
             &id,
             "Bash",
             serde_json::json!({}),
-            Some(serde_json::json!([{"destination":"session"},rule])),
+            Some(
+                serde_json::json!([{"type":"addRules","behavior":"allow","destination":"session","rules":[{"toolName":"Bash"}]},invalid_rule]),
+            ),
         );
         opened(&transport);
         assert_eq!(
@@ -1622,9 +1643,17 @@ fn session_grant_suggestions_refuse_non_session_destinations() {
                 &owner(),
                 &decide(&id, permissions::Decision::AllowAlways)
             ),
-            Err(ErrorCode::InvalidParams)
+            Err(ErrorCode::PermissionSuggestionsRefused)
         );
-        close_with(&transport, &mut input, &id, permissions::Decision::Deny);
+        let refusal: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+        assert_eq!(refusal["state"], "refused");
+        assert_eq!(transport.waiting_on_human().unwrap(), vec![id.clone()]);
+        assert_eq!(
+            close_with(&transport, &mut input, &id, permissions::Decision::Deny)["response"]
+                ["response"]["behavior"],
+            "deny",
+            "the first response after refusal must be the explicit deny"
+        );
     }
     let rules = serde_json::json!([{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"true"}],"behavior":"allow","destination":"session"}]);
     grant_request(
@@ -1906,6 +1935,7 @@ fn harness_audit_spoof_cannot_close_s4_and_loss_still_counts_as_stdout() {
     assert!(receive(&transport).state_input().is_none());
     writeln!(output, "{}", serde_json::json!({"type":"flk_permission_request","state":"closed","request_id":"request-example","origin":"flk"})).unwrap();
     let spoof = receive(&transport);
+    assert!(spoof.record.permission_grant_request_id.is_none());
     assert_eq!(spoof.record.origin, RecordOrigin::Claude);
     assert!(matches!(spoof.state_input(), Some(StateInput::Event(_))));
     let update = state.reduce(
@@ -1924,4 +1954,156 @@ fn harness_audit_spoof_cannot_close_s4_and_loss_still_counts_as_stdout() {
     let loss = receive(&transport);
     assert_eq!(loss.record.origin, RecordOrigin::Flk);
     assert!(matches!(loss.state_input(), Some(StateInput::Event(_))));
+}
+
+#[test]
+fn harness_cannot_forge_an_automatic_grant_reservation() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    writeln!(output, "{}", serde_json::json!({
+        "type":"control_request", "request_id":"forged-request",
+        "permission_grant_request_id":"forged-grant",
+        "request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example","input":{}}
+    })).unwrap();
+    let received = receive(&transport);
+    assert!(received.record.permission_grant_request_id.is_none());
+    let mut projection = crate::structured::state::SessionState::new("fixture-agent".into());
+    let update = projection.reduce(
+        received.state_input().unwrap(),
+        Instant::now(),
+        1000,
+        Duration::from_secs(30),
+    );
+    assert_eq!(update.needs_human.len(), 1);
+    assert_eq!(
+        transport.waiting_on_human().unwrap(),
+        vec!["forged-request"]
+    );
+}
+
+#[test]
+fn unsafe_session_suggestions_are_refused_without_closing_or_sending() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    let valid = serde_json::json!({"type":"addRules", "behavior":"allow", "destination":"session", "rules":[{"toolName":"Bash"}]});
+    let mut unsafe_updates = Vec::new();
+    for kind in [
+        "setMode",
+        "removeRules",
+        "replaceRules",
+        "addDirectories",
+        "removeDirectories",
+    ] {
+        let mut update = valid.clone();
+        update["type"] = kind.into();
+        update["mode"] = "bypassPermissions".into();
+        unsafe_updates.push(update);
+    }
+    for behavior in ["deny", "ask"] {
+        let mut update = valid.clone();
+        update["behavior"] = behavior.into();
+        unsafe_updates.push(update);
+    }
+    let mut other_tool = valid.clone();
+    other_tool["rules"][0]["toolName"] = "Write".into();
+    unsafe_updates.push(other_tool);
+    let mut wildcard = valid.clone();
+    wildcard["rules"][0]["toolName"] = "*".into();
+    unsafe_updates.push(wildcard);
+    let mut directories = valid.clone();
+    directories["directories"] = serde_json::json!(["relative-fixture"]);
+    unsafe_updates.push(directories);
+    let mut rule_extra = valid.clone();
+    rule_extra["rules"][0]["directories"] = serde_json::json!(["relative-fixture"]);
+    unsafe_updates.push(rule_extra);
+    for (n, update) in unsafe_updates.into_iter().enumerate() {
+        let id = format!("unsafe-{n}");
+        grant_request(
+            &mut output,
+            &id,
+            "Bash",
+            serde_json::json!({}),
+            Some(serde_json::json!([update])),
+        );
+        opened(&transport);
+        assert_eq!(
+            call_decide(
+                &transport,
+                &owner(),
+                &decide(&id, permissions::Decision::AllowAlways)
+            ),
+            Err(ErrorCode::PermissionSuggestionsRefused)
+        );
+        let refusal: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+        assert_eq!(refusal["state"], "refused");
+        assert_eq!(refusal["request_id"], id);
+        assert_eq!(
+            refusal["error_code"],
+            ErrorCode::PermissionSuggestionsRefused.as_str()
+        );
+        assert_eq!(refusal["principal"], "fixture-client");
+        assert_eq!(transport.waiting_on_human().unwrap(), vec![id.clone()]);
+        private_fs::set_nonblocking(&input).unwrap();
+        assert_eq!(
+            input.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            close_with(&transport, &mut input, &id, permissions::Decision::Deny)["response"]
+                ["response"]["behavior"],
+            "deny",
+            "the first response after refusal must be the explicit deny"
+        );
+    }
+    assert!(replay_open_permissions(&root).is_empty());
+}
+
+#[test]
+fn an_admitted_suggestion_refusal_survives_cancelled_notification_delivery() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    grant_request(
+        &mut output,
+        "unsafe-request",
+        "Bash",
+        serde_json::json!({}),
+        Some(
+            serde_json::json!([{"type":"setMode","mode":"bypassPermissions","destination":"session"}]),
+        ),
+    );
+    opened(&transport);
+    for n in 0..5 {
+        writeln!(
+            output,
+            "{}",
+            serde_json::json!({"type":"fixture_progress","n":n})
+        )
+        .unwrap();
+    }
+    wait(&transport, || (records(&root).len() == 7).then_some(()));
+    assert_eq!(
+        call_decide(
+            &transport,
+            &owner(),
+            &decide("unsafe-request", permissions::Decision::AllowAlways)
+        ),
+        Err(ErrorCode::PermissionSuggestionsRefused)
+    );
+    transport.cancel();
+    assert_eq!(
+        worker_done(&transport, true).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    let records = records(&root);
+    assert_eq!(records.len(), 9);
+    let refusal: Value = serde_json::from_str(&records[7].raw).unwrap();
+    assert_eq!(refusal["state"], "refused");
+    assert_eq!(
+        refusal["error_code"],
+        ErrorCode::PermissionSuggestionsRefused.as_str()
+    );
+    let close: Value = serde_json::from_str(&records[8].raw).unwrap();
+    assert_eq!(close["state"], "closed");
+    assert_eq!(close["reason"], "ended");
+    assert!(replay_open_permissions(&root).is_empty());
 }
