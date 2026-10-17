@@ -176,11 +176,13 @@ impl App {
     /// mesh relay. It fails closed: a caller whose pid the socket could not
     /// read is not the operator.
     ///
-    /// Cooperative only until O19a (#1208, #1177, ADR-0035 §6.3 point 6): an
-    /// agent's detached (`setsid`) child has no pane in its ancestry and
-    /// passes (ADR-0027 §1a).
+    /// Kernel UID is checked before ancestry (ADR-0036 §1a): detached dedicated
+    /// agents never become operators. Same-UID PTYs remain cooperative (#1177).
     pub(super) fn caller_is_local_operator(&mut self) -> bool {
-        self.lease_caller() == crate::structured::lease::Caller::Unrelated
+        self.current_api_peer_uid.is_none_or(|uid| {
+            self.runtime_config.uid_policy.classify(uid)
+                == crate::structured::identity::Principal::Operator
+        }) && self.lease_caller() == crate::structured::lease::Caller::Unrelated
             && self.current_api_peer_pid.is_some()
             && self.caller_pane_candidate().is_none()
             && self

@@ -89,8 +89,14 @@ impl App {
             }
             Err(respond_to) => respond_to,
         };
-        if let Some((request, peer_pid, peer_birth)) = self.pending_recovery_park.take() {
-            self.park_until_mesh_recovered(request, peer_pid, peer_birth, respond_to);
+        if let Some((request, caller)) = self.pending_recovery_park.take() {
+            self.park_until_mesh_recovered(
+                request,
+                caller.pid,
+                caller.birth,
+                caller.uid,
+                respond_to,
+            );
             return;
         }
         if let Some(mut relay) = self.message_relays.pending.take() {
@@ -306,8 +312,7 @@ mod tests {
     async fn unproven_pane_is_refused_as_an_ssh_relay() {
         const CHILD: &str = "FLOCK_TEST_OWNED_SSH_DRIVER";
         if std::env::var_os(CHILD).is_none() {
-            let root =
-                crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+            let root = crate::test_support::TempDir::socket();
             let executable = root.path().join("sshd");
             // Rename our own test executable: copied system shells cannot stand
             // in for sshd under the macOS process-name restrictions.
@@ -341,6 +346,12 @@ mod tests {
                 "owned SSH driver failed: {result:?}"
             );
             worker.join().unwrap();
+            let fixture_path = root.path().to_owned();
+            drop(root);
+            assert!(
+                !fixture_path.exists(),
+                "owned executable fixture must be removed"
+            );
             return;
         }
         assert!(crate::platform::process_name(std::process::id())

@@ -358,8 +358,9 @@ impl App {
     /// Classify the caller of a spawn-shaped request (#349).
     ///
     /// An AGENT is a caller whose process ancestry lands in a live pane that
-    /// is running one. Anything else — a shell pane, an operator's terminal
-    /// outside flock, a caller ancestry cannot place at all — is the operator,
+    /// is running one. Dedicated and unknown socket UIDs cannot be operators.
+    /// For the operator UID, a shell pane or an operator's terminal
+    /// outside flock is the operator,
     /// because none of them is an agent whose children the ceiling is counting.
     ///
     /// The pane the ancestry landed in rides along (#398) rather than being
@@ -402,6 +403,16 @@ impl App {
                 pane_id,
                 agent_id,
             },
+            None if self.current_api_peer_uid.is_some_and(|uid| {
+                self.runtime_config.uid_policy.classify(uid)
+                    == crate::structured::identity::Principal::Agent
+            }) =>
+            {
+                SpawnCaller::Structured {
+                    agent_id: None,
+                    depth: 0,
+                }
+            }
             None => SpawnCaller::Operator {
                 pane: Some((ws_idx, pane_id)),
             },
