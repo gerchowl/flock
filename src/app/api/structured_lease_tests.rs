@@ -278,6 +278,7 @@ async fn queued_socket_requests_with_reused_birth_never_become_operator() {
             respond_to,
             peer_pid: Some(pid),
             peer_birth,
+            peer_uid: Some(crate::platform::peer::effective_uid()),
         });
         let response: serde_json::Value =
             serde_json::from_str(&response.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
@@ -310,6 +311,7 @@ async fn recovery_parked_requests_preserve_original_peer_birth() {
         },
         Some(pid),
         Some(Some(birth.wrapping_add(1))),
+        None,
         respond_to,
     );
     app.replay_recovery_parked();

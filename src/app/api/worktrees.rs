@@ -1827,7 +1827,10 @@ mod tests {
             None,
             api_rx,
             event_hub,
-            crate::app::AppRuntimeConfig { merge_gate },
+            crate::app::AppRuntimeConfig {
+                merge_gate,
+                ..Default::default()
+            },
         )
     }
 

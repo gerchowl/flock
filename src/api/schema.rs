@@ -333,6 +333,7 @@ impl Method {
     /// Can this request be sent again after a transport error that left its
     /// fate unknown (#910)?
     ///
+    /// The anonymous-UID boundary also relies on this being reads/previews only.
     /// Only reads qualify: a read timeout on a write says nothing about
     /// whether the server applied it, and sending a `pane.close` twice turns
     /// "closed" into `pane_not_found`. `msg.read` is left out on purpose, it
