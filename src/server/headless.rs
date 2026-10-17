@@ -957,7 +957,7 @@ impl HeadlessServer {
             };
 
             match event {
-                LoopEvent::InputWrites => self.app.input_writes.service(),
+                LoopEvent::InputWrites => self.app.service_input_writes(),
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
                     if self.handle_internal_event_with_forwarding(ev) {
@@ -3757,6 +3757,7 @@ impl HeadlessServer {
     /// would never see the fault that only the server can have.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         self.app.input_writes.service_due(now);
+        self.app.start_ready_pastes();
         let mut changed = false;
 
         self.app.sync_headless_animation_timer(now);

@@ -246,7 +246,6 @@ pub struct App {
     /// Operator drafts an injection could not type back (#850).
     pub(crate) kept_drafts: std::cell::RefCell<draft_stash::KeptDrafts>,
     /// Plain paste observation parked by `respond_or_park` after dispatch.
-    pub(crate) pending_paste: Option<paste_confirm::Paste>,
     /// `integration.install`, answered from a worker thread by
     /// `respond_or_park`, because installing Claude probes `claude --version`.
     pub(crate) pending_integration_install: Option<api::integrations::PendingInstall>,
@@ -1048,7 +1047,6 @@ impl App {
             inbound: Default::default(),
             message_relays: Default::default(),
             pending_agent_submit: None,
-            pending_paste: None,
             pending_integration_install: None,
             claude_version_probe: std::sync::Arc::new(crate::integration::probe_claude_version),
             active_submissions: Default::default(),
@@ -1635,7 +1633,7 @@ impl App {
             };
 
             match event {
-                LoopEvent::InputWrites => self.input_writes.service(),
+                LoopEvent::InputWrites => self.service_input_writes(),
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
                     self.handle_internal_event_with_prefix_sync(ev);
