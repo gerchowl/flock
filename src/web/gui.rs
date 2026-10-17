@@ -109,6 +109,26 @@ fn immutable(path: &str) -> bool {
         && extension.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// Restrict the document to bundled resources and its listener's transport.
+///
+/// CSP3's `'self'` includes same-host/port WebSockets. An explicit IPv4 source
+/// also supports browsers with older matching rules. IPv6 literals are invalid
+/// CSP host sources, so IPv6 uses `'self'` and fails closed on older browsers.
+fn document_policy(authority: &str) -> axum::http::HeaderValue {
+    let websocket = if authority.starts_with('[') {
+        String::new()
+    } else {
+        format!(" ws://{authority}/v1/ws")
+    };
+    format!(
+        "default-src 'self'; script-src 'self'; style-src 'self'; \
+         connect-src 'self'{websocket}; object-src 'none'; base-uri 'none'; \
+         frame-ancestors 'none'; form-action 'none'"
+    )
+    .parse()
+    .expect("numeric listener authority produces a valid CSP header")
+}
+
 fn content_type(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or_default() {
         "html" => "text/html; charset=utf-8",
@@ -187,6 +207,9 @@ async fn serve<A: RustEmbed>(
         file.data.into_owned().into_response()
     };
     let output = response.headers_mut();
+    if path == "index.html" {
+        output.insert(header::CONTENT_SECURITY_POLICY, document_policy(&authority));
+    }
     output.insert(
         header::CACHE_CONTROL,
         cache.parse().expect("constant cache header"),

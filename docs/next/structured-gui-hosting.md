@@ -50,6 +50,37 @@ Requests without browser metadata are allowed when Host matches. This minimal
 listener does not support hostname aliases, proxy origins or TLS termination.
 Serving the static bundle does not grant token scopes or mutation authority.
 
+## Document security policy
+
+The entry document (`/` and `/index.html`) sends an enforcing
+`Content-Security-Policy` on GET, HEAD and conditional 304 responses:
+
+```text
+default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://<listener-authority>/v1/ws; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'
+```
+
+The explicit WebSocket source uses the actual numeric IPv4 listener address and
+port, never the request's Host or Origin. It supplements `'self'` for browsers
+whose same-origin matching does not include WebSockets. IPv6 documents omit
+that extra source: literal IPv6 addresses are invalid CSP host sources, so they
+rely on CSP3's same-host/port WebSocket matching for `'self'`. Browsers without
+that matching fail closed on IPv6; use the IPv4 listener with those browsers.
+The policy allows same-origin HTTP API requests and the loopback WebSocket;
+it does not grant token scopes or replace transport origin/auth checks.
+
+The production Vite bundle uses external same-origin module scripts and CSS.
+Inline scripts, event handlers, styles and string evaluation are blocked;
+there is no `unsafe-inline` or `unsafe-eval` exception. The standalone fixture
+preview's inlined bundle is not a production hosting input. A browser-shell
+bootstrap that injects configuration must use an external same-origin script
+or add a hash for its exact inline bytes; this router does not inject one.
+Objects, base-URL overrides, framing by another page and form submissions are
+blocked. Artifact sandbox policies remain separate (ADR-0038 §7).
+
+The [CSP3 source-matching rules](https://www.w3.org/TR/CSP3/#match-url-to-source-expression)
+define WebSocket matching; [MDN's connect-src reference](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/connect-src)
+notes the browser difference for `'self'`.
+
 ## Paths and caching
 
 - `/` and `/index.html` serve the entry document with `Cache-Control: no-cache`

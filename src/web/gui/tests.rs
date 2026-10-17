@@ -25,9 +25,10 @@ impl Server {
         Self::with(router_for::<A>).await
     }
     async fn with(make: impl FnOnce(SocketAddr) -> io::Result<Router>) -> Self {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
+        Self::on("127.0.0.1:0".parse().unwrap(), make).await
+    }
+    async fn on(bind: SocketAddr, make: impl FnOnce(SocketAddr) -> io::Result<Router>) -> Self {
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = make(address).unwrap();
         let task = tokio::spawn(async move {
@@ -335,4 +336,44 @@ async fn non_vite_suffix_lookalike_revalidates_over_http() {
 #[test]
 fn authority_without_http1_host_is_refused() {
     assert!(!origin_allowed(&HeaderMap::new(), "127.0.0.1:80"));
+}
+
+#[tokio::test]
+async fn index_csp_restricts_scripts_and_connections_and_survives_head_and_304() {
+    let server = Server::start::<Fixture>().await;
+    let expected = format!(
+        "default-src 'self'; script-src 'self'; style-src 'self'; \
+         connect-src 'self' ws://{}/v1/ws; object-src 'none'; base-uri 'none'; \
+         frame-ancestors 'none'; form-action 'none'",
+        server.address
+    );
+    for path in ["/", "/index.html?policy=1"] {
+        let (status, headers, _) = server.request("GET", path, "").await;
+        assert_eq!(status, 200);
+        assert_eq!(headers[header::CONTENT_SECURITY_POLICY], expected);
+        let conditional = format!(
+            "If-None-Match: {}\r\n",
+            headers[header::ETAG].to_str().unwrap()
+        );
+        for (method, extra, status) in [("HEAD", "", 200), ("GET", conditional.as_str(), 304)] {
+            let (actual, headers, body) = server.request(method, path, extra).await;
+            assert_eq!(actual, status);
+            assert_eq!(headers[header::CONTENT_SECURITY_POLICY], expected);
+            assert!(body.is_empty());
+        }
+    }
+    let (_, headers, _) = server.request("GET", "/assets/main-AbCd-E_1.js", "").await;
+    assert!(!headers.contains_key(header::CONTENT_SECURITY_POLICY));
+}
+
+#[tokio::test]
+async fn ipv6_index_csp_uses_self_without_invalid_literal_or_wildcard_sources() {
+    let server = Server::on("[::1]:0".parse().unwrap(), router_for::<Fixture>).await;
+    let (status, headers, _) = server.request("GET", "/", "").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers[header::CONTENT_SECURITY_POLICY],
+        "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; \
+         object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+    );
 }
