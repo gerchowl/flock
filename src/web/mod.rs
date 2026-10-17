@@ -20,6 +20,7 @@
 //!   3. same-origin check on the WS upgrade (CSWSH defence).
 
 pub(crate) mod client_exchange;
+pub(crate) mod gui;
 pub(crate) mod store_io;
 // The listener slice mounts this independently tested protocol core.
 #[allow(dead_code)]
@@ -55,7 +56,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Local aliases for the defaults, now sourced from [`crate::config`] so the
-/// [`crate::config::model::WebSectionConfig`] and this file agree on the same numbers (ADR-0002
+/// [`WebSectionConfig`](crate::config::model::WebSectionConfig) and this file agree on the same numbers (ADR-0002
 /// phase e).
 const DEFAULT_BIND: &str = CONFIG_DEFAULT_BIND;
 const DEFAULT_MAX_SESSIONS: usize = CONFIG_DEFAULT_MAX_SESSIONS;
