@@ -1296,6 +1296,7 @@ impl HeadlessServer {
         }
 
         let snapshot = crate::persist::capture(
+            &self.app.state.structured_agents,
             &self.app.state.workspaces,
             &self.app.state.terminals,
             &self.app.terminal_runtimes,
