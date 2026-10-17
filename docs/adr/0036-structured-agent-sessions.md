@@ -993,10 +993,26 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   type the client's protocol predates without the §8 unknown wrapper.
 - **Auth.** Every client presents a bearer token in `hello`; the address it
   connects from grants nothing (§1a). The operator's own browser gets an
-  `operator`-scoped token through `flk client open`, which runs over the
+  `operate`-scoped token through `flk client open`, which runs over the
   unix socket (so `caller_is_local_operator()` and the uid check of §1a
-  apply), mints a one-time code, and opens the client with it; the client
-  exchanges the code for its session token once. Tokens follow the channel-token model of ADR-0028 §8
+  apply), mints a one-time code, and opens the client in a new browser tab or
+  window; the client
+  exchanges the code for its session token once. The code contains 256 bits of
+  randomness encoded as 64 lowercase hex characters, is bound to that token,
+  exists only in server memory, is single
+  use, and expires at age 60 seconds. `flk client open --print` prints the
+  loopback URL rather than launching the browser. The code is carried only in
+  the URL fragment (`#code=…`), never the query, so it is absent from HTTP
+  request targets and Referer. The browser consumes that fragment and sends
+  `POST /v1/client/exchange` with JSON `{ "code": "…" }`; the loopback-only,
+  same-origin endpoint returns `{ "token": "…" }` exactly once, with
+  `Cache-Control: no-store`. Used, expired and unknown codes get one uniform
+  401; failed exchanges are rate limited. Cross-origin and non-loopback
+  requests are refused, and neither codes nor tokens enter diagnostic logs.
+  The token then travels in the unchanged normal `hello` frame.
+  The served client derives its server and transport from its own location
+  (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.
+  Tokens follow the channel-token model of ADR-0028 §8
   (`src/channels.rs`): 32 random bytes as 64 hex digits, one file per client
   under `<data dir>/client-tokens/<name>.token`, mode 0600 in a 0700 dir,
   compared as SHA-256 digests in constant time, never logged, revoked by
