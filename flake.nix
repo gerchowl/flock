@@ -61,9 +61,13 @@
             # Until #1731 lands, missing assets receive the typed HTTP 503.
             guiDist = self.packages.${system}.flock-client or null;
           };
+          # The web client's production bundle (web/client/dist), built offline
+          # from a fixed-output fetch of bun.lock (#1731). Only the bundle:
+          # S7-min slice 7a embeds it in `flk`.
+          flock-client = pkgs.callPackage ./nix/client.nix { };
         in
         {
-          inherit flock flock-web;
+          inherit flock flock-web flock-client;
           default = flock;
         }
       );
@@ -83,6 +87,7 @@
         in
         {
           flock = self.packages.${system}.default;
+          flock-client = self.packages.${system}.flock-client;
           sccache =
             pkgs.runCommand "flock-sccache-probe"
               {
