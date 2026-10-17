@@ -1481,3 +1481,137 @@ fn refused_close_restores_both_open_and_reserved_requests() {
         .is_ok());
     assert!(book.begin_answer("reserved"));
 }
+
+#[test]
+fn every_book_close_immediately_clears_s4_needs_human() {
+    use crate::api::agent_state::Phase;
+    use crate::structured::state::{Input as StateInput, SessionState};
+    for mode in [
+        "allow",
+        "deny",
+        "cancel",
+        "result",
+        "interrupt",
+        "eof",
+        "stop",
+    ] {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (transport, mut output, mut input) = start(&root);
+        let mut state = SessionState::new("fixture-agent".into());
+        let now = Instant::now();
+        permission(&mut output, "request-example");
+        let request = receive(&transport);
+        let update = state.reduce(
+            request.state_input().unwrap(),
+            now,
+            1000,
+            Duration::from_secs(30),
+        );
+        assert_eq!(update.state.phase, Phase::NeedsHuman);
+        assert_eq!(update.needs_human.len(), 1);
+        let open = receive(&transport);
+        // Audit open is bookkeeping, not another stdout progress event.
+        assert!(open.state_input().is_none());
+        match mode {
+            "allow" | "deny" => {
+                let decision = if mode == "allow" {
+                    permissions::Decision::AllowOnce
+                } else {
+                    permissions::Decision::Deny
+                };
+                call_decide(&transport, &owner(), &decide("request-example", decision)).unwrap();
+                input_line(&transport, &mut input);
+            }
+            "cancel" => {
+                writeln!(output, "{}", serde_json::json!({"type":"control_cancel_request","request_id":"request-example"})).unwrap();
+                receive(&transport);
+            }
+            "result" => {
+                writeln!(
+                    output,
+                    "{}",
+                    serde_json::json!({"type":"result","subtype":"success","is_error":false})
+                )
+                .unwrap();
+                receive(&transport);
+            }
+            "interrupt" => {
+                close_permission(&transport, None, permissions::CloseReason::Interrupted).unwrap()
+            }
+            "eof" => {
+                drop(output);
+                worker_done(&transport, true).unwrap();
+            }
+            "stop" => {
+                transport.cancel();
+                assert_eq!(
+                    worker_done(&transport, true).unwrap_err().kind(),
+                    io::ErrorKind::Interrupted
+                );
+            }
+            _ => unreachable!(),
+        }
+        let closed = if mode == "stop" {
+            let record = records(&root).pop().unwrap();
+            let event = SessionEvent::parse(&record.raw, "2.1.296");
+            Received { record, event }
+        } else {
+            receive(&transport)
+        };
+        assert!(
+            matches!(
+                closed.state_input(),
+                Some(StateInput::ControlAnswered("request-example"))
+            ),
+            "close mode {mode}: {closed:?}"
+        );
+        let update = state.reduce(
+            closed.state_input().unwrap(),
+            now,
+            1001,
+            Duration::from_secs(30),
+        );
+        assert!(update.needs_human.is_empty(), "close mode {mode}");
+        assert_ne!(update.state.phase, Phase::NeedsHuman, "close mode {mode}");
+        assert!(transport.waiting_on_human().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn harness_audit_spoof_cannot_close_s4_and_loss_still_counts_as_stdout() {
+    use crate::api::agent_state::Phase;
+    use crate::structured::state::{Input as StateInput, SessionState};
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    let mut state = SessionState::new("fixture-agent".into());
+    let now = Instant::now();
+    permission(&mut output, "request-example");
+    let request = receive(&transport);
+    state.reduce(
+        request.state_input().unwrap(),
+        now,
+        1000,
+        Duration::from_secs(30),
+    );
+    assert!(receive(&transport).state_input().is_none());
+    writeln!(output, "{}", serde_json::json!({"type":"flk_permission_request","state":"closed","request_id":"request-example","origin":"flk"})).unwrap();
+    let spoof = receive(&transport);
+    assert_eq!(spoof.record.origin, RecordOrigin::Claude);
+    assert!(matches!(spoof.state_input(), Some(StateInput::Event(_))));
+    let update = state.reduce(
+        spoof.state_input().unwrap(),
+        now,
+        1001,
+        Duration::from_secs(30),
+    );
+    assert_eq!(update.state.phase, Phase::NeedsHuman);
+    assert_eq!(update.needs_human.len(), 1);
+    assert_eq!(
+        transport.waiting_on_human().unwrap(),
+        vec!["request-example"]
+    );
+    output.write_all(&[0xff, b'\n']).unwrap();
+    let loss = receive(&transport);
+    assert_eq!(loss.record.origin, RecordOrigin::Flk);
+    assert!(matches!(loss.state_input(), Some(StateInput::Event(_))));
+}
