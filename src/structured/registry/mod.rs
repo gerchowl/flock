@@ -292,6 +292,25 @@ impl Registry {
         }
     }
 
+    /// Carry uncertainty across further handoffs even when no worker was restored.
+    pub(crate) fn handoff_unknown(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| entry.projection.update.state.lifecycle == Lifecycle::Unknown)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Restore only the exporter's uncertainty, without a process, lease or resume.
+    pub(crate) fn restore_handoff_unknown(&mut self, ids: &[String]) {
+        for id in ids {
+            if let Some(entry) = self.entries.get_mut(id) {
+                entry.reducer.set_initial_lifecycle(Lifecycle::Unknown);
+                entry.projection.update.state = AgentState::unknown();
+            }
+        }
+    }
+
     /// Inactive retained entries, for diagnostics without exposing raw payloads.
     /// Slice (a) has no structured status/doctor route; #1843 owns public routing.
     pub fn retained_count(&self) -> usize {

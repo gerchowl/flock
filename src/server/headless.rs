@@ -985,13 +985,6 @@ impl HeadlessServer {
             }
         }
 
-        self.stop_structured_before_handoff()?;
-
-        // Save session on exit.
-        if !self.app.no_session {
-            self.app.save_session_now();
-        }
-
         info!("headless server exiting");
         Ok(())
     }
@@ -1159,11 +1152,15 @@ impl HeadlessServer {
 
     /// S3a-3 deliberately stops structured sessions before transferring ownership.
     /// Full single-writer session handoff belongs to S7-rest.
-    fn stop_structured_before_handoff(&mut self) -> io::Result<()> {
-        self.app
+    fn stop_structured_before_handoff(&mut self) -> Vec<String> {
+        if let Err(error) = self
+            .app
             .structured_workers
             .shutdown(&mut self.app.state.structured_agents)
-            .map_err(io::Error::other)
+        {
+            crate::logging::structured_worker_shutdown_failed(&error);
+        }
+        self.app.state.structured_agents.handoff_unknown()
     }
 
     #[cfg(unix)]
@@ -1191,7 +1188,7 @@ impl HeadlessServer {
             );
             return Err(HandoffError::SessionBroken);
         }
-        self.stop_structured_before_handoff()?;
+        let structured_unknown = self.stop_structured_before_handoff();
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
@@ -1360,6 +1357,7 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
         );
+        manifest.structured_unknown = structured_unknown;
         manifest.store_generation = store_generation;
         manifest.kept_drafts = self.app.kept_drafts.borrow().export();
         if cfg!(debug_assertions)
@@ -4039,7 +4037,7 @@ impl HeadlessServer {
     fn complete_shutdown(&mut self) -> io::Result<()> {
         info!("completing server shutdown");
         self.app.settle_injections_for_exit();
-        let structured = self.stop_structured_before_handoff();
+        let structured = self.app.finish_session();
 
         // Send ServerShutdown to all remaining clients.
         if !self.clients.is_empty() {
@@ -4063,7 +4061,7 @@ impl HeadlessServer {
         // Remove socket files.
         self.cleanup_sockets()?;
 
-        structured
+        structured.map_err(io::Error::other)
     }
 
     /// Removes socket files created by the server.
@@ -4233,7 +4231,10 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     event_hub.set_read_max_wait_ms(loaded_config.config.events.read_max_wait_ms);
 
     let mut imports = HashMap::new();
-    for (pane, fd) in received.manifest.panes.into_iter().zip(received.fds) {
+    for (pane, fd) in std::mem::take(&mut received.manifest.panes)
+        .into_iter()
+        .zip(received.fds)
+    {
         let pane_id = pane.pane_id;
         imports.insert(
             pane_id,
@@ -4271,6 +4272,9 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
                 return Err(err);
             }
         };
+        received
+            .manifest
+            .restore_structured_unknown(&mut app.state.structured_agents);
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
         app.kept_drafts
@@ -4791,7 +4795,7 @@ mod tests {
             cases.push(case);
         }
         if handoff {
-            server.stop_structured_before_handoff().unwrap();
+            assert!(server.stop_structured_before_handoff().is_empty());
         } else {
             server.complete_shutdown().unwrap();
         }
@@ -4815,6 +4819,149 @@ mod tests {
                 Lifecycle::Offline
             );
         }
+    }
+
+    #[tokio::test]
+    async fn uncertain_worker_reports_but_does_not_veto_handoff_and_crosses_as_unknown() {
+        use crate::api::{agent_state::Lifecycle, error_code::ErrorCode};
+        use crate::structured::workers::tests::Case;
+        let _guard = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        struct SavedEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for SavedEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+        let _env = SavedEnv(
+            [
+                crate::config::CONFIG_PATH_ENV_VAR,
+                "XDG_STATE_HOME",
+                "XDG_CONFIG_HOME",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+        );
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+        let mut server = test_headless_server();
+        let notify = server.app.render_notify.clone();
+        let case = Case::uncertain(
+            &mut server.app.state.structured_agents,
+            &mut server.app.structured_workers,
+            42,
+            &notify,
+        )
+        .await;
+        let (offline, _, _) = Case::prepare(
+            &mut server.app.state.structured_agents,
+            43,
+            "state-reducer",
+            vec![],
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                server.stop_structured_before_handoff(),
+                vec![case.id.clone()]
+            );
+            let error = server
+                .app
+                .structured_workers
+                .shutdown(&mut server.app.state.structured_agents)
+                .unwrap_err();
+            assert!(error
+                .0
+                .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
+            let result = server.perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
+                import_exe: Some(
+                    root.path()
+                        .join("missing-importer")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                expected_protocol: None,
+                expected_version: None,
+                skip_undrained: false,
+            });
+            match result {
+                Err(HandoffError::Failed(error)) => assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::NotFound,
+                    "worker diagnostics must reach the real importer precondition"
+                ),
+                other => panic!("unexpected handoff outcome: {other:?}"),
+            }
+        }
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "workspaces":[],"active":null,"selected":0,"structured_agents":server.app.state.structured_agents,
+        })).unwrap();
+        let mut manifest = crate::server::handoff::manifest_for(snapshot, Vec::new(), None, None);
+        manifest.structured_unknown = server.stop_structured_before_handoff();
+        let manifest: crate::server::handoff::HandoffManifest =
+            serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut restored = crate::app::App::new_from_handoff(
+            &crate::config::Config::default(),
+            None,
+            rx,
+            crate::api::EventHub::default(),
+            &manifest.snapshot,
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        manifest.restore_structured_unknown(&mut restored.state.structured_agents);
+        assert_eq!(
+            restored
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle,
+            Lifecycle::Unknown
+        );
+        assert_eq!(
+            restored
+                .state
+                .structured_agents
+                .get(&offline.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle,
+            Lifecycle::Offline
+        );
+        assert_eq!(
+            restored.state.structured_agents.handoff_unknown(),
+            vec![case.id.clone()],
+            "the next handoff must preserve Unknown without a restored worker"
+        );
+        assert!(restored
+            .structured_workers
+            .runtime(&case.id, case.generation)
+            .is_none());
+        let error = server.complete_shutdown().unwrap_err();
+        let diagnostic = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::structured::workers::ShutdownError>())
+            .expect("quit must keep the typed shutdown diagnostic as its source");
+        assert!(diagnostic
+            .0
+            .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
     }
 
     #[tokio::test]

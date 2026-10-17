@@ -115,6 +115,8 @@ pub struct Workers {
     // Coalesced wake for teardown while the async server loop is quiescent.
     wake: mpsc::SyncSender<()>,
     wakes: mpsc::Receiver<()>,
+    // One teardown per admitted worker set, including failed attempts.
+    shutdown_result: Option<Result<(), ShutdownError>>,
 }
 impl Workers {
     /// Share the app's event wake, including while no client is connected.
@@ -123,6 +125,7 @@ impl Workers {
         Self {
             wake,
             wakes,
+            shutdown_result: None,
             entries: BTreeMap::new(),
             notify,
         }
@@ -244,6 +247,7 @@ impl Workers {
                 let _ = wake.try_send(());
             })
             .map_err(|_| ErrorCode::AgentStartFailed)?;
+        self.shutdown_result = None;
         self.entries.insert(
             agent_id,
             Worker {
@@ -404,11 +408,36 @@ impl Workers {
     /// Stop all sessions before shutdown or handoff. Drain durable book closes,
     /// release confirmed leases, then join. Offline records resume only explicitly.
     /// After the grace deadline kill confirmed child identities and allow a bounded
-    /// cleanup interval. Any diagnostic refuses handoff; uncertain owners stay fenced.
+    /// cleanup interval. Diagnostics are cached and reported without vetoing handoff.
+    /// Uncertain records cross handoff as Unknown; this call never retries teardown.
     pub fn shutdown(&mut self, registry: &mut Registry) -> Result<(), ShutdownError> {
         self.shutdown_until(registry, Duration::from_secs(10), Duration::from_secs(10))
     }
     fn shutdown_until(
+        &mut self,
+        registry: &mut Registry,
+        grace: Duration,
+        cleanup: Duration,
+    ) -> Result<(), ShutdownError> {
+        if let Some(result) = &self.shutdown_result {
+            return result.clone();
+        }
+        let result = self.shutdown_once(registry, grace, cleanup);
+        for (id, worker) in &self.entries {
+            if !worker.finished || worker.report.as_ref().is_some_and(|r| r.authority_retained) {
+                worker.reduce(
+                    registry,
+                    id,
+                    Input::Lifecycle(Lifecycle::Unknown),
+                    Instant::now(),
+                    crate::app::notifications::now_ms(),
+                );
+            }
+        }
+        self.shutdown_result = Some(result.clone());
+        result
+    }
+    fn shutdown_once(
         &mut self,
         registry: &mut Registry,
         grace: Duration,
@@ -488,7 +517,7 @@ impl Workers {
     }
 }
 /// Typed shutdown failures, paired with the affected stable agent identity.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ShutdownError(pub Vec<(String, ErrorCode)>);
 impl std::fmt::Display for ShutdownError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -502,8 +531,14 @@ impl std::fmt::Display for ShutdownError {
 impl std::error::Error for ShutdownError {}
 impl Drop for Workers {
     fn drop(&mut self) {
-        if let Err(error) = self.shutdown(&mut Registry::default()) {
-            crate::logging::structured_worker_shutdown_failed(&error);
+        if self.shutdown_result.is_none() {
+            if let Err(error) = self.shutdown(&mut Registry::default()) {
+                crate::logging::structured_worker_shutdown_failed(&error);
+            }
+        } else {
+            for worker in self.entries.values_mut() {
+                worker.join_finished();
+            }
         }
     }
 }

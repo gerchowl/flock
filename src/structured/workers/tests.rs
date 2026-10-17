@@ -149,6 +149,45 @@ impl Case {
         });
         assert!(closed, "permission close survives runtime shutdown on disk");
     }
+    pub(crate) fn force_shutdown(
+        &self,
+        registry: &mut Registry,
+        workers: &mut Workers,
+    ) -> ShutdownError {
+        workers
+            .shutdown_until(registry, Duration::ZERO, LIMIT)
+            .unwrap_err()
+    }
+    pub(crate) async fn uncertain(
+        registry: &mut Registry,
+        workers: &mut Workers,
+        n: u32,
+        notify: &Arc<Notify>,
+    ) -> Self {
+        let (case, _, _) = Self::prepare(registry, n, "state-reducer", vec![]);
+        let (tx, messages) = mpsc::sync_channel(2);
+        drop(tx);
+        workers.entries.insert(
+            case.id.clone(),
+            Worker {
+                generation: case.generation,
+                messages,
+                runtime: None,
+                stop: StopRequest::default(),
+                report: None,
+                finished: false,
+                events_closed: false,
+                stall_after: STALL,
+                thread: Some(std::thread::spawn(|| {})),
+            },
+        );
+        wait(notify, || {
+            workers.poll(registry, Instant::now(), 1000);
+            workers.report(&case.id, case.generation).is_some()
+        })
+        .await;
+        case
+    }
     pub fn submit(&self, workers: &Workers) {
         workers.runtime(&self.id, self.generation).unwrap().try_submit(&json!({"type":"user","message":{"role":"user","content":"fixture turn"},"parent_tool_use_id":null,"session_id":""})).unwrap();
     }
@@ -756,4 +795,44 @@ async fn fake_harness_preparation_panic_has_a_distinct_typed_failure_and_is_join
         registry.get(&a.id).unwrap().1.update.state.lifecycle,
         Lifecycle::Offline
     );
+}
+
+#[test]
+fn drop_after_failed_shutdown_does_not_wait_a_second_time() {
+    let (mut registry, mut workers, _, _) = owner();
+    let (_case, launch, factory) = Case::prepare(&mut registry, 44, "state-reducer", vec![]);
+    let (entered_tx, entered) = mpsc::sync_channel(1);
+    let (release, released) = mpsc::sync_channel(1);
+    workers
+        .start(&mut registry, launch, move |record| {
+            entered_tx.send(()).unwrap();
+            // The test owns the sender and releases it even when the deadline fails.
+            let _ = released.recv();
+            factory(record)
+        })
+        .unwrap();
+    entered.recv_timeout(LIMIT).unwrap();
+    let error = workers
+        .shutdown_until(&mut registry, Duration::ZERO, Duration::ZERO)
+        .unwrap_err();
+    assert_eq!(error.0[0].1, ErrorCode::StructuredWorkerTimeout);
+    // Retain the owning handle so the fixture can join after releasing preparation.
+    let worker = workers
+        .entries
+        .values_mut()
+        .next()
+        .unwrap()
+        .thread
+        .take()
+        .unwrap();
+    let (finished, completion) = mpsc::sync_channel(1);
+    let dropper = std::thread::spawn(move || {
+        drop(workers);
+        finished.send(()).unwrap();
+    });
+    let result = completion.recv_timeout(LIMIT);
+    release.send(()).unwrap();
+    worker.join().unwrap();
+    dropper.join().unwrap();
+    result.expect("Drop must not repeat the full teardown after its deadline");
 }
