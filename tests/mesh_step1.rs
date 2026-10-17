@@ -148,7 +148,10 @@ fn diagnose_pane(node: &Node, pane: &str, output: &std::path::Path) -> String {
         ),
         raw("peers.enrollment", json!({})),
     );
-    for dir in [node.config_home.join("flock-dev"), node.home.join("data")] {
+    for dir in [
+        node.config_home.join(support::paths::app_dir_name()),
+        node.home.join("data"),
+    ] {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -264,13 +267,17 @@ fn status(node: &Node, correlation: &str) -> Value {
 
 fn audit_event(node: &Node, event: &str, field: &str, correlation: &str) -> Value {
     fleet::wait_until("server audit event", DEADLINE, || {
-        std::fs::read_to_string(node.config_home.join("flock-dev/event-log.jsonl"))
-            .ok()?
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .find(|row| {
-                row["envelope"]["event"] == event && row["envelope"]["data"][field] == correlation
-            })
+        std::fs::read_to_string(
+            node.config_home
+                .join(support::paths::app_dir_name())
+                .join("event-log.jsonl"),
+        )
+        .ok()?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|row| {
+            row["envelope"]["event"] == event && row["envelope"]["data"][field] == correlation
+        })
     })
 }
 
@@ -318,8 +325,13 @@ fn mail(node: &Node, pane: &str) -> Value {
 }
 
 fn db(node: &Node) -> rusqlite::Connection {
-    let db =
-        rusqlite::Connection::open(node.home.join("state/flock-dev/mesh-mail.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(
+        node.home
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
+    )
+    .unwrap();
     db.busy_timeout(Duration::from_secs(5)).unwrap();
     db
 }
@@ -967,7 +979,8 @@ fn audit_rotation_during_held_conversation_loses_nothing() {
         .fleet
         .node("nodeb")
         .config_home
-        .join("flock-dev/event-log.jsonl");
+        .join(support::paths::app_dir_name())
+        .join("event-log.jsonl");
     // ADR-0005 has fixed rotation bounds, not a configuration knob. JSON
     // whitespace seeds the real byte threshold without inventing audit events.
     let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();

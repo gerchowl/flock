@@ -14,6 +14,8 @@
 
 mod support;
 
+use support::paths::app_dir_name;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -115,14 +117,6 @@ impl Server {
             );
             thread::sleep(Duration::from_millis(100));
         }
-    }
-}
-
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
     }
 }
 
