@@ -21,6 +21,11 @@ impl Fixture {
     pub(crate) fn new() -> Self {
         Self::under(&std::env::temp_dir())
     }
+    /// Owned short root for Unix sockets, independent of the caller's TMPDIR.
+    pub(crate) fn for_socket() -> Self {
+        // guardrails-ok(hermetic): Unix sockets need a short base on macOS.
+        Self::under(std::path::Path::new("/tmp"))
+    }
     pub(crate) fn under(parent: &std::path::Path) -> Self {
         let root = SessionConfigDir::create(parent).expect("fixture root");
         let path = root.path().join("lifetime");

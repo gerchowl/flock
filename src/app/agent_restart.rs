@@ -240,8 +240,9 @@ impl App {
             return Err(refuse("invalid_params", "continue_with must be one line of plain instructions, at most 16 KiB, and cannot start with / or !".into()));
         }
         let agent = terminal.agent_id.to_string();
+        // Failure notifications must still reach a possibly-in-pane requester.
         let requester = self
-            .parse_pane_id_or_peer("", self.current_api_peer_pid)
+            .caller_pane_candidate()
             .and_then(|(ws, pane)| self.state.workspaces[ws].terminal_id(pane))
             .and_then(|id| self.state.terminals.get(id))
             .map(|t| t.agent_id.to_string());

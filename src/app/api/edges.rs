@@ -120,7 +120,7 @@ impl App {
                 "this platform did not report the caller's pid, so no relay can be bound",
             );
         };
-        if self.parse_pane_id_or_peer("", Some(pid)).is_some() {
+        if self.caller_pane_candidate().is_some() {
             return encode_error(
                 id,
                 "not_from_a_pane",
@@ -268,8 +268,8 @@ mod tests {
 
     #[test]
     fn a_pane_process_is_refused() {
-        // A pane's shell descends from the flock server, which descends from
-        // the user's terminal and login session, never from an ssh server.
+        // A locally started server has no SSH ancestor. A server started over
+        // SSH does; attach_inbound_edge must independently refuse pane candidates.
         let table = [
             (50, 40, "flk"),
             (40, 30, "zsh"),
@@ -301,5 +301,70 @@ mod tests {
         table.push((101 + depth, 1, "sshd"));
         assert!(!walk(100, &table));
         assert!(walk(100 + 1, &table));
+    }
+    #[tokio::test]
+    async fn unproven_pane_is_refused_as_an_ssh_relay() {
+        const CHILD: &str = "FLOCK_TEST_OWNED_SSH_DRIVER";
+        if std::env::var_os(CHILD).is_none() {
+            let root =
+                crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+            let executable = root.path().join("sshd");
+            // Rename our own test executable: copied system shells cannot stand
+            // in for sshd under the macOS process-name restrictions.
+            std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+            let mut child =
+                crate::process::TracedCommand::new(&executable, "test:ssh-pane-refusal")
+                    .args([
+                        "--exact",
+                        "app::api::edges::tests::unproven_pane_is_refused_as_an_ssh_relay",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env_remove("FLOCK_TEST_RELAY_ANCESTOR")
+                    .spawn_traced()
+                    .unwrap();
+            let pid = child.id();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let _ = tx.send(child.wait());
+            });
+            let result = rx.recv_timeout(std::time::Duration::from_secs(10));
+            if result.is_err() {
+                crate::platform::signal_processes(&[pid], crate::platform::Signal::Kill);
+                // Reap if possible, but never join a live silent waiter.
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
+            }
+            assert!(
+                result
+                    .as_ref()
+                    .is_ok_and(|r| r.as_ref().is_ok_and(|status| status.success())),
+                "owned SSH driver failed: {result:?}"
+            );
+            worker.join().unwrap();
+            return;
+        }
+        assert!(crate::platform::process_name(std::process::id())
+            .unwrap()
+            .starts_with("sshd"));
+        for mismatch in [false, true] {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(
+                &crate::config::Config::default(),
+                true,
+                None,
+                rx,
+                crate::api::EventHub::default(),
+            );
+            app.state.workspaces = vec![crate::workspace::Workspace::test_new("ssh-pane")];
+            app.state.ensure_test_terminals();
+            let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+            crate::test_support::adopt_unproven_pane_caller(&mut app, pane, mismatch);
+            assert!(descends_from_ssh(app.current_api_peer_pid.unwrap()));
+            assert_eq!(app.caller_pane(), None, "unproven pane grants no authority");
+            let response: serde_json::Value =
+                serde_json::from_str(&app.attach_inbound_edge("relay".into())).unwrap();
+            assert_eq!(response["error"]["code"], "not_from_a_pane", "{response}");
+            assert!(!app.caller_is_local_operator());
+        }
     }
 }

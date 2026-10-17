@@ -1310,8 +1310,7 @@ async fn guarded_mcp_submit_requires_calling_workspace_confirmation() {
     } = rig();
     claude_idle_for(&mut app, settled());
     let (ws, id) = app.parse_pane_id(&pane).unwrap();
-    app.test_pane_child_pids.insert(id, std::process::id());
-    app.current_api_peer_pid = Some(std::process::id());
+    crate::test_support::attest_pane_caller(&mut app, id);
     let response = app.handle_api_request(Request {
         id: "mcp".into(),
         method: Method::PaneSubmit(crate::api::schema::PaneSubmitParams {

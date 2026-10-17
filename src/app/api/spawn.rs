@@ -651,9 +651,7 @@ mod tests {
         }
     }
 
-    /// Make workspace 0's focused pane look like a live agent the API peer is
-    /// running inside: an agent terminal, with this test process standing in
-    /// for the pane's child so the ancestry walk lands on it.
+    /// Give workspace 0 an owned live agent pane and make its child the API peer.
     fn caller_pane_is_an_agent(app: &mut crate::app::App) -> (crate::layout::PaneId, String) {
         let pane_id = app.state.workspaces[0]
             .focused_pane_id()
@@ -666,8 +664,7 @@ mod tests {
         let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
         terminal.launch_argv = Some(vec!["claude".into()]);
         let agent_id = terminal.agent_id.to_string();
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(app, pane_id);
         (pane_id, agent_id)
     }
 
@@ -882,8 +879,7 @@ mod tests {
         let pane_id = app.state.workspaces[0]
             .focused_pane_id()
             .expect("workspace has a pane");
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(&mut app, pane_id);
         let in_pane = app.spawn_caller();
         assert!(
             matches!(in_pane, super::SpawnCaller::Operator { pane: Some((0, _)) }),
