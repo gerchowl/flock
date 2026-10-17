@@ -866,6 +866,78 @@ fn tab_methods_round_trip_over_socket() {
     cleanup_spawned_flock(child, base);
 }
 
+// Drive the actual readiness loop with either a socket or an owned stream pair.
+fn wait_for_foreground_cwd(
+    mut connect: impl FnMut() -> JsonLineReader,
+    pane_id: &str,
+    expected: &Path,
+    deadline: Instant,
+    mut ready: impl FnMut() -> bool,
+) -> serde_json::Value {
+    let mut reader = connect();
+    loop {
+        let marker_ready = ready();
+        reader.send_line(&format!(
+            r#"{{"id":"fg_pane","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
+            pane_id
+        ));
+        let pane = reader.read_json_line(deadline.saturating_duration_since(Instant::now()));
+        assert!(pane.get("error").is_none(), "pane.get failed: {pane}");
+        if marker_ready
+            && pane["result"]["pane"]["foreground_cwd"]
+                .as_str()
+                .and_then(|cwd| Path::new(cwd).canonicalize().ok())
+                .as_deref()
+                == Some(expected)
+        {
+            return pane;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "foreground cwd did not settle: {pane}"
+        );
+    }
+}
+
+#[test]
+fn foreground_cwd_wait_reuses_one_connection_until_ready() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let expected = base.canonicalize().unwrap();
+    let (stream, mut peer) = UnixStream::pair().unwrap();
+    // Two complete responses force another iteration without clocks or sleeps.
+    writeln!(
+        peer,
+        "{}",
+        serde_json::json!({"result":{"pane":{"foreground_cwd":null}}})
+    )
+    .unwrap();
+    writeln!(
+        peer,
+        "{}",
+        serde_json::json!({"result":{"pane":{"foreground_cwd":expected}}})
+    )
+    .unwrap();
+    let mut stream = Some(stream);
+    let pane = wait_for_foreground_cwd(
+        || JsonLineReader {
+            stream: stream.take().expect("readiness wait reconnected"),
+            buf: Vec::new(),
+            pending_events: Vec::new(),
+        },
+        "fixture-pane",
+        &expected,
+        Instant::now() + Duration::from_secs(5),
+        || true,
+    );
+    assert_eq!(
+        pane["result"]["pane"]["foreground_cwd"],
+        expected.to_str().unwrap()
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
 // This test used to be `#[cfg(target_os = "linux")]` because it proved the
 // foreground process's directory by reading `/proc/<pid>/cwd` (#269). That read
 // has been replaced by having the foreground shell report its own cwd with
@@ -941,33 +1013,19 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
     // The foreground group can still be changing, so wait for the actual API
     // observation, bounded by the original deadline and server liveness.
     let expected = foreground.canonicalize().unwrap();
-    let pane = loop {
-        assert!(
-            child.child.try_wait().unwrap().is_none(),
-            "server exited before foreground readiness"
-        );
-        let mut reader = JsonLineReader::connect(&socket_path);
-        reader.send_line(&format!(
-            r#"{{"id":"fg_pane","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
-            pane_id
-        ));
-        let pane = reader.read_json_line(deadline.saturating_duration_since(Instant::now()));
-        assert!(pane.get("error").is_none(), "pane.get failed: {pane}");
-        if marker.exists()
-            && pane["result"]["pane"]["foreground_cwd"]
-                .as_str()
-                .and_then(|cwd| Path::new(cwd).canonicalize().ok())
-                .as_ref()
-                == Some(&expected)
-        {
-            break pane;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "foreground cwd did not settle: {pane}"
-        );
-    };
+    let pane = wait_for_foreground_cwd(
+        || JsonLineReader::connect(&socket_path),
+        &pane_id,
+        &expected,
+        deadline,
+        || {
+            assert!(
+                child.child.try_wait().unwrap().is_none(),
+                "server exited before foreground readiness"
+            );
+            marker.exists()
+        },
+    );
     assert_same_dir(
         &serde_json::json!(fs::read_to_string(&cwd_marker).unwrap().trim()),
         &foreground,
