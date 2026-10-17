@@ -97,6 +97,29 @@ pub struct Received {
     pub event: SessionEvent,
 }
 
+impl Received {
+    /// Feed a durable stream record into S4, including book-owned close facts.
+    /// Permission audit opens are not extra stdout progress observations.
+    pub fn state_input(&self) -> Option<super::state::Input<'_>> {
+        if self.record.origin == RecordOrigin::Flk {
+            if let SessionEvent::Unknown { value, .. } = &self.event {
+                if value.get("type").and_then(Value::as_str) == Some("flk_permission_request") {
+                    return match (
+                        value.get("state").and_then(Value::as_str),
+                        value.get("request_id").and_then(Value::as_str),
+                    ) {
+                        (Some("closed"), Some(id)) => {
+                            Some(super::state::Input::ControlAnswered(id))
+                        }
+                        _ => None,
+                    };
+                }
+            }
+        }
+        Some(super::state::Input::Event(&self.event))
+    }
+}
+
 /// Worker termination, independent of the supervised process's outcome.
 #[derive(Debug)]
 pub enum Completion {

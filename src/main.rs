@@ -43,6 +43,9 @@ mod codex_rollout;
 // Binding foundation, connected to the reader and authority in #1663/#1664.
 #[allow(dead_code)]
 mod codex_binding;
+// File/cursor foundation; segment admission and supervision follow in #1856/#1857.
+#[allow(dead_code)]
+mod codex_reader;
 mod codex_transcript;
 // Version eligibility foundation; binding and runtime consumers follow in #1662/#1664.
 #[allow(dead_code)]
