@@ -144,7 +144,7 @@ error_codes! {
         PermissionRequestTooLarge = "permission_request_too_large",
         PermissionRequestUnknown = "permission_request_unknown",
         PermissionRequestClosed = "permission_request_closed",
-        // Session grants are not yet supported in the first permission slice.
+        // Retained for compatibility with runtimes predating session grants.
         PermissionDecisionUnsupported = "permission_decision_unsupported",
         OriginMismatch = "origin_mismatch",
         OwnerPolicyChanged = "owner_policy_changed",

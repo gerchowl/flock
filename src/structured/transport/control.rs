@@ -94,7 +94,7 @@ impl<'a> Recorder<'a> {
         metadata: metadata::Line,
     ) -> io::Result<()> {
         let mut open = None;
-        let mut denial = None;
+        let mut pending_answer = None;
         let mut closings = Vec::new();
         if count > MAX_LINE_BYTES as u64 {
             if let Some((id, request)) = metadata.oversized_request(count)? {
@@ -105,7 +105,7 @@ impl<'a> Recorder<'a> {
                     .oversized(&id, request)
                     .map_err(io::Error::other)?;
                 open = Some(audit);
-                denial = Some(answer);
+                pending_answer = Some(answer);
             }
         } else if let Ok(raw) = std::str::from_utf8(line) {
             match SessionEvent::parse(raw, self.version) {
@@ -122,15 +122,17 @@ impl<'a> Recorder<'a> {
                             .oversized(&id, request)
                             .map_err(io::Error::other)?;
                         open = Some(audit);
-                        denial = Some(answer);
+                        pending_answer = Some(answer);
                     } else {
+                        let mut book = self.controls.book.lock();
                         open = Some(
-                            self.controls
-                                .book
-                                .lock()
-                                .observe(&event.request_id, event.request)
+                            book.observe(&event.request_id, event.request)
                                 .map_err(io::Error::other)?,
                         );
+                        // Reserve automatic approval before open becomes visible.
+                        pending_answer = book
+                            .automatic(&event.request_id)
+                            .map_err(io::Error::other)?;
                     }
                 }
                 SessionEvent::ControlCancel(event) => {
@@ -198,7 +200,7 @@ impl<'a> Recorder<'a> {
         for event in closed {
             publish(event, self.tx, self.cancel)?;
         }
-        if let Some(answer) = denial {
+        if let Some(answer) = pending_answer {
             let bytes = encode(&answer.response)?;
             self.answer(Control { answer, bytes })?;
         }

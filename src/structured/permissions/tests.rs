@@ -72,6 +72,7 @@ fn unknown_and_closed_requests_are_distinct_and_never_retry() {
             .err(),
         Some(ErrorCode::PermissionRequestClosed)
     );
+    assert!(b.begin_answer(&answer.id));
     b.audited(&answer);
     assert!(b.waiting().is_empty());
     assert!(
@@ -86,25 +87,6 @@ fn unknown_and_closed_requests_are_distinct_and_never_retry() {
         .unwrap();
     assert_eq!(closed, ErrorCode::PermissionRequestClosed);
     assert_eq!(closed.retry(), crate::cli::exit::Retry::Never);
-}
-
-#[test]
-fn allow_always_is_explicitly_unsupported_without_closing() {
-    let mut b = book();
-    let code = b
-        .prepare(&token(), &args("request-example", Decision::AllowAlways))
-        .err()
-        .unwrap();
-    assert_eq!(code, ErrorCode::PermissionDecisionUnsupported);
-    assert_eq!(
-        ErrorCode::from_code("permission_decision_unsupported"),
-        Some(code)
-    );
-    assert_eq!(code.retry(), crate::cli::exit::Retry::Never);
-    assert_eq!(b.waiting(), vec!["request-example"]);
-    assert!(b
-        .prepare(&token(), &args("request-example", Decision::Deny))
-        .is_ok());
 }
 
 #[test]
@@ -150,4 +132,83 @@ fn failed_admission_can_retry_and_requests_are_bounded() {
         b.observe("overflow", request()).err(),
         Some(ErrorCode::InvalidRequest)
     );
+}
+
+#[test]
+fn session_grants_reserve_distinct_keys_and_abort_releases_capacity() {
+    let mut b = Book::new("fixture-agent".into());
+    for n in 0..14 {
+        let id = format!("grant-{n}");
+        let mut r = request();
+        r.input.insert("n".into(), json!(n));
+        b.observe(&id, r).unwrap();
+        let answer = b
+            .prepare(&token(), &args(&id, Decision::AllowAlways))
+            .unwrap();
+        assert!(b.begin_answer(&answer.id));
+        b.audited(&answer);
+        b.written(answer);
+    }
+    b.observe("deny", request()).unwrap();
+    b.prepare(&token(), &args("deny", Decision::Deny)).unwrap();
+    for id in ["same-a", "same-b"] {
+        b.observe(id, request()).unwrap();
+        b.prepare(&token(), &args(id, Decision::AllowAlways))
+            .unwrap();
+    }
+    let mut distinct = request();
+    distinct.input.insert("n".into(), json!(100));
+    b.observe("last-slot", distinct).unwrap();
+    b.prepare(&token(), &args("last-slot", Decision::AllowAlways))
+        .unwrap();
+    let mut overflow = request();
+    overflow.input.insert("n".into(), json!(101));
+    b.observe("overflow", overflow).unwrap();
+    assert_eq!(
+        b.prepare(&token(), &args("overflow", Decision::AllowAlways))
+            .err(),
+        Some(ErrorCode::InvalidParams)
+    );
+    b.aborted("last-slot");
+    assert!(b
+        .prepare(&token(), &args("overflow", Decision::AllowAlways))
+        .is_ok());
+}
+
+#[test]
+fn grant_is_installed_only_after_audit_and_cleared_on_runtime_end() {
+    let mut b = book();
+    let answer = b
+        .prepare(&token(), &args("request-example", Decision::AllowAlways))
+        .unwrap();
+    assert!(b.grants.is_empty());
+    assert!(b.begin_answer(&answer.id));
+    b.audited(&answer);
+    assert_eq!(b.grants.len(), 1);
+    b.end();
+    assert!(b.grants.is_empty());
+    b.audited(&answer);
+    assert!(
+        b.grants.is_empty(),
+        "a late audit cannot resurrect a terminated runtime grant"
+    );
+}
+
+#[test]
+fn cancelled_grant_reservation_cannot_install_a_grant_after_its_close() {
+    let mut b = book();
+    let answer = b
+        .prepare(&token(), &args("request-example", Decision::AllowAlways))
+        .unwrap();
+    let closing = b
+        .close(Some("request-example"), CloseReason::Cancelled)
+        .unwrap();
+    for close in closing {
+        b.closed(&close.id);
+    }
+    assert!(!b.begin_answer(&answer.id));
+    b.audited(&answer);
+    assert!(b.grants.is_empty());
+    b.observe("following-request", request()).unwrap();
+    assert!(b.automatic("following-request").unwrap().is_none());
 }
