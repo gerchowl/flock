@@ -28,8 +28,13 @@ use std::time::{Duration, Instant};
 /// Facts supplied by the stream owner, never inferred from screen text.
 pub enum Input<'a> {
     /// Every stdout event, including unknown lines, counts as stream progress.
+    /// Stream consumers must use `Received::state_input` to include host closes.
     Event(&'a SessionEvent),
-    /// An answer was sent for this exact incoming permission request.
+    /// Stdout progress whose tool request was already reserved by a grant.
+    /// It never opens a needs-human entry.
+    Progress,
+    /// The book durably closed this request (decision, cancel, result, interrupt
+    /// or end). This is not an acknowledgment of stdin delivery.
     ControlAnswered(&'a str),
     /// The process exited. A started input without result is crashed, not idle.
     ProcessExited,
@@ -115,6 +120,10 @@ impl SessionState {
                 self.stdout = Some((now, unix_ms));
                 self.stalled = false;
                 self.event(event, now);
+            }
+            Input::Progress => {
+                self.stdout = Some((now, unix_ms));
+                self.stalled = false;
             }
             Input::ControlAnswered(id) => {
                 self.controls.remove(id);
