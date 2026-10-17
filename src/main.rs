@@ -99,7 +99,9 @@ mod release_notes;
 mod remote;
 mod render_prof;
 mod report;
-#[cfg(test)]
+// Later wire slices consume the staged subscription and command contracts.
+#[cfg(any(test, feature = "web"))]
+#[allow(dead_code, unused_imports)]
 mod structured_wire;
 #[cfg(test)]
 mod test_support;

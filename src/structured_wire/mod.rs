@@ -1,7 +1,7 @@
 //! Structured JSON wire contracts, separate from the terminal's framed protocol.
 //!
-//! ADR-0036 §4/§5/§5a governs these types. S7a is test-only until S7 installs
-//! an endpoint: no transport, authentication, timers or command execution lives here.
+//! ADR-0036 §4/§5/§5a governs these types. The web-feature transport core consumes
+//! these types; no authentication, timers or command execution lives in this module.
 //! Frames tolerate additive fields; unknown `t` tags are protocol errors, rather
 //! than session events. Only event payloads have §8's lossless unknown wrapper.
 //! All u64 wire numbers are JSON numbers, exact in JavaScript below 2^53.
@@ -11,6 +11,7 @@ use crate::structured::claude::KnownSessionEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(test)]
 pub(crate) mod fixture;
 mod minimal;
 pub use minimal::{
@@ -83,7 +84,7 @@ pub enum ClientFrame {
         /// ADR-0036 §5 stream path; an unknown/removed path gets unknown_stream.
         stream: String,
         /// JSON number; exact in JavaScript below 2^53.
-        /// Omitted for bootstrap and cursorless agent/<id>/live.
+        /// Omitted for bootstrap and cursorless `agent/<id>/live`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         after: Option<u64>,
@@ -257,7 +258,7 @@ pub enum ServerFrame {
         /// Same stream identity supplied in sub.
         stream: String,
         /// JSON number; exact in JavaScript below 2^53.
-        /// Seq streams only; agent/<id>/live omits seq and never advances a cursor.
+        /// Seq streams only; `agent/<id>/live` omits seq and never advances a cursor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         seq: Option<u64>,
