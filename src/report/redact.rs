@@ -188,6 +188,18 @@ pub(crate) fn mask_credentials(value: &str) -> String {
         .into_owned()
 }
 
+/// Mask known token shapes without the report scrubber's identity rules.
+/// The prefix check keeps ordinary process argv off the shared regex hot path.
+pub(crate) fn mask_secret_tokens(value: &str) -> std::borrow::Cow<'_, str> {
+    if !["gh", "github_pat_", "sk-", "xox", "AKIA", "eyJ"]
+        .iter()
+        .any(|prefix| value.contains(prefix))
+    {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    secret_token_re().replace_all(value, "<redacted-token>")
+}
+
 fn secret_token_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {

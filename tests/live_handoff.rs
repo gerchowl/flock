@@ -2307,6 +2307,7 @@ fn handoff_import_stalled_peer_exits_within_deadline() {
     command
         .args(["server", "--handoff-import"])
         .arg(&socket)
+        // Compatibility with an exporter that was already running before #301.
         .arg("stalled-peer-token")
         .envs(support::environment::isolated_env(
             &base.join("config"),
@@ -2366,7 +2367,7 @@ fn handoff_ready_importer_survives_commit_after_startup_deadline() {
     command
         .args(["server", "--handoff-import"])
         .arg(&socket)
-        .arg("late-commit-token")
+        .env("FLOCK_HANDOFF_TOKEN", "late-commit-token")
         .envs(support::environment::isolated_env(
             &base.join("config"),
             &base.join("runtime"),
