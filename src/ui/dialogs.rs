@@ -220,23 +220,34 @@ pub(crate) fn remove_worktree_stakes_rows(remove: &crate::app::state::WorktreeRe
     rows
 }
 
+fn remove_worktree_error_rows(width: u16, remove: &crate::app::state::WorktreeRemoveState) -> u16 {
+    remove.error.as_ref().map_or(1, |error| {
+        Paragraph::new(format!(" {error}"))
+            .wrap(Wrap { trim: false })
+            .line_count(width.max(1))
+            .min(u16::MAX as usize) as u16
+    })
+}
+
 /// Where the force toggle's line sits inside the dialog (#326), so a click can
 /// reach it. `None` until the probe lands, which is when the toggle is drawn.
 ///
-/// Derived from the same two numbers the render uses — the seven fixed rows
-/// above the flexible tail, then the stakes block — so the clickable row and
-/// the drawn row cannot drift apart.
+/// Derived from the render's base rows, wrapped error height and stakes block,
+/// so the clickable row and the drawn row cannot drift apart.
 pub(crate) fn remove_worktree_force_rect(
     inner: Rect,
     remove: &crate::app::state::WorktreeRemoveState,
 ) -> Option<Rect> {
     remove.probe.as_ref()?;
-    let y = inner.y + REMOVE_WORKTREE_FIXED_ROWS + remove_worktree_stakes_rows(remove);
+    let y = inner.y
+        + REMOVE_WORKTREE_FIXED_ROWS
+        + remove_worktree_stakes_rows(remove)
+        + remove_worktree_error_rows(inner.width, remove).saturating_sub(1);
     (y < inner.y + inner.height.saturating_sub(1)).then(|| Rect::new(inner.x, y, inner.width, 1))
 }
 
-/// Rows above the dialog's flexible tail: title, lead-in, path, gate line,
-/// dirty warning, status, spacer.
+/// Minimum rows above the flexible tail: title, lead-in, path, gate line,
+/// dirty warning, status and spacer. A wrapped error grows the status row.
 pub(crate) const REMOVE_WORKTREE_FIXED_ROWS: u16 = 7;
 
 /// The dialog grows with what it has to account for (#325): the fixed 10-row
@@ -248,7 +259,9 @@ pub(crate) fn remove_worktree_popup_rect(
     // +1 for the force-toggle line, which is always present once the probe has
     // landed so the affordance does not appear and disappear under the cursor.
     let extra = remove_worktree_stakes_rows(remove) + u16::from(remove.probe.is_some());
-    centered_popup_rect(area, 72, 10 + extra)
+    let width = 72.min(area.width.saturating_sub(4)).saturating_sub(2);
+    let error_extra = remove_worktree_error_rows(width, remove).saturating_sub(1);
+    centered_popup_rect(area, 72, (10 + extra).saturating_add(error_extra))
 }
 
 pub(crate) fn remove_worktree_button_rects(inner: Rect, primary_label: &str) -> (Rect, Rect) {
@@ -650,7 +663,10 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(
+            remove_worktree_error_rows(inner.width, remove)
+                .min(inner.height.saturating_sub(7).max(1)),
+        ),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
@@ -789,7 +805,9 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
         );
     } else if let Some(error) = &remove.error {
         frame.render_widget(
-            Paragraph::new(format!(" {error}")).style(Style::default().fg(app.palette.red)),
+            Paragraph::new(format!(" {error}"))
+                .style(Style::default().fg(app.palette.red))
+                .wrap(Wrap { trim: false }),
             rows[5],
         );
     }
@@ -1821,6 +1839,35 @@ mod tests {
             "there are no changes to assume: {text:?}"
         );
         assert!(text.contains("already gone"), "{text:?}");
+    }
+
+    #[test]
+    fn kill_dialog_shows_unreachable_checkout_recovery_and_buttons() {
+        let mut app = AppState::test_new();
+        let mut remove = kill_dialog_state(None);
+        let refusal = crate::worktree::CheckoutUnreachable {
+            repo: None,
+            path: std::env::temp_dir().join("unreachable-render-fixture"),
+            possible_unmounted_mount_point: Some(true),
+        };
+        remove.error = Some(refusal.to_string());
+        app.worktree_remove = Some(remove);
+        let rendered = render_kill_dialog(&app);
+        let words = rendered
+            .replace('│', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for phrase in [
+            "unmounted mount point",
+            "Remount and retry",
+            "remove the directory yourself",
+            "repo-wide",
+            "temporarily absent checkouts.",
+            "cancel",
+        ] {
+            assert!(words.contains(phrase), "missing {phrase}: {words}");
+        }
     }
 
     #[test]
