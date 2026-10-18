@@ -5270,11 +5270,13 @@ mod tests {
             }
             assert_ne!(grants[0].release_id(), grants[1].release_id());
             assert!(serde_json::to_value(Method::WaitReleaseAdmitted(grants[0].clone())).is_err());
-            for method in ["WaitHoldAdmitted", "WaitReleaseAdmitted"] {
-                assert!(serde_json::from_value::<Request>(serde_json::json!({
-                    "id":"forged", "method":method, "params":{"wait_id":grants[0].release_id()}
+            for method in ["wait.hold", "wait.release"] {
+                let error = serde_json::from_value::<Request>(serde_json::json!({
+                    "id":"forged", "method":method,
+                    "params":{"wait_id":grants[0].release_id(), "authority":"Operator"}
                 }))
-                .is_err());
+                .unwrap_err();
+                assert!(error.to_string().contains(method), "{error}");
             }
             let due = server.app.waits.next_deadline().unwrap();
             server
@@ -5283,6 +5285,7 @@ mod tests {
                 .remove(&terminal_id)
                 .unwrap()
                 .shutdown();
+            crate::platform::assert_owned_child_reaped(pid);
             assert!(crate::platform::process_start_time(pid).is_none());
             let response = call(&mut server, Method::WaitReleaseAdmitted(grants[0].clone()));
             assert!(response.get("result").is_some(), "{response}");
@@ -5291,7 +5294,7 @@ mod tests {
             else {
                 panic!("releasing one hold must leave the other open");
             };
-            assert_eq!(Some(wait_id.as_str()), grants[1].release_id());
+            assert_eq!(wait_id.as_str(), grants[1].release_id());
             let response = call(&mut server, Method::WaitReleaseAdmitted(grants[1].clone()));
             assert!(response.get("result").is_some(), "{response}");
             assert!(matches!(

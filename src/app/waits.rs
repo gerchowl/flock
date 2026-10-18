@@ -277,7 +277,11 @@ impl App {
             if let Some(grant) =
                 crate::api::schema::WaitReleaseAuthority::admitted(wait_id.clone(), authority)
             {
-                let _ = admission.set(grant);
+                if let Err(grant) = admission.set(grant) {
+                    // The reader already left, or this cell already owns another hold.
+                    // Only the rejected grant's exact hold is closed.
+                    self.handle_wait_release(id.clone(), grant.release_id());
+                }
             }
         }
         encode_success(id, ResponseResult::WaitHeld { wait_id })

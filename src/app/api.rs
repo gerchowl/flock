@@ -1457,14 +1457,7 @@ impl App {
         // Cleanup owns only its admitted hold and survives its caller's exit.
         // Handle it before live-process admission or unrelated request effects.
         if let Method::WaitReleaseAdmitted(authority) = &request.method {
-            return match authority.release_id() {
-                Some(wait_id) => self.handle_wait_release(request.id.clone(), wait_id),
-                None => responses::encode_error(
-                    request.id.clone(),
-                    crate::api::error_code::ErrorCode::NotAuthorized.as_str(),
-                    "hold release lacks admission",
-                ),
-            };
+            return self.handle_wait_release(request.id.clone(), authority.release_id());
         }
         self.structured_sends.staged = None;
         self.input_writes.abandon_staged();

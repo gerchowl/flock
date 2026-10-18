@@ -2,8 +2,51 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// In-process admission result for one held read, never serialized to clients.
-pub type WaitAdmission = std::sync::Arc<std::sync::OnceLock<WaitReleaseAuthority>>;
+/// Shared in-process admission and reader-lifetime handoff, never serialized.
+pub type WaitAdmission = std::sync::Arc<WaitAdmissionState>;
+
+/// Publishes one hold's grant unless its reader has already abandoned the request.
+/// The local mutex serializes publication with abandonment; no App dispatch or
+/// channel send runs while it is held. The published grant remains immutable.
+#[derive(Debug, Default)]
+pub struct WaitAdmissionState {
+    grant: std::sync::OnceLock<WaitReleaseAuthority>,
+    abandoned: parking_lot::Mutex<bool>,
+}
+
+impl WaitAdmissionState {
+    /// Publish once. The App must close the returned grant's hold on refusal.
+    pub(crate) fn set(&self, grant: WaitReleaseAuthority) -> Result<(), WaitReleaseAuthority> {
+        let abandoned = self.abandoned.lock();
+        if *abandoned {
+            return Err(grant);
+        }
+        self.grant.set(grant)
+    }
+
+    /// Inspect the immutable grant, including after its hold has closed.
+    pub(crate) fn get(&self) -> Option<&WaitReleaseAuthority> {
+        self.grant.get()
+    }
+
+    /// End the reader's ownership. A published grant is released by its holder;
+    /// otherwise a late publisher gets the grant back and closes that exact hold.
+    pub(crate) fn abandon(&self) -> Option<WaitReleaseAuthority> {
+        let mut abandoned = self.abandoned.lock();
+        *abandoned = true;
+        self.get().cloned()
+    }
+
+    fn is_abandoned(&self) -> bool {
+        *self.abandoned.lock()
+    }
+}
+
+impl PartialEq for WaitAdmissionState {
+    fn eq(&self, other: &Self) -> bool {
+        self.grant == other.grant && self.is_abandoned() == other.is_abandoned()
+    }
+}
 
 /// App-issued authority to close exactly one already-admitted hold.
 /// Private fields prevent retargeting; this grants no other request authority.
@@ -15,6 +58,8 @@ pub struct WaitReleaseAuthority {
 
 impl WaitReleaseAuthority {
     /// Mint after admission; an unknown UID class never grants release authority.
+    /// Private fields make this the only constructor, so `release_id` need not
+    /// re-check the captured authority class or the caller's later liveness.
     pub(crate) fn admitted(
         wait_id: String,
         authority: crate::structured::identity::Principal,
@@ -25,10 +70,8 @@ impl WaitReleaseAuthority {
     }
 
     /// The original hold this grant can close, independent of caller lifetime.
-    pub(crate) fn release_id(&self) -> Option<&str> {
-        use crate::structured::identity::Principal;
-        matches!(self.authority, Principal::Operator | Principal::Agent)
-            .then_some(self.wait_id.as_str())
+    pub(crate) fn release_id(&self) -> &str {
+        &self.wait_id
     }
 }
 
@@ -6434,5 +6477,55 @@ mod pr_info_tests {
         let invalid = serde_json::json!({"bytes_written":-1,"bytes_total":5,
             "reason":"deadline","remainder_discarded":true});
         assert!(serde_json::from_value::<InputWriteDetails>(invalid).is_err());
+    }
+}
+
+#[cfg(test)]
+mod wait_admission_tests {
+    use super::*;
+    use crate::structured::identity::Principal;
+
+    fn grant(id: &str) -> WaitReleaseAuthority {
+        WaitReleaseAuthority::admitted(id.into(), Principal::Operator).unwrap()
+    }
+
+    #[test]
+    fn unattested_authority_cannot_mint_a_release_grant() {
+        assert!(WaitReleaseAuthority::admitted("unknown".into(), Principal::Unknown).is_none());
+    }
+
+    #[test]
+    fn publication_before_abandonment_returns_only_its_own_grant() {
+        let admission = WaitAdmissionState::default();
+        admission.set(grant("first")).unwrap();
+        assert_eq!(admission.abandon().unwrap().release_id(), "first");
+        assert_eq!(
+            admission.set(grant("later")).unwrap_err().release_id(),
+            "later"
+        );
+        assert_eq!(admission.get().unwrap().release_id(), "first");
+        assert!(admission.eq(&admission));
+    }
+
+    #[test]
+    fn abandonment_before_publication_returns_the_late_grant_to_the_app() {
+        let admission = WaitAdmissionState::default();
+        assert!(admission.abandon().is_none());
+        assert_eq!(
+            admission.set(grant("late")).unwrap_err().release_id(),
+            "late"
+        );
+        assert!(admission.get().is_none());
+    }
+
+    #[test]
+    fn a_second_publication_cannot_replace_an_existing_hold() {
+        let admission = WaitAdmissionState::default();
+        admission.set(grant("first")).unwrap();
+        assert_eq!(
+            admission.set(grant("second")).unwrap_err().release_id(),
+            "second"
+        );
+        assert_eq!(admission.abandon().unwrap().release_id(), "first");
     }
 }

@@ -43,6 +43,23 @@ impl<'a> HeldWait<'a> {
         predicate: WaitPredicate,
         hold: Duration,
     ) -> Self {
+        Self::open_with_timeout(
+            api_tx,
+            peer,
+            predicate,
+            hold,
+            super::server::APP_RESPONSE_TIMEOUT,
+        )
+    }
+
+    // Test seam: a zero response budget forces timeout while App dispatch is gated.
+    fn open_with_timeout(
+        api_tx: &'a ApiRequestSender,
+        peer: crate::platform::peer::Credentials,
+        predicate: WaitPredicate,
+        hold: Duration,
+        response_timeout: Duration,
+    ) -> Self {
         let hold_ms = u64::try_from(hold.as_millis()).unwrap_or(u64::MAX);
         let admission = Arc::default();
         // Cleanup authority travels in-process, never through the JSON response.
@@ -52,7 +69,7 @@ impl<'a> HeldWait<'a> {
                 method: Method::WaitHoldAdmitted(predicate, hold_ms, Arc::clone(&admission)),
             },
             api_tx,
-            None,
+            Some(response_timeout),
             peer,
         );
         Self {
@@ -65,7 +82,7 @@ impl<'a> HeldWait<'a> {
 
 impl Drop for HeldWait<'_> {
     fn drop(&mut self) {
-        let Some(authority) = self.admission.get().cloned() else {
+        let Some(authority) = self.admission.abandon() else {
             return;
         };
         // Nobody reads the answer: the release cannot fail in a way the
@@ -200,6 +217,107 @@ pub(super) fn read_events(
 #[cfg(test)]
 mod attribution_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn timed_out_hold_admitted_after_reader_exit_is_released_by_id() {
+        for uid in [7, 42] {
+            let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = crate::app::App::new(
+                &crate::config::Config::default(),
+                true,
+                None,
+                events_rx,
+                EventHub::default(),
+            );
+            app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+                operator: 7,
+                dedicated: Ok(Some(42)).into(),
+            };
+            app.state.workspaces = vec![crate::workspace::Workspace::test_new("late-held-read")];
+            app.state.ensure_test_terminals();
+            let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+            let terminal_id = app.state.workspaces[0]
+                .pane_state(pane)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .launch_argv = Some(vec!["claude".into()]);
+            let agent_id = app
+                .state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .agent_id
+                .to_string();
+            crate::test_support::attest_pane_caller(&mut app, pane);
+            let peer = crate::platform::peer::Credentials {
+                pid: app.current_api_peer_pid,
+                birth: app
+                    .current_api_peer_pid
+                    .and_then(crate::platform::process_start_time),
+                uid: Some(uid),
+            };
+            let predicate = || WaitPredicate::Events {
+                kinds: vec![],
+                subjects: vec![],
+                after: 0,
+            };
+            let (finished, finish) = std::sync::mpsc::channel();
+            let driver = std::thread::spawn(move || {
+                let held = HeldWait::open_with_timeout(
+                    &api_tx,
+                    peer,
+                    predicate(),
+                    Duration::from_secs(600),
+                    Duration::ZERO,
+                );
+                drop(held);
+                finished.send(()).unwrap();
+            });
+            let hold = tokio::time::timeout(Duration::from_secs(2), api_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            // The App has not handled the queued hold. Timeout and Drop finish first.
+            finish.recv_timeout(Duration::from_secs(2)).unwrap();
+            driver.join().unwrap();
+            let (other, _) = app
+                .waits
+                .open(
+                    agent_id.clone(),
+                    pane,
+                    predicate(),
+                    Duration::from_secs(600),
+                    Instant::now(),
+                    0,
+                )
+                .unwrap();
+            app.handle_api_request_message(hold);
+            assert!(
+                app.waits.close(&other).is_some(),
+                "another hold must survive"
+            );
+            assert!(
+                app.waits.next_deadline().is_none(),
+                "uid={uid}: late hold must close immediately"
+            );
+            assert!(matches!(
+                app.waits.waiting(&agent_id),
+                crate::api::agent_state::Waiting::None
+            ));
+            app.tick_waits(Instant::now() + Duration::from_secs(3600));
+            assert!(!app
+                .event_hub
+                .events_after(0)
+                .iter()
+                .any(|(_, event)| { event.event == crate::api::schema::EventKind::WaitExpired }));
+        }
+    }
 
     #[tokio::test]
     async fn held_read_release_keeps_captured_peer_and_closes_the_wait() {

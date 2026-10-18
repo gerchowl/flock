@@ -1791,7 +1791,7 @@ mod tests {
         };
         assert_eq!(held, &predicate);
         assert_eq!(admission.get(), Some(grant));
-        assert_eq!(grant.release_id(), Some("w_1"));
+        assert_eq!(grant.release_id(), "w_1");
     }
 
     /// #1028: `events.read` filters by subject and holds the request on the

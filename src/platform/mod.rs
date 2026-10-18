@@ -251,3 +251,17 @@ mod tests {
 
 pub(crate) mod client_token_lock;
 pub(crate) mod client_tokens;
+
+/// Assert that an owned test child's watcher completed its kernel wait.
+#[cfg(test)]
+pub(crate) fn assert_owned_child_reaped(pid: u32) {
+    // SAFETY: callers pass only a child they owned and shut down themselves.
+    assert_eq!(
+        unsafe { libc::waitpid(pid as libc::pid_t, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}

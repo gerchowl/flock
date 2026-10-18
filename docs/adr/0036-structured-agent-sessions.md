@@ -373,7 +373,12 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   their release dispatch too. App admission also issues an in-process release
   grant containing the authority class and an immutable hold ID. The holder
   stores this grant and uses it on completion or hang-up, even after the caller
-  process exits. Release never repeats liveness or ancestry admission: the grant
+  process exits. Hold registration uses the existing 5-second App response budget.
+  Grant publication and reader abandonment share one synchronized handoff: if
+  the reader leaves before a delayed admission, the App closes the newly opened
+  hold by that grant's exact ID. A concurrent or unrelated hold is untouched, and
+  a late admission cannot survive to emit a spurious `wait.expired`.
+  Release never repeats liveness or ancestry admission: the grant
   closes only its own hold and confers no other authority. It cannot be serialized
   or supplied by a wire client; App and headless dispatch use the same mechanism.
   Retry safety never grants read authority. Server and client-token lifecycle
