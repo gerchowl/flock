@@ -71,6 +71,8 @@ for (const mode of ["desktop", "phone"] as const) {
       button(app, "Deny").click();
       expect(cmds(app)).toHaveLength(1);
       app.event("atlas", "r1", "Bash", { command: "just check" }, 42);
+      expect(button(app, "Allow once").hasAttribute("disabled")).toBe(true);
+      button(app, "Review new request").click();
       expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
       button(app, "Allow once").click();
       expect(cmds(app).map((c) => c.args["request_seq"])).toEqual([41, 42]);
@@ -103,6 +105,7 @@ describe("answering a prompt", () => {
     button(app, "Allow once").click();
     expect(cmds(app)).toHaveLength(1);
     app.event("atlas", "r1", "Bash", { command: "just check" }, 42);
+    button(app, "Review new request").click();
     expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
   });
 
@@ -159,7 +162,7 @@ describe("answering a prompt", () => {
     expect(status(app)).toBe(STATUS_LABELS.sent);
   });
 
-  test("a new request_seq while the Always-allow confirm is open cancels it, says why, and sends nothing", () => {
+  test("a new request_seq while the Always-allow confirm is open cancels it, keeps the draft, and sends nothing until the review is acknowledged", () => {
     const app = prompt();
     const box = app.root.querySelector<HTMLInputElement>(".decide__message");
     if (box === null) throw new Error("no message box");
@@ -168,14 +171,64 @@ describe("answering a prompt", () => {
     button(app, "Always allow").click();
     expect($$(app.root, "decide")[0]?.textContent).toContain("Confirm always allow");
     app.event("atlas", "r1", "Edit", { file_path: "other.rs" }, 42);
-    expect(app.root.querySelector<HTMLInputElement>(".decide__message")?.value).toBe("keep me");
     expect($$(app.root, "decide")[0]?.textContent).not.toContain("Confirm always allow");
-    expect(status(app)).toBe("The request changed; review it again.");
+    expect(app.root.querySelector<HTMLInputElement>(".decide__message")?.value).toBe("keep me");
+    expect(status(app)).toBe("Request changed — review it.");
+    for (const label of ["Allow once", "Always allow", "Deny"]) {
+      expect(button(app, label).hasAttribute("disabled")).toBe(true);
+      button(app, label).click();
+    }
     expect(cmds(app)).toHaveLength(0);
+    button(app, "Review new request").click();
     button(app, "Always allow").click();
     expect($$(app.root, "decide")[0]?.textContent).toContain("Always allow Edit");
     button(app, "Confirm always allow").click();
     expect(cmds(app).map((c) => c.args["request_seq"])).toEqual([42]);
+  });
+
+  for (const [label, decision] of [
+    ["Allow once", "allow_once"],
+    ["Deny", "deny"],
+  ] as const) {
+    test(`the 41 → 42 race: ${label} sends nothing for 42 until the review is acknowledged`, () => {
+      const app = prompt();
+      app.event("atlas", "r1", "Edit", { file_path: "other.rs" }, 42);
+      expect(button(app, label).hasAttribute("disabled")).toBe(true);
+      button(app, label).click();
+      expect(cmds(app)).toHaveLength(0);
+      button(app, "Review new request").click();
+      button(app, label).click();
+      expect(cmds(app).map((c) => [c.args["request_seq"], c.args["decision"]])).toEqual([[42, decision]]);
+    });
+  }
+
+  test("an open confirm that becomes disabled (over the message limit) cannot be confirmed", () => {
+    const app = prompt();
+    button(app, "Always allow").click();
+    const box = app.root.querySelector<HTMLInputElement>(".decide__message");
+    if (box === null) throw new Error("no message box");
+    box.value = "x".repeat(MESSAGE_MAX_BYTES + 1);
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(button(app, "Confirm always allow").hasAttribute("disabled")).toBe(true);
+    button(app, "Confirm always allow").click();
+    expect(cmds(app)).toHaveLength(0);
+    expect(status(app)).toContain("over the 2048-byte limit");
+  });
+
+  test("a send error for one request never shows on the next", () => {
+    const app = prompt();
+    const connection = app.h.connection as unknown as { command: (...args: unknown[]) => string };
+    const real = connection.command.bind(connection);
+    connection.command = () => {
+      throw new Error("could not queue the answer");
+    };
+    button(app, "Allow once").click();
+    expect(status(app)).toBe("could not queue the answer");
+    connection.command = real;
+    app.event("atlas", "r1", "Bash", { command: "just check" }, 42);
+    expect(status(app)).toBe("Request changed — review it.");
+    button(app, "Review new request").click();
+    expect(status(app)).toBe("Answering sends your decision to the agent.");
   });
 
   test("a stale card, after a history gap, has its buttons disabled with the reason until it resyncs", () => {
@@ -211,6 +264,21 @@ describe("answering a prompt", () => {
     type(app, fits);
     button(app, "Allow once").click();
     expect(cmds(app)[0]?.args["message"]).toBe(fits);
+  });
+
+  test("a closed request drops its draft: nothing typed for it comes back with a later card", () => {
+    const app = prompt();
+    const box = (): HTMLInputElement => {
+      const found = app.root.querySelector<HTMLInputElement>(".decide__message");
+      if (found === null) throw new Error("no message box");
+      return found;
+    };
+    box().value = "stale draft";
+    box().dispatchEvent(new Event("input", { bubbles: true }));
+    app.close("atlas", "r1");
+    expect(cards(app.root)).toEqual([]);
+    app.event("atlas", "r1", "Bash", { command: "just check" }, 50);
+    expect(box().value).toBe("");
   });
 
   test("Always allow needs the confirm step, naming the tool, and a given message is sent", () => {

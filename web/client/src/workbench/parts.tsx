@@ -3,7 +3,7 @@
  *
  * @module
  */
-import { For, Show, createUniqueId, type JSX } from "solid-js";
+import { For, Show, createEffect, createUniqueId, type JSX } from "solid-js";
 
 import type { AgentRow } from "../fleet";
 import type { Sender } from "./Composer";
@@ -66,6 +66,11 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
     uis.set(key, fresh);
     return fresh;
   };
+  // No state leaks: an entry goes when its request closes or is delisted.
+  createEffect(() => {
+    const live = new Set(props.cards.map((card) => `${card.agent}\u0000${card.id}`));
+    for (const key of [...uis.keys()]) if (!live.has(key)) uis.delete(key);
+  });
   return (
     <>
       <Show when={note()}>{(text) => <p class="inbox__note">{text()}</p>}</Show>

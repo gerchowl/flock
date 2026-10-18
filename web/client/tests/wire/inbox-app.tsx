@@ -19,10 +19,18 @@ import { Workbench } from "../../src/workbench/Workbench";
 import { Harness, live, sentFrames, step } from "./harness";
 
 /** #2244's real open and closed records: the helpers vary them, never hand-build the shape. */
-const [OPEN, CLOSED] = fixtureExamples["permission-decision"].flatMap((line) => {
-  const ev = line.step === "send" && line.frame?.t === "ev" ? (line.frame.ev as unknown as { type?: string }) : null;
-  return ev?.type === "flk_permission_request" ? [ev as Record<string, unknown> & { request: Record<string, unknown> }] : [];
-}) as [Record<string, unknown> & { request: Record<string, unknown> }, Record<string, unknown>];
+type Template = Record<string, unknown> & { request: Record<string, unknown> };
+const RECORDS = fixtureExamples["permission-decision"].flatMap((line) => {
+  const ev = line.step === "send" && line.frame?.t === "ev" ? (line.frame.ev as unknown as { type?: string; state?: string }) : null;
+  return ev?.type === "flk_permission_request" ? [ev as unknown as Template & { state: string }] : [];
+});
+const pick = (state: string): Template => {
+  const found = RECORDS.find((record) => record.state === state);
+  if (found === undefined) throw new Error(`the permission-decision fixture has no ${state} record`);
+  return found;
+};
+const OPEN = pick("open");
+const CLOSED = pick("closed");
 
 let dispose: (() => void) | undefined;
 /** Tears the mounted workbench down; call from `afterEach`. */
