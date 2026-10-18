@@ -334,7 +334,7 @@ fn keyed_sink_never_changes_another_agent_or_publishes_eventhub_events() {
 }
 
 #[test]
-fn review_blocker_allowed_warning_does_not_block() {
+fn allowed_warning_does_not_block() {
     let now = Instant::now();
     let mut reducer = SessionState::new("agent_fixture".into());
     step(&mut reducer, started(), now);
@@ -354,7 +354,7 @@ fn review_blocker_allowed_warning_does_not_block() {
 }
 
 #[test]
-fn review_blocker_unknown_limit_status_preserves_the_last_observation() {
+fn unknown_rate_limit_status_preserves_the_last_observation() {
     let now = Instant::now();
     let mut reducer = SessionState::new("agent_fixture".into());
     step(&mut reducer, started(), now);
@@ -371,7 +371,7 @@ fn review_blocker_unknown_limit_status_preserves_the_last_observation() {
 }
 
 #[test]
-fn review_blocker_exit_closes_all_open_requests() {
+fn process_exit_closes_all_open_requests() {
     let now = Instant::now();
     let mut reducer = SessionState::new("agent_fixture".into());
     step(&mut reducer, started(), now);
@@ -394,7 +394,7 @@ fn review_blocker_exit_closes_all_open_requests() {
 }
 
 #[test]
-fn review_blocker_result_closes_all_open_requests() {
+fn top_level_result_closes_all_open_requests() {
     for result in [
         result(),
         fixture("result", Some(("/subtype", "error_during_execution"))),
@@ -416,12 +416,14 @@ fn review_blocker_result_closes_all_open_requests() {
 }
 
 #[test]
-fn review_blocker_cancel_closes_only_the_named_request() {
+fn control_cancel_closes_only_the_named_request() {
     let now = Instant::now();
     let mut reducer = SessionState::new("agent_fixture".into());
     step(&mut reducer, started(), now);
     step(&mut reducer, permission("p1", "Read"), now);
     step(&mut reducer, permission("p2", "AskUserQuestion"), now);
+    // Reconstructed from the SDK protocol, not a CLI capture. Its shape must be
+    // confirmed in the #1385 recapture: https://github.com/gerchowl/flock/issues/1385.
     let cancel = |id: &str| json!({"type":"control_cancel_request","request_id":id});
     assert_eq!(
         step(&mut reducer, cancel("other"), now).needs_human.len(),
