@@ -78,7 +78,7 @@ async fn creation_work_outlasts_the_ordinary_request_cap() {
 #[tokio::test]
 async fn agent_start_outlasts_the_ordinary_request_cap() {
     let request: Request = serde_json::from_value(serde_json::json!({
-        "id": "agent-budget", "method": "agent.start", "params": {"name": "budget-fixture"}
+        "id": "agent-budget", "method": "agent.start", "params": {"name": "budget-fixture", "argv": ["/bin/sh"]}
     }))
     .unwrap();
     delayed_operation(request.method).await;
@@ -128,7 +128,7 @@ fn assert_pre_dispatch(error: &io::Error) {
         "{error:?}"
     );
     assert_eq!(
-        crate::api::error_code::ErrorCode::Timeout.exit(),
+        crate::cli::output::io_error_code(error).exit(),
         crate::cli::exit::TIMEOUT
     );
 }
