@@ -187,7 +187,8 @@ is retained apart from the existing ASCII case-insensitive cache lookup.
 
 The reported host comes from the node's configured `name` or its OS hostname;
 a node with a non-LDH name must configure an LDH name to participate in peer
-summaries. SSH destinations are separate: `user@host`, ports, bracketed IPv6 and
+summaries, then restart: the advertised hostname is cached for the session.
+SSH destinations are separate: `user@host`, ports, bracketed IPv6 and
 SSH aliases keep their existing destination/ProxyJump grammar and 256-byte bound.
 They are not admitted as reported host identities. An absent or empty reported
 host means no reported identity and retains the legacy SSH-destination fallback,

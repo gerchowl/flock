@@ -511,7 +511,8 @@ is preserved, with ASCII case-insensitive cache lookup. A bad host returns
 binary route. Logs contain the typed code and fixed field name, never its value.
 
 The reported host comes from the node's configured `name` or OS hostname. Set
-a `name` that meets this grammar if the OS hostname does not. SSH destinations
+a `name` that meets this grammar if the OS hostname does not, then restart
+the server: its advertised hostname is cached for the session. SSH destinations
 are separate fields: `user@host`, ports, bracketed IPv6 and SSH aliases keep
 their existing destination and ProxyJump validation, with a 256-byte bound.
 IPv4 addresses meet the hostname grammar directly. An absent or empty reported
