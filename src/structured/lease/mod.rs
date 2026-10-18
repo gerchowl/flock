@@ -2,9 +2,14 @@
 //! Reserve before launch. Unconfirmed process cleanup retains the reservation;
 //! an unresolved reservation never grants operator authority. UID policy is #1629.
 #![deny(missing_docs)]
+mod credential;
+mod scoped;
 use super::supervision::ProcessIdentity;
 use crate::platform;
+pub(crate) use credential::LeaseCredential;
 use parking_lot::Mutex;
+use scoped::Generation;
+pub(crate) use scoped::{ContinuationProof, ScopedRefusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
@@ -24,6 +29,7 @@ struct Entry {
     parent: Option<String>,
     process: Option<ProcessIdentity>,
     root: Root,
+    generation: Generation,
 }
 /// Server-owned lease table shared with its runtime workers.
 #[derive(Clone, Default)]
@@ -42,6 +48,22 @@ pub enum Caller {
     },
     /// Missing/reused process identity, pending launch or unavailable registry.
     Uncertain,
+    /// Scoped ancestry exceeds the supported permanent depth limit.
+    AncestryLimit,
+    /// Scoped verification could not acquire the registry.
+    Busy,
+}
+impl Caller {
+    /// Refusals never acquire unrelated/operator authority, including under churn.
+    pub(crate) fn refusal(&self) -> Option<crate::api::error_code::ErrorCode> {
+        use crate::api::error_code::ErrorCode;
+        match self {
+            Self::Busy => Some(ErrorCode::LeaseBusy),
+            Self::AncestryLimit => Some(ErrorCode::LeaseAncestryLimit),
+            Self::Uncertain => Some(ErrorCode::NotAuthorized),
+            _ => None,
+        }
+    }
 }
 /// Exclusive session reservation. Drop releases only a never-spawned launch.
 pub struct Lease {
@@ -51,6 +73,7 @@ pub struct Lease {
     spawned: bool,
     released: bool,
     cleanup_confirmed: bool,
+    generation: Generation,
 }
 impl SessionLeases {
     // ADR-0036 §1a: acquire both views before mutation; timeout leaves the
@@ -90,6 +113,8 @@ impl SessionLeases {
         session: &str,
         lineage: Option<(&str, u32)>,
     ) -> Result<Lease, crate::api::error_code::ErrorCode> {
+        let generation =
+            Generation::new().map_err(|_| crate::api::error_code::ErrorCode::AgentStartFailed)?;
         self.update(|entries| {
             if entries.contains_key(session) {
                 return Err(crate::api::error_code::ErrorCode::SessionBusy);
@@ -102,6 +127,7 @@ impl SessionLeases {
                     parent: lineage.map(|(parent, _)| parent.to_owned()),
                     process: None,
                     root: Root::Launcher(std::process::id()),
+                    generation: generation.clone(),
                 },
             );
             Ok(())
@@ -114,6 +140,7 @@ impl SessionLeases {
             spawned: false,
             released: false,
             cleanup_confirmed: false,
+            generation,
         })
     }
     /// Worker-side cleanup confirmation. Never wait on this lock in the app loop.
@@ -263,10 +290,12 @@ impl Lease {
     /// Publish PID/birth before the runtime handle, retaining uncertainty on failure.
     pub(super) fn bind(&mut self, pid: u32) -> io::Result<()> {
         let process = ProcessIdentity::capture(pid);
+        self.generation.bump();
         self.leases.update(|entries| {
             let entry = entries
                 .get_mut(&self.session)
                 .ok_or_else(|| io::Error::other("lease missing"))?;
+            entry.generation = self.generation.clone();
             entry.root = Root::Process(pid);
             entry.process = process.as_ref().ok().copied();
             Ok::<_, io::Error>(())
@@ -275,6 +304,7 @@ impl Lease {
     }
     /// Release after the runtime confirms process-tree cleanup, including startup errors.
     pub(super) fn release(&mut self) {
+        self.revoke();
         self.cleanup_confirmed = true;
         if self.released {
             return;
@@ -296,6 +326,7 @@ impl Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
+        self.revoke();
         if !self.spawned && !self.released {
             self.release();
         }
@@ -310,3 +341,11 @@ impl Drop for Lease {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+impl Lease {
+    /// Bind the current fixture peer without spawning a harness.
+    pub(crate) fn bind_test_peer(&mut self, pid: u32) {
+        self.bind(pid).expect("bind owned test peer");
+    }
+}

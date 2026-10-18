@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod peer_uid_tests;
 #[cfg(test)]
+mod scoped_mcp_tests;
+#[cfg(test)]
 mod structured_lease_tests;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -210,7 +212,7 @@ impl App {
             respond_to,
         } = ev
         {
-            self.advance_guarded_request(request_id, pane_id, attempt, respond_to);
+            self.advance_guarded_request(request_id, pane_id, *attempt, respond_to);
             return;
         }
         if let AppEvent::ClipboardWrite { content } = ev {
@@ -1404,6 +1406,17 @@ impl App {
         request: &crate::api::schema::Request,
     ) -> Option<String> {
         use crate::api::{error_code::ErrorCode, schema::Method};
+        if let Some(code) = self
+            .current_api_scope
+            .as_ref()
+            .and_then(|scope| scope.refusal())
+        {
+            return Some(responses::encode_error(
+                request.id.clone(),
+                code.as_str(),
+                "scoped caller admission refused",
+            ));
+        }
         let uid = self.current_api_peer_uid?;
         let code = if matches!(
             request.method,
@@ -1425,7 +1438,7 @@ impl App {
             };
             let attributed = self.runtime_config.uid_policy.classify(uid)
                 == crate::structured::identity::Principal::Agent
-                && self.lease_caller() != crate::structured::lease::Caller::Uncertain;
+                && self.lease_caller().refusal().is_none();
             self.runtime_config
                 .uid_policy
                 .refusal(uid, attributed, &request.method)
@@ -1464,6 +1477,7 @@ impl App {
             self.pending_recovery_park = Some((
                 request,
                 super::ApiCaller {
+                    scope: self.current_api_scope.clone(),
                     pid: self.current_api_peer_pid,
                     birth: self.current_api_peer_birth,
                     uid: self.current_api_peer_uid,

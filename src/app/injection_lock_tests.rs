@@ -1158,3 +1158,68 @@ async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
         );
     }
 }
+
+#[tokio::test]
+async fn admitted_guarded_submit_survives_brief_registry_contention() {
+    let (leases, _lease, scope, _) = crate::api::scoped::tests::live_scope();
+    let Rig {
+        mut app,
+        pane,
+        mut pty,
+    } = lock_rig(&CLAUDE);
+    app.current_api_scope = Some(scope);
+    let now = Instant::now();
+    let mut attempt = app
+        .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+        .unwrap();
+    assert_eq!(drain(&mut pty), vec![b"hello".to_vec()]);
+    paint(&app, &CLAUDE, "hello");
+    let now = observe_paste_write(&app, &pane, &mut attempt, now);
+    leases.with_registry_locked(|| {
+        assert_eq!(
+            app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+            None
+        );
+    });
+    assert_eq!(drain(&mut pty), vec![b"\r".to_vec()]);
+    took_turn(&mut app, Agent::Claude, now + GAP);
+    assert_eq!(
+        app.advance_guarded_submit(&pane, &mut attempt, now + GAP),
+        Some(Outcome::ObservedAccepted)
+    );
+}
+
+#[tokio::test]
+async fn admitted_submit_refuses_revocation_and_fresh_ancestry_loss_under_contention() {
+    for revoked in [false, true] {
+        let (leases, lease, scope, _) = crate::api::scoped::tests::live_scope();
+        leases.with_registry_locked(|| assert_eq!(scope.continuation_refusal(), None));
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = lock_rig(&CLAUDE);
+        app.current_api_scope = Some(if revoked {
+            scope
+        } else {
+            crate::api::scoped::tests::ancestry_lost(&scope)
+        });
+        let now = Instant::now();
+        let mut attempt = app
+            .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
+            .unwrap();
+        drain(&mut pty);
+        let check = || {
+            assert_eq!(
+                app.advance_guarded_submit(&pane, &mut attempt, Instant::now()),
+                Some(Outcome::Unconfirmed("paste_written"))
+            );
+        };
+        if revoked {
+            crate::api::scoped::tests::with_revocation_under_contention(&leases, lease, check);
+        } else {
+            leases.with_registry_locked(check);
+        }
+        assert!(drain(&mut pty).is_empty());
+    }
+}

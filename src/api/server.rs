@@ -256,14 +256,13 @@ pub(crate) fn handle_connection(
         return Ok(());
     };
 
-    let line = line.trim();
-    if line.is_empty() {
+    if line.trim().is_empty() {
         return Ok(());
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
+    let (request, credential) = match super::scoped::decode(line.trim()) {
         Ok(request) => request,
-        Err(err) => {
+        Err(detail) => {
             write_json_line_allow_disconnect(
                 &mut stream,
                 &ErrorResponse {
@@ -271,12 +270,34 @@ pub(crate) fn handle_connection(
                     error: ErrorBody {
                         data: None,
                         code: "invalid_request".into(),
-                        message: format!("invalid request: {err}"),
+                        message: detail.map_or_else(
+                            || "invalid request".into(),
+                            |error| format!("invalid request: {error}"),
+                        ),
                     },
                 },
             )?;
             return Ok(());
         }
+    };
+
+    drop(line);
+
+    let _scope = match credential {
+        Some(credential) => match super::scoped::Scope::enter(credential, peer, &request, api_tx) {
+            Ok(guard) => Some(guard),
+            Err(code) => {
+                return write_text_line_allow_disconnect(
+                    &mut stream,
+                    &error_response_json(
+                        request.id,
+                        code.as_str(),
+                        "scoped caller admission refused".into(),
+                    ),
+                )
+            }
+        },
+        None => None,
     };
 
     let request_id = request.id.clone();
@@ -327,6 +348,9 @@ pub(crate) fn handle_connection(
                 );
                 return Ok(());
             };
+            if continuation_refused() {
+                return Ok(());
+            }
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -360,6 +384,9 @@ pub(crate) fn handle_connection(
                 );
                 return Ok(());
             };
+            if continuation_refused() {
+                return Ok(());
+            }
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -386,6 +413,9 @@ pub(crate) fn handle_connection(
                 );
                 return Ok(());
             };
+            if continuation_refused() {
+                return Ok(());
+            }
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -632,27 +662,29 @@ fn api_response_outcome(response: &str) -> &'static str {
     }
 }
 
-fn read_initial_request_line(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
+fn read_initial_request_line(
+    stream: &mut UnixStream,
+) -> std::io::Result<Option<zeroize::Zeroizing<String>>> {
     stream.set_nonblocking(true)?;
     let deadline = Instant::now() + INITIAL_REQUEST_TIMEOUT;
-    let mut bytes = Vec::new();
-    let mut byte = [0u8; 1];
+    let mut bytes = super::secret_json::Buffer::default();
+    let mut byte = zeroize::Zeroizing::new([0u8; 1]);
 
     loop {
-        match stream.read(&mut byte) {
+        match stream.read(&mut *byte) {
             Ok(0) => {
                 stream.set_nonblocking(false)?;
                 return Ok(None);
             }
             Ok(_) => {
-                bytes.push(byte[0]);
+                bytes.write_all(&*byte)?;
                 if byte[0] == b'\n' {
                     stream.set_nonblocking(false)?;
-                    return String::from_utf8(bytes)
-                        .map(Some)
+                    return std::str::from_utf8(&bytes.0)
+                        .map(|text| Some(zeroize::Zeroizing::new(text.to_owned())))
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
                 }
-                if bytes.len() > MAX_INITIAL_REQUEST_BYTES {
+                if bytes.0.len() > MAX_INITIAL_REQUEST_BYTES {
                     stream.set_nonblocking(false)?;
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -678,14 +710,36 @@ fn read_initial_request_line(stream: &mut UnixStream) -> std::io::Result<Option<
     }
 }
 
-fn stream_subscriptions(
-    mut stream: UnixStream,
+pub(super) fn stream_subscriptions(
+    stream: UnixStream,
     request_id: String,
     params: crate::api::schema::EventsSubscribeParams,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    stream_subscriptions_with(
+        stream,
+        request_id,
+        params,
+        api_tx,
+        event_hub,
+        running,
+        || {},
+    )
+}
+
+/// The callback is the deterministic test seam after poll reply and before write.
+pub(super) fn stream_subscriptions_with(
+    mut stream: UnixStream,
+    request_id: String,
+    params: crate::api::schema::EventsSubscribeParams,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    mut before_event_write: impl FnMut(),
+) -> std::io::Result<()> {
+    let _continuation = super::scoped::Scope::enter_continuation();
     // ADR-0028 §3 (#1030): from the caller's cursor, else from now. A
     // cursor past the newest event is refused, as `events.read` refuses it,
     // rather than streaming nothing until the hub catches up to it.
@@ -700,10 +754,16 @@ fn stream_subscriptions(
                 message: format!("cursor {start} is past this server's newest event {head}"),
             },
         };
+        if continuation_refused() {
+            return Ok(());
+        }
         return write_json_line_allow_disconnect(&mut stream, &refusal);
     }
     let mut subscriptions = Vec::with_capacity(params.subscriptions.len());
     for (index, subscription) in params.subscriptions.into_iter().enumerate() {
+        if continuation_refused() {
+            return Ok(());
+        }
         let active = match ActiveSubscription::new(
             subscription,
             &request_id,
@@ -714,6 +774,9 @@ fn stream_subscriptions(
         ) {
             Ok(active) => active,
             Err(response) => {
+                if continuation_refused() {
+                    return Ok(());
+                }
                 if let Err(err) = write_json_line(&mut stream, &response) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -726,6 +789,9 @@ fn stream_subscriptions(
         subscriptions.push(active);
     }
 
+    if continuation_refused() {
+        return Ok(());
+    }
     if let Err(err) = write_json_line(
         &mut stream,
         &SuccessResponse {
@@ -746,8 +812,15 @@ fn stream_subscriptions(
 
         let mut wrote = false;
         for subscription in &mut subscriptions {
+            if continuation_refused() {
+                return Ok(());
+            }
             if let Some(event) = subscription.poll(api_tx, event_hub) {
+                before_event_write();
                 wrote = true;
+                if continuation_refused() {
+                    return Ok(());
+                }
                 if let Err(err) = write_json_line(&mut stream, &event) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -767,6 +840,9 @@ fn stream_subscriptions(
             .map(ActiveSubscription::hub_cursor)
             .collect::<Option<Vec<u64>>>()
             .and_then(|cursors| cursors.into_iter().min());
+        if continuation_refused() {
+            return Ok(());
+        }
         match cursor {
             // Drain a burst before sleeping: one poll yields one event.
             Some(_) if wrote => {}
@@ -806,10 +882,18 @@ fn write_json_line_allow_disconnect<T: serde::Serialize>(
     write_text_line_allow_disconnect(stream, &encoded)
 }
 
+fn continuation_refused() -> bool {
+    super::scoped::Scope::current().is_some_and(|scope| scope.continuation_refusal().is_some())
+}
+
 pub(super) fn should_stop_connection(
     stream: &mut UnixStream,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
+    if continuation_refused() {
+        return Ok(true);
+    }
+
     if !running.load(Ordering::Relaxed) {
         return Ok(true);
     }
@@ -856,6 +940,7 @@ pub(super) fn dispatch_to_app_with_timeout(
     timeout: Option<Duration>,
     peer: crate::platform::peer::Credentials,
 ) -> String {
+    let peer = super::scoped::Scope::current().map_or(peer, |scope| scope.peer());
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
@@ -864,6 +949,7 @@ pub(super) fn dispatch_to_app_with_timeout(
         peer_pid: peer.pid,
         peer_birth: peer.birth,
         peer_uid: peer.uid,
+        scope: super::scoped::Scope::current(),
     }) {
         return error_response_json(
             request_id,

@@ -15,6 +15,9 @@ impl App {
         if !self.socket_birth_valid() {
             return crate::structured::lease::Caller::Uncertain;
         }
+        if let Some(scope) = &self.current_api_scope {
+            return scope.principal();
+        }
         let evidence = self.caller_pane_evidence();
         let pane = evidence
             .as_ref()
@@ -31,6 +34,18 @@ impl App {
             crate::structured::lease::Caller::Uncertain
         } else {
             caller
+        }
+    }
+
+    /// Internal authentication probes execute no user method or effect.
+    pub(crate) fn respond_scope_probe(&self, msg: &crate::api::ApiRequestMessage) -> bool {
+        if let Some(reply) = msg.scope.as_ref().and_then(|scope| {
+            scope.probe_reply(&self.session_leases, &self.runtime_config.uid_policy)
+        }) {
+            let _ = msg.respond_to.send(reply.into());
+            true
+        } else {
+            false
         }
     }
 

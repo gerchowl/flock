@@ -459,6 +459,9 @@ fn switch_failure_reason(err: &io::Error) -> String {
     peers::failure_text(&err.to_string())
 }
 
+// MCP serve must reach its credential scrub through the synchronous CLI path
+// before any runtime, logging worker or other thread is created. Do not move
+// worker setup ahead of CLI dispatch: getenv storage is mutated in place there.
 fn main() {
     if let Err(error) = run() {
         eprintln!("Error: {error}");

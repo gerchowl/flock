@@ -85,7 +85,7 @@ pub fn assert_command_isolated(cmd: &std::process::Command) {
 /// All test subprocesses use this builder. Only flk (including a flk argument
 /// to sandbox-exec) receives the sandbox environment at the execution boundary.
 /// Keeping the inner command private prevents builder chains bypassing the guard.
-pub struct Command(std::process::Command);
+pub struct Command(std::process::Command, bool);
 
 impl std::ops::Deref for Command {
     type Target = std::process::Command;
@@ -98,7 +98,7 @@ impl std::ops::Deref for Command {
 #[allow(clippy::disallowed_methods)]
 impl Command {
     pub fn new(program: impl AsRef<std::ffi::OsStr>) -> Self {
-        Self(std::process::Command::new(program))
+        Self(std::process::Command::new(program), false)
     }
     pub fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) -> &mut Self {
         self.0.arg(arg);
@@ -133,8 +133,12 @@ impl Command {
         self.0.env_remove(key);
         self
     }
+    pub fn environment_was_cleared(&self) -> bool {
+        self.1
+    }
     pub fn env_clear(&mut self) -> &mut Self {
         self.0.env_clear();
+        self.1 = true;
         self
     }
     pub fn current_dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {

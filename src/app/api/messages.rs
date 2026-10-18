@@ -196,7 +196,7 @@ pub(crate) struct WakeSuppression {
 /// in this module branches on WHO sent a message, only on WHERE it goes.
 impl App {
     pub(super) fn handle_msg_send(&mut self, id: String, params: MsgSendParams) -> String {
-        if self.lease_caller() == crate::structured::lease::Caller::Uncertain {
+        if self.lease_caller().refusal().is_some() {
             return encode_error(
                 id,
                 "msg_not_allowed",
@@ -326,7 +326,7 @@ impl App {
     }
 
     pub(super) fn handle_msg_reply(&mut self, id: String, params: MsgReplyParams) -> String {
-        if self.lease_caller() == crate::structured::lease::Caller::Uncertain {
+        if self.lease_caller().refusal().is_some() {
             return encode_error(
                 id,
                 "msg_not_allowed",
@@ -1390,7 +1390,9 @@ impl App {
     pub(super) fn attested_sender_agent(&mut self) -> Option<String> {
         match self.lease_caller() {
             crate::structured::lease::Caller::Agent { agent, .. } => return Some(agent),
-            crate::structured::lease::Caller::Uncertain => return None,
+            crate::structured::lease::Caller::Uncertain
+            | crate::structured::lease::Caller::AncestryLimit
+            | crate::structured::lease::Caller::Busy => return None,
             crate::structured::lease::Caller::Unrelated => (),
         }
         let (ws_idx, pane_id) = self.parse_pane_id_or_peer("", self.current_api_peer_pid)?;
@@ -2097,6 +2099,7 @@ mod tests {
         let recovery = hold_recovery(&mut replacement);
         let (respond_to, responses) = std::sync::mpsc::channel();
         replacement.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "reply".into(),
                 method: Method::MsgReply(MsgReplyParams {
@@ -2129,6 +2132,7 @@ mod tests {
     fn park(app: &mut crate::app::App, method: Method) -> std::sync::mpsc::Receiver<String> {
         let (respond_to, responses) = std::sync::mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "parked".into(),
                 method,
@@ -2283,6 +2287,7 @@ mod tests {
             .unwrap();
         let (respond_to, responses) = std::sync::mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "completed".into(),
                 method: fyi_send(&app, "after-recovery"),
