@@ -132,6 +132,7 @@ pub(super) struct SelectionEraseTracker {
     parameters_len: usize,
     colon: bool,
     screen: Option<ActiveScreen>,
+    screen_sync: bool,
     screens: [ScreenEraseFacts; 2],
 }
 
@@ -193,8 +194,8 @@ impl SelectionEraseTracker {
     fn invalidate_active(&mut self) {
         match self.screen {
             Some(screen) => self.invalidate_screen(screen),
-            // XTRESTORE does not reveal its saved value. A later erase in the
-            // same chunk may target either screen, so refuse both until resynced.
+            // The native screen is unknown until a transition is flushed.
+            // Refuse both if a later mode in the same CSI erases either screen.
             None => self.invalidate_all(),
         }
     }
@@ -218,9 +219,12 @@ impl SelectionEraseTracker {
         self.screen = screen;
     }
 
-    pub(super) fn write(&mut self, bytes: &[u8]) {
+    /// Track a prefix through the next screen boundary, or the entire slice.
+    /// The caller flushes that prefix natively and synchronizes before continuing.
+    pub(super) fn write(&mut self, bytes: &[u8]) -> usize {
+        self.screen_sync = false;
         use EraseState::*;
-        for &byte in bytes {
+        for (offset, &byte) in bytes.iter().enumerate() {
             // Ground bytes pass through Ghostty's UTF-8 decoder: raw C1 bytes
             // there are text, not controls. In other states its VT table applies.
             let next = match byte {
@@ -252,6 +256,7 @@ impl SelectionEraseTracker {
                         if byte == b'c' {
                             self.invalidate_all();
                             self.screen = Some(ActiveScreen::Primary);
+                            self.screen_sync = true;
                         }
                         self.state = Ground;
                     }
@@ -301,7 +306,11 @@ impl SelectionEraseTracker {
                 Osc if byte == 7 => self.state = Ground,
                 _ => {}
             }
+            if self.screen_sync {
+                return offset + 1;
+            }
         }
+        bytes.len()
     }
 
     fn start_csi(&mut self) {
@@ -342,13 +351,11 @@ impl SelectionEraseTracker {
                     if mode != 47 || final_byte == b'r' {
                         self.invalidate_screen(ActiveScreen::Alternate);
                     }
-                    self.screen = match final_byte {
-                        b'h' => Some(ActiveScreen::Alternate),
-                        b'l' => Some(ActiveScreen::Primary),
-                        // Saved bits are deliberately not mirrored. Terminal.write
-                        // resynchronizes from the native screen after each chunk.
-                        _ => None,
-                    };
+                    // The native result, including restore and allocation errors,
+                    // is authoritative. Unknown transitions inside a mode list
+                    // make any following erase in that same CSI fail safe.
+                    self.screen = None;
+                    self.screen_sync = true;
                 }
                 _ => {}
             }
@@ -663,7 +670,16 @@ mod screen_scope_tests {
     }
 
     #[test]
-    fn unknown_restored_screen_erases_fail_safe_until_native_resynchronization() {
+    fn native_screen_resynchronization_scopes_erases_after_restore() {
+        let mut saved_true = Terminal::new(40, 6, 256 * 1024).unwrap();
+        saved_true.write(b"\x1b[?1049h\x1b[?1049s\x1b[?47l");
+        saved_true.write(b"\x1b[?1049r\x1b[3J\x1b[?47l");
+        assert_eq!(
+            saved_true
+                .selection_erases
+                .generation(ActiveScreen::Primary),
+            0
+        );
         let mut terminal = Terminal::new(40, 6, 256 * 1024).unwrap();
         terminal.write(b"\x1b[?1049r\x1b[3J");
         assert!(terminal.selection_erases.generation(ActiveScreen::Primary) > 0);

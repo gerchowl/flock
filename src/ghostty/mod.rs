@@ -588,7 +588,16 @@ impl Terminal {
     pub fn write(&mut self, bytes: &[u8]) {
         self.selection_erases
             .synchronize_screen(self.active_screen().ok());
-        self.selection_erases.write(bytes);
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let consumed = self.selection_erases.write(remaining);
+            self.write_native(&remaining[..consumed]);
+            remaining = &remaining[consumed..];
+        }
+    }
+
+    /// Preserve native parser state between chunks and observe actual switches.
+    fn write_native(&mut self, bytes: &[u8]) {
         // SAFETY: self.raw is a live terminal handle for self's lifetime.
         unsafe {
             ffi::ghostty_terminal_vt_write(self.raw, bytes.as_ptr(), bytes.len());

@@ -51,7 +51,7 @@ erase policy, including ED 0 after cursor-home, remains tracked by #2143.
 Ordinary retained-cell rewrites still follow the copy policy in §2.
 
 Full reset (`ESC c`) invalidates both screen generations. Screen mode
-1047/1049 clears invalidate alternate identity, including XTRESTORE (`CSI ? Pm
+1047/1049 transitions conservatively invalidate alternate identity, including XTRESTORE (`CSI ? Pm
 r`) regardless of the saved value; mode 47 restore is conservatively treated
 as alternate loss too. None of these alternate facts invalidate primary cells.
 `TrackedSelection::points` compares only its captured screen’s generation and
@@ -65,13 +65,16 @@ inactive, and primary identity only for primary loss. Alternate history or
 past allocation never vetoes a primary anchor. This covers modes 47, 1047 and
 1049, saved restores and teardown without a bridge or C-API change (#2146).
 
-`SelectionEraseTracker::dispatch_csi` follows known screen switches in wire
-order, so alternate enter/output/erase/exit in one `Terminal::write` chunk
-cannot leak alternate erase facts into primary. Saved mode bits are not
-mirrored: after XTRESTORE the active screen is unknown until the native write
-finishes and `synchronize_screen` reads it back. An erase while that own-screen
-fact is unknown invalidates both generations, failing safe. DECCOLM also
-applies the per-screen resize-loss facts before invalidating its active erase.
+`SelectionEraseTracker::dispatch_csi` identifies screen-switch boundaries.
+`Terminal::write` flushes through each boundary and uses `synchronize_screen`
+to read the native active screen before tracking the following bytes. This
+preserves native parser state across segments; alternate enter/output/erase/exit
+in one PTY read cannot leak alternate erase facts into primary. Saved mode bits
+are not mirrored, and no successful allocation or restored value is guessed.
+A failed native query leaves the active screen unknown. An erase while that
+own-screen fact is unknown, including a later mode inside the same CSI,
+invalidates both generations, failing safe. DECCOLM also applies per-screen
+resize-loss facts before invalidating its active erase.
 
 Audit: the stream dispatcher sends XTSAVE to `save_mode` / `modes.save`,
 which only stores bits; XTRESTORE dispatches `restore_mode` through
