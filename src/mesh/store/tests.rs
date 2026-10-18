@@ -5138,3 +5138,243 @@ fn route_generation_clears_a_withdrawn_recipient_while_its_hub_stays_adjacent() 
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn inbox_admission_refusal_is_terminal_but_read_cannot_be_refused() {
+    for read in [false, true] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        let mail = envelope();
+        store.set_local_node(&mail.key.origin_node);
+        store
+            .accept_local(
+                &mail,
+                CUSTODY_TTL_MS,
+                "native-recipient",
+                "native-session",
+                0,
+            )
+            .unwrap();
+        if read {
+            store.finish(&mail.key, Outcome::Read, 1).unwrap();
+            assert!(matches!(
+                store.settle_queue_admission(&mail.key, Some("session_busy"), 2),
+                Err(Error::InvalidState)
+            ));
+        } else {
+            store
+                .settle_queue_admission(&mail.key, Some("session_busy"), 1)
+                .unwrap();
+            store
+                .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 2)
+                .unwrap();
+            assert!(store.mailbox_keys().unwrap().is_empty());
+            drop(store);
+            let store = fixture.open(3);
+            let status = store
+                .status(&mail.key.origin_node, &mail.correlation_id, 3)
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.state, "refused");
+            assert_eq!(status.detail.as_deref(), Some("session_busy"));
+        }
+    }
+}
+
+#[test]
+fn remote_origin_inbox_cannot_be_changed_to_refused() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store.set_local_node("other.example");
+    store
+        .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    assert!(matches!(
+        store.refuse(&mail.key, "session_busy", 1),
+        Err(Error::InvalidState)
+    ));
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "inbox");
+}
+
+#[test]
+fn custody_completion_transport_refusal_cannot_revoke_own_inbox() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store.set_local_node(&mail.key.origin_node);
+    store
+        .accept_local(
+            &mail,
+            CUSTODY_TTL_MS,
+            "native-recipient",
+            "native-session",
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.refuse(&mail.key, "session_busy", 1),
+        Err(Error::InvalidState)
+    ));
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "inbox");
+    store.settle_queue_admission(&mail.key, None, 2).unwrap();
+    let admitted = store.get(&mail.key).unwrap().unwrap();
+    assert_eq!(admitted.state, "delivered");
+    assert_eq!(admitted.envelope.body, mail.body);
+    store.finish(&mail.key, Outcome::Read, 3).unwrap();
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "read");
+}
+
+#[test]
+fn custody_unknown_expiry_is_recorded_by_every_inbox_expiry_path() {
+    use crate::api::error_code::ErrorCode;
+    for path in [
+        "maintain",
+        "read",
+        "finish",
+        "recovery",
+        "late-proof",
+        "reply",
+    ] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        let mail = envelope();
+        store.set_local_node(&mail.key.origin_node);
+        store
+            .accept_local(&mail, CUSTODY_TTL_MS, "native", "session", 0)
+            .unwrap();
+        assert_eq!(
+            store
+                .queue_commitment_unknown(&mail.key, Some(ErrorCode::QueueJournalNewer), 0)
+                .unwrap(),
+            Some(DAY_MS as u64)
+        );
+        let unchanged = store.connection.total_changes();
+        store
+            .queue_commitment_unknown(&mail.key, Some(ErrorCode::QueueJournalNewer), 0)
+            .unwrap();
+        assert_eq!(
+            store.connection.total_changes(),
+            unchanged + 1,
+            "only the clock advances"
+        );
+        let status = store
+            .status(&mail.key.origin_node, &mail.correlation_id, DAY_MS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.state, "expired");
+        assert_eq!(status.detail.as_deref(), Some(COMMITMENT_UNKNOWN_AT_EXPIRY));
+        match path {
+            "maintain" => {
+                store.maintain(DAY_MS).unwrap();
+            }
+            "read" => {
+                assert_eq!(
+                    store
+                        .read_inbox(std::slice::from_ref(&mail.key), DAY_MS)
+                        .unwrap(),
+                    vec![mail.key.clone()]
+                );
+            }
+            "finish" => {
+                store
+                    .finish(&mail.key, Outcome::InboxExpired, DAY_MS)
+                    .unwrap();
+            }
+            "recovery" => {
+                assert_eq!(
+                    store
+                        .queue_commitment_unknown(&mail.key, Some(ErrorCode::AgentNotFound), DAY_MS)
+                        .unwrap(),
+                    None
+                );
+            }
+            "late-proof" => {
+                assert_eq!(
+                    store
+                        .queue_commitment_unknown(&mail.key, None, DAY_MS)
+                        .unwrap(),
+                    None
+                );
+            }
+            "reply" => {
+                let mut reply = envelope();
+                reply.request_key = Some(mail.key.clone());
+                reply.correlation_id = "answer".into();
+                reply.body = br#"{"message":{"body":"answer"}}"#.to_vec();
+                store
+                    .accept(&reply, CUSTODY_TTL_MS, Admission::Inbox, DAY_MS)
+                    .unwrap();
+                store.maintain(DAY_MS).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        drop(store);
+        let store = fixture.open(DAY_MS);
+        assert_eq!(
+            store.get(&mail.key).unwrap().unwrap().state,
+            "inbox_expired"
+        );
+        assert_eq!(
+            store
+                .collection_error(&mail.key.origin_node, &mail.correlation_id)
+                .unwrap()
+                .as_deref(),
+            Some(COMMITMENT_UNKNOWN_AT_EXPIRY)
+        );
+    }
+}
+
+#[test]
+fn custody_unknown_diagnostic_clears_when_custody_is_settled_or_owner_answers() {
+    use crate::api::error_code::ErrorCode;
+    for action in ["owner", "delivered", "read", "read-inbox"] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        let mail = envelope();
+        store.set_local_node(&mail.key.origin_node);
+        store
+            .accept_local(&mail, CUSTODY_TTL_MS, "native", "session", 0)
+            .unwrap();
+        store
+            .queue_commitment_unknown(&mail.key, Some(ErrorCode::AgentNotFound), 0)
+            .unwrap();
+        let expected = match action {
+            "owner" => {
+                assert!(store
+                    .queue_commitment_unknown(&mail.key, None, 1)
+                    .unwrap()
+                    .is_some());
+                "queued"
+            }
+            "delivered" => {
+                store.settle_queue_admission(&mail.key, None, 1).unwrap();
+                "delivered"
+            }
+            "read" => {
+                store.finish(&mail.key, Outcome::Read, 1).unwrap();
+                "read"
+            }
+            "read-inbox" => {
+                assert!(store
+                    .read_inbox(std::slice::from_ref(&mail.key), 1)
+                    .unwrap()
+                    .is_empty());
+                "read"
+            }
+            _ => unreachable!(),
+        };
+        assert!(store
+            .collection_error(&mail.key.origin_node, &mail.correlation_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .status(&mail.key.origin_node, &mail.correlation_id, 1)
+                .unwrap()
+                .unwrap()
+                .state,
+            expected
+        );
+    }
+}
