@@ -314,4 +314,4 @@ async fn connection(
     }
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

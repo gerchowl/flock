@@ -29,6 +29,12 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 serial-pty = { max-threads = 1 }
 
 [[profile.default.overrides]]
+# #1894: real mounted listener tests and the optional web core must expose failures on try one.
+# mount.rs is a module of client_tokens, not a separately configured binary.
+filter = 'binary(=client_tokens) | binary(=gui_feature_gate) | binary(=gui_bundle_build) | (binary(=flk) & (test(web::) | test(platform::client_listener::)))'
+retries = 0
+
+[[profile.default.overrides]]
 # Hang ceiling only (#1317): condition waits decide correctness, while a
 # silent live producer must eventually produce a named test failure in CI.
 # Retain the stricter 180s backstop: each binary's measured p99 is below 18s

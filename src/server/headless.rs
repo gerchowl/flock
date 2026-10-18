@@ -640,9 +640,6 @@ impl HeadlessServer {
     pub async fn run(&mut self) -> io::Result<()> {
         #[cfg(feature = "web")]
         {
-            if self.client_wire.is_none() {
-                self.prepare_client_wire(None).await?;
-            }
             if let Some(wire) = &mut self.client_wire {
                 wire.activate();
             }
@@ -700,16 +697,6 @@ impl HeadlessServer {
         let mut needs_full_render = true;
 
         loop {
-            #[cfg(feature = "web")]
-            if self
-                .client_wire
-                .as_ref()
-                .is_some_and(crate::web::client_listener::Listener::failed)
-            {
-                return Err(io::Error::other(
-                    "structured client acceptor ended unexpectedly",
-                ));
-            }
             crate::render_prof::event("loop.tick");
             crate::render_prof::flush_if_due();
 

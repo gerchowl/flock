@@ -451,6 +451,7 @@ fn handle_request(
                 // exactly as long as the fault lasts.
                 session_health: Some(crate::health::confirmed()),
                 agent_account_diagnostic: crate::structured::identity::account_diagnostic(),
+                client_listener: crate::api::client_listener::status(),
                 api_listener: Some(
                     listener_health
                         .lock()

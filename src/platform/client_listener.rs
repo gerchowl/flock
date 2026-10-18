@@ -4,6 +4,21 @@ use std::{
     net::TcpListener,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
 };
+/// Accept recovery classes shared by the listener owner and structured logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcceptFailure {
+    Connection,
+    Resource,
+    Fatal,
+}
+/// Only invalid listener descriptors are fatal; all other peer/protocol errors are recoverable.
+pub(crate) fn accept_failure(error: &io::Error) -> AcceptFailure {
+    match error.raw_os_error() {
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK) => AcceptFailure::Fatal,
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => AcceptFailure::Resource,
+        _ => AcceptFailure::Connection,
+    }
+}
 /// Duplicate without relinquishing the exporter's rollback ownership.
 pub(crate) fn duplicate(listener: &TcpListener) -> io::Result<RawFd> {
     Ok(listener.try_clone()?.into_raw_fd())

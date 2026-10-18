@@ -1,6 +1,9 @@
 //! Real structured-client listener ownership (ADR-0036 §5/§5a).
+use super::wire::timing::{Clock, SystemClock};
 use super::{client_exchange, gui, wire::Core};
+use crate::api::client_listener::{publish, Status};
 use crate::client_open::Codes;
+use crate::platform::client_listener::{accept_failure, AcceptFailure};
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -12,6 +15,7 @@ use hyper_util::{
     rt::{TokioIo, TokioTimer},
     service::TowerToHyperService,
 };
+use std::future::Future;
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr, TcpListener},
@@ -31,13 +35,33 @@ const HTTP_ADMISSION_DEADLINE: Duration = Duration::from_secs(5);
 const FUNNEL_DEADLINE: Duration = Duration::from_secs(5);
 /// Maximum status JSON bytes accepted from the public-funnel probe.
 const FUNNEL_STATUS_BYTES: usize = 65_536;
-/// Own every HTTP task; upgraded sockets transfer ownership to the core.
-async fn serve(socket: tokio::net::TcpListener, router: Router) -> io::Result<()> {
+/// Resource pressure pauses acceptance without spinning or stopping the server (Tokio convention).
+const ACCEPT_RESOURCE_BACKOFF: Duration = Duration::from_millis(100);
+/// Own every HTTP task; acceptance and its monotonic clock are injectable without test sleeps.
+async fn serve<A, F>(mut accept: A, router: Router, clock: Arc<dyn Clock>) -> io::Result<()>
+where
+    A: FnMut() -> F,
+    F: Future<Output = io::Result<(tokio::net::TcpStream, SocketAddr)>>,
+{
     let slots = Arc::new(Semaphore::new(HTTP_CONNECTIONS));
     let mut clients = JoinSet::new();
     loop {
         while clients.try_join_next().is_some() {}
-        let (socket, peer) = socket.accept().await?;
+        let (socket, peer) = match accept().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                let class = accept_failure(&error);
+                crate::logging::client_accept_failed(&error, class);
+                if class == AcceptFailure::Fatal {
+                    publish(Status::Failed);
+                    return Err(error);
+                }
+                if class == AcceptFailure::Resource {
+                    clock.until(clock.now() + ACCEPT_RESOURCE_BACKOFF).await;
+                }
+                continue;
+            }
+        };
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             continue;
         };
@@ -91,9 +115,6 @@ impl Listener {
         if bind.ip() != Ipv4Addr::LOCALHOST {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        tokio::task::spawn_blocking(check_funnel)
-            .await
-            .map_err(io::Error::other)??;
         let socket = match inherited {
             Some(socket) => socket,
             None => TcpListener::bind(bind)?,
@@ -102,6 +123,9 @@ impl Listener {
         if actual.ip() != bind.ip() || (bind.port() != 0 && actual.port() != bind.port()) {
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        tokio::task::spawn_blocking(move || check_funnel(actual.port()))
+            .await
+            .map_err(io::Error::other)??;
         socket.set_nonblocking(true)?;
         let acceptor = tokio::net::TcpListener::from_std(socket.try_clone()?)?;
         let core = Core::new(data.clone()).await?;
@@ -121,12 +145,11 @@ impl Listener {
     /// Start only inside the owning server loop, after handoff commit if importing.
     pub(crate) fn activate(&mut self) {
         if let Some((socket, router)) = self.prepared.take() {
-            self.task = Some(tokio::spawn(serve(socket, router)));
+            publish(Status::Listening);
+            self.task = Some(tokio::spawn(async move {
+                serve(|| socket.accept(), router, Arc::new(SystemClock)).await
+            }));
         }
-    }
-    /// True only if the owning accept task unexpectedly ended.
-    pub(crate) fn failed(&self) -> bool {
-        self.task.as_ref().is_some_and(JoinHandle::is_finished)
     }
     /// Cancel owned HTTP tasks, then cancel and require upgraded core lease release.
     pub(crate) async fn shutdown(mut self) -> io::Result<()> {
@@ -162,17 +185,63 @@ async fn guard(
 struct FunnelStatus {
     #[serde(rename = "AllowFunnel", default)]
     enabled: std::collections::BTreeMap<String, bool>,
+    #[serde(flatten)]
+    rest: serde_json::Map<String, serde_json::Value>,
 }
-fn check_funnel() -> io::Result<()> {
+fn check_funnel(port: u16) -> io::Result<()> {
     let output = crate::process::TracedCommand::new("tailscale", "client-wire")
         .args(["serve", "status", "--json"])
         .output_traced_with_timeout_and_limit(FUNNEL_DEADLINE, FUNNEL_STATUS_BYTES)?;
-    let status: FunnelStatus = serde_json::from_slice(&output.stdout).map_err(io::Error::other)?;
-    if !output.status.success() || status.enabled.values().any(|active| *active) {
+    if !output.status.success() {
+        return Err(io::Error::other("tailscale status command failed"));
+    }
+    let status: FunnelStatus = serde_json::from_slice(&output.stdout)
+        .map_err(|_| io::Error::other("invalid tailscale status JSON"))?;
+    if status
+        .enabled
+        .iter()
+        .any(|(target, active)| *active && target_port(target) == Some(port))
+        || targets_port(&serde_json::Value::Object(status.rest), port)
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "client listener refused: public-funnel status is unsafe or unavailable",
+            "tailscale serve/funnel may expose the client port",
         ));
     }
     Ok(())
 }
+
+/// Proxy strings may be a bare port, an authority, or an HTTP(S) URL (Tailscale serve schema).
+fn target_port(target: &str) -> Option<u16> {
+    let default = if target.to_ascii_lowercase().starts_with("https") {
+        443
+    } else {
+        80
+    };
+    target.parse().ok().or_else(|| {
+        let authority = target.split_once("://").map_or(target, |(_, rest)| rest);
+        format!("http://{authority}")
+            .parse::<axum::http::Uri>()
+            .ok()
+            .map(|uri| uri.port_u16().unwrap_or(default))
+    })
+}
+/// Traverse foreground and service configs as well as the node's background config.
+fn targets_port(value: &serde_json::Value, port: u16) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => fields.iter().any(|(key, value)| {
+            (matches!(key.as_str(), "Proxy" | "TCPForward")
+                && value
+                    .as_str()
+                    .and_then(target_port)
+                    .is_none_or(|target| target == port))
+                || (key == "TCP" && value.get(port.to_string()).is_some())
+                || targets_port(value, port)
+        }),
+        serde_json::Value::Array(values) => values.iter().any(|value| targets_port(value, port)),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests;

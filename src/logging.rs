@@ -66,6 +66,22 @@ pub(crate) fn client_exchange_failed(
     tracing::warn!(event = "client.exchange.internal_failure", subsystem = "structured_client", reason, io_kind = ?io_kind, "browser credential exchange unavailable");
 }
 
+/// Report accept failures with typed classes and errno, never request contents.
+#[cfg(feature = "web")]
+pub(crate) fn client_accept_failed(
+    error: &std::io::Error,
+    class: crate::platform::client_listener::AcceptFailure,
+) {
+    use crate::platform::client_listener::AcceptFailure;
+    let errno = error.raw_os_error();
+    let event = "client.listener.accept";
+    match class {
+        AcceptFailure::Connection => tracing::debug!(event, errno, ?class),
+        AcceptFailure::Resource => tracing::warn!(event, errno, ?class),
+        AcceptFailure::Fatal => tracing::error!(event, errno, ?class),
+    }
+}
+
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),

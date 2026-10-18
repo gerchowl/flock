@@ -324,7 +324,6 @@ fn real_server_exchange_internal_failure_is_typed_uniform_and_secret_free() {
 #[test]
 fn real_server_refuses_active_and_unknown_funnel_producers() {
     for probe in [
-        "#!/bin/sh\nprintf '%s\\n' '{\"AllowFunnel\":{\"fixture.example:443\":true}}'\n",
         "#!/bin/sh\nprintf '%s\\n' 'not-json'\n",
         "#!/bin/sh\nexit 1\n",
         "#!/bin/sh\nprintf '%s\\n' 'null'\n",
