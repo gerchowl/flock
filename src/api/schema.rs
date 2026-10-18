@@ -2,6 +2,36 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// In-process admission result for one held read, never serialized to clients.
+pub type WaitAdmission = std::sync::Arc<std::sync::OnceLock<WaitReleaseAuthority>>;
+
+/// App-issued authority to close exactly one already-admitted hold.
+/// Private fields prevent retargeting; this grants no other request authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaitReleaseAuthority {
+    wait_id: String,
+    authority: crate::structured::identity::Principal,
+}
+
+impl WaitReleaseAuthority {
+    /// Mint after admission; an unknown UID class never grants release authority.
+    pub(crate) fn admitted(
+        wait_id: String,
+        authority: crate::structured::identity::Principal,
+    ) -> Option<Self> {
+        use crate::structured::identity::Principal;
+        matches!(authority, Principal::Operator | Principal::Agent)
+            .then_some(Self { wait_id, authority })
+    }
+
+    /// The original hold this grant can close, independent of caller lifetime.
+    pub(crate) fn release_id(&self) -> Option<&str> {
+        use crate::structured::identity::Principal;
+        matches!(self.authority, Principal::Operator | Principal::Agent)
+            .then_some(self.wait_id.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
@@ -248,12 +278,22 @@ pub enum Method {
     /// return at once, so the agent can end its turn.
     #[serde(rename = "wait.park")]
     WaitPark(WaitParkParams),
-    /// In-process only: a held `events.read` registers its blocking wait
-    /// against the attested caller. Never on the wire, so no client can open
-    /// or close a wait it does not hold.
+    /// Direct registry driver for unit tests; production holds carry admission grants.
+    #[cfg(test)]
     #[serde(skip)]
     WaitHold(crate::api::wait_predicate::WaitPredicate, u64),
-    /// In-process only: the held `events.read` returned.
+    /// In-process held read: publish its release grant only after admission.
+    #[serde(skip)]
+    WaitHoldAdmitted(
+        crate::api::wait_predicate::WaitPredicate,
+        u64,
+        WaitAdmission,
+    ),
+    /// In-process cleanup using a grant bound to the admitted hold, even after exit.
+    #[serde(skip)]
+    WaitReleaseAdmitted(WaitReleaseAuthority),
+    /// Direct registry cleanup for unit tests; production releases require a grant.
+    #[cfg(test)]
     #[serde(skip)]
     WaitRelease(String),
     /// In-process only: admit a socket read fast path before any target lookup.
@@ -451,9 +491,11 @@ impl Method {
             | Self::ChecksList(_)
             | Self::DigestRender(_)
             | Self::FleetStatus(_)
-            | Self::WaitHold(..)
-            | Self::WaitRelease(_)
+            | Self::WaitHoldAdmitted(..)
+            | Self::WaitReleaseAdmitted(_)
             | Self::AuthorizeRead => false,
+            #[cfg(test)]
+            Self::WaitHold(..) | Self::WaitRelease(_) => false,
             Self::NotificationShow(_)
             | Self::NotificationAck(_)
             | Self::WorkspaceCreate(_)
@@ -3399,7 +3441,7 @@ pub enum ResponseResult {
         predicate: String,
         deadline: u64,
     },
-    /// The in-process `WaitHold`: the wait it opened, `None` when the caller
+    /// The in-process `WaitHoldAdmitted`: the wait it opened, `None` when the caller
     /// is no agent and nothing was recorded.
     WaitHeld {
         wait_id: Option<String>,

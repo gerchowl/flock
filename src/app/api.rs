@@ -1454,6 +1454,18 @@ impl App {
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
+        // Cleanup owns only its admitted hold and survives its caller's exit.
+        // Handle it before live-process admission or unrelated request effects.
+        if let Method::WaitReleaseAdmitted(authority) = &request.method {
+            return match authority.release_id() {
+                Some(wait_id) => self.handle_wait_release(request.id.clone(), wait_id),
+                None => responses::encode_error(
+                    request.id.clone(),
+                    crate::api::error_code::ErrorCode::NotAuthorized.as_str(),
+                    "hold release lacks admission",
+                ),
+            };
+        }
         self.structured_sends.staged = None;
         self.input_writes.abandon_staged();
         self.pending_integration_install = None;
@@ -1608,9 +1620,21 @@ impl App {
             }
             Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),
             Method::WaitPark(params) => return self.handle_wait_park(request.id, params),
+            #[cfg(test)]
             Method::WaitHold(predicate, hold_ms) => {
-                return self.handle_wait_hold(request.id, predicate, hold_ms)
+                return self.handle_wait_hold(request.id, predicate, hold_ms, None)
             }
+            Method::WaitHoldAdmitted(predicate, hold_ms, admission) => {
+                return self.handle_wait_hold(request.id, predicate, hold_ms, Some(&admission));
+            }
+            Method::WaitReleaseAdmitted(_) => {
+                return responses::encode_error(
+                    request.id,
+                    crate::api::error_code::ErrorCode::NotAuthorized.as_str(),
+                    "hold release lacks admission",
+                );
+            }
+            #[cfg(test)]
             Method::WaitRelease(wait_id) => return self.handle_wait_release(request.id, &wait_id),
             Method::AuthorizeRead => SuccessResponse {
                 id: request.id,

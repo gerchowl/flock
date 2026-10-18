@@ -370,7 +370,12 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   existing response timeout. Subscription probes/polls and held output reads
   retain the captured socket credentials. Recognized server-UID reads use the
   same-UID cooperative rule. Held event reads retain the captured peer for
-  their release dispatch too, so the wait closes under its original authority.
+  their release dispatch too. App admission also issues an in-process release
+  grant containing the authority class and an immutable hold ID. The holder
+  stores this grant and uses it on completion or hang-up, even after the caller
+  process exits. Release never repeats liveness or ancestry admission: the grant
+  closes only its own hold and confers no other authority. It cannot be serialized
+  or supplied by a wire client; App and headless dispatch use the same mechanism.
   Retry safety never grants read authority. Server and client-token lifecycle
   operations retain their `operator_only` refusal.
   Same-UID callers are authorised to resolve targets, including shell panes.

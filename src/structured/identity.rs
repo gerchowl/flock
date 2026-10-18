@@ -75,7 +75,7 @@ pub(crate) struct UidPolicy {
     pub dedicated: DedicatedUid,
 }
 /// Local socket UID classification. Unknown is never operator authority.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Principal {
     /// Operator UID, subject to independent agent ancestry checks.
     Operator,

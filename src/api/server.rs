@@ -644,8 +644,12 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ClientOpen(_) => "client.open",
         Method::ChannelHello(_) => "channel.hello",
         Method::WaitPark(_) => "wait.park",
+        #[cfg(test)]
         Method::WaitHold(..) => "wait.hold",
+        #[cfg(test)]
         Method::WaitRelease(_) => "wait.release",
+        Method::WaitHoldAdmitted(..) => "wait.hold",
+        Method::WaitReleaseAdmitted(_) => "wait.release",
         Method::AuthorizeRead => "authority.read",
         Method::OwnerBind(_) => "owner.bind",
         Method::OwnerUnbind(_) => "owner.unbind",
@@ -1712,7 +1716,16 @@ mod tests {
         let app = std::thread::spawn(move || {
             let mut seen = Vec::new();
             while let Some(message) = api_rx.blocking_recv() {
-                if matches!(message.request.method, Method::WaitHold(..)) {
+                if let Method::WaitHoldAdmitted(_, _, admission) = &message.request.method {
+                    admission
+                        .set(
+                            crate::api::schema::WaitReleaseAuthority::admitted(
+                                "w_1".into(),
+                                crate::structured::identity::Principal::Operator,
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
                     assert_eq!(
                         message.peer_uid,
                         Some(crate::platform::peer::effective_uid())
@@ -1771,13 +1784,14 @@ mod tests {
             subjects: vec!["ws_1:p2".into()],
             after: 1,
         };
-        assert_eq!(
-            seen,
-            [
-                Method::WaitHold(predicate, 50),
-                Method::WaitRelease("w_1".into())
-            ]
-        );
+        let [Method::WaitHoldAdmitted(held, 50, admission), Method::WaitReleaseAdmitted(grant)] =
+            seen.as_slice()
+        else {
+            panic!("the read must open and release its admitted hold: {seen:?}");
+        };
+        assert_eq!(held, &predicate);
+        assert_eq!(admission.get(), Some(grant));
+        assert_eq!(grant.release_id(), Some("w_1"));
     }
 
     /// #1028: `events.read` filters by subject and holds the request on the

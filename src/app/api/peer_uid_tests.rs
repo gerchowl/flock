@@ -390,6 +390,15 @@ fn operator_dispatch_refuses_unknown_socket_birth_with_empty_leases() {
     assert!(app.session_leases.is_empty());
     let response = dispatched_send(&mut app, "agent_worker_2077", Some(7), None);
     assert_eq!(response["error"]["code"], "not_authorized", "{response}");
+    collision_shell(&mut app);
+    let birth = crate::platform::process_start_time(std::process::id());
+    for (target, code) in [
+        ("missing.example", "agent_not_found"),
+        ("shared", "agent_target_ambiguous"),
+    ] {
+        let reply = dispatched_send(&mut app, target, Some(7), birth);
+        assert_eq!(reply["error"]["code"], code, "{target}: {reply}");
+    }
 }
 #[test]
 fn operator_dispatch_requires_current_matching_socket_birth() {
