@@ -1018,11 +1018,16 @@ checks the pane's live `codex_conversation_locked` screen before admitting one
 `r` or `f` without Enter. `write_timeout_ms` has the same 1..=30000 validation
 and 10000 ms default as `pane.send_keys`. A pane no longer showing the lock
 refuses with `agent_not_ready`, without input. The owner serializes choices per
-pane: after one admission, `injection_pending` refuses every further choice
-until a live unlocked snapshot is observed, including requests received before
-the first choice repaints the screen. An immediate, proven zero-byte refusal releases the
-fence. Deferred writes keep the fence until unlock is observed. After an uncertain write the fence remains; clients must inspect rather than resend. Invalid write budgets refuse
-before admission. This is an explicit keyboard
+pane using the actual write receipt. `injection_pending` refuses a second
+choice while the first write is pending and for 60 seconds after its completed
+write, unless an unlock is observed sooner. A zero-byte failure releases the
+fence immediately, including a deferred failure. A still-locked screen admits
+another explicit choice after the window; no key is automatically re-sent.
+The 60-second settle window is also the CLI's maximum confirmation bound;
+`--ready-timeout` can shorten the CLI wait. Pending writes retain the existing
+1..=30000 ms write budget. If an incomplete failed write has no completion
+instant, its original write deadline bounds the start of the settle window.
+Invalid budgets refuse before admission. This is an explicit keyboard
 operation, not an automatic reply or an MCP tool. Use `delegate send
 --resolve-lock` for a recorded choice and bounded screen confirmation. Older
 servers reject the method; clients must not fall back to raw keys.

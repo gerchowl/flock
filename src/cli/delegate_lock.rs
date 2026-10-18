@@ -90,7 +90,8 @@ pub(super) fn resolve(name: &str, choice: CodexLockChoice, flags: &SendFlags) ->
         + Duration::from_millis(
             flags
                 .ready_timeout_ms
-                .unwrap_or(super::super::ready::DEFAULT_READY_TIMEOUT_MS),
+                .unwrap_or(crate::api::schema::CODEX_LOCK_SETTLE_MS)
+                .min(crate::api::schema::CODEX_LOCK_SETTLE_MS),
         );
     // Subscribe before snapshot and key: a fast repaint cannot fall in a gap.
     let request = Request {

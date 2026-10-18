@@ -2030,6 +2030,9 @@ pub enum CodexLockChoice {
     Fork,
 }
 
+/// Maximum explicit lock confirmation and post-write settle window (60 seconds).
+pub(crate) const CODEX_LOCK_SETTLE_MS: u64 = 60_000;
+
 /// A single guarded key, never an automatic reply or a submitted brief.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneResolveCodexLockParams {

@@ -1897,6 +1897,15 @@ fn codex_lock_raw_socket_callers_cannot_both_write_before_repaint() {
 
 #[test]
 fn codex_lock_wait_clears_observed_unlocked_intent_in_outcome() {
+    assert_wait_unlock_metadata(false);
+}
+
+#[test]
+fn codex_lock_wait_reports_typed_contention_instead_of_outcome() {
+    assert_wait_unlock_metadata(true);
+}
+
+fn assert_wait_unlock_metadata(contended: bool) {
     let server = start_locked_codex(false);
     let path = locked_registry(&server);
     let mut entry: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -1917,12 +1926,30 @@ fn codex_lock_wait_clears_observed_unlocked_intent_in_outcome() {
         }
         assert!(Instant::now() < deadline, "fixture never unlocked");
     }
+    let _writer = contended.then(|| {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        file.try_lock().unwrap();
+        file
+    });
     let mut child = cli_spawn(
         &server,
         &["delegate", "wait", "locked", "--json", "--timeout", "1000"],
     );
     assert!(exited_within(&mut child, WITHIN).is_some());
     let out = finish(child);
+    if contended {
+        assert_eq!(out.status.code(), Some(10), "{}", stderr(&out));
+        let error = stdout_json(&out);
+        assert_eq!(error["error"]["code"], "injection_pending");
+        assert!(error.get("outcome").is_none());
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(stored.get("lock_resolution").is_some());
+        return;
+    }
     let out = stdout_json(&out);
     assert!(out.get("outcome").is_some(), "{out}");
     assert!(out["lock_resolution"].is_null(), "{out}");

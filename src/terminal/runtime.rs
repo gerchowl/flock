@@ -292,14 +292,14 @@ impl TerminalRuntime {
         self.0.visible_ansi()
     }
 
-    /// Release a choice only after the input layer proves zero written bytes.
-    pub(crate) fn cancel_codex_lock_choice(&self) {
-        self.0.cancel_codex_lock_choice();
-    }
-
-    /// Admit one lock choice through the pane's owner-side fence.
-    pub(crate) fn admit_codex_lock_choice(&self) -> Result<(), &'static str> {
-        self.0.admit_codex_lock_choice()
+    /// Recheck and track one guarded choice, including deferred write evidence.
+    pub(crate) fn try_resolve_codex_lock_at(
+        &self,
+        bytes: Bytes,
+        deadline: std::time::Instant,
+        now: std::time::Instant,
+    ) -> Result<crate::pty::write_receipt::WriteReceipt, &'static str> {
+        self.0.try_resolve_codex_lock_at(bytes, deadline, now)
     }
 
     pub fn detection_text(&self) -> String {

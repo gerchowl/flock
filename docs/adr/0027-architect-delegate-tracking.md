@@ -185,9 +185,16 @@ exclusive with a brief or await. The CLI holds the existing delegate lock,
 subscribes before observing, durably records the intent, then calls guarded
 `pane.resolve_codex_lock`. That operation rechecks the live screen in the
 server's owner turn and admits exactly one `r` or `f` with no Enter. A per-pane
-fence refuses another choice with `injection_pending` until an unlocked
-snapshot is observed, including two raw callers before repaint. An uncertain
-write keeps the fence; this is not permission to resend. An older
+fence refuses another choice with `injection_pending` during the bounded write
+and a fixed 60-second settle window measured from its completed write. The
+actual receipt releases the fence immediately on zero-byte failure, including
+deferred failure; an observed unlock also releases it. A failed incomplete
+write without a completion instant uses its original write deadline to bound
+the settle window. Pending writes retain their existing bounded write budget.
+The CLI uses the same 60-second maximum for confirmation, with smaller
+`--ready-timeout` values shortening its wait. After inspecting a still-locked
+pane, the operator can choose again after the settle window; flock never
+re-sends a key automatically. An older
 server rejects this method; it cannot silently ignore a guard and send a raw
 key. MCP exposes no new keyboard tool. Mesh VERSION remains 5.
 
@@ -197,8 +204,9 @@ readiness budget, never re-sending. The registry holds only the latest choice,
 its timestamp and confirmation bit while the lock remains; unknown future
 metadata is preserved raw. Resolution, an observed unlocked screen in status,
 an observed unlocked outcome, or the next submitted round clears it. Older flock versions read the additive
-key but drop it when rewriting an entry. A status that needs to clear metadata
-refuses with `injection_pending` if a concurrent registry writer holds the lock.
+key but drop it when rewriting an entry. Status or wait that needs to clear
+metadata refuses with `injection_pending` if a concurrent registry writer holds
+the lock; wait then returns that typed refusal instead of its normal outcome.
 An unconfirmed intent is not proof of delivery. A silent producer, stream
 loss, or uncertain write returns registered `codex_lock_unconfirmed` with
 ADR-0029's after-inspection exit 8. The operator inspects before another choice.

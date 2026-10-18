@@ -1052,6 +1052,15 @@ impl App {
         id: String,
         params: PaneSendInputParams,
     ) -> String {
+        self.handle_pane_send_input_guarded(id, params, false)
+    }
+
+    fn handle_pane_send_input_guarded(
+        &mut self,
+        id: String,
+        params: PaneSendInputParams,
+        codex_lock: bool,
+    ) -> String {
         let Some(deadline) = crate::app::input_writes::deadline(params.write_timeout_ms.as_ref())
         else {
             return encode_error(
@@ -1099,6 +1108,7 @@ impl App {
                 deadline,
                 operator_interrupt,
                 paste: None,
+                codex_lock,
             },
         )
     }
@@ -1380,44 +1390,21 @@ impl App {
                 "write_timeout_ms must be an integer in 1..=30000",
             );
         }
-        let (ws, pane) = match self.resolve_pane_target(&params.pane_id) {
-            Ok(target) => target,
-            Err(error) => return target_refusal(id, error),
-        };
-        let admission = self
-            .lookup_runtime(ws, pane)
-            .map_or(Err("agent_not_ready"), |(runtime, _)| {
-                runtime.admit_codex_lock_choice()
-            });
-        if let Err(code) = admission {
-            return encode_error(id, code, "No key sent: lock absent or a choice is pending until an unlocked screen is observed");
-        }
         let key = match params.choice {
             crate::api::schema::CodexLockChoice::Retry => "r",
             crate::api::schema::CodexLockChoice::Fork => "f",
         };
-        let response = self.handle_pane_send_keys(
+        self.handle_pane_send_input_guarded(
             id,
-            PaneSendKeysParams {
+            PaneSendInputParams {
                 pane_id: params.pane_id,
+                text: String::new(),
                 keys: vec![key.into()],
+                raw: true,
                 write_timeout_ms: params.write_timeout_ms,
             },
-        );
-        if serde_json::from_str::<serde_json::Value>(&response)
-            .ok()
-            .is_some_and(|reply| {
-                reply
-                    .pointer("/error/data/input_write/bytes_written")
-                    .and_then(serde_json::Value::as_u64)
-                    == Some(0)
-            })
-        {
-            if let Some((runtime, _)) = self.lookup_runtime(ws, pane) {
-                runtime.cancel_codex_lock_choice();
-            }
-        }
-        response
+            true,
+        )
     }
 
     pub(super) fn handle_pane_send_keys(
@@ -1624,6 +1611,47 @@ mod tests {
             );
             assert_eq!(response["error"]["data"]["input_write"]["bytes_written"], 0);
         }
+    }
+
+    #[tokio::test]
+    async fn codex_lock_deferred_zero_byte_failure_releases_without_repaint() {
+        let (mut app, _, public) = app_with_terminal();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut bytes) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime.test_process_pty_bytes(
+            include_str!("../../../tests/fixtures/codex/conversation-locked.txt")
+                .replace('\n', "\r\n")
+                .as_bytes(),
+        );
+        runtime
+            .try_send_bytes(Bytes::from_static(b"occupied"))
+            .unwrap();
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let first = raw_request(
+            &mut app,
+            "pane.resolve_codex_lock",
+            serde_json::json!({"pane_id":public,"choice":"retry"}),
+        );
+        assert!(first.try_recv().is_err());
+        app.input_writes
+            .retire_all(crate::pty::write_receipt::WriteFailure::OwnerChanged);
+        let failed: serde_json::Value = serde_json::from_str(&first.try_recv().unwrap()).unwrap();
+        assert_eq!(failed["error"]["code"], "input_write_cancelled");
+        assert_eq!(failed["error"]["data"]["input_write"]["bytes_written"], 0);
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"occupied");
+        let next = raw_request(
+            &mut app,
+            "pane.resolve_codex_lock",
+            serde_json::json!({"pane_id":public,"choice":"fork"}),
+        );
+        app.input_writes.service();
+        let response: serde_json::Value = serde_json::from_str(&next.try_recv().unwrap()).unwrap();
+        assert!(response.get("result").is_some(), "{response}");
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"f");
+        assert!(bytes.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2255,6 +2283,7 @@ mod tests {
                 deadline: std::time::Instant::now() - std::time::Duration::from_nanos(1),
                 operator_interrupt: false,
                 paste: None,
+                codex_lock: false,
             },
         );
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();

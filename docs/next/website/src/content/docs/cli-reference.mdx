@@ -733,9 +733,11 @@ at round 0 and reports `agent_blocked` (exit 6) without submitting the brief.
 Choose explicitly with `flk delegate send <name> --resolve-lock retry` or
 `--resolve-lock fork`. These send exactly one `r` or `f`, without Enter or a
 brief, and cannot be combined with `--brief` or `--await`. The server checks the
-live lock again before admitting the key. A second choice before an unlocked
-screen is observed refuses with `injection_pending`; two raw socket callers
-cannot both send a key before repaint. A changed or unlocked pane refuses
+live lock again before admitting the key. A second choice during the bounded
+write and its 60-second post-write settle window refuses with
+`injection_pending`; an observed unlock or a zero-byte write failure releases
+it sooner, including deferred failures. After inspecting a still-locked pane,
+you can choose again once the window expires. A changed or unlocked pane refuses
 with `agent_not_ready` (exit 10) and receives no key. A plain send while locked
 refuses with `codex_conversation_locked` (exit 6), naming both choices.
 
@@ -743,8 +745,9 @@ The delegate registry retains the explicit lock choice, its timestamp and
 confirmation bit while the lock remains. Successful resolution, a status read
 that observes unlock, or a new round clears `lock_resolution`; it never describes
 an earlier round. An older flock can read the additive key but drops it when
-rewriting the entry. A status blocked by a concurrent registry writer refuses
-with `injection_pending` rather than overwriting that writer's entry.
+rewriting the entry. Status or wait that needs to clear metadata refuses with
+`injection_pending` if a concurrent registry writer holds the lock; wait returns
+that typed refusal instead of its normal outcome, without overwriting the writer.
 
 Every JSON outcome report includes `startup_dialog` (the named blocked dialog,
 or null) and `lock_resolution` (the current intent object, or null). JSON status
@@ -753,7 +756,7 @@ uses the same nullable fields. The intent object contains `choice` (`retry` or
 before the key request; `confirmed: false` does **not** prove whether a key was
 sent. A registry-write failure before the request sends nothing. Confirmation
 uses live screen checks, status notifications and bounded condition polling,
-within `--ready-timeout` (default 60000 ms). Success reports `lock_resolved`
+within `--ready-timeout` (default and maximum for lock confirmation: 60000 ms). Success reports `lock_resolved`
 (exit 0), without changing the round or submitting a brief; leaving the lock
 does not imply the next screen is ready for a brief. An uncertain write,
 missing confirmation, or silent producer returns `codex_lock_unconfirmed`

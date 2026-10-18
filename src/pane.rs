@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::Path;
 use std::sync::{
@@ -767,10 +767,36 @@ pub struct PaneRuntime {
     /// Flock's hold on operator input during one guarded injection (#850).
     injection_lease: injection_lease::InjectionLease,
     spawned_with_default_shell: bool,
-    /// One explicit lock choice remains pending until an unlocked snapshot is observed.
-    codex_lock_pending: Cell<bool>,
+    /// One bounded write/settle fence for explicit conversation-lock choices.
+    codex_lock_pending: RefCell<Option<CodexLockWrite>>,
     // Task handles for deterministic shutdown
     detect_handle: tokio::task::AbortHandle,
+}
+
+struct CodexLockWrite {
+    receipt: crate::pty::write_receipt::WriteReceipt,
+    write_deadline: std::time::Instant,
+}
+
+impl CodexLockWrite {
+    fn pending_at(&self, now: std::time::Instant) -> bool {
+        let mut progress = self.receipt.progress();
+        if progress.completed_at.is_none() && now > self.write_deadline {
+            self.receipt
+                .retire(crate::pty::write_receipt::WriteFailure::Deadline);
+            progress = self.receipt.progress();
+        }
+        if progress.failure.is_some() && progress.bytes_written == 0 {
+            return false;
+        }
+        let completed = match progress.completed_at {
+            Some(at) => at,
+            // Incomplete retirement has no successful final-write instant.
+            None if progress.failure.is_some() => self.write_deadline,
+            None => return true,
+        };
+        now < completed + std::time::Duration::from_millis(crate::api::schema::CODEX_LOCK_SETTLE_MS)
+    }
 }
 
 /// The last moment operator input was written to a pane (ADR-0018 §2).
@@ -1744,7 +1770,7 @@ impl PaneRuntime {
             has_been_typed_into: Cell::new(true),
             injection_lease: Default::default(),
             spawned_with_default_shell: false,
-            codex_lock_pending: Cell::new(false),
+            codex_lock_pending: RefCell::new(None),
             detect_handle,
         })
     }
@@ -2203,7 +2229,7 @@ impl PaneRuntime {
             has_been_typed_into: Cell::new(false),
             injection_lease: Default::default(),
             spawned_with_default_shell: initial_state.spawned_with_default_shell,
-            codex_lock_pending: Cell::new(false),
+            codex_lock_pending: RefCell::new(None),
             detect_handle,
         })
     }
@@ -2297,26 +2323,32 @@ impl PaneRuntime {
 
     pub fn detection_text(&self) -> String {
         let text = self.terminal.detection_text();
-        if self.codex_lock_pending.get() && !crate::detect::codex_conversation_locked(&text) {
-            self.codex_lock_pending.set(false);
+        if !crate::detect::codex_conversation_locked(&text) {
+            self.codex_lock_pending.borrow_mut().take();
         }
         text
     }
 
-    /// Release a choice for which the input layer proved that no byte was written.
-    pub(crate) fn cancel_codex_lock_choice(&self) {
-        self.codex_lock_pending.set(false);
-    }
-
-    /// Admit one owner-checked lock choice, clearing the fence only after unlock.
-    pub(crate) fn admit_codex_lock_choice(&self) -> Result<(), &'static str> {
+    /// Recheck, admit and track one guarded choice under the owner turn's clock.
+    pub(crate) fn try_resolve_codex_lock_at(
+        &self,
+        bytes: Bytes,
+        deadline: std::time::Instant,
+        now: std::time::Instant,
+    ) -> Result<crate::pty::write_receipt::WriteReceipt, &'static str> {
         if !crate::detect::codex_conversation_locked(&self.detection_text()) {
             return Err("agent_not_ready");
         }
-        if self.codex_lock_pending.replace(true) {
+        let mut pending = self.codex_lock_pending.borrow_mut();
+        if pending.as_ref().is_some_and(|write| write.pending_at(now)) {
             return Err("injection_pending");
         }
-        Ok(())
+        let receipt = self.try_send_tracked(bytes, deadline, false);
+        *pending = Some(CodexLockWrite {
+            receipt: receipt.clone(),
+            write_deadline: deadline,
+        });
+        Ok(receipt)
     }
 
     pub fn detection_ansi(&self) -> String {
@@ -2847,7 +2879,7 @@ impl PaneRuntime {
                 has_been_typed_into: Cell::new(false),
                 injection_lease: Default::default(),
                 spawned_with_default_shell: false,
-                codex_lock_pending: Cell::new(false),
+                codex_lock_pending: RefCell::new(None),
                 detect_handle: tokio::spawn(async {}).abort_handle(),
             },
             rx,
@@ -2858,6 +2890,72 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn codex_lock_settle_window_is_measured_from_completed_write() {
+        let (runtime, mut bytes) = PaneRuntime::test_with_channel_capacity(80, 24, 8);
+        runtime.test_process_pty_bytes(
+            include_str!("../tests/fixtures/codex/conversation-locked.txt")
+                .replace('\n', "\r\n")
+                .as_bytes(),
+        );
+        let now = std::time::Instant::now();
+        let budget = std::time::Duration::from_secs(10);
+        let receipt = runtime
+            .try_resolve_codex_lock_at(Bytes::from_static(b"r"), now + budget, now)
+            .unwrap();
+        let completed = receipt.progress().completed_at.unwrap();
+        let end =
+            completed + std::time::Duration::from_millis(crate::api::schema::CODEX_LOCK_SETTLE_MS);
+        for at in [completed, end - std::time::Duration::from_nanos(1)] {
+            assert_eq!(
+                runtime
+                    .try_resolve_codex_lock_at(Bytes::from_static(b"f"), at + budget, at)
+                    .unwrap_err(),
+                "injection_pending"
+            );
+        }
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"r");
+        assert!(bytes.try_recv().is_err());
+        runtime
+            .try_resolve_codex_lock_at(Bytes::from_static(b"f"), end + budget, end)
+            .unwrap();
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"f");
+        assert!(bytes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn codex_lock_silent_pending_writer_releases_at_its_deadline() {
+        let (runtime, mut bytes) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime.test_process_pty_bytes(
+            include_str!("../tests/fixtures/codex/conversation-locked.txt")
+                .replace('\n', "\r\n")
+                .as_bytes(),
+        );
+        runtime
+            .try_send_bytes(Bytes::from_static(b"occupied"))
+            .unwrap();
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(10);
+        let first = runtime
+            .try_resolve_codex_lock_at(Bytes::from_static(b"r"), deadline, now)
+            .unwrap();
+        assert_eq!(first.progress().bytes_written, 0);
+        assert!(first.progress().failure.is_none());
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"occupied");
+        let after = deadline + std::time::Duration::from_nanos(1);
+        runtime
+            .try_resolve_codex_lock_at(
+                Bytes::from_static(b"f"),
+                after + std::time::Duration::from_secs(10),
+                after,
+            )
+            .unwrap();
+        assert_eq!(first.progress().bytes_written, 0);
+        assert!(first.progress().failure.is_some());
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"f");
+        assert!(bytes.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn test_channel_receipts_follow_successful_tracked_writes() {
@@ -3351,7 +3449,7 @@ mod tests {
             has_been_typed_into: Cell::new(true),
             injection_lease: Default::default(),
             spawned_with_default_shell: false,
-            codex_lock_pending: Cell::new(false),
+            codex_lock_pending: RefCell::new(None),
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 
@@ -3385,7 +3483,7 @@ mod tests {
             has_been_typed_into: Cell::new(true),
             injection_lease: Default::default(),
             spawned_with_default_shell: false,
-            codex_lock_pending: Cell::new(false),
+            codex_lock_pending: RefCell::new(None),
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 
