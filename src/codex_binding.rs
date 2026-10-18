@@ -133,8 +133,8 @@ pub(crate) fn validate(
     )
 }
 
-/// Inject only the descriptor query; production and tests share path resolution,
-/// safe opening and all subsequent validation.
+/// Test seam for injecting the descriptor metadata query. Production and tests
+/// share path resolution, safe opening and all subsequent validation.
 fn validate_with_link_count(
     key: &Key,
     launch: &Launch,

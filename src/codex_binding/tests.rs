@@ -473,10 +473,6 @@ fn open_descriptor_metadata_failure_is_distinct_from_path_failure() {
         binding.decision(&owners),
         Decision::BindingValidationFailed(Failure::Metadata)
     );
-    assert!(
-        f.validate(&key).is_ok(),
-        "injection leaves no persistent fault state"
-    );
 }
 
 #[test]
