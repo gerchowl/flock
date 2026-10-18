@@ -1001,7 +1001,9 @@ entry reported by list. Only the local operator outside agent panes may use
 these commands; other callers receive `operator_only` (exit 13). Issuance prints
 its bearer only when stdout is a terminal, unless `--json` or `--show-token`
 explicitly permits secret output to a pipe or file. Otherwise it refuses before
-creating a token.
+creating a token. Token names cannot begin with `-`; an operand named
+`--show-token` is not consent. Use `token rm --entry HEX_ID` to revoke an
+older unsafe record by the identifier reported by list.
 
 `flk client open [--print]` creates or reuses the operator credential and opens
 a new browser tab or window at a configured loopback URL containing a single-use
@@ -1011,5 +1013,18 @@ server URL from its own location; no config script is served.
 The code expires after 60 seconds; it is exchanged once for a bearer and is never
 placed in the query or diagnostic logs. Set `[client] bind = "127.0.0.1:7682"`
 explicitly. This is separate from the terminal bridge's `[web]` settings and
-requires the `web` feature. The structured listener integration is tracked by
-#1828; the exchange router alone does not start a listener.
+requires the `web` feature. The headless server mounts the GUI, browser-code
+exchange and WebSocket core on this opt-in listener. Port `0` selects an
+OS-assigned port; `client open` reports the live address after binding and keeps
+it across configuration reloads. Host/Origin must match that address. Startup
+accepts only the exact IPv4 loopback address `127.0.0.1`. Startup and handoff
+import refuse any serve or funnel configuration targeting the bound port,
+including tailnet-only serve, and an unavailable, unsuccessful or malformed
+bounded forwarding probe. The listener checks again on config reload and every
+60 seconds. A new exposure stops only the listener and its connections and
+reports `client_listener: exposed_by_serve` in ping; server work and PTYs continue.
+Probe failures stop only the listener with `failed`. Removing the bind allows
+handoff but disables the inherited listener (`disabled`) instead of refusing
+the whole handoff (#1972).
+The handshake-only transport currently advertises no command capabilities;
+subscription and command routing follow in the remaining structured-client slices.

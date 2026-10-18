@@ -149,6 +149,7 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
                 &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 None,
                 &std::sync::Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             )
             .unwrap();

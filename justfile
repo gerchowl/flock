@@ -64,6 +64,12 @@ doc-check:
 ci filter='all()': lint
     cargo nextest run --locked --features ts -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
 
+# Build both feature variants with an explicit fixture input, proving GUI
+# embedding and exclusion without the independent frontend build (#1826).
+gui-check:
+    FLOCK_GUI_DIST="{{justfile_directory()}}/tests/fixtures/gui-dist" cargo nextest run --locked --features ts -E 'binary(gui_feature_gate) | binary(gui_bundle_build)' --retries 0
+    FLOCK_GUI_DIST="{{justfile_directory()}}/tests/fixtures/gui-dist" cargo nextest run --locked --features web,ts -E 'test(web::gui::) | binary(gui_feature_gate) | binary(gui_bundle_build)' --retries 0
+
 # Build every test binary once into a nextest archive for CI's shard jobs, then
 # fail unless the shards in .config/ci-shards.toml partition `leg`'s tests
 # exactly (#991). Writes the shard matrix to $GITHUB_OUTPUT when set.
