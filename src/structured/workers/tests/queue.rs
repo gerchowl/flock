@@ -700,6 +700,17 @@ async fn worker_queue_readonly_error_does_not_repeat_a_completion_per_event() {
         NonZeroU64::new(1).unwrap()
     })
     .await;
+    // The initial I/O error becomes a source-less latched refusal after init.
+    // Observe that real transition before counting unchanged event completions.
+    r.until(|r| {
+        r.updates.iter().any(|update| {
+            matches!(
+                &update.offer,
+                Err(error) if error.code == ErrorCode::QueueJournalCorrupt && error.source.is_none()
+            )
+        })
+    })
+    .await;
     r.updates.clear();
     let mut events = vec![event("rate_limit_event"); 12];
     events.push(event("control_request"));
