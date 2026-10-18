@@ -9,11 +9,20 @@
  * says it was answered. A typed refusal is shown in plain words and never
  * retried; the buttons stay disabled for that `request_seq`, and a new open
  * record, with a new seq, enables them again. One decision is in flight per
- * request. "Always allow" is a standing grant, so it takes one inline confirm.
+ * request. "Always allow" is a standing grant, so it takes one inline confirm,
+ * bound to the `request_id` and `request_seq` it was opened for: if the card's
+ * seq changes while it is open, it is cancelled with a reason, and a decision
+ * always carries the values captured at the click, never the card's current ones.
+ * A card whose agent stream has a history gap is stale: its buttons wait for the
+ * resync (ADR-0038 §1).
+ *
+ * Settled outbox entries are not persisted (`wire/outbox.ts`), so after a reload
+ * an answered but still-open card has live buttons again. That is harmless: the
+ * server refuses a second answer with `permission_request_closed`, shown here.
  *
  * @module
  */
-import { For, Show, createSignal, createUniqueId, type JSX } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, createUniqueId, on, type JSX, type Signal } from "solid-js";
 
 import type { AgentDecideErrorCode } from "../gen/AgentDecideErrorCode";
 import type { PermissionDecision } from "../gen/PermissionDecision";
@@ -70,36 +79,83 @@ const CHOICES: readonly { readonly label: string; readonly decision: PermissionD
   { label: "Deny", decision: "deny" },
 ];
 
+/** The longest message the server takes, in UTF-8 bytes of the trimmed text (the server limit is being filed; one constant to change). */
+export const MESSAGE_MAX_BYTES = 2048;
+
+const utf8Bytes = (text: string): number => new TextEncoder().encode(text).length;
+
+/** The request a decision is bound to: captured when the person clicked, never read live. */
+export type Target = { readonly agent: string; readonly id: string; readonly seq: number; readonly title: string };
+
+/**
+ * What the person has typed and opened on one card. It outlives the card's
+ * component: a new record rebuilds the card object, and with it the component,
+ * but a draft message and an open confirm must survive that, or be cancelled
+ * with a reason, never lost silently.
+ */
+export type DecideUi = {
+  readonly message: Signal<string>;
+  readonly confirming: Signal<Target | null>;
+  readonly error: Signal<string | null>;
+};
+
+/** Creates one card's {@link DecideUi}. */
+export function createDecideUi(): DecideUi {
+  return { message: createSignal(""), confirming: createSignal<Target | null>(null), error: createSignal<string | null>(null) };
+}
+
 /** The message box, choices and status line of one live permission card. */
-export function PermissionActions(props: { readonly card: InboxCard; readonly sender: Sender | null }): JSX.Element {
-  const [message, setMessage] = createSignal("");
-  const [confirming, setConfirming] = createSignal(false);
-  const [error, setError] = createSignal<string | null>(null);
+export function PermissionActions(props: { readonly card: InboxCard; readonly sender: Sender | null; readonly ui: DecideUi }): JSX.Element {
+  const [message, setMessage] = props.ui.message;
+  const [confirming, setConfirming] = props.ui.confirming;
+  const [error, setError] = props.ui.error;
   const reason = createUniqueId();
   const state = (): DecideState => (props.sender === null ? { kind: "idle" } : decideState(props.sender.commands(), props.card));
+  const bytes = (): number => utf8Bytes(message().trim());
   /** Why the buttons are disabled, or null when they can answer. */
   const blocked = (): string | null => {
     if (props.sender === null) return "Answering is not available in this view.";
     const sender = props.sender.blocked();
     if (sender !== null) return sender;
     if (props.card.requestSeq === undefined) return "Answering needs the server's open permission record.";
+    if (props.card.stale === true) return "This agent's history has a gap; answering waits for it to catch up.";
     const current = state();
     if (current.kind === "answered") return "Answered; waiting for the agent";
     if (current.kind === "inflight" || current.kind === "refused") return current.line;
+    if (bytes() > MESSAGE_MAX_BYTES) return `The message is ${bytes() - MESSAGE_MAX_BYTES} bytes over the ${MESSAGE_MAX_BYTES}-byte limit.`;
     return null;
   };
-  const send = (decision: PermissionDecision): void => {
-    const seq = props.card.requestSeq;
-    if (props.sender === null || seq === undefined || blocked() !== null) return;
+  /** The request the card shows now, for a click to capture. */
+  const target = (): Target | null => (props.card.requestSeq === undefined ? null : { agent: props.card.agent, id: props.card.id, seq: props.card.requestSeq, title: props.card.title });
+  const send = (decision: PermissionDecision, at: Target | null): void => {
+    if (props.sender === null || at === null || blocked() !== null) return;
+    if (at.id !== props.card.id || at.seq !== props.card.requestSeq) {
+      setConfirming(null);
+      setError("The request changed; review it again.");
+      return;
+    }
     const note = message().trim();
     try {
-      props.sender.decide({ agent: props.card.agent, request_id: props.card.id, request_seq: seq, decision, ...(note === "" ? {} : { message: note }) });
+      props.sender.decide({ agent: at.agent, request_id: at.id, request_seq: at.seq, decision, ...(note === "" ? {} : { message: note }) });
       setError(null);
     } catch (thrown) {
       setError((thrown as Error).message);
     }
-    setConfirming(false);
+    setConfirming(null);
   };
+  // The confirm belongs to one request_seq: a new open record cancels it, saying why.
+  const changed = (): boolean => {
+    const at = confirming();
+    return at !== null && (at.id !== props.card.id || at.seq !== props.card.requestSeq);
+  };
+  createEffect(() => {
+    if (!changed()) return;
+    setConfirming(null);
+    setError("The request changed; review it again.");
+  });
+  // A send error covers the status only until the status moves on.
+  const stateKey = createMemo(() => JSON.stringify(state()));
+  createEffect(on(stateKey, () => setError(null), { defer: true }));
   return (
     <div class="decide" data-testid="decide">
       <input
@@ -107,10 +163,16 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
         type="text"
         aria-label="Message to the agent (optional)"
         placeholder="Message to the agent (optional)"
+        aria-describedby={reason}
         value={message()}
-        disabled={blocked() !== null}
+        disabled={props.sender === null || props.sender.blocked() !== null || props.card.requestSeq === undefined}
         onInput={(event) => setMessage(event.currentTarget.value)}
       />
+      <Show when={message().trim() !== ""}>
+        <p class="decide__count" data-testid="decide-count">
+          {bytes() > MESSAGE_MAX_BYTES ? `${bytes() - MESSAGE_MAX_BYTES} bytes over the limit` : `${MESSAGE_MAX_BYTES - bytes()} bytes left`}
+        </p>
+      </Show>
       <Show
         when={confirming()}
         fallback={
@@ -122,7 +184,7 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
                   class="action"
                   disabled={blocked() !== null}
                   aria-describedby={reason}
-                  onClick={() => (choice.decision === "allow_always" ? setConfirming(true) : send(choice.decision))}
+                  onClick={() => (choice.decision === "allow_always" ? setConfirming(target()) : send(choice.decision, target()))}
                 >
                   {choice.label}
                 </button>
@@ -131,17 +193,19 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
           </div>
         }
       >
-        <div class="decide__confirm" role="group" aria-label="Confirm always allow">
-          <p>Always allow {props.card.title} for the rest of this agent's session? This is a standing grant.</p>
-          <div class="card__choices">
-            <button type="button" class="action action--primary" onClick={() => send("allow_always")}>
-              Confirm always allow
-            </button>
-            <button type="button" class="action" onClick={() => setConfirming(false)}>
-              Cancel
-            </button>
+        {(at) => (
+          <div class="decide__confirm" role="group" aria-label="Confirm always allow">
+            <p>Always allow {at().title} for the rest of this agent's session? This is a standing grant.</p>
+            <div class="card__choices">
+              <button type="button" class="action action--primary" onClick={() => send("allow_always", at())}>
+                Confirm always allow
+              </button>
+              <button type="button" class="action" onClick={() => setConfirming(null)}>
+                Cancel
+              </button>
+            </div>
           </div>
-        </div>
+        )}
       </Show>
       <p id={reason} class="waits__reason" data-testid="decide-status">
         {error() ?? blocked() ?? "Answering sends your decision to the agent."}

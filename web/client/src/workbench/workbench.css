@@ -584,3 +584,9 @@
 .phone .decide__message {
   min-height: 48px;
 }
+
+.decide__count {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}

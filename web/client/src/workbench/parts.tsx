@@ -7,7 +7,7 @@ import { For, Show, createUniqueId, type JSX } from "solid-js";
 
 import type { AgentRow } from "../fleet";
 import type { Sender } from "./Composer";
-import { PermissionActions } from "./decide";
+import { PermissionActions, createDecideUi, type DecideUi } from "./decide";
 import { sortInbox, type InboxCard } from "./inbox";
 import { PHASE_LABELS, StatusMark, markFor } from "./marks";
 
@@ -56,6 +56,16 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
       : props.cards.length === 0
         ? "The live inbox arrives with G5 (#1597)."
         : "Sample cards: the live inbox arrives with G5 (#1597).";
+  // A card is rebuilt on every record, so what the person typed lives here, by request.
+  const uis = new Map<string, DecideUi>();
+  const uiFor = (card: InboxCard): DecideUi => {
+    const key = `${card.agent}\u0000${card.id}`;
+    const found = uis.get(key);
+    if (found !== undefined) return found;
+    const fresh = createDecideUi();
+    uis.set(key, fresh);
+    return fresh;
+  };
   return (
     <>
       <Show when={note()}>{(text) => <p class="inbox__note">{text()}</p>}</Show>
@@ -89,7 +99,7 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
                   </>
                 }
               >
-                <PermissionActions card={card} sender={props.sender} />
+                <PermissionActions card={card} sender={props.sender} ui={uiFor(card)} />
               </Show>
             </Show>
           </article>

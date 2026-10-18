@@ -7,7 +7,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import type { OutboxStatus } from "../src/gen/OutboxStatus";
 import type { OutboxEntry } from "../src/wire/outbox";
-import { REFUSALS, decideState } from "../src/workbench/decide";
+import { MESSAGE_MAX_BYTES, REFUSALS, decideState } from "../src/workbench/decide";
 import { STATUS_LABELS } from "../src/workbench/Composer";
 import { WELCOME, sentFrames, step } from "./wire/harness";
 import { $$, cards, frames, mountInbox, unmountInbox, type App } from "./wire/inbox-app";
@@ -130,6 +130,60 @@ describe("answering a prompt", () => {
     expect(button(app, "Deny").hasAttribute("disabled")).toBe(true);
     expect(cards(app.root)).toHaveLength(1);
     expect(status(app)).toBe(STATUS_LABELS.sent);
+  });
+
+  test("a new request_seq while the Always-allow confirm is open cancels it, says why, and sends nothing", () => {
+    const app = prompt();
+    const box = app.root.querySelector<HTMLInputElement>(".decide__message");
+    if (box === null) throw new Error("no message box");
+    box.value = "keep me";
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+    button(app, "Always allow").click();
+    expect($$(app.root, "decide")[0]?.textContent).toContain("Confirm always allow");
+    app.event("atlas", "r1", "Edit", { file_path: "other.rs" }, 42);
+    expect(app.root.querySelector<HTMLInputElement>(".decide__message")?.value).toBe("keep me");
+    expect($$(app.root, "decide")[0]?.textContent).not.toContain("Confirm always allow");
+    expect(status(app)).toBe("The request changed; review it again.");
+    expect(cmds(app)).toHaveLength(0);
+    button(app, "Always allow").click();
+    expect($$(app.root, "decide")[0]?.textContent).toContain("Always allow Edit");
+    button(app, "Confirm always allow").click();
+    expect(cmds(app).map((c) => c.args["request_seq"])).toEqual([42]);
+  });
+
+  test("a stale card, after a history gap, has its buttons disabled with the reason until it resyncs", () => {
+    const app = prompt();
+    app.gap("atlas");
+    expect(button(app, "Allow once").hasAttribute("disabled")).toBe(true);
+    expect(status(app)).toBe("This agent's history has a gap; answering waits for it to catch up.");
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(0);
+    app.event("atlas", "r1", "Bash", { command: "just check" }, 41);
+    expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
+  });
+
+  test("the message is bounded in UTF-8 bytes, not characters, and over the limit disables the answer", () => {
+    const type = (app: App, text: string): void => {
+      const input = app.root.querySelector<HTMLInputElement>(".decide__message");
+      if (input === null) throw new Error("no message box");
+      input.value = text;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    const app = prompt();
+    const fits = "€".repeat(Math.floor(MESSAGE_MAX_BYTES / 3));
+    type(app, `  ${fits}  `);
+    expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
+    expect($$(app.root, "decide-count")[0]?.textContent).toBe(`${MESSAGE_MAX_BYTES - (fits.length * 3)} bytes left`);
+    type(app, `${fits}😀`);
+    expect(fits.length + 2).toBeLessThan(MESSAGE_MAX_BYTES);
+    expect(button(app, "Allow once").hasAttribute("disabled")).toBe(true);
+    expect($$(app.root, "decide-count")[0]?.textContent).toBe(`${fits.length * 3 + 4 - MESSAGE_MAX_BYTES} bytes over the limit`);
+    expect(status(app)).toBe(`The message is ${fits.length * 3 + 4 - MESSAGE_MAX_BYTES} bytes over the ${MESSAGE_MAX_BYTES}-byte limit.`);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(0);
+    type(app, fits);
+    button(app, "Allow once").click();
+    expect(cmds(app)[0]?.args["message"]).toBe(fits);
   });
 
   test("Always allow needs the confirm step, naming the tool, and a given message is sent", () => {
