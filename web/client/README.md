@@ -29,12 +29,22 @@ How it is built (`nix/client.nix`):
    (patched to find their libraries on Linux), and runs `bun run build`
    offline under the same nodejs as the dev shell.
 
-### After changing `bun.lock`
+### After changing `bun.lock` or Bun
 
 Run `just client-deps-hash` and commit `nix/client-deps.json`. The file
-records the sha256 of the `bun.lock` its hash was computed from, so a lock
-changed without it fails evaluation with a message that names the file and
-this command. `dist/` is never committed.
+records the lock’s sha256 and Bun version. Changing either without refreshing
+the pin fails evaluation with a message naming this command. Failed refreshes
+and INT/TERM interruptions restore the original pin, including during verification.
+`dist/` is never committed.
+
+A same-version nixpkgs Bun patch can reuse the cached fixed-output outPath;
+the version check cannot detect it. Run `just client-deps-hash` explicitly
+after such a patch. The mismatch diagnostic documents this limit too.
+
+The client-dependency workflow builds and rebuilds the FOD on x86_64-linux
+and aarch64-darwin, records the actual NAR hashes, and requires matching
+hashes, lock digests and Bun versions. Rebuilding prevents a shared cached
+output from hiding a platform-specific difference.
 
 ### Known limits
 
