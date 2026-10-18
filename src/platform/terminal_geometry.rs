@@ -136,6 +136,23 @@ pub(crate) mod tests {
             .open(master.tty_name().expect("owned PTY has a slave path"))
             .unwrap()
     }
+    /// Signal only this owned, unreaped fixture child; its PID cannot be reused.
+    pub(crate) fn interrupt_child(
+        child: &mut (dyn portable_pty::Child + Send + Sync),
+    ) -> io::Result<()> {
+        if child.try_wait()?.is_some() {
+            return Err(io::Error::other("geometry client exited before SIGINT"));
+        }
+        let pid = child
+            .process_id()
+            .ok_or_else(|| io::Error::other("fixture has no PID"))?;
+        // SAFETY: the owned child remains unreaped throughout this call. No
+        // unrelated process can acquire its PID, even if it exits concurrently.
+        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
     /// A fresh session without a controlling tty, before the child creates threads.
     pub(crate) fn detached_command() -> std::process::Command {
         use std::os::unix::process::CommandExt;

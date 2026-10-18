@@ -300,8 +300,8 @@ fn startup_guard_worker() {
     assert_eq!((initial.0, initial.1), (132, 40));
     assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     // Drive the actual pre-handshake return against an isolated socket.
-    let directory = crate::structured::launch::SessionConfigDir::create(Path::new("/tmp")).unwrap();
-    let socket_path = directory.path().join("client.sock");
+    let directory = geometry_fixture_dir();
+    let socket_path = directory.path().join("s");
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
     listener.set_nonblocking(true).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -396,8 +396,21 @@ fn startup_guard_worker() {
 /// A bounded channel wait replaces the former yield loop. Cancellation kills
 /// only this owned child through its standard process handle.
 fn finish_pty_child(
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    cancel: bool,
+) -> portable_pty::ExitStatus {
+    finish_pty_child_with_timeout(
+        child,
+        cancel,
+        INITIAL_GEOMETRY_TIMEOUT + Duration::from_secs(3),
+    )
+}
+
+/// Bound completion by the supplied cap, then kill/reap only the owned child.
+fn finish_pty_child_with_timeout(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     cancel: bool,
+    timeout: Duration,
 ) -> portable_pty::ExitStatus {
     let (stop, stopped) = std::sync::mpsc::channel();
     let (sent, received) = std::sync::mpsc::channel();
@@ -419,7 +432,7 @@ fn finish_pty_child(
     if cancel {
         stop.send(()).unwrap();
     }
-    let status = match received.recv_timeout(Duration::from_secs(5)) {
+    let status = match received.recv_timeout(timeout) {
         Ok(status) => status,
         Err(_) => {
             let _ = stop.send(());
@@ -522,8 +535,8 @@ fn stdio_attach_worker() {
 
 /// A successful real Hello/Welcome exchange proves startup reached attachment.
 fn exercise_geometry_attach(mut probe: GeometryQuery) {
-    let directory = crate::structured::launch::SessionConfigDir::create(Path::new("/tmp")).unwrap();
-    let path = directory.path().join("geometry.sock");
+    let directory = geometry_fixture_dir();
+    let path = directory.path().join("s");
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     // A finite nonblocking accept wait lets cleanup work even if startup fails.
     listener.set_nonblocking(true).unwrap();
@@ -723,8 +736,8 @@ fn startup_geometry_quit_is_clean_before_and_during_the_wait() {
 
 #[test]
 fn geometry_wait_never_reserves_a_server_handshake_slot() {
-    let root = crate::structured::launch::SessionConfigDir::create(Path::new("/tmp")).unwrap();
-    let socket = root.path().join("client.sock");
+    let root = geometry_fixture_dir();
+    let socket = root.path().join("s");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let quit = Arc::new(AtomicBool::new(false));
@@ -779,4 +792,24 @@ fn local_geometry_failure_does_not_retry_in_an_open_handoff_window() {
         assert!(!retry.should_retry(&failure, Duration::ZERO));
         assert!(!failure.is_redial_failure());
     }
+}
+
+/// A compact name leaves room for the socket even under macOS's long temp root.
+struct GeometryFixture(std::path::PathBuf);
+impl GeometryFixture {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for GeometryFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn geometry_fixture_dir() -> GeometryFixture {
+    let mut random = [0; 4];
+    getrandom::fill(&mut random).unwrap();
+    let path = std::env::temp_dir().join(format!("g{:08x}", u32::from_ne_bytes(random)));
+    std::fs::create_dir(&path).unwrap();
+    GeometryFixture(path)
 }
