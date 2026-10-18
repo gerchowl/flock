@@ -1,11 +1,24 @@
 use super::*;
 use serde_json::{json, Value};
 use std::{cell::Cell, sync::Mutex};
-#[derive(Debug, Default)]
-struct ClockLog(Mutex<Vec<Duration>>);
+#[derive(Debug)]
+struct ClockLog(Mutex<Vec<Duration>>, Instant, Mutex<Duration>);
+impl Default for ClockLog {
+    fn default() -> Self {
+        Self(
+            Mutex::new(Vec::new()),
+            Instant::now(),
+            Mutex::new(Duration::ZERO),
+        )
+    }
+}
 impl Clock for ClockLog {
+    fn now(&self) -> Instant {
+        self.1 + *self.2.lock().unwrap()
+    }
     fn wait(&self, duration: Duration) {
         self.0.lock().unwrap().push(duration);
+        *self.2.lock().unwrap() += duration;
     }
 }
 #[test]
@@ -167,5 +180,27 @@ fn a_caller_deadline_cannot_be_extended_by_a_busy_retry() {
     .unwrap();
     assert_eq!(calls.get(), 1);
     assert!(clock.0.lock().unwrap().is_empty());
+    assert_eq!(result["error"]["code"], "lease_busy");
+}
+
+#[test]
+fn advancing_clock_deadline_cuts_off_second_retry() {
+    let clock = ClockLog::default();
+    let calls = Cell::new(0);
+    let start = clock.now();
+    let result = attempts(
+        true,
+        &clock,
+        Some(start + Duration::from_millis(40)),
+        || {
+            calls.set(calls.get() + 1);
+            Ok::<_, ()>(json!({"error":{"code":"lease_busy"}}))
+        },
+        |v| v,
+    )
+    .unwrap();
+    assert_eq!(calls.get(), 2);
+    assert_eq!(clock.now() - start, LEASE_BACKOFF);
+    assert_eq!(*clock.0.lock().unwrap(), [LEASE_BACKOFF]);
     assert_eq!(result["error"]["code"], "lease_busy");
 }

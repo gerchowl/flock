@@ -42,6 +42,8 @@ use framing::{error_response, parse_message, success_response};
 /// Run the MCP stdio server on this process's stdin/stdout. Returns when
 /// stdin reaches EOF or an IO error interrupts the loop.
 pub(crate) fn serve_over_stdio(structured: bool) -> std::io::Result<i32> {
+    // Keep this first: it scrubs the credential's original environment storage
+    // while main's synchronous CLI path still has no other threads.
     let client = client::capture(structured)?;
     let stdin = std::io::stdin();
     let reader = BufReader::new(stdin.lock());

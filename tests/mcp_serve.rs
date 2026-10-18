@@ -825,3 +825,84 @@ fn structured_mcp_real_argv_preserves_scoped_transport() {
     assert!(!output.contains(&secret));
     cleanup_test_base(&base);
 }
+
+/// A real child must scrub the exec-time environment, not only libc's lookup.
+#[test]
+fn structured_mcp_scrubs_exec_time_environment_before_ready() {
+    use base64::Engine;
+    struct ChildGuard(Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let secret = base64::engine::general_purpose::STANDARD.encode([43; 32]);
+    let sentinel = "MCP_SCRUB_SENTINEL=exec-environment-reader-control";
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
+    for (name, _) in
+        std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("FLOCK_"))
+    {
+        command.env_remove(name);
+    }
+    command.envs(support::environment::isolated_env(
+        &base.join("c"),
+        &base.join("r"),
+    ));
+    let mut child = ChildGuard(
+        command
+            .args(["mcp", "serve", "--structured"])
+            .env("FLOCK_SOCKET_PATH", base.join("a"))
+            .env("FLOCK_MCP_LEASE_CREDENTIAL", &secret)
+            .env("MCP_SCRUB_SENTINEL", "exec-environment-reader-control")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let output = child.0.stdout.take().unwrap();
+    let (ready, received) = std::sync::mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(output)
+            .read_line(&mut line)
+            .map(|count| (count, line));
+        let _ = ready.send(result);
+    });
+    writeln!(
+        child.0.stdin.as_mut().unwrap(),
+        "{}",
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
+    )
+    .unwrap();
+    let (count, line) = received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("MCP ready producer stayed silent")
+        .unwrap();
+    reader.join().unwrap();
+    assert!(count > 0, "MCP exited before ready");
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    assert!(
+        reply.get("result").is_some(),
+        "unexpected ready response: {reply}"
+    );
+    // The platform reader uses KERN_PROCARGS2 on Darwin and /proc on Linux.
+    // A missing sentinel or an inspection error fails, including on either supported OS.
+    let environment = support::process_table::process_environment(child.0.id()).unwrap();
+    assert!(
+        environment.iter().any(|entry| entry == sentinel),
+        "exec environment reader omitted its control"
+    );
+    assert!(
+        !environment.iter().any(|entry| entry
+            .as_bytes()
+            .windows(secret.len())
+            .any(|bytes| bytes == secret.as_bytes())),
+        "credential remains in the child's exec-time environment"
+    );
+    drop(child);
+    cleanup_test_base(&base);
+}

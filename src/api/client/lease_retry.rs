@@ -14,13 +14,14 @@ pub(super) trait Clock: Debug + Send + Sync {
     /// Advance past a backoff before issuing another admission attempt.
     fn wait(&self, duration: Duration);
     /// Monotonic instant used to retain the caller's absolute deadline.
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
+    fn now(&self) -> Instant;
 }
 #[derive(Debug)]
 pub(super) struct SystemClock;
 impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
     fn wait(&self, duration: Duration) {
         std::thread::sleep(duration);
     }

@@ -1,4 +1,16 @@
 use super::*;
+
+fn configured(
+    structured: bool,
+    credential: Option<OsString>,
+    socket: Option<OsString>,
+) -> io::Result<ApiClient> {
+    super::configured(
+        structured,
+        credential.map(|raw| zeroize::Zeroizing::new(raw.into_encoded_bytes())),
+        socket,
+    )
+}
 use crate::{
     api::schema::{EmptyParams, Method},
     mcp::{
@@ -119,32 +131,6 @@ fn local_calls_compatibility_probes_and_channel_reattachment_share_scoping() {
         .expect("transport fixture must complete within fail ceiling");
 }
 
-#[test]
-fn credential_is_removed_before_any_endpoint_read_even_when_configuration_refuses() {
-    let removed = std::cell::Cell::new(false);
-    let reads = std::cell::Cell::new(0);
-    let result = capture_using(
-        true,
-        |name| {
-            reads.set(reads.get() + 1);
-            if name == CREDENTIAL_ENV {
-                assert!(!removed.get());
-                Some("invalid-secret".into())
-            } else {
-                assert!(
-                    removed.get(),
-                    "credential still present when startup proceeds"
-                );
-                None
-            }
-        },
-        || removed.set(true),
-    );
-    assert!(result.is_err());
-    assert!(removed.get());
-    assert_eq!(reads.get(), 2);
-}
-
 #[global_allocator]
 static ALLOCATOR: SecretAudit = SecretAudit;
 struct SecretAudit;
@@ -196,4 +182,25 @@ fn startup_credential_buffers_are_zeroized_before_deallocation() {
         AUDIT.set(false);
         assert_eq!(LEAKED.get(), 0, "credential bytes freed before zeroization");
     }
+}
+
+#[test]
+fn credential_is_removed_before_any_endpoint_read_even_when_configuration_refuses() {
+    let removed = std::cell::Cell::new(false);
+    let result = capture_using(
+        true,
+        || {
+            removed.set(true);
+            Ok(Some(zeroize::Zeroizing::new(b"invalid-secret".to_vec())))
+        },
+        || {
+            assert!(
+                removed.get(),
+                "credential still present when startup proceeds"
+            );
+            None
+        },
+    );
+    assert!(result.is_err());
+    assert!(removed.get());
 }
