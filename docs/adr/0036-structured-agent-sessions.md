@@ -1850,6 +1850,14 @@ P16 and P17 have no source in the stream today and are not promised;
   reference the originating grant request ID. A raw request already reserved by
   an exact grant carries that trusted reference into replay and counts as
   stdout progress without ever opening S4 needs-human attention.
+  Decision messages normalize CRLF to LF, trim surrounding whitespace, and
+  contain at most 2048 UTF-8 bytes (`MAX_PERMISSION_DECISION_MESSAGE_BYTES`,
+  #2249). They use `prompt_control_bytes` rules: newlines and tabs are allowed;
+  other controls are refused. Oversized or unsafe messages return typed
+  `invalid_params` before any reservation, grant, audit or harness input.
+  Empty and absent messages are allowed; audits and deny responses carry the
+  normalized text.
+
 - **`allow_always` lasts for one live harness runtime.** Its grant is held
   only in memory for that structured agent. Exit, restart and resume into a
   new runtime discard it, even when resuming the same persisted session.

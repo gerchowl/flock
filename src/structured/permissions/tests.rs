@@ -40,6 +40,77 @@ fn book() -> Book {
 }
 
 #[test]
+fn permission_message_over_limit_refuses_without_mutating() {
+    assert_eq!(MAX_PERMISSION_DECISION_MESSAGE_BYTES, 2048);
+    for decision in [Decision::AllowOnce, Decision::AllowAlways, Decision::Deny] {
+        for message in ["a".repeat(2049), "é".repeat(1025)] {
+            let mut b = book();
+            let mut request = args(&b, "request-example", decision);
+            request.message = Some(message);
+            let waiting = b.waiting();
+            assert_eq!(
+                b.prepare(&token(), &request).err(),
+                Some(ErrorCode::InvalidParams)
+            );
+            assert_eq!(b.waiting(), waiting);
+            assert!(b.grants.is_empty());
+            assert!(b.closed_ids.is_empty());
+            assert!(b
+                .open
+                .values()
+                .all(|r| r.stage == Stage::Open && r.grant.is_none()));
+            request.message = Some("corrected".into());
+            assert!(b.prepare(&token(), &request).is_ok());
+        }
+    }
+}
+
+#[test]
+fn permission_message_is_trimmed_at_utf8_boundary() {
+    for expected in [
+        "a".repeat(2048),
+        "é".repeat(1024),
+        String::new(),
+        "line one\n\tline two".into(),
+    ] {
+        let mut b = book();
+        let mut request = args(&b, "request-example", Decision::Deny);
+        request.message = Some(format!(" \t{}\r\n ", expected.replace('\n', "\r\n")));
+        let answer = b.prepare(&token(), &request).unwrap();
+        assert_eq!(answer.response["message"], expected);
+        assert_eq!(
+            serde_json::to_value(answer.audit).unwrap()["message"],
+            expected
+        );
+    }
+}
+
+#[test]
+fn permission_message_rejects_prompt_control_bytes_without_mutating() {
+    for message in [
+        "before\rafter",
+        "before\0after",
+        "before\u{7}after",
+        "before\u{7f}after",
+        "before\u{85}after",
+        "before\x1b[31mafter",
+        "before\x1b]0;title\x07after",
+    ] {
+        let mut b = book();
+        let mut request = args(&b, "request-example", Decision::Deny);
+        request.message = Some(message.into());
+        assert_eq!(
+            b.prepare(&token(), &request).err(),
+            Some(ErrorCode::InvalidParams),
+            "{message:?}"
+        );
+        assert_eq!(b.waiting(), vec![("request-example".into(), 1)]);
+        request.message = None;
+        assert!(b.prepare(&token(), &request).is_ok());
+    }
+}
+
+#[test]
 fn only_an_authenticated_operate_token_can_decide() {
     for principal in [
         Principal::Operator,
