@@ -20,6 +20,9 @@ use tracing::info;
 
 #[cfg(unix)]
 const HANDOFF_VERSION: u32 = 1;
+/// Import-only credential channel, consumed before the importer starts children.
+#[cfg(unix)]
+pub(crate) const HANDOFF_TOKEN_ENV: &str = "FLOCK_HANDOFF_TOKEN";
 #[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
@@ -117,7 +120,7 @@ pub(crate) fn spawn_handoff_import(
         .arg("server")
         .arg("--handoff-import")
         .arg(socket_path)
-        .arg(token)
+        .env(HANDOFF_TOKEN_ENV, token)
         // A test version override names the exporter's build, not the
         // importer's, which reports its own (#958).
         .env_remove("FLOCK_TEST_BUILD_VERSION")
@@ -821,6 +824,39 @@ mod tests {
     use std::io::Read;
     use std::os::unix::net::UnixStream;
     use std::thread;
+
+    #[test]
+    fn importer_secret_uses_environment_and_never_argv_or_logs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TempDir::socket();
+        let importer = dir.path().join("importer");
+        std::fs::write(
+            &importer,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" \"$FLOCK_HANDOFF_TOKEN\" >\"$0.result\"\n",
+        )
+        .expect("fixture script");
+        std::fs::set_permissions(&importer, std::fs::Permissions::from_mode(0o700))
+            .expect("executable fixture");
+        let socket = dir.path().join("import.sock");
+        let token = ["fixture", "handoff", "credential"].join("-");
+        let logs = crate::logging::capture_logs(|| {
+            let mut child = spawn_handoff_import(Some(&importer), &socket, &token)
+                .expect("spawn fixture importer");
+            assert!(child.wait().expect("fixture completion").success());
+        });
+        assert!(!logs.contains(&token));
+        let received =
+            std::fs::read_to_string(importer.with_extension("result")).expect("fixture receipt");
+        assert_eq!(
+            received.lines().collect::<Vec<_>>(),
+            [
+                "server",
+                "--handoff-import",
+                socket.to_str().unwrap(),
+                token.as_str()
+            ]
+        );
+    }
 
     #[test]
     fn import_deadline_disarm_and_expiry_race_has_only_one_winner() {
