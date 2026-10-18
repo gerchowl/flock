@@ -363,6 +363,10 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   token that only the local operator can mint over the unix socket, and the
   `principal` in `welcome` names the token, never the address.
 
+**Scoped session MCP requests (#1734).** Every structured-session MCP API request carries a server-issued credential scoped to one lease reservation generation. The server verifies it against current kernel peer identity and the live bound lease root, and derives only an agent principal. Failed or revoked session authentication never falls back to operator ancestry classification. This applies independently to every connection, queued request and channel attachment; lease/root loss refuses subsequent admission. Already admitted work never acquires operator authority. Parent-change exit is defense in depth. Unscoped arbitrary same-UID programs retain the explicitly cooperative #1177 limitation; dedicated-account policy remains mandatory unless the operator opts out.
+
+Slice A adds the scoped local request envelope and server admission. Slice B of #1734 supplies mandatory generated MCP credentials and immutable transport propagation; public structured starts remain gated until both land. Legacy unscoped CLI/MCP requests retain their existing policy. Credentials are not operator/client tokens and never appear in logs, errors or status. Failed scoped decoding or authentication cannot be retried through legacy dispatch. Revocation precedes cleanup and lease removal; scoped subscriptions close on revoked or unreadable identity. Operations admitted before root loss may finish with agent authority only. The scoped verifier requires a living kernel process, not merely a matching birth time: zombies cannot authorize admission. The local envelope is `{"request": <Request>, "credential": <LeaseCredential>}`; malformed scoped envelopes return `invalid_request`, authentication failures return `not_authorized`, and neither path retries as a legacy request.
+
 ### 2. Mapping session events onto flk state, questions and waits
 
 A new `StateSource::Session` joins `Screen`, `Hook`, `Plugin`,
