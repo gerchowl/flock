@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { render } from "solid-js/web";
 
+import { permissionLifecycle } from "../src/gen/FixtureExamples";
 import { App } from "../src/App";
 import type { Transport } from "../src/transport";
 import { FIXTURE_STREAM, createFixtureTransport } from "../src/transport/fixture";
@@ -103,4 +104,15 @@ describe("App", () => {
     await Promise.resolve();
     expect(root.querySelectorAll('[data-testid="known-event"]').length).toBeGreaterThan(0);
   });
+});
+
+test("permission audit open and closed render as known transcript entries", async () => {
+  const lines = permissionLifecycle.filter((record) => "state" in record).map((record) => JSON.stringify(record)).join("\n");
+  const { transport, synced } = whenSynced(createFixtureTransport(lines));
+  const root = mount(() => <Transcript transport={transport} stream={FIXTURE_STREAM} source="replay" />);
+  await synced;
+  expect(root.querySelectorAll('[data-testid="known-event"]').length).toBe(2);
+  expect(root.querySelectorAll('[data-testid="unknown-event"]').length).toBe(0);
+  expect(root.textContent).toContain("Permission request · Bash");
+  expect(root.textContent).toContain("Permission request closed");
 });

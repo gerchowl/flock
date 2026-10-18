@@ -35,7 +35,7 @@ for the retired ID are silently dropped; frames for never-opened IDs are protoco
 errors. Reusing a live or closed ID is refused with subfail code `sub_id_reused`. The `fleet-lite.jsonl` fixture pins
 bootstrap, live updates/removal and recovery.
 
-`agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, `decision`
+`agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, required `request_seq`, `decision`
 (`allow_once`, `allow_always` or `deny`), and optional `message`. Only a
 token-authenticated client principal can submit this command. The ack uses the
 same envelope as `agent.send`, echoes `cmd_id`, and on success returns
@@ -50,3 +50,41 @@ Failures use `ok: false` and the existing `WireError` envelope without `result`.
 `permission_request_closed` and `not_authorized`, with retry class `never`.
 These names are contracts for S6 (#1429) to register before serving them; this
 slice adds no API error registrations or authorization behavior.
+
+Live structured runtimes keep at most 16 open/in-flight requests
+(`MAX_OPEN_PERMISSION_REQUESTS`). The harness blocks per request, so more than a
+few concurrent prompts is pathological; 16 leaves headroom for parallel tool
+calls. An extra valid request receives a `permission_request_limit` deny (retry
+`never`), a structured warning and a durable closed audit with no matching open
+audit. The other requests and the session remain live.
+
+Every open request carries a flk-issued `request_seq: u64` in its audit, trusted
+stdout envelope and S4 snapshot. It increases strictly within the session,
+including across runtime resumes. S7 slice 5 must carry both `request_id` and
+`request_seq` from that display to `agent.decide`; an ID alone cannot authorize
+an answer. Like stream cursors, generated TypeScript represents this JSON number
+as `number`, exact below 2^53. Clients must preserve the exact value.
+
+The most recent 1024 closed `(request_id, request_seq)` handles are retained in
+FIFO closure order. A decision for a retained closed pair returns
+`permission_request_closed`; an evicted or never-seen pair returns
+`permission_request_unknown`. A reused harness ID receives a new sequence:
+a delayed decision for its old handle cannot approve the new request or install
+an `allow_always` grant. Session grants remain exact matches for this live runtime.
+
+## Permission lifecycle records
+
+`flk_permission_request` is a known agent-stream event, exported as the generated
+`PermissionRecord` type. Its `state` is `open` or `closed`; there is no `decided`
+state. Both carry `request_id` and the flk-issued `request_seq`. Only `open`
+carries `request: ToolRequest`, from which the client renders the tool summary.
+A close carries `decision`, nullable `message`, `principal` and `source`, or a
+closed reason enum. Capacity refusals use `permission_request_limit` and may
+have no preceding open. Other reasons include `ended`, `cancelled`, `result`,
+`interrupted`, `permission_request_too_large`, and `session_ended` (restart
+recovery, #2236). Existing closed JSON is preserved apart from `request_seq`.
+
+The `permission-decision` fixture shows open, `agent.decide` acknowledgement,
+then closed. The ack acknowledges admission; remove the card when the durable
+closed event arrives. Future or incompatible record shapes use the existing
+unknown-event wrapper, preserving their original payload.

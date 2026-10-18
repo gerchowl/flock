@@ -272,7 +272,7 @@ macro_rules! events {
         );)*
         }
 
-        /// One Claude stdout event, with lossless JSON fallback for new shapes.
+        /// One structured stream event, including host permission audits, with lossless fallback.
         ///
         /// A known discriminator with incompatible fields also becomes Unknown.
         /// Heterogeneous API messages, SSE bodies and SDK metadata stay JSON;
@@ -284,6 +284,8 @@ macro_rules! events {
         #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
         #[cfg_attr(feature = "ts", ts(as = "StoredSessionEvent"))]
         pub enum SessionEvent {
+            /// Host permission lifecycle audit, known on the agent stream.
+            PermissionRequest(Box<crate::structured_wire::PermissionRecord>),
             $($(#[$doc])* $name(Box<$name>),)*
             /// An unrecognised or incompatible JSON shape, preserved in full.
             Unknown {
@@ -307,6 +309,8 @@ macro_rules! events {
         #[serde(untagged)]
         #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
         pub(crate) enum KnownSessionEvent {
+            /// Host permission lifecycle audit.
+            PermissionRequest(Box<crate::structured_wire::PermissionRecord>),
             $($(#[$doc])* $name(Box<$name>),)*
         }
 
@@ -315,6 +319,7 @@ macro_rules! events {
             fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 let value = Value::deserialize(d)?;
                 match SessionEvent::parse(&value.to_string(), "wire") {
+                    SessionEvent::PermissionRequest(event) => Ok(Self::PermissionRequest(event)),
                     $(SessionEvent::$name(event) => Ok(Self::$name(event)),)*
                     SessionEvent::Unknown { .. } => Err(serde::de::Error::custom(
                         "unknown agent payload requires {type:unknown,raw,shape}")),
@@ -334,7 +339,7 @@ macro_rules! events {
                 assert_eq!(serde_json::to_string(&known).unwrap(),
                     serde_json::to_string(&parsed).unwrap());
                 match parsed {
-                    $(SessionEvent::$name(_) => { seen.insert(stringify!($name)); },)*
+                    SessionEvent::PermissionRequest(_) => panic!("host record in harness catalogue"),                    $(SessionEvent::$name(_) => { seen.insert(stringify!($name)); },)*
                     SessionEvent::Unknown { .. } => panic!("recorded fixture must remain known: {line}"),
                 }
             }
@@ -381,7 +386,7 @@ macro_rules! events {
         }
 
         impl SessionEvent {
-            /// Parse one stdout line using the observed Claude version.
+            /// Parse a stream payload using the observed Claude version.
             ///
             /// Unknown pairs, incompatible payloads and non-JSON diagnostics all
             /// become Unknown. There is no versionless serde Deserialize path.
@@ -395,12 +400,24 @@ macro_rules! events {
             /// A non-empty map marks a known event as a new shape (§8).
             pub fn extra(&self) -> Option<&Map<String, Value>> {
                 match self {
+                    Self::PermissionRequest(_) => {
+                        static EMPTY: std::sync::LazyLock<Map<String, Value>> = std::sync::LazyLock::new(Map::new);
+                        Some(&EMPTY)
+                    }
                     $(Self::$name(event) => Some(&event.extra),)*
                     Self::Unknown { .. } => None,
                 }
             }
 
             fn from_value(raw: Value, line: &str, version: &str) -> Self {
+                if raw.get("type").and_then(Value::as_str) == Some("flk_permission_request") {
+                    if let Ok(record) = serde_json::from_value::<crate::structured_wire::PermissionRecord>(raw.clone()) {
+                        // Keep incompatible and future fields lossless in Unknown.
+                        if serde_json::to_value(&record).ok().as_ref() == Some(&raw) {
+                            return Self::PermissionRequest(Box::new(record));
+                        }
+                    }
+                }
                 $(if raw.get("type").and_then(Value::as_str) == Some($kind)
                     && (if $path.is_empty() { raw.get("subtype").is_none() }
                         else { raw.pointer($path).and_then(Value::as_str) == Some($sub) })
@@ -429,7 +446,7 @@ macro_rules! events {
             let union = <SessionEvent as ts_rs::TS>::decl(&cfg);
             assert_eq!(union, "type SessionEvent = KnownSessionEvent | JsonValue;");
             assert_eq!(<KnownSessionEvent as ts_rs::TS>::decl(&cfg),
-                format!("type KnownSessionEvent = {};", [$(stringify!($name)),*].join(" | ")));
+                format!("type KnownSessionEvent = PermissionRecord | {};", [$(stringify!($name)),*].join(" | ")));
 
             let raw = "{ \"type\" : \"future\", \"counter\": 1e2 }";
             let unknown = SessionEvent::parse(raw, "fixture");
@@ -440,6 +457,7 @@ macro_rules! events {
                 let json = serde_json::to_string(&event).unwrap();
                 let value: Value = serde_json::from_str(&json).unwrap();
                 match event {
+                    SessionEvent::PermissionRequest(_) => panic!("host record in harness catalogue"),
                     $(SessionEvent::$name(_) => {
                         assert_eq!(value["type"], $kind);
                         if !$path.is_empty() {
@@ -466,6 +484,7 @@ macro_rules! events {
         impl Serialize for SessionEvent {
             fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                 match self {
+                    Self::PermissionRequest(event) => event.serialize(serializer),
                     $(Self::$name(event) => event.serialize(serializer),)*
                     Self::Unknown { raw, .. } => match serde_json::value::RawValue::from_string(raw.clone()) {
                         Ok(json) => json.serialize(serializer),
