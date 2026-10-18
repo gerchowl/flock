@@ -342,8 +342,10 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
 
     if let Err(err) = crate::update::self_update(crate::update::SelfUpdateOptions::default()) {
         eprintln!("update failed: {err}");
-        eprintln!("Run `flk update` to retry.");
-        return Ok(1);
+        if err.code().is_none() {
+            eprintln!("Run `flk update` to retry.");
+        }
+        return Ok(err.exit());
     }
 
     Ok(0)

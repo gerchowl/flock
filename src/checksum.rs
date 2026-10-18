@@ -34,6 +34,7 @@ impl<'de> Deserialize<'de> for AssetRef {
                     .ok_or_else(|| serde::de::Error::custom("asset object is missing url"))?;
                 let sha256 = object
                     .remove("sha256")
+                    .filter(|value| !value.is_null())
                     .map(|value| {
                         value.as_str().map(str::to_string).ok_or_else(|| {
                             serde::de::Error::custom("asset sha256 must be a string")
@@ -94,7 +95,8 @@ pub(crate) fn verify_sha256(path: &Path, expected: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn file_sha256(path: &Path) -> io::Result<String> {
+/// Hash a local transfer source so the remote can verify the received bytes.
+pub(crate) fn file_sha256(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -164,6 +166,17 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn null_checksum_is_absent_and_remains_unverified() {
+        let asset: super::AssetRef = serde_json::from_value(serde_json::json!({
+            "url":"https://example.invalid/asset", "sha256":null
+        }))
+        .unwrap();
+        assert_eq!(asset.sha256(), None);
+        let root = crate::test_support::TempDir::socket();
+        assert!(super::verify_asset(&root.path().join("not-downloaded"), asset.sha256()).is_ok());
     }
 
     #[test]

@@ -7,6 +7,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
+use crate::api::error_code::ErrorCode;
+use crate::checksum::AssetRef as RemoteAssetRef;
 use crate::process::TracedCommand;
 
 use serde::Deserialize;
@@ -530,8 +532,6 @@ impl RemoteFlock {
         self
     }
 }
-
-use crate::checksum::AssetRef as RemoteAssetRef;
 
 #[derive(Deserialize)]
 struct RemoteUpdateManifest {
@@ -1616,16 +1616,31 @@ fn install_remote_flock(
         &source_path.display().to_string(),
         &remote_flock.shell_path,
     );
+    let expected = crate::checksum::file_sha256(source_path)?;
+    let mut source = File::open(source_path)?;
     let script = format!(
         r#"dest="$HOME/{install_suffix}"
 dir="${{dest%/*}}"
 mkdir -p "$dir"
 tmp="${{dest}}.tmp.$$"
+trap 'rm -f "$tmp"' 0
 cat > "$tmp"
+if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$tmp") || exit {mismatch_exit}
+elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$tmp") || exit {mismatch_exit}
+else
+    exit {missing_exit}
+fi
+actual=${{actual%% *}}
+[ "$actual" = {expected} ] || exit {mismatch_exit}
 chmod 755 "$tmp"
 mv "$tmp" "$dest"
 "#,
-        install_suffix = remote_flock.install_suffix
+        install_suffix = remote_flock.install_suffix,
+        expected = shell_quote(&expected),
+        mismatch_exit = crate::cli::exit::REFUSED,
+        missing_exit = crate::cli::exit::USAGE,
     );
 
     let mut child = TracedCommand::new("ssh", "remote")
@@ -1642,7 +1657,6 @@ mv "$tmp" "$dest"
         .spawn_traced()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh install: {err}")))?;
 
-    let mut source = File::open(source_path)?;
     let copy_result = if let Some(mut stdin) = child.stdin.take() {
         io::copy(&mut source, &mut stdin).map(|_| ())
     } else {
@@ -1653,6 +1667,19 @@ mv "$tmp" "$dest"
     };
     let output = child.wait_with_output()?;
     let status = output.status;
+    let refusal = match status.code() {
+        Some(crate::cli::exit::REFUSED) => {
+            Some((io::ErrorKind::InvalidData, ErrorCode::ChecksumMismatch))
+        }
+        Some(crate::cli::exit::USAGE) => {
+            Some((io::ErrorKind::NotFound, ErrorCode::ChecksumToolMissing))
+        }
+        _ => None,
+    };
+    if let Some((kind, code)) = refusal {
+        crate::logging::remote_install_failed(target, &remote_flock.shell_path, code.as_str());
+        return Err(io::Error::new(kind, code));
+    }
     copy_result?;
 
     if status.success() {
@@ -5347,3 +5374,6 @@ exit 0
         );
     }
 }
+
+#[cfg(test)]
+mod install_tests;

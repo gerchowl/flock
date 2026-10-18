@@ -172,9 +172,20 @@ checksum verifier. A declared checksum is verified before chmod, replacement or
 remote installation. A mismatch or malformed digest is an `InvalidData` refusal,
 with the failed download removed. This checks bytes against the manifest, not an
 independent release signature. Legacy bare URL strings (and objects with an
-absent checksum) remain unverified during the transition. Requiring checksums
+absent or JSON `null` checksum) remain unverified during the transition. Requiring checksums
 for all downloaded assets is deferred to #2076, gated on a stable release having
-shipped this metadata. Old published manifests are not rewritten.
+shipped this metadata. Old published manifests are not rewritten. The local updater preserves
+verification failure as registered `checksum_mismatch` and CLI exit 10
+(`REFUSED`, ADR-0029), rather than an unclassified failure.
+
+Remote installs also hash the local transfer source and verify the received
+temporary file before replacing the installed executable. This applies to
+release downloads and operator-supplied local binaries alike, and detects a
+truncated transfer independently of manifest authentication. The remote shell
+uses `sha256sum` or `shasum -a 256`; neither available is a registered
+`checksum_tool_missing` refusal. A mismatch is `checksum_mismatch`. Both keep
+the previous binary and remove the temporary upload. Shell exit statuses are
+mapped to registered errors without interpreting stderr text.
 
 ### 4. The bump is derived and checked; the number stays a human's
 
