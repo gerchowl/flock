@@ -111,6 +111,7 @@ pub(crate) struct GhosttyPaneTerminal {
 }
 
 pub(crate) struct GhosttyPaneCore {
+    codex_lock_cache: Option<(u64, bool)>,
     pub terminal: crate::ghostty::Terminal,
     pub render_state: crate::ghostty::RenderState,
     pub kitty_keyboard: KittyKeyboardTracker,
@@ -189,6 +190,11 @@ impl PaneTerminal {
 
     pub fn visible_ansi(&self) -> String {
         self.ghostty.visible_ansi()
+    }
+
+    /// Reuse the lock diagnosis until content, geometry or terminal mode changes.
+    pub(crate) fn codex_conversation_locked(&self) -> bool {
+        self.ghostty.codex_conversation_locked()
     }
 
     pub fn detection_text(&self) -> String {
@@ -352,6 +358,7 @@ impl GhosttyPaneTerminal {
         key_encoder.set_from_terminal(&terminal);
         Ok(Self {
             core: Mutex::new(GhosttyPaneCore {
+                codex_lock_cache: None,
                 terminal,
                 render_state,
                 kitty_keyboard: KittyKeyboardTracker::default(),
@@ -1005,6 +1012,22 @@ impl GhosttyPaneTerminal {
             .unwrap_or_default()
     }
 
+    fn codex_conversation_locked(&self) -> bool {
+        let Ok(mut core) = self.core.lock() else {
+            return false;
+        };
+        let revision = core.terminal.detection_revision();
+        if let Some((cached_revision, locked)) = core.codex_lock_cache {
+            if revision == cached_revision {
+                return locked;
+            }
+        }
+        let locked = ghostty_detection_text(&core)
+            .is_ok_and(|text| crate::detect::codex_conversation_locked(&text));
+        core.codex_lock_cache = Some((revision, locked));
+        locked
+    }
+
     pub fn detection_text(&self) -> String {
         self.core
             .lock()
@@ -1458,6 +1481,9 @@ fn ghostty_visible_ansi(core: &GhosttyPaneCore) -> Result<String, crate::ghostty
 }
 
 fn ghostty_detection_text(core: &GhosttyPaneCore) -> Result<String, crate::ghostty::Error> {
+    #[cfg(test)]
+    super::DETECTION_TEXT_READS.with(|reads| reads.set(reads.get() + 1));
+
     let lines = core
         .terminal
         .rows()

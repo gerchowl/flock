@@ -590,6 +590,8 @@ mod tests {
         let screen = include_str!("../../../tests/fixtures/codex/conversation-locked-narrow.txt");
         for screen in [
             screen.to_owned(),
+            screen[..screen.find("   esc/").unwrap()].to_string(),
+            format!("{}\n\n", &screen[..screen.find("   esc/").unwrap()]),
             format!("{screen}\n\n\n"),
             screen[..screen.find("ctrl+c/q").unwrap()].to_string(),
             screen.replace("ctrl+c/q exit   ctrl+t\n  transcript", "…"),

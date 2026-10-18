@@ -302,6 +302,11 @@ impl TerminalRuntime {
         self.0.try_resolve_codex_lock_at(bytes, deadline, now)
     }
 
+    /// Lock diagnosis cached against the terminal content revision.
+    pub(crate) fn codex_conversation_locked(&self) -> bool {
+        self.0.codex_conversation_locked()
+    }
+
     pub fn detection_text(&self) -> String {
         self.0.detection_text()
     }

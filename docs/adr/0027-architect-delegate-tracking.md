@@ -173,11 +173,21 @@ recognised only in the live screen tail by the lock notice, continuation
 instruction and retry/fork/exit footer. Quoted history above a later composer
 is not this state. Detection feeds ADR-0028 §1's human-attention axis.
 
+The live-tail footer may end exactly at `r retry f fork`: this is accepted as
+a truncated footer, including blank trailing lines. Text or a composer after
+the footer invalidates the match; scrollback alone is not a lock.
+
 No automatic path answers the lock. A start blocked there retains its pane,
 checkout and round-0 record and returns `agent_blocked` (ADR-0029 exit 6).
 Status and wait name the same dialog at startup or later; wait exits 6.
-Readiness consumes the fresh lock diagnosis in `agent.get`'s existing
-`blocked_reason`, without another screen RPC or reliance on cached status. A plain
+Readiness consumes the lock diagnosis in `agent.get`'s existing
+`blocked_reason`, without another screen RPC. A lock reason requires
+`agent_status: blocked`; the server caches the live diagnosis per terminal
+content revision and projects that status with its reason, even before the
+asynchronous detector publishes the transition. PTY writes, resize and mode
+changes invalidate the cache; user viewport scrolling does not. Offline and
+hibernated lifecycle states still outrank a lock diagnosis. Other reasons retain their
+existing semantics: `resume_failed` can describe an offline identity. A plain
 brief send refuses with the registered `codex_conversation_locked` code.
 
 `delegate send --resolve-lock retry|fork` is the explicit choice, mutually
@@ -188,10 +198,13 @@ server's owner turn and admits exactly one `r` or `f` with no Enter. A per-pane
 fence refuses another choice with `injection_pending` during the bounded write
 and a fixed 60-second settle window measured from its completed write. The
 actual receipt releases the fence immediately on zero-byte failure, including
-deferred failure; an observed unlock also releases it. Failed or partial
+deferred failure; an observed unlock releases it only once the pending write
+has finished or been retired, so a transient repaint cannot admit two keys. Failed or partial
 writes retain their first terminal-write timestamp, so later cancellation or
 observation cannot extend the settle window. Pending writes retain their
-existing bounded write budget.
+existing bounded write budget. The fence is runtime-only and resets on server
+handoff. A pane without a runtime refuses with `pane_not_found` rather than
+`agent_not_ready`.
 The CLI uses the same 60-second maximum for confirmation, with smaller
 `--ready-timeout` values shortening its wait. After inspecting a still-locked
 pane, the operator can choose again after the settle window; flock never

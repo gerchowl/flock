@@ -4439,7 +4439,11 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
     let screen = (!gone
         && (status == "blocked"
             || entry.lock_resolution.is_some()
-            || matches!(status, "idle" | "done")))
+            || (matches!(status, "idle" | "done")
+                && !record
+                    .get("settled_with_background_shells")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false))))
     .then(|| detection_screen(&entry.pane_id, None))
     .flatten();
     let background_shells = !gone

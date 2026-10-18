@@ -747,6 +747,11 @@ impl ChildExit {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static DETECTION_TEXT_READS: Cell<usize> = const { Cell::new(0) };
+}
+
 pub struct PaneRuntime {
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,
@@ -2310,6 +2315,11 @@ impl PaneRuntime {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_detection_text_reads() -> usize {
+        DETECTION_TEXT_READS.with(Cell::get)
+    }
+
     pub fn visible_text(&self) -> String {
         self.terminal.visible_text()
     }
@@ -2318,12 +2328,28 @@ impl PaneRuntime {
         self.terminal.visible_ansi()
     }
 
+    /// Lock diagnosis cached against the terminal content revision.
+    pub(crate) fn codex_conversation_locked(&self) -> bool {
+        let locked = self.terminal.codex_conversation_locked();
+        self.observe_codex_lock(|| locked);
+        locked
+    }
+
     pub fn detection_text(&self) -> String {
         let text = self.terminal.detection_text();
-        if !crate::detect::codex_conversation_locked(&text) {
-            self.codex_lock_pending.borrow_mut().take();
-        }
+        self.observe_codex_lock(|| crate::detect::codex_conversation_locked(&text));
         text
+    }
+
+    fn observe_codex_lock(&self, locked: impl FnOnce() -> bool) {
+        let mut pending = self.codex_lock_pending.borrow_mut();
+        if let Some(write) = pending.as_ref() {
+            // Retire an expired write before judging an unlocked repaint.
+            let _ = write.receipt.progress();
+            if write.receipt.finished_at().is_some() && !locked() {
+                pending.take();
+            }
+        }
     }
 
     /// Recheck, admit and track one guarded choice under the owner turn's clock.
@@ -2887,6 +2913,41 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn codex_lock_flicker_does_not_release_pending_write() {
+        let (runtime, mut bytes) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        let locked =
+            include_str!("../tests/fixtures/codex/conversation-locked.txt").replace('\n', "\r\n");
+        runtime.test_process_pty_bytes(locked.as_bytes());
+        runtime
+            .try_send_bytes(Bytes::from_static(b"occupied"))
+            .unwrap();
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_secs(10);
+        let first = runtime
+            .try_resolve_codex_lock_at(Bytes::from_static(b"r"), deadline, now)
+            .unwrap();
+        assert!(first.finished_at().is_none());
+        runtime.test_process_pty_bytes(b"\x1b[2J\x1b[H> repaint");
+        assert!(!crate::detect::codex_conversation_locked(
+            &runtime.detection_text()
+        ));
+        runtime.test_process_pty_bytes(b"\x1b[2J\x1b[H");
+        runtime.test_process_pty_bytes(locked.as_bytes());
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"occupied");
+        assert_eq!(
+            runtime
+                .try_resolve_codex_lock_at(Bytes::from_static(b"f"), deadline, now)
+                .unwrap_err(),
+            "injection_pending"
+        );
+        assert!(bytes.try_recv().is_err());
+        first.retire(crate::pty::write_receipt::WriteFailure::Deadline);
+        runtime.test_process_pty_bytes(b"\x1b[2J\x1b[H> unlocked");
+        assert!(!runtime.codex_conversation_locked());
+        assert!(runtime.codex_lock_pending.borrow().is_none());
+    }
 
     #[tokio::test]
     async fn codex_lock_settle_window_is_measured_from_completed_write() {
