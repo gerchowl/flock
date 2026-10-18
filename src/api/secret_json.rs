@@ -45,10 +45,10 @@ impl SecretValue {
         let raw: Credential<'_> = serde_json::from_str(line)?;
         if raw
             .credential
-            .is_some_and(|value| value.get().starts_with('"') && value.get().contains('\\'))
+            .is_some_and(|value| !value.get().starts_with('"') || value.get().contains('\\'))
         {
             return Err(serde::de::Error::custom(
-                "escaped credentials are not accepted",
+                "credential must be an unescaped JSON string",
             ));
         }
         serde_json::from_str(line).map(Self)
