@@ -23,10 +23,11 @@ def run(binary, scenario):
         root = Path(temporary).resolve()
         (root / "bin").mkdir()
         (root / "project").mkdir()
-        for name in ("ready", "turn-ready"):
+        for name in ("ready", "turn-ready", "resume-ready"):
             os.mkfifo(root / name, 0o600)
         ready = os.open(root / "ready", os.O_RDWR | os.O_NONBLOCK)
         turn_ready = os.open(root / "turn-ready", os.O_RDWR | os.O_NONBLOCK)
+        resume_ready = os.open(root / "resume-ready", os.O_RDWR | os.O_NONBLOCK)
         fake = root / "bin" / "claude"
         fake.write_text(f"#!{sys.executable}\n" + (repo / "tests/fixtures/structured-public/claude.py").read_text())
         fake.chmod(0o700)
@@ -181,6 +182,20 @@ max_spawn_fanout = {fanout}
             cli("agent", "stop", child_id)
             observe(child_id, "offline")
             assert tool("flock_agent_start", args)["error"]["data"]["refusal"] == "agent_name_taken"
+            for target in ("dogfood-child", "dogfood-parent"):
+                control.sendall((json.dumps({"fixture_cli": ["agent", "start", target,
+                    "--runtime", "structured", "--", "claude"]}) + "\n").encode())
+                refusal = json.loads(channel.readline())
+                assert refusal["exit"] == 13, refusal
+                assert refusal["response"]["error"]["code"] == "operator_only", refusal
+            resumed = cli("agent", "start", "dogfood-child", "--runtime", "structured", "--", "claude")["result"]["agent"]
+            assert resumed["agent_id"] == child_id and resumed["session_id"] == child["session_id"]
+            assert select.select([resume_ready], [], [], 10)[0], "operator resume readiness missing"
+            assert os.read(resume_ready, 1) == b"R"
+            # Fanout still bills the original parent after an operator resume.
+            assert tool("flock_agent_start", extra)["error"]["data"]["refusal"] == expected
+            cli("agent", "stop", child_id)
+            observe(child_id, "offline")
             control.sendall(b'"close"\n')
             channel.close()
             channel = None
@@ -203,6 +218,7 @@ max_spawn_fanout = {fanout}
             server.stdout.close()
             os.close(ready)
             os.close(turn_ready)
+            os.close(resume_ready)
 
 
 if __name__ == "__main__":

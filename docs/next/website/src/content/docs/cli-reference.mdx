@@ -1063,14 +1063,20 @@ requires the `web` feature. The structured listener integration is tracked by
 MCP structured spawn requires a fresh name/identity and accepts only `agent: "claude"` and a tracked `worktree_path` or
 `workspace_id`. No raw binary, argv, profile, lease credential or MCP endpoint is
 accepted as launch authority. Explicit question policies, focus and new-branch
-placement are refused for structured starts. Stdio permission decisions and
+placement and `unattended: true` are refused for structured starts. The name
+`self` is reserved and cannot be used for a fresh structured identity. Stdio permission decisions and
 richer question routing remain ADR-0036 S6 work (#1307).
 
 The server attests the caller and enforces spawn opt-in, pause, depth, fanout and
 capacity through the same owner admission. An unrelated MCP process cannot use
 operator authority to spawn. An opening prompt is validated and nonce-framed
 before it reaches stream stdin; it never becomes harness argv. Unknown restored
-records remain fenced. Scoped transport verifies the live lease on each request
+records remain fenced. Resuming an existing record through CLI/socket is
+operator-only, even when an agent targets itself (`operator_only`, exit 13).
+Resume keeps the original parent and depth. MCP spawn cannot resume records;
+mesh relays refuse structured start/spawn. Browser token scopes do not confer
+socket operator identity. The structured WebSocket command endpoint is not yet
+implemented (#1828/#1677). Scoped transport verifies the live lease on each request
 and at effect admission, including queued requests. The lease credential exists
 only in the generated private MCP config and captured MCP client context; it
 never reaches Claude's launch environment. CLI and MCP negotiate

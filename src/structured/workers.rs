@@ -78,6 +78,7 @@ struct Worker {
     finished: bool,
     events_closed: bool,
     stall_after: Duration,
+    lineage: Option<(String, u32)>,
     thread: Option<JoinHandle<()>>,
 }
 impl Worker {
@@ -181,6 +182,12 @@ impl Workers {
                 return Err(ErrorCode::SessionBusy);
             }
         }
+        // Resume retains the original admission ancestry, including operator roots.
+        let lineage = self
+            .entries
+            .get(&agent_id)
+            .map_or(lineage, |w| w.lineage.clone());
+        let retained_lineage = lineage.clone();
         let record = registry
             .get(&agent_id)
             .filter(|(_, _, g)| *g == current)
@@ -330,6 +337,7 @@ impl Workers {
                 finished: false,
                 events_closed: false,
                 stall_after,
+                lineage: retained_lineage,
                 thread: Some(thread),
             },
         );

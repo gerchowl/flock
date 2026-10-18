@@ -208,6 +208,9 @@ impl App {
         // prevent, which is why fork's answer to the same class is the
         // opposite one.
         let caller = self.spawn_caller();
+        // This first check is an early policy refusal before location resolution
+        // and launch preparation. The shared structured funnel rechecks before
+        // owner-thread reservation, which is the atomic admission authority.
         let lineage = match self.admit_spawn(SpawnVerb::Spawn, &caller, None) {
             Ok(Some(lineage)) => lineage,
             Ok(None) => {
@@ -227,6 +230,14 @@ impl App {
                 );
             }
         };
+
+        if params.runtime == crate::api::schema::AgentRuntime::Structured && params.unattended {
+            return encode_error(
+                id,
+                "runtime_unsupported",
+                "structured spawn does not support unattended mode",
+            );
+        }
 
         // #1179: an agent caller, so `route` unless it narrows to `deny`.
         let questions = match Self::admit_questions(&caller, params.questions, params.unattended) {
@@ -271,6 +282,9 @@ impl App {
             let name = params
                 .name
                 .unwrap_or_else(crate::app::worktrees::generated_fork_run_id);
+            if name == "self" {
+                return encode_error(id, "invalid_agent_name", "self is a reserved agent target");
+            }
             match self.structured_target(&name) {
                 Ok(None) => {}
                 Ok(Some((agent, _))) => {

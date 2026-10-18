@@ -20,7 +20,11 @@ checks raw-method exclusion, unexposed argv, disabled spawn, lineage depth,
 capacity, fanout, tracked checkout admission, and the child's framed opening
 turn. It checks additive list/get/status contracts by id and name, PTY contract
 preservation, pane-only refusal, and parent refusal to stop its child. The
-operator stops the owned sessions and server. A success prints a JSON receipt.
+operator stops the child, and the fake parent then invokes the real CLI against
+both that offline child and itself: both resumes must refuse `operator_only`.
+The operator resumes the child with the same native session identity; another
+MCP spawn must still observe the original parent's fanout/capacity accounting.
+The operator stops the owned sessions and server. A success prints a JSON receipt.
 
 Each policy scenario starts a fresh server with its own loaded config.
 Live reload does not apply `[structured]`/`[fleet]` yet (#2043); the `[sessions]`

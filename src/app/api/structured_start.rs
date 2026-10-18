@@ -44,6 +44,23 @@ impl App {
             return Err(ErrorCode::InvalidAgentArgv);
         }
         let existing = self.structured_target(&params.name)?;
+        // ADR-0036 §1a: neither history ownership nor a relay grants resume authority.
+        if (existing.is_some()
+            && (!matches!(caller, SpawnCaller::Operator { .. })
+                || self.current_api_peer_uid.is_none_or(|uid| {
+                    self.runtime_config.uid_policy.classify(uid)
+                        != crate::structured::identity::Principal::Operator
+                })))
+            || self
+                .inbound
+                .edge(
+                    self.current_api_peer_pid,
+                    crate::platform::process_start_time,
+                )
+                .is_some()
+        {
+            return Err(ErrorCode::OperatorOnly);
+        }
         if existing.as_ref().is_some_and(|(id, _)| {
             self.state
                 .structured_agents

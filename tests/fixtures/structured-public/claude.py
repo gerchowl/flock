@@ -63,7 +63,14 @@ if model == "dogfood-parent":
                 request = json.loads(line)
                 if request == "close":
                     break
-                control.sendall((json.dumps(call(request)) + "\n").encode())
+                if isinstance(request, dict) and "fixture_cli" in request:
+                    cli_env = dict(os.environ, FLOCK_SOCKET_PATH=server["env"]["FLOCK_SOCKET_PATH"])
+                    result = subprocess.run([server["command"], "--json", *request["fixture_cli"]],
+                                            env=cli_env, capture_output=True, text=True, timeout=10)
+                    response = {"exit": result.returncode, "response": json.loads(result.stdout)}
+                else:
+                    response = call(request)
+                control.sendall((json.dumps(response) + "\n").encode())
     finally:
         listener.close()
         tool.stdin.close()
@@ -75,6 +82,16 @@ if model == "dogfood-parent":
             raise AssertionError("MCP failed to close")
         tool.stdout.close()
 else:
+    seen = root / f"seen-{session}"
+    if seen.exists():
+        init = json.loads((root / "init.json").read_text())
+        init["session_id"] = session
+        print(json.dumps(init), flush=True)
+        with open(root / "resume-ready", "wb", buffering=0) as ready:
+            ready.write(b"R")
+        sys.stdin.read()
+        sys.exit(0)
+    seen.write_text("first launch")
     line = sys.stdin.readline()
     assert line, "opening turn was never delivered"
     user = json.loads(line)
