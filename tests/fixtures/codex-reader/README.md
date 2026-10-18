@@ -19,7 +19,7 @@ comes from metadata, not an arbitrary first observed number; see the
 Continuity tests replace, truncate, edit, remove or redirect actual files after
 an initial successful read. Equal-length prefix mutation must fail even when the
 file identity is unchanged. A source failure is sticky: later bytes cannot
-silently restore it. File/record budgets fail rather than truncate, and the
+silently restore it. Record budgets fail rather than truncate, and the
 paired reducer's turn budget never evicts IDs. EOF tests advance the supplied
 clock by hours without new records; working and idle remain intact. Partial EOF
 retains exact suffix bytes and complete/read offsets, including an unfinished
@@ -36,10 +36,35 @@ before the positive rerun; no fault-injection hook is part of the product.
 This foundation returns verified appended bytes and immutable checkpoints. It
 checks an opened handle against its still-local primary path before/after each
 read, rehashes the entire consumed prefix, and verifies framing/ordinals before
-returning a batch. `Limits` bounds file bytes, record bytes and the paired
-reducer's remembered turn IDs. Repeated prefix verification has linear work in
-the consumed prefix per check; the file-byte limit bounds that work. Reads may
-hold the file buffer, returned suffix and partial checkpoint concurrently.
+returning a batch. `Limits::work_bytes` now bounds each scan step rather than
+whole-file size. A hash pass can span arbitrarily many steps: hash the consumed
+prefix, compare its digest at the exact prior read offset, then continue the
+same hasher over appended bytes. Each byte is read/hashed once per pass. At EOF
+the next check begins a fresh pass, preserving detection of equal-length edits.
+This intentionally remains O(file size) per complete verification pass, without
+retaining the file. A pass is not an atomic filesystem snapshot: edits behind
+the scan position are detected by the next full pass, as with a concurrent edit
+during an ordinary streaming read. Device/inode checks never replace hashing. A file can grow beyond the work budget without sticky
+capacity failure. No cached digest is trusted solely because file identity matches.
+
+`Update::eof_at == None` means intermediate work, including prefix-only progress;
+it is never a successful empty EOF check. Such steps deliver no unverified
+suffix and leave the previous committed checkpoint unchanged until the prefix
+comparison succeeds. Batches contain at most work_bytes new bytes; framing
+retains at most record_bytes, with bounded JSON/reducer memory. Oversized records
+and exhausted turn-ID capacity still fail explicitly, without eviction. A finite
+history reaches EOF across finite calls; a continuously growing history need not
+be caught up. All scanning APIs require the caller to keep scheduling work.
+Reader supervision, deadlines and scheduling cadence belong to #1857, not to the
+Codex event rate. Bounded bytes do not make kernel filesystem calls nonblocking.
+
+The streaming regressions use 3–17-byte work units for files far larger than a
+unit, assert bounded batch/partial sizes, and sum scanned bytes to show exactly
+one full-file pass for bootstrap, append catch-up and quiet EOF checks. Prefix
+mutation/shrink during verification must fail before appended data is delivered.
+Record overflow and ordinal gaps still fail across chunk boundaries. The real
+neutralized fixture remains unchanged. Partial last-line bytes are delivered
+unvalidated and are not accepted as a complete lifecycle record.
 
 A returned batch is not lifecycle authority. Segment attribution and admission
 before `Binding::finish`, resume/copy validation, ignoring inherited partial
