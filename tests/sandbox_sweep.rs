@@ -69,64 +69,18 @@ impl Probe {
             .collect();
         assert_eq!(records.len(), 1);
         probe.record = Some(serde_json::from_slice(&fs::read(records[0].path()).unwrap()).unwrap());
-        probe.record.as_mut().unwrap().start_time =
-            Some(process_lifetime::birth(probe.record().pid).unwrap());
+        assert_eq!(
+            probe.record().start_time,
+            process_lifetime::birth(probe.record().pid)
+        );
+        assert!(probe.record().start_time.is_some());
         assert!(probe.record().matches(&probe.base));
         assert!(probe.record().binary.starts_with(&probe.base));
         probe
     }
 
     fn line(&mut self, death: &ExitWatch) -> String {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut line = Vec::new();
-        loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .expect("probe stage ceiling");
-            let mut events = [
-                libc::pollfd {
-                    fd: self.stdout.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: death.raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            let result = unsafe {
-                libc::poll(
-                    events.as_mut_ptr(),
-                    2,
-                    remaining.as_millis().min(i32::MAX as u128) as i32,
-                )
-            };
-            assert_ne!(
-                result, 0,
-                "probe stayed alive and silent until the stage ceiling"
-            );
-            assert!(
-                result > 0,
-                "probe poll failed: {}",
-                io::Error::last_os_error()
-            );
-            assert_eq!(
-                events[1].revents, 0,
-                "probe owner died before its expected stage"
-            );
-            let mut byte = [0];
-            assert_eq!(
-                self.stdout.read(&mut byte).unwrap(),
-                1,
-                "probe output ended before its stage"
-            );
-            line.push(byte[0]);
-            assert!(line.len() <= 65536, "unexpected probe output");
-            if byte[0] == b'\n' {
-                return String::from_utf8(line).unwrap();
-            }
-        }
+        stage_line(&mut self.stdout, death)
     }
 
     fn record(&self) -> &ServerRecord {
@@ -141,6 +95,59 @@ impl Probe {
             self.record().matches(&self.base),
             "fixture server must outlive its fake owner"
         );
+    }
+}
+
+fn stage_line(stdout: &mut ChildStdout, death: &ExitWatch) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut line = Vec::new();
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .expect("probe stage ceiling");
+        let mut events = [
+            libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: death.raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let result = unsafe {
+            libc::poll(
+                events.as_mut_ptr(),
+                2,
+                remaining.as_millis().min(i32::MAX as u128) as i32,
+            )
+        };
+        assert_ne!(
+            result, 0,
+            "probe stayed alive and silent until the stage ceiling"
+        );
+        assert!(
+            result > 0,
+            "probe poll failed: {}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(
+            events[1].revents, 0,
+            "probe owner died before its expected stage"
+        );
+        let mut byte = [0];
+        assert_eq!(
+            stdout.read(&mut byte).unwrap(),
+            1,
+            "probe output ended before its stage"
+        );
+        line.push(byte[0]);
+        assert!(line.len() <= 65536, "unexpected probe output");
+        if byte[0] == b'\n' {
+            return String::from_utf8(line).unwrap();
+        }
     }
 }
 
@@ -329,4 +336,201 @@ fn server_argument_in_a_client_command_never_proves_server_identity() {
         "hello".into()
     ]));
     assert!(!sandboxes::server_argv(&["server".into()]));
+}
+
+#[test]
+fn dead_owner_server_is_recovered_after_its_binary_is_replaced() {
+    let mut probe = Probe::start();
+    let exit = ExitWatch::new(probe.record().pid).unwrap();
+    probe.orphan();
+    let old = probe.base.join("old-flk");
+    fs::rename(&probe.record().binary, &old).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_flk"), &probe.record().binary).unwrap();
+    fs::remove_file(old).unwrap();
+    sandboxes::sweep(probe.root.as_ref().unwrap().path());
+    assert!(!probe.base.exists(), "rebuild stranded the recorded server");
+    exit.wait(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn missing_birth_proof_retains_the_sandbox_and_its_server() {
+    let mut probe = Probe::start();
+    probe.orphan();
+    let mut incomplete = probe.record().clone();
+    incomplete.start_time = None;
+    incomplete.write(&probe.base).unwrap();
+    sandboxes::sweep(probe.root.as_ref().unwrap().path());
+    assert!(
+        probe.base.exists(),
+        "missing birth proof authorized cleanup"
+    );
+    assert!(probe.record().matches(&probe.base));
+}
+
+#[test]
+fn runtime_recording_excludes_the_client_candidate() {
+    let probe = Probe::start();
+    let root = SocketDir::reserve("2162");
+    let base = root.path().join(format!(
+        "flock-autodetect-test-{}-client",
+        std::process::id()
+    ));
+    let config = base.join("config");
+    let runtime = base.join("runtime");
+    fs::create_dir_all(&config).unwrap();
+    fs::create_dir(&runtime).unwrap();
+    sandboxes::record_runtime_candidates(
+        &config,
+        &runtime,
+        Some(probe.record().pid),
+        [probe.record().pid],
+    );
+    assert!(
+        !base
+            .join(format!(".server-{}.json", probe.record().pid))
+            .exists(),
+        "client candidate became a durable server record"
+    );
+}
+
+struct SignalChild(Child);
+impl SignalChild {
+    fn start(ignore: bool) -> Self {
+        let code = format!("import os,signal\nsignal.signal(signal.SIGTERM, lambda *_: (os.write(1,b'TERM\\n'), {}))\nos.write(1,b'READY\\n')\nwhile True: signal.pause()\n", if ignore { "None" } else { "os._exit(0)" });
+        let mut fixture = Self(
+            Command::new("python3")
+                .args(["-c", &code])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let death = ExitWatch::new(fixture.0.id()).unwrap();
+        assert_eq!(
+            stage_line(fixture.0.stdout.as_mut().unwrap(), &death),
+            "READY\n"
+        );
+        fixture
+    }
+}
+impl Drop for SignalChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn stop_sends_term_and_allows_graceful_cleanup() {
+    let mut fixture = SignalChild::start(false);
+    let pid = fixture.0.id();
+    let birth = process_lifetime::birth(pid).unwrap();
+    process_lifetime::stop(pid, || process_lifetime::birth(pid) == Some(birth)).unwrap();
+    assert!(
+        fixture.0.wait().unwrap().success(),
+        "server never received graceful TERM"
+    );
+    let mut output = String::new();
+    fixture
+        .0
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(output, "TERM\n");
+}
+
+#[test]
+fn stop_escalates_after_term_and_rechecks_identity() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut fixture = SignalChild::start(true);
+    let mut checks = 0;
+    let pid = fixture.0.id();
+    let birth = process_lifetime::birth(pid).unwrap();
+    process_lifetime::stop(pid, || {
+        checks += 1;
+        process_lifetime::birth(pid) == Some(birth)
+    })
+    .unwrap();
+    assert_eq!(checks, 2, "escalation must recheck identity");
+    assert_eq!(fixture.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    let mut output = String::new();
+    fixture
+        .0
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    assert_eq!(output, "TERM\n");
+}
+
+#[test]
+fn changed_identity_before_escalation_is_not_signalled() {
+    let mut fixture = SignalChild::start(true);
+    let mut checks = 0;
+    let result = process_lifetime::stop(fixture.0.id(), || {
+        checks += 1;
+        checks == 1
+    });
+    assert!(result.is_err(), "identity change did not refuse escalation");
+    assert!(fixture.0.try_wait().unwrap().is_none());
+    assert_eq!(checks, 2);
+}
+
+#[test]
+fn outside_sandbox_server_with_matching_argv_and_birth_is_not_signalled() {
+    let mut probe = Probe::start();
+    let outside = Probe::start();
+    probe.orphan();
+    let mut wrong = outside.record().clone();
+    wrong.home = probe.record().home.clone();
+    wrong.state = probe.record().state.clone();
+    fs::write(
+        probe
+            .base
+            .join(format!(".server-{}.json", probe.record().pid)),
+        serde_json::to_vec(&wrong).unwrap(),
+    )
+    .unwrap();
+    sandboxes::sweep(probe.root.as_ref().unwrap().path());
+    assert!(probe.base.exists());
+    assert!(outside.record().matches(&outside.base));
+    assert!(probe.record().matches(&probe.base));
+}
+
+#[test]
+fn missing_exact_argv_proof_retains_the_server() {
+    let mut probe = Probe::start();
+    probe.orphan();
+    let mut incomplete = probe.record().clone();
+    incomplete.argv.clear();
+    incomplete.write(&probe.base).unwrap();
+    sandboxes::sweep(probe.root.as_ref().unwrap().path());
+    assert!(probe.base.exists());
+    assert!(probe.record().matches(&probe.base));
+}
+
+#[test]
+fn direct_spawn_records_known_launch_argv_before_exec_is_visible() {
+    let fixture = SignalChild::start(true);
+    let root = SocketDir::reserve("2162");
+    let base = root.path().join(format!(
+        "flock-autodetect-test-{}-preexec",
+        std::process::id()
+    ));
+    let config = base.join("config");
+    let runtime = base.join("runtime");
+    fs::create_dir_all(&config).unwrap();
+    fs::create_dir(&runtime).unwrap();
+    // A forked child can still expose inherited argv before exec. This owned
+    // producer supplies different argv deterministically; no signal uses this record.
+    sandboxes::record_spawn(fixture.0.id(), &config, &runtime);
+    let record: ServerRecord = serde_json::from_slice(
+        &fs::read(base.join(format!(".server-{}.json", fixture.0.id()))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record.argv, vec![env!("CARGO_BIN_EXE_flk"), "server"]);
+    assert_eq!(record.binary, PathBuf::from(env!("CARGO_BIN_EXE_flk")));
+    assert_eq!(record.start_time, process_lifetime::birth(fixture.0.id()));
 }

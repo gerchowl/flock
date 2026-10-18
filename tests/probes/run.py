@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Run a TUI probe with an owned, crash-sweepable server and binary copy (#529)."""
 import argparse
+import ctypes
+import ctypes.util
+import sys
 import json
 import os
 from pathlib import Path
@@ -9,6 +12,32 @@ import shutil
 import subprocess
 import tempfile
 import time
+
+
+def process_birth(pid):
+    """Native birth identity matching the Rust sweep, with no executable lookup."""
+    try:
+        if sys.platform == "linux":
+            return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        if sys.platform == "darwin":
+            # Public proc_bsdinfo ABI from the SDK's sys/proc_info.h.
+            class BsdInfo(ctypes.Structure):
+                _fields_ = [("ids", ctypes.c_uint32 * 12), ("names", ctypes.c_char * 48),
+                            ("details", ctypes.c_uint32 * 6), ("seconds", ctypes.c_uint64),
+                            ("micros", ctypes.c_uint64)]
+            library = ctypes.util.find_library("proc")
+            if library is None:
+                return None
+            info = BsdInfo()
+            proc = ctypes.CDLL(library)
+            proc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                         ctypes.c_void_p, ctypes.c_int]
+            size = proc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+            if size == ctypes.sizeof(info) and info.ids[3] == pid and info.seconds:
+                return info.seconds * 1000000 + info.micros
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def main():
@@ -41,7 +70,8 @@ def main():
             (config / "config.toml").write_text("onboarding = false\n")
         server = subprocess.Popen([str(binary), "server"], cwd=base, env=env,
                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        record = dict(pid=server.pid, binary=str(binary), home=env["HOME"], state=env["XDG_STATE_HOME"], start_time=None)
+        record = dict(pid=server.pid, binary=str(binary), home=env["HOME"], state=env["XDG_STATE_HOME"], start_time=process_birth(server.pid),
+                      argv=[str(binary), "server"])
         pending = base / ".server.pending"
         with pending.open("w") as out:
             json.dump(record, out)
