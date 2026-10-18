@@ -168,9 +168,15 @@ impl Workers {
             .filter(|(_, _, g)| *g == current)
             .map(|(r, _, _)| r.clone())
             .ok_or(ErrorCode::AgentNotFound)?;
-        let generation = registry
-            .begin_launch(&agent_id, current)
-            .map_err(|_| ErrorCode::AgentStartFailed)?;
+        let generation =
+            registry
+                .begin_launch(&agent_id, current)
+                .map_err(|error| match error {
+                    super::registry::RegistryError::RecoveryRequired => {
+                        ErrorCode::StructuredRecoveryRequired
+                    }
+                    _ => ErrorCode::AgentStartFailed,
+                })?;
         let (tx, messages) = mpsc::sync_channel(2);
         let stop = StopRequest::default();
         let cancelled = stop.clone();

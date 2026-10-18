@@ -1509,11 +1509,14 @@ impl App {
         use crate::app::terminal_targets::TerminalTargetError;
         let candidates = match &error {
             TerminalTargetError::Ambiguous { candidates, .. } => candidates.clone(),
-            TerminalTargetError::NotFound { .. } => Vec::new(),
+            TerminalTargetError::NotFound { .. }
+            | TerminalTargetError::RuntimeUnsupported { .. } => Vec::new(),
         };
         let ambiguous = matches!(error, TerminalTargetError::Ambiguous { .. });
         MessageTargetError {
-            code: if ambiguous {
+            code: if matches!(error, TerminalTargetError::RuntimeUnsupported { .. }) {
+                crate::api::error_code::ErrorCode::RuntimeUnsupported
+            } else if ambiguous {
                 crate::api::error_code::ErrorCode::MsgTargetAmbiguous
             } else {
                 crate::api::error_code::ErrorCode::MsgTargetNotFound
