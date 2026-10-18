@@ -35,7 +35,8 @@ Queue record size is bounded by the journal's 2 MiB limit. This interface does
 not promise constant total snapshot memory or constant-time append publication.
 
 Each continuation has a four-cut, 256 KiB bound, separate from its initial replay
-cut. Overflow closes explicitly as `lagged`; recover from the last applied cursor,
+cut. Overflow closes explicitly as `lagged` and discards any unread replay
+packet along with queued continuation. Recover from the last applied cursor,
 not from the reported overflow head. Enable the readiness future before paging
 and recheck after waking. Reader pages use their own packet queues and never
 take the shared capture/book lock, avoiding reader-to-reader pending stalls.
