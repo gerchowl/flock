@@ -89,6 +89,10 @@ pub struct StreamRecord {
     /// Retained on disk so replay cannot manufacture a transient human prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_grant_request_id: Option<String>,
+    /// Book-issued permission handle for this stdout request, never copied from
+    /// harness JSON. Older records lack a handle and cannot authorize decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_request_seq: Option<u64>,
     /// Exact line without its LF; synthetic summaries explicitly identify loss.
     pub raw: String,
 }
@@ -110,6 +114,14 @@ impl Received {
             && matches!(self.event, SessionEvent::CanUseTool(_))
         {
             return Some(super::state::Input::Progress);
+        }
+        if let Some(request_seq) = self.record.permission_request_seq {
+            if matches!(self.event, SessionEvent::CanUseTool(_)) {
+                return Some(super::state::Input::PermissionEvent(
+                    &self.event,
+                    request_seq,
+                ));
+            }
         }
         if self.record.origin == RecordOrigin::Flk {
             if let SessionEvent::Unknown { value, .. } = &self.event {
@@ -337,8 +349,9 @@ impl Transport {
         self.input.close_permissions(principal, id, reason)
     }
 
-    /// Open permission ids; contention fails closed rather than claiming no wait.
-    pub fn waiting_on_human(&self) -> Result<Vec<String>, ErrorCode> {
+    /// Open `(request_id, request_seq)` handles; contention fails closed rather
+    /// than claiming no wait. Carry the surfaced pair unchanged into a decide.
+    pub fn waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
         self.input.waiting_on_human()
     }
 
@@ -380,7 +393,7 @@ impl Drop for Transport {
 }
 
 impl InputHandle {
-    pub(super) fn waiting_on_human(&self) -> Result<Vec<String>, ErrorCode> {
+    pub(super) fn waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
         Ok(self
             .permissions
             .try_lock()
@@ -401,17 +414,18 @@ impl InputHandle {
         let bytes = match encode(&answer.response) {
             Ok(bytes) => bytes,
             Err(_) => {
-                book.aborted(&answer.id);
+                book.aborted(&answer.id, answer.request_seq);
                 return Err(ErrorCode::InvalidParams);
             }
         };
         let id = answer.id.clone();
+        let request_seq = answer.request_seq;
         if self
             .decisions
             .try_send(Command::Decide(Control { answer, bytes }))
             .is_err()
         {
-            book.aborted(&id);
+            book.aborted(&id, request_seq);
             return Err(ErrorCode::SessionBusy);
         }
         Ok(())
@@ -769,7 +783,7 @@ fn emit(
     synthetic: bool,
 ) -> io::Result<()> {
     let received = persist(
-        file, seq, line, count, version, busy, uncertain, synthetic, None,
+        file, seq, line, count, version, busy, uncertain, synthetic, None, None,
     )?;
     publish(received, tx, cancel)
 }
@@ -784,6 +798,7 @@ fn persist(
     uncertain: &AtomicBool,
     synthetic: bool,
     grant_request_id: Option<&str>,
+    permission_request_seq: Option<u64>,
 ) -> io::Result<Received> {
     let origin = if synthetic || count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err()
     {
@@ -834,6 +849,7 @@ fn persist(
         origin,
         result_subtype,
         permission_grant_request_id: grant_request_id.map(str::to_owned),
+        permission_request_seq,
         raw,
     };
     let mut encoded = serde_json::to_vec(&record)?;

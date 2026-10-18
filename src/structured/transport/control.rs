@@ -47,6 +47,7 @@ impl<'a> Recorder<'a> {
         count: u64,
         synthetic: bool,
         grant_request_id: Option<&str>,
+        request_seq: Option<u64>,
     ) -> io::Result<Received> {
         persist(
             self.file,
@@ -58,12 +59,13 @@ impl<'a> Recorder<'a> {
             self.uncertain,
             synthetic,
             grant_request_id,
+            request_seq,
         )
     }
     fn audit(&mut self, value: &Value) -> io::Result<Received> {
         let mut raw = encode(value)?;
         raw.pop();
-        self.record(&raw, raw.len() as u64, true, None)
+        self.record(&raw, raw.len() as u64, true, None, None)
     }
     pub fn command(&mut self, command: Command) -> io::Result<()> {
         match command {
@@ -73,7 +75,12 @@ impl<'a> Recorder<'a> {
     }
     fn answer(&mut self, control: Control) -> io::Result<()> {
         // A cancellation reserved before the reader claims this answer wins.
-        if !self.controls.book.lock().begin_answer(&control.answer.id) {
+        if !self
+            .controls
+            .book
+            .lock()
+            .begin_answer(&control.answer.id, control.answer.request_seq)
+        {
             return Ok(());
         }
         let event = self.audit(&control.answer.audit)?;
@@ -88,7 +95,10 @@ impl<'a> Recorder<'a> {
         let mut events = Vec::with_capacity(closings.len());
         for closing in closings {
             events.push(self.audit(&closing.audit)?);
-            self.controls.book.lock().closed(&closing.id);
+            self.controls
+                .book
+                .lock()
+                .closed(&closing.id, closing.request_seq);
         }
         Ok(events)
     }
@@ -110,6 +120,7 @@ impl<'a> Recorder<'a> {
         oversized: bool,
     ) -> io::Result<Admission> {
         let mut book = self.controls.book.lock();
+        book.resume_after(*self.seq);
         let result = if oversized {
             book.oversized(id, request)
                 .map(|(audit, answer)| (audit, Some(answer)))
@@ -126,7 +137,7 @@ impl<'a> Recorder<'a> {
                 refusal: None,
             }),
             Err(ErrorCode::PermissionRequestLimit) => Ok(Admission {
-                refusal: Some(book.capacity_refusal(id)),
+                refusal: Some(book.capacity_refusal(id).map_err(io::Error::other)?),
                 ..Admission::default()
             }),
             Err(code) => Err(io::Error::other(code)),
@@ -147,7 +158,12 @@ impl<'a> Recorder<'a> {
         } else if let Ok(raw) = std::str::from_utf8(line) {
             match SessionEvent::parse(raw, self.version) {
                 SessionEvent::CanUseTool(event) => {
-                    if encode(&permissions::open_record(&event.request_id, &event.request)).is_err()
+                    if encode(&permissions::open_record(
+                        &event.request_id,
+                        u64::MAX,
+                        &event.request,
+                    ))
+                    .is_err()
                     {
                         let (id, request) = metadata
                             .oversized_request(count)?
@@ -209,7 +225,12 @@ impl<'a> Recorder<'a> {
             .as_ref()
             .and_then(|answer| answer.audit.get("grant_request_id"))
             .and_then(Value::as_str);
-        let raw = self.record(line, count, false, grant_request_id)?;
+        let request_seq = admission
+            .open
+            .as_ref()
+            .and_then(|audit| audit.get("request_seq"))
+            .and_then(Value::as_u64);
+        let raw = self.record(line, count, false, grant_request_id, request_seq)?;
         // Persist open before publishing raw: cancellation at either notification
         // must still leave an open record for the terminal close to match.
         let opened = admission
@@ -224,7 +245,10 @@ impl<'a> Recorder<'a> {
         // either notification or the deny reaches the harness.
         let refused = if let Some(answer) = &admission.refusal {
             let event = self.audit(&answer.audit)?;
-            self.controls.book.lock().closed(&answer.id);
+            self.controls
+                .book
+                .lock()
+                .closed(&answer.id, answer.request_seq);
             Some(event)
         } else {
             None
