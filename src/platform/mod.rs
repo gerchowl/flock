@@ -6,6 +6,13 @@
 pub(crate) mod peer;
 pub(crate) mod structured;
 
+/// A same-device observation is only a possible unmounted-mount hint, not proof.
+pub(crate) fn same_device_as_parent(path: &std::path::Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = path.parent()?;
+    Some(std::fs::metadata(path).ok()?.dev() == std::fs::metadata(parent).ok()?.dev())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
     pub pid: u32,

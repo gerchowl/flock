@@ -53,7 +53,7 @@ pub struct WorktreeBranchDeleteResult {
 pub struct WorktreeRemoveResult {
     pub workspace_id: String,
     pub path: std::path::PathBuf,
-    pub result: Result<(), String>,
+    pub result: Result<(), crate::worktree::WorktreeRemoveFailure>,
     /// Processes whose cwd was inside the checkout when the removal started
     /// (#400). Captured up front because that is the last moment the kernel
     /// can answer the question; whichever of these outlive the teardown are
@@ -66,7 +66,7 @@ pub struct WorktreeRemoveResult {
 /// for merged rows, the branch) was removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeKillAllResult {
-    pub outcomes: Vec<(String, Result<(), String>)>,
+    pub outcomes: Vec<(String, Result<(), crate::worktree::WorktreeRemoveFailure>)>,
     /// Rows whose removal git refused first and the sweep cleared by forcing
     /// (#402). Separate from `outcomes` because a recovered row is still an
     /// `Ok`, and an `Ok` that quietly cost a `--force` is exactly what the

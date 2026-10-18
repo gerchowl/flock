@@ -576,6 +576,7 @@ fn worktree_remove(args: &[String]) -> std::io::Result<i32> {
 fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
     let mut workspace_id = None;
     let mut path = None;
+    let mut repo = None;
     let mut dry_run = false;
     let mut force = false;
     let mut keep_branch = false;
@@ -598,6 +599,14 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
                     return Ok(2);
                 };
                 path = Some(normalize_path_arg(value)?);
+                index += 2;
+            }
+            "--repo" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --repo");
+                    return Ok(super::exit::USAGE);
+                };
+                repo = Some(normalize_path_arg(value)?);
                 index += 2;
             }
             "--dry-run" => {
@@ -626,9 +635,9 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
-    if workspace_id.is_some() == path.is_some() {
+    if workspace_id.is_some() == path.is_some() || (repo.is_some() && path.is_none()) {
         eprintln!(
-            "usage: flk worktree kill (--workspace ID | --path PATH) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]"
+            "usage: flk worktree kill (--workspace ID | --path PATH [--repo REPO]) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]"
         );
         return Ok(2);
     }
@@ -642,6 +651,7 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
         method: Method::WorktreeKill(WorktreeKillParams {
             workspace_id,
             path,
+            repo,
             force,
             keep_branch,
             dry_run,
@@ -692,6 +702,9 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
 /// remedy for the same refusal.
 pub(super) fn kill_error_exit_code(error: &serde_json::Value) -> i32 {
     match error.get("code").and_then(|v| v.as_str()).unwrap_or("") {
+        code @ ("worktree_checkout_unreachable"
+        | "worktree_repository_unreachable"
+        | "worktree_path_not_root") => super::error_code_exit(code, false),
         "not_linked_worktree" | "workspace_not_found" => super::exit::WORKTREE_NOT_LINKED,
         // The retryable class: the same call with --force clears it.
         "dirty_worktree_requires_force" | "submodule_worktree_requires_force" => {
@@ -777,7 +790,7 @@ fn print_worktree_help() {
     );
     eprintln!("  flk worktree remove --workspace ID [--force] [--json]");
     eprintln!(
-        "  flk worktree kill (--workspace ID | --path PATH) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]"
+        "  flk worktree kill (--workspace ID | --path PATH [--repo REPO]) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]"
     );
     eprintln!("  flk worktree quarantine-list");
     eprintln!("  flk worktree unquarantine <quarantined-path> <destination>");
@@ -902,5 +915,18 @@ mod tests {
             "is_linked_worktree": true,
         }));
         assert_eq!(row.branch, "(detached)");
+    }
+    #[test]
+    fn unreachable_checkout_kill_exit_requires_recovery_not_force() {
+        for code in [
+            "worktree_checkout_unreachable",
+            "worktree_repository_unreachable",
+            "worktree_path_not_root",
+        ] {
+            assert_eq!(
+                super::kill_error_exit_code(&serde_json::json!({"code":code})),
+                crate::cli::exit::REFUSED
+            );
+        }
     }
 }

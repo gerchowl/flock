@@ -31,7 +31,7 @@ const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 
 pub struct ServerHandle {
-    _thread: std::thread::JoinHandle<()>,
+    _thread: Option<std::thread::JoinHandle<()>>,
     path: PathBuf,
     pub(crate) node_id: Option<String>,
     pub(crate) clone_detection_warning: Option<String>,
@@ -52,6 +52,23 @@ impl Drop for ServerHandle {
 }
 
 impl ServerHandle {
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        // A listener that already observed shutdown may have closed before wakeup.
+        drop(UnixStream::connect(&self.path));
+        let thread = self._thread.take().expect("owned accept thread");
+        let (finished, completion) = std::sync::mpsc::sync_channel(1);
+        let joiner = std::thread::spawn(move || {
+            let _ = finished.send(thread.join());
+        });
+        completion
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bounded fixture listener shutdown")
+            .unwrap();
+        joiner.join().unwrap();
+    }
+
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
         remove_socket_file_if_owned(&self.path, self.identity)
     }
@@ -142,7 +159,7 @@ pub(crate) fn start_server_with_capabilities(
     });
 
     Ok(ServerHandle {
-        _thread: thread,
+        _thread: Some(thread),
         node_id,
         clone_detection_warning,
         path,
