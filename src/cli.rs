@@ -187,6 +187,9 @@ fn run(args: &[String]) -> std::io::Result<CommandOutcome> {
         }
     }
     match outcome {
+        Err(error) if outcome_unknown(&error).is_some() => {
+            Ok(CommandOutcome::Handled(exit::REQUEST_OUTCOME_UNKNOWN))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
             let code = output::failure(
                 crate::api::error_code::ErrorCode::Timeout,
@@ -1220,8 +1223,23 @@ fn send_ok_request_for(method: Method, send_like: bool) -> std::io::Result<i32> 
 
 pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Value> {
     ApiClient::local()
+        .with_class(crate::api::client::RequestClass::for_method(
+            &request.method,
+        ))
         .request_value(request)
         .map_err(api_client_error_to_io)
+}
+
+/// Preserve the typed post-dispatch refusal even in verbs with custom outcomes.
+fn outcome_unknown(error: &std::io::Error) -> Option<i32> {
+    error
+        .get_ref()?
+        .downcast_ref::<crate::api::deadline::RequestOutcomeUnknown>()?;
+    Some(output::failure(
+        crate::api::error_code::ErrorCode::RequestOutcomeUnknown,
+        &error.to_string(),
+        exit::REQUEST_OUTCOME_UNKNOWN,
+    ))
 }
 
 fn api_timeout_error(err: &std::io::Error) -> bool {

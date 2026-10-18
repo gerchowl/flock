@@ -1,4 +1,5 @@
 //! One monotonic deadline for a CLI socket exchange (ADR-0029 §2, #921).
+use super::client::RequestClass;
 use super::schema::{Method, Request, MSG_WAIT_REPLY_MAX_MS};
 use std::{
     fmt,
@@ -15,6 +16,13 @@ pub(crate) const OPERATION_MARGIN: Duration = Duration::from_secs(5);
 /// Finite cap for a wait or event stream whose caller supplied no timeout.
 pub(crate) const MAX_WAIT: Duration = Duration::from_millis(MSG_WAIT_REPLY_MAX_MS);
 
+/// Reject durations that the monotonic clock cannot represent.
+pub(crate) fn end_after(started: Instant, timeout: Duration) -> io::Result<Instant> {
+    started
+        .checked_add(timeout)
+        .ok_or_else(|| io::ErrorKind::InvalidInput.into())
+}
+
 /// Select the operation's finite wait, plus transport margin, without truncating
 /// a requested long poll. Invalid parameters are left for server validation.
 pub(crate) fn request_timeout(request: &Request, ordinary: Duration) -> Duration {
@@ -29,7 +37,6 @@ pub(crate) fn request_timeout(request: &Request, ordinary: Duration) -> Duration
         }
         Method::EventsWait(p) => Some(p.timeout_ms.map(Duration::from_millis).unwrap_or(MAX_WAIT)),
         Method::EventsRead(p) => Some(Duration::from_millis(p.wait_ms.unwrap_or(0))),
-        Method::WaitPark(p) => Some(Duration::from_millis(p.deadline_ms)),
         _ => serde_json::to_value(request)
             .ok()
             .and_then(|v| v["params"]["write_timeout_ms"].as_u64())
@@ -40,8 +47,7 @@ pub(crate) fn request_timeout(request: &Request, ordinary: Duration) -> Duration
     })
 }
 
-/// Typed transport expiry. A mutation may already have reached the server:
-/// inspect its outcome before repeating it. The CLI reports exit TIMEOUT.
+/// Safely retryable transport expiry: no dispatch, or a declared read/idempotent call.
 #[derive(Debug)]
 pub(crate) struct SocketTimeout {
     pub(crate) socket: PathBuf,
@@ -59,6 +65,21 @@ impl fmt::Display for SocketTimeout {
 }
 impl std::error::Error for SocketTimeout {}
 
+/// A mutation accepted bytes but supplied no reply before its deadline.
+/// Never retry automatically: inspect server state first (ADR-0029 §2).
+#[derive(Debug)]
+pub(crate) struct RequestOutcomeUnknown(pub(crate) SocketTimeout);
+impl fmt::Display for RequestOutcomeUnknown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}; operation may have been applied; inspect before retrying",
+            self.0
+        )
+    }
+}
+impl std::error::Error for RequestOutcomeUnknown {}
+
 /// A socket whose connect, writes and reads consume one deadline. Retrying a
 /// read preserves partial JSON bytes and never resends a mutation. EAGAIN,
 /// EINTR and kernel timeout reports retry only while time remains.
@@ -67,16 +88,17 @@ pub(crate) struct DeadlineStream {
     socket: PathBuf,
     started: Instant,
     deadline: Instant,
+    class: RequestClass,
+    dispatched: bool,
 }
 impl DeadlineStream {
-    pub(crate) fn connect(socket: &Path, timeout: Duration) -> io::Result<Self> {
+    pub(crate) fn connect(
+        socket: &Path,
+        timeout: Duration,
+        class: RequestClass,
+    ) -> io::Result<Self> {
         let started = Instant::now();
-        let deadline = started.checked_add(timeout).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "socket deadline exceeds monotonic clock range",
-            )
-        })?;
+        let deadline = end_after(started, timeout)?;
         let stream = crate::platform::socket_deadline::connect(socket, deadline).map_err(|e| {
             if e.kind() == io::ErrorKind::TimedOut {
                 Self::timeout_at(socket, started)
@@ -89,35 +111,32 @@ impl DeadlineStream {
             socket: socket.to_owned(),
             started,
             deadline,
+            class,
+            dispatched: false,
         })
     }
-    /// Start a new bounded event wait after its acknowledgement or previous event.
-    pub(crate) fn set_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        self.started = Instant::now();
-        self.deadline = self
-            .started
-            .checked_add(timeout.unwrap_or(MAX_WAIT))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "socket deadline exceeds monotonic clock range",
-                )
-            })?;
-        Ok(())
-    }
     pub(crate) fn timeout_at(socket: &Path, started: Instant) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            SocketTimeout {
-                socket: socket.to_owned(),
-                elapsed: started.elapsed(),
-            },
-        )
+        Self::expiry(socket, started, false)
+    }
+    fn expiry(socket: &Path, started: Instant, unknown: bool) -> io::Error {
+        let timeout = SocketTimeout {
+            socket: socket.to_owned(),
+            elapsed: started.elapsed(),
+        };
+        if unknown {
+            io::Error::other(RequestOutcomeUnknown(timeout))
+        } else {
+            io::Error::new(io::ErrorKind::TimedOut, timeout)
+        }
     }
     fn remaining(&self) -> io::Result<Duration> {
         let left = self.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            Err(Self::timeout_at(&self.socket, self.started))
+            Err(Self::expiry(
+                &self.socket,
+                self.started,
+                self.dispatched && self.class == RequestClass::Mutating,
+            ))
         } else {
             Ok(left)
         }
@@ -145,7 +164,12 @@ impl DeadlineStream {
                 {
                     continue
                 }
-                result => return result,
+                result => {
+                    if !read && matches!(result, Ok(n) if n > 0) {
+                        self.dispatched = true;
+                    }
+                    return result;
+                }
             }
         }
     }

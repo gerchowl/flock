@@ -1,7 +1,6 @@
 use super::deadline::{self, DeadlineStream};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
-#[cfg(test)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -39,10 +38,34 @@ impl ConnectionTarget {
     }
 }
 
+/// Caller-declared dispatch semantics (ADR-0029 §2). Unclassified calls mutate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RequestClass {
+    /// The server may change state, so an unanswered dispatch cannot be retried.
+    #[default]
+    Mutating,
+    /// Repeating this operation cannot apply an effect twice.
+    ReadOrIdempotent,
+}
+impl RequestClass {
+    /// Explicit CLI allowlist. Consuming reads and new methods remain mutating.
+    pub(crate) fn for_method(method: &Method) -> Self {
+        match method {
+            method if method.is_retry_safe() => Self::ReadOrIdempotent,
+            Method::MsgWaitReply(_)
+            | Method::PaneWaitForOutput(_)
+            | Method::EventsWait(_)
+            | Method::EventsRead(_) => Self::ReadOrIdempotent,
+            _ => Self::Mutating,
+        }
+    }
+}
+
 /// Reusable client for Flock's newline-delimited JSON API.
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     target: ConnectionTarget,
+    class: RequestClass,
 }
 
 impl ApiClient {
@@ -51,7 +74,18 @@ impl ApiClient {
     }
 
     pub fn for_target(target: ConnectionTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            class: RequestClass::default(),
+        }
+    }
+
+    /// Declare the semantics of requests sent by this client. The default is mutating.
+    pub fn with_class(&self, class: RequestClass) -> Self {
+        Self {
+            target: self.target.clone(),
+            class,
+        }
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -65,12 +99,7 @@ impl ApiClient {
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
         let timeout = deadline::request_timeout(request, deadline::REQUEST_TIMEOUT);
-        let end = Instant::now().checked_add(timeout).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "socket deadline exceeds monotonic clock range",
-            )
-        })?;
+        let end = deadline::end_after(Instant::now(), timeout)?;
         self.request_value_retrying(request, timeout, Some(end))
     }
 
@@ -131,13 +160,11 @@ impl ApiClient {
             };
             let retry = retries < TRANSIENT_RETRIES
                 && failure.is_transient()
-                && (failure.before_send() || request.method.is_retry_safe())
+                && (failure.before_send()
+                    || (self.class == RequestClass::ReadOrIdempotent
+                        && request.method.is_retry_safe()))
                 && deadline.is_none_or(|deadline| Instant::now() + backoff < deadline);
             if !retry {
-                if matches!(failure.error(), ApiClientError::Io(e) if e.kind() == io::ErrorKind::TimedOut)
-                {
-                    return Err(DeadlineStream::timeout_at(&self.socket_path(), started).into());
-                }
                 return Err(failure.into_error());
             }
             tracing::debug!(
@@ -159,7 +186,7 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, Attempt> {
-        let mut stream = DeadlineStream::connect(&self.socket_path(), timeout)
+        let mut stream = DeadlineStream::connect(&self.socket_path(), timeout, self.class)
             .map_err(|err| Attempt::BeforeSend(err.into()))?;
         write_request(&mut stream, request).map_err(Attempt::AfterSend)?;
 
@@ -168,7 +195,7 @@ impl ApiClient {
         if matches!(request.method, Method::Ping(_)) {
             super::compatibility::observe_ping(self, &response);
         } else {
-            super::compatibility::normalize(self, &mut response).map_err(Attempt::AfterSend)?;
+            super::compatibility::normalize(self, &mut response);
         }
         Ok(response)
     }
@@ -193,21 +220,23 @@ impl ApiClient {
         request: &Request,
         read_timeout: Option<Duration>,
     ) -> Result<(serde_json::Value, EventStream), ApiClientError> {
-        let mut stream = DeadlineStream::connect(&self.socket_path(), deadline::REQUEST_TIMEOUT)?;
+        let mut stream = UnixStream::connect(self.socket_path())?;
+        stream.set_read_timeout(read_timeout)?;
         write_request(&mut stream, request)?;
 
         let mut reader = BufReader::new(stream);
         let mut ack = read_json_line(&mut reader)?;
-        super::compatibility::normalize(self, &mut ack)?;
-        reader.get_mut().set_timeout(read_timeout)?;
+        super::compatibility::normalize(self, &mut ack);
         Ok((ack, EventStream { reader }))
     }
 
     pub fn status(&self) -> Result<crate::api::RuntimeStatus, ApiClientError> {
-        let response = self.request(Request {
-            id: "api-client:status".into(),
-            method: Method::Ping(PingParams::default()),
-        })?;
+        let response = self
+            .with_class(RequestClass::ReadOrIdempotent)
+            .request(Request {
+                id: "api-client:status".into(),
+                method: Method::Ping(PingParams::default()),
+            })?;
         match response.result {
             ResponseResult::Pong {
                 version,
@@ -240,8 +269,9 @@ impl ApiClient {
             id: "api-client:preview-protocol".into(),
             method: Method::Ping(PingParams::default()),
         };
-        let response =
-            self.request_value_with_timeout(&ping, timeout.unwrap_or(Duration::from_secs(5)))?;
+        let response = self
+            .with_class(RequestClass::ReadOrIdempotent)
+            .request_value_with_timeout(&ping, timeout.unwrap_or(Duration::from_secs(5)))?;
         let protocol = response
             .pointer("/result/protocol")
             .and_then(serde_json::Value::as_u64);
@@ -296,20 +326,12 @@ impl Attempt {
 }
 
 pub struct EventStream {
-    reader: BufReader<DeadlineStream>,
+    reader: BufReader<UnixStream>,
 }
 
 impl EventStream {
-    /// Re-arm the per-read timeout mid-stream.
-    ///
-    /// `subscribe_value` sets the timeout once, which is enough for a wait
-    /// that returns on the first event. A wait that has to READ PAST events
-    /// it does not want — a readiness wait sees every status and title change
-    /// on the pane — would otherwise get the full timeout again on each one,
-    /// so a chatty pane could stretch a bounded wait indefinitely. Callers
-    /// that loop re-arm this with whatever is left of their own deadline.
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        self.reader.get_mut().set_timeout(timeout)
+        self.reader.get_mut().set_read_timeout(timeout)
     }
 
     pub fn next_value(&mut self) -> Result<Option<serde_json::Value>, ApiClientError> {
@@ -429,7 +451,8 @@ mod tests {
             listener.set_nonblocking(true).unwrap();
             listener
         });
-        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
         let request = Request {
             id: "preview".into(),
             method: Method::WorktreeCreate(crate::api::schema::WorktreeCreateParams {
@@ -486,7 +509,8 @@ mod tests {
             )
             .unwrap();
         });
-        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
         let response = client
             .request_value(&Request {
                 id: "preview".into(),
@@ -529,7 +553,8 @@ mod tests {
                 .unwrap();
             }
         });
-        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
         let response = client
             .request_value(&Request {
                 id: "read".into(),
@@ -610,7 +635,8 @@ mod tests {
     #[test]
     fn a_read_is_retried_through_eagain_until_it_is_answered() {
         let (path, server) = stalling_server("read", 2, 3);
-        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
         let response = client
             .request_value_retrying(&agent_get(), ATTEMPT, None)
             .expect("the third attempt is answered");
@@ -625,7 +651,8 @@ mod tests {
     #[test]
     fn a_write_that_timed_out_is_not_sent_again() {
         let (path, server) = stalling_server("write", 1, 1);
-        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
         let close = Request {
             id: "f910".into(),
             method: Method::PaneClose(crate::api::schema::PaneTarget {
@@ -633,11 +660,12 @@ mod tests {
             }),
         };
         let error = client
+            .with_class(RequestClass::Mutating)
             .request_value_retrying(&close, ATTEMPT, None)
             .unwrap_err();
         assert!(
-            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::TimedOut),
-            "the timeout is reported as it happened: {error:?}"
+            matches!(&error, ApiClientError::Io(err) if err.get_ref().is_some_and(|e| e.is::<deadline::RequestOutcomeUnknown>())),
+            "a dispatched mutation has an unknown outcome: {error:?}"
         );
         let (listener, seen, _held) = server.join().unwrap();
         assert_eq!(seen, vec![close]);
@@ -649,7 +677,8 @@ mod tests {
     fn a_read_that_never_answers_gives_up_after_the_retries() {
         let attempts = TRANSIENT_RETRIES as usize + 1;
         let (path, server) = stalling_server("never", attempts, attempts);
-        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
         let error = client
             .request_value_retrying(&agent_get(), ATTEMPT, None)
             .unwrap_err();
@@ -666,7 +695,8 @@ mod tests {
     #[test]
     fn no_retry_starts_that_the_deadline_cannot_hold() {
         let (path, server) = stalling_server("deadline", 1, 1);
-        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
         // One 50 ms attempt fits; the 100 ms backoff after it does not.
         let deadline = Instant::now() + Duration::from_millis(120);
         let error = client
@@ -711,7 +741,8 @@ mod tests {
     #[test]
     fn socket_path_target_uses_explicit_path() {
         let path = PathBuf::from("/tmp/flock-test.sock");
-        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
         assert_eq!(client.socket_path(), path);
     }
     #[test]

@@ -1423,6 +1423,7 @@ impl PinnedRequests for SocketRequests<'_> {
         timeout: Duration,
     ) -> Result<serde_json::Value, Unanswered> {
         self.client
+            .with_class(crate::api::client::RequestClass::ReadOrIdempotent)
             .request_value_with_timeout(
                 &Request {
                     id: "cli:settled:agent-get".into(),
@@ -1441,6 +1442,7 @@ impl PinnedRequests for SocketRequests<'_> {
         timeout: Duration,
     ) -> Result<serde_json::Value, Unanswered> {
         self.client
+            .with_class(crate::api::client::RequestClass::ReadOrIdempotent)
             .request_value_with_timeout(
                 &Request {
                     id: "cli:settled:pane-get".into(),
@@ -1468,6 +1470,7 @@ impl PinnedRequests for SocketRequests<'_> {
         // before it and costs a second round trip.
         let wait_ms = u64::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u64::MAX);
         self.client
+            .with_class(crate::api::client::RequestClass::ReadOrIdempotent)
             .request_value_with_timeout(
                 &Request {
                     id: "cli:settled:events-read".into(),

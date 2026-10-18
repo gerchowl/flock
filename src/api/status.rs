@@ -33,6 +33,7 @@ pub fn read_runtime_status_at(
         method: Method::Ping(crate::api::schema::PingParams::default()),
     };
     let response = client
+        .with_class(crate::api::client::RequestClass::ReadOrIdempotent)
         .request_value_retrying(&request, timeout, Some(std::time::Instant::now() + timeout))
         .and_then(crate::api::client::parse_response_value);
     let response = match response {

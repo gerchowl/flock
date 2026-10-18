@@ -7,7 +7,34 @@ Flock’s CLI talks to the running server over the same local socket API used by
 
 Most commands print JSON responses. Use them from scripts when you want deterministic automation.
 
-When an existing status ping, submission guard, or failed command reveals a different server protocol, the CLI prints one warning to stderr per invocation. Read-only commands add no status probe; a state-changing command adds one ping per invocation, cached for the rest of it (see below). Unknown-method errors from older-protocol servers become `server_version_gap`, with the server version, protocol, required client protocol, and recovery command: `flk server live-handoff` (or restart the server). Surfaced failures return **exit code 78**; optional lookups that consume the error preserve the command's successful exit. Equal or newer protocols retain the original API error. Every state-changing command (`delegate start` and `send`, `agent start`, `restart` and `send`, `pane send-*` and `submit`, `worktree create`, `msg send` and `reply`, and the rest) checks the server protocol before its first state-changing request and refuses an older server with `server flk X (protocol N) is incompatible with client flk Y (protocol M)` and exit 78, so nothing is half-created. That check costs one ping per invocation. Read-only commands, `flk status` and `flk server` (including `live-handoff` and `stop`) still reach an older server, since handing it off is the fix. Diagnosis probes have a 500 ms timeout and reuse a server identity already obtained during the invocation. An unavailable probe leaves the original error intact. MCP tools return the same skew message with `error.data.refusal: "server_version_gap"`.
+When an existing status ping, submission guard, or failed command reveals a different server protocol, the CLI prints one warning to stderr per invocation. Read-only commands add no status probe; a state-changing command adds one ping per invocation, cached for the rest of it (see below). Unknown-method errors from older-protocol servers become `server_version_gap`, with the server version, protocol, required client protocol, and recovery command: `flk server live-handoff` (or restart the server). Surfaced failures return **exit code 78**; optional lookups that consume the error preserve the command's successful exit. Equal or newer protocols retain the original API error. Every state-changing command (`delegate start` and `send`, `agent start`, `restart` and `send`, `pane send-*` and `submit`, `worktree create`, `msg send` and `reply`, and the rest) checks the server protocol before its first state-changing request and refuses an older server with `server flk X (protocol N) is incompatible with client flk Y (protocol M)` and exit 78, so nothing is half-created. That check costs one ping per invocation. Read-only commands, `flk status` and `flk server` (including `live-handoff` and `stop`) still reach an older server, since handing it off is the fix. Diagnosis probes have a 500 ms timeout and reuse a server identity already obtained during the invocation. An unavailable probe leaves the original error intact; an expired probe reports a typed timeout before a mutation is dispatched. MCP tools return the same skew message with `error.data.refusal: "server_version_gap"`.
+
+## Socket deadlines
+
+Ordinary API exchanges have a 10-second monotonic deadline covering connect,
+write and reply, including partial replies and transient `EAGAIN`/`EINTR` reads.
+`flk status` uses its status-ping cap; compatibility probes use 500 ms.
+A listening server that stops replying reports a timeout, not “server not running”.
+Errors name the socket and elapsed time.
+
+Blocking output/reply/event waits and long polls use at least their requested
+operation timeout plus a fixed 5-second transport margin, rather than the
+ordinary cap. An omitted output/reply/event wait timeout has a finite 24-hour
+transport cap plus that margin. Explicit caller deadlines can be shorter.
+Guarded writes similarly reserve their declared write budget plus the margin.
+
+A timeout before dispatch, or on an explicitly read-only/idempotent request,
+returns `timeout`, exit **124** (`retry: yes`). After a mutation has written any
+bytes, expiry instead returns `request_outcome_unknown`, exit **14**
+(`retry: after_inspecting`): the operation may have been applied. Inspect server
+state before repeating it. These mutations are never automatically resent.
+Unclassified API calls default to mutating; callers must declare safe reads.
+
+This covers the shared request client and ordinary CLI send path. Peer relay
+and subscription lifecycle deadlines follow in
+[#2180](https://github.com/gerchowl/flock/issues/2180); session, update and
+standalone probe paths and their typed exit propagation follow in
+[#2181](https://github.com/gerchowl/flock/issues/2181).
 
 ## Exit codes
 

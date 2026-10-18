@@ -88,14 +88,16 @@ fn cached(path: &Path) -> Option<Option<ServerVersion>> {
 pub(super) fn probe(
     client: &ApiClient,
 ) -> Result<Option<ServerVersion>, super::client::ApiClientError> {
-    let response = client.request_value_retrying(
-        &Request {
-            id: "api:compatibility".into(),
-            method: Method::Ping(PingParams::default()),
-        },
-        Duration::from_millis(500),
-        Some(std::time::Instant::now() + Duration::from_millis(500)),
-    )?;
+    let response = client
+        .with_class(crate::api::client::RequestClass::ReadOrIdempotent)
+        .request_value_retrying(
+            &Request {
+                id: "api:compatibility".into(),
+                method: Method::Ping(PingParams::default()),
+            },
+            Duration::from_millis(500),
+            Some(std::time::Instant::now() + Duration::from_millis(500)),
+        )?;
     Ok(parse_ping(&response))
 }
 
@@ -112,12 +114,9 @@ pub fn is_capability_failure(reason: &str) -> bool {
         || reason.contains("method not found")
 }
 
-pub fn normalize(
-    client: &ApiClient,
-    response: &mut Value,
-) -> Result<(), super::client::ApiClientError> {
+pub fn normalize(client: &ApiClient, response: &mut Value) {
     let Some(error) = response.get("error") else {
-        return Ok(());
+        return;
     };
     if !matches!(
         error["code"].as_str(),
@@ -125,20 +124,19 @@ pub fn normalize(
     ) && error["code"].as_i64() != Some(-32601)
         && !is_capability_failure(error["message"].as_str().unwrap_or_default())
     {
-        return Ok(());
+        return;
     }
     let path = client.socket_path();
-    let server = server_version_result(client)?;
-    let Some(server) = server else { return Ok(()) };
+    let server = server_version(client);
+    let Some(server) = server else { return };
     if server.protocol >= crate::protocol::PROTOCOL_VERSION {
-        return Ok(());
+        return;
     }
     response["error"] = serde_json::json!({
         "code": ERROR_CODE,
         "message": server.message(),
     });
     record_failure(&path, &server);
-    Ok(())
 }
 
 fn record_failure(path: &Path, server: &ServerVersion) {
@@ -160,7 +158,8 @@ fn record_failure(path: &Path, server: &ServerVersion) {
 /// and the refusal lands before anything is allocated. Only a CLI invocation
 /// that asked for the gate is checked: `flk server` and `flk status` must keep
 /// reaching an older server, since handing it off is the fix, and a server
-/// whose version cannot be read is let through to fail as it would have.
+/// whose version cannot be read is let through to fail as it would have,
+/// except that a transport deadline is surfaced before dispatching a mutation.
 pub fn refuse_skew(
     client: &ApiClient,
     request: &Request,
@@ -197,7 +196,16 @@ fn server_version_result(
     if let Some(server) = cached(&path) {
         return Ok(server);
     }
-    let server = probe(client)?;
+    let server = match probe(client) {
+        Err(super::client::ApiClientError::Io(error))
+            if error.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            return Err(error.into());
+        }
+        // Optional version diagnosis keeps the original error without evidence
+        // of skew. A deadline, unlike unavailable evidence, must remain visible.
+        result => result.ok().flatten(),
+    };
     INVOCATION.with_borrow_mut(|state| {
         if state.target.as_ref() == Some(&path) {
             state.probed = true;

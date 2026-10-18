@@ -2,7 +2,7 @@
 //! owned peer before joining the client, including the pre-deadline control.
 use super::*;
 use crate::{
-    api::deadline::{SocketTimeout, OPERATION_MARGIN, REQUEST_TIMEOUT},
+    api::deadline::{RequestOutcomeUnknown, SocketTimeout, OPERATION_MARGIN, REQUEST_TIMEOUT},
     test_support::TempDir,
 };
 use std::thread;
@@ -38,7 +38,7 @@ fn typed_timeout(error: &io::Error, path: &std::path::Path) {
     assert!(error.to_string().contains(&path.display().to_string()));
 }
 
-async fn wedged(call: impl FnOnce(ApiClient) -> io::Result<()> + Send + 'static) {
+async fn wedged(unknown: bool, call: impl FnOnce(ApiClient) -> io::Result<()> + Send + 'static) {
     let root = TempDir::socket();
     let path = root.path().join("api");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -74,23 +74,47 @@ async fn wedged(call: impl FnOnce(ApiClient) -> io::Result<()> + Send + 'static)
     };
     worker.join().unwrap();
     assert!(on_time, "request exceeded its bounded harness: {result:?}");
-    typed_timeout(&result.unwrap_err(), &path);
+    let error = result.unwrap_err();
+    if unknown {
+        let outcome = error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<RequestOutcomeUnknown>())
+            .expect("default mutating classification");
+        assert_eq!(outcome.0.socket, path);
+        assert!(error.to_string().contains("may have been applied"));
+    } else {
+        typed_timeout(&error, &path);
+    }
 }
 
 #[tokio::test]
 async fn request_value_times_out_on_a_real_wedged_server() {
-    wedged(|client| client.request_value(&ping()).map(|_| ()).map_err(io_error)).await;
+    wedged(false, |client| {
+        client
+            .with_class(RequestClass::ReadOrIdempotent)
+            .request_value(&ping())
+            .map(|_| ())
+            .map_err(io_error)
+    })
+    .await;
+    // Even a read-shaped method is conservative without a caller declaration.
+    wedged(true, |client| {
+        client.request_value(&ping()).map(|_| ()).map_err(io_error)
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn status_ping_times_out_instead_of_reporting_server_not_running() {
-    wedged(|client| crate::api::read_runtime_status_at(&client.socket_path(), SHORT).map(|_| ()))
-        .await;
+    wedged(false, |client| {
+        crate::api::read_runtime_status_at(&client.socket_path(), SHORT).map(|_| ())
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn compatibility_probe_reports_a_typed_timeout() {
-    wedged(|client| {
+    wedged(false, |client| {
         crate::api::compatibility::probe(&client)
             .map(|_| ())
             .map_err(io_error)
@@ -98,12 +122,11 @@ async fn compatibility_probe_reports_a_typed_timeout() {
     .await;
 }
 
-#[tokio::test]
-async fn a_long_poll_outlasts_the_ordinary_request_cap() {
+async fn long_poll(reply: bool) {
     let root = TempDir::socket();
     let path = root.path().join("poll");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
-    let client = ApiClient::for_target(ConnectionTarget::SocketPath(path));
+    let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
     let hold = REQUEST_TIMEOUT + SHORT;
     let request = Request {
         id: "poll".into(),
@@ -118,7 +141,11 @@ async fn a_long_poll_outlasts_the_ordinary_request_cap() {
     );
     let (send, mut receive) = oneshot::channel();
     let worker = thread::spawn(move || {
-        let _ = send.send(client.request_value(&request));
+        let _ = send.send(
+            client
+                .with_class(RequestClass::ReadOrIdempotent)
+                .request_value(&request),
+        );
     });
     let (peer, _) = tokio::time::timeout(FINISH_CAP, listener.accept())
         .await
@@ -132,6 +159,35 @@ async fn a_long_poll_outlasts_the_ordinary_request_cap() {
         .unwrap();
     let sent: Request = serde_json::from_str(&line).unwrap();
     assert!(matches!(sent.method, Method::EventsRead(_)));
+    if !reply {
+        let completion = tokio::time::timeout(hold + OPERATION_MARGIN * 2, &mut receive).await;
+        drop(peer);
+        let on_time = completion.is_ok();
+        let result = match completion {
+            Ok(result) => result.unwrap(),
+            Err(_) => tokio::time::timeout(FINISH_CAP, receive)
+                .await
+                .expect("closing the peer must release the long poll")
+                .unwrap(),
+        };
+        worker.join().unwrap();
+        assert!(
+            on_time,
+            "long poll exceeded its bounded harness: {result:?}"
+        );
+        let error = io_error(result.unwrap_err());
+        typed_timeout(&error, &path);
+        let timeout = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<SocketTimeout>()
+            .unwrap();
+        assert!(
+            timeout.elapsed >= hold,
+            "long poll expired before its own wait"
+        );
+        return;
+    }
     // This bounded receive is the assertion: the server has not completed its
     // operation yet, and the transport must not apply the shorter ordinary cap.
     let early = tokio::time::timeout(hold, &mut receive).await;
@@ -158,7 +214,12 @@ async fn a_long_poll_outlasts_the_ordinary_request_cap() {
 }
 
 #[tokio::test]
-async fn status_cli_returns_timeout_exit_and_names_the_socket() {
+async fn a_long_poll_outlasts_the_ordinary_cap_and_has_a_finite_derived_deadline() {
+    long_poll(true).await;
+    long_poll(false).await;
+}
+
+async fn cli_timeout(mutating: bool) {
     let root = TempDir::socket();
     let path = root.path().join("cli");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -171,7 +232,11 @@ async fn status_cli_returns_timeout_exit_and_names_the_socket() {
         .env("XDG_CONFIG_HOME", root.path().join("c"))
         .env("XDG_STATE_HOME", root.path().join("s"))
         .env("FLOCK_SOCKET_PATH", &path)
-        .args(["status", "server", "--json"])
+        .args(if mutating {
+            ["workspace", "create", "--json"]
+        } else {
+            ["status", "server", "--json"]
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
@@ -195,6 +260,30 @@ async fn status_cli_returns_timeout_exit_and_names_the_socket() {
         .await
         .unwrap()
         .unwrap();
+    if mutating {
+        let sent: Request = serde_json::from_str(&request).unwrap();
+        assert!(matches!(sent.method, Method::Ping(_)));
+        let reply = serde_json::json!({"id": sent.id, "result": {"type": "pong", "version": env!("CARGO_PKG_VERSION"), "protocol": crate::protocol::PROTOCOL_VERSION}});
+        peer.get_mut()
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .unwrap();
+        drop(peer);
+        let (stream, _) = tokio::time::timeout(FINISH_CAP, listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        peer = tokio::io::BufReader::new(stream);
+        request.clear();
+        tokio::time::timeout(FINISH_CAP, peer.read_line(&mut request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Request>(&request).unwrap().method,
+            Method::WorkspaceCreate(_)
+        ));
+    }
     let status = match tokio::time::timeout(FINISH_CAP, child.wait()).await {
         Ok(status) => status.unwrap(),
         Err(_) => {
@@ -213,13 +302,54 @@ async fn status_cli_returns_timeout_exit_and_names_the_socket() {
         .unwrap();
     assert_eq!(
         status.code(),
-        Some(crate::cli::exit::TIMEOUT),
+        Some(if mutating {
+            crate::cli::exit::REQUEST_OUTCOME_UNKNOWN
+        } else {
+            crate::cli::exit::TIMEOUT
+        }),
         "stdout={out:?}, stderr={err:?}"
     );
     let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    assert_eq!(value["error"]["code"], "timeout");
+    assert_eq!(
+        value["error"]["code"],
+        if mutating {
+            "request_outcome_unknown"
+        } else {
+            "timeout"
+        }
+    );
+    assert_eq!(
+        value["error"]["retry"],
+        if mutating { "after_inspecting" } else { "yes" }
+    );
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("timed out after"));
+    if mutating {
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("may have been applied"));
+        assert!(
+            tokio::time::timeout(SHORT, listener.accept())
+                .await
+                .is_err(),
+            "mutation must not be resent"
+        );
+    }
     assert!(value["error"]["message"]
         .as_str()
         .unwrap()
         .contains(&path.display().to_string()));
+}
+
+#[tokio::test]
+async fn status_cli_returns_timeout_exit_and_names_the_socket() {
+    cli_timeout(false).await;
+}
+
+#[tokio::test]
+async fn dispatched_mutation_cli_returns_outcome_unknown_without_retry() {
+    cli_timeout(true).await;
 }
