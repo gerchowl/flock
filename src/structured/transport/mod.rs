@@ -696,18 +696,22 @@ fn write_inputs(
 /// Recovery truncates only a final tail without a trailing LF, syncs the repair,
 /// logs discarded bytes and resumes the last good sequence. Malformed records
 /// ending in LF are corruption and are refused, as are non-dense sequences.
-fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(File, u64)> {
+fn open_stream(
+    location: StreamLocation,
+    cancel: &AtomicBool,
+) -> io::Result<(File, u64, permissions::Orphaned)> {
     let dir = location.data_dir.join("sessions");
     private_fs::ensure_private_dir(&dir)?;
     let dir = dir.join(location.agent);
     private_fs::ensure_private_dir(&dir)?;
     let path = dir.join(format!("{}.jsonl", location.session));
     let mut file = match private_fs::create_private_file(&path) {
-        Ok(file) => return Ok((file, 0)),
+        Ok(file) => return Ok((file, 0, permissions::Orphaned::default())),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => private_fs::open_append_file(&path)?,
         Err(e) => return Err(e),
     };
     let length = file.metadata()?.len();
+    let mut orphaned = permissions::Orphaned::default();
     let mut good_bytes = 0;
     let mut seq = 0_u64;
     {
@@ -730,6 +734,7 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
                     return Err(io::Error::other("non-dense session sequence"));
                 }
                 seq = record.seq;
+                orphaned.observe(&record);
                 good_bytes += n;
             } else {
                 // A bounded scan accepts only an unterminated final tail. Any
@@ -756,7 +761,7 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
         file.sync_all()?;
         crate::logging::structured_stream_repaired(length - good_bytes);
     }
-    Ok((file, seq))
+    Ok((file, seq, orphaned))
 }
 
 fn pump(
@@ -771,7 +776,7 @@ fn pump(
 ) -> io::Result<()> {
     let blobs = super::blobs::BlobStore::open(&location.data_dir).map_err(io::Error::other)?;
     let threshold = location.storage.blob_min_bytes;
-    let (mut file, mut seq) = open_stream(location, cancel)?;
+    let (mut file, mut seq, orphaned) = open_stream(location, cancel)?;
     let mut recorder = control::Recorder::new(
         &mut file,
         &mut seq,
@@ -784,6 +789,7 @@ fn pump(
         (&blobs, threshold),
     );
     let result = (|| {
+        recorder.recover(orphaned)?;
         let mut line = Vec::new();
         let mut count = 0_u64;
         let mut metadata = metadata::Line::default();

@@ -69,6 +69,15 @@ pub(crate) fn structured_permission_request_refused(
     );
 }
 
+/// Report a malformed permission header without disclosing the stored payload.
+pub(crate) fn structured_permission_recovery_skipped(seq: u64) {
+    tracing::warn!(
+        event = "structured.permission.recovery_skipped",
+        seq,
+        "invalid permission recovery header skipped and preserved"
+    );
+}
+
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),

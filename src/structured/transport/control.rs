@@ -124,6 +124,18 @@ impl<'a> Recorder<'a> {
         }
         Ok(())
     }
+    /// Fsync every recovery close before any notification or new control admission.
+    /// Reuse ordinary audit persistence; a failure stops the stream owner.
+    pub fn recover(&mut self, orphaned: permissions::Orphaned) -> io::Result<()> {
+        let events = orphaned
+            .into_closes()
+            .map(|record| self.audit(&record))
+            .collect::<io::Result<Vec<_>>>()?;
+        for event in events {
+            publish(event, self.tx, self.cancel)?;
+        }
+        Ok(())
+    }
     pub fn finish(&mut self) -> io::Result<()> {
         let closings = self.controls.book.lock().terminal();
         self.close(closings)
