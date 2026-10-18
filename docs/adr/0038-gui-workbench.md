@@ -508,16 +508,22 @@ The changes ADR-0036 needs are for its owner to make, and are listed at the end 
    - The fork's own restart follows the same rules.
    - *Reason:* ADR-0028 already says which waits survive and which never come back. A question tied to a replaced agent must not be answered into its successor.
 4. **Who may answer: the question's recipient, through its own surfaces.**
-   - **A question to the operator** (its recipient under ADR-0034's routing) is answered only from the operator's authenticated surfaces. One is a client token (ADR-0036 §5; `answer` or `operate` scope: the `answer` scope exists for a narrower owner token, for example on a phone). The other is the local operator's CLI or TUI under ADR-0028 §8a. It is never answered from another agent's pane input or tool call.
+   - **A question to the operator** (its recipient under ADR-0034's routing) is answered only from the operator's authenticated surfaces:
+     - a client token (ADR-0036 §5; `answer` or `operate` scope: the `answer` scope exists for a narrower owner token, for example on a phone);
+     - the local operator's CLI or TUI (ADR-0028 §8a);
+     - a channel adapter binding with `reply` scope (`channel:<binding>`, ADR-0028 §8a), for example Telegram from a phone, to which ADR-0034 §2 routes operator questions under E9c.
+
+     It is never answered from another agent's pane input or tool call, and so not through MCP `flock_question_answer` either.
    - **A question to an agent** keeps ADR-0034 §3's path. The architect answers with `flk question answer` or `flock_question_answer`, as §7's agent recipients do through their question tools.
    - **A merge-back proposal** is applied by the question's recipient, under the same rule: for an operator question, from one of the operator's surfaces. In the GUI that is `inbox.answer`, and §5's row is unchanged.
-   - **Amendments:** none is needed to ADR-0034 or ADR-0028 for recorded questions. ADR-0034 already routes by recipient, and ADR-0028 §8a already lists the operator's answer bindings. This rule only names which of them count for an operator question. Refusing another agent's keystrokes into a `pty` dialog is #1673's own follow-up (ADR-0008, ADR-0029), not this record's.
+   - **Amendment:** excluding MCP `flock_question_answer` for operator-addressed questions narrows ADR-0028 §8a, which lets MCP answer any question. That is an ADR-0028 §8a amendment, made with S6e and listed under "What ADR-0028 must change" below. An agent's tool call must never answer for the operator (#1673). Agent-addressed questions keep MCP (ADR-0034 §3). Refusing another agent's keystrokes into a `pty` dialog is #1673's own follow-up (ADR-0008, ADR-0029), not this record's.
    - The fork composes the proposal, and the recipient applies it. Once S6e amends ADR-0036, the fork's `question.resolve` records a **proposal**, not an answer. Until then it answers directly (ADR-0036 §2a), so the GUI offers no thread before S6e (G14 depends on it).
    - *Reason:* in #1673 a stray keystroke from another agent was recorded as an owner decision. An answer to the operator carries the owner's authority, so it comes only from the operator's own surfaces. Agents keep answering what is addressed to them.
-5. **Blocking: the asker decides, and says why, if owner decision 15 retakes ADR-0036's decision 3a.**
-   - ADR-0036 owner decision 3a (S6d) lets a System-One check decide when `blocking` is absent. Only the owner can reverse it, so that reversal is owner decision 15 (§11, open).
-   - If decision 15 is yes, S6e makes `flock_question_ask { blocking: true }` require a `blocking_reason`: what the asker cannot proceed on, and why nothing else is open. A question without `blocking` is then non-blocking, and the server records the reason and never decides on the agent's behalf. S6d's check no longer holds a turn, so a held turn is the asker's choice under the tool contract.
-   - Until then, or if decision 15 is no, ADR-0036 §2a applies. An absent `blocking` lets S6d's check decide, there is no reason to show, and the card states only the server's `blocking` flag.
+5. **Blocking: the asker says why; what an absent `blocking` means is owner decision 15.**
+   - S6e makes `flock_question_ask { blocking: true }` require a `blocking_reason` (1–512 bytes, trimmed UTF-8, one paragraph): what the asker cannot proceed on, and why nothing else is open. This holds whatever decision 15 says.
+   - Only the default when `blocking` is absent depends on decision 15. ADR-0036 owner decision 3a (S6d) lets a System-One check decide then, and only the owner can reverse that, so the reversal is owner decision 15 (§11, open).
+   - If decision 15 is yes, a question without `blocking` is non-blocking, and the server never decides on the agent's behalf. S6d's check no longer holds a turn, so a held turn is always the asker's choice under the tool contract.
+   - Until then, or if decision 15 is no, ADR-0036 §2a applies to an absent `blocking`: S6d's check decides. A turn it holds has no reason to show, and its card states only the server's `blocking` flag.
    - The GUI orders a blocking card first (§1) and shows "Blocking: <reason>" in the agent's own words. The agent's row shows the amber *needs you* mark (§2a), and its composer line states the server's phase (`waiting_on_human`).
    - A non-blocking card puts no mark on the agent. The GUI never judges whether a reason is honest.
    - *Reason (for the recommendation on decision 15):* "literally nothing else to work on" is a fact only the agent can know. A server-side guess either blocks an agent that had other work, or misses an honest blocker. A stated reason makes the choice visible and open to review.
@@ -580,7 +586,8 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
 
 **What ADR-0036 must change** (its owner amends it; this record does not):
 - owner decision 3's channel order, for questions to the operator;
-- `blocking_reason` (1–512 bytes, trimmed UTF-8, one paragraph), and, only if owner decision 15 retakes its decision 3a, `blocking` false by default and S6d's check no longer holding;
+- `blocking_reason`, required if and only if `blocking: true` (1–512 bytes, trimmed UTF-8, one paragraph), whatever owner decision 15 says;
+- only if owner decision 15 retakes its decision 3a: `blocking` false by default, and S6d's check no longer holding;
 - the lease origin;
 - `question.resolve` as a proposal, applied by the question's recipient (decision 4);
 - the question states `threaded` and `proposed`, beside ADR-0028's `withdrawn` and `expired`;
@@ -589,6 +596,8 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
 - the fork code `fork_prefix_gone`, distinct from `invalid_fork_point`;
 - the durable `question.proposed` record, and `question.answered`'s `proposal_id` and `edited`;
 - the fork-point cost on the inbox item.
+
+**What ADR-0028 must change** (with S6e): §8a's MCP answer binding (`flock_question_answer`) no longer answers a question whose recipient is the operator (decision 4). The CLI, the TUI and `reply`-scoped channel bindings still do. Agent-addressed questions keep MCP.
 
 ### 6. Shells: one bundle, two hosts, one transport
 
@@ -730,7 +739,7 @@ Each slice is at most about 400 production lines; TypeScript counts the same. **
 | G11 | Artifact carriage over the mesh | G6, ADR-0026 | no | 300 |
 | G12 | `work` records, phase 2 (§8) | G8, owner decision 7 | no | 400 |
 | G13 | Telemetry views (§4a): `telemetry/traces`, `telemetry/logs` and `audit` reads in the server; trace, logs and audit tiles | S7, #1614, a vigil release (#1300) | no | 400 |
-| S6e | ADR-0036's question amendment, by its owner (§5b, "What ADR-0036 must change"): `flock_question_ask` as the one path for questions to the operator, `blocking_reason`, the blocking default if owner decision 15 is yes, the lease as the attested origin, `question.resolve` as a proposal, the `threaded` and `proposed` states, `subject_replaced` closing a question as `withdrawn`, the held-to-deferred rule, `fork_prefix_gone`, the logged proposal and edit records | S6b, S6c, S3b #1426, #1734; owner decision 15 for the blocking default | no | ADR + 250 |
+| S6e | ADR-0036's question amendment, by its owner (§5b, "What ADR-0036 must change"): `flock_question_ask` as the one path for questions to the operator, `blocking_reason` required iff `blocking: true`, the blocking default if owner decision 15 is yes, the lease as the attested origin, `question.resolve` as a proposal, the `threaded` and `proposed` states, `subject_replaced` closing a question as `withdrawn`, the held-to-deferred rule, `fork_prefix_gone`, the logged proposal and edit records; with it, the ADR-0028 §8a amendment: no MCP `flock_question_answer` for operator-addressed questions | S6b, S6c, S3b #1426, #1734; owner decision 15 for the blocking default | no | ADR + 250 |
 | G14 | Threads on the wire: `InboxItem`'s `blocking_reason`, `threads` and `fork_points` (with `dry_run` cost), `inbox.thread`, `inbox.answer { proposal_id }`, and answers to operator questions only from the operator's surfaces (#1673) | S6e, G5, S12, S8b | no | 300 |
 | G15 | The thread UX: *Take as thread* and *Thread from now*, the fork's tile, *Review and merge back* with editing, the card states and the stale-answer display (§5b) | G14, S9a, G2 | no | 400 TS |
 | G16 | Thread lifecycle against the scripted server: asker restart and handoff (`observation_reset`), identity replacement (`subject_replaced` → `withdrawn`), two threads racing on one question, a `pty` asker | G15, #1577 | no | 200 TS |
@@ -761,7 +770,7 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 | 12 | Does the person review, and may edit, a thread's proposal before it is applied? (§5b) | **Decided: yes, and logged** ("this should be logged -- so we can later learn/improve the skills/context"). The proposal opens as editable text, and only *Apply* answers. The proposal, the applied answer and whether it was edited are durable records on the log. | One more step per thread before the answer is delivered; a blocking asker waits for it, a non-blocking one keeps working. The analysis of the logged records is a follow-up (#1717). |
 | 13 | What happens to a thread's fork after the merge-back? (§5b) | **Decided: yes** ("stop fork but keep transcript"). The fork is stopped, and its transcript is kept in the lineage (the `AgentForked` edge); the sidebar folds ended threads. | Stored transcripts, and lineage rows to fold. No retention limit is stated yet: ADR-0036 S16 owns it. A rehydrated copy is deleted when the fork ends either way (ADR-0036 owner decision 14). |
 | 14 | A thread fork's tools (§5b) | **Decided: read-only now, through the general machinery** ("machinery first … but with read only as per now"). The fork runs under ADR-0036 S19's permission tiers (#1321) with a read-only tier, never a thread-specific flag. | A fork that would have to run a command to answer must say so in its proposal. Widening is #1321's follow-up: tiers selectable per model, and a fork that requests more, which the person grants. |
-| 15 | Does S6e retake ADR-0036 owner decision 3a, so that the asker decides blocking, with a reason, instead of S6d's System-One check? (§5b decision 5) | **Open: owner.** Recommended: yes, following the owner's #1717 words "not blocking unless there is literally nothing else to work on". The backend architect has put the question to the owner. | The server stops catching a wrongly held or wrongly continued turn, and an agent that over-uses `blocking: true` only costs itself and puts its card first. S6d's check, and its ratings, would be dropped or made advisory. |
+| 15 | Does S6e retake ADR-0036 owner decision 3a, so that the asker decides blocking, with a reason, instead of S6d's System-One check? (§5b decision 5) | **Open: owner.** Recommended: yes, following the owner's #1717 words "not vlocking [sic] unless there is literally nothing else to work on". The backend architect has put the question to the owner. | The server stops catching a wrongly held or wrongly continued turn, and an agent that over-uses `blocking: true` only costs itself and puts its card first. S6d's check, and its ratings, would be dropped or made advisory. |
 
 ## Failure modes and known limits
 
