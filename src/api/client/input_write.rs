@@ -169,7 +169,11 @@ pub(super) fn call(
             if let Some(target) =
                 agent_target.filter(|_| response["error"]["code"] == "pane_not_found")
             {
-                if let Some(data) = response["error"]["data"].as_object_mut() {
+                if let Some(data) = response
+                    .get_mut("error")
+                    .and_then(|error| error.get_mut("data"))
+                    .and_then(Value::as_object_mut)
+                {
                     data.remove("expected");
                 }
                 response["error"]["code"] = json!(ErrorCode::AgentNotFound.as_str());

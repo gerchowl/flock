@@ -270,25 +270,33 @@ fn explicit_write_range_errors_are_distinct_from_caller_budget_errors() {
 
 #[test]
 fn agent_target_refusal_drops_pane_expected_but_keeps_other_metadata() {
-    let peer = ScriptedApi::new(vec![
-        ("ping", Some(ping(true))),
-        (
-            "pane.write_text",
-            Some(json!({
-                "error":{"code":"pane_not_found","message":"missing pane", "data":{
-                    "expected":[{"type":"pane","pane":"<pane>"}],"candidates":[],"detail":"preserve"}}
-            })),
-        ),
-    ]);
-    let request: Request = serde_json::from_value(json!({"id":"agent","method":"agent.send",
-        "params":{"target":"missing","text":"hello","submit":false}}))
-    .unwrap();
-    let response = peer.client().request_value(&request).unwrap();
-    assert_eq!(response["error"]["code"], "agent_not_found");
-    assert!(response["error"]["data"].get("expected").is_none());
-    assert_eq!(response["error"]["data"]["detail"], "preserve");
-    assert_eq!(response["error"]["data"]["candidates"], json!([]));
-    assert_eq!(peer.finish().len(), 2);
+    for data in [
+        Some(json!({"expected":[{"type":"pane","pane":"<pane>"}],
+            "candidates":[],"detail":"preserve"})),
+        None,
+    ] {
+        let mut error = json!({"code":"pane_not_found","message":"missing pane"});
+        if let Some(data) = &data {
+            error["data"] = data.clone();
+        }
+        let peer = ScriptedApi::new(vec![
+            ("ping", Some(ping(true))),
+            ("pane.write_text", Some(json!({"error":error}))),
+        ]);
+        let request: Request = serde_json::from_value(json!({"id":"agent","method":"agent.send",
+            "params":{"target":"missing","text":"hello","submit":false}}))
+        .unwrap();
+        let response = peer.client().request_value(&request).unwrap();
+        assert_eq!(response["error"]["code"], "agent_not_found");
+        if data.is_some() {
+            assert!(response["error"]["data"].get("expected").is_none());
+            assert_eq!(response["error"]["data"]["detail"], "preserve");
+            assert_eq!(response["error"]["data"]["candidates"], json!([]));
+        } else {
+            assert!(response["error"].get("data").is_none());
+        }
+        assert_eq!(peer.finish().len(), 2);
+    }
 }
 
 #[test]
