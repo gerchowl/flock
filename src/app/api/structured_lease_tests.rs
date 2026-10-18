@@ -206,11 +206,36 @@ async fn fake_claude_calls(mcp: bool) {
         .try_submit(&serde_json::json!({"type":"user"}))
         .unwrap();
     let mut attributed = true;
-    for _ in 0..request_count {
+    // Scoped MCP has a private admission probe followed by actual dispatch on
+    // each connection. Ordinary fake Claude requests have only dispatch.
+    let stages = if mcp {
+        request_count * 2
+    } else {
+        request_count
+    };
+    for stage in 0..stages {
         let msg = tokio::time::timeout(Duration::from_secs(10), app.api_rx.recv())
             .await
             .expect("bounded socket dispatch")
             .expect("request");
+        if mcp {
+            assert!(
+                matches!(
+                    (&msg.request.method, stage / 2),
+                    (Method::DelegateList(_), 0) | (Method::MsgSend(_), 1)
+                ),
+                "unexpected scoped MCP request stage {stage}"
+            );
+        }
+        let probe = app.respond_scope_probe(&msg);
+        assert_eq!(
+            probe,
+            mcp && stage % 2 == 0,
+            "unexpected admission stage {stage}"
+        );
+        if probe {
+            continue;
+        }
         let root_pid: u32 = std::fs::read_to_string(root.join("model.pid"))
             .unwrap()
             .parse()

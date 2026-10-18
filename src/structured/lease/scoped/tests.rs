@@ -140,7 +140,7 @@ fn scoped_contention_refuses_and_revocation_precedes_registry_removal() {
     let held = leases.0.lock();
     assert_eq!(
         leases.scoped_for_test(Some(&credential), peer(), facts),
-        Caller::Uncertain
+        Caller::Busy
     );
     lease.revoke();
     drop(held);
