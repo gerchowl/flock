@@ -271,6 +271,7 @@ mod tests {
     fn empty_snapshot() -> SessionSnapshot {
         SessionSnapshot {
             structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![],
