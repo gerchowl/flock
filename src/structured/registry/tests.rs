@@ -376,7 +376,11 @@ fn security_agent_name_structured_registry_rejects_and_retains_inactive() {
         let mut registry = Registry::default();
         let refused = registry.register(bad).is_err();
         let restored: Registry = serde_json::from_value(raw.clone()).unwrap();
-        if !refused || !restored.is_empty() {
+        if !refused
+            || !restored.records().is_empty()
+            || restored.is_empty()
+            || restored.retained_count() != 1
+        {
             failures.push(case);
         }
         assert_eq!(serde_json::to_value(restored).unwrap(), raw);

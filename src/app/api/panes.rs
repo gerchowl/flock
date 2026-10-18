@@ -2146,7 +2146,8 @@ mod tests {
                 .terminals
                 .get_mut(&terminal_id)
                 .unwrap()
-                .agent_name = Some("builder".into());
+                .set_agent_name("builder".into())
+                .unwrap();
             let pane_id = app.state.workspaces[0].tabs[0].root_pane;
             let (runtime, mut rx) =
                 crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
@@ -2225,7 +2226,8 @@ mod tests {
             .terminals
             .get_mut(&other_terminal)
             .unwrap()
-            .agent_name = Some(public.clone());
+            .set_agent_name(public.clone())
+            .unwrap();
         assert_eq!(app.resolve_pane_target(&public).unwrap(), (0, pane_id));
         let response = app.handle_pane_close("precedence".into(), PaneTarget { pane_id: public });
         assert!(response.contains("\"result\""), "{response}");
@@ -2240,7 +2242,7 @@ mod tests {
     fn pane_only_verbs_resolve_agent_name_and_fleet_agent_id() {
         let (mut app, terminal_id, public) = app_with_terminal();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.agent_name = Some("reviewer".into());
+        terminal.set_agent_name("reviewer".into()).unwrap();
         let agent_id = terminal.agent_id.to_string();
         for target in ["reviewer".to_string(), agent_id, terminal_id.to_string()] {
             let get = app.handle_pane_get(
@@ -2322,7 +2324,8 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .agent_name = Some("builder".into());
+            .set_agent_name("builder".into())
+            .unwrap();
         for (method, extra) in [
             ("pane.send_text", serde_json::json!({"text": "prompt"})),
             ("pane.send_keys", serde_json::json!({"keys": ["Enter"]})),
@@ -2353,7 +2356,8 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .agent_name = Some("builder".into());
+            .set_agent_name("builder".into())
+            .unwrap();
         app.state.workspaces.push(Workspace::test_new("other"));
         app.state.ensure_test_terminals();
         let other = app.state.workspaces[1].tabs[0].root_pane;
@@ -2362,7 +2366,8 @@ mod tests {
             .terminals
             .get_mut(&other_terminal)
             .unwrap()
-            .agent_name = Some("builder".into());
+            .set_agent_name("builder".into())
+            .unwrap();
         for (target, code) in [
             ("builder", "agent_target_ambiguous"),
             ("missing", "pane_not_found"),

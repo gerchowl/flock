@@ -233,7 +233,7 @@ pub struct TerminalState {
     /// so it must not be used to pick a transcript to render (#328).
     session_ref_hook_confirmed: bool,
     pub manual_label: Option<String>,
-    pub agent_name: Option<String>,
+    agent_name: Option<String>,
     /// The `FLOCK_RUN_ID` this pane's agent was spawned under (#332).
     ///
     /// Minted per scheduler- or agent-initiated spawn, stamped into the
@@ -1155,12 +1155,18 @@ impl TerminalState {
     /// form the per-frame path needs; `pane_details` keeps the owned one
     /// because it hands the value to a `String` field.
     pub fn display_agent_label(&self) -> Option<Cow<'_, str>> {
-        self.effective_display_agent().map(Cow::Owned).or_else(|| {
-            self.agent_name
-                .as_deref()
-                .or_else(|| self.effective_agent_label())
-                .map(Cow::Borrowed)
-        })
+        self.effective_display_agent()
+            .map(Cow::Owned)
+            .or_else(|| {
+                self.agent_name
+                    .as_deref()
+                    .or_else(|| self.effective_agent_label())
+                    .map(Cow::Borrowed)
+            })
+            .map(|name| match name {
+                Cow::Borrowed(name) => super::agent_name::display(name),
+                Cow::Owned(name) => Cow::Owned(super::agent_name::display(&name).into_owned()),
+            })
     }
 
     pub fn effective_agent_label(&self) -> Option<&str> {
@@ -1366,9 +1372,20 @@ impl TerminalState {
         self.manual_label = None;
     }
 
-    pub fn set_agent_name(&mut self, name: String) {
-        let name = name.trim().to_string();
+    /// Reject unsafe or overlong raw names without changing identity (#317).
+    /// Empty, safe whitespace clears the name, preserving the rename contract.
+    pub fn set_agent_name(
+        &mut self,
+        name: String,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        let name = super::agent_name::validate(&name)?.to_string();
         self.agent_name = (!name.is_empty()).then_some(name);
+        Ok(())
+    }
+
+    /// Validated operator name, distinct from the detected harness label.
+    pub fn agent_name(&self) -> Option<&str> {
+        self.agent_name.as_deref()
     }
 
     pub fn clear_agent_name(&mut self) {
@@ -3787,8 +3804,8 @@ mod tests {
         let mut failures = Vec::new();
         for (case, name) in crate::test_support::hostile_agent_names() {
             let mut terminal = test_terminal();
-            terminal.set_agent_name("safe".into());
-            terminal.set_agent_name(name);
+            terminal.set_agent_name("safe".into()).unwrap();
+            let _ = terminal.set_agent_name(name);
             if terminal.agent_name.as_deref() != Some("safe") {
                 failures.push(case);
             }
@@ -3820,7 +3837,7 @@ mod tests {
     fn respawn_cleanup_resets_restored_agent_status() {
         let mut terminal = test_terminal();
         terminal.respawn_shell_on_exit = true;
-        terminal.set_agent_name("codex".into());
+        terminal.set_agent_name("codex".into()).unwrap();
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),

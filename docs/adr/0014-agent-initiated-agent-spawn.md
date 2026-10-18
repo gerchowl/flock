@@ -113,6 +113,27 @@ GitHub user drive flock into acting on a public repo. The spawn carries a
 system-owned preamble the caller cannot displace, and refuses control-sequence
 bytes as `msg_send` already does.
 
+#### Agent identity text (#317)
+
+Agent names are untrusted renderer input too. The owner-directed rule is to
+reject names containing C0/C1 controls, ESC/CSI/OSC introducers, line breaks,
+Unicode line separators or bidi formatting controls, and names longer than 64
+Unicode scalar values before trimming. `TerminalState::set_agent_name` is the
+validated storage boundary; rename, start, spawn, CLI and relay admission use
+the same policy and return `invalid_agent_name` without echoing rejected text.
+No rejected rename changes the existing identity. Safe empty names retain the
+existing clear-name behavior; creation requires a nonempty name.
+
+Older mesh v5 peers and saved PTY sessions can carry invalid names. Receivers
+drop just that name and warn with a typed code and fixed source, without its
+content. A saved pane title that exactly mirrors the rejected name is dropped
+too, so older rename operations cannot restore it through a second field.
+Invalid structured records remain inactive with raw data retained
+(ADR-0028 §3a). Navigator and agent-panel labels escape controls and bidi marks
+at the final display boundary and bound legacy label length as defence in depth.
+This does not change the wire layout or mesh version. The separate delegate
+filename restriction remains narrower than the general Unicode display rule.
+
 ### 5. The ceiling is lineage-aware, not a single global counter
 
 A flat `max_concurrent_agents` is a footgun on its own: an adversarial or

@@ -5078,6 +5078,7 @@ pub struct PeerWorkspaceSummary {
     pub is_linked_worktree: bool,
     /// Short agent label of the workspace's attention-leading pane (e.g. "cc").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
     /// Seconds since the leading pane's state last changed.
@@ -5109,6 +5110,7 @@ pub struct PeerAgentSummary {
     /// Public pane id on the owning server. A routing detail, not a name.
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
 }

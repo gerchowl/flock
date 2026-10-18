@@ -511,7 +511,7 @@ fn capture_tab(
             .panes
             .get(id)
             .and_then(|pane| terminals.get(&pane.attached_terminal_id))
-            .and_then(|terminal| terminal.agent_name.clone());
+            .and_then(|terminal| terminal.agent_name().map(str::to_owned));
         let launch_argv = tab
             .panes
             .get(id)

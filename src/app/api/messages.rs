@@ -1573,7 +1573,7 @@ impl App {
                                 .terminals
                                 .get(&pane_state.attached_terminal_id)
                                 .is_some_and(|terminal| {
-                                    terminal.agent_name.as_deref() == Some(pane.as_str())
+                                    terminal.agent_name() == Some(pane.as_str())
                                         || terminal.effective_agent_label() == Some(pane.as_str())
                                 });
                             if public_matches || agent_matches {

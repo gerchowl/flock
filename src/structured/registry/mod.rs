@@ -146,6 +146,14 @@ impl Registry {
     }
 
     fn register_raw(&mut self, record: Record, raw: Value) -> Result<u64, RegistryError> {
+        if record
+            .name
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            crate::logging::agent_name_dropped("registry");
+            return Err(RegistryError::InvalidRecord);
+        }
         if self.unparsed.is_some()
             || record.agent_id.is_empty()
             || record.session_id.is_empty()

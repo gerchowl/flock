@@ -1017,9 +1017,7 @@ impl AppState {
                     terminal
                         .and_then(|terminal| terminal.manual_label.as_deref().map(str::to_string))
                 })
-                .or_else(|| {
-                    terminal.and_then(|terminal| terminal.agent_name.as_deref().map(str::to_string))
-                })
+                .or_else(|| terminal.and_then(|terminal| terminal.agent_name().map(str::to_string)))
                 .or_else(|| {
                     terminal
                         .and_then(|terminal| terminal.effective_agent_label().map(str::to_string))
@@ -1031,7 +1029,7 @@ impl AppState {
             let display_agent = terminal.and_then(|terminal| terminal.effective_display_agent());
             let agent_label = display_agent.as_deref().or_else(|| {
                 terminal
-                    .and_then(|terminal| terminal.agent_name.as_deref())
+                    .and_then(|terminal| terminal.agent_name())
                     .or_else(|| terminal.and_then(|terminal| terminal.effective_agent_label()))
             });
             let custom_status = terminal.and_then(|terminal| terminal.effective_custom_status());

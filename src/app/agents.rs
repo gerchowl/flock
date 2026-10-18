@@ -114,6 +114,12 @@ impl App {
         let resolved = self
             .resolve_terminal_target(target)
             .map_err(AgentRenameError::Target)?;
+        if name
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            return Err(AgentRenameError::InvalidName);
+        }
         let normalized_name = name.and_then(|name| {
             let trimmed = name.trim().to_string();
             (!trimmed.is_empty()).then_some(trimmed)
@@ -141,7 +147,9 @@ impl App {
         };
         match normalized_name {
             Some(name) => {
-                terminal.set_agent_name(name.clone());
+                terminal
+                    .set_agent_name(name.clone())
+                    .map_err(|_| AgentRenameError::InvalidName)?;
                 terminal.set_manual_label(name);
             }
             None => terminal.clear_agent_name(),
@@ -530,7 +538,9 @@ impl App {
         caller: &SpawnCaller,
         questions: crate::api::schema::QuestionPolicy,
     ) -> Result<crate::api::schema::ResponseResult, AgentStartError> {
-        let name = params.name.trim().to_string();
+        let name = crate::terminal::agent_name::validate(&params.name)
+            .map_err(|_| AgentStartError::InvalidName)?
+            .to_string();
         if name.is_empty() {
             return Err(AgentStartError::InvalidName);
         }
@@ -839,7 +849,9 @@ impl App {
         };
         terminal.launch_env = spawn_env;
         terminal.questions = questions;
-        terminal.set_agent_name(name.clone());
+        terminal
+            .set_agent_name(name.clone())
+            .map_err(|_| AgentStartError::InvalidName)?;
         terminal.set_manual_label(name);
         self.state.mark_session_dirty();
 
@@ -869,7 +881,7 @@ impl App {
             AgentStartError::InvalidName => crate::api::schema::ErrorBody {
                 data: None,
                 code: "invalid_agent_name".into(),
-                message: "agent name must not be empty".into(),
+                message: format!("{}; a new agent name must not be empty", crate::terminal::agent_name::POLICY),
             },
             AgentStartError::EmptyArgv => crate::api::schema::ErrorBody {
                 data: None,
@@ -1001,6 +1013,7 @@ impl App {
     ) -> crate::api::schema::ErrorBody {
         match err {
             AgentRenameError::Target(err) => self.agent_target_error_body(err),
+            AgentRenameError::InvalidName => crate::terminal::agent_name::refusal(),
             AgentRenameError::DuplicateName { name, candidates } => crate::api::schema::ErrorBody {
                 data: None,
                 code: "agent_name_taken".into(),
@@ -1332,7 +1345,7 @@ impl App {
         Some(crate::api::schema::AgentInfo {
             agent_id: terminal.agent_id.to_string(),
             terminal_id: pane.terminal_id,
-            name: terminal.agent_name.clone(),
+            name: terminal.agent_name().map(str::to_owned),
             agent: pane.agent,
             title: pane.title,
             display_agent: pane.display_agent,
@@ -1489,6 +1502,7 @@ fn last_non_empty_line(text: &str) -> Option<String> {
 }
 
 pub(super) enum AgentRenameError {
+    InvalidName,
     Target(TerminalTargetError),
     DuplicateName {
         name: String,
@@ -1656,10 +1670,11 @@ mod tests {
         for method in ["agent.rename", "agent.start", "agent.spawn"] {
             for (case, name) in crate::test_support::hostile_agent_names() {
                 let mut app = test_app();
+                app.state.config.fleet.agent_spawn_enabled = true;
                 app.state.workspaces = vec![crate::workspace::Workspace::test_new("name-security")];
                 app.state.ensure_test_terminals();
                 let terminal = app.state.terminals.values_mut().next().unwrap();
-                terminal.set_agent_name("safe".into());
+                terminal.set_agent_name("safe".into()).unwrap();
                 let target = terminal.id.to_string();
                 let params = match method {
                     "agent.rename" => serde_json::json!({"target":target,"name":name}),
