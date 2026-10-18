@@ -52,7 +52,9 @@ that describe the bug — is the point of the format.
 Before starting a server, the auto-detect test suite sweeps the same sandbox
 namespace. Live owner PIDs are kept. For dead owners, durable `.server-*.json`
 records must prove the current server's executable, `server` argument, sandbox
-HOME and state directory, and start time when recorded. Identity is rechecked
+HOME and state directory, and start time when recorded. The argv must be the
+fixture's exact server invocation, rather than a client command containing the
+word `server`. Identity is rechecked
 before a signal; native exit notifications impose a finite cleanup ceiling.
 Unproven identities, incomplete records, unavailable inspection and timeouts are
 logged and retain the sandbox. There are no pattern-based signals in this sweep.

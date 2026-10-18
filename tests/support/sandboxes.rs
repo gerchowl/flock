@@ -72,7 +72,7 @@ impl ServerRecord {
         }
         let info = process_table::process_info(self.pid).ok()?;
         if info.exe_path.and_then(|p| p.canonicalize().ok()).as_ref() != Some(&binary)
-            || !info.argv.iter().any(|arg| arg == "server")
+            || !server_argv(&info.argv)
         {
             return Some(false);
         }
@@ -88,6 +88,11 @@ impl ServerRecord {
                 && process_lifetime::birth(self.pid) == Some(before),
         )
     }
+}
+
+/// Recognize the server invocation produced by these fixture launchers.
+pub fn server_argv(argv: &[String]) -> bool {
+    matches!(argv, [_, mode] if mode == "server")
 }
 
 /// Record a direct child only in a sandbox owned by this test process.

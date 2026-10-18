@@ -318,3 +318,15 @@ fn pid_liveness_rejects_special_pids_and_tracks_an_owned_child() {
     exit.wait(Duration::from_secs(5)).unwrap();
     assert!(!process_lifetime::pid_alive(child.id()));
 }
+
+#[test]
+fn server_argument_in_a_client_command_never_proves_server_identity() {
+    assert!(sandboxes::server_argv(&["flk".into(), "server".into()]));
+    assert!(!sandboxes::server_argv(&[
+        "flk".into(),
+        "msg".into(),
+        "server".into(),
+        "hello".into()
+    ]));
+    assert!(!sandboxes::server_argv(&["server".into()]));
+}
