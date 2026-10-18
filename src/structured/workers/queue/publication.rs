@@ -45,6 +45,9 @@ struct Live {
     refusal: Option<ErrorCode>,
     ended: bool,
 }
+/// RawMutex is an intentional lock-witness seam: tests exercise this same
+/// registration implementation at each reader unlock. Production uses the
+/// default native mutex; the seam adds no alternate registration path.
 struct Book<R: parking_lot::lock_api::RawMutex = parking_lot::RawMutex> {
     retained: Arc<Cut>,
     bootstrapped: bool,
