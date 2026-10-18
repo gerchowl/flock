@@ -100,10 +100,10 @@ async fn unattested_uid_callers_cannot_read_directories_send_or_operate() {
     );
     app.current_api_peer_pid = Some(std::process::id());
     app.runtime_config.uid_policy.dedicated = Err(()).into();
-    assert!(!app.caller_is_local_operator());
+    assert!(app.caller_is_local_operator());
     assert_eq!(
         response(&mut app, send())["error"]["code"],
-        "not_authorized"
+        "msg_target_not_found"
     );
 }
 fn pane(app: &mut App, agent: bool) {
@@ -390,10 +390,6 @@ fn operator_dispatch_refuses_unknown_socket_birth_with_empty_leases() {
     assert!(app.session_leases.is_empty());
     let response = dispatched_send(&mut app, "agent_worker_2077", Some(7), None);
     assert_eq!(response["error"]["code"], "not_authorized", "{response}");
-    for target in ["missing.example", "shared"] {
-        let reply = dispatched_send(&mut app, target, Some(7), None);
-        assert_eq!(reply["error"], response["error"], "{reply}");
-    }
 }
 #[test]
 fn operator_dispatch_requires_current_matching_socket_birth() {
@@ -523,12 +519,15 @@ fn unattested_directory_dispatch_refuses_before_target_lookup() {
 async fn send_authority_precedes_resolution_and_preserves_authorised_errors() {
     let mut app = fixture(Some(7));
     structured_recipient(&mut app);
-    let terminal = collision_shell(&mut app);
+    collision_shell(&mut app);
     let expected = authority_dispatch(&mut app, authority_send("agent_worker_2077"), Some(7));
     assert_eq!(expected["error"]["code"], "not_authorized");
-    for target in ["missing.example", "shared", terminal.as_str()] {
+    for (target, code) in [
+        ("missing.example", "agent_not_found"),
+        ("shared", "agent_target_ambiguous"),
+    ] {
         let reply = authority_dispatch(&mut app, authority_send(target), Some(7));
-        assert_eq!(reply["error"], expected["error"], "{target}: {reply}");
+        assert_eq!(reply["error"]["code"], code, "{target}: {reply}");
     }
     for agent in [false, true] {
         let mut app = fixture(Some(7));

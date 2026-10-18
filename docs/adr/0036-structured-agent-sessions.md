@@ -329,12 +329,11 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   **Account policy (owner decisions, #1795).** File-only
   `[security] agent_account = "flk-agent" | "none"` defaults to `"flk-agent"`.
   Recognition is independent of `structured.run_as`: opting into operator-mode
-  launch does not disable it. With recognition enabled, a pending or failed
-  directory lookup classifies socket callers as `Unknown`, including callers
-  with the server UID: the health/capability ping remains available, but
-  directory reads and target-bearing calls are refused before resolution. A
-  resolved dedicated UID distinct from the server UID permits the server UID
-  to proceed to the existing ancestry checks; a resolved absent account does too. A dedicated UID equal to the server UID
+  launch does not disable it. The UID boundary compares the captured UID with
+  the server UID independently of account lookup: a pending or failed lookup
+  never makes same-UID callers unattested. Other UIDs remain unknown until
+  dedicated-account recognition and positive ancestry establish their identity.
+  A confirmed dedicated UID equal to the server UID
   is a §1a misconfiguration, never operator authority. Report
   `agent_account_uid_collision` once in the log and retain the typed diagnostic
   in server status until restart. Each server owns its account cache and
@@ -370,14 +369,16 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   cannot be forged through wire JSON; an unavailable App fails closed with the
   existing response timeout. Subscription probes/polls and held output reads
   retain the captured socket credentials. Recognized server-UID reads use the
-  same-UID cooperative rule.
+  same-UID cooperative rule. Held event reads retain the captured peer for
+  their release dispatch too, so the wait closes under its original authority.
   Retry safety never grants read authority. Server and client-token lifecycle
   operations retain their `operator_only` refusal.
-  `agent.send` verifies an operator or attributed agent principal before deciding
-  whether the target is structured or terminal. An unconfirmed same-UID caller
-  gets the same refusal for existing, missing and ambiguous targets. Only callers
-  authorised to resolve receive `agent_not_found`, `agent_target_ambiguous` or
-  candidate metadata. PID-reuse hardening is tracked separately in #2138.
+  Same-UID callers are authorised to resolve targets, including shell panes.
+  They and enrolled mesh relays keep their cooperative terminal-target send
+  rights. Structured-target sends still require an operator or attributed agent
+  principal after resolution. Only callers authorised to resolve receive
+  `agent_not_found`, `agent_target_ambiguous` or candidate metadata. PID-reuse
+  hardening is tracked separately in #2138.
 - **WebSocket clients always present a token** (§5). Loopback is not an
   identity: the operator's own browser is a client with an `operator`-scoped
   token that only the local operator can mint over the unix socket, and the

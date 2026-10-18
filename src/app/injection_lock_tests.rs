@@ -73,8 +73,6 @@ fn lock_rig_with(
         api_rx,
         crate::api::EventHub::default(),
     );
-    app.current_api_peer_pid = Some(std::process::id());
-    app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
     let sender = crate::workspace::Workspace::test_new("alpha");
     let mut recipient = crate::workspace::Workspace::test_new("beta");
     let focused = recipient.focused_pane_id().expect("pane");
@@ -1160,6 +1158,70 @@ async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
         assert_eq!(
             app.delivery_attempts()[0].draft.as_deref(),
             Some("restored")
+        );
+    }
+}
+
+/// Cooperative terminal sends retain their PTY effect for shell and mesh callers.
+#[tokio::test]
+async fn cooperative_shell_terminal_send_reaches_the_pty() {
+    cooperative_terminal_send(false);
+}
+
+#[tokio::test]
+async fn cooperative_mesh_terminal_send_reaches_the_pty() {
+    cooperative_terminal_send(true);
+}
+
+fn cooperative_terminal_send(mesh: bool) {
+    {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = lock_rig(&CLAUDE);
+        let pid = std::process::id();
+        let birth = crate::platform::process_start_time(pid).unwrap();
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: 7,
+            dedicated: Ok(Some(42)).into(),
+        };
+        app.current_api_peer_uid = Some(Some(7));
+        app.current_api_peer_pid = Some(pid);
+        app.current_api_peer_birth = Some(Some(birth));
+        if mesh {
+            app.inbound
+                .attach(pid, birth, crate::platform::process_start_time)
+                .unwrap();
+            let edge = app
+                .inbound
+                .edge_mut(Some(pid), crate::platform::process_start_time)
+                .unwrap();
+            edge.enrollment.peer = "relay.example".into();
+            edge.enrollment.node_id = Some("fixture-node".into());
+            edge.enrollment.state = "pinned".into();
+        } else {
+            let shell = app.state.workspaces[0].focused_pane_id().unwrap();
+            app.test_pane_child_pids.insert(shell, pid);
+        }
+        let response = app.handle_api_request(Request {
+            id: "cooperative-send".into(),
+            method: Method::AgentSend(crate::api::schema::AgentSendParams {
+                target: pane,
+                text: "cooperative note".into(),
+                raw: true,
+                submit: false,
+                item_id: None,
+                write_timeout_ms: None,
+            }),
+        });
+        assert!(response.is_empty(), "mesh={mesh}: {response}");
+        let bytes: Vec<u8> = drain(&mut pty).into_iter().flatten().collect();
+        assert!(
+            bytes
+                .windows(b"cooperative note".len())
+                .any(|part| part == b"cooperative note"),
+            "mesh={mesh}: {bytes:?}"
         );
     }
 }

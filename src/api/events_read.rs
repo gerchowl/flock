@@ -30,6 +30,7 @@ use crate::api::{ApiRequestMessage, ApiRequestSender, EventHub};
 /// closes it.
 struct HeldWait<'a> {
     api_tx: &'a ApiRequestSender,
+    peer: crate::platform::peer::Credentials,
     wait_id: Option<String>,
 }
 
@@ -55,7 +56,11 @@ impl<'a> HeldWait<'a> {
         let wait_id = serde_json::from_str::<serde_json::Value>(&response)
             .ok()
             .and_then(|value| value["result"]["wait_id"].as_str().map(str::to_owned));
-        Self { api_tx, wait_id }
+        Self {
+            api_tx,
+            peer,
+            wait_id,
+        }
     }
 }
 
@@ -73,9 +78,9 @@ impl Drop for HeldWait<'_> {
                 method: Method::WaitRelease(wait_id),
             },
             respond_to,
-            peer_pid: None,
-            peer_birth: None,
-            peer_uid: None,
+            peer_pid: self.peer.pid,
+            peer_birth: self.peer.birth,
+            peer_uid: self.peer.uid,
         });
     }
 }
@@ -190,5 +195,77 @@ pub(super) fn read_events(
             .saturating_duration_since(Instant::now())
             .min(CONNECTION_POLL_INTERVAL);
         event_hub.wait_after(after, slice);
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn held_read_release_keeps_captured_peer_and_closes_the_wait() {
+        let (api_tx, mut api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            events_rx,
+            EventHub::default(),
+        );
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: 7,
+            dedicated: Ok(Some(42)).into(),
+        };
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("held-read")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let terminal = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state.terminals.get_mut(&terminal).unwrap().launch_argv = Some(vec!["claude".into()]);
+        crate::test_support::attest_pane_caller(&mut app, pane);
+        let peer = crate::platform::peer::Credentials {
+            pid: app.current_api_peer_pid,
+            birth: app
+                .current_api_peer_pid
+                .and_then(crate::platform::process_start_time),
+            uid: Some(7),
+        };
+        let (finish, release) = std::sync::mpsc::channel();
+        let driver = std::thread::spawn(move || {
+            let held = HeldWait::open(
+                &api_tx,
+                peer,
+                WaitPredicate::Events {
+                    kinds: vec![],
+                    subjects: vec![],
+                    after: 0,
+                },
+                Duration::from_secs(1),
+            );
+            release.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(held);
+        });
+        let hold = api_rx.recv().await.unwrap();
+        app.handle_api_request_message(hold);
+        let due = app.waits.next_deadline().expect("hold was attributed");
+        finish.send(()).unwrap();
+        let release = api_rx.recv().await.unwrap();
+        app.handle_api_request_message(release);
+        driver.join().unwrap();
+        assert_eq!(
+            app.waits.next_deadline(),
+            None,
+            "release must close the attributed wait"
+        );
+        app.tick_waits(due);
+        assert!(!app
+            .event_hub
+            .events_after(0)
+            .iter()
+            .any(|(_, event)| event.event == crate::api::schema::EventKind::WaitExpired));
     }
 }

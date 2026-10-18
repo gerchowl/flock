@@ -115,14 +115,15 @@ impl UidPolicy {
     }
 
     /// Constrain the caller role by UID; agent identity still requires ancestry.
-    /// Configured pending/failed lookups deny operator availability. Only explicit
-    /// account-policy `none` avoids that cost; a resolved UID collision fails closed.
+    /// Same-UID authority does not depend on directory-service availability.
+    /// A confirmed dedicated-account collision still fails closed (#1944).
     pub fn classify(&self, uid: Option<u32>) -> Principal {
-        let (Some(uid), Ok(dedicated)) = (uid, self.dedicated.get()) else {
+        let Some(uid) = uid else {
             return Principal::Unknown;
         };
+        let dedicated = self.dedicated.get();
         self.report_cached_collision();
-        if dedicated == Some(uid) {
+        if dedicated == Ok(Some(uid)) {
             Principal::Agent
         } else if uid == self.operator {
             Principal::Operator
@@ -247,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_account_lookup_does_not_block_app_startup_or_grant_authority() {
+    fn blocked_account_lookup_keeps_same_uid_authority_without_blocking_startup() {
         exercise_blocked_lookup(crate::config::model::AgentAccount::FlkAgent);
     }
 
@@ -344,26 +345,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("classification must finish while NSS stays blocked");
         driver.join().unwrap();
-        assert_eq!(
-            roles[0],
-            if recognition {
-                Principal::Unknown
-            } else {
-                Principal::Operator
-            }
-        );
+        assert_eq!(roles[0], Principal::Operator);
         assert!(roles[1..].iter().all(|role| *role == Principal::Unknown));
-        if recognition {
-            assert_eq!(stop["error"]["code"], "operator_only");
-        } else {
-            assert!(stop.get("result").is_some(), "{stop}");
-        }
-        if recognition {
-            assert_eq!(read["error"]["code"], "not_authorized", "{read}");
-        } else {
-            assert!(read.get("result").is_some(), "{read}");
-        }
-        assert_eq!(quit, !recognition);
+        assert!(stop.get("result").is_some(), "{stop}");
+        assert!(read.get("result").is_some(), "{read}");
+        assert!(quit);
         assert!(
             lookup_entered.try_recv().is_err(),
             "one worker despite repeated calls"
@@ -478,6 +464,24 @@ mod tests {
     }
 
     #[test]
+    fn same_uid_survives_failed_and_pending_account_lookup() {
+        use crate::api::schema::{EmptyParams, Method};
+        let pending = DedicatedUid::lazy(|| panic!("lookup already started"));
+        pending.0.started.call_once(|| ());
+        for lookup in [DedicatedUid::from(Err(())), pending] {
+            let policy = UidPolicy {
+                operator: 7,
+                dedicated: lookup,
+            };
+            assert_eq!(policy.classify(Some(7)), Principal::Operator);
+            assert_eq!(
+                policy.refusal(Some(7), false, &Method::AgentList(EmptyParams {})),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn uid_boundary_never_promotes_anonymous_or_unknown_credentials() {
         let policy = UidPolicy {
             operator: 7,
@@ -498,7 +502,7 @@ mod tests {
                 dedicated: Err(()).into()
             }
             .classify(Some(7)),
-            Principal::Unknown
+            Principal::Operator
         );
         assert_eq!(
             UidPolicy {

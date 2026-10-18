@@ -235,7 +235,8 @@ impl App {
         self.structured_sends.waiting.insert(key, waiter);
         Ok(Ticket { item_id, committed })
     }
-    /// The dispatcher verifies `principal` before resolving any target.
+    /// The dispatcher admits the UID before resolution and verifies `principal`
+    /// before a structured send. Terminal sends keep their cooperative authority.
     pub(super) fn handle_structured_send(
         &mut self,
         id: String,
