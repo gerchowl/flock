@@ -50,6 +50,10 @@ pub(crate) struct Ticket {
 }
 pub(crate) struct Staged(String, Ticket);
 /// Bounded response routing attached to the existing sole completion consumer.
+/// Socket sends hold a waiter plus a parked reply: 112 non-operator slots mean
+/// about 56 sends, and 128 total slots mean 64 sends with about 8 reserved for
+/// operators. Unparked shared-service tickets consume one slot. Keep both charges
+/// so replies remain bounded independently of worker completions (ADR-0036 S5).
 #[derive(Default)]
 pub(crate) struct Sends {
     waiting: HashMap<Key, Sender<ResultId>>,
@@ -340,5 +344,42 @@ mod tests {
         }
         assert!(sends.full(false));
         assert!(sends.full(true));
+    }
+    #[test]
+    fn send_admission_paired_tickets_keep_eight_operator_sends_reserved() {
+        let mut sends = Sends::default();
+        let mut replies = Vec::new();
+        let mut pair = |sends: &mut Sends, n: usize| {
+            let id = n.to_string();
+            let (waiter, committed) = mpsc::channel();
+            sends
+                .waiting
+                .insert(("recipient".into(), 1, id.clone()), waiter);
+            let (reply, receiver) = mpsc::channel();
+            replies.push(receiver);
+            sends.park(
+                Staged(
+                    id.clone(),
+                    Ticket {
+                        item_id: id,
+                        committed,
+                    },
+                ),
+                reply,
+            );
+        };
+        for n in 0..56 {
+            assert!(!sends.full(false));
+            pair(&mut sends, n);
+        }
+        assert!(sends.full(false));
+        assert!(!sends.full(true));
+        for n in 56..64 {
+            assert!(!sends.full(true));
+            pair(&mut sends, n);
+        }
+        assert!(sends.full(true));
+        assert_eq!(sends.waiting.len(), 64);
+        assert_eq!(sends.parked.len(), 64);
     }
 }

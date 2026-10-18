@@ -316,3 +316,112 @@ async fn operator_without_a_dedicated_account_keeps_normal_mutations() {
     assert!(result.get("result").is_some(), "{result}");
     assert!(app.state.should_quit);
 }
+
+fn collision_shell(app: &mut App) -> String {
+    app.state.workspaces = vec![crate::workspace::Workspace::test_new("authority-shell")];
+    app.state.ensure_test_terminals();
+    let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+    let id = app.state.terminal_id_for_pane(0, pane).unwrap();
+    let terminal = app.state.terminals.get_mut(&id).unwrap();
+    terminal.launch_argv = None;
+    terminal.agent_name = Some("shared".into());
+    let id = terminal.agent_id.to_string();
+    // Existing pane ancestry seam attributes the dispatcher's actual process.
+    app.test_pane_child_pids.insert(pane, std::process::id());
+    id
+}
+fn structured_recipient(app: &mut App) {
+    app.state
+        .structured_agents
+        .register(crate::structured::registry::Record {
+            runtime: crate::structured::registry::StructuredRuntime::Structured,
+            agent_id: "agent_worker_2077".into(),
+            name: Some("shared".into()),
+            harness: "claude".into(),
+            session_id: "00000000-0000-4000-8000-000000002077".into(),
+            cwd: std::env::temp_dir(),
+            model: None,
+        })
+        .unwrap();
+}
+fn dispatched_send(
+    app: &mut App,
+    target: &str,
+    uid: Option<u32>,
+    birth: Option<u64>,
+) -> serde_json::Value {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.handle_api_request_message(crate::api::ApiRequestMessage {
+        request: Request {
+            id: "attestation-followup".into(),
+            method: Method::AgentSend(
+                serde_json::from_value(serde_json::json!({
+                    "target":target,"text":"/compact","submit":true,
+                    "item_id":"00000000-0000-4000-8000-000000002077"
+                }))
+                .unwrap(),
+            ),
+        },
+        respond_to: tx,
+        peer_pid: Some(std::process::id()),
+        peer_birth: birth,
+        peer_uid: uid,
+    });
+    serde_json::from_str(&rx.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap()
+}
+#[test]
+fn operator_dispatch_refuses_unknown_socket_birth_with_empty_leases() {
+    let mut app = fixture(Some(7));
+    structured_recipient(&mut app);
+    assert!(app.session_leases.is_empty());
+    let response = dispatched_send(&mut app, "agent_worker_2077", Some(7), None);
+    assert_eq!(response["error"]["code"], "not_authorized", "{response}");
+}
+#[test]
+fn operator_dispatch_requires_current_matching_socket_birth() {
+    let mut app = fixture(Some(7));
+    structured_recipient(&mut app);
+    let birth = crate::platform::process_start_time(std::process::id()).unwrap();
+    let response = dispatched_send(
+        &mut app,
+        "agent_worker_2077",
+        Some(7),
+        Some(birth.wrapping_add(1)),
+    );
+    assert_eq!(response["error"]["code"], "not_authorized");
+    // A matching operator passes authority and reaches the absent worker.
+    let response = dispatched_send(&mut app, "agent_worker_2077", Some(7), Some(birth));
+    assert_eq!(response["error"]["code"], "agent_not_found");
+}
+#[test]
+fn unattested_send_dispatch_has_no_target_existence_oracle() {
+    let mut app = fixture(Some(99));
+    structured_recipient(&mut app);
+    let terminal = collision_shell(&mut app);
+    let birth = crate::platform::process_start_time(std::process::id());
+    for target in [
+        "agent_worker_2077",
+        terminal.as_str(),
+        "shared",
+        "missing.example",
+    ] {
+        let response = dispatched_send(&mut app, target, Some(99), birth);
+        assert_eq!(
+            response["error"]["code"], "not_authorized",
+            "{target}: {response}"
+        );
+        assert_eq!(
+            response["error"]["message"],
+            "socket caller lacks authority for this operation"
+        );
+    }
+}
+#[test]
+fn operator_dispatch_from_a_shell_pane_is_not_an_operator_surface() {
+    let mut app = fixture(Some(7));
+    structured_recipient(&mut app);
+    collision_shell(&mut app);
+    let birth = crate::platform::process_start_time(std::process::id());
+    let response = dispatched_send(&mut app, "agent_worker_2077", Some(7), birth);
+    assert_eq!(response["error"]["code"], "not_authorized");
+}

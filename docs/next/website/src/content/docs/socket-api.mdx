@@ -186,19 +186,29 @@ before queue or stdin work. `raw` and `write_timeout_ms` are terminal-only optio
 An optional canonical lower-case `item_id` UUID makes an identical committed
 retry idempotent; a different payload under that ID returns `queue_item_conflict`.
 One outstanding admission per item and at most 128 outstanding tickets/replies
-are accepted. Non-operator requests stop at 112 outstanding tickets/replies,
-reserving 16 slots for the operator; `session_busy` is retryable after capacity
-clears. If the worker
+are accepted. Non-operator requests stop at 112 tickets/replies. Each ordinary
+socket send holds both a waiter and a parked reply: about 56 non-operator sends,
+64 total, with about 8 sends reserved for operators. Shared-service tickets that
+are not parked consume one slot instead. These bound pending acknowledgements,
+not the durable queue length; the worker's bounded channel can refuse earlier.
+The existing accounting is retained so outstanding replies remain bounded;
+`session_busy` is retryable after capacity clears. If the worker
 exits or its generation changes before an acknowledgement is consumed,
 `input_write_unknown` requires inspecting the queue before retrying with the
 same lifecycle ID. The admission may already have committed when the worker
 exited; never retry under a fresh ID. There is no
 automatic retry or queue delivery timeout.
 
-Socket operator authority requires a kernel-attested PID and operator UID,
-with neither an agent pane/lease nor an inbound relay edge. Missing or unknown
-credentials and relays receive `not_authorized`; pane/lease-attested agents retain
-their agent identity. Shared-service operator tokens must be verified. Producer
+Socket operator authority requires a kernel-attested PID, a recorded process
+start time that still matches, and the operator UID. Its ancestry must contain
+no flk pane of any kind (including shell panes), structured lease or inbound
+relay edge. A shell pane cannot be distinguished from one driven by an agent,
+so it is intentionally excluded. Supported operator surfaces are the CLI from
+an external terminal outside all flk panes, the operator composer, and the
+shared S7-min send service with a verified operator/token principal. The latter
+services supply verified authority directly rather than deriving it from a
+claimed producer. Missing, unknown or mismatched credentials and relays receive
+`not_authorized`; pane/lease-attested agents retain their agent identity. Producer
 strings in command JSON never grant authority. A structured self-send is refused
 with `self_message_forbidden`; names or IDs shared with a terminal are refused
 with `agent_target_ambiguous`. Only operator-origin
