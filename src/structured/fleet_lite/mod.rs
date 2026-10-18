@@ -6,7 +6,9 @@
 //! allocated seqs must also reach existing subscribers before subsequent deltas.
 //! The exclusive file lock fences local writers, not the deferred S7 handoff protocol.
 //! Unknown/invalid rows are warned, skipped and preserved raw (ADR-0028 §3a).
-//! Invalid high-water metadata refuses opening: recovering it as zero loses cursors.
+//! A separate durable cursor reserves positions before snapshot replacement (#1976).
+//! Lost/corrupt snapshots recover empty at that floor with a typed diagnostic.
+//! Missing/corrupt cursor evidence cannot silently authorize a reset to zero.
 #![deny(missing_docs)]
 // #1832 slice 6b adds the product caller after subscription machinery lands.
 #![allow(dead_code)]
@@ -94,11 +96,29 @@ pub struct Snapshot {
     pub rows: Vec<Delta>,
 }
 
+/// Recoverable snapshot loss, exposed to 6b's status/operator diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Diagnostic {
+    /// The snapshot disappeared; rebuild rows from the provider before serving.
+    SnapshotMissing {
+        /// Independent durable floor retained through the loss.
+        high_water: u64,
+    },
+    /// JSON, header or row-collection metadata is corrupt; no rows are trusted.
+    SnapshotCorrupt {
+        /// Independent durable floor retained through the corruption.
+        high_water: u64,
+    },
+}
+
 /// Locked durable materialization. Every mutation/checkpoint persists before
 /// publication. On any write failure, this instance refuses further writes until
 /// reopened: rename may have succeeded despite a failed directory fsync.
-/// Missing files start at zero; malformed headers/files refuse loading. Only rows
-/// are lenient. Retained duplicates stay inert and are dropped on explicit removal
+/// A genuinely new store starts at zero. A separate `fleet.cursor` record survives
+/// lost/corrupt `fleet.json`; corrupt cursor evidence refuses loading. Failed
+/// writes can reserve unpublished positions; recovery snapshots cover that gap.
+/// Changed rows drop unknown top-level fields; unchanged rows keep their raw form.
+/// Collection entries are lenient. Retained duplicates stay inert and are dropped on explicit removal
 /// of their ID, preventing resurrection on the next load.
 pub struct Store {
     path: PathBuf,
@@ -109,6 +129,7 @@ pub struct Store {
     retained: Vec<Value>,
     high_water: u64,
     writable: bool,
+    diagnostics: Vec<Diagnostic>,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -124,33 +145,155 @@ fn valid(row: &FleetAgentRow) -> bool {
         && !row.label.is_empty()
         && row.waiting_on_human.iter().all(|id| !id.is_empty())
 }
+fn sync_parent(path: &Path) -> io::Result<()> {
+    File::open(parent(path))?.sync_all()
+}
+// Both records use the same temp/fsync/rename/fsync-dir discipline, under one lock.
+fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    replace_with_parent_sync(path, bytes, sync_parent)
+}
+// Argument-only seam for testing directory-sync failures after a real rename.
+fn replace_with_parent_sync(
+    path: &Path,
+    bytes: &[u8],
+    sync: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    let temp = PathBuf::from(name);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temp, path)?;
+    sync(path)
+}
+fn cursor(path: &Path) -> io::Result<Option<u64>> {
+    match fs::read(path.with_extension("cursor")) {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)?
+            .get("high_water")
+            .and_then(Value::as_u64)
+            .map(Some)
+            .ok_or_else(|| invalid("invalid fleet cursor; restore a trusted high-water floor")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 impl Store {
     /// Acquire exclusive ownership before loading. A busy owner refuses immediately.
     /// Future/invalid rows survive subsequent saves; duplicate IDs keep the first
-    /// valid row. Unknown top-level fields also round-trip unchanged.
+    /// valid row. Unknown document fields also round-trip unchanged. A legacy
+    /// snapshot with an unmarked legacy lock seeds the cursor; later cursor loss
+    /// refuses loading even if an older snapshot survives. Lost/corrupt snapshots
+    /// recover only with a valid cursor. Never delete both recovery records.
+    /// Opening preserves damaged snapshot bytes; a later write replaces them.
+    /// An empty, unmarked lock without either record opens at zero, including a
+    /// legacy snapshot-only lock (#1974). Legacy locks were always unmarked, even
+    /// after publishing positions. That layout's only floor was `fleet.json`:
+    /// if it is lost, no better floor can be recovered, preserving the old behavior.
+    /// Before marking the lock, opening syncs the cursor's parent directory even
+    /// when its value already matches: a previous rename may have succeeded but
+    /// its directory sync failed.
+    /// A directory-sync failure refuses opening and leaves the lock unmarked.
+    /// `fleet.lock` carries the initialization marker: deleting it together with
+    /// `fleet.cursor` while an older `fleet.json` survives reopens at that older
+    /// head. Operators must never delete the lock.
     pub fn open(path: PathBuf) -> io::Result<Self> {
+        Self::open_with_parent_sync(path, sync_parent)
+    }
+
+    // Test seam shared by cursor replacement and initialization recovery.
+    fn open_with_parent_sync(
+        path: PathBuf,
+        mut sync: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(parent(&path))?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
+        let lock_path = path.with_extension("lock");
+        let mut lock = match OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path.with_extension("lock"))?;
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                OpenOptions::new().read(true).write(true).open(lock_path)?
+            }
+            Err(e) => return Err(e),
+        };
         lock.try_lock().map_err(|e| match e {
             TryLockError::WouldBlock => {
                 io::Error::new(io::ErrorKind::WouldBlock, "fleet store busy")
             }
             TryLockError::Error(error) => error,
         })?;
-        let document: Value = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => json!({"high_water":0,"rows":[]}),
+        let initialized = lock.metadata()?.len() != 0;
+        let reserved = cursor(&path)?;
+        if initialized && reserved.is_none() {
+            return Err(invalid(
+                "fleet cursor missing; restore a trusted high-water floor",
+            ));
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        let high_water = document
-            .get("high_water")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| invalid("invalid fleet high-water"))?;
+        let parsed: Option<Value> = bytes.as_ref().and_then(|b| serde_json::from_slice(b).ok());
+        let snapshot_head = parsed
+            .as_ref()
+            .filter(|d| d.get("rows").is_some_and(Value::is_array))
+            .and_then(|d| d.get("high_water").and_then(Value::as_u64));
+        let high_water = match (reserved, snapshot_head) {
+            (Some(a), Some(b)) => a.max(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) if !initialized && bytes.is_none() => 0,
+            _ => {
+                return Err(invalid(
+                    "fleet cursor unavailable; restore a trusted high-water floor",
+                ))
+            }
+        };
+        let mut diagnostics = Vec::new();
+        let document = if snapshot_head.is_some() {
+            parsed.ok_or_else(|| invalid("invalid fleet snapshot"))?
+        } else {
+            if reserved.is_some() {
+                diagnostics.push(if bytes.is_some() {
+                    Diagnostic::SnapshotCorrupt { high_water }
+                } else {
+                    Diagnostic::SnapshotMissing { high_water }
+                });
+                let reason = if bytes.is_some() {
+                    "snapshot_corrupt"
+                } else {
+                    "snapshot_missing"
+                };
+                tracing::warn!(reason, high_water, "fleet rows require provider recovery");
+            }
+            json!({"high_water":high_water,"rows":[]})
+        };
+        if reserved != Some(high_water) {
+            replace_with_parent_sync(
+                &path.with_extension("cursor"),
+                &serde_json::to_vec(&json!({"high_water":high_water}))?,
+                &mut sync,
+            )?;
+        } else if !initialized {
+            // A previous open may have renamed the cursor without syncing its directory.
+            sync(&path.with_extension("cursor"))?;
+        }
+        if !initialized {
+            // Mark the locked inode only after cursor durability, before any reservations.
+            // Its marker distinguishes legacy migration from later cursor loss.
+            lock.write_all(b"1")?;
+            lock.sync_all()?;
+        }
         let raw = document
             .get("rows")
             .and_then(Value::as_array)
@@ -158,17 +301,20 @@ impl Store {
         let mut rows = Rows::new();
         let mut encoded = BTreeMap::new();
         let mut retained = Vec::new();
-        for value in raw {
-            match serde_json::from_value::<FleetAgentRow>(value.clone()) {
-                Ok(row) if valid(&row) && !rows.contains_key(&row.id) => {
+        for (index, value) in raw.iter().enumerate() {
+            let reason = match serde_json::from_value::<FleetAgentRow>(value.clone()) {
+                Ok(row) if !valid(&row) => "invalid",
+                Ok(row) if rows.contains_key(&row.id) => "duplicate",
+                Ok(row) => {
                     encoded.insert(row.id.clone(), value.clone());
                     rows.insert(row.id.clone(), row);
+                    continue;
                 }
-                _ => {
-                    tracing::warn!("skipping and retaining unsupported or duplicate fleet row");
-                    retained.push(value.clone());
-                }
-            }
+                Err(_) if value.is_object() && value.get("id").is_none() => "unsupported",
+                Err(_) => "invalid",
+            };
+            tracing::warn!(index, reason, "skipping and retaining fleet row");
+            retained.push(value.clone());
         }
         Ok(Self {
             path,
@@ -179,7 +325,13 @@ impl Store {
             retained,
             high_water,
             writable: true,
+            diagnostics,
         })
+    }
+
+    /// Recovery facts from opening, retained until this owner is dropped.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
     }
 
     /// Refresh from a coherent provider cut. Duplicate/invalid identities refuse
@@ -213,18 +365,7 @@ impl Store {
                     continue;
                 }
             }
-            let mut value = self.encoded.get(id).cloned().unwrap_or_else(|| json!({}));
-            let object = value
-                .as_object_mut()
-                .ok_or_else(|| invalid("invalid fleet row"))?;
-            object.remove("activity");
-            object.extend(
-                serde_json::to_value(row)?
-                    .as_object()
-                    .ok_or_else(|| invalid("invalid fleet projection"))?
-                    .clone(),
-            );
-            encoded.insert(id.clone(), value);
+            encoded.insert(id.clone(), serde_json::to_value(row)?);
         }
         let removed: BTreeSet<_> = batch
             .iter()
@@ -300,22 +441,20 @@ impl Store {
                 "fleet durability uncertain; reopen required",
             ));
         }
+        if head < self.high_water {
+            return Err(invalid("fleet cursor cannot decrease"));
+        }
         let mut document = self.document.clone();
         document["high_water"] = json!(head);
         document["rows"] = encoded.values().chain(retained).cloned().collect();
         let bytes = serde_json::to_vec(&document)?;
         self.writable = false;
-        let temp = self.path.with_extension("tmp");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, &self.path)?;
-        File::open(parent(&self.path))?.sync_all()?;
+        // Reserve first: a failed snapshot write may burn positions, never reuse them.
+        replace(
+            &self.path.with_extension("cursor"),
+            &serde_json::to_vec(&json!({"high_water":head}))?,
+        )?;
+        replace(&self.path, &bytes)?;
         self.high_water = head;
         self.document = document;
         self.writable = true;
