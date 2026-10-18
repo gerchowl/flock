@@ -71,9 +71,10 @@ impl Fixture {
         let mcp_output = UnixListener::bind(&mcp_output_path).unwrap();
         let launch_fixture = crate::structured::runtime::tests::Fixture::for_socket();
         let profile = launch_fixture.profile("mcp-config", "2.1.296");
-        let endpoint =
-            crate::structured::launch::SessionMcp::new(&std::env::current_exe().unwrap(), &socket)
-                .unwrap();
+        // Registration pins a canonical executable. Capture the same launch
+        // identity when the test binary is reached through a target symlink.
+        let binary = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let endpoint = crate::structured::launch::SessionMcp::new(&binary, &socket).unwrap();
         profile.register_flock_mcp(Some(lease), &endpoint).unwrap();
         let config_index = profile
             .args()
@@ -109,7 +110,7 @@ impl Fixture {
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/fixtures/scoped-mcp/parent.py"
             ))
-            .arg(std::env::current_exe().unwrap())
+            .arg(&binary)
             .arg(mcp_config)
             .arg(&mcp_output_path)
             .env_clear()
