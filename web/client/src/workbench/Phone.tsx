@@ -40,7 +40,8 @@ type Tab = "inbox" | "agents";
 export function PhoneWorkbench(props: PhoneProps): JSX.Element {
   const [tab, setTab] = createSignal<Tab>("inbox");
   const [onAgent, setOnAgent] = createSignal(false);
-  const blocked = (): number => props.inbox.filter((card) => card.blocking).length;
+  // The same count as the sidebar badge: what the server lists as waiting on a human.
+  const blocked = (): number => props.rows().reduce((sum, row) => sum + row.waitingOnHuman.length, 0);
   const headline = (): string => (blocked() === 0 ? "Nothing is blocked on you." : `${blocked()} blocked on you.`);
   /*
    * The agent screen is a history entry, so the system back gesture returns

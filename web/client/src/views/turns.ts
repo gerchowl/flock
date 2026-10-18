@@ -52,14 +52,38 @@ function startsTurn(entry: SessionEntry): boolean {
   return typeof content === "string" || blocks(entry).some((block) => block["type"] === "text");
 }
 
-/** The one-line command of a tool call: its command, path or first string input. */
-export function commandOf(input: JsonValue | undefined): string {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) return "";
-  for (const key of ["command", "file_path", "path", "pattern", "url"]) {
+const SUMMARY_KEYS = ["command", "file_path", "path", "pattern", "url"] as const;
+
+/** The input's value under a well-known key, or `null`. */
+function knownInput(input: JsonValue | undefined): string | null {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
+  for (const key of SUMMARY_KEYS) {
     const value = input[key];
     if (typeof value === "string") return value;
   }
+  return null;
+}
+
+/** The one-line command of a tool call: its command, path or first string input. */
+export function commandOf(input: JsonValue | undefined): string {
+  const known = knownInput(input);
+  if (known !== null) return known;
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return "";
   return Object.values(input).find((value): value is string => typeof value === "string") ?? "";
+}
+
+/** The longest input summary a card shows, in characters; longer ones end in an ellipsis. */
+export const SUMMARY_MAX = 200;
+
+/**
+ * What a permission card shows for a tool's input: the well-known key's value
+ * bounded to {@link SUMMARY_MAX}, or a typed placeholder naming the tool when
+ * the input has none (a card never claims an empty input).
+ */
+export function inputSummary(tool: string, input: JsonValue | undefined): string {
+  const known = knownInput(input);
+  if (known === null) return `(no summary for ${tool})`;
+  return known.length > SUMMARY_MAX ? `${known.slice(0, SUMMARY_MAX - 1)}…` : known;
 }
 
 /** Groups `entries` into turns and pairs tool calls with their results. */

@@ -9,6 +9,7 @@ import { render } from "solid-js/web";
 
 import type { AgentState } from "../src/gen/AgentState";
 import type { ServerFrame } from "../src/gen/ServerFrame";
+import { SUMMARY_MAX } from "../src/views/turns";
 import { emptyLayout } from "../src/layout/model";
 import type { Mode } from "../src/layout/phone";
 import { createWireFleet } from "../src/wire/fleet";
@@ -27,8 +28,10 @@ afterEach(() => {
 const state: AgentState = { turn: "idle", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "needs_human", source: {} };
 const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAll(`[data-testid="${id}"]`)];
 
-type App = { h: Harness; root: HTMLElement; fleet: (id: string, waiting: string[]) => void; event: (agent: string, id: string, tool?: string, input?: object, requestSeq?: number) => void;
-  close: (agent: string, id: string) => void; synced: (agent: string) => void };
+type App = { h: Harness; root: HTMLElement; fleet: (id: string, waiting: string[]) => void; event: (agent: string, id: string, tool?: string, input?: object, requestSeq?: number, tsMs?: number) => void;
+  close: (agent: string, id: string) => void;
+  raw: (agent: string, ev: object) => void;
+  gap: (agent: string) => void; synced: (agent: string) => void };
 
 function mountInbox(mode: Mode = "desktop"): App {
   const h = new Harness();
@@ -50,17 +53,22 @@ function mountInbox(mode: Mode = "desktop"): App {
     h,
     root,
     fleet: (id, waiting) => send({ t: "ev", sub_id: fleetSub, stream: "fleet", seq: ++fleetSeq, ts_ms: 0, ev: { type: "fleet.upsert", row: { id, label: id.toUpperCase(), state, waiting_on_human: waiting } } }),
-    event: (agent, id, tool = "Bash", input = { command: "just check" }, requestSeq = 7) =>
+    event: (agent, id, tool = "Bash", input = { command: "just check" }, requestSeq = 7, tsMs = 0) =>
       send({
         t: "ev",
         sub_id: agentSub(agent),
         stream: `agent/${agent}`,
         seq: ++agentSeq,
-        ts_ms: 0,
+        ts_ms: tsMs,
         ev: { type: "flk_permission_request", state: "open", request_id: id, request_seq: requestSeq, request: { subtype: "can_use_tool", tool_name: tool, input, tool_use_id: `tool-${id}` } } as never,
       }),
     close: (agent, id) =>
-      send({ t: "ev", sub_id: agentSub(agent), stream: `agent/${agent}`, seq: ++agentSeq, ts_ms: 0, ev: { type: "flk_permission_request", state: "closed", request_id: id, decision: "allow" } as never }),
+      send({ t: "ev", sub_id: agentSub(agent), stream: `agent/${agent}`, seq: ++agentSeq, ts_ms: 0, ev: { type: "flk_permission_request", state: "closed", request_id: id, decision: "allow_once", message: null, principal: "p", source: "token" } as never }),
+    raw: (agent, ev) => send({ t: "ev", sub_id: agentSub(agent), stream: `agent/${agent}`, seq: ++agentSeq, ts_ms: 0, ev: ev as never }),
+    gap: (agent) => {
+      send({ t: "gap", sub_id: agentSub(agent), from: agentSeq + 1, to: agentSeq + 2 });
+      agentSeq += 2;
+    },
     synced: (agent) => send({ t: "synced", sub_id: agentSub(agent), seq: agentSeq }),
   };
 }
@@ -143,18 +151,100 @@ describe("live permission inbox", () => {
   });
 
   for (const mode of ["desktop", "phone"] as const) {
-    test(`two agents are ordered by first-listed age, then matched event seq (${mode})`, () => {
+    test(`cards sort by each request's own server age, not the agent's (${mode})`, () => {
       const { root, fleet, event } = mountInbox(mode);
       fleet("kite", ["k1"]);
       fleet("atlas", ["a1", "a2"]);
-      event("atlas", "a2", "Write", { file_path: "later.rs" });
-      event("kite", "k1", "Bash", { command: "kite cmd" });
-      event("atlas", "a1", "Read", { file_path: "a-first.rs" });
-      const order = cards(root).map((text) => (text.match(/kite cmd|later\.rs|a-first\.rs/) ?? [""])[0]);
-      // kite was listed first; atlas's cards follow by event seq (a2's came before a1's).
-      expect(order).toEqual(["kite cmd", "later.rs", "a-first.rs"]);
+      event("atlas", "a2", "Write", { file_path: "oldest.rs" }, 1, 10);
+      event("kite", "k1", "Bash", { command: "newest cmd" }, 2, 30);
+      event("atlas", "a1", "Read", { file_path: "middle.rs" }, 3, 20);
+      const order = cards(root).map((text) => (text.match(/oldest\.rs|middle\.rs|newest cmd/) ?? [""])[0]);
+      // kite's agent was listed first, but atlas's a2 request is older on the wire.
+      expect(order).toEqual(["oldest.rs", "middle.rs", "newest cmd"]);
     });
   }
+
+  test("equal server times fall back to the agent's age, then the stream seq", () => {
+    const { root, fleet, event } = mountInbox();
+    fleet("kite", ["k1"]);
+    fleet("atlas", ["a1", "a2"]);
+    event("atlas", "a2", "Write", { file_path: "second.rs" }, 1, 5);
+    event("atlas", "a1", "Read", { file_path: "third.rs" }, 2, 5);
+    event("kite", "k1", "Bash", { command: "first cmd" }, 3, 5);
+    expect(cards(root).map((text) => (text.match(/second\.rs|third\.rs|first cmd/) ?? [""])[0])).toEqual(["first cmd", "second.rs", "third.rs"]);
+  });
+
+  test("the phone headline counts waiting_on_human, like the badge, even after a closed record", () => {
+    const { root, fleet, event, close } = mountInbox("phone");
+    fleet("atlas", ["r1", "r2"]);
+    event("atlas", "r1");
+    close("atlas", "r1");
+    expect(cards(root)).toHaveLength(1);
+    expect(root.querySelector('[data-testid="inbox-headline"]')?.textContent).toBe("2 blocked on you.");
+  });
+
+  test("a record that does not match the decided shape fails visibly, naming what is wrong", () => {
+    const { root, fleet, raw } = mountInbox();
+    fleet("atlas", ["r1"]);
+    // Today's server: an open record without request_seq (before #1941).
+    raw("atlas", { type: "flk_permission_request", state: "open", request_id: "r1", request: { tool_name: "Bash", input: {}, tool_use_id: "t", subtype: "can_use_tool" } });
+    expect(cards(root)).toHaveLength(1);
+    expect(cards(root)[0]).toContain("permission r1");
+    expect(cards(root)[0]).toContain("Unusable permission record: request_seq is missing or not an integer");
+    expect(cards(root)[0]).not.toContain("Loading details");
+  });
+
+  test("an unlisted or unreadable bad record gets a notice card, and a good record for a listed id replaces the error", () => {
+    const { root, fleet, event, raw } = mountInbox();
+    fleet("atlas", ["r1"]);
+    raw("atlas", { type: "flk_permission_request", state: "open", request_id: "auto-1" });
+    raw("atlas", { type: "flk_permission_request", state: "open" });
+    expect(cards(root).length).toBe(3);
+    expect(cards(root)[1]).toContain("permission auto-1 (not awaiting you)");
+    expect(cards(root)[2]).toContain("unreadable permission record");
+    expect(cards(root)[2]).toContain("request_id is missing");
+    raw("atlas", { type: "flk_permission_request", state: "open", request_id: "r1" });
+    expect(cards(root)[0]).toContain("Unusable permission record");
+    event("atlas", "r1");
+    expect(cards(root)[0]).toContain("just check");
+  });
+
+  test("an invalid closed record fails visibly; a closed record with a typed reason closes", () => {
+    const { root, fleet, event, raw, close } = mountInbox();
+    fleet("atlas", ["r1", "r2"]);
+    event("atlas", "r1");
+    event("atlas", "r2");
+    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r1", decision: "maybe", principal: "p", source: "token" });
+    expect(cards(root)).toHaveLength(2);
+    expect(cards(root)[0]).toContain('decision "maybe" is not one of allow_once, allow_always, deny');
+    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r2", reason: "ended" });
+    expect(cards(root)).toHaveLength(1);
+    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r1", reason: "bogus" });
+    expect(cards(root)[0]).toContain("reason \"bogus\" is not one of ended, cancelled, result, interrupted");
+    close("atlas", "r1");
+    expect(cards(root)).toEqual([]);
+  });
+
+  test("a tool with no known input key shows a typed placeholder, and a long input is bounded", () => {
+    const { root, fleet, event } = mountInbox();
+    fleet("atlas", ["r1", "r2"]);
+    event("atlas", "r1", "Mystery", { n: 1 }, 1, 1);
+    event("atlas", "r2", "Bash", { command: "x".repeat(SUMMARY_MAX * 3) }, 2, 2);
+    expect(cards(root)[0]).toContain("(no summary for Mystery)");
+    const detail = root.querySelectorAll('[data-testid="inbox-card"] .card__detail')[1]?.textContent ?? "";
+    expect(detail).toBe(`${"x".repeat(SUMMARY_MAX - 1)}…`);
+  });
+
+  test("a history gap marks the agent's cards stale until its next entry", () => {
+    const { root, fleet, event, gap } = mountInbox();
+    fleet("atlas", ["r1"]);
+    event("atlas", "r1");
+    expect($$(root, "inbox-stale")).toHaveLength(0);
+    gap("atlas");
+    expect($$(root, "inbox-stale")).toHaveLength(1);
+    event("atlas", "r1");
+    expect($$(root, "inbox-stale")).toHaveLength(0);
+  });
 
   test("the agent subscription opens with the first id and closes when the list empties", () => {
     const { h, fleet } = mountInbox();

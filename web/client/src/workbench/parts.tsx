@@ -67,13 +67,20 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
             </p>
             <h3 class="card__title">{card.title}</h3>
             <p class="card__detail">{card.detail}</p>
-            <div class="card__choices">
-              <For each={card.choices}>{(choice) => <Waits label={choice} reasonId={reason} />}</For>
-              <Waits label="Edit…" reasonId={reason} />
-            </div>
-            <p id={reason} class="waits__reason">
-              Answering waits for {card.waitsFor}.
-            </p>
+            <Show when={card.stale}>
+              <p class="card__stale" data-testid="inbox-stale">
+                This agent's history has a gap; this may be out of date.
+              </p>
+            </Show>
+            <Show when={card.choices.length > 0}>
+              <div class="card__choices">
+                <For each={card.choices}>{(choice) => <Waits label={choice} reasonId={reason} />}</For>
+                <Waits label="Edit…" reasonId={reason} />
+              </div>
+              <p id={reason} class="waits__reason">
+                Answering waits for {card.waitsFor}.
+              </p>
+            </Show>
           </article>
           );
         }}

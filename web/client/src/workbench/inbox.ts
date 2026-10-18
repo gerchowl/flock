@@ -27,6 +27,8 @@ export type InboxCard = {
   readonly waitsFor: string;
   /** A permission card's server `request_seq`, verbatim, for PR 2's decide; absent on samples and pending cards. */
   readonly requestSeq?: number;
+  /** The agent's stream had a history gap that nothing has followed yet: the card may be out of date. */
+  readonly stale?: boolean;
 };
 
 const SAMPLE_WAITS_FOR = "the inbox stream (G5 #1597)";
