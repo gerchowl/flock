@@ -575,9 +575,10 @@ stall reporting exactly as for started turns. The transport serializes its host
 fast response. This is an internal stream fact, not an EventHub event kind or
 mesh frame. Its monotonic stamp belongs only to the current launch and cannot
 be reconstructed on replay; a raw host record without that stamp is skipped.
-Admission is not proof of a successful pipe write or provider turn. A cancelled
-admission requests process shutdown as well as pipe cancellation. Transport
-failure remains an explicit worker failure, and output backpressure delays
+Admission is not proof of a successful pipe write or provider turn. An unavailable
+acceptance observer requests process shutdown as well as pipe cancellation.
+Ordinary I/O cancellation does not record stop intent or change the observed exit
+outcome. Transport failure remains an explicit worker failure, and output backpressure delays
 notification rather than dropping it. No queue/scheduler feed is needed.
 
 The caller supplies monotonic observation time and its configured `stall_ms`;

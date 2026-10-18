@@ -72,6 +72,7 @@ fn transport(root: &SessionConfigDir) -> (Transport, [UnixStream; 2]) {
             data_dir: root.path().into(),
             agent: "input-fixture".into(),
             session: "input-session".into(),
+            storage: Default::default(),
         },
         "fixture-version".into(),
     )
