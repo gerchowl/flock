@@ -1186,15 +1186,20 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   `unicode` and `sessionid`; the short `sig` alias
   matches only the complete name, preserving ordinary `design` parameters.
   Exact credential header names (`Authorization`, `Proxy-Authorization`,
-  `Cookie`, `Set-Cookie`, API-key names and the `X-` credential-header family)
+  `Private-Token`, `Cookie`, `Set-Cookie`, API-key names and the `X-`
+  credential-header family)
   allow horizontal whitespace before `:` and mask values even without space
-  after it, including names glued to curl's `-H` option. Header recognition
+  after it, including names glued to curl's `-H` option or a short-flag
+  cluster ending in `H`, such as `-sSLH`. Header recognition
   classifies the complete name, so `refs/heads/cookie` is a ref name rather
   than a `Cookie` header. Generic credential labels such as `token`, `session`
   and `secret`, including prefixed labels, require whitespace or end-of-string
   after `:`. This preserves refspecs and terminal targets such as
   `refs/heads/token:refs/heads/x`, `token:main`, `deploy-token:main` and
   `mysession:0`.
+  Bare compact refspecs such as `cookie:cookie` and `authorization:main` are
+  masked in logs because they are indistinguishable from compact credential
+  headers, an acceptable loss of diagnostic detail to avoid exposing secrets.
   These rules shape diagnostic logs only; executed argv is never rewritten.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location

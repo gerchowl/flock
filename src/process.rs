@@ -573,7 +573,7 @@ fn redact_arg(arg: &str) -> String {
     static HEADER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static COMPACT_HEADER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let header = HEADER.get_or_init(|| {
-        // Capture complete names, including ref paths and a glued curl option.
+        // Capture complete names, including ref paths and glued curl options.
         regex::Regex::new(&format!(
             r"(?i)(([\w/-]*{})[ \t]*:)",
             crate::report::redact::secret_label_pattern("")
@@ -581,8 +581,9 @@ fn redact_arg(arg: &str) -> String {
         .expect("static secret header pattern")
     });
     let compact = COMPACT_HEADER.get_or_init(|| {
+        // A single-dash ASCII short-flag cluster may end in curl's H option.
         regex::Regex::new(&format!(
-            r"(?i)^(?:authorization|proxy-authorization|cookie|set-cookie|{}|x-[\w-]*{})$",
+            r"^(?:-[A-Za-z]*H)?(?i:authorization|proxy-authorization|private-token|cookie|set-cookie|{}|x-[\w-]*{})$",
             crate::report::redact::API_KEY_LABEL_PATTERN,
             crate::report::redact::secret_label_pattern("")
         ))
@@ -591,7 +592,6 @@ fn redact_arg(arg: &str) -> String {
     if let Some(found) = header.captures_iter(arg).find_map(|captures| {
         let found = captures.get(1)?;
         let name = captures.get(2)?.as_str();
-        let name = name.strip_prefix("-H").unwrap_or(name);
         let rest = &arg[found.end()..];
         // HTTP permits compact exact headers. Generic words need spacing so
         // refspecs and terminal targets retain their values in the audit trail.
@@ -1352,6 +1352,73 @@ mod tests {
             "session:0",
             "deploy-token:main",
             "mysession:0",
+        ] {
+            assert_eq!(redact_arg(argument), argument);
+        }
+    }
+
+    #[test]
+    fn dev_base_compact_header_names_remain_masked() {
+        let secret = ["glpat", "abc123"].join("-");
+        // These are all four header names masked by the ac26226e dev base.
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "private-token",
+            "x-api-key",
+        ] {
+            for name in [name.to_owned(), name.to_ascii_uppercase()] {
+                for prefix in ["", "-H"] {
+                    let label = format!("{prefix}{name}:");
+                    let logs =
+                        logged_fixture_args(&[format!("{label}{secret}"), "ordinary".into()]);
+                    assert!(!logs.contains(&secret), "{label}: {logs}");
+                    assert!(logs.contains(&label), "{logs}");
+                    assert!(logs.contains("<redacted> ordinary"), "{logs}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn curl_short_flag_clusters_mask_glued_credential_headers() {
+        let secret = ["fixture", "combined", "credential"].join("-");
+        for prefix in ["-sH", "-vH", "-sSLH"] {
+            for name in [
+                "Authorization",
+                "Proxy-Authorization",
+                "Private-Token",
+                "Cookie",
+                "X-Api-Key",
+                "X-Auth-Token",
+                "X-Amz-Security-Token",
+                "x-csrf-token",
+            ] {
+                let value = match name {
+                    "Authorization" => format!("Bearer {secret}"),
+                    "Cookie" => format!("a={secret}; c=d"),
+                    _ => secret.clone(),
+                };
+                let label = format!("{prefix}{name}:");
+                let logs = logged_fixture_args(&[format!("{label}{value}"), "ordinary".into()]);
+                assert!(!logs.contains(&secret), "{label}: {logs}");
+                assert!(logs.contains(&label), "{logs}");
+                assert!(logs.contains("<redacted> ordinary"), "{logs}");
+            }
+        }
+    }
+
+    #[test]
+    fn compact_header_refspec_ambiguity_is_conservatively_masked() {
+        for argument in ["cookie:cookie", "authorization:main"] {
+            let label = argument.split_once(':').unwrap().0;
+            assert_eq!(redact_arg(argument), format!("{label}: <redacted>"));
+        }
+        for argument in [
+            "--sHAuthorization:main",
+            "-1HAuthorization:main",
+            "-sHtoken:main",
+            "refs/heads/private-token:refs/heads/x",
         ] {
             assert_eq!(redact_arg(argument), argument);
         }
