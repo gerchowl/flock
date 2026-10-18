@@ -5686,6 +5686,18 @@ mod tests {
             response["error"]["data"]["nearest_enclosing_worktree"],
             serde_json::to_value(enclosing).unwrap()
         );
+        let failures = &response["error"]["data"]["repository_probe_failures"];
+        assert!(
+            failures.is_array(),
+            "every path-not-root refusal has an array: {response}"
+        );
+        if enclosing.is_none() {
+            assert_eq!(
+                failures,
+                &serde_json::json!([]),
+                "no hint means no retained probe failure: {response}"
+            );
+        }
     }
 
     #[test]
@@ -6195,10 +6207,15 @@ mod tests {
     fn kill_api_with_invalid_stored_repo_preserves_checkout_and_branch() {
         let (repo, checkout, mut app) = exact_root_fixture("invalid-stored-repo-api");
         let workspace_id = push_worktree_workspace(&mut app, &repo, &checkout);
+        app.state.workspaces.reverse();
         let invalid = repo.join("plain-directory");
         std::fs::create_dir(&invalid).unwrap();
         let invalid = invalid.canonicalize().unwrap();
-        app.state.workspaces[1]
+        app.state
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+            .expect("fixture workspace must exist")
             .worktree_space
             .as_mut()
             .unwrap()
