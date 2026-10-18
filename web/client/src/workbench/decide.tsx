@@ -139,10 +139,16 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
   const bytes = (): number => utf8Bytes(message().trim());
   /** The request the card shows now. */
   const current = (): Target | null => (props.card.requestSeq === undefined ? null : { agent: props.card.agent, id: props.card.id, seq: props.card.requestSeq, title: props.card.title });
-  // The first request this card shows is the one the person sees first; later ones need an acknowledgement.
-  untrack(() => {
-    const now = current();
-    if (bound() === null && now !== null) setBound(now);
+  // The first request this card shows is the one the person sees first, whenever it arrives (a card
+  // can be pending first); later ones need an acknowledgement. Bound before any button can render enabled.
+  const bindFirst = (): void =>
+    untrack(() => {
+      const now = current();
+      if (bound() === null && now !== null) setBound(now);
+    });
+  bindFirst();
+  createEffect(() => {
+    if (props.card.requestSeq !== undefined) bindFirst();
   });
   /** The card's request_seq moved since the person last acknowledged one. */
   const changed = (): boolean => {

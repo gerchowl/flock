@@ -281,6 +281,18 @@ describe("answering a prompt", () => {
     expect(box().value).toBe("");
   });
 
+  test("a card that is pending first and gets its open record later sends exactly one decide for that seq", () => {
+    const app = mountInbox("desktop", { sender: true });
+    app.fleet("atlas", ["r1"]);
+    app.synced("atlas");
+    expect(button(app, "Allow once").hasAttribute("disabled")).toBe(true);
+    app.event("atlas", "r1", "Bash", { command: "just check" }, 77);
+    expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(1);
+    expect(cmds(app)[0]?.args).toEqual({ agent: "atlas", request_id: "r1", request_seq: 77, decision: "allow_once" });
+  });
+
   test("Always allow needs the confirm step, naming the tool, and a given message is sent", () => {
     const app = prompt();
     const input = app.root.querySelector<HTMLInputElement>(".decide__message");
