@@ -11,6 +11,7 @@ pub(super) struct Recorder<'a> {
     uncertain: &'a AtomicBool,
     cancel: &'a AtomicBool,
     controls: &'a ControlPlane,
+    storage: (&'a super::super::blobs::BlobStore, usize),
 }
 impl<'a> Recorder<'a> {
     pub fn new(
@@ -22,6 +23,7 @@ impl<'a> Recorder<'a> {
         uncertain: &'a AtomicBool,
         cancel: &'a AtomicBool,
         controls: &'a ControlPlane,
+        storage: (&'a super::super::blobs::BlobStore, usize),
     ) -> Self {
         Self {
             file,
@@ -32,6 +34,7 @@ impl<'a> Recorder<'a> {
             uncertain,
             cancel,
             controls,
+            storage,
         }
     }
     fn record(
@@ -51,6 +54,7 @@ impl<'a> Recorder<'a> {
             self.uncertain,
             synthetic,
             grant_request_id,
+            self.storage,
         )
     }
     fn audit(&mut self, value: &Value) -> io::Result<Received> {

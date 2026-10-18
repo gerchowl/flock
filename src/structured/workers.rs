@@ -209,6 +209,7 @@ impl Workers {
                     let profile = prepare().map_err(|error| (error.code(), error.to_string()))?;
                     let location = StreamLocation {
                         data_dir: state.clone(),
+                        storage: Default::default(),
                         agent: record.agent_id.clone(),
                         session: record.session_id.clone(),
                     };
