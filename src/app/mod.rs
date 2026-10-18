@@ -1998,10 +1998,8 @@ impl App {
             self.state.config.channels = config.channels.clone();
             crate::channels::issue_tokens(&config.channels, &short_host_name());
         }
-        // Valid sections retain their existing live consumers.
-        if !invalid_section("name") {
-            self.state.config.name = config.name.clone();
-        }
+        // The cached node name is startup-owned, matching its reload classification.
+        // Valid live sections retain their existing consumers.
         if !invalid_section("onboarding") {
             self.state.config.onboarding = config.onboarding;
         }
@@ -3773,6 +3771,35 @@ sidebar_pane_gap = 99
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// ADR-0002's live snapshot must agree with the startup-owned node label.
+    #[test]
+    fn reload_config_name_report_matches_the_running_name_until_restart() {
+        let _guard = config_env_guard();
+        let path = temp_config_path("reload-startup-name");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = test_app();
+        let original_name = app.state.config.name.clone();
+        std::fs::write(&path, "name='renamed.example.test'\nonboarding=false\n").unwrap();
+        for _ in 0..2 {
+            let report = app.reload_config();
+            assert_eq!(app.state.config.name, original_name);
+            assert_eq!(app.state.config.onboarding, Some(false));
+            assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+            assert_eq!(
+                report
+                    .sections
+                    .iter()
+                    .find(|section| section.section == "name")
+                    .unwrap()
+                    .status,
+                crate::config::reload::SectionStatus::RestartRequired
+            );
+        }
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     #[test]
     fn removed_key_on_live_reload_applies_other_settings() {
         let _guard = config_env_guard();
@@ -3781,16 +3808,22 @@ sidebar_pane_gap = 99
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
         let mut app = test_app();
         let workspace_count = app.state.workspaces.len();
+        let original_name = app.state.config.name.clone();
         for removed in [
             "[msg]\nuplink_timeout_secs=20",
             "[msg]\nuplink_heartbeat_secs=3",
             "[msg]\ndeferral_relay_concurrency=1",
             "[[peers]]\nname='nodea'\nsummary_command='false'",
         ] {
-            std::fs::write(&path, format!("name='changed'\n{removed}\n")).unwrap();
+            std::fs::write(
+                &path,
+                format!("name='changed'\nonboarding=false\n{removed}\n"),
+            )
+            .unwrap();
             let report = app.reload_config();
             assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
-            assert_eq!(app.state.config.name, "changed");
+            assert_eq!(app.state.config.name, original_name);
+            assert_eq!(app.state.config.onboarding, Some(false));
             assert_eq!(app.state.workspaces.len(), workspace_count);
             assert!(app
                 .state

@@ -1141,8 +1141,12 @@ The default dedicated-user launch boundary remains enforced after reload.
 
 Sections with startup-owned consumers report `restart_required`: `checks`,
 `client`, `gpu_command`, `icon`, `msg`, `name`, `security`, `sessions`, `spawn`, `systemone`,
-`thermal_command`, `title`, and `web`. A section can have a live reader while
-another consumer still requires restart; repeated reloads retain that outcome
-until the process restarts. In particular, socket account policy
+`thermal_command`, `title`, and `web`. The node `name` stays at its startup value,
+matching the cached node identity. While an edit to a restart-required section
+remains unapplied, **every later reload reports overall `partial` until restart**,
+even if the file has not changed again. Each reload compares these sections with
+the startup configuration, not the previous reload; reverting the edit to its
+startup value removes that restart requirement. A section can have a live reader
+while another consumer still requires restart. In particular, socket account policy
 never changes on reload, and existing worker storage policy remains fixed
 (the `[sessions]` follow-up is #1975). These outcomes replace silent omissions.
