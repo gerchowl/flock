@@ -107,11 +107,29 @@ describe("live permission inbox", () => {
     expect(cards(root)[0]).toContain("just check");
   });
 
-  test("an open record shows a card even when fleet-lite does not list its id", () => {
+  test("an open record for an unlisted id, an automatic request, shows no card", () => {
     const { root, fleet, event } = mountInbox();
     fleet("atlas", ["listed"]);
-    event("atlas", "unlisted", "Edit", { file_path: "src/b.rs" });
+    event("atlas", "automatic", "Edit", { file_path: "src/b.rs" });
+    expect(cards(root)).toHaveLength(1);
+    expect(cards(root)[0]).not.toContain("src/b.rs");
+  });
+
+  test("an unlisted id with an open record shows a card once it is listed, an automatic request turned manual", () => {
+    const { root, fleet, event } = mountInbox();
+    fleet("atlas", ["listed"]);
+    event("atlas", "automatic", "Edit", { file_path: "src/b.rs" });
+    fleet("atlas", ["listed", "automatic"]);
     expect(cards(root).map((text) => text.includes("src/b.rs"))).toEqual([true, false]);
+  });
+
+  test("a card leaves when the id drops out of the fleet list, without a closed record", () => {
+    const { root, fleet, event } = mountInbox();
+    fleet("atlas", ["r1", "r2"]);
+    event("atlas", "r1");
+    fleet("atlas", ["r2"]);
+    expect(cards(root)).toHaveLength(1);
+    expect(cards(root)[0]).toContain("permission r2");
   });
 
   test("a listed id without its record is a visible pending card; once synced it says there is none", () => {

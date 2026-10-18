@@ -2,15 +2,20 @@
  * The live inbox of open permission prompts (ADR-0038 §1, §2a, §3; #1749
  * PR 1, read-only).
  *
- * The state comes from the server's permission record on `agent/<id>`
- * (`wire/permission-record.ts`, #2224): a card shows from an open record and
- * goes on the closed record with the same `request_id`, never on a client
- * guess. An open record on a subscribed stream shows a card even when
- * fleet-lite does not list its id: the record is the authority (#2224). A
- * closed record for an id with no open record is ignored. Fleet-lite's
- * `waiting_on_human` chooses which streams to subscribe to, and a listed id
- * with no record yet shows a loading card (or, once the stream has synced
- * without one, says so); a listed id is never hidden.
+ * The card set is fleet-lite's `waiting_on_human`, the server's answer to
+ * "what waits on a human". An id that is not listed never shows a card, even
+ * when its stream has an open record: the server opens a record for an
+ * automatic request (one a session grant pre-approves) too, with no flag, and
+ * that card would be one nobody can act on. A listed id's details and
+ * `request_seq` come from the server's permission record on `agent/<id>`
+ * (`wire/permission-record.ts`, #2224), and a listed id with no open record
+ * yet shows a loading card (or, once the stream has synced without one, says
+ * so); a listed id is never hidden. A card leaves on whichever server signal
+ * arrives first: the closed record with its `request_id`, or the id dropping
+ * out of `waiting_on_human`. A closed id does not come back as pending while
+ * the fleet still lists it; a closed record for an unknown id is ignored. An
+ * open record for an unlisted id waits: if the request turns manual, the id
+ * is listed and its card shows.
  *
  * One subscription per agent with listed ids, opened when its first id is
  * listed and closed when its list empties. The focused transcript tile's own
@@ -92,9 +97,10 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
     const ordered = [...agents.entries()].sort(([, a], [, b]) => a.listedAt - b.listedAt);
     setCards(
       ordered.flatMap(([agent, tracked]) => {
-        const records = [...tracked.open.values()].sort((a, b) => a.seq - b.seq).map((found) => card(agent, tracked, found.record.request_id, found));
-        const pending = tracked.ids.filter((id) => !tracked.open.has(id) && !tracked.closed.has(id)).map((id) => card(agent, tracked, id, undefined));
-        return [...records, ...pending];
+        const shown = tracked.ids.filter((id) => tracked.open.has(id) || !tracked.closed.has(id));
+        const rank = (id: string): number => tracked.open.get(id)?.seq ?? Number.POSITIVE_INFINITY;
+        // `sort` is stable, so ids without a record keep the server's listed order.
+        return [...shown].sort((a, b) => rank(a) - rank(b)).map((id) => card(agent, tracked, id, tracked.open.get(id)));
       }),
     );
   };
