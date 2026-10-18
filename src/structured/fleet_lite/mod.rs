@@ -192,10 +192,12 @@ impl Store {
     /// refuses loading even if an older snapshot survives. Lost/corrupt snapshots
     /// recover only with a valid cursor. Never delete both recovery records.
     /// Opening preserves damaged snapshot bytes; a later write replaces them.
-    /// An empty, unmarked lock without either record is uninitialized and opens at
-    /// zero, including a legacy snapshot-only lock (#1974). This is safe because
-    /// an unmarked lock means nothing was ever reserved. Before marking the lock,
-    /// opening syncs the cursor's parent directory even when its value already
+    /// An empty, unmarked lock without either record opens at zero, including a
+    /// legacy snapshot-only lock (#1974). Legacy locks were always unmarked, even
+    /// after publishing positions. That layout's only floor was `fleet.json`:
+    /// if it is lost, no better floor can be recovered, preserving the old behavior.
+    /// The legacy layout never landed on `dev` and never shipped.
+    /// Before marking the lock, opening syncs the cursor's parent directory even when its value already
     /// matches: a previous rename may have succeeded but its directory sync failed.
     /// A directory-sync failure refuses opening and leaves the lock unmarked.
     /// `fleet.lock` carries the initialization marker: deleting it together with
