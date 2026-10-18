@@ -116,8 +116,11 @@ impl Runtime {
     pub(super) fn queue_custody_committed(
         &self,
         key: &crate::mesh::key::MessageKey,
-    ) -> Option<bool> {
-        self.queue.as_ref()?.custody_committed(key)
+    ) -> Result<bool, crate::structured::queue::custody::Unknown> {
+        self.queue
+            .as_ref()
+            .ok_or(crate::structured::queue::custody::Unknown::OwnerUnavailable)?
+            .custody_committed(key)
     }
     pub(super) fn queue_update(&self) -> Option<super::workers::queue::Update> {
         self.queue.as_ref()?.update()

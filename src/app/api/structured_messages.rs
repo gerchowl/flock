@@ -59,7 +59,7 @@ impl Ack {
     ) -> String {
         let committed = workers.queue_custody_committed(&self.signed.target_agent, &self.key);
         // Recovery cannot revoke a committed or still uncertain owner outcome.
-        let code = if self.recovered && (committed != Some(false) || transient(code)) {
+        let code = if self.recovered && (committed != Ok(false) || transient(code)) {
             ErrorCode::InputWriteUnknown
         } else {
             code
@@ -303,6 +303,19 @@ impl App {
             ]
             .into(),
         };
+        // Persist uncertainty before the owner can commit. Maintenance may run
+        // before its acknowledgement, but must retain the right to resolve expiry.
+        if stored(|s| {
+            s.queue_commitment_unknown(
+                &signed.key,
+                Some(crate::structured::queue::custody::Unknown::AdmissionPending),
+                super::messages::now_ms() as i64,
+            )
+        })?
+        .is_none()
+        {
+            return Err(ErrorCode::MessageExpired);
+        }
         let ticket =
             self.structured_enqueue(signed.target_agent.clone(), generation, item, principal)?;
         Ok((ticket, ack))
@@ -314,7 +327,7 @@ impl App {
         for (ack, code) in std::mem::take(&mut self.structured_sends.failed) {
             match stored(|s| s.get(&ack.key)) {
                 Ok(Some(record)) if ack.recovered && record.state == "inbox" => {
-                    self.retry_queue_custody(record.envelope, code);
+                    self.retry_queue_custody_at(record.envelope, code, now);
                 }
                 Ok(Some(record))
                     if matches!(record.state.as_str(), "refused" | "recipient_gone") =>
@@ -323,13 +336,18 @@ impl App {
                     self.publish_queue_refusal(&record.envelope, code)
                 }
                 Err(_) if ack.recovered => {
-                    self.retry_queue_custody(ack.signed, code);
+                    self.retry_queue_custody_at(ack.signed, code, now);
                 }
                 _ => (),
             }
         }
         for ack in std::mem::take(&mut self.structured_sends.acknowledged) {
             let current = stored(|s| s.get(&ack.key));
+            if matches!(&current, Ok(Some(r)) if matches!(r.state.as_str(), "refused" | "recipient_gone"))
+            {
+                self.structured_sends.retries.remove(&ack.key);
+                continue;
+            }
             let settled =
                 matches!(&current, Ok(Some(r)) if matches!(r.state.as_str(), "delivered" | "read"));
             let settlement = if settled {
@@ -340,21 +358,45 @@ impl App {
                 })
             };
             if let Err(code) = settlement {
-                self.retry_queue_custody(ack.signed, code);
+                self.retry_queue_custody_at(ack.signed, code, now);
                 continue;
             }
             self.record_queue_delivery(ack, settled);
         }
         for signed in std::mem::take(&mut self.structured_sends.recovering) {
+            // Expiry cleanup and a final proof do not perform a new admission,
+            // so they must not wait behind the admission retry floor.
+            if stored(|s| s.get(&signed.key))
+                .is_ok_and(|row| row.is_none_or(|row| row.state != "inbox"))
+            {
+                self.retry_queue_custody_at(signed, ErrorCode::InputWriteUnknown, now);
+                continue;
+            }
             if self.fleet_pause.paused
-                || (!changed
-                    && self
-                        .structured_sends
-                        .retries
-                        .get(&signed.key)
-                        .is_some_and(|r| now < r.at))
+                || (self
+                    .structured_sends
+                    .retries
+                    .get(&signed.key)
+                    .is_some_and(|r| {
+                        let owner = self.custody_owner_generation(&signed);
+                        now < r.at
+                            && (!changed
+                                || (!r.superseded(
+                                    u64::from(owner.is_some()),
+                                    owner.unwrap_or(0),
+                                    false,
+                                ) && now < r.wake_at))
+                    }))
             {
                 self.structured_sends.recovering.push(signed);
+                continue;
+            }
+            if self
+                .structured_workers
+                .queue_custody_committed(&signed.target_agent, &signed.key)
+                == Ok(true)
+            {
+                self.retry_queue_custody_at(signed, ErrorCode::InputWriteUnknown, now);
                 continue;
             }
             match self.admit_queue_custody(&signed) {
@@ -365,7 +407,7 @@ impl App {
                         .park(Staged(String::new(), ticket, Some(ack)), tx);
                 }
                 Err(code) => {
-                    self.retry_queue_custody(signed, code);
+                    self.retry_queue_custody_at(signed, code, now);
                 }
             }
         }
@@ -420,8 +462,22 @@ impl App {
     /// Retry the same authenticated envelope using the existing bounded backoff.
     /// Permanent refusals use the ordinary status event, never a log-only outcome.
     pub(super) fn retry_queue_custody(&mut self, signed: Envelope, code: ErrorCode) -> ErrorCode {
+        self.retry_queue_custody_at(signed, code, std::time::Instant::now())
+    }
+    fn custody_owner_generation(&self, signed: &Envelope) -> Option<u64> {
+        let (_, _, generation) = self.state.structured_agents.get(&signed.target_agent)?;
+        self.structured_workers
+            .runtime(&signed.target_agent, generation)?;
+        Some(generation)
+    }
+    fn retry_queue_custody_at(
+        &mut self,
+        signed: Envelope,
+        code: ErrorCode,
+        now: std::time::Instant,
+    ) -> ErrorCode {
         if stored(|s| s.get(&signed.key))
-            .is_ok_and(|r| r.is_none_or(|r| !matches!(r.state.as_str(), "inbox")))
+            .is_ok_and(|r| r.is_none_or(|r| !matches!(r.state.as_str(), "inbox" | "inbox_expired")))
         {
             self.structured_sends.retries.remove(&signed.key);
             return code;
@@ -431,25 +487,28 @@ impl App {
         let committed = self
             .structured_workers
             .queue_custody_committed(&signed.target_agent, &signed.key);
-        let ack = if committed == Some(true) {
-            self.node_id.as_deref().and_then(|origin| {
-                payload(&signed).ok().map(|data| {
-                    Ack::custody(&signed, data.message, signed.key.origin_node != origin)
-                })
-            })
-        } else {
-            None
-        };
-        if let Some(ack) = ack.filter(|_| {
-            stored(|s| {
+        if committed == Ok(true)
+            && stored(|s| {
                 s.settle_queue_admission(&signed.key, None, super::messages::now_ms() as i64)
             })
             .is_ok()
-        }) {
-            self.record_queue_delivery(ack, false);
+        {
+            // Proof settles even a payload-less expiry. Post-commit accounting
+            // can use retained reply material, but never reconstructs deleted data.
+            if let Some(ack) = self.node_id.as_deref().and_then(|origin| {
+                payload(&signed).ok().map(|data| {
+                    Ack::custody(&signed, data.message, signed.key.origin_node != origin)
+                })
+            }) {
+                self.record_queue_delivery(ack, false);
+            }
+            self.structured_sends.retries.remove(&signed.key);
+            self.structured_sends
+                .recovering
+                .retain(|e| e.key != signed.key);
             return ErrorCode::InputWriteUnknown;
         }
-        if committed == Some(false)
+        if committed == Ok(false)
             && !transient(code)
             && stored(|s| {
                 s.settle_queue_admission(
@@ -467,7 +526,7 @@ impl App {
         let remaining = match stored(|s| {
             s.queue_commitment_unknown(
                 &signed.key,
-                (committed.is_none()).then_some(code),
+                committed.err(),
                 super::messages::now_ms() as i64,
             )
         }) {
@@ -484,11 +543,13 @@ impl App {
                 None
             }
         };
-        let now = std::time::Instant::now();
+        // Only a different runtime/generation is progress that can bypass the
+        // floor on a wake. The current owner's own failure is not progress.
+        let owner = self.custody_owner_generation(&signed);
         let mut retry = super::mesh_routes::Retry::failed(
             self.structured_sends.retries.get(&signed.key),
-            0,
-            0,
+            u64::from(owner.is_some()),
+            owner.unwrap_or(0),
             now,
         );
         if let Some(remaining) = remaining {

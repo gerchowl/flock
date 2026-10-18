@@ -30,10 +30,12 @@ pub(super) struct Retry {
     generation: u64,
     attempts: u32,
     pub(super) at: Instant,
+    /// Owner wakes may shorten long recovery backoff, but never this floor.
+    pub(super) wake_at: Instant,
 }
 
 impl Retry {
-    fn superseded(&self, enrollment: u64, generation: u64, awakened: bool) -> bool {
+    pub(super) fn superseded(&self, enrollment: u64, generation: u64, awakened: bool) -> bool {
         awakened || self.enrollment != enrollment || self.generation != generation
     }
 
@@ -64,6 +66,7 @@ impl Retry {
             generation,
             attempts,
             at: now + delay,
+            wake_at: now + Duration::from_secs(4),
         }
     }
 }

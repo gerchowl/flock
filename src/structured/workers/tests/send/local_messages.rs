@@ -487,3 +487,27 @@ fn local_message_unknown_native_target_never_projects_as_legacy() {
         }
     });
 }
+
+#[test]
+fn local_custody_cached_identity_attests_without_reading_the_key_file() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = AppQueue::new(2533, |_| max_policy()).await;
+        node(&mut r);
+        ready(&mut r).await;
+        let _caller = caller(&mut r, "agent_worker_2200");
+        fs::remove_file(crate::config::state_dir().join("mesh/identity.json")).unwrap();
+        let target = r.case.id.clone();
+        let answer = security::socket_method(&mut r, send(&target, "cached-key-thread")).await;
+        let key: MessageKey =
+            serde_json::from_value(answer["result"]["message_key"].clone()).unwrap();
+        let row = with_store(|s| s.get(&key).map_err(|e| e.to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(crate::mesh::sign::verify(&row.envelope), Ok(()));
+        assert_eq!(row.envelope.sender, "agent_worker_2200");
+        assert_eq!(row.state, "delivered");
+        r.until(|r| inputs(r).len() == 1).await;
+        r.stop().await;
+    });
+}

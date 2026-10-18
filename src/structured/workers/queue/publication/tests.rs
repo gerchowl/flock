@@ -828,7 +828,7 @@ fn custody_completion_pending_key_is_unknown_until_the_owner_finishes() {
         Service::open(root.path(), "input-fixture", NonZeroU64::new(1).unwrap()).unwrap();
     client.enqueue(request(&key)).unwrap();
     assert_eq!(
-        format!("{:?}", client.custody_committed(&key)),
+        format!("{:?}", client.custody_committed(&key).ok()),
         "None",
         "a buffered admission may still commit and must not be revoked"
     );
@@ -837,7 +837,7 @@ fn custody_completion_pending_key_is_unknown_until_the_owner_finishes() {
         ErrorCode::SessionBusy
     );
     assert_eq!(
-        format!("{:?}", client.custody_committed(&key)),
+        format!("{:?}", client.custody_committed(&key).ok()),
         "None",
         "a failed duplicate enqueue must not clear the first pending request"
     );
@@ -847,7 +847,7 @@ fn custody_completion_pending_key_is_unknown_until_the_owner_finishes() {
         ErrorCode::SessionBusy
     );
     assert_eq!(
-        format!("{:?}", client.custody_committed(&other)),
+        format!("{:?}", client.custody_committed(&other).ok()),
         "Some(false)",
         "an unbuffered request cannot commit later"
     );
@@ -855,7 +855,7 @@ fn custody_completion_pending_key_is_unknown_until_the_owner_finishes() {
     owner.tick(&t.input_handle(), false, &|| {});
     assert!(owner.flush(false, &|| {}));
     assert_eq!(
-        format!("{:?}", client.custody_committed(&key)),
+        format!("{:?}", client.custody_committed(&key).ok()),
         "Some(true)"
     );
     assert!(client.update().unwrap().admitted.unwrap().1.is_ok());
@@ -880,12 +880,12 @@ fn custody_completion_pending_key_is_unknown_until_the_owner_finishes() {
         ErrorCode::InputWriteUnknown
     );
     assert_eq!(
-        format!("{:?}", client.custody_committed(&other)),
-        "None",
+        client.custody_committed(&other),
+        Err(crate::structured::queue::custody::Unknown::WriteUncertain),
         "uncertain writes need reopen before absence can be proven"
     );
     assert_eq!(
-        format!("{:?}", client.custody_committed(&key)),
+        format!("{:?}", client.custody_committed(&key).ok()),
         "Some(true)"
     );
     drop(owner);
@@ -920,15 +920,15 @@ fn custody_completion_opaque_journal_cannot_prove_key_absence() {
     )
     .unwrap();
     assert_eq!(
-        format!("{:?}", client.custody_committed(&key)),
-        "None",
+        client.custody_committed(&key),
+        Err(crate::structured::queue::custody::Unknown::JournalOpaque),
         "opaque committed records may contain the custody admission"
     );
     assert_eq!(fs::read(path).unwrap(), before);
 }
 
 #[test]
-fn custody_tracking_stays_bounded_across_many_committed_messages() {
+fn custody_tracking_shares_retained_fold_across_many_committed_messages() {
     use crate::structured::queue::model::{Kind, Producer};
     let root = root();
     let (mut owner, client) = Service::open(
@@ -961,12 +961,12 @@ fn custody_tracking_stays_bounded_across_many_committed_messages() {
             &owner.scheduler.journal().item_snapshot()
         ));
         assert!(
-            client.committed_custody.lock().tracked_keys() <= 2,
+            client.committed_custody.lock().pending.len() <= 2,
             "custody bookkeeping must not retain one key per historical message"
         );
     }
     for key in &keys {
-        assert_eq!(client.custody_committed(key), Some(true));
+        assert_eq!(client.custody_committed(key).ok(), Some(true));
     }
     drop(owner);
     drop(client);
@@ -976,9 +976,9 @@ fn custody_tracking_stays_bounded_across_many_committed_messages() {
         NonZeroU64::new(u64::MAX).unwrap(),
     )
     .unwrap();
-    assert!(client.committed_custody.lock().tracked_keys() <= 2);
+    assert!(client.committed_custody.lock().pending.len() <= 2);
     for key in &keys {
-        assert_eq!(client.custody_committed(key), Some(true));
+        assert_eq!(client.custody_committed(key).ok(), Some(true));
     }
     close(t);
 }

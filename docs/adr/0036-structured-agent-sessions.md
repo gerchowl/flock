@@ -948,25 +948,56 @@ same queue (owner decision 5): there is no second input path.
   marker (architect decision on #1958). A delegate's structured result and receipt become a
   `delegate_result` item for its parent. The Stop-hook recap and nudge
   become server work on `result` (§3a).
-- **Queue custody completion (#2160, #2186).** The journal owner's committed
-  fold is authoritative: a committed `MessageKey` cannot later be refused as
-  never committed. The custody lookup shares that fold, without a separate
-  growing key index. Auxiliary tracking is bounded by in-flight admissions;
-  lookups scan retained items without file I/O on the server loop. The journal
-  itself still retains its item history. A definite absence requires a complete,
-  readable fold with no pending admission. Production never emits queue removals;
-  future garbage collection must preserve commitment proof before removing items.
+- **Queue custody completion (#2160, #2186, #2164).** The journal owner's
+  committed fold is authoritative: a committed `MessageKey` cannot later be
+  refused as never committed. The custody lookup shares that fold, without a
+  separate growing key index. Auxiliary tracking is bounded by in-flight
+  admissions. Each lookup is O(retained journal items), with no file I/O on the
+  server loop. The journal still retains its item history. The shared snapshot
+  refreshes on admission completion and publication; between an append and that
+  refresh, the owner and snapshot may briefly retain two item vectors. A definite
+  absence requires a complete, readable fold with no pending admission.
+  Production never emits queue removals; future garbage collection must preserve
+  commitment proof before removing items.
   Missing owners/runtimes, read-only or future-format journals and uncertain
-  writes cannot prove absence. Even a permanent recovery error then keeps the
+  writes cannot prove absence. Admission persists `admission_pending` before
+  dispatching to the owner, so expiry before acknowledgement retains uncertainty.
+  Even a permanent recovery error then keeps the
   same key recovering until its existing inbox TTL (24 hours), never a fresh
-  send or a terminal refusal. Existing jittered backoff is 4–5 seconds, then
-  48–60 seconds, then capped at 240–300 seconds, clipped to the remaining TTL.
-  Message status remains `queued` with typed detail
-  `input_write_unknown:<registered cause code>`. Resolution clears that detail.
-  At TTL expiry the existing inbox-expiry/tombstone path records
-  `input_write_unknown:commitment_unknown_at_expiry`, retained for the existing
-  outcome window. Expiry ends recovery, but does not prove nothing was committed.
-  No new store outcome or wire kind is introduced.
+  send or a terminal refusal. Jittered backoff is 4–5 seconds, then 48–60 seconds,
+  then capped at 240–300 seconds, clipped to the remaining TTL. Owner/capacity
+  wakes can shorten a long backoff, but consecutive attempts against the same
+  owner generation remain at least four seconds apart. A new owner generation
+  can resume immediately on its wake; a failure's own notification cannot
+  create a retry loop.
+  Status stays `queued` with typed detail `input_write_unknown:<cause>`:
+  `owner_unavailable`, `admission_pending`, `write_uncertain`, `journal_opaque`,
+  `queue_journal_newer` or `queue_journal_corrupt`. These describe the owner's
+  uncertainty, independently of the error that triggered recovery. A reply is
+  not journal commitment proof: `queued` and the unknown detail may coexist
+  with a reply until the owner answers, custody settles, or its TTL expires.
+  At TTL expiry the existing expiry/tombstone path records
+  `input_write_unknown:commitment_unknown_at_expiry` for the existing outcome
+  window. Expiry ends recovery without proving that nothing committed.
+  Positive proof before expiry is persisted settles `Delivered` directly, even
+  if the inbox deadline passed between commit and settlement. After persisted
+  expiry, only an expiry carrying unknown commitment can change to `Delivered`,
+  exactly once, with typed detail `delivered_after_expiry:<item_id>` (the proven
+  MessageKey's lifecycle identity). A commit proof never changes an existing
+  `Delivered` or `Refused` outcome.
+  This corrects the expiry label only: deleted payload is not restored, released
+  quota is not re-acquired, and the original deadlines stay unchanged. Replies
+  use the existing payload-less path and the seven-day custody/reply deadline
+  from original admission; neither proof nor settlement extends that window.
+  Deleted payload cannot be signature-verified again or recover original pane
+  metadata, so local replies requiring that material remain unavailable. Remote
+  return bindings retain their existing deadline and validation requirements.
+  No new store
+  outcome or wire kind is introduced.
+  Attested sends reuse the process's validated node identity without reading its
+  key file per send. Pre-upgrade unsigned custody rows are not retroactively
+  attested: their replies retain the terminal route during the existing inbox
+  window (up to 24 hours), rather than acquiring structured sender authority.
 - **Storage.** The queue persists as `queue.jsonl` beside the agent's
   session streams (§4).
 

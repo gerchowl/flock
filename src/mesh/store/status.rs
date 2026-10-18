@@ -170,8 +170,13 @@ impl<D: DiskSpace> Store<D> {
         if commitment_unknown && state == "expired" {
             error = Some(COMMITMENT_UNKNOWN_AT_EXPIRY.into());
         }
+        let delivered_after_expiry = matches!(record.state.as_str(), "delivered" | "read")
+            && error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(super::queue_custody::DELIVERED_AFTER_EXPIRY));
         if error.is_some()
             && !commitment_unknown
+            && !delivered_after_expiry
             && !matches!(
                 state.as_str(),
                 "refused" | "recipient_gone" | hub_outcomes::UNDELIVERABLE

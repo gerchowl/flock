@@ -329,11 +329,11 @@ impl Workers {
         &self,
         id: &str,
         key: &crate::mesh::key::MessageKey,
-    ) -> Option<bool> {
+    ) -> Result<bool, crate::structured::queue::custody::Unknown> {
         self.entries
-            .get(id)?
-            .runtime
-            .as_ref()?
+            .get(id)
+            .and_then(|entry| entry.runtime.as_ref())
+            .ok_or(crate::structured::queue::custody::Unknown::OwnerUnavailable)?
             .queue_custody_committed(key)
     }
     /// Consume an immutable completion/cut from the current generation only.

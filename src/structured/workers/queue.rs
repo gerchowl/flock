@@ -12,6 +12,7 @@ use crate::structured::{
 };
 pub(crate) mod publication;
 pub(crate) mod recovery;
+use crate::structured::queue::custody::Unknown;
 use std::{
     cell::RefCell,
     io,
@@ -25,14 +26,10 @@ type CommittedCustody = Arc<parking_lot::Mutex<CustodyIndex>>;
 struct CustodyIndex {
     items: Arc<Vec<Item>>,
     pending: std::collections::HashMap<crate::mesh::key::MessageKey, usize>,
-    uncertain: bool,
+    uncertain: Option<Unknown>,
 }
 impl CustodyIndex {
-    #[cfg(test)]
-    fn tracked_keys(&self) -> usize {
-        self.pending.len()
-    }
-    fn finish(&mut self, key: crate::mesh::key::MessageKey, complete: bool) {
+    fn finish(&mut self, key: crate::mesh::key::MessageKey, unknown: Option<Unknown>) {
         let remove = self.pending.get_mut(&key).is_some_and(|count| {
             *count -= 1;
             *count == 0
@@ -40,7 +37,7 @@ impl CustodyIndex {
         if remove {
             self.pending.remove(&key);
         }
-        self.uncertain |= !complete;
+        self.uncertain = self.uncertain.or(unknown);
     }
 }
 
@@ -97,25 +94,30 @@ pub(in crate::structured) struct Client {
     committed_custody: CommittedCustody,
 }
 impl Client {
-    pub fn custody_committed(&self, key: &crate::mesh::key::MessageKey) -> Option<bool> {
+    pub fn custody_committed(&self, key: &crate::mesh::key::MessageKey) -> Result<bool, Unknown> {
         // Only clone the committed fold under the lock; lookup is linear in
         // retained items, with no file I/O or extra historical-key allocation.
         let (items, uncertain) = {
             let index = self.committed_custody.lock();
             (
                 index.items.clone(),
-                index.uncertain || index.pending.contains_key(key),
+                index.uncertain.or_else(|| {
+                    index
+                        .pending
+                        .contains_key(key)
+                        .then_some(Unknown::AdmissionPending)
+                }),
             )
         };
         if items
             .iter()
             .any(|item| custody_key(item).as_ref() == Some(key))
         {
-            Some(true)
-        } else if uncertain {
-            None
+            Ok(true)
+        } else if let Some(reason) = uncertain {
+            Err(reason)
         } else {
-            Some(false)
+            Ok(false)
         }
     }
     /// Full returns session_busy; disconnection returns agent_not_found. Success
@@ -132,7 +134,7 @@ impl Client {
         });
         if result.is_err() {
             if let Some(key) = key {
-                index.finish(key, true);
+                index.finish(key, None);
             }
         }
         result
@@ -222,7 +224,7 @@ impl Service {
         let committed_custody = Arc::new(parking_lot::Mutex::new(CustodyIndex {
             items: scheduler.journal().item_snapshot(),
             pending: Default::default(),
-            uncertain: !scheduler.journal().complete_items(),
+            uncertain: scheduler.journal().commitment_unknown(),
         }));
         Ok((
             Self {
@@ -328,7 +330,7 @@ impl Service {
             if let Some(key) = key {
                 let mut index = self.committed_custody.lock();
                 index.items = self.scheduler.journal().item_snapshot();
-                index.finish(key, self.scheduler.journal().complete_items());
+                index.finish(key, self.scheduler.journal().commitment_unknown());
             }
             (id, result)
         });
@@ -411,7 +413,9 @@ impl Service {
         {
             let mut index = self.committed_custody.lock();
             index.items = self.scheduler.journal().item_snapshot();
-            index.uncertain |= !self.scheduler.journal().complete_items();
+            index.uncertain = index
+                .uncertain
+                .or(self.scheduler.journal().commitment_unknown());
         }
         let facts = self.scheduler.take_facts();
         let changed = !facts.is_empty()

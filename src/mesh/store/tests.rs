@@ -5227,7 +5227,6 @@ fn custody_completion_transport_refusal_cannot_revoke_own_inbox() {
 
 #[test]
 fn custody_unknown_expiry_is_recorded_by_every_inbox_expiry_path() {
-    use crate::api::error_code::ErrorCode;
     for path in [
         "maintain",
         "read",
@@ -5245,13 +5244,21 @@ fn custody_unknown_expiry_is_recorded_by_every_inbox_expiry_path() {
             .unwrap();
         assert_eq!(
             store
-                .queue_commitment_unknown(&mail.key, Some(ErrorCode::QueueJournalNewer), 0)
+                .queue_commitment_unknown(
+                    &mail.key,
+                    Some(crate::structured::queue::custody::Unknown::JournalNewer),
+                    0
+                )
                 .unwrap(),
             Some(DAY_MS as u64)
         );
         let unchanged = store.connection.total_changes();
         store
-            .queue_commitment_unknown(&mail.key, Some(ErrorCode::QueueJournalNewer), 0)
+            .queue_commitment_unknown(
+                &mail.key,
+                Some(crate::structured::queue::custody::Unknown::JournalNewer),
+                0,
+            )
             .unwrap();
         assert_eq!(
             store.connection.total_changes(),
@@ -5284,7 +5291,11 @@ fn custody_unknown_expiry_is_recorded_by_every_inbox_expiry_path() {
             "recovery" => {
                 assert_eq!(
                     store
-                        .queue_commitment_unknown(&mail.key, Some(ErrorCode::AgentNotFound), DAY_MS)
+                        .queue_commitment_unknown(
+                            &mail.key,
+                            Some(crate::structured::queue::custody::Unknown::OwnerUnavailable),
+                            DAY_MS
+                        )
                         .unwrap(),
                     None
                 );
@@ -5327,7 +5338,6 @@ fn custody_unknown_expiry_is_recorded_by_every_inbox_expiry_path() {
 
 #[test]
 fn custody_unknown_diagnostic_clears_when_custody_is_settled_or_owner_answers() {
-    use crate::api::error_code::ErrorCode;
     for action in ["owner", "delivered", "read", "read-inbox"] {
         let fixture = Fixture::new();
         let mut store = fixture.open(0);
@@ -5337,7 +5347,11 @@ fn custody_unknown_diagnostic_clears_when_custody_is_settled_or_owner_answers() 
             .accept_local(&mail, CUSTODY_TTL_MS, "native", "session", 0)
             .unwrap();
         store
-            .queue_commitment_unknown(&mail.key, Some(ErrorCode::AgentNotFound), 0)
+            .queue_commitment_unknown(
+                &mail.key,
+                Some(crate::structured::queue::custody::Unknown::OwnerUnavailable),
+                0,
+            )
             .unwrap();
         let expected = match action {
             "owner" => {
@@ -5376,5 +5390,160 @@ fn custody_unknown_diagnostic_clears_when_custody_is_settled_or_owner_answers() 
                 .state,
             expected
         );
+    }
+}
+
+#[test]
+fn custody_followup_proof_resolves_only_unknown_expiry_without_reclaiming_payload() {
+    use crate::structured::queue::custody::Unknown;
+    for unknown in [false, true] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        let mail = envelope();
+        store.set_local_node(&mail.key.origin_node);
+        store
+            .accept_local(&mail, CUSTODY_TTL_MS, "native", "session", 0)
+            .unwrap();
+        if unknown {
+            store
+                .queue_commitment_unknown(&mail.key, Some(Unknown::WriteUncertain), 0)
+                .unwrap();
+        }
+        store.maintain(DAY_MS).unwrap();
+        let quota = usage(&store);
+        let deadlines = |store: &Store<Disk>| {
+            store.connection.query_row(
+            "SELECT custody_deadline,inbox_deadline,outcome_until FROM envelopes WHERE origin=?1 AND id=?2",
+            params![mail.key.origin_node,mail.key.message_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        ).unwrap()
+        };
+        let original_deadlines = deadlines(&store);
+        if unknown {
+            store
+                .settle_queue_admission(&mail.key, None, DAY_MS + 1)
+                .unwrap();
+            let status = store
+                .status(&mail.key.origin_node, &mail.correlation_id, DAY_MS + 1)
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.state, "delivered");
+            assert_eq!(
+                status.detail,
+                Some(format!(
+                    "delivered_after_expiry:{}",
+                    mail.key.lifecycle_id()
+                ))
+            );
+            let changes = store.connection.total_changes();
+            store
+                .settle_queue_admission(&mail.key, None, DAY_MS + 2)
+                .unwrap();
+            assert_eq!(
+                store.connection.total_changes(),
+                changes + 1,
+                "only the clock changes on repeated proof"
+            );
+            assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "delivered");
+            assert_eq!(
+                store
+                    .collection_record(&mail.key, CUSTODY_TTL_MS)
+                    .unwrap()
+                    .unwrap()
+                    .remaining_ms,
+                0,
+                "the original reply deadline still ends recovery"
+            );
+        } else {
+            assert!(matches!(
+                store.settle_queue_admission(&mail.key, None, DAY_MS + 1),
+                Err(Error::InvalidState)
+            ));
+            assert_eq!(
+                store.get(&mail.key).unwrap().unwrap().state,
+                "inbox_expired"
+            );
+        }
+        assert!(store
+            .get(&mail.key)
+            .unwrap()
+            .unwrap()
+            .envelope
+            .body
+            .is_empty());
+        assert_eq!(
+            usage(&store),
+            quota,
+            "proof must not re-acquire released quota"
+        );
+        assert_eq!(
+            deadlines(&store),
+            original_deadlines,
+            "no reply or retention extension"
+        );
+        drop(store);
+        let store = fixture.open(DAY_MS + 2);
+        assert_eq!(
+            store.get(&mail.key).unwrap().unwrap().state,
+            if unknown {
+                "delivered"
+            } else {
+                "inbox_expired"
+            }
+        );
+    }
+}
+
+#[test]
+fn custody_followup_commit_before_expiry_maintenance_settles_directly() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store.set_local_node(&mail.key.origin_node);
+    store
+        .accept_local(&mail, CUSTODY_TTL_MS, "native", "session", 0)
+        .unwrap();
+    store
+        .settle_queue_admission(&mail.key, None, DAY_MS)
+        .unwrap();
+    store.maintain(DAY_MS).unwrap();
+    let row = store.get(&mail.key).unwrap().unwrap();
+    assert_eq!(row.state, "delivered");
+    assert_eq!(row.envelope.body, mail.body);
+    assert_eq!(
+        store
+            .status(&mail.key.origin_node, &mail.correlation_id, DAY_MS)
+            .unwrap()
+            .unwrap()
+            .detail,
+        None
+    );
+}
+
+#[test]
+fn custody_followup_positive_proof_never_changes_terminal_delivery_or_refusal() {
+    for refusal in [None, Some("msg_not_allowed")] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        let mail = envelope();
+        store.set_local_node(&mail.key.origin_node);
+        store
+            .accept_local(&mail, CUSTODY_TTL_MS, "native", "session", 0)
+            .unwrap();
+        store.settle_queue_admission(&mail.key, refusal, 1).unwrap();
+        let before = store
+            .status(&mail.key.origin_node, &mail.correlation_id, 1)
+            .unwrap()
+            .unwrap();
+        let quota = usage(&store);
+        store
+            .settle_queue_admission(&mail.key, None, DAY_MS)
+            .unwrap();
+        let after = store
+            .status(&mail.key.origin_node, &mail.correlation_id, DAY_MS)
+            .unwrap()
+            .unwrap();
+        assert_eq!((after.state, after.detail), (before.state, before.detail));
+        assert_eq!(usage(&store), quota);
     }
 }

@@ -1252,7 +1252,8 @@ fn custody_unknown_owner_is_observable_until_ttl_then_stops() {
         assert_eq!(
             r.app
                 .structured_workers
-                .queue_custody_committed(&r.case.id, &d.envelope.key,),
+                .queue_custody_committed(&r.case.id, &d.envelope.key,)
+                .ok(),
             None
         );
         for _ in 0..8 {
@@ -1280,7 +1281,7 @@ fn custody_unknown_owner_is_observable_until_ttl_then_stops() {
         assert_eq!(status.state, "queued");
         assert_eq!(
             status.detail.as_deref(),
-            Some("input_write_unknown:agent_not_found")
+            Some("input_write_unknown:owner_unavailable")
         );
         let expired = now + 24 * 60 * 60 * 1000;
         with_store(|s| s.maintain(expired - 100).map_err(|e| e.to_string())).unwrap();
@@ -1363,12 +1364,6 @@ fn custody_followup_commit_survives_expiry_before_settlement() {
         r.until(|_| ticket.committed.try_recv().is_ok_and(|x| x.is_ok()))
             .await;
         with_store(|s| {
-            s.queue_commitment_unknown(
-                &d.envelope.key,
-                Some(crate::api::error_code::ErrorCode::InputWriteUnknown),
-                now,
-            )
-            .unwrap();
             s.maintain(now + crate::mesh::store::DAY_MS)
                 .map_err(|e| e.to_string())
         })
@@ -1492,12 +1487,21 @@ fn custody_followup_present_owner_uncertain_write_retries_same_key() {
             status.detail.as_deref(),
             Some("input_write_unknown:write_uncertain")
         );
+        let attempts = r.app.structured_sends.custody_attempts;
+        let now = std::time::Instant::now();
+        for n in 0..100 {
+            r.app
+                .finish_structured_messages(true, now + std::time::Duration::from_millis(n));
+        }
+        assert_eq!(
+            r.app.structured_sends.custody_attempts, attempts,
+            "a present owner's failure wakes must respect the retry floor"
+        );
         let at = r
             .app
             .structured_sends
             .recovery_deadline(std::time::Instant::now())
             .unwrap();
-        let attempts = r.app.structured_sends.custody_attempts;
         r.app.finish_structured_messages(true, at);
         r.until(|r| {
             r.app.structured_sends.custody_attempts > attempts
@@ -1514,6 +1518,71 @@ fn custody_followup_present_owner_uncertain_write_retries_same_key() {
                 .retry_queue_custody(d.envelope.clone(), ErrorCode::InputWriteUnknown),
             ErrorCode::InputWriteUnknown
         );
+        r.stop().await;
+    });
+}
+
+#[test]
+fn custody_followup_payloadless_expiry_settles_from_owner_proof() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2534).await;
+        let d = mail(&r);
+        let now = crate::app::notifications::now_ms() as i64;
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (
+                    &r.case.id,
+                    &r.app
+                        .state
+                        .structured_agents
+                        .get(&r.case.id)
+                        .unwrap()
+                        .0
+                        .session_id,
+                ),
+                false,
+                now,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let (ticket, ack) = r.app.admit_queue_custody(&d.envelope).unwrap();
+        r.until(|_| ticket.committed.try_recv().is_ok_and(|x| x.is_ok()))
+            .await;
+        with_store(|s| {
+            s.maintain(now + crate::mesh::store::DAY_MS)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let expired = with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+            .unwrap()
+            .unwrap();
+        assert!(expired.envelope.body.is_empty());
+        r.app.retry_queue_custody(
+            expired.envelope,
+            crate::api::error_code::ErrorCode::InputWriteUnknown,
+        );
+        drop(ack);
+        let stored = with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.state, "delivered",
+            "a proven commit outranks inbox expiry"
+        );
+        assert!(
+            stored.envelope.body.is_empty(),
+            "expiry never restores payload"
+        );
+        let attempts = r.app.structured_sends.custody_attempts;
+        let rx = request(&mut r, d.clone());
+        let response = answer(&mut r, &rx).await;
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(r.app.structured_sends.custody_attempts, attempts);
+        r.until(|r| !r.inputs().is_empty()).await;
+        assert_eq!(r.inputs().len(), 1);
         r.stop().await;
     });
 }
