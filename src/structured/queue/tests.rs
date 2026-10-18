@@ -852,7 +852,44 @@ fn known_variant_names_never_fall_back_to_unknown() {
 }
 
 #[test]
+fn null_enum_values_are_corruption_not_unknown() {
+    assert_missing_variant_name(Value::Null);
+}
+
+#[test]
+fn empty_enum_objects_are_corruption_not_unknown() {
+    assert_missing_variant_name(json!({}));
+}
+
+#[test]
+fn two_key_enum_objects_are_corruption_not_unknown() {
+    assert_missing_variant_name(json!({"future_a":42,"future_b":false}));
+}
+
+fn assert_missing_variant_name(raw: Value) {
+    for field in ["producer", "state", "kind", "priority", "delivery"] {
+        assert_corrupt_item_read_only(field, raw.clone());
+    }
+}
+
+#[test]
+fn object_form_known_producers_reject_numeric_payloads() {
+    for tag in ["human", "agent", "channel", "system", "fork"] {
+        assert_corrupt_item_read_only("producer", json!({tag:42}));
+    }
+}
+
+#[test]
 fn unknown_producer_tag_preserves_its_uninterpreted_payload() {
+    assert_unknown_producer(json!({"future_source":{"arbitrary":42}}));
+}
+
+#[test]
+fn unknown_producer_object_tag_keeps_its_numeric_payload() {
+    assert_unknown_producer(json!({"tag":42}));
+}
+
+fn assert_unknown_producer(raw: Value) {
     let root = Root::new();
     drop(root.open());
     let mut record = serde_json::to_value(Record {
@@ -860,13 +897,55 @@ fn unknown_producer_tag_preserves_its_uninterpreted_payload() {
         change: upsert("future", 0),
     })
     .unwrap();
-    let raw = json!({"future_source":{"arbitrary":42}});
     record["item"]["producer"] = raw.clone();
-    root.write_records(encode(&record).unwrap());
+    let bytes = root.write_records(encode(&record).unwrap());
     let mut journal = root.open();
+    assert_eq!(
+        journal.items().len(),
+        1,
+        "unknown producer must retain its item"
+    );
     assert_eq!(journal.items()[0].producer, Producer::Unknown(raw));
     assert_eq!(journal.replay(0).unwrap().records, [record]);
     assert!(journal.checkpoint().is_err());
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn unknown_payload_keeps_json_value_while_checkpoint_preserves_original_bytes() {
+    let root = Root::new();
+    drop(root.open());
+    let raw = r#"{ "future_source": { "z": 1, "a": "\u0061" } }"#;
+    let parsed = json!({"future_source":{"a":"a","z":1}});
+    let record = serde_json::to_string(&Record {
+        seq: 1,
+        change: upsert("future", 0),
+    })
+    .unwrap();
+    let marker = r#""producer":"human""#;
+    assert_eq!(record.matches(marker).count(), 1);
+    let record = record.replace(marker, &format!("\"producer\":{raw}"));
+    let bytes = root.write_records(format!("{record}\n"));
+    let mut journal = root.open();
+    assert_eq!(
+        journal.items()[0].producer,
+        Producer::Unknown(parsed.clone())
+    );
+    let serialized = serde_json::to_string(&journal.items()[0].producer).unwrap();
+    assert_eq!(serialized, r#"{"future_source":{"a":"a","z":1}}"#);
+    assert_ne!(serialized, raw);
+    assert_eq!(
+        journal.replay(0).unwrap().records[0]["item"]["producer"],
+        parsed
+    );
+    let error = journal.checkpoint().unwrap_err();
+    let reason = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<QueueJournalCorrupt>()
+        .unwrap();
+    assert_eq!(reason.reason, "unknown_data_prevents_checkpoint");
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
 }
 
 mod admission;
