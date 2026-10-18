@@ -430,7 +430,10 @@ mod tests {
             let failed_status = app.pane_info(0, pane_id).unwrap().agent_status;
             let failed_events = app.event_hub.events_after(sequence);
             let snapshot = crate::persist::capture(
-                &app.state.structured_agents,
+                crate::persist::RegistryCapture {
+                    registry: &app.state.structured_agents,
+                    now_ms: Some(42),
+                },
                 &app.state.workspaces,
                 &app.state.terminals,
                 &app.terminal_runtimes,

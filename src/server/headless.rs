@@ -1354,8 +1354,12 @@ impl HeadlessServer {
             return Err(HandoffError::Undrained(undrained));
         }
 
+        let retained_at_ms = self.app.prepare_retained_save();
         let snapshot = crate::persist::capture(
-            &self.app.state.structured_agents,
+            crate::persist::RegistryCapture {
+                registry: &self.app.state.structured_agents,
+                now_ms: retained_at_ms,
+            },
             &self.app.state.workspaces,
             &self.app.state.terminals,
             &self.app.terminal_runtimes,
@@ -2940,6 +2944,9 @@ impl HeadlessServer {
     /// trigger internal events that may set toast state or would normally
     /// play sounds — in headless mode we forward these to clients instead.
     fn handle_api_request_with_shutdown_check(&mut self, msg: api::ApiRequestMessage) -> bool {
+        if self.app.respond_scope_probe(&msg) {
+            return false;
+        }
         if self.shutting_down {
             // During shutdown, respond with server_unavailable.
             let response = serde_json::to_string(&api::schema::ErrorResponse {
@@ -2962,6 +2969,7 @@ impl HeadlessServer {
             msg.request.method,
             api::schema::Method::ServerLiveHandoff(_) | api::schema::Method::ServerReloadConfig(_)
         ) {
+            let scope = std::mem::replace(&mut self.app.current_api_scope, msg.scope.clone());
             let outer = (
                 self.app.current_api_peer_pid,
                 self.app.current_api_peer_birth,
@@ -2971,6 +2979,7 @@ impl HeadlessServer {
             self.app.current_api_peer_birth = Some(msg.peer_birth);
             self.app.current_api_peer_uid = Some(msg.peer_uid);
             let refusal = self.app.peer_uid_refusal(&msg.request);
+            self.app.current_api_scope = scope;
             (
                 self.app.current_api_peer_pid,
                 self.app.current_api_peer_birth,
@@ -3091,12 +3100,14 @@ impl HeadlessServer {
                 .unwrap_or_else(|_| "{}".to_string())
             })
         } else {
+            self.app.current_api_scope = msg.scope;
             self.app.current_api_peer_pid = msg.peer_pid;
             self.app.current_api_peer_birth = Some(msg.peer_birth);
             self.app.current_api_peer_uid = Some(msg.peer_uid);
             let response = self
                 .app
                 .handle_api_request_after_internal_events_drained(msg.request);
+            self.app.current_api_scope = None;
             self.app.current_api_peer_pid = None;
             self.app.current_api_peer_birth = None;
             self.app.current_api_peer_uid = None;
@@ -5184,6 +5195,7 @@ mod tests {
             .insert(pane, runtime);
         let (respond_to, response) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            scope: None,
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true,"write_timeout_ms":200}})).unwrap(),
             respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
         });
@@ -5228,6 +5240,7 @@ mod tests {
             .insert(pane, runtime);
         let (respond_to, response) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            scope: None,
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true}})).unwrap(),
             respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
         });
@@ -5434,6 +5447,7 @@ mod tests {
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let (respond_to, response) = std::sync::mpsc::channel();
         let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            scope: None,
             request: api::schema::Request {
                 id: "uid-handoff".into(),
                 method: api::schema::Method::ServerLiveHandoff(
@@ -5473,6 +5487,7 @@ mod tests {
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(
             server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                scope: None,
                 request: api::schema::Request {
                     id: "headless_stop_after_events".into(),
                     method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
@@ -8189,6 +8204,7 @@ next_tab = ""
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(
             server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                scope: None,
                 request: api::schema::Request {
                     id: "focus_b".into(),
                     method: api::schema::Method::WorkspaceFocus(api::schema::WorkspaceTarget {
@@ -9818,6 +9834,7 @@ next_tab = ""
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            scope: None,
             request: api::schema::Request {
                 id: "stale".into(),
                 method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
