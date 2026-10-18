@@ -882,10 +882,14 @@ fn read_entry(name: &str) -> Option<Entry> {
 /// update atomic: a `delegate status` running against a half-written file reads
 /// the previous round, not a prefix of the next one.
 fn write_entry(entry: &Entry) -> io::Result<()> {
+    write_entry_at(entry, &entry_path(&entry.name))
+}
+
+/// Publish a complete entry at the registry path, removing any failed temp file.
+fn write_entry_at(entry: &Entry, path: &Path) -> io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
-    let path = entry_path(&entry.name);
     let dir = path.parent().expect("the entry path always has a parent");
     std::fs::create_dir_all(dir)?;
     let temp = dir.join(format!(".{}.json.tmp", entry.name));
@@ -908,7 +912,7 @@ fn write_entry(entry: &Entry) -> io::Result<()> {
         let _ = std::fs::remove_file(&temp);
         return Err(err);
     }
-    if let Err(err) = std::fs::rename(&temp, &path) {
+    if let Err(err) = std::fs::rename(&temp, path) {
         let _ = std::fs::remove_file(&temp);
         return Err(err);
     }
@@ -3023,17 +3027,41 @@ fn fail_started(
 /// Persist an unsubmitted human block without closing its pane or checkout.
 /// Registry durability failures leave the pane available and return failure.
 fn keep_startup_block(entry: &Entry, dialog: &StartupDialog, json: bool) -> i32 {
-    let saved = write_entry(entry).and_then(|()| {
-        let path = entry_path(&entry.name);
-        let dir = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
-        std::fs::File::open(dir)?.sync_all()
-    });
+    let path = entry_path(&entry.name);
+    let saved = save_startup_block_at(entry, &path, |dir| std::fs::File::open(dir)?.sync_all());
+    emit_startup_block(entry, dialog, json, saved)
+}
+
+/// Confirm retained-block durability after publishing a complete entry.
+/// A failed directory sync can leave the new entry visible, never a prefix.
+fn save_startup_block_at(
+    entry: &Entry,
+    path: &Path,
+    sync_dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    write_entry_at(entry, path)?;
+    let dir = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    sync_dir(dir)
+}
+
+/// Report durability failure without rolling back an operator-owned prompt.
+fn emit_startup_block(
+    entry: &Entry,
+    dialog: &StartupDialog,
+    json: bool,
+    saved: io::Result<()>,
+) -> i32 {
     if let Err(err) = saved {
-        eprintln!(
-            "delegate {}: could not durably record the block; pane {} retained: {err}",
-            entry.name, entry.pane_id
-        );
-        return crate::cli::exit::FAILURE;
+        let code = crate::api::error_code::ErrorCode::WriteFailed;
+        let response = serde_json::json!({"error": {
+            "code": code.as_str(),
+            "message": format!(
+                "delegate {}: could not durably record the block; pane {} retained: {err}",
+                entry.name, entry.pane_id
+            ),
+            "data": {"pane_id": entry.pane_id, "pane_retained": true},
+        }});
+        return super::output::error(&response, code.exit());
     }
     let info = serde_json::json!({"startup_dialog": dialog.code, "status_text": dialog.refusal});
     emit_outcome(

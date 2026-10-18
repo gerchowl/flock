@@ -1363,7 +1363,7 @@ fn directory_permission_trust_start_keeps_the_named_block_for_status_and_wait() 
 enum RetainedBlockCase {
     Observe,
     AwaitAndSend,
-    RegistryFailure,
+    RegistryFailure(bool),
 }
 
 #[test]
@@ -1376,10 +1376,12 @@ fn permission_trust_start_await_names_block_and_send_after_operator_answer_works
 
 #[test]
 fn permission_trust_registry_failure_is_typed_and_retains_pane_without_partial_entry() {
-    assert_permission_trust_start(
-        include_str!("fixtures/attention-1023/claude-trust-with-permissions.txt"),
-        RetainedBlockCase::RegistryFailure,
-    );
+    for keep_on_failure in [false, true] {
+        assert_permission_trust_start(
+            include_str!("fixtures/attention-1023/claude-trust-with-permissions.txt"),
+            RetainedBlockCase::RegistryFailure(keep_on_failure),
+        );
+    }
 }
 
 fn assert_permission_trust_start(screen: &str, case: RetainedBlockCase) {
@@ -1407,9 +1409,12 @@ fn assert_permission_trust_start(screen: &str, case: RetainedBlockCase) {
     if matches!(case, RetainedBlockCase::AwaitAndSend) {
         args.push("--await");
     }
+    if matches!(case, RetainedBlockCase::RegistryFailure(true)) {
+        args.push("--keep-on-failure");
+    }
     let mut child = cli_spawn(&server, &args);
     let pane = delegate_pane(&server, "permissions");
-    let refused_entry = if matches!(case, RetainedBlockCase::RegistryFailure) {
+    let refused_entry = if matches!(case, RetainedBlockCase::RegistryFailure(_)) {
         let lock = walk(&server.base.join("state"))
             .into_iter()
             .find(|path| path.ends_with("permissions.lock"))
@@ -1446,6 +1451,8 @@ fn assert_permission_trust_start(screen: &str, case: RetainedBlockCase) {
         assert_eq!(status.and_then(|s| s.code()), Some(1), "{}", stderr(&out));
         let error = stdout_json(&out);
         assert_eq!(error["error"]["code"], "write_failed", "{error}");
+        assert_eq!(error["error"]["data"]["pane_id"], pane);
+        assert_eq!(error["error"]["data"]["pane_retained"], true);
         assert!(error["error"]["message"].as_str().unwrap().contains(&pane));
         assert!(path.is_dir(), "the pre-existing destination is untouched");
         assert!(!path
@@ -1502,9 +1509,57 @@ fn assert_permission_trust_start(screen: &str, case: RetainedBlockCase) {
         // fixture paints the prompt and reports the real SessionStart hook.
         let answered = cli(&server, &["pane", "send-keys", &pane, "Down", "Enter"]);
         assert!(answered.status.success(), "{}", stderr(&answered));
-        assert_eq!(wait_typed(&server, 1), vec![String::new()]);
+        assert_eq!(wait_typed(&server, 1), vec!["\u{1b}[B".to_string()]);
         report_session(&server, &pane);
         report(&server, &pane, "idle");
+        // SessionStart may publish idle before the renderer paints its prompt.
+        // Gate on the live screen too, so send cannot race that producer.
+        let deadline = Instant::now() + WITHIN;
+        loop {
+            let shown = request(
+                &server,
+                &serde_json::json!({
+                    "id": "operator-ready", "method": "pane.read",
+                    "params": {"pane_id": pane, "source": "detection", "format": "text"},
+                })
+                .to_string(),
+            );
+            let text = shown["result"]["read"]["text"].as_str().unwrap_or("");
+            if text.contains(&"─".repeat(48))
+                && text.lines().any(|line| line.trim() == "❯")
+                && !text.contains("pre-approves")
+                && !text.contains("Crunching")
+            {
+                break;
+            }
+            assert!(
+                agent_get(&server, "permissions").is_some(),
+                "fixture exited: {shown}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "operator answer never reached the prompt: {shown}"
+            );
+            thread::yield_now();
+        }
+        // The existing operator-input guard still applies after a manual key.
+        // Observe the fixture's normal quiet condition before the one send.
+        let settled = cli(
+            &server,
+            &[
+                "agent",
+                "wait",
+                &pane,
+                "--status",
+                "settled",
+                "--settle",
+                SETTLE,
+                "--timeout",
+                "5000",
+                "--json",
+            ],
+        );
+        assert!(settled.status.success(), "{}", stderr(&settled));
         let next = brief(&server, "after-trust.md", "Now run the task.\n");
         let mut sent = cli_spawn(
             &server,
@@ -1519,10 +1574,30 @@ fn assert_permission_trust_start(screen: &str, case: RetainedBlockCase) {
                 "--json",
             ],
         );
-        assert_eq!(
-            wait_typed(&server, 2),
-            vec![String::new(), expected_line(&next)]
-        );
+        let deadline = Instant::now() + WITHIN;
+        let lines = loop {
+            let lines = typed(&server);
+            if lines.len() >= 2 {
+                break lines;
+            }
+            if let Some(status) = sent.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "send exited before input: {}",
+                    stderr(&finish(sent))
+                );
+            }
+            assert!(
+                agent_get(&server, "permissions").is_some(),
+                "fixture exited before receiving input"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "send never reached the live fixture: {lines:?}"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(lines, vec!["\u{1b}[B".to_string(), expected_line(&next)]);
         assert!(
             exited_within(&mut sent, WITHIN).unwrap().success(),
             "{}",

@@ -1013,7 +1013,7 @@ mod tests {
             screen.to_string(),
             screen
                 .replace("17 tool", "301 tool")
-                .replace("devkit-3c4e4016", "another-checkout"),
+                .replace("fixture-project", "another-fixture-project"),
         ] {
             assert_eq!(detect_structural(&screen), Some(AgentState::Blocked));
             assert!(has_visible_blocker(&screen));
