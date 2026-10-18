@@ -7,7 +7,8 @@
 #![deny(missing_docs)]
 
 use super::launch::{
-    registry_has_messaging_socket, LaunchError, LaunchProfile, SessionConfigDir, VerifiedBinary,
+    registry_has_messaging_socket, LaunchError, LaunchProfile, SessionConfigDir, SessionMcp,
+    VerifiedBinary,
 };
 use super::supervision::{self, StopRequest};
 use super::transport::{
@@ -65,10 +66,18 @@ pub struct Runtime {
 }
 impl Runtime {
     /// Offer a bounded user envelope only while idle; WouldBlock never waits.
+    /// Successful admission emits an internal accepted-input fact through
+    /// `Received::state_input`, arming S4 silence observation before started.
+    /// Success acknowledges admission, not delivery or provider execution.
+    /// Cancellation errors also request process shutdown, not just pipe closure.
     /// `structured_turn_end_unknown` means loss concealed the boundary; await a
     /// subsequent result or explicitly stop, rather than retry as ordinary busy.
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
-        self.transport.try_submit(user)
+        let result = self.transport.try_submit(user);
+        if result.is_err() && self.control.cancelled() {
+            self.stop.request();
+        }
+        result
     }
     /// Server entry for a dispatcher-authenticated agent.decide command.
     /// Token identity is context, never a field decoded from command arguments.
@@ -126,14 +135,16 @@ impl Drop for Runtime {
 /// lookup window; see `registry_has_messaging_socket`. Forward the returned exit
 /// through the caller's event channel. This API does not expose agent.start or
 /// reserve a lease; the caller must reserve before preparing the launch.
+/// `mcp` pins this build and the owning server socket; no ambient endpoint lookup.
 pub fn run(
     state: &Path,
     profile: LaunchProfile,
     lease: super::lease::Lease,
     location: StreamLocation,
+    mcp: SessionMcp,
     ready: impl FnOnce(Runtime),
 ) -> Result<Exit, LaunchError> {
-    run_notified(state, profile, lease, location, ready, || {})
+    run_notified(state, profile, lease, location, mcp, ready, || {})
 }
 
 /// Worker assembly with a nonblocking wake after each queued stream notification.
@@ -144,12 +155,13 @@ pub(crate) fn run_notified(
     profile: LaunchProfile,
     lease: super::lease::Lease,
     location: StreamLocation,
+    mcp: SessionMcp,
     ready: impl FnOnce(Runtime),
     notify: impl Fn() + Send + 'static,
 ) -> Result<Exit, LaunchError> {
     run_controlled(
         state,
-        profile,
+        (profile, mcp),
         lease,
         location,
         ready,
@@ -161,7 +173,7 @@ pub(crate) fn run_notified(
 /// Worker-owned cancellation exists before spawn, including deadline escalation.
 pub(crate) fn run_controlled(
     state: &Path,
-    profile: LaunchProfile,
+    (profile, mcp): (LaunchProfile, SessionMcp),
     mut lease: super::lease::Lease,
     location: StreamLocation,
     ready: impl FnOnce(Runtime),
@@ -173,6 +185,7 @@ pub(crate) fn run_controlled(
     {
         return Err(io::Error::other("structured lease/stream mismatch").into());
     }
+    profile.register_flock_mcp(Some(&lease), &mcp)?;
     for entry in supervision::sweep_stale_sessions(state)? {
         crate::logging::structured_sweep_outcome(&entry);
     }
@@ -463,8 +476,12 @@ fn collect(
                             .as_object()
                             .is_some_and(|object| object.contains_key("messaging_socket_path"))
                     });
-                    let uninspectable =
-                        received.record.origin == RecordOrigin::Flk && !init_inspected;
+                    let uninspectable = received.record.origin == RecordOrigin::Flk
+                        && !init_inspected
+                        && !matches!(
+                            received.state_input(),
+                            Some(super::state::Input::Accepted { .. })
+                        );
                     if init.is_some() && !forbidden {
                         init_inspected = true;
                     }

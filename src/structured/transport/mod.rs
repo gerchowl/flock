@@ -7,6 +7,11 @@
 //! Each durable record is buffered before one write_all. Reopen repairs a torn
 //! final record without a trailing LF, logging discarded bytes
 //! and continuing its sequence; interior corruption remains an explicit error.
+//! Successful user admission also produces an ordered `flk_input_accepted` host
+//! stream record for S4 (ADR-0036 S4, #1903), not an EventHub kind or mesh event.
+//! Its live monotonic stamp is never reconstructed from persisted wall time.
+//! Admission is not a pipe-write acknowledgment. Backpressure delays the fact,
+//! while persistence/cancellation errors remain explicit worker failures.
 //! Envelope origins distinguish transport summaries from stdout lookalikes.
 //! Any top-level result ends the input gate; its outcome remains adapter work.
 #![deny(missing_docs)]
@@ -27,20 +32,30 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Accept complete lines up to 2 MiB; larger lines produce explicit summaries.
 pub const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(2);
 
+#[derive(Debug, Clone, Copy)]
+struct Accepted {
+    at: Instant,
+    at_ms: u64,
+}
+
 type Permissions = Arc<parking_lot::Mutex<Book>>;
 struct Control {
     answer: permissions::Answer,
     bytes: Vec<u8>,
 }
+struct UserInput {
+    bytes: Vec<u8>,
+    admitted: Arc<AtomicBool>,
+}
 enum Input {
-    User(Vec<u8>),
+    User(UserInput),
     Decision(Control),
     Refusal(Vec<u8>),
 }
@@ -49,6 +64,7 @@ enum Command {
     Close(Vec<permissions::Closing>),
 }
 struct ControlPlane {
+    accepted: mpsc::Receiver<Accepted>,
     book: Permissions,
     decisions: mpsc::Receiver<Command>,
     input: mpsc::SyncSender<Input>,
@@ -70,7 +86,7 @@ pub struct StreamLocation {
 pub enum RecordOrigin {
     /// Original Claude stdout, including apparent flk marker names.
     Claude,
-    /// A transport-generated oversize or invalid-UTF-8 summary.
+    /// A transport-generated summary, permission audit or input-admission fact.
     Flk,
 }
 
@@ -104,12 +120,22 @@ pub struct Received {
     pub record: StreamRecord,
     /// Interpretation using the observed harness version.
     pub event: SessionEvent,
+    accepted: Option<Accepted>,
 }
 
 impl Received {
-    /// Feed a durable stream record into S4, including book-owned close facts.
-    /// Permission audit opens are not extra stdout progress observations.
+    /// Feed an ordered stream record into S4, including admission and book closes.
+    /// Accepted-input facts carry the actual admission clocks, not dequeue time.
+    /// A replayed admission without its launch-local monotonic stamp is skipped.
+    /// Stdout lookalikes cannot become host facts. Permission audit opens are
+    /// not extra stdout progress observations.
     pub fn state_input(&self) -> Option<super::state::Input<'_>> {
+        if let Some(accepted) = self.accepted {
+            return Some(super::state::Input::Accepted {
+                at: accepted.at,
+                at_ms: accepted.at_ms,
+            });
+        }
         if self.record.permission_grant_request_id.is_some()
             && matches!(self.event, SessionEvent::CanUseTool(_))
         {
@@ -125,6 +151,10 @@ impl Received {
         }
         if self.record.origin == RecordOrigin::Flk {
             if let SessionEvent::Unknown { value, .. } = &self.event {
+                if value.get("type").and_then(Value::as_str) == Some("flk_input_accepted") {
+                    // Monotonic stamps belong to this launch, never to replay.
+                    return None;
+                }
                 if value.get("type").and_then(Value::as_str) == Some("flk_permission_request") {
                     return match (
                         value.get("state").and_then(Value::as_str),
@@ -166,6 +196,7 @@ pub struct Transport {
 #[derive(Clone)]
 pub(super) struct InputHandle {
     input: Option<mpsc::SyncSender<Input>>,
+    accepted: mpsc::SyncSender<Accepted>,
     decisions: mpsc::SyncSender<Command>,
     permissions: Permissions,
     busy: Arc<AtomicBool>,
@@ -241,7 +272,12 @@ impl Transport {
         let (input, input_rx) = mpsc::sync_channel(permissions::MAX_OPEN_PERMISSION_REQUESTS + 1);
         let (decisions, decision_rx) = mpsc::sync_channel(4);
         let permissions = Arc::new(parking_lot::Mutex::new(Book::new(location.agent.clone())));
+        // The busy gate permits one admission until stdout retires its turn.
+        // The stdout owner drains these facts before handling each response.
+        let (accepted_tx, accepted) =
+            mpsc::sync_channel(permissions::MAX_OPEN_PERMISSION_REQUESTS + 1);
         let plane = ControlPlane {
+            accepted,
             book: permissions.clone(),
             decisions: decision_rx,
             input: input.clone(),
@@ -293,6 +329,7 @@ impl Transport {
         Ok(Self {
             input: InputHandle {
                 input: Some(input),
+                accepted: accepted_tx,
                 decisions,
                 permissions,
                 busy,
@@ -462,6 +499,8 @@ impl InputHandle {
 
     /// Offer one user envelope at idle. WouldBlock means busy; it never queues a
     /// mid-turn steering write. Input is capped before serialization allocation.
+    /// Success records acceptance for S4's caller-supplied stall policy, even if
+    /// the harness never emits started. It does not acknowledge a pipe write.
     /// This is the only user-input admission path; permission responses use a private lane.
     /// Loss with no identifiable event type yields `structured_turn_end_unknown`
     /// until a real result confirms the boundary; never retry it as ordinary busy.
@@ -486,6 +525,13 @@ impl InputHandle {
             return Err(io::Error::other("stdin accepts only user envelopes"));
         }
         let bytes = encode(user)?;
+        let at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_millis()
+            .try_into()
+            .map_err(io::Error::other)?;
+        let at = Instant::now();
         if self
             .busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -496,15 +542,29 @@ impl InputHandle {
                 "session is working",
             ));
         }
+        let admitted = Arc::new(AtomicBool::new(false));
         if let Err(err) = self
             .input
             .as_ref()
             .ok_or_else(|| io::Error::other("stdin closed"))?
-            .try_send(Input::User(bytes))
+            .try_send(Input::User(UserInput {
+                bytes,
+                admitted: admitted.clone(),
+            }))
         {
             self.busy.store(false, Ordering::Release);
             return Err(io::Error::other(err.to_string()));
         }
+        if self.accepted.try_send(Accepted { at, at_ms }).is_err() {
+            self.cancel.store(true, Ordering::Release);
+            self.busy.store(false, Ordering::Release);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "admission observer unavailable",
+            ));
+        }
+        // No stdin bytes can trigger a response before the fact is queued.
+        admitted.store(true, Ordering::Release);
         Ok(())
     }
 }
@@ -546,7 +606,7 @@ fn write_inputs(
     permissions: &Permissions,
 ) -> io::Result<()> {
     let mut before_first_write = Some(before_first_write);
-    let mut pending = None;
+    let mut pending: Option<UserInput> = None;
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(cancelled());
@@ -554,7 +614,11 @@ fn write_inputs(
         if close.load(Ordering::Acquire) {
             return Ok(());
         }
-        let next = if pending.is_some() && !permissions.lock().blocked() {
+        let next = if pending
+            .as_ref()
+            .is_some_and(|input| input.admitted.load(Ordering::Acquire))
+            && !permissions.lock().blocked()
+        {
             Ok(Input::User(
                 pending.take().expect("pending input was checked"),
             ))
@@ -564,14 +628,17 @@ fn write_inputs(
         match next {
             Ok(input) => {
                 let (bytes, answer) = match input {
-                    Input::User(bytes) if permissions.lock().blocked() => {
+                    Input::User(bytes)
+                        if !bytes.admitted.load(Ordering::Acquire)
+                            || permissions.lock().blocked() =>
+                    {
                         if pending.is_some() {
                             return Err(io::Error::other(ErrorCode::PermissionInputAlreadyHeld));
                         }
                         pending = Some(bytes);
                         continue;
                     }
-                    Input::User(bytes) => (bytes, None),
+                    Input::User(input) => (input.bytes, None),
                     Input::Decision(control) => (control.bytes, Some(control.answer)),
                     Input::Refusal(bytes) => (bytes, None),
                 };
@@ -700,6 +767,7 @@ fn pump(
             if cancel.load(Ordering::Acquire) {
                 return Err(cancelled());
             }
+            recorder.accepted()?;
             while let Ok(command) = controls.decisions.try_recv() {
                 recorder.command(command)?;
             }
@@ -866,7 +934,11 @@ fn persist(
     {
         uncertain.store(true, Ordering::Release);
     }
-    Ok(Received { record, event })
+    Ok(Received {
+        record,
+        event,
+        accepted: None,
+    })
 }
 fn publish<T>(mut received: T, tx: &mpsc::SyncSender<T>, cancel: &AtomicBool) -> io::Result<()> {
     loop {
