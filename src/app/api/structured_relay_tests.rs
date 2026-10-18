@@ -730,14 +730,31 @@ fn custody_completion_unknown_retries_in_process_with_the_same_key() {
                 source: None,
             }),
         );
-        let response = answer(&mut r, &rx).await;
+        // Keep the owner unavailable until the failed receipt is processed.
+        // Its real commit may finish, but cannot race the unknown observation.
+        let owner = std::mem::replace(
+            &mut r.app.structured_workers,
+            crate::structured::workers::Workers::new(r.notify.clone()),
+        );
+        r.app
+            .structured_sends
+            .poll(&r.app.structured_workers, &r.app.state.structured_agents);
+        r.app
+            .finish_structured_messages(false, std::time::Instant::now());
+        let response: Value =
+            serde_json::from_str(&rx.try_recv().expect("failed receipt must reply")).unwrap();
         assert_eq!(response["error"]["code"], "input_write_unknown");
         assert_eq!(
             response["error"]["data"]["message_key"],
             json!(d.envelope.key)
         );
         let now = std::time::Instant::now();
-        let due = r.app.structured_sends.recovery_deadline(now).unwrap_or(now);
+        let due = r
+            .app
+            .structured_sends
+            .recovery_deadline(now)
+            .expect("unknown custody must have a recovery deadline");
+        r.app.structured_workers = owner;
         r.app.service_structured_workers(due);
         r.until(|_| {
             with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
@@ -1211,5 +1228,107 @@ fn custody_completion_recovered_conflict_cannot_revoke_committed_key() {
         );
         assert_eq!(r.inputs().len(), 1);
         r.stop().await;
+    });
+}
+
+#[test]
+fn custody_unknown_owner_is_observable_until_ttl_then_stops() {
+    run(async {
+        use crate::api::error_code::ErrorCode;
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2522).await;
+        let d = mail(&r);
+        let record = &r.app.state.structured_agents.get(&r.case.id).unwrap().0;
+        let now = crate::app::notifications::now_ms() as i64;
+        with_store(|s| {
+            s.accept_bound_delivery(&d, (&record.agent_id, &record.session_id), false, now)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        r.stop().await;
+        r.app.structured_workers = crate::structured::workers::Workers::new(std::sync::Arc::new(
+            tokio::sync::Notify::new(),
+        ));
+        assert_eq!(
+            r.app
+                .structured_workers
+                .queue_custody_committed(&r.case.id, &d.envelope.key,),
+            None
+        );
+        for _ in 0..8 {
+            assert_eq!(
+                r.app
+                    .retry_queue_custody(d.envelope.clone(), ErrorCode::AgentNotFound),
+                ErrorCode::InputWriteUnknown
+            );
+            let at = r
+                .app
+                .structured_sends
+                .recovery_deadline(std::time::Instant::now())
+                .expect("unknown commitment must retain its recovery deadline");
+            assert!(
+                at.saturating_duration_since(std::time::Instant::now())
+                    <= std::time::Duration::from_secs(300)
+            );
+        }
+        let status = with_store(|s| {
+            s.status(&d.envelope.key.origin_node, &d.envelope.correlation_id, now)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(status.state, "queued");
+        assert_eq!(
+            status.detail.as_deref(),
+            Some("input_write_unknown:agent_not_found")
+        );
+        let expired = now + 24 * 60 * 60 * 1000;
+        with_store(|s| s.maintain(expired - 100).map_err(|e| e.to_string())).unwrap();
+        assert_eq!(
+            r.app
+                .retry_queue_custody(d.envelope.clone(), ErrorCode::AgentNotFound),
+            ErrorCode::InputWriteUnknown
+        );
+        let at = r
+            .app
+            .structured_sends
+            .recovery_deadline(std::time::Instant::now())
+            .expect("recovery retains the final TTL deadline");
+        assert!(
+            at.saturating_duration_since(std::time::Instant::now())
+                <= std::time::Duration::from_millis(100)
+        );
+        with_store(|s| s.maintain(expired).map_err(|e| e.to_string())).unwrap();
+        let status = with_store(|s| {
+            s.status(
+                &d.envelope.key.origin_node,
+                &d.envelope.correlation_id,
+                expired,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(status.state, "expired");
+        assert_eq!(
+            status.detail.as_deref(),
+            Some("input_write_unknown:commitment_unknown_at_expiry")
+        );
+        assert_eq!(
+            with_store(|s| s
+                .collection_error(&d.envelope.key.origin_node, &d.envelope.correlation_id)
+                .map_err(|e| e.to_string()))
+            .unwrap()
+            .as_deref(),
+            Some("input_write_unknown:commitment_unknown_at_expiry")
+        );
+        r.app
+            .finish_structured_messages(true, std::time::Instant::now());
+        assert!(r.app.structured_sends.recovering.is_empty());
+        assert!(r
+            .app
+            .structured_sends
+            .recovery_deadline(std::time::Instant::now())
+            .is_none());
     });
 }

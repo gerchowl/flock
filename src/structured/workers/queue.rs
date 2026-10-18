@@ -23,12 +23,16 @@ use std::{
 pub(crate) const COMPLETION_CAPACITY: usize = 4;
 type CommittedCustody = Arc<parking_lot::Mutex<CustodyIndex>>;
 struct CustodyIndex {
-    committed: std::collections::HashSet<crate::mesh::key::MessageKey>,
+    items: Arc<Vec<Item>>,
     pending: std::collections::HashMap<crate::mesh::key::MessageKey, usize>,
     uncertain: bool,
 }
 impl CustodyIndex {
-    fn finish(&mut self, key: crate::mesh::key::MessageKey, committed: bool, complete: bool) {
+    #[cfg(test)]
+    fn tracked_keys(&self) -> usize {
+        self.pending.len()
+    }
+    fn finish(&mut self, key: crate::mesh::key::MessageKey, complete: bool) {
         let remove = self.pending.get_mut(&key).is_some_and(|count| {
             *count -= 1;
             *count == 0
@@ -37,9 +41,6 @@ impl CustodyIndex {
             self.pending.remove(&key);
         }
         self.uncertain |= !complete;
-        if committed {
-            self.committed.insert(key);
-        }
     }
 }
 
@@ -97,10 +98,21 @@ pub(in crate::structured) struct Client {
 }
 impl Client {
     pub fn custody_committed(&self, key: &crate::mesh::key::MessageKey) -> Option<bool> {
-        let index = self.committed_custody.lock();
-        if index.committed.contains(key) {
+        // Only clone the committed fold under the lock; lookup is linear in
+        // retained items, with no file I/O or extra historical-key allocation.
+        let (items, uncertain) = {
+            let index = self.committed_custody.lock();
+            (
+                index.items.clone(),
+                index.uncertain || index.pending.contains_key(key),
+            )
+        };
+        if items
+            .iter()
+            .any(|item| custody_key(item).as_ref() == Some(key))
+        {
             Some(true)
-        } else if index.uncertain || index.pending.contains_key(key) {
+        } else if uncertain {
             None
         } else {
             Some(false)
@@ -120,7 +132,7 @@ impl Client {
         });
         if result.is_err() {
             if let Some(key) = key {
-                index.finish(key, false, true);
+                index.finish(key, true);
             }
         }
         result
@@ -208,12 +220,7 @@ impl Service {
         let (updates, rx) = mpsc::sync_channel(COMPLETION_CAPACITY);
         let final_facts = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let committed_custody = Arc::new(parking_lot::Mutex::new(CustodyIndex {
-            committed: scheduler
-                .journal()
-                .items()
-                .iter()
-                .filter_map(custody_key)
-                .collect(),
+            items: scheduler.journal().item_snapshot(),
             pending: Default::default(),
             uncertain: !scheduler.journal().complete_items(),
         }));
@@ -319,11 +326,9 @@ impl Service {
                 })
             };
             if let Some(key) = key {
-                self.committed_custody.lock().finish(
-                    key,
-                    result.is_ok(),
-                    self.scheduler.journal().complete_items(),
-                );
+                let mut index = self.committed_custody.lock();
+                index.items = self.scheduler.journal().item_snapshot();
+                index.finish(key, self.scheduler.journal().complete_items());
             }
             (id, result)
         });
@@ -403,7 +408,11 @@ impl Service {
             .as_ref()
             .err()
             .map(|e| (e.code, e.source.as_ref().map(|s| (s.kind(), s.to_string()))));
-        self.committed_custody.lock().uncertain |= !self.scheduler.journal().complete_items();
+        {
+            let mut index = self.committed_custody.lock();
+            index.items = self.scheduler.journal().item_snapshot();
+            index.uncertain |= !self.scheduler.journal().complete_items();
+        }
         let facts = self.scheduler.take_facts();
         let changed = !facts.is_empty()
             || self.initial

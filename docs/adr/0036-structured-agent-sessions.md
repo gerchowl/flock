@@ -948,6 +948,25 @@ same queue (owner decision 5): there is no second input path.
   marker (architect decision on #1958). A delegate's structured result and receipt become a
   `delegate_result` item for its parent. The Stop-hook recap and nudge
   become server work on `result` (§3a).
+- **Queue custody completion (#2160, #2186).** The journal owner's committed
+  fold is authoritative: a committed `MessageKey` cannot later be refused as
+  never committed. The custody lookup shares that fold, without a separate
+  growing key index. Auxiliary tracking is bounded by in-flight admissions;
+  lookups scan retained items without file I/O on the server loop. The journal
+  itself still retains its item history. A definite absence requires a complete,
+  readable fold with no pending admission. Production never emits queue removals;
+  future garbage collection must preserve commitment proof before removing items.
+  Missing owners/runtimes, read-only or future-format journals and uncertain
+  writes cannot prove absence. Even a permanent recovery error then keeps the
+  same key recovering until its existing inbox TTL (24 hours), never a fresh
+  send or a terminal refusal. Existing jittered backoff is 4–5 seconds, then
+  48–60 seconds, then capped at 240–300 seconds, clipped to the remaining TTL.
+  Message status remains `queued` with typed detail
+  `input_write_unknown:<registered cause code>`. Resolution clears that detail.
+  At TTL expiry the existing inbox-expiry/tombstone path records
+  `input_write_unknown:commitment_unknown_at_expiry`, retained for the existing
+  outcome window. Expiry ends recovery, but does not prove nothing was committed.
+  No new store outcome or wire kind is introduced.
 - **Storage.** The queue persists as `queue.jsonl` beside the agent's
   session streams (§4).
 

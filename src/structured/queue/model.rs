@@ -250,6 +250,9 @@ pub enum Change {
         reason: String,
     },
     /// Remove retained state, leaving a durable removal for subscribers.
+    /// Decode/replay and tests only: production never emits removals. Custody
+    /// absence is definitive only while committed message items remain retained.
+    /// Any future GC must preserve commitment proof before enabling this write.
     Remove {
         /// Identity whose retained state is removed.
         item_id: String,

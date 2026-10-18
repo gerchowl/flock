@@ -162,7 +162,7 @@ fn failed_append_or_sync_never_folds_or_publishes_and_requires_reopen() {
     peer.shutdown(Shutdown::Write).unwrap();
     let mut recovery = root.open();
     recovery.file = file;
-    recovery.items.clear();
+    recovery.items = Default::default();
     recovery.records.clear();
     recovery.seq = 0;
     assert!(
@@ -1584,4 +1584,28 @@ fn custody_completion_real_v2_upgrades_on_first_write_and_v2_refuses_v3() {
         .contains("queue_journal_newer"));
     assert!(old.checkpoint().is_err());
     assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn no_production_queue_removals() {
+    // Retained committed items are the proof behind a definite custody absence.
+    // These three references only decode/fold old records, never construct one.
+    let remove = regex::Regex::new(r"(?:Change|Self)\s*::\s*Remove\b").unwrap();
+    for (path, source) in crate::cli::exit::tests::production_sources() {
+        if path.contains("/tests/") {
+            continue;
+        }
+        let allowed = if path.ends_with("/structured/queue/model.rs") {
+            2
+        } else if path.ends_with("/structured/queue/mod.rs") {
+            1
+        } else {
+            0
+        };
+        assert_eq!(
+            remove.find_iter(&source).count(),
+            allowed,
+            "production removal would invalidate retained custody proof: {path}"
+        );
+    }
 }

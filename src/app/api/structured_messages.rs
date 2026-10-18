@@ -460,12 +460,38 @@ impl App {
             self.structured_sends.retries.remove(&signed.key);
             return code;
         }
-        let retry = super::mesh_routes::Retry::failed(
+        let remaining = match stored(|s| {
+            s.queue_commitment_unknown(
+                &signed.key,
+                (committed.is_none()).then_some(code),
+                super::messages::now_ms() as i64,
+            )
+        }) {
+            Ok(Some(remaining)) => Some(remaining),
+            Ok(None) => {
+                self.structured_sends.retries.remove(&signed.key);
+                self.structured_sends
+                    .recovering
+                    .retain(|e| e.key != signed.key);
+                return ErrorCode::InputWriteUnknown;
+            }
+            Err(failure) => {
+                crate::logging::mesh_custody_failed("structured-recovery", failure.as_str());
+                None
+            }
+        };
+        let now = std::time::Instant::now();
+        let mut retry = super::mesh_routes::Retry::failed(
             self.structured_sends.retries.get(&signed.key),
             0,
             0,
-            std::time::Instant::now(),
+            now,
         );
+        if let Some(remaining) = remaining {
+            retry.at = retry
+                .at
+                .min(now + std::time::Duration::from_millis(remaining));
+        }
         self.structured_sends
             .retries
             .insert(signed.key.clone(), retry);
