@@ -233,9 +233,9 @@ async fn cli_timeout(mutating: bool) {
         .env("XDG_STATE_HOME", root.path().join("s"))
         .env("FLOCK_SOCKET_PATH", &path)
         .args(if mutating {
-            ["workspace", "create", "--json"]
+            ["--json", "workspace", "rename", "ws_1", "new-label"].as_slice()
         } else {
-            ["status", "server", "--json"]
+            ["status", "server", "--json"].as_slice()
         })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -281,7 +281,7 @@ async fn cli_timeout(mutating: bool) {
             .unwrap();
         assert!(matches!(
             serde_json::from_str::<Request>(&request).unwrap().method,
-            Method::WorkspaceCreate(_)
+            Method::WorkspaceRename(_)
         ));
     }
     let status = match tokio::time::timeout(FINISH_CAP, child.wait()).await {

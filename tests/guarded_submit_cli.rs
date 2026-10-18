@@ -101,3 +101,6 @@ async fn guarded_submit_cli_reports_exit_8_and_9_with_scripted_evidence() {
         );
     }
 }
+
+#[path = "guarded_submit_cli/default_budget.rs"]
+mod default_budget;

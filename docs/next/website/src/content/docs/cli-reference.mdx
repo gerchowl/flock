@@ -21,7 +21,11 @@ Blocking output/reply/event waits and long polls use at least their requested
 operation timeout plus a fixed 5-second transport margin, rather than the
 ordinary cap. An omitted output/reply/event wait timeout has a finite 24-hour
 transport cap plus that margin. Explicit caller deadlines can be shorter.
-Guarded writes similarly reserve their declared write budget plus the margin.
+Input writes reserve the declared raw-write budget, or the server's 10-second
+raw-write default when omitted, plus the server's 2-second confirmation window
+and the 5-second transport margin. Live handoff reserves the server's shutdown,
+pane-drain, import-startup, commit and rollback phase budgets plus the margin:
+the handler replies only after those synchronous phases finish.
 
 A timeout before dispatch, or on an explicitly read-only/idempotent request,
 returns `timeout`, exit **124** (`retry: yes`). After a mutation has written any

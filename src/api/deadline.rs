@@ -26,7 +26,13 @@ pub(crate) fn end_after(started: Instant, timeout: Duration) -> io::Result<Insta
 /// Select the operation's finite wait, plus transport margin, without truncating
 /// a requested long poll. Invalid parameters are left for server validation.
 pub(crate) fn request_timeout(request: &Request, ordinary: Duration) -> Duration {
-    let wait = match &request.method {
+    operation_timeout(&request.method, ordinary)
+}
+
+/// Shared client cap table, including the server's write and confirmation budgets.
+/// Explicit caller deadlines may still shorten this transport allowance.
+pub(crate) fn operation_timeout(method: &Method, ordinary: Duration) -> Duration {
+    let wait = match method {
         Method::MsgWaitReply(p) => Some(Duration::from_millis(
             p.timeout_ms
                 .unwrap_or(MSG_WAIT_REPLY_MAX_MS)
@@ -37,14 +43,32 @@ pub(crate) fn request_timeout(request: &Request, ordinary: Duration) -> Duration
         }
         Method::EventsWait(p) => Some(p.timeout_ms.map(Duration::from_millis).unwrap_or(MAX_WAIT)),
         Method::EventsRead(p) => Some(Duration::from_millis(p.wait_ms.unwrap_or(0))),
-        _ => serde_json::to_value(request)
-            .ok()
-            .and_then(|v| v["params"]["write_timeout_ms"].as_u64())
-            .map(Duration::from_millis),
+        Method::AgentSend(p) => Some(write_budget(p.write_timeout_ms.as_ref())),
+        Method::PaneSendText(p) | Method::PaneWriteText(p) => {
+            Some(write_budget(p.write_timeout_ms.as_ref()))
+        }
+        Method::PaneSendKeys(p) | Method::PaneWriteKeys(p) => {
+            Some(write_budget(p.write_timeout_ms.as_ref()))
+        }
+        Method::PaneSendInput(p) | Method::PaneWriteInput(p) => {
+            Some(write_budget(p.write_timeout_ms.as_ref()))
+        }
+        Method::PaneSubmit(_) => Some(write_budget(None)),
+        Method::ServerLiveHandoff(_) => Some(crate::server::handoff::operation_budget()),
+        _ => None,
     };
     wait.map_or(ordinary, |wait| {
         ordinary.max(wait.saturating_add(OPERATION_MARGIN))
     })
+}
+
+fn write_budget(timeout: Option<&serde_json::Value>) -> Duration {
+    Duration::from_millis(
+        timeout
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(super::schema::DEFAULT_RAW_WRITE_TIMEOUT_MS),
+    )
+    .saturating_add(crate::app::guarded_submit::CONFIRM_WINDOW)
 }
 
 /// Safely retryable transport expiry: no dispatch, or a declared read/idempotent call.
@@ -99,13 +123,8 @@ impl DeadlineStream {
     ) -> io::Result<Self> {
         let started = Instant::now();
         let deadline = end_after(started, timeout)?;
-        let stream = crate::platform::socket_deadline::connect(socket, deadline).map_err(|e| {
-            if e.kind() == io::ErrorKind::TimedOut {
-                Self::timeout_at(socket, started)
-            } else {
-                e
-            }
-        })?;
+        let stream = crate::platform::socket_deadline::connect(socket, deadline)
+            .map_err(|error| Self::connect_error(socket, started, error))?;
         Ok(Self {
             stream,
             socket: socket.to_owned(),
@@ -114,6 +133,15 @@ impl DeadlineStream {
             class,
             dispatched: false,
         })
+    }
+    /// A full listener backlog is a pre-dispatch timeout, including Linux EAGAIN.
+    pub(crate) fn connect_error(socket: &Path, started: Instant, error: io::Error) -> io::Error {
+        match error.kind() {
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                Self::timeout_at(socket, started)
+            }
+            _ => error,
+        }
     }
     pub(crate) fn timeout_at(socket: &Path, started: Instant) -> io::Error {
         Self::expiry(socket, started, false)

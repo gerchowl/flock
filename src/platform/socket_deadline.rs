@@ -12,6 +12,9 @@ use std::{
 /// Connect without letting the kernel wait indefinitely for a listener slot.
 /// The caller owns timeout diagnosis; all descriptor cleanup is automatic.
 pub(crate) fn connect(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    if Instant::now() >= deadline {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
     let bytes = path.as_os_str().as_bytes();
     // SAFETY: an all-zero sockaddr_un is a valid starting representation.
     let mut address: libc::sockaddr_un = unsafe { mem::zeroed() };
@@ -89,4 +92,36 @@ pub(crate) fn connect(path: &Path, deadline: Instant) -> io::Result<UnixStream> 
     }
     stream.set_nonblocking(false)?;
     Ok(stream)
+}
+
+/// Fill an owned listener without accepting, exercising the real connect backlog.
+#[cfg(test)]
+pub(crate) fn saturate_backlog(
+    listener: &std::os::unix::net::UnixListener,
+    path: &Path,
+) -> Vec<UnixStream> {
+    // SAFETY: listener owns this live socket. A small queue keeps the fixture bounded.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+    let mut holders = Vec::new();
+    for _ in 0..16 {
+        match connect(path, Instant::now() + std::time::Duration::from_millis(100)) {
+            Ok(stream) => holders.push(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                assert!(
+                    !holders.is_empty(),
+                    "backlog must contain a real connection"
+                );
+                return holders;
+            }
+            Err(error) => panic!("unexpected backlog setup error: {error}"),
+        }
+    }
+    panic!("listener never saturated its one-entry backlog");
 }

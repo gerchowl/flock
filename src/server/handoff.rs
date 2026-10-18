@@ -50,6 +50,30 @@ pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 8 * 1024;
 #[cfg(unix)]
 pub(crate) const COMMIT_TIMEOUT: Duration = READY_TIMEOUT;
 
+/// Concurrent pane drain allowance before export starts.
+pub(crate) const PANE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Additional time for a failed importer's public socket descriptors to close.
+const PUBLIC_SOCKET_RELEASE_MARGIN: Duration = Duration::from_secs(2);
+/// Wait for a failed importer's public sockets before restoring ownership.
+pub(crate) const ROLLBACK_SOCKET_TIMEOUT: Duration =
+    COMMIT_TIMEOUT.saturating_add(PUBLIC_SOCKET_RELEASE_MARGIN);
+
+/// Conservative sum of the synchronous handoff handler's phase bounds.
+/// Import startup overlaps the accept phase, but both are reserved because the
+/// import watchdog begins in the child. Commit and rollback are reserved too:
+/// the API response is sent only after `perform_live_handoff` returns.
+pub(crate) fn operation_budget() -> Duration {
+    crate::structured::workers::SHUTDOWN_GRACE
+        .saturating_add(crate::structured::workers::SHUTDOWN_CLEANUP)
+        .saturating_add(PANE_DRAIN_TIMEOUT)
+        .saturating_add(READY_TIMEOUT)
+        .saturating_add(IMPORT_STARTUP_TIMEOUT)
+        .saturating_add(COMMIT_TIMEOUT)
+        .saturating_add(OWNED_ACK_TIMEOUT)
+        .saturating_add(IMPORT_REAP_TIMEOUT)
+        .saturating_add(ROLLBACK_SOCKET_TIMEOUT)
+}
+
 #[cfg(unix)]
 #[derive(Serialize, Deserialize)]
 pub(crate) struct HandoffManifest {

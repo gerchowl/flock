@@ -1083,6 +1083,9 @@ pub struct AgentResultInfo {
     pub turn_open_at_ms: Option<u64>,
 }
 
+/// Server raw-input write budget when `write_timeout_ms` is absent.
+pub(crate) const DEFAULT_RAW_WRITE_TIMEOUT_MS: u64 = 10_000;
+
 /// Turns returned by `agent.history` when the caller names no `limit`.
 pub const AGENT_HISTORY_DEFAULT_TURNS: u32 = 20;
 
