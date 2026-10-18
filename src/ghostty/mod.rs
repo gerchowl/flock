@@ -602,9 +602,12 @@ impl Terminal {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> Result<(), Error> {
-        // Screen.resize erases history when scrollback is disabled, including
-        // the alternate screen. Its surviving native pins can be retargeted.
-        if self.no_scrollback || self.active_screen().ok() == Some(ActiveScreen::Alternate) {
+        // Terminal.resize also resizes an allocated, inactive alternate screen.
+        // Its no-scrollback Screen.resize erases history and can retarget pins.
+        if self.no_scrollback
+            || self.selection_erases.alternate_exists
+            || self.active_screen().ok() == Some(ActiveScreen::Alternate)
+        {
             self.selection_erases.invalidate();
         }
         let cell_width_px = cell_width_px.max(1);

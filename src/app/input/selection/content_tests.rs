@@ -41,6 +41,25 @@ while IFS= read -r command; do
             printf '\033[3J'
             printf 'DONE_erase3\r\n'
             ;;
+        erase3semi)
+            printf '\033[3;J'
+            printf 'DONE_erase3semi\r\n'
+            ;;
+        erase2semi)
+            printf '\033[2;J'
+            printf 'DONE_erase2semi\r\n'
+            ;;
+        alternate)
+            printf '\033[?47h\033[HSELECTA\r\nSELECTB\r\nDONE_alternate\r\n'
+            ;;
+        primary)
+            printf '\033[?47l'
+            printf 'DONE_primary\r\n'
+            ;;
+        alternate_return)
+            printf '\033[?47h'
+            printf 'BACK_ALT\r\n'
+            ;;
         erase2)
             printf '\033[2J'
             printf 'DONE_erase2\r\n'
@@ -245,7 +264,7 @@ async fn real_read_selection_survives_resize() {
 async fn assert_erased_selection_refuses(command: &str) {
     let mut fixture = Fixture::new().await;
     fixture.select();
-    if command == "erase3" {
+    if command.starts_with("erase3") {
         // Move the anchored rows into history before deleting that history.
         fixture.write_and_wait("chunk", "DONE_chunk_1").await;
     }
@@ -290,4 +309,37 @@ async fn closed_pane_selection_refuses_with_distinct_reason() {
         .as_ref()
         .expect("visible closed pane refusal");
     assert_eq!(toast.context, "Selected pane closed");
+}
+
+#[tokio::test]
+async fn real_read_scrollback_erase_with_trailing_separator_refuses_copy() {
+    assert_erased_selection_refuses("erase3semi").await;
+}
+
+#[tokio::test]
+async fn real_read_display_erase_with_trailing_separator_refuses_copy() {
+    assert_erased_selection_refuses("erase2semi").await;
+}
+
+#[tokio::test]
+async fn real_read_inactive_alternate_resize_refuses_copy() {
+    let mut fixture = Fixture::new().await;
+    fixture.write_and_wait("alternate", "DONE_alternate").await;
+    fixture.select();
+    fixture.write_and_wait("primary", "DONE_primary").await;
+    fixture.runtime().resize(3, 20, 0, 0);
+    fixture.write_and_wait("alternate_return", "BACK_ALT").await;
+    fixture.state.request_clipboard_write = Some(b"previous clipboard".to_vec());
+    fixture.copy();
+    assert_eq!(
+        fixture.state.request_clipboard_write.as_deref(),
+        Some(b"previous clipboard".as_slice())
+    );
+    let toast = fixture
+        .state
+        .toast
+        .as_ref()
+        .expect("visible inactive alternate resize refusal");
+    assert_eq!(toast.kind, ToastKind::NeedsAttention);
+    assert_eq!(toast.title, "Cannot copy selection");
 }

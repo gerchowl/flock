@@ -24,7 +24,14 @@ ED 3 (`CSI 3 J`) calls `Screen.eraseHistory` → `PageList.eraseRows` /
 without marking them garbage. A generation mismatch therefore refuses in
 `resolve_content_selection` before either copying or highlighting. Tracking
 runs at `Terminal.write`, across fragmented PTY reads, and leaves vendored
-libghostty-vt unchanged.
+libghostty-vt unchanged. Its CSI parameters follow the vendored parser's
+24-slot limit, saturating 16-bit values, saved empty slots and non-empty
+final-slot rule. A trailing separator saves the preceding value without
+adding a final empty value: `CSI 3 ; J` is ED 3 and `CSI 2 ; J` is ED 2,
+while `CSI 3 ; ; J` has two parameters and is ignored. Empty saved values
+are zero; no parameters select ED 0. Colons suppress non-SGR dispatch.
+A table test checks these forms against the vendored terminal's actual
+screen/history effects, not a second constructed parser model.
 
 ED 2 (`CSI 2 J`) normally clears the main screen's active cells **in place**
 via `clearRows`; at a semantic shell prompt it may first scroll them into
@@ -32,7 +39,12 @@ history. Neither path reliably invalidates pins. Treat ED 2 as a destructive
 boundary too. ED 22 scrolls active rows into history and retains the anchors.
 Full reset (`ESC c`), mode 1047/1049 screen clears and no-scrollback resize
 also invalidate the generation. The latter calls `eraseHistory` in
-`Screen.resize`; ordinary resize/reflow with scrollback remains supported.
+`Screen.resize`. `Terminal.resize` resizes an allocated alternate screen
+even while primary is active, so the tracker remembers its allocation
+across `?47l` and invalidates on resize until full reset removes it.
+This conservatively invalidates primary-screen anchors too once an alternate
+screen exists. Ordinary primary resize/reflow before alternate allocation
+with scrollback remains supported.
 The other `erasePage` path trims blank trailing resize rows only after
 checking that no tracked pin occupies them; normal history pruning already
 marks evicted pins garbage. Flock does not expose the full application's

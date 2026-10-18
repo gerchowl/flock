@@ -127,7 +127,10 @@ pub(super) struct SelectionEraseTracker {
     valid: bool,
     parameter_started: bool,
     private: bool,
-    screen_clear: bool,
+    parameters: [u16; 24],
+    parameters_len: usize,
+    colon: bool,
+    pub(super) alternate_exists: bool,
     pub(super) generation: u64,
 }
 
@@ -180,6 +183,7 @@ impl SelectionEraseTracker {
                     0x30..=0x7e => {
                         if byte == b'c' {
                             self.invalidate();
+                            self.alternate_exists = false;
                         }
                         self.state = Ground;
                     }
@@ -187,35 +191,32 @@ impl SelectionEraseTracker {
                 },
                 EscapeIntermediate if (0x30..=0x7e).contains(&byte) => self.state = Ground,
                 Csi => match byte {
-                    b'?' if !self.parameter_started && !self.private => self.private = true,
+                    b'?' if !self.parameter_started
+                        && self.parameters_len == 0
+                        && !self.private =>
+                    {
+                        self.private = true
+                    }
                     b'0'..=b'9' => {
                         self.parameter_started = true;
-                        match self
+                        self.parameter = self
                             .parameter
-                            .checked_mul(10)
-                            .and_then(|n| n.checked_add(u16::from(byte - b'0')))
-                        {
-                            Some(n) => self.parameter = n,
-                            None => self.valid = false,
-                        }
+                            .saturating_mul(10)
+                            .saturating_add(u16::from(byte - b'0'));
                     }
-                    b';' => {
-                        self.screen_clear |= matches!(self.parameter, 1047 | 1049);
+                    // Parser.zig saves even an empty slot. A trailing empty
+                    // slot is not finalized at dispatch. Excess slots are ignored.
+                    b';' | b':' if self.parameters_len < self.parameters.len() => {
+                        self.parameters[self.parameters_len] = self.parameter;
+                        self.parameters_len += 1;
                         self.parameter = 0;
-                        self.valid = false;
+                        self.parameter_started = false;
+                        self.colon |= byte == b':';
                     }
+                    b';' | b':' => {}
                     0x20..=0x3f => self.valid = false,
                     0x40..=0x7e => {
-                        if byte == b'J' && self.valid && matches!(self.parameter, 2 | 3) {
-                            self.invalidate();
-                        }
-                        // 1047/1049 screen switches invoke eraseDisplay internally.
-                        if self.private
-                            && matches!(byte, b'h' | b'l')
-                            && (self.screen_clear || matches!(self.parameter, 1047 | 1049))
-                        {
-                            self.invalidate();
-                        }
+                        self.dispatch_csi(byte);
                         self.state = Ground;
                     }
                     _ => {}
@@ -232,7 +233,31 @@ impl SelectionEraseTracker {
         self.valid = true;
         self.parameter_started = false;
         self.private = false;
-        self.screen_clear = false;
+        self.parameters_len = 0;
+        self.colon = false;
+    }
+
+    /// Mirror Parser.zig's 24-slot cap, final-slot rule and non-SGR colon
+    /// rejection before interpreting stream.zig's ED and screen-mode actions.
+    fn dispatch_csi(&mut self, final_byte: u8) {
+        if !self.valid || self.colon || self.parameters_len >= self.parameters.len() {
+            return;
+        }
+        if self.parameter_started {
+            self.parameters[self.parameters_len] = self.parameter;
+            self.parameters_len += 1;
+        }
+        let parameters = &self.parameters[..self.parameters_len];
+        let display_erase = final_byte == b'J' && matches!(parameters, [2 | 3]);
+        let screen_mode = self.private && matches!(final_byte, b'h' | b'l');
+        let screen_clear = screen_mode && parameters.iter().any(|p| matches!(p, 1047 | 1049));
+        // Alternate screens remain allocated after returning to primary.
+        self.alternate_exists |= screen_mode
+            && final_byte == b'h'
+            && parameters.iter().any(|p| matches!(p, 47 | 1047 | 1049));
+        if display_erase || screen_clear {
+            self.invalidate();
+        }
     }
 }
 
@@ -250,10 +275,13 @@ mod erase_tests {
     }
 
     #[test]
-    fn ordinary_output_strings_and_invalid_erases_keep_the_generation() {
+    fn strings_and_invalid_erases_are_ignored_but_trailing_separator_erases() {
         let mut tracker = SelectionEraseTracker::default();
         tracker.write(b"title [3J\x1b]0;[3J\x07\x1bP[2J\x1b\\\x1b[3;J\x1b[>3J\x1b[3\x18J\x1b[22J");
-        assert_eq!(tracker.generation, 0);
+        assert_eq!(
+            tracker.generation, 1,
+            "trailing empty parameter does not invalidate ED 3"
+        );
     }
 
     #[test]
@@ -263,6 +291,79 @@ mod erase_tests {
             terminal.write(b"selected\r\n");
             terminal.resize(20, 8, 1, 1).unwrap();
             assert_eq!(terminal.selection_erases.generation, expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod parameter_tests {
+    use super::*;
+
+    #[test]
+    fn parameter_forms_match_the_vendored_terminal_parser() {
+        // Mode 0 clears BOTTOM, 1 clears TOP, 2 clears both, and 3 clears
+        // history only. An ignored dispatch keeps every marker. Observe the
+        // actual vendored parser's result independently of our generation.
+        let cases = [
+            ("", Some(0)),
+            (";", Some(0)),
+            ("0;", Some(0)),
+            ("1;", Some(1)),
+            ("2", Some(2)),
+            ("2;", Some(2)),
+            ("3", Some(3)),
+            ("3;", Some(3)),
+            ("0003;", Some(3)),
+            ("?2;", Some(2)),
+            ("?3;", Some(3)),
+            ("3\x7f;", Some(3)),
+            ("3\x00;", Some(3)),
+            (";;", None),
+            (";0;", None),
+            ("3;;", None),
+            ("3;0", None),
+            ("3;0;", None),
+            (";3", None),
+            (";3;", None),
+            ("2:", None),
+            ("3:0", None),
+            (":3", None),
+            (">3;", None),
+            ("3 ;", None),
+            ("65539", None),
+            ("3;;;;;;;;;;;;;;;;;;;;;;;;", None),
+        ];
+        for (parameters, mode) in cases {
+            let mut terminal = Terminal::new(40, 6, 256 * 1024).unwrap();
+            terminal.write(b"history\r\n".repeat(20).as_slice());
+            terminal.write(b"\x1b[H TOP\x1b[6;1HBOTTOM\x1b[3;1H");
+            let history = terminal.scrollbar().unwrap().total;
+            let generation = terminal.selection_erases.generation;
+            let command = format!("\x1b[{parameters}J");
+            for byte in command.bytes() {
+                terminal.write(&[byte]);
+            }
+            let text = terminal.read_text_viewport((0, 0), (39, 5), false).unwrap();
+            assert_eq!(
+                text.contains("TOP"),
+                !matches!(mode, Some(1 | 2)),
+                "native TOP: {parameters:?}"
+            );
+            assert_eq!(
+                text.contains("BOTTOM"),
+                !matches!(mode, Some(0 | 2)),
+                "native BOTTOM: {parameters:?}"
+            );
+            assert_eq!(
+                terminal.scrollbar().unwrap().total < history,
+                mode == Some(3),
+                "native history: {parameters:?}"
+            );
+            assert_eq!(
+                terminal.selection_erases.generation - generation,
+                u64::from(matches!(mode, Some(2 | 3))),
+                "generation: {parameters:?}"
+            );
         }
     }
 }
