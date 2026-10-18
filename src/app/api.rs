@@ -211,7 +211,7 @@ impl App {
             respond_to,
         } = ev
         {
-            self.advance_guarded_request(request_id, pane_id, attempt, respond_to);
+            self.advance_guarded_request(request_id, pane_id, *attempt, respond_to);
             return;
         }
         if let AppEvent::ClipboardWrite { content } = ev {
@@ -1405,6 +1405,17 @@ impl App {
         request: &crate::api::schema::Request,
     ) -> Option<String> {
         use crate::api::{error_code::ErrorCode, schema::Method};
+        if self
+            .current_api_scope
+            .as_ref()
+            .is_some_and(|scope| scope.caller() == crate::structured::lease::Caller::Uncertain)
+        {
+            return Some(responses::encode_error(
+                request.id.clone(),
+                ErrorCode::NotAuthorized.as_str(),
+                "scoped caller authentication refused",
+            ));
+        }
         let uid = self.current_api_peer_uid?;
         let code = if matches!(
             request.method,
@@ -1467,6 +1478,7 @@ impl App {
             self.pending_recovery_park = Some((
                 request,
                 super::ApiCaller {
+                    scope: self.current_api_scope.clone(),
                     pid: self.current_api_peer_pid,
                     birth: self.current_api_peer_birth,
                     uid: self.current_api_peer_uid,

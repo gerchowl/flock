@@ -9,6 +9,7 @@ pub mod question;
 mod reply_wait;
 pub mod retained;
 pub mod schema;
+pub(crate) mod scoped;
 pub(crate) mod server;
 mod status;
 mod subscriptions;
@@ -76,6 +77,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
 }
 
 pub struct ApiRequestMessage {
+    /// Scoped transport attribution; None is an ordinary legacy request.
+    pub(crate) scope: Option<scoped::Scope>,
     pub request: Request,
     pub respond_to: std::sync::mpsc::Sender<String>,
     /// PID of the process on the other end of the API socket, when the
