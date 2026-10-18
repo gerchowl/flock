@@ -113,6 +113,15 @@ An entirely failed round still increments the global failure count and does not
 stamp success. Worker panics, spawn failures and stuck rounds retain their
 round-level failures.
 
+Refreshes rotate their starting repository after each completed round. With a
+stable set of N repositories and K probes started per round, every repository
+starts within ceil(N/K) rounds, provided K is nonzero. Three consecutive rounds
+without admission show repository `status: starved`, a
+`consecutive_not_started` count, and poller `status: degraded` with
+`reason: starved`. This does not increment failure counts or add `[git stale]`.
+The next admission clears starvation; a failed probe remains a separate failure.
+The in-memory admission history resets on server restart.
+
 A repository not started before the shared deadline is not refreshed this round:
 its cached values stay unchanged, with no new failure or stale marker. Only its
 own failed or timed-out probe earns a failure. Moving or removing a workspace's

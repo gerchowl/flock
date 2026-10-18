@@ -166,10 +166,24 @@ impl App {
         }
         if !row.repositories.is_empty() && row.last_error.is_none() {
             row.status = "degraded".into();
-            row.last_error = Some(row.repositories[0].last_error.clone());
+            row.last_error = row
+                .repositories
+                .iter()
+                .find(|repo| !repo.last_error.is_empty())
+                .map(|repo| repo.last_error.clone());
         }
         if row.last_error.is_some() && row.status == "ok" {
             row.status = "degraded".into();
+        }
+        if row.status != "broken"
+            && row
+                .repositories
+                .iter()
+                .any(|repo| repo.status == crate::api::schema::GitRepositoryStatus::Starved)
+        {
+            row.status = "degraded".into();
+            row.reason = Some(PollerReason::Starved);
+            return row;
         }
         // Age alone diagnoses missing freshness, never an invented failure.
         if row.last_error.is_none() && row.status != "ok" {

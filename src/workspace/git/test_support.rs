@@ -154,3 +154,33 @@ impl Drop for CountingGit {
         }
     }
 }
+
+/// Reftable fixtures require Git 2.45 or newer, as in the discovery fixtures.
+pub(crate) fn init_reftable(cwd: &std::path::Path) -> bool {
+    let version = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .expect("fixture git version");
+    assert!(version.status.success());
+    let version = String::from_utf8(version.stdout).expect("git version text");
+    let mut parts = version
+        .split_whitespace()
+        .nth(2)
+        .expect("git version number")
+        .split('.');
+    let major: u32 = parts.next().expect("major").parse().expect("numeric major");
+    let minor: u32 = parts.next().expect("minor").parse().expect("numeric minor");
+    if (major, minor) < (2, 45) {
+        return false;
+    }
+    let output = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(["init", "-q", "--ref-format=reftable", "-b", "main"])
+        .output()
+        .expect("run fixture git init");
+    assert!(
+        output.status.success(),
+        "supported git must initialize reftable fixture"
+    );
+    true
+}

@@ -77,6 +77,7 @@ impl App {
     pub(crate) fn git_repository_health_rows(
         &self,
     ) -> Vec<crate::api::schema::GitRepositoryHealth> {
+        let schedule = self.git_refresh_schedule.lock();
         let mut rows: Vec<_> = self
             .git_repository_failures
             .values()
@@ -102,6 +103,10 @@ impl App {
                     return None;
                 }
                 workspace_ids.sort();
+                let missed = schedule
+                    .missed
+                    .get(&failure.cache_key)
+                    .map_or(0, |(_, count)| *count);
                 Some(crate::api::schema::GitRepositoryHealth {
                     repo: failure
                         .cache_key
@@ -113,9 +118,60 @@ impl App {
                     workspace_ids,
                     consecutive_failures: *count,
                     last_error: failure.error.as_str().into(),
+                    status: if missed >= super::runtime::GIT_REFRESH_STARVED_ROUNDS {
+                        crate::api::schema::GitRepositoryStatus::Starved
+                    } else {
+                        crate::api::schema::GitRepositoryStatus::Failed
+                    },
+                    consecutive_not_started: missed,
                 })
             })
             .collect();
+        rows.extend(
+            schedule
+                .missed
+                .iter()
+                .filter_map(|(key, (targets, count))| {
+                    if *count < super::runtime::GIT_REFRESH_STARVED_ROUNDS
+                        || self.git_repository_failures.contains_key(key)
+                    {
+                        return None;
+                    }
+                    let mut workspace_ids: Vec<_> = targets
+                        .iter()
+                        .filter(|target| {
+                            self.state.workspaces.iter().any(|ws| {
+                                ws.id == target.workspace_id
+                                    && ws
+                                        .resolved_identity_cwd_from(
+                                            &self.state.terminals,
+                                            &self.terminal_runtimes,
+                                        )
+                                        .as_ref()
+                                        == Some(&target.resolved_identity_cwd)
+                            })
+                        })
+                        .map(|target| target.workspace_id.clone())
+                        .collect();
+                    if workspace_ids.is_empty() {
+                        return None;
+                    }
+                    workspace_ids.sort();
+                    Some(crate::api::schema::GitRepositoryHealth {
+                        repo: key
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .escape_default()
+                            .to_string(),
+                        workspace_ids,
+                        consecutive_failures: 0,
+                        last_error: String::new(),
+                        status: crate::api::schema::GitRepositoryStatus::Starved,
+                        consecutive_not_started: *count,
+                    })
+                }),
+        );
         rows.sort_by(|a, b| {
             a.repo
                 .cmp(&b.repo)

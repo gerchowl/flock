@@ -4932,12 +4932,28 @@ pub enum PollerReason {
     NoEligibleWorkspaces,
     /// No failure is known, but fresh results have not arrived yet.
     AwaitingRefresh,
+    /// At least one repository missed admission for three consecutive rounds.
+    Starved,
     /// A newer peer supplied an unrecognized reason.
     #[serde(other)]
     Unknown,
 }
 
-/// One repository's failed refresh, independent of the worker's health.
+/// Repository-level refresh condition. Starvation is not a failed probe.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRepositoryStatus {
+    /// This repository's own probe failed or timed out.
+    #[default]
+    Failed,
+    /// Three consecutive refresh rounds ended before this repository could start.
+    Starved,
+    /// A newer peer supplied a condition this reader does not recognize.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One repository's degraded refresh condition, independent of worker health.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitRepositoryHealth {
     /// ASCII-escaped checkout basename only, never an absolute filesystem path.
@@ -4946,8 +4962,19 @@ pub struct GitRepositoryHealth {
     pub workspace_ids: Vec<String>,
     /// Failed probes since this repository's last successful completion.
     pub consecutive_failures: u32,
-    /// Closed git-refresh error code, never command output or a path.
+    /// Closed git-refresh failure code, or empty for starvation without failure.
+    /// Never command output or a path. Kept as a string for mesh-v5 readers.
     pub last_error: String,
+    /// Failure or admission starvation; absent in older summaries means failed.
+    #[serde(default)]
+    pub status: GitRepositoryStatus,
+    /// Consecutive rounds skipped before admission; never a probe failure count.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub consecutive_not_started: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 /// One poller's health.
@@ -4958,7 +4985,7 @@ pub struct GitRepositoryHealth {
 /// colour a badge. Making either reconstruct the other guarantees they disagree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollerHealth {
-    /// Failed git repositories. Empty/absent for healthy repositories and other pollers.
+    /// Failed or starved git repositories. Empty/absent when none are degraded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repositories: Vec<GitRepositoryHealth>,
     /// `ok` | `idle` | `degraded` | `broken`; unknown future values remain readable.

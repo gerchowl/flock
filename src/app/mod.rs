@@ -321,6 +321,9 @@ pub struct App {
     pub(crate) issue_guard_fetch_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
+    /// Completed-round admission history, shared with the owned refresh worker.
+    pub(crate) git_refresh_schedule:
+        std::sync::Arc<parking_lot::Mutex<runtime::GitRefreshSchedule>>,
     pub(crate) git_repository_failures:
         HashMap<std::path::PathBuf, (git_repository_health::RepositoryFailure, u32)>,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
@@ -1033,6 +1036,7 @@ impl App {
             issue_guard_fetch_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_status_cache: HashMap::new(),
+            git_refresh_schedule: Default::default(),
             git_repository_failures: HashMap::new(),
             last_sidebar_divider_click: None,
             last_pane_click: None,

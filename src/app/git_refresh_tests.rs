@@ -460,3 +460,102 @@ async fn git2034_all_repositories_failing_does_not_stamp_success() {
         assert_eq!(row["repositories"][0]["consecutive_failures"], count);
     }
 }
+
+#[tokio::test]
+async fn git2100_starvation_is_visible_and_running_clears_it() {
+    let mut app = app();
+    app.state.app_client_attached = true;
+    app.state.workspaces[0].tabs.clear();
+    let ws = &app.state.workspaces[0];
+    let jobs = vec![WorkspaceGitRefreshJob {
+        cache_key: ws.identity_cwd.clone(),
+        status_cwd: ws.identity_cwd.clone(),
+        cached: None,
+        targets: vec![WorkspaceGitRefreshTarget {
+            workspace_id: ws.id.clone(),
+            resolved_identity_cwd: ws.identity_cwd.clone(),
+        }],
+    }];
+    let mut schedule = GitRefreshSchedule::default();
+    for round in 1..=3 {
+        let deadline = Instant::now();
+        refresh_git_jobs(
+            jobs.clone(),
+            &mut schedule,
+            deadline,
+            || deadline,
+            |_, _| panic!("expired budget must not probe"),
+        );
+        *app.git_refresh_schedule.lock() = schedule.clone();
+        let row = summary(&mut app);
+        if round < 3 {
+            assert!(row["repositories"].is_null());
+        } else {
+            assert_eq!(row["status"], "degraded");
+            assert_eq!(row["reason"], "starved");
+            assert_eq!(row["repositories"][0]["status"], "starved");
+            assert_eq!(row["repositories"][0]["consecutive_not_started"], 3);
+            assert_eq!(row["repositories"][0]["consecutive_failures"], 0);
+            // Mesh-v5 readers that predate starvation still accept these rows.
+            #[derive(serde::Deserialize)]
+            struct LegacyRepository {
+                repo: String,
+                workspace_ids: Vec<String>,
+                consecutive_failures: u32,
+                last_error: String,
+            }
+            let legacy: LegacyRepository =
+                serde_json::from_value(row["repositories"][0].clone()).unwrap();
+            assert!(!legacy.repo.is_empty());
+            assert_eq!(legacy.workspace_ids.len(), 1);
+            assert_eq!(legacy.consecutive_failures, 0);
+            assert!(legacy.last_error.is_empty());
+            assert!(row["last_error"].is_null());
+        }
+        assert!(!app.state.workspaces[0].git_status_stale);
+    }
+    let start = Instant::now();
+    let output = refresh_git_jobs(
+        jobs,
+        &mut schedule,
+        start + Duration::from_secs(1),
+        || start,
+        |_, _| Err(GitRefreshErrorKind::GitExit),
+    );
+    // Admission clears starvation even if this repository's probe then fails.
+    *app.git_refresh_schedule.lock() = schedule;
+    app.handle_internal_event(AppEvent::GitStatusRefreshed {
+        results: output.results,
+        failures: output.failures,
+        cache_updates: output.cache_updates,
+        error: output.error,
+    });
+    let row = summary(&mut app);
+    assert_eq!(row["status"], "degraded");
+    assert_ne!(row["reason"], "starved");
+    assert_eq!(row["repositories"][0]["status"], "failed");
+    assert_eq!(row["last_error"], "git_exit");
+    assert!(app.state.workspaces[0].git_status_stale);
+}
+
+#[tokio::test]
+async fn git2100_removed_or_moved_repository_has_no_starvation_diagnostic() {
+    let mut app = app();
+    app.state.workspaces[0].tabs.clear();
+    let ws = &app.state.workspaces[0];
+    app.git_refresh_schedule.lock().missed.insert(
+        ws.identity_cwd.clone(),
+        (
+            vec![WorkspaceGitRefreshTarget {
+                workspace_id: ws.id.clone(),
+                resolved_identity_cwd: ws.identity_cwd.clone(),
+            }],
+            3,
+        ),
+    );
+    assert_eq!(app.git_repository_health_rows().len(), 1);
+    app.state.workspaces[0].identity_cwd.push("moved");
+    assert!(app.git_repository_health_rows().is_empty());
+    app.state.workspaces.clear();
+    assert!(app.git_repository_health_rows().is_empty());
+}

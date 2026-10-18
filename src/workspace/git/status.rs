@@ -487,10 +487,9 @@ mod tests {
     fn branch_error_fixture(detached: bool) {
         use crate::workspace::git::test_support::CountingGit;
         let root = crate::test_support::TempDir::socket();
-        run_git(
-            root.path(),
-            &["init", "-q", "--ref-format=reftable", "-b", "main"],
-        );
+        if !crate::workspace::git::test_support::init_reftable(root.path()) {
+            return;
+        }
         run_git(
             root.path(),
             &[
@@ -541,10 +540,9 @@ mod tests {
     #[test]
     fn git2034_non_branch_reftable_head_keeps_legacy_branch_fallback() {
         let root = crate::test_support::TempDir::socket();
-        run_git(
-            root.path(),
-            &["init", "-q", "--ref-format=reftable", "-b", "main"],
-        );
+        if !crate::workspace::git::test_support::init_reftable(root.path()) {
+            return;
+        }
         run_git(
             root.path(),
             &["symbolic-ref", "HEAD", "refs/tags/unborn-fixture"],

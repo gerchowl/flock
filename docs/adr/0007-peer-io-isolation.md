@@ -173,3 +173,18 @@ a successful snapshot for that workspace's current cwd. Results for removed or
 moved workspace/cwd pairs do not mutate their current health. Operators should
 repair the named checkout's repository or filesystem and let the next scheduled
 round confirm recovery; healthy checkouts continue independently.
+
+Refresh admission is round-robin across deduplicated repositories. The next
+round starts immediately after the last repository admitted in the previous
+round, so a stable set of N repositories with K admissions per round is served
+within ceil(N/K) rounds (provided K is nonzero). When no repository can start,
+the cursor still advances by one; this cannot promise progress against a
+permanently exhausted budget. Three consecutive unstarted rounds expose a
+repository `status: starved` and `consecutive_not_started` in the summary, and
+poller `status: degraded`, `reason: starved`. This is admission starvation,
+not a probe failure: no failure count increments or new stale marker follows.
+Admission clears the skipped-round streak even when the admitted probe fails.
+Removed or moved workspace/cwd pairs cannot retain a starvation diagnostic.
+These fields are additive on mesh v5; older readers still receive the existing
+string `last_error`, empty for a starved repository with no failed probe.
+Scheduling history is in memory and resets when the server restarts.
