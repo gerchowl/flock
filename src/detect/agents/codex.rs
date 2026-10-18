@@ -280,7 +280,8 @@ fn has_codex_visible_working_without_prompt(content: &str) -> bool {
 }
 
 fn has_codex_strong_blocked_prompt(lower_content: &str) -> bool {
-    has_codex_hook_review(lower_content)
+    has_codex_conversation_lock(lower_content)
+        || has_codex_hook_review(lower_content)
         || has_codex_folder_trust(lower_content)
         || lower_content.contains("press enter to confirm or esc to cancel")
         || lower_content.contains("enter to submit answer")
@@ -522,6 +523,22 @@ pub(in crate::detect) fn is_progress_chrome(line: &str) -> bool {
     codex_working_status_line(line)
 }
 
+/// Live lock controls, including a wrapped or right-truncated final footer.
+/// Blank rows are ignored; any non-footer content after the controls rejects history.
+pub(in crate::detect) fn has_codex_conversation_lock(content: &str) -> bool {
+    let compact: String = bottom_non_empty_lines(content, 16)
+        .join("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    compact.contains("thisconversationisopeninanotherapp")
+        && compact.contains("closeitthereandpressrtocontinuehere")
+        && compact.rsplit_once("rretryffork").is_some_and(|(_, end)| {
+            "esc/ctrl+c/qexitctrl+ttranscript".starts_with(end.trim_end_matches('…'))
+        })
+}
+
 pub(in crate::detect) fn has_codex_hook_review(content: &str) -> bool {
     let bottom = bottom_non_empty_lines(content, 10);
     bottom
@@ -553,6 +570,46 @@ pub(in crate::detect) fn has_codex_folder_trust(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_lock_fixture_is_blocked_but_scrollback_is_not() {
+        let screen = include_str!("../../../tests/fixtures/codex/conversation-locked.txt");
+        assert_eq!(detect(screen), AgentState::Blocked);
+        assert!(has_visible_blocker(screen));
+        let earlier_footer =
+            format!("r retry f fork esc/ctrl+c/q exit ctrl+t transcript\n{screen}");
+        assert_eq!(detect(&earlier_footer), AgentState::Blocked);
+        let history = format!("{screen}\n› Ask Codex to do anything\n  ? for shortcuts\n");
+        assert_eq!(detect(&history), AgentState::Idle);
+        assert!(!has_visible_blocker(&history));
+    }
+
+    #[test]
+    fn conversation_lock_narrow_live_footer_and_truncation_exclude_history() {
+        // Captured from Codex 0.160.1 in an isolated split pane via recent text.
+        let screen = include_str!("../../../tests/fixtures/codex/conversation-locked-narrow.txt");
+        for screen in [
+            screen.to_owned(),
+            screen[..screen.find("   esc/").unwrap()].to_string(),
+            format!("{}\n\n", &screen[..screen.find("   esc/").unwrap()]),
+            format!("{screen}\n\n\n"),
+            screen[..screen.find("ctrl+c/q").unwrap()].to_string(),
+            screen.replace("ctrl+c/q exit   ctrl+t\n  transcript", "…"),
+        ] {
+            assert!(has_codex_conversation_lock(&screen), "{screen}");
+            assert_eq!(detect(&screen), AgentState::Blocked, "{screen}");
+            for tail in [
+                "› Ask Codex to do anything",
+                "• Working (1s • esc to interrupt)",
+                "Allow command?\n[y/n]",
+            ] {
+                assert!(
+                    !has_codex_conversation_lock(&format!("{screen}\n{tail}")),
+                    "{tail}"
+                );
+            }
+        }
+    }
 
     const HOLLOW_WORKING: &str =
         include_str!("../../../tests/fixtures/codex/working-hollow-background.txt");

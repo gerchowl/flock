@@ -1279,11 +1279,21 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
-        let status = super::api_helpers::pane_agent_status_from_terminal(
+        let mut status = super::api_helpers::pane_agent_status_from_terminal(
             terminal,
             pane_state.seen,
             self.terminal_runtimes.get(&terminal.id).is_some(),
         );
+        if !matches!(
+            status,
+            crate::api::schema::AgentStatus::Offline | crate::api::schema::AgentStatus::Hibernated
+        ) && terminal.effective_known_agent() == Some(crate::detect::Agent::Codex)
+            && self
+                .lookup_runtime(ws_idx, pane_id)
+                .is_some_and(|(runtime, _)| runtime.codex_conversation_locked())
+        {
+            status = crate::api::schema::AgentStatus::Blocked;
+        }
         let provider_wait = (status == crate::api::schema::AgentStatus::Blocked)
             .then_some(terminal.provider_limit.as_ref())
             .flatten();
@@ -1325,7 +1335,19 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
-        let pane = self.pane_info(ws_idx, pane_id)?;
+        let mut pane = self.pane_info(ws_idx, pane_id)?;
+        // Cache live evidence per screen revision, then project its status and
+        // reason together even before the asynchronous detector publishes it.
+        let codex_lock = !matches!(
+            pane.agent_status,
+            crate::api::schema::AgentStatus::Offline | crate::api::schema::AgentStatus::Hibernated
+        ) && pane.agent.as_deref() == Some("codex")
+            && self
+                .lookup_runtime(ws_idx, pane_id)
+                .is_some_and(|(runtime, _)| runtime.codex_conversation_locked());
+        if codex_lock {
+            pane.agent_status = crate::api::schema::AgentStatus::Blocked;
+        }
         let provider_wait = (pane.agent_status == crate::api::schema::AgentStatus::Blocked)
             .then_some(terminal.provider_limit.as_ref())
             .flatten();
@@ -1347,7 +1369,13 @@ impl App {
                 .agent_state_of_at(ws_idx, pane_id, now)
                 .map(|(_, state)| state),
             agent_status: pane.agent_status,
-            blocked_reason: if terminal.resume_failed {
+            blocked_reason: if codex_lock {
+                Some(
+                    crate::api::error_code::ErrorCode::CodexConversationLocked
+                        .as_str()
+                        .into(),
+                )
+            } else if terminal.resume_failed {
                 Some("resume_failed".into())
             } else {
                 provider_wait.as_ref().map(|_| "provider_limit".into())
@@ -1506,6 +1534,95 @@ enum StartPlacement {
 #[cfg(test)]
 mod tests {
     use crate::api::schema::{AgentStartParams, Method, Request};
+
+    #[tokio::test]
+    async fn agent_info_caches_codex_lock_per_screen_revision() {
+        use crate::api::schema::AgentStatus;
+        let (mut app, _) = app_with_workspace("lock-read-count", None);
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let (runtime, _receiver) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(
+            include_str!("../../tests/fixtures/codex/conversation-locked.txt")
+                .replace('\n', "\r\n")
+                .as_bytes(),
+        );
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        for state in [
+            crate::detect::AgentState::Idle,
+            crate::detect::AgentState::Working,
+            crate::detect::AgentState::Blocked,
+        ] {
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .set_detected_state(Some(crate::detect::Agent::Codex), state);
+            let before = crate::pane::PaneRuntime::test_detection_text_reads();
+            for _ in 0..100 {
+                for info in [
+                    app.agent_info(0, pane).unwrap(),
+                    app.collect_agent_infos().pop().unwrap(),
+                ] {
+                    assert_eq!(
+                        info.blocked_reason.as_deref(),
+                        Some("codex_conversation_locked")
+                    );
+                    assert_eq!(info.agent_status, AgentStatus::Blocked);
+                }
+            }
+            assert_eq!(
+                crate::pane::PaneRuntime::test_detection_text_reads() - before,
+                usize::from(state == crate::detect::AgentState::Idle)
+            );
+        }
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[2J\x1b[H> unlocked");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Codex),
+                crate::detect::AgentState::Idle,
+            );
+        let before = crate::pane::PaneRuntime::test_detection_text_reads();
+        let info = app.agent_info(0, pane).unwrap();
+        assert_eq!(info.agent_status, AgentStatus::Idle);
+        assert!(info.blocked_reason.is_none());
+        assert_eq!(
+            crate::pane::PaneRuntime::test_detection_text_reads() - before,
+            1
+        );
+        app.agent_info(0, pane).unwrap();
+        assert_eq!(
+            crate::pane::PaneRuntime::test_detection_text_reads() - before,
+            1
+        );
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .scroll_up(10);
+        let before = crate::pane::PaneRuntime::test_detection_text_reads();
+        app.agent_info(0, pane).unwrap();
+        assert_eq!(
+            crate::pane::PaneRuntime::test_detection_text_reads(),
+            before
+        );
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .resize(24, 100, 0, 0);
+        let before = crate::pane::PaneRuntime::test_detection_text_reads();
+        app.agent_info(0, pane).unwrap();
+        app.agent_info(0, pane).unwrap();
+        assert_eq!(
+            crate::pane::PaneRuntime::test_detection_text_reads() - before,
+            1
+        );
+    }
 
     #[test]
     fn deferred_restore_without_runtime_is_offline_and_resumable() {
