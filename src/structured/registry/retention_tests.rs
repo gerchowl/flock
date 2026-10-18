@@ -256,16 +256,28 @@ fn retained_purge_reclassifies_the_last_forward_copy_before_automatic_pruning() 
 
 #[test]
 fn retained_cause_codes_cover_every_registry_error() {
-    let cases = [
-        (RegistryError::InvalidRecord, "invalid_record"),
-        (
-            RegistryError::UnsupportedCollectionShape,
-            "unsupported_collection_shape",
-        ),
-        (RegistryError::Conflict, "conflict"),
-        (RegistryError::StaleGeneration, "stale_generation"),
-        (RegistryError::GenerationExhausted, "generation_exhausted"),
-    ];
+    // One list generates both the cases and their exhaustive expected-code match.
+    macro_rules! cause_cases {
+        ($($variant:ident => $code:literal),+ $(,)?) => {{
+            fn expected_cause(error: &RegistryError) -> &'static str {
+                match error {
+                    $(RegistryError::$variant => $code),+
+                }
+            }
+            [$({
+                let error = RegistryError::$variant;
+                let code = expected_cause(&error);
+                (error, code)
+            }),+]
+        }};
+    }
+    let cases = cause_cases! {
+        InvalidRecord => "invalid_record",
+        UnsupportedCollectionShape => "unsupported_collection_shape",
+        Conflict => "conflict",
+        StaleGeneration => "stale_generation",
+        GenerationExhausted => "generation_exhausted",
+    };
     let actual: Vec<_> = cases
         .iter()
         .map(|(error, _)| error.retained_cause())
