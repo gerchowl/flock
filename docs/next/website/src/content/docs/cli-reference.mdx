@@ -113,6 +113,12 @@ An entirely failed round still increments the global failure count and does not
 stamp success. Worker panics, spawn failures and stuck rounds retain their
 round-level failures.
 
+A repository not started before the shared deadline is not refreshed this round:
+its cached values stay unchanged, with no new failure or stale marker. Only its
+own failed or timed-out probe earns a failure. Moving or removing a workspace's
+cwd clears the old cwd's stale marker. Branch-discovery errors, including the
+reftable branch-only fallback, are typed failures rather than a successful
+unknown branch. A healthy detached HEAD still has no branch name.
 
 ## Peer enrollment
 

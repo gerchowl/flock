@@ -28,4 +28,4 @@ pub(crate) use self::test_support::temp_test_dir as test_support_temp_dir;
 #[cfg(test)]
 mod timeout_tests;
 
-pub(crate) use self::status::git_status_snapshot_for_cwd;
+pub(crate) use self::status::{git_status_snapshot_in_round, GitRefreshRound};

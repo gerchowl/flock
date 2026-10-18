@@ -1869,25 +1869,52 @@ pub(crate) fn refresh_workspace_git_statuses_with_cache(
     cache: &HashMap<std::path::PathBuf, GitStatusCacheEntry>,
     deadline: Instant,
 ) -> WorkspaceGitRefreshOutput {
-    let mut output = WorkspaceGitRefreshOutput::default();
     for item in &mut items {
         if Instant::now() >= deadline {
-            output.error = Some(GitRefreshErrorKind::Timeout);
-            return output;
+            return WorkspaceGitRefreshOutput::default();
         }
         item.cache_key = crate::workspace::git_status_cache_key(&item.resolved_identity_cwd)
             .unwrap_or_else(|| item.resolved_identity_cwd.clone());
     }
-    for job in deduplicate_git_refresh_items(items, cache) {
-        if Instant::now() >= deadline {
-            output.error = Some(GitRefreshErrorKind::Timeout);
+    let mut round = crate::workspace::git::GitRefreshRound::default();
+    refresh_git_jobs(
+        deduplicate_git_refresh_items(items, cache),
+        deadline,
+        Instant::now,
+        |job, deadline| {
+            Workspace::git_status_snapshot_for_cwd_with_cache(
+                &job.status_cwd,
+                job.cached.as_ref(),
+                deadline,
+                &mut round,
+            )
+        },
+    )
+}
+
+/// A shared deadline gates admission, not the outcome of an unstarted probe.
+/// The clock/probe boundary makes neighbor starvation deterministic in tests.
+fn refresh_git_jobs(
+    jobs: Vec<WorkspaceGitRefreshJob>,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut probe: impl FnMut(
+        &WorkspaceGitRefreshJob,
+        Instant,
+    ) -> Result<
+        (
+            crate::workspace::WorkspaceGitStatusSnapshot,
+            Option<GitStatusCacheEntry>,
+        ),
+        GitRefreshErrorKind,
+    >,
+) -> WorkspaceGitRefreshOutput {
+    let mut output = WorkspaceGitRefreshOutput::default();
+    for job in jobs {
+        if now() >= deadline {
             break;
         }
-        let (snapshot, cache_entry) = match Workspace::git_status_snapshot_for_cwd_with_cache(
-            &job.status_cwd,
-            job.cached.as_ref(),
-            deadline,
-        ) {
+        let (snapshot, cache_entry) = match probe(&job, deadline) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 output
@@ -2209,6 +2236,206 @@ mod tests {
             is_focused: true,
         });
         (app, pane_id)
+    }
+
+    #[tokio::test]
+    async fn git2100_neighbor_budget_exhaustion_only_marks_an_attempted_failure() {
+        for fails in [false, true] {
+            let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+            app.state.workspaces = ["admitted", "not-refreshed"]
+                .into_iter()
+                .map(|name| {
+                    let mut ws = Workspace::test_new(name);
+                    ws.tabs.clear();
+                    ws.cached_git_branch = Some("last-known".into());
+                    ws
+                })
+                .collect();
+            let items = app
+                .state
+                .workspaces
+                .iter()
+                .map(|ws| WorkspaceGitRefreshItem {
+                    workspace_id: ws.id.clone(),
+                    resolved_identity_cwd: ws.identity_cwd.clone(),
+                    cache_key: ws.identity_cwd.clone(),
+                })
+                .collect();
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(60);
+            let clock = std::cell::Cell::new(started);
+            let mut attempted = 0;
+            let output = refresh_git_jobs(
+                deduplicate_git_refresh_items(items, &HashMap::new()),
+                deadline,
+                || clock.get(),
+                |_, _| {
+                    attempted += 1;
+                    clock.set(deadline);
+                    if fails {
+                        Err(GitRefreshErrorKind::Timeout)
+                    } else {
+                        Ok((
+                            crate::workspace::WorkspaceGitStatusSnapshot {
+                                branch: Some("updated".into()),
+                                ahead_behind: None,
+                                space: None,
+                            },
+                            None,
+                        ))
+                    }
+                },
+            );
+            assert_eq!(attempted, 1, "the neighbor must never start");
+            assert_eq!(output.failures.len(), usize::from(fails));
+            assert_eq!(output.error, fails.then_some(GitRefreshErrorKind::Timeout));
+            app.handle_internal_event(AppEvent::GitStatusRefreshed {
+                results: output.results,
+                failures: output.failures,
+                error: output.error,
+                cache_updates: output.cache_updates,
+            });
+            assert_eq!(app.state.workspaces[0].git_status_stale, fails);
+            let skipped = &app.state.workspaces[1];
+            assert!(!skipped.git_status_stale);
+            assert_eq!(skipped.cached_git_branch.as_deref(), Some("last-known"));
+            assert!(!crate::ui::grammar::local_member_label(
+                &app.state,
+                skipped,
+                &app.terminal_runtimes
+            )
+            .contains("[git stale]"));
+            assert_eq!(app.git_repository_health_rows().len(), usize::from(fails));
+            assert_eq!(
+                app.git_refresh_health.consecutive_failures,
+                u32::from(fails)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git2100_unstarted_completion_does_not_invent_success() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+        let previous = Instant::now() - Duration::from_secs(100);
+        app.git_refresh_health.last_success = Some(previous);
+        app.git_refresh_in_flight = true;
+        app.git_refresh_health.mark_started(Instant::now());
+        app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            results: vec![],
+            failures: vec![],
+            cache_updates: vec![],
+            error: None,
+        });
+        assert_eq!(app.git_refresh_health.last_success, Some(previous));
+        assert_eq!(app.git_refresh_health.consecutive_failures, 0);
+        assert!(app.git_refresh_health.in_flight_since.is_none());
+        assert!(!app.git_refresh_in_flight);
+    }
+
+    #[test]
+    fn git2100_absent_refs_are_verified_once_per_repo_per_round() {
+        use crate::workspace::git::test_support::{run_git, CountingGit};
+        let base = crate::test_support::TempDir::socket();
+        let repo = base.path().join("repo");
+        let linked = base.path().join("linked");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(
+            &repo,
+            &["init", "-q", "--ref-format=reftable", "-b", "main"],
+        );
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "other",
+                linked.to_str().unwrap(),
+            ],
+        );
+        for branch in ["main", "other"] {
+            run_git(
+                &repo,
+                &["config", &format!("branch.{branch}.remote"), "origin"],
+            );
+            run_git(
+                &repo,
+                &[
+                    "config",
+                    &format!("branch.{branch}.merge"),
+                    "refs/heads/missing",
+                ],
+            );
+        }
+        let counter = CountingGit::new();
+        let started = Instant::now();
+        for _ in 0..10 {
+            let items = [&repo, &linked]
+                .into_iter()
+                .enumerate()
+                .map(|(i, cwd)| WorkspaceGitRefreshItem {
+                    workspace_id: format!("fixture-{i}"),
+                    resolved_identity_cwd: cwd.clone(),
+                    cache_key: cwd.clone(),
+                })
+                .collect();
+            let output = refresh_workspace_git_statuses_with_cache(
+                items,
+                &HashMap::new(),
+                Instant::now() + Duration::from_secs(60),
+            );
+            assert_eq!(output.error, None);
+            assert_eq!(output.results.len(), 2);
+            assert!(output.results.iter().all(|s| s.ahead_behind.is_none()));
+        }
+        let elapsed = started.elapsed();
+        let calls = counter.calls();
+        let optional = calls
+            .lines()
+            .filter(|line| line.ends_with("rev-parse --verify --quiet refs/remotes/origin/missing"))
+            .count();
+        let report = format!("git2100 measurement: 20 fingerprint misses, {} processes, {optional} optional-ref verifications, {:.3} ms/miss",
+            calls.lines().count(), elapsed.as_secs_f64() * 1000.0 / 20.0);
+        println!("{report}"); // guardrails-ok(no-debug-leftovers): benchmark measurements are acceptance evidence
+
+        assert_eq!(
+            optional, 10,
+            "one optional-ref probe per common repo per round"
+        );
+        assert_eq!(calls.lines().count(), 70);
+    }
+
+    #[test]
+    fn git2100_expired_round_does_not_fail_an_unstarted_repository() {
+        let cwd = crate::test_support::TempDir::socket();
+        let output = refresh_workspace_git_statuses_with_cache(
+            vec![WorkspaceGitRefreshItem {
+                workspace_id: "starved-fixture".into(),
+                resolved_identity_cwd: cwd.path().into(),
+                cache_key: cwd.path().into(),
+            }],
+            &HashMap::new(),
+            Instant::now(),
+        );
+        assert_eq!(output.error, None, "no probe ran, so no probe failed");
+        assert!(output.failures.is_empty());
+        assert!(output.results.is_empty());
     }
 
     #[test]

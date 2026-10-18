@@ -238,8 +238,11 @@ impl App {
                 } else {
                     self.git_refresh_health.mark_failure(Instant::now(), error);
                 }
-            } else {
+            } else if !results.is_empty() {
                 self.git_refresh_health.mark_success(Instant::now());
+            } else {
+                // No repository was admitted before the shared deadline.
+                self.git_refresh_health.in_flight_since = None;
             }
             self.git_refresh_timed_out = false;
             // #262: the periodic probe is flock's freshness contract for every

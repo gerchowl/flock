@@ -64,12 +64,9 @@ impl App {
                     .iter()
                     .any(|target| target.workspace_id == ws.id)
             });
-            let succeeded = results.iter().any(|result| {
-                result.workspace_id == ws.id
-                    && live.get(&ws.id).and_then(Option::as_ref)
-                        == Some(&result.resolved_identity_cwd)
-            });
-            let stale = failed || (!succeeded && ws.git_status_stale);
+            // Retained failures were pruned against current workspace/cwd pairs.
+            // An old flag cannot outlive the cwd that earned it.
+            let stale = failed;
             changed |= stale != ws.git_status_stale;
             ws.git_status_stale = stale;
         }
@@ -147,6 +144,18 @@ mod tests {
         };
         app.state.workspaces.push(ws);
         (app, failure)
+    }
+
+    #[tokio::test]
+    async fn git2100_moved_cwd_clears_previously_stale_flag_without_a_result() {
+        let (mut app, failure) = fixture();
+        assert!(app.apply_git_repository_outcome(&[], vec![failure]));
+        assert!(app.state.workspaces[0].git_status_stale);
+        let moved = crate::test_support::TempDir::socket();
+        app.state.workspaces[0].identity_cwd = moved.path().to_owned();
+        assert!(app.apply_git_repository_outcome(&[], vec![]));
+        assert!(!app.state.workspaces[0].git_status_stale);
+        assert!(app.git_repository_failures.is_empty());
     }
 
     #[tokio::test]

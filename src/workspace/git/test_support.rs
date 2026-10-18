@@ -39,7 +39,7 @@ pub(crate) fn write_fake_tracked_repo(root: &Path) {
     .unwrap();
 }
 
-pub(super) fn run_git(cwd: &Path, args: &[&str]) {
+pub(crate) fn run_git(cwd: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
         .arg("-C")
@@ -105,6 +105,49 @@ impl Drop for HungGit {
         // Unblock an accept if spawning the fixture failed before connection.
         let _ = std::os::unix::net::UnixStream::connect(self.dir.path().join("gate"));
         if let Some(path) = &self.old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+    }
+}
+
+/// Count real git subprocesses in a nextest-isolated test process.
+pub(crate) struct CountingGit {
+    dir: crate::test_support::TempDir,
+    path: Option<std::ffi::OsString>,
+}
+impl CountingGit {
+    pub(crate) fn new() -> Self {
+        Self::scripted("")
+    }
+    pub(crate) fn scripted(fault: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let git = crate::test_support::program_path("git");
+        let dir = crate::test_support::TempDir::socket();
+        let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n{fault}\nexec {} \"$@\"\n",
+            quote(&dir.path().join("calls")),
+            quote(&git)
+        );
+        std::fs::write(dir.path().join("git"), script).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("git"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let path = std::env::var_os("PATH");
+        std::env::set_var("PATH", dir.path());
+        Self { dir, path }
+    }
+    pub(crate) fn calls(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("calls")).unwrap_or_default()
+    }
+}
+impl Drop for CountingGit {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
             std::env::set_var("PATH", path);
         } else {
             std::env::remove_var("PATH");

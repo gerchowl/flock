@@ -118,13 +118,29 @@ verification also hides malformed loose refs, so absence is confirmed by a bound
 `show-ref` database check (exit 1 for an empty database). Neither command parses
 stderr. An absent revision also requires a symbolic or resolvable detached HEAD:
 a damaged reftable stack can otherwise appear to be an empty database. Detached
-symbolic refs retain their exit-1 absence semantics.
+symbolic refs retain their exit-1 absence semantics. Verified absence is cached
+by common repository directory and ref name for one owned refresh round, shared
+by linked worktrees. HEAD absence is scoped to its worktree directory instead.
+Only successful absence is memoized: errors and positive OIDs are probed normally.
+A ref created mid-round becomes visible on the next round, never hidden across
+refresh rounds or restarts.
 
 A missing fingerprint keeps the earlier branch-only fallback, with the same
 round/command bounds on reftable discovery. Symbolic reftable HEAD outside
 `refs/heads/` has no branch fingerprint, rather than being malformed output:
 the branch-only fallback may still show its shortened symbolic target. Such
-snapshots are not cached and carry no ahead/behind counts.
+snapshots are not cached and carry no ahead/behind counts. Unlike the former
+branch-only convenience wrapper, probe errors in this fallback remain typed
+repository failures rather than a successful unknown branch. A healthy detached
+HEAD still has no branch label.
+
+The shared deadline gates starting the next repository. A repository not started
+before it is not refreshed this round: its values remain unchanged, and it earns
+no failure or stale marker from a neighbor's use of the budget. Its own failed or
+timed-out probe still counts. An entirely unstarted round neither increments the
+failure streak nor invents a successful refresh timestamp. Stale flags are derived
+from failures belonging to still-current workspace/cwd pairs, so removing or
+moving a cwd cannot leave its flag behind.
 
 The app watchdog stays scheduled while a round is in flight, including without
 viewers. At 60 seconds it records `round_stalled` once and retains worker

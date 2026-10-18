@@ -52,15 +52,61 @@ pub fn git_status_cache_key(cwd: &Path) -> Option<PathBuf> {
     git_worktree_info(cwd).map(|info| canonicalize_best_effort_path(&info.repo_root))
 }
 
-/// Read one snapshot without caching a failed command. Every git subprocess
-/// shares the round deadline as well as its own ten-second ceiling.
+/// Optional-ref absence is remembered only within one owned refresh round.
+/// Linked checkouts share ref names through their common directory, but HEAD
+/// belongs to one worktree. Errors and positive OIDs are never memoized here.
+/// A ref created during the round is observed on the next round.
+#[derive(Default)]
+pub(crate) struct GitRefreshRound {
+    absent: std::collections::HashSet<(PathBuf, String)>,
+}
+
+impl GitRefreshRound {
+    fn revision(
+        &mut self,
+        info: &GitWorktreeInfo,
+        revision: &str,
+        deadline: Instant,
+    ) -> Result<Option<String>, Error> {
+        let directory = if revision == "HEAD" {
+            &info.git_dir
+        } else {
+            &info.git_common_dir
+        };
+        let key = (
+            canonicalize_best_effort_path(directory),
+            revision.to_owned(),
+        );
+        if self.absent.contains(&key) {
+            return Ok(None);
+        }
+        let oid = git_rev_parse_verify(&info.repo_root, revision, deadline)?;
+        if oid.is_none() {
+            self.absent.insert(key);
+        }
+        Ok(oid)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn git_status_snapshot_for_cwd(
     cwd: &Path,
     cached: Option<&GitStatusCacheEntry>,
     deadline: Instant,
 ) -> Result<(WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>), Error> {
+    git_status_snapshot_in_round(cwd, cached, deadline, &mut GitRefreshRound::default())
+}
+
+/// Read one snapshot without caching a failed command. Every git subprocess
+/// shares the round deadline as well as its own ten-second ceiling.
+pub(crate) fn git_status_snapshot_in_round(
+    cwd: &Path,
+    cached: Option<&GitStatusCacheEntry>,
+    deadline: Instant,
+    round: &mut GitRefreshRound,
+) -> Result<(WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>), Error> {
     let space = git_space_metadata(cwd);
-    let Some(fingerprint) = git_status_fingerprint(cwd, deadline)? else {
+    let Some(fingerprint) = git_status_fingerprint_in_round(cwd, deadline, round)? else {
         return Ok((
             WorkspaceGitStatusSnapshot {
                 branch: super::discovery::git_branch_with_deadline(cwd, deadline)?,
@@ -108,9 +154,18 @@ pub(crate) fn git_status_snapshot_for_cwd(
     ))
 }
 
+#[cfg(test)]
 pub(super) fn git_status_fingerprint(
     cwd: &Path,
     deadline: Instant,
+) -> Result<Option<GitStatusFingerprint>, Error> {
+    git_status_fingerprint_in_round(cwd, deadline, &mut GitRefreshRound::default())
+}
+
+fn git_status_fingerprint_in_round(
+    cwd: &Path,
+    deadline: Instant,
+    round: &mut GitRefreshRound,
 ) -> Result<Option<GitStatusFingerprint>, Error> {
     if Instant::now() >= deadline {
         return Err(Error::Timeout);
@@ -118,12 +173,12 @@ pub(super) fn git_status_fingerprint(
     let Some(info) = git_worktree_info(cwd) else {
         return Ok(None);
     };
-    let Some(head) = read_head_identity(&info, deadline)? else {
+    let Some(head) = read_head_identity(&info, deadline, round)? else {
         return Ok(None);
     };
     let upstream = match &head {
         GitHeadIdentity::Branch { short_name, .. } => {
-            read_upstream_identity(&info, short_name, deadline)?
+            read_upstream_identity(&info, short_name, deadline, round)?
         }
         GitHeadIdentity::Detached { .. } => None,
     };
@@ -161,6 +216,7 @@ impl GitStatusFingerprint {
 fn read_head_identity(
     info: &GitWorktreeInfo,
     deadline: Instant,
+    round: &mut GitRefreshRound,
 ) -> Result<Option<GitHeadIdentity>, Error> {
     if !git_ref_storage_is_reftable(&info.git_common_dir) {
         return Ok(read_head_identity_from_files(info));
@@ -169,14 +225,15 @@ fn read_head_identity(
         let Some(short_name) = full_ref.strip_prefix("refs/heads/").map(str::to_owned) else {
             return Ok(None);
         };
-        let oid = git_rev_parse_verify(&info.repo_root, &full_ref, deadline)?;
+        let oid = round.revision(info, &full_ref, deadline)?;
         return Ok(Some(GitHeadIdentity::Branch {
             full_ref,
             short_name,
             oid,
         }));
     }
-    Ok(git_rev_parse_verify(&info.repo_root, "HEAD", deadline)?
+    Ok(round
+        .revision(info, "HEAD", deadline)?
         .map(|oid| GitHeadIdentity::Detached { oid }))
 }
 
@@ -202,6 +259,7 @@ fn read_upstream_identity(
     info: &GitWorktreeInfo,
     branch: &str,
     deadline: Instant,
+    round: &mut GitRefreshRound,
 ) -> Result<Option<GitUpstreamIdentity>, Error> {
     let Some(config) = read_branch_config(info, branch) else {
         return Ok(None);
@@ -210,7 +268,7 @@ fn read_upstream_identity(
         return Ok(None);
     };
     let oid = if git_ref_storage_is_reftable(&info.git_common_dir) {
-        git_rev_parse_verify(&info.repo_root, &full_ref, deadline)?
+        round.revision(info, &full_ref, deadline)?
     } else {
         read_ref_oid(&info.git_common_dir, &full_ref)
     };
@@ -424,6 +482,60 @@ mod tests {
         );
 
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    fn branch_error_fixture(detached: bool) {
+        use crate::workspace::git::test_support::CountingGit;
+        let root = crate::test_support::TempDir::socket();
+        run_git(
+            root.path(),
+            &["init", "-q", "--ref-format=reftable", "-b", "main"],
+        );
+        run_git(
+            root.path(),
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        if detached {
+            run_git(root.path(), &["checkout", "--detach", "-q"]);
+        } else {
+            run_git(root.path(), &["symbolic-ref", "HEAD", "refs/tags/fixture"]);
+        }
+        let fault = if detached {
+            "if [ \"$3\" = symbolic-ref ]; then exit 128; fi"
+        } else {
+            "if [ \"$3\" = symbolic-ref ] && [ \"$5\" = --short ]; then exit 128; fi"
+        };
+        let counter = CountingGit::scripted(fault);
+        assert_eq!(
+            git_status_snapshot_for_cwd(root.path(), None, deadline()),
+            Err(Error::GitExit)
+        );
+        drop(counter);
+        let (snapshot, cache) = git_status_snapshot_for_cwd(root.path(), None, deadline()).unwrap();
+        assert_eq!(
+            snapshot.branch.as_deref(),
+            if detached { None } else { Some("fixture") }
+        );
+        assert_eq!(cache.is_some(), detached);
+    }
+
+    #[test]
+    fn git2100_symbolic_head_outside_heads_preserves_typed_fallback_error() {
+        branch_error_fixture(false);
+    }
+
+    #[test]
+    fn git2100_detached_head_preserves_typed_probe_error() {
+        branch_error_fixture(true);
     }
 
     #[test]

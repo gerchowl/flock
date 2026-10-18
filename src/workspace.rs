@@ -1162,11 +1162,12 @@ impl Workspace {
         resolved_identity_cwd: &std::path::Path,
         cached: Option<&GitStatusCacheEntry>,
         deadline: std::time::Instant,
+        round: &mut self::git::GitRefreshRound,
     ) -> Result<
         (WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>),
         crate::health::GitRefreshErrorKind,
     > {
-        self::git::git_status_snapshot_for_cwd(resolved_identity_cwd, cached, deadline)
+        self::git::git_status_snapshot_in_round(resolved_identity_cwd, cached, deadline, round)
     }
 
     pub fn find_tab_index_for_pane(&self, pane_id: PaneId) -> Option<usize> {
