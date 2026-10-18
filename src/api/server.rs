@@ -2008,6 +2008,51 @@ mod tests {
     }
 
     #[test]
+    fn subscription_live_start_recovers_unapplied_events_from_the_quiet_floor() {
+        let hub = EventHub::default();
+        hub.push(queued_for("ws_1:p1", "before-live"));
+        let filters = vec![
+            serde_json::json!({"type":"msg.queued","pane":"ws_1:p1"}),
+            serde_json::json!({"type":"msg.queued","pane":"ws_1:p2"}),
+            serde_json::json!({"type":"workspace.closed"}),
+        ];
+        let mut live = ResumeSubscription::new(hub.clone(), None, filters.clone());
+        let ack = live.next();
+        let floor = ack["result"]["start_sequence"].as_u64().unwrap();
+        assert_eq!(floor, 1);
+        let mut applied = [floor; 3];
+        hub.push(queued_for("ws_1:p1", "applied-live"));
+        let event = live.next();
+        assert_eq!(event["data"]["correlation_id"], "applied-live");
+        assert_eq!(event["seq"], 2);
+        applied[event["subscription_index"].as_u64().unwrap() as usize] = 2;
+        drop(live);
+
+        hub.push(queued_for("ws_1:p2", "missed-disconnected"));
+        hub.push(queued_for("ws_1:p1", "later-disconnected"));
+        let resume = *applied.iter().min().unwrap();
+        let mut recovered = ResumeSubscription::new(hub, Some(resume), filters);
+        assert_eq!(recovered.next()["result"]["start_sequence"], resume);
+        let mut new_items = Vec::new();
+        let mut duplicates = Vec::new();
+        for _ in 0..3 {
+            let event = recovered.next();
+            let index = event["subscription_index"].as_u64().unwrap() as usize;
+            let sequence = event["seq"].as_u64().unwrap();
+            let id = event["data"]["correlation_id"].as_str().unwrap().to_owned();
+            if sequence <= applied[index] {
+                duplicates.push(id);
+            } else {
+                applied[index] = sequence;
+                new_items.push(id);
+            }
+        }
+        assert_eq!(duplicates, ["applied-live"]);
+        assert_eq!(new_items, ["missed-disconnected", "later-disconnected"]);
+        assert_eq!(applied, [4, 3, floor]);
+    }
+
+    #[test]
     fn ordinary_subscription_events_identify_same_type_filters_independently() {
         let hub = EventHub::default();
         hub.push(queued_for("ws_1:p2", "earlier"));

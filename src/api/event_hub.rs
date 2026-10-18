@@ -498,9 +498,13 @@ impl EventHub {
                 code: ErrorCode::EventsLost.as_str().into(),
                 message: "Events were lost. Resync with per-verb reads (workspace.list, pane.list, agent.list, msg.list); use events.read for retained durable history.".into(),
                 data: Some(Box::new(ErrorData {
-                    extra: [("requested_sequence".into(), sequence.into()),
+                    extra: [
+                        ("requested_sequence".into(), sequence.into()),
                         ("oldest_available_sequence".into(), oldest.into()),
-                        ("current_sequence".into(), state.next_sequence.into())].into_iter().collect(),
+                        ("current_sequence".into(), state.next_sequence.into()),
+                    ]
+                    .into_iter()
+                    .collect(),
                     ..Default::default()
                 })),
             });

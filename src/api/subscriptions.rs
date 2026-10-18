@@ -307,7 +307,7 @@ fn subscription_events(
         if let Some(oldest) = error
             .data
             .as_ref()
-            .and_then(|d| d.extra.get("oldest_available_sequence"))
+            .and_then(|data| data.extra.get("oldest_available_sequence"))
             .and_then(serde_json::Value::as_u64)
         {
             *cursor = oldest.saturating_sub(1);

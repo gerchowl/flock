@@ -462,7 +462,8 @@ mod tests {
 
     #[test]
     fn opted_in_subscription_checks_capability_then_sends_distinct_cursor() {
-        let path = std::path::PathBuf::from(format!("/tmp/f473ok-{}.sock", std::process::id()));
+        let directory = crate::test_support::TempDir::socket();
+        let path = directory.path().join("events.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
@@ -496,19 +497,13 @@ mod tests {
         let sent = server.join().unwrap();
         assert_eq!(sent["params"]["after_sequence"], 7);
         assert!(sent["params"].get("after").is_none());
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn opted_in_subscription_refuses_a_server_without_the_capability() {
         for advertised in [None, Some(false)] {
-            let dir = std::path::PathBuf::from("/tmp").join(format!(
-                "f473cap-{}-{:?}",
-                std::process::id(),
-                advertised
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("s.sock");
+            let directory = crate::test_support::TempDir::socket();
+            let path = directory.path().join("events.sock");
             let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
             let server = std::thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
@@ -536,7 +531,6 @@ mod tests {
             );
             assert_eq!(probe["method"], "ping");
             assert!(matches!(listener.accept(),Err(e) if e.kind()==io::ErrorKind::WouldBlock));
-            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 
