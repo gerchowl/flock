@@ -121,3 +121,46 @@ mod tests {
         assert!(captured.birth.is_some());
     }
 }
+
+#[cfg(test)]
+mod live_scope_tests {
+    #[test]
+    fn scoped_liveness_refuses_an_exited_unreaped_process() {
+        let mut command = crate::process::TracedCommand::new("/bin/sh", "scoped-zombie-fixture");
+        command.args(["-c", "exit 0"]);
+        command.stdin(std::process::Stdio::piped());
+        let mut child = command.spawn_traced().unwrap();
+        let pid = child.id();
+        let (done, received) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            // SAFETY: siginfo_t is a zero-initializable output buffer. The PID
+            // belongs to this fixture; WNOWAIT preserves it for the assertion.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result =
+                unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+            let _ = done.send(result);
+        });
+        let result = received.recv_timeout(std::time::Duration::from_secs(5));
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        waiter.join().unwrap();
+        assert_eq!(
+            result.expect("fixture exit must arrive within the fail ceiling"),
+            0
+        );
+        let legacy = crate::platform::process_start_time(pid);
+        let live = crate::platform::live_process_facts(pid);
+        let reaped = child.wait().unwrap();
+        assert!(reaped.success());
+        assert!(
+            legacy.is_some(),
+            "the fixture was deliberately left unreaped"
+        );
+        assert!(
+            live.is_none(),
+            "zombie process facts cannot authorize a request"
+        );
+    }
+}

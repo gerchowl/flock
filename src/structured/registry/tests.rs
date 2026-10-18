@@ -2,7 +2,7 @@ use super::*;
 use crate::api::agent_state::{Attention, Background, Phase, StateSource, Turn, Waiting};
 use crate::structured::claude::SessionEvent;
 
-fn record(id: &str) -> Record {
+pub(super) fn record(id: &str) -> Record {
     Record {
         runtime: crate::structured::registry::StructuredRuntime::Structured,
         agent_id: id.into(),
