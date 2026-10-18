@@ -16,6 +16,7 @@ def main():
     parser.add_argument("--bin", required=True, type=Path)
     parser.add_argument("--driver", required=True, nargs="+")
     parser.add_argument("--runbook", required=True, type=Path)
+    parser.add_argument("--artifacts", type=Path, help="keep driver artifacts outside the disposable sandbox")
     parser.add_argument("--root", type=Path, default=Path("/tmp"), help=argparse.SUPPRESS)
     args = parser.parse_args()
     root = args.root.resolve(strict=True)
@@ -67,7 +68,8 @@ def main():
                     raise RuntimeError(f"incomplete server startup: {output.decode(errors='replace')}")
                 output.extend(chunk)
         print(json.dumps(dict(sandbox=str(base))), flush=True)
-        result = subprocess.run([*args.driver, "run", str(runbook), "--artifacts", str(base / "out"),
+        artifacts = args.artifacts.resolve() if args.artifacts else base / "out"
+        result = subprocess.run([*args.driver, "run", str(runbook), "--artifacts", str(artifacts),
                                  "--var", f"bin={binary}", "--var", f"home={base / 'h'}", "--var", f"xdg={base / 'c'}"],
                                 cwd=base, env=env)
         return result.returncode

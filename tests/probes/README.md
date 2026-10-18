@@ -13,8 +13,8 @@ two builds, not as CI.
 
 ```sh
 PROBE=~/.claude/skills/tui-probe/tui-probe
-$PROBE run tests/probes/<name>.toml --artifacts /tmp/out \
-  --var bin=target/debug/flk --var home=<sandbox> --var xdg=/tmp/<short>
+python3 tests/probes/run.py --bin target/debug/flk \
+  --runbook tests/probes/<name>.toml --artifacts /tmp/probe-out --driver "$PROBE"
 ```
 
 Every runbook takes `bin`, so the same script runs against two builds. That
@@ -39,9 +39,32 @@ that describe the bug — is the point of the format.
 - **Seed the config.** `onboarding = false` skips the welcome dialogs, and
   binding what you need to a plain key (`toggle_prompt_expand = ["f8"]`)
   avoids driving prefix-mode chords.
-- **Kill the server the probe leaves behind.** Stopping the probe stops the
-  client; flk's server daemonises and survives. Match on the sandbox binary
-  path so you can never signal the user's real server.
+- **Use the wrapper for either build.** It copies the selected binary inside a
+  private `/tmp/flock-autodetect-test-<owner-pid>-<random>` sandbox, seeds config,
+  removes inherited `FLOCK_*` variables, and records its server before invoking
+  the driver. Normal completion stops that owned child and removes the copy.
+  Optional `--artifacts` keeps driver artifacts separately; binary copies and
+  state always stay disposable. Never leave an unfixed binary copy outside this
+  lifecycle.
+
+## Crash recovery and identity
+
+Before starting a server, the auto-detect test suite sweeps the same sandbox
+namespace. Live owner PIDs are kept. For dead owners, durable `.server-*.json`
+records must prove the current server's executable, `server` argument, sandbox
+HOME and state directory, and start time when recorded. Identity is rechecked
+before a signal; native exit notifications impose a finite cleanup ceiling.
+Unproven identities, incomplete records, unavailable inspection and timeouts are
+logged and retain the sandbox. There are no pattern-based signals in this sweep.
+Concurrent sweepers use a nonblocking per-sandbox lock. Copied binaries disappear
+only with their recovered sandbox.
+
+Only newly recorded sandboxes are recoverable automatically: historical
+sandboxes without records are retained, as are dead-owner PIDs reused by a live
+process. The copied probe server is recorded by the wrapper; direct and detached
+auto-detect servers are recorded by shared test support. Rust tests in
+`tests/sandbox_sweep.rs` exercise the actual wrapper and recovery with real
+isolated servers, including a wrong-PID refusal, so the proof runs in CI.
 
 ## Socket-driven measurement scripts
 
