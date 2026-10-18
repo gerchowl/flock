@@ -1,5 +1,6 @@
 //! Structured harness adapters, separate from flock state events (ADR-0036 §11).
 
+pub mod blobs;
 pub mod claude;
 pub mod fleet_lite;
 pub mod launch;
