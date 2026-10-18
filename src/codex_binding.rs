@@ -59,6 +59,8 @@ pub(crate) struct Key {
 pub(crate) enum Failure {
     Route,
     Path,
+    /// The opened transcript has more than one directory entry.
+    HardLink,
     Metadata,
     Writer,
     Version,
@@ -96,10 +98,18 @@ pub(crate) struct Validated {
     pub metadata_version: String,
 }
 
+impl Validated {
+    /// Attribution capability retained by file/cursor and supervised reader slices.
+    pub fn key(&self) -> &Key {
+        &self.key
+    }
+}
+
 /// Validate on a worker, with a caller-supplied metadata byte budget. The writer
 /// candidates must come from this local launch's process attribution, never hook
 /// JSON or a filename. No environment/default profile lookup occurs here.
 /// Version eligibility is supplied by S1, not re-probed for each claim.
+/// Multiply linked transcript inodes fail with `Failure::HardLink` (ADR-0028 §1a).
 pub(crate) fn validate(
     key: &Key,
     launch: &Launch,
@@ -133,6 +143,9 @@ pub(crate) fn validate(
     let relative = path.strip_prefix(&home).map_err(|_| Failure::Path)?;
     let file =
         platform::structured::open_regular_beneath(&home, relative).map_err(|_| Failure::Path)?;
+    if platform::structured::file_link_count(&file).map_err(|_| Failure::Path)? > 1 {
+        return Err(Failure::HardLink);
+    }
     let mut line = Vec::new();
     let mut reader = BufReader::new(file.take(metadata_limit.saturating_add(1)));
     reader
@@ -271,6 +284,11 @@ impl Binding {
         self.key = Some(key.clone());
         self.pending = true;
         Ok(key)
+    }
+
+    /// Reject stale worker callbacks before segment preparation or admission.
+    pub fn pending(&self, key: &Key) -> bool {
+        self.pending && self.key.as_ref() == Some(key)
     }
 
     /// Complete exactly the still-pending capability. Rejected and superseded

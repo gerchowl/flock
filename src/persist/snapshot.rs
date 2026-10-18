@@ -17,6 +17,12 @@ pub struct SessionSnapshot {
     /// Format version — used to detect incompatible changes.
     #[serde(default)]
     pub version: u32,
+    /// Pane-free records. Empty in older snapshots, restored offline without authority.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::structured::registry::Registry::is_empty"
+    )]
+    pub structured_agents: crate::structured::registry::Registry,
     pub workspaces: Vec<WorkspaceSnapshot>,
     pub active: Option<usize>,
     pub selected: usize,
@@ -129,8 +135,47 @@ pub struct TabSnapshot {
     pub root_pane: Option<u32>,
 }
 
+/// Pane runtime discriminator with lossless retention of unknown tags.
+#[derive(Clone, Default)]
+pub enum PtyRuntime {
+    /// Supported PTY placement, also the default for older snapshots.
+    #[default]
+    Pty,
+    /// Future tag retained across saves, without automatic agent resume.
+    Unknown(serde_json::Value),
+}
+impl Serialize for PtyRuntime {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Pty => "pty".serialize(serializer),
+            Self::Unknown(raw) => raw.serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for PtyRuntime {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        if raw == "pty" {
+            return Ok(Self::Pty);
+        }
+        tracing::warn!("unknown pane runtime tag retained; automatic agent resume disabled");
+        Ok(Self::Unknown(raw))
+    }
+}
+impl PtyRuntime {
+    pub(super) fn unknown(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Pty => None,
+            Self::Unknown(raw) => Some(raw),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnapshot {
+    /// Additive runtime discriminator. Older pane snapshots are PTY records.
+    #[serde(default)]
+    pub runtime: PtyRuntime,
     pub cwd: PathBuf,
     /// Fleet-global agent identity (see [`crate::terminal::AgentId`]).
     ///
@@ -286,6 +331,8 @@ struct RawSessionSnapshot {
     #[serde(default)]
     workspaces: Vec<serde_json::Value>,
     #[serde(default)]
+    structured_agents: crate::structured::registry::Registry,
+    #[serde(default)]
     active: Option<usize>,
     #[serde(default)]
     selected: usize,
@@ -307,6 +354,7 @@ struct RawSessionSnapshot {
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
     Ok(SessionSnapshot {
+        structured_agents: raw.structured_agents,
         issue_draft: None,
         version: raw.version,
         workspaces: raw
@@ -374,6 +422,7 @@ fn first_pane_id_in_layout(layout: &LayoutSnapshot) -> Option<u32> {
 
 /// Capture the current app state into a serializable snapshot.
 pub fn capture(
+    structured_agents: &crate::structured::registry::Registry,
     workspaces: &[Workspace],
     terminals: &std::collections::HashMap<
         crate::terminal::TerminalId,
@@ -389,6 +438,7 @@ pub fn capture(
     pane_id_aliases: std::collections::HashMap<u32, u32>,
 ) -> SessionSnapshot {
     SessionSnapshot {
+        structured_agents: structured_agents.snapshot(),
         issue_draft: None,
         version: SNAPSHOT_VERSION,
         workspaces: workspaces
@@ -511,6 +561,13 @@ fn capture_tab(
         panes.insert(
             id.raw(),
             PaneSnapshot {
+                runtime: tab
+                    .panes
+                    .get(id)
+                    .and_then(|pane| terminals.get(&pane.attached_terminal_id))
+                    .and_then(|terminal| terminal.persisted_runtime_tag.clone())
+                    .map(PtyRuntime::Unknown)
+                    .unwrap_or_default(),
                 cwd,
                 agent_id,
                 label,
@@ -848,6 +905,238 @@ mod tests {
             .all(|pane| pane.hibernated.is_none()));
     }
 
+    #[test]
+    fn structured_registry_round_trips_actual_snapshot_with_pty_records() {
+        use crate::structured::registry::Record;
+        let mut state = state_with_workspaces(&["registry-fixture"]);
+        let record = Record {
+            runtime: crate::structured::registry::StructuredRuntime::Structured,
+            agent_id: "agent_fixture_structured".into(),
+            name: Some("fixture-worker".into()),
+            harness: "claude".into(),
+            session_id: "fixture-session".into(),
+            cwd: std::env::temp_dir().join("registry-fixture"),
+            model: Some("fixture-model".into()),
+        };
+        state.structured_agents.register(record.clone()).unwrap();
+        let captured = capture_from_state(&state);
+        let json = serde_json::to_value(&captured).unwrap();
+        assert_eq!(json["structured_agents"][0]["runtime"], "structured");
+        let panes = json["workspaces"][0]["tabs"][0]["panes"]
+            .as_object()
+            .unwrap();
+        assert!(!panes.is_empty());
+        assert!(panes.values().all(|pane| pane["runtime"] == "pty"));
+        let parsed = parse_snapshot(&json.to_string()).unwrap();
+        assert_eq!(parsed.structured_agents.records(), vec![record.clone()]);
+        let restored = parsed.structured_agents;
+        assert_eq!(restored.records(), vec![record]);
+        assert_eq!(
+            restored
+                .get("agent_fixture_structured")
+                .unwrap()
+                .1
+                .update
+                .state
+                .phase,
+            crate::api::agent_state::Phase::Offline
+        );
+        let mut invalid = json.clone();
+        invalid["structured_agents"]
+            .as_array_mut()
+            .unwrap()
+            .push(json["structured_agents"][0].clone());
+        let lenient = parse_snapshot(&invalid.to_string()).unwrap();
+        assert_eq!(lenient.structured_agents.records().len(), 1);
+        assert_eq!(lenient.structured_agents.retained_count(), 1);
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("structured_agents");
+        for pane in old["workspaces"][0]["tabs"][0]["panes"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            pane.as_object_mut().unwrap().remove("runtime");
+        }
+        let parsed = parse_snapshot(&old.to_string()).unwrap();
+        assert!(parsed.structured_agents.is_empty());
+        assert!(parsed.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .all(|pane| matches!(pane.runtime, PtyRuntime::Pty)));
+    }
+
+    async fn assert_lenient_registry_round_trip(case: &str) {
+        use crate::structured::registry::{Record, StructuredRuntime};
+        let root = crate::test_support::TempDir::socket();
+        let mut state = state_with_workspaces(&["first", "second"]);
+        for workspace in &mut state.workspaces {
+            workspace.identity_cwd = root.path().to_owned();
+        }
+        let record = Record {
+            runtime: StructuredRuntime::Structured,
+            agent_id: "agent_fixture_structured".into(),
+            name: Some("fixture-worker".into()),
+            harness: "claude".into(),
+            session_id: "fixture-session".into(),
+            cwd: root.path().to_owned(),
+            model: None,
+        };
+        state.structured_agents.register(record.clone()).unwrap();
+        let mut json = serde_json::to_value(capture_from_state(&state)).unwrap();
+        let mut future = json["structured_agents"][0].clone();
+        future["future_metadata"] = serde_json::json!({"nested": [1, "keep me"]});
+        match case {
+            "runtime" => future["runtime"] = "future-runtime".into(),
+            "harness" => future["harness"] = "future-harness".into(),
+            "duplicate" => future["model"] = "different-second-record".into(),
+            "invalid" => future = serde_json::json!({"runtime":"structured","broken":[1,2]}),
+            "pane" | "pane-hibernated" => {
+                for (index, workspace) in json["workspaces"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .enumerate()
+                {
+                    let pane = workspace["tabs"][0]["panes"]
+                        .as_object_mut()
+                        .unwrap()
+                        .values_mut()
+                        .next()
+                        .unwrap();
+                    pane["agent_session"] = serde_json::json!({
+                        "source":"flock:codex", "agent":"codex", "kind":"id",
+                        "value":format!("00000000-0000-4000-8000-{:012}", index + 1),
+                    });
+                    if index == 0 {
+                        pane["runtime"] = serde_json::json!({"future":"pane-runtime"});
+                        if case == "pane-hibernated" {
+                            pane["hibernated"] = serde_json::json!({
+                                "agent":"codex", "argv":["codex","resume","fixture-session"],
+                                "dedupe_key":"fixture-hibernation",
+                            });
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        if !case.starts_with("pane") {
+            json["structured_agents"]
+                .as_array_mut()
+                .unwrap()
+                .push(future);
+        }
+        let expected = json["structured_agents"].clone();
+        let parsed =
+            parse_snapshot(&json.to_string()).expect("one bad entry must not lose PTY workspaces");
+        assert_eq!(parsed.structured_agents.records(), vec![record]);
+        let (events, _receiver) = tokio::sync::mpsc::channel(32);
+        let (workspaces, terminals, runtimes) = crate::persist::restore(
+            &parsed,
+            None,
+            24,
+            80,
+            0,
+            &crate::test_support::no_op_program(),
+            crate::config::ShellModeConfig::NonLogin,
+            case.starts_with("pane"),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        assert_eq!(workspaces.len(), 2);
+        if case.starts_with("pane") {
+            let unknown = terminals
+                .values()
+                .find(|terminal| terminal.persisted_runtime_tag.is_some())
+                .unwrap();
+            assert!(unknown.pending_agent_resume_plan.is_none());
+            if case == "pane-hibernated" {
+                assert_eq!(
+                    unknown.hibernated_resume_plan.as_ref().unwrap().dedupe_key,
+                    "fixture-hibernation"
+                );
+            } else {
+                assert!(unknown.hibernated_resume_plan.is_none());
+            }
+            let known = terminals
+                .values()
+                .find(|terminal| terminal.persisted_runtime_tag.is_none())
+                .unwrap();
+            assert!(
+                known.pending_agent_resume_plan.is_some(),
+                "only the unknown pane loses automatic resume"
+            );
+            assert!(known.hibernated_resume_plan.is_none());
+        } else {
+            assert!(terminals
+                .values()
+                .all(|terminal| terminal.pending_agent_resume_plan.is_none()));
+        }
+        assert!(workspaces
+            .iter()
+            .all(|workspace| !workspace.tabs[0].panes.is_empty()));
+        let recaptured = capture(
+            &parsed.structured_agents,
+            &workspaces,
+            &terminals,
+            &runtimes.into(),
+            parsed.active,
+            parsed.selected,
+            state.panel_scopes(),
+            24,
+            0.5,
+            Default::default(),
+            Default::default(),
+        );
+        let path = root.path().join("round-trip.json");
+        super::super::io::save_to_path(&path, &recaptured).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            saved["structured_agents"], expected,
+            "raw entries and order survive save"
+        );
+        if case.starts_with("pane") {
+            assert!(saved["workspaces"][0]["tabs"][0]["panes"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(
+                    |pane| pane["runtime"] == serde_json::json!({"future":"pane-runtime"})
+                        && (case != "pane-hibernated"
+                            || pane["hibernated"]["dedupe_key"] == "fixture-hibernation")
+                ));
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_runtime_preserves_pty_workspaces_and_raw_record() {
+        assert_lenient_registry_round_trip("runtime").await;
+    }
+    #[tokio::test]
+    async fn unknown_harness_preserves_pty_workspaces_and_raw_record() {
+        assert_lenient_registry_round_trip("harness").await;
+    }
+    #[tokio::test]
+    async fn duplicate_preserves_first_record_pty_workspaces_and_raw_record() {
+        assert_lenient_registry_round_trip("duplicate").await;
+    }
+    #[tokio::test]
+    async fn invalid_record_preserves_pty_workspaces_and_raw_record() {
+        assert_lenient_registry_round_trip("invalid").await;
+    }
+    #[tokio::test]
+    async fn future_pane_runtime_preserves_workspace_and_tag_after_save() {
+        assert_lenient_registry_round_trip("pane").await;
+    }
+
+    #[tokio::test]
+    async fn future_pane_runtime_preserves_hibernation_for_that_pane_only() {
+        assert_lenient_registry_round_trip("pane-hibernated").await;
+    }
+
     fn capture_from_state(state: &AppState) -> SessionSnapshot {
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         capture_from_state_with_runtimes(state, &terminal_runtimes)
@@ -858,6 +1147,7 @@ mod tests {
         terminal_runtimes: &TerminalRuntimeRegistry,
     ) -> SessionSnapshot {
         capture(
+            &state.structured_agents,
             &state.workspaces,
             &state.terminals,
             terminal_runtimes,
@@ -888,6 +1178,7 @@ mod tests {
     #[test]
     fn round_trip_empty_session() {
         let snap = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
             issue_draft: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![],
@@ -937,6 +1228,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                runtime: crate::persist::snapshot::PtyRuntime::Pty,
                 agent_id: None,
                 cwd: PathBuf::from("/home/can/Projects/flock"),
                 label: None,
@@ -956,6 +1248,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                runtime: crate::persist::snapshot::PtyRuntime::Pty,
                 agent_id: None,
                 cwd: PathBuf::from("/home/can/Projects/website"),
                 label: Some("website".into()),
@@ -974,6 +1267,7 @@ mod tests {
         );
 
         let snap = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
             issue_draft: None,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wproj".to_string()),
@@ -1247,6 +1541,7 @@ mod tests {
         // Sibling workspaces (#25) group purely via stamped membership — a
         // snapshot round-trip must preserve it or restore loses grouping.
         let snap = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
             issue_draft: None,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wsib".to_string()),
@@ -1641,6 +1936,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                runtime: crate::persist::snapshot::PtyRuntime::Pty,
                 agent_id: None,
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-flock-test"),
                 label: None,
@@ -1660,6 +1956,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                runtime: crate::persist::snapshot::PtyRuntime::Pty,
                 agent_id: None,
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
@@ -1680,6 +1977,7 @@ mod tests {
         );
 
         let snap = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
             issue_draft: None,
             version: SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {

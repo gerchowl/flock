@@ -114,6 +114,8 @@ pub enum HumanReason {
 #[serde(rename_all = "snake_case")]
 pub enum BlockedReason {
     ProviderLimit,
+    /// A structured process exited with a started input lacking a result.
+    Crashed,
     #[default]
     Unknown,
 }
@@ -184,6 +186,8 @@ pub enum Phase {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum StateSource {
+    /// Authoritative structured session stream (ADR-0036 S4).
+    Session,
     Screen,
     Hook,
     Plugin,

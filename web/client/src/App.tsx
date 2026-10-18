@@ -19,11 +19,14 @@ import type { ConfigResult, FixtureShellConfig, WireShellConfig } from "./config
 import { createFixtureFleet } from "./fleet";
 import { emptyLayout } from "./layout/model";
 import { createLayoutStore } from "./layout/persistence";
+import { previewMode } from "./layout/phone";
 import { createFixtureTransport } from "./transport/fixture";
 import { WireConnection, type ConnectionOptions } from "./wire/connection";
 import { browserClock, browserSockets, endpointUrl } from "./wire/env";
 import { createWireFleet } from "./wire/fleet";
 import { createWireTransport } from "./wire/transport";
+import { ConnectionBar } from "./workbench/ConnectionBar";
+import type { Sender } from "./workbench/Composer";
 import { SAMPLE_INBOX } from "./workbench/inbox";
 import { SAMPLE_AGENTS } from "./workbench/samples";
 import { Workbench } from "./workbench/Workbench";
@@ -49,9 +52,11 @@ function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element
         fleet={fleet}
         transport={transport}
         inbox={SAMPLE_INBOX}
+        sender={null}
         layout={layout}
         saveLayout={(next) => store.save(next)}
         status={() => notice}
+        mode={previewMode(location.search)}
         source="replay"
       />
     </>
@@ -61,9 +66,14 @@ function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element
 function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEnv }): JSX.Element {
   const url = endpointUrl(props.config.serverUrl);
   const connection = new WireConnection({ url, token: props.config.token, client: CLIENT, ...props.env });
-  const [status, setStatus] = createSignal<string | null>(null);
-  const describe = (): string => `${connection.state}${connection.error === null ? "" : ` · ${connection.error}`}`;
-  onCleanup(connection.onChange(() => setStatus(describe())));
+  const [revision, setRevision] = createSignal(0);
+  onCleanup(connection.onChange(() => setRevision(revision() + 1)));
+  const sender: Sender = {
+    commands: () => (revision(), connection.commands()),
+    // `submit` sends the message, not only types it (`AgentSendParams`; S7a's agent-send script).
+    send: (agent, text) => connection.command("agent.send", { target: agent, text, submit: true }),
+    blocked: () => (revision(), connection.principal === null ? "Sending opens once the server has welcomed this client." : null),
+  };
   connection.connect();
   onCleanup(() => connection.disconnect());
   const store = createLayoutStore({ serverKey: url, initial: emptyLayout });
@@ -72,15 +82,20 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const fleet = createWireFleet(connection);
   const transport = createWireTransport(connection);
   return (
-    <Workbench
-      fleet={fleet}
-      transport={transport}
-      inbox={[]}
-      layout={layout}
-      saveLayout={(next) => store.save(next)}
-      status={() => [notice, status()].filter((part) => part !== null).join(" · ")}
-      source="live"
-    />
+    <>
+      <ConnectionBar connection={connection} revision={revision} />
+      <Workbench
+        fleet={fleet}
+        transport={transport}
+        inbox={[]}
+        sender={sender}
+        layout={layout}
+        saveLayout={(next) => store.save(next)}
+        status={() => notice}
+        mode={previewMode(location.search)}
+        source="live"
+      />
+    </>
   );
 }
 

@@ -34,6 +34,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "ui",
     "update",
     "web",
+    "client",
     "worktrees",
 ];
 
@@ -643,6 +644,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.web = section,
+    );
+    load_live_section(
+        &table,
+        "client",
+        "client config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.client = section,
     );
     load_live_section(
         &table,

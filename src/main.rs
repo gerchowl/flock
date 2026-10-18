@@ -36,12 +36,16 @@ mod checks;
 mod checksum;
 mod cli;
 mod client;
+mod client_open;
 // Pure rollout foundation; runtime consumers follow in #1662–#1664.
 #[allow(dead_code)]
 mod codex_rollout;
 // Binding foundation, connected to the reader and authority in #1663/#1664.
 #[allow(dead_code)]
 mod codex_binding;
+// File/cursor foundation; segment admission and supervision follow in #1856/#1857.
+#[allow(dead_code)]
+mod codex_reader;
 mod codex_transcript;
 // Version eligibility foundation; binding and runtime consumers follow in #1662/#1664.
 #[allow(dead_code)]
@@ -464,6 +468,9 @@ fn main() {
 
 fn run() -> io::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.len() == 2 && raw_args[1] == platform::client_token_lock::WORKER_ARG {
+        return platform::client_token_lock::worker();
+    }
     let args = match session::configure_from_args(&raw_args) {
         Ok(args) => args,
         Err(err) => {
@@ -572,6 +579,7 @@ fn run() -> io::Result<()> {
         println!("       flk wait <subcommand> ...");
         println!("       flk events <read|wait> ...");
         println!("       flk adapter hello <binding> ...");
+        println!("       flk client <token|open> ...");
         println!("       flk owner policy <show|adopt> ...");
         println!("       flk session <subcommand> ...");
         println!("       flk integration <subcommand> ...");
@@ -650,6 +658,10 @@ fn run() -> io::Result<()> {
             (
                 "flk adapter hello <binding>",
                 "Check a channel adapter's binding token before it starts",
+            ),
+            (
+                "flk client <token|open>",
+                "Manage GUI credentials or open the GUI",
             ),
             (
                 "flk owner policy <show|adopt>",
@@ -772,7 +784,13 @@ fn run() -> io::Result<()> {
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub =
         api::EventHub::with_persistence(crate::session::data_dir().join("event-log.jsonl"));
-    let _api_server = match api::start_server_for_mode(api_tx, event_hub.clone(), false) {
+    let runtime_config = app::AppRuntimeConfig::for_config(&loaded_config.config);
+    let _api_server = match api::start_server_for_mode(
+        api_tx,
+        event_hub.clone(),
+        false,
+        runtime_config.uid_policy.clone(),
+    ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             eprintln!("error: flk is already running");
@@ -845,12 +863,13 @@ fn run() -> io::Result<()> {
             std::io::stdout().flush()?;
         }
 
-        let mut app = app::App::new(
+        let mut app = app::App::new_with_runtime_config(
             config,
             true, // no_session — monolithic mode never saves/restores sessions
             config_diagnostic,
             api_rx,
             event_hub,
+            runtime_config,
         );
         let result = match app.initialize_mesh_mail(Some(&_api_server)) {
             Ok(()) => app.run(&mut terminal).await,

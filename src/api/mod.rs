@@ -1,5 +1,6 @@
 pub mod agent_state;
 pub mod client;
+pub mod client_tokens;
 pub(crate) mod compatibility;
 pub(crate) mod error_code;
 mod event_hub;
@@ -17,7 +18,8 @@ pub use event_hub::EventHub;
 pub(crate) use reply_wait::{best_answer, Answer};
 pub(crate) use server::socket_peer_pid;
 pub(crate) use server::start_server_for_mode;
-pub use server::{start_server, start_server_with_capabilities, ServerHandle};
+pub use server::ServerHandle;
+pub(crate) use server::{start_server, start_server_with_capabilities};
 pub use status::{read_runtime_status_at, RuntimeStatus};
 
 use std::path::PathBuf;

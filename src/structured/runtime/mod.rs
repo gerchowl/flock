@@ -65,12 +65,44 @@ pub struct Runtime {
 }
 impl Runtime {
     /// Offer a bounded user envelope only while idle; WouldBlock never waits.
+    /// Successful admission emits an internal accepted-input fact through
+    /// `Received::state_input`, arming S4 silence observation before started.
+    /// Success acknowledges admission, not delivery or provider execution.
+    /// Cancellation errors also request process shutdown, not just pipe closure.
     /// `structured_turn_end_unknown` means loss concealed the boundary; await a
     /// subsequent result or explicitly stop, rather than retry as ordinary busy.
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
-        self.transport.try_submit(user)
+        let result = self.transport.try_submit(user);
+        if result.is_err() && self.control.cancelled() {
+            self.stop.request();
+        }
+        result
+    }
+    /// Server entry for a dispatcher-authenticated agent.decide command.
+    /// Token identity is context, never a field decoded from command arguments.
+    pub fn agent_decide(
+        &self,
+        principal: &super::permissions::Principal<'_>,
+        args: &super::permissions::AgentDecide,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        self.transport.agent_decide(principal, args)
+    }
+    /// Audit a host cancellation/result/interrupt without sending a tool decision.
+    /// The caller must carry an authenticated operate-token capability.
+    pub fn close_permissions(
+        &self,
+        principal: &super::permissions::Principal<'_>,
+        id: Option<&str>,
+        reason: super::permissions::CloseReason,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        self.transport.close_permissions(principal, id, reason)
+    }
+    /// Current permission ids for S4 attention; a busy snapshot fails closed.
+    pub fn waiting_on_human(&self) -> Result<Vec<String>, crate::api::error_code::ErrorCode> {
+        self.transport.waiting_on_human()
     }
     /// Poll persisted events. Empty is not EOF; monitor the owning worker result too.
+    /// Feed `Received::state_input` into S4 so book closures clear attention.
     pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
         self.events.try_recv()
     }
@@ -103,9 +135,44 @@ impl Drop for Runtime {
 pub fn run(
     state: &Path,
     profile: LaunchProfile,
+    lease: super::lease::Lease,
+    location: StreamLocation,
+    ready: impl FnOnce(Runtime),
+) -> Result<Exit, LaunchError> {
+    run_notified(state, profile, lease, location, ready, || {})
+}
+
+/// Worker assembly with a nonblocking wake after each queued stream notification.
+/// Ready/completion notifications remain the launch owner's responsibility.
+/// The callback must not perform I/O or wait for queue capacity.
+pub(crate) fn run_notified(
+    state: &Path,
+    profile: LaunchProfile,
+    lease: super::lease::Lease,
+    location: StreamLocation,
+    ready: impl FnOnce(Runtime),
+    notify: impl Fn() + Send + 'static,
+) -> Result<Exit, LaunchError> {
+    run_controlled(
+        state,
+        profile,
+        lease,
+        location,
+        ready,
+        notify,
+        StopRequest::default(),
+    )
+}
+
+/// Worker-owned cancellation exists before spawn, including deadline escalation.
+pub(crate) fn run_controlled(
+    state: &Path,
+    profile: LaunchProfile,
     mut lease: super::lease::Lease,
     location: StreamLocation,
     ready: impl FnOnce(Runtime),
+    notify: impl Fn() + Send + 'static,
+    stop: StopRequest,
 ) -> Result<Exit, LaunchError> {
     if !lease.matches(&location.agent, &location.session)
         || profile.session_id() != location.session
@@ -141,6 +208,9 @@ pub fn run(
     profile.configure_environment(|key, value| {
         command.env(key, value);
     });
+    if let Some(cwd) = profile.cwd() {
+        command.current_dir(cwd);
+    }
     let (mut child, profile) = match profile.try_spawn(|| lease.spawn(|| command.spawn_traced())) {
         Ok(started) => started,
         Err(error) => {
@@ -151,6 +221,9 @@ pub fn run(
     let config = profile.config_dir().to_owned();
     let files = profile.into_session_files();
     let pid = child.id();
+    if let Ok(identity) = supervision::ProcessIdentity::capture(pid) {
+        stop.track(&[identity]);
+    }
     if let Err(error) = lease.bind(pid) {
         return Err(startup_failed(
             child, files, config, error, true, &mut lease,
@@ -188,7 +261,6 @@ pub fn run(
     };
     let control = transport.stop_handle();
     let input = transport.input_handle();
-    let stop = StopRequest::default();
     let (events_tx, events) = mpsc::sync_channel(4);
     let (io_tx, io_rx) = mpsc::sync_channel(1);
     let (pump_stop, pump_control) = (stop.clone(), control.clone());
@@ -196,7 +268,7 @@ pub fn run(
         .name("session-events".into())
         .spawn(move || {
             let facts = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                collect(&transport, &pump_stop, &pump_control, events_tx)
+                collect(&transport, &pump_stop, &pump_control, events_tx, &notify)
             }))
             .unwrap_or_else(|_| {
                 pump_stop.request();
@@ -339,6 +411,7 @@ fn collect(
     stop: &StopRequest,
     control: &StopHandle,
     output: mpsc::SyncSender<Received>,
+    notify: &impl Fn(),
 ) -> Facts {
     let mut facts = Facts::default();
     let mut done = [false; 2];
@@ -396,8 +469,12 @@ fn collect(
                             .as_object()
                             .is_some_and(|object| object.contains_key("messaging_socket_path"))
                     });
-                    let uninspectable =
-                        received.record.origin == RecordOrigin::Flk && !init_inspected;
+                    let uninspectable = received.record.origin == RecordOrigin::Flk
+                        && !init_inspected
+                        && !matches!(
+                            received.state_input(),
+                            Some(super::state::Input::Accepted { .. })
+                        );
                     if init.is_some() && !forbidden {
                         init_inspected = true;
                     }
@@ -424,7 +501,7 @@ fn collect(
         }
         if let Some(received) = pending.take() {
             match output.try_send(received) {
-                Ok(()) => (),
+                Ok(()) => notify(),
                 Err(mpsc::TrySendError::Full(received)) => pending = Some(received),
                 Err(mpsc::TrySendError::Disconnected(_)) => {
                     stop.request();

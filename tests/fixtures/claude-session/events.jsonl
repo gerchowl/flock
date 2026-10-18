@@ -33,3 +33,4 @@
 {"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use"}},"session_id":"session-example","uuid":"event-example"}
 {"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","api_error_status":404,"session_id":"session-example","uuid":"event-example"}
 {"type":"result","subtype":"error_during_execution","is_error":true,"errors":[],"terminal_reason":"aborted_tools","session_id":"session-example","uuid":"event-example"}
+{"type":"control_cancel_request","request_id":"request-example"}

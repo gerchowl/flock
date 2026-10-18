@@ -95,6 +95,30 @@ pub(crate) fn open_regular_beneath(home: &Path, relative: &Path) -> io::Result<F
     Ok(file)
 }
 
+/// Number of directory entries referring to an already-open file inode.
+/// Uses the descriptor so replacement of its path cannot change the observation.
+pub(crate) fn file_link_count(file: &File) -> io::Result<u64> {
+    Ok(file.metadata()?.nlink())
+}
+
+/// Local file identity, independent of names and timestamps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileIdentity(pub u64, pub u64);
+
+/// Check an already-open rollout against its still-local primary path. Core
+/// reader code never accesses platform-specific inode fields or follows links.
+pub(crate) fn rollout_identity(file: &File, path: &Path) -> io::Result<FileIdentity> {
+    let opened = file.metadata()?;
+    let named = open_regular_file(path)?.metadata()?;
+    if !opened.is_file()
+        || path.canonicalize()? != path
+        || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
+    {
+        return Err(io::Error::other("rollout identity changed"));
+    }
+    Ok(FileIdentity(opened.dev(), opened.ino()))
+}
+
 /// Create a new owner-only directory, without a permissive creation window.
 pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)?;
