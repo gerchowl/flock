@@ -546,6 +546,7 @@ fn collect(
         }
         let input = transport.input_handle();
         let queue_ready = queue.as_mut().is_none_or(|queue| {
+            queue.capture();
             if !queue.flush(control.cancelled(), notify) {
                 return false;
             }

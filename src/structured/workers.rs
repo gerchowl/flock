@@ -308,7 +308,7 @@ impl Workers {
             .queue_enqueue(request)
     }
     /// Retained live-generation provider, fenced by the registry epoch.
-    /// Cold sources refuse with queue_mode_unsupported until #1956 part 2.
+    /// Cold sources refuse with retryable queue_source_cold until #1956 part 2.
     /// This never performs filesystem work or returns an empty successful source.
     pub(crate) fn queue_source(
         &self,
@@ -321,7 +321,7 @@ impl Workers {
         }
         self.runtime(id, generation)
             .and_then(Runtime::queue_source)
-            .ok_or(ErrorCode::QueueModeUnsupported)
+            .ok_or(ErrorCode::QueueSourceCold)
     }
     /// Consume an immutable completion/cut from the current generation only.
     /// Terminal cuts remain available after exit; drain before relaunch/removal.

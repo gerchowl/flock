@@ -532,3 +532,121 @@ fn queue_provider_ahead_cursor_cannot_become_valid_during_bootstrap() {
     );
     assert_eq!(fs::read(path).unwrap(), before);
 }
+
+#[test]
+fn queue_provider_bootstrap_and_real_worker_cursor_do_not_duplicate_a_large_snapshot() {
+    let root = root();
+    let mut j = journal(&root, 0);
+    let mut large = item(0);
+    large.body = "x".repeat(LIVE_BYTES + 1);
+    j.append(Change::Upsert {
+        item: Box::new(large),
+        position: 0,
+    })
+    .unwrap();
+    let worker_cursor = j.replay(0).unwrap().through;
+    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let mut reader = source.subscribe(None).unwrap();
+    publisher.capture(|| j.subscription().map_err(Into::into), None);
+    assert_eq!(sequences(&pages(&mut reader)), [2]);
+    publisher.publish(&update(j.replay(worker_cursor).unwrap()));
+    let next = pages(&mut reader);
+    assert!(sequences(&next).is_empty(), "duplicate snapshot: {next:?}");
+    assert!(
+        !next
+            .iter()
+            .any(|p| matches!(p, Page::Gap(_) | Page::Lagged(_))),
+        "bootstrap cursor mismatch: {next:?}"
+    );
+}
+
+#[test]
+fn queue_provider_initial_replay_does_not_consume_the_four_live_cut_slots() {
+    let root = root();
+    let mut j = journal(&root, 0);
+    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let mut reader = source.subscribe(None).unwrap();
+    publisher.capture(|| j.subscription().map_err(Into::into), None);
+    for n in 0..LIVE_CUTS {
+        let cursor = j.replay(0).unwrap().through;
+        j.append(Change::Upsert {
+            item: Box::new(item(n as u32)),
+            position: n,
+        })
+        .unwrap();
+        publisher.publish(&update(j.replay(cursor).unwrap()));
+    }
+    let all = pages(&mut reader);
+    assert_eq!(sequences(&all), [1, 2, 3, 4]);
+    assert!(!all.iter().any(|p| matches!(p, Page::Lagged(_))));
+}
+
+#[test]
+fn queue_provider_readers_do_not_wait_on_another_readers_book_access() {
+    let root = root();
+    let mut j = journal(&root, 1);
+    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let mut first = source.subscribe(None).unwrap();
+    publisher.capture(|| j.subscription().map_err(Into::into), None);
+    let mut second = source.subscribe(None).unwrap();
+    publisher.capture(|| panic!("unexpected recapture"), None);
+    // Deterministically hold the shared lock that used to serialize all pages.
+    // Neither reader needs this lock once its packet has been registered.
+    let _held = source.1.lock();
+    assert!(matches!(first.page(), Page::Gap(_)));
+    assert!(matches!(second.page(), Page::Gap(_)));
+}
+
+#[test]
+fn queue_provider_bootstrap_status_preserves_the_last_operation_error() {
+    let root = root();
+    let mut j = journal(&root, 1);
+    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let mut failed = update(j.replay(0).unwrap());
+    failed.offer = Err(Failure {
+        code: ErrorCode::InternalError,
+        source: None,
+    });
+    publisher.publish(&failed);
+    let mut reader = source.subscribe(None).unwrap();
+    publisher.capture(|| j.subscription().map_err(Into::into), None);
+    assert!(pages(&mut reader)
+        .iter()
+        .any(|p| matches!(p, Page::Status(_, Some(ErrorCode::InternalError)))));
+}
+
+#[test]
+fn queue_provider_final_status_preserves_the_last_operation_error() {
+    let root = root();
+    let mut j = journal(&root, 1);
+    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let mut reader = source.subscribe(None).unwrap();
+    publisher.capture(|| j.subscription().map_err(Into::into), None);
+    pages(&mut reader);
+    let mut failed = update(j.replay(2).unwrap());
+    failed.offer = Err(Failure {
+        code: ErrorCode::InternalError,
+        source: None,
+    });
+    publisher.publish(&failed);
+    pages(&mut reader);
+    publisher.finish(|| j.checkpoint().map_err(Into::into), None);
+    assert!(pages(&mut reader)
+        .iter()
+        .any(|p| matches!(p, Page::Status(_, Some(ErrorCode::InternalError)))));
+}
+
+#[test]
+fn queue_provider_status_only_publish_never_copies_the_retained_snapshot() {
+    let root = root();
+    let mut j = journal(&root, 2);
+    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let _reader = source.subscribe(None).unwrap();
+    publisher.capture(|| j.subscription().map_err(Into::into), None);
+    let retained = source.1.lock().retained.clone();
+    publisher.publish(&update(j.replay(2).unwrap()));
+    assert!(
+        Arc::ptr_eq(&retained, &source.1.lock().retained),
+        "status update cloned the entire retained snapshot"
+    );
+}

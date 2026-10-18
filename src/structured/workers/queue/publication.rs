@@ -42,6 +42,7 @@ struct Live {
     bytes: usize,
     lagged: Option<u64>,
     refusal: Option<ErrorCode>,
+    ended: bool,
 }
 struct Book {
     retained: Arc<Cut>,
@@ -61,6 +62,7 @@ impl Book {
         if after.is_some_and(|n| n > self.retained.through) {
             return Err(ErrorCode::CursorAhead);
         }
+        live.lock().ended = self.ended;
         live.lock().packets.push_back(Packet(
             self.retained.clone(),
             self.status.clone(),
@@ -73,7 +75,13 @@ impl Book {
         Ok(())
     }
     fn publish(&mut self, mut cut: Cut, status: Option<Pending>, error: Option<ErrorCode>) {
-        let replacement = cut.gap.is_some() && cut.gap != self.retained.gap;
+        // `from` belongs to the caller's cursor, not the checkpoint identity.
+        let replacement = cut.gap.as_ref().is_some_and(|gap| {
+            self.retained
+                .gap
+                .as_ref()
+                .is_none_or(|old| (gap.to, gap.snapshot_to) != (old.to, old.snapshot_to))
+        });
         if !replacement {
             cut.gap = None;
             let start = cut.records.partition_point(|v| {
@@ -95,7 +103,7 @@ impl Book {
             };
             let mut reader = reader.lock();
             if reader.lagged.is_some()
-                || reader.packets.len() >= LIVE_CUTS
+                || reader.packets.iter().filter(|p| !p.3).count() >= LIVE_CUTS
                 || bytes > LIVE_BYTES.saturating_sub(reader.bytes)
             {
                 reader.lagged = Some(cut.through);
@@ -109,15 +117,29 @@ impl Book {
             }
             true
         });
-        let retained = Arc::make_mut(&mut self.retained);
         if cut.gap.is_some() {
-            *retained = cut.as_ref().clone();
-        } else {
+            self.retained = cut.clone();
+        } else if !cut.records.is_empty() {
+            // A still-unread replay shares the old cut. Only an actual append
+            // needs copy-on-write; status-only updates never copy its prefix.
+            let retained = Arc::make_mut(&mut self.retained);
             retained.records.extend(cut.records.iter().cloned());
             retained.through = cut.through;
         }
         self.status = status;
         self.error = error;
+    }
+    fn close(&mut self) {
+        self.ended = true;
+        self.readers.retain(|reader| {
+            let Some(reader) = reader.upgrade() else {
+                return false;
+            };
+            let mut reader = reader.lock();
+            reader.ended = true;
+            reader.refusal = self.refusal;
+            true
+        });
     }
 }
 struct Capture(Option<u64>, Arc<Mutex<Live>>);
@@ -168,11 +190,10 @@ impl Subscription for Reader {
         if self.closed {
             return Page::End;
         }
-        let Some(book) = self.source.1.try_lock() else {
-            return Page::Pending;
-        };
+        // Each reader owns its packet queue. Paging never contends on the
+        // owner's book lock, so no pending wake can be lost on its release.
         let mut live = self.live.lock();
-        if let Some(code) = live.refusal.or(book.refusal) {
+        if let Some(code) = live.refusal {
             self.closed = true;
             return Page::Refused(code);
         }
@@ -196,7 +217,7 @@ impl Subscription for Reader {
             self.stage = 0;
         }
         let Some(packet) = &self.current else {
-            return if book.ended {
+            return if live.ended {
                 self.closed = true;
                 Page::End
             } else {
@@ -268,12 +289,13 @@ impl Publisher {
         match snapshot() {
             Ok(cut) => {
                 if cut.through != book.retained.through || cut.gap != book.retained.gap {
-                    book.publish(cut, status, None);
+                    let error = book.error;
+                    book.publish(cut, status, error);
                 }
             }
             Err(error) => book.refusal = Some(error.code),
         }
-        book.ended = true;
+        book.close();
         drop(book);
         self.0 .2.notify_waiters();
     }
@@ -285,13 +307,15 @@ impl Publisher {
                 update.offer.as_ref().err().map(|e| e.code),
             );
         } else {
-            self.0 .1.lock().refusal = Some(
+            let mut book = self.0 .1.lock();
+            book.refusal = Some(
                 update
                     .offer
                     .as_ref()
                     .err()
                     .map_or(ErrorCode::InternalError, |e| e.code),
             );
+            book.close();
         }
         self.0 .2.notify_waiters();
     }
@@ -302,7 +326,7 @@ impl Drop for Publisher {
         if !book.ended {
             book.refusal = Some(ErrorCode::InternalError);
         }
-        book.ended = true;
+        book.close();
         while let Ok(Capture(after, live)) = self.1.try_recv() {
             if let Err(code) = book.register(after, live.clone()) {
                 live.lock().refusal = Some(code);
@@ -326,7 +350,8 @@ fn capture_locked<R: parking_lot::lock_api::RawMutex>(
         match snapshot() {
             Ok(cut) => {
                 if cut.through != book.retained.through || cut.gap != book.retained.gap {
-                    book.publish(cut, status, None);
+                    let error = book.error;
+                    book.publish(cut, status, error);
                 }
                 book.bootstrapped = true;
             }
