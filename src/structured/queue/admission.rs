@@ -91,6 +91,9 @@ impl Admission {
     pub fn journal(&self) -> &Journal {
         &self.journal
     }
+    pub(super) fn checkpoint_if_required(&mut self) -> Result<Option<super::Cut>, Failure> {
+        self.journal.checkpoint_if_required().map_err(Into::into)
+    }
     /// Append one new item and its gate before acknowledging acceptance. Operator
     /// authority creates human input; other origins cannot impersonate humans or
     /// create command items, even when their body starts with a slash.

@@ -2,10 +2,11 @@
 
 ADR-0036 §3/§4's runtime owner (#1879, part of #1802 and #1428) wraps the
 admission/batch core from #1878. Construct it once for a fresh runtime
-generation, with exclusive ownership of user-input submission. The registry
-feeds durable session events in order, supplies the S4 reducer's current
-AgentState, drains final events before process exit, and publishes queue cuts
-only after successful operations. Disk work stays on the dedicated worker.
+generation, with exclusive ownership of user-input submission. The event pump
+feeds persisted session events in order, while the registry supplies the S4
+reducer's current AgentState. Final events drain before process exit, and queue
+cuts publish only after successful operations. Disk work stays on the dedicated
+worker.
 
 Delivery queries S6's live `Runtime::waiting_on_human` book directly. An open
 request or a lookup error cannot be treated as idle. S4 must report live,
@@ -66,6 +67,17 @@ whose result never arrived. Cancellation remains terminal. A fresh scheduler
 holds any previous outstanding or unrecognized result flag with
 session_unconfirmed, preventing automatic replay into a new process.
 
-Actual producer routing, server ownership, global lifecycle acknowledgements
-and registered submit:false refusal remain #1803. Steer, interrupt, urgent
-priority, queue UI and System One remain their approved follow-up scopes.
+Worker integration (#1955, Part of #1803) runs the sole journal/scheduler on the
+existing session event pump, away from the server loop. Persisted events reach
+it before registry S4 projection; generation-fenced registry snapshots supply
+the S4 gate and the live S6 book supplies permission state. Queue-owned runtimes
+refuse raw submission. Nonblocking requests acknowledge only buffer acceptance;
+typed completions carry durable admission, offer/pending status and atomic cuts.
+
+Request and S4 channels hold one item each; completions hold four plus one pending
+owner completion. Saturation backpressures queue work and session delivery.
+Consumers drain through terminal completion before relaunch; terminal cuts remain
+available after process exit. Shutdown cancellation explicitly reports incomplete
+notification delivery and requires durable replay. Final persisted records drain
+before reservation retirement. Producer routing is #1957/#1958 and queue/global
+publication is #1956, without new queue deadlines or public endpoints here.

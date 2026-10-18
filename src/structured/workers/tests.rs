@@ -72,12 +72,30 @@ impl Case {
             leases: leases.clone(),
             state: fixture.root.path().to_owned(),
             stall_after: STALL,
+            queue_rewrite_bytes: crate::config::Config::default()
+                .sessions
+                .queue_rewrite_bytes,
             lineage: None,
         };
-        let f = fixture.clone();
-        let authority = leases.clone();
+        let case = Self {
+            fixture,
+            id,
+            session,
+            generation,
+            leases,
+        };
+        let factory = case.factory(mode, events);
+        (case, launch, factory)
+    }
+    fn factory(
+        &self,
+        mode: &str,
+        events: Vec<Value>,
+    ) -> impl FnOnce(&Record) -> Result<LaunchProfile, LaunchError> + Send + 'static {
+        let f = self.fixture.clone();
+        let authority = self.leases.clone();
         let mode = mode.to_owned();
-        let factory = move |record: &Record| {
+        move |record: &Record| {
             assert!(
                 authority.is_reserved(&record.session_id).unwrap(),
                 "reserve precedes profile factory"
@@ -108,18 +126,7 @@ impl Case {
                 0o600,
             );
             Ok(profile)
-        };
-        (
-            Self {
-                fixture,
-                id,
-                session,
-                generation,
-                leases,
-            },
-            launch,
-            factory,
-        )
+        }
     }
     pub(crate) fn assert_shutdown(&self, registry: &Registry, workers: &Workers) {
         assert!(workers.entries[&self.id].thread.is_none(), "worker joined");
@@ -178,6 +185,7 @@ impl Case {
                 finished: false,
                 events_closed: false,
                 stall_after: STALL,
+                queue_state: None,
                 thread: Some(std::thread::spawn(|| {})),
             },
         );
@@ -189,7 +197,17 @@ impl Case {
         case
     }
     pub fn submit(&self, workers: &Workers) {
-        workers.runtime(&self.id, self.generation).unwrap().try_submit(&json!({"type":"user","message":{"role":"user","content":"fixture turn"},"parent_tool_use_id":null,"session_id":""})).unwrap();
+        let mut item = crate::structured::queue::tests::item(&self.session);
+        item.body = "fixture turn".into();
+        workers
+            .runtime(&self.id, self.generation)
+            .unwrap()
+            .queue_enqueue(super::queue::Request {
+                item,
+                principal: crate::structured::queue::admission::Principal::Operator,
+                gate: crate::structured::queue::admission::Gate::Send,
+            })
+            .unwrap();
     }
     pub async fn ready(
         &self,
@@ -634,6 +652,7 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
             finished: false,
             events_closed: false,
             stall_after: STALL,
+            queue_state: None,
             thread: Some(std::thread::spawn(|| {})),
         },
     );
@@ -836,3 +855,5 @@ fn drop_after_failed_shutdown_does_not_wait_a_second_time() {
     dropper.join().unwrap();
     result.expect("Drop must not repeat the full teardown after its deadline");
 }
+
+mod queue;

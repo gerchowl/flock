@@ -126,6 +126,12 @@ impl Scheduler {
     /// No status observation writes a record.
     /// S4/S6 gates and no-eligible-input are reported by deliver when unreserved.
     pub fn status(&self, runtime: &Runtime) -> Option<Pending> {
+        self.status_on(runtime.input_handle())
+    }
+    pub(in crate::structured) fn status_on(
+        &self,
+        runtime: &crate::structured::transport::InputHandle,
+    ) -> Option<Pending> {
         if let Some(reason) = self.journal().read_only() {
             return Some(Pending {
                 batch_id: None,
@@ -163,8 +169,16 @@ impl Scheduler {
         state: &AgentState,
         now_ms: u64,
     ) -> Result<Offer, Failure> {
+        self.deliver_on(runtime.input_handle(), state, now_ms)
+    }
+    pub(in crate::structured) fn deliver_on(
+        &mut self,
+        runtime: &crate::structured::transport::InputHandle,
+        state: &AgentState,
+        now_ms: u64,
+    ) -> Result<Offer, Failure> {
         self.journal().writable()?;
-        if let Some(pending) = self.status(runtime) {
+        if let Some(pending) = self.status_on(runtime) {
             return Ok(Offer::Pending(pending));
         }
         let open = runtime
@@ -237,6 +251,10 @@ impl Scheduler {
         self.refused = None;
         self.virgin = false;
         Ok(Offer::Submitted { batch_id: batch.id })
+    }
+    /// Check configured rewrite policy under the scheduler's sole write ownership.
+    pub(crate) fn checkpoint_if_required(&mut self) -> Result<Option<super::Cut>, Failure> {
+        self.admission.checkpoint_if_required()
     }
     fn members(&self) -> Vec<Item> {
         self.admission

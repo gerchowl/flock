@@ -147,35 +147,38 @@ The ADR-0036 §4 owner decisions in #1820 and #1922 separate three cases:
    it is not necessarily a record boundary. Known updates/removals cannot erase
    the raw unknown history.
 
-   Slice 1 of [#1803](https://github.com/gerchowl/flock/issues/1803),
-   [#1954](https://github.com/gerchowl/flock/issues/1954), adds the opt-in journal
-   policy and configuration. `[sessions] queue_rewrite_bytes` is a positive
-   integer byte count, with named default `DEFAULT_QUEUE_REWRITE_BYTES` of
-   8 MiB (8,388,608 bytes). Zero is rejected, including by live config loading.
-   A checkpoint is required when the existing file is **strictly larger** than
-   this value, before another append. An append may cross the threshold; the
-   next mutation checks it. This is a rewrite trigger, not a maximum snapshot
-   size: a materialized queue can itself be larger than the configured value.
+   The journal policy from [#1954](https://github.com/gerchowl/flock/issues/1954)
+   is enforced by the worker owner in
+   [#1955](https://github.com/gerchowl/flock/issues/1955), closing the production
+   integration requirement of [#1928](https://github.com/gerchowl/flock/issues/1928).
+   Every worker opens the journal with `Journal::open_with_policy` using
+   `[sessions] queue_rewrite_bytes`, a positive byte count with named default
+   `DEFAULT_QUEUE_REWRITE_BYTES` of 8 MiB (8,388,608 bytes). Zero is rejected.
+   When the existing file is **strictly larger** than the configured value, the
+   worker serializes a checkpoint before further admission/lifecycle appends.
+   This is a rewrite trigger, not a maximum materialized snapshot size.
 
-   `Journal::open_with_policy` installs the same policy for append and recovery.
-   Recovery re-derives the typed unknown-data refusal above the threshold before
-   repairing a torn suffix, leaving refused bytes unchanged. Known supported
-   crash-torn tails keep their existing repair behavior. Known data are rewritten
-   on the next append or explicit `checkpoint_if_required()` call, which returns
-   the complete atomic cut after fsync, rename and directory fsync. A caller must
-   publish that cut, or replay from its pre-operation cursor to include an
-   automatic append-time rewrite; publishing just the appended record loses the
-   checkpoint gap and snapshot. Refusal never returns a successful cut.
+   Reopen measures the entire file **including a torn final suffix** before
+   repair. Thus a torn suffix can make a checkpoint required. If unknown data
+   prevent it, the worker re-derives the typed read-only latch before repairing
+   that suffix and preserves every byte. Supported known data keep the existing
+   torn-tail repair behavior. Recovery never needs a persisted refusal marker.
+   A worker does not retry a latched storage refusal on each pump iteration.
 
-   Production enforcement remains a requirement on
-   [#1955](https://github.com/gerchowl/flock/issues/1955), slice 2: the worker must
-   use this policy with its configured byte threshold on every open, preserve
-   serialized mutation ownership and publish the resulting cuts. The legacy
-   `Journal::open` does not install a policy. Thus production same-version growth
-   is not bounded by this slice alone, and
-   [#1928](https://github.com/gerchowl/flock/issues/1928) remains open until worker
-   integration. Reopening through the policy re-establishes the refusal without
-   adding any persistent marker. A newer-stamped journal instead uses
+   `checkpoint_if_required()` and automatic append-time replacements keep the
+   existing fsync-temp, rename, fsync-directory rule. The worker captures replay
+   from its preceding cursor after each serialized operation, so its bounded
+   completion includes the atomic gap, snapshot and later records. It never
+   reports a successful cut when durability is uncertain. The publication adapter
+   is [#1956](https://github.com/gerchowl/flock/issues/1956); consumers must drain
+   completions to release backpressure. Shutdown notification cancellation is
+   explicit in the runtime report and requires durable replay.
+
+   Valid live reloads that change the threshold keep the active server policy
+   and report `restart required`; restarting applies the new configuration to
+   worker-owned queues. This documents the configuration/reopen requirements
+   from [#1975](https://github.com/gerchowl/flock/issues/1975), items 1–3.
+   A newer-stamped journal instead uses
    `QueueJournalNewer` read-only mode. There is no opaque checkpoint passthrough
    and no inference of a version from unknown contents.
 2. **Malformed known records are corruption.** A supported-version journal still

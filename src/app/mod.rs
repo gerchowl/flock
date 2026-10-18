@@ -1898,6 +1898,12 @@ impl App {
             diagnostics.push("security.agent_account changed: restart the server to apply socket account policy; keeping current policy".into());
         }
 
+        if !invalid_section("sessions")
+            && config.sessions.queue_rewrite_bytes != self.state.config.sessions.queue_rewrite_bytes
+        {
+            diagnostics.push("sessions.queue_rewrite_bytes changed: restart required to apply the worker queue policy; keeping current threshold".into());
+        }
+
         // Snapshot fields that need to detect a change relative to the
         // previous live config BEFORE any per-section replacement below.
         let previous_sound = self.state.config.ui.sound.clone();
@@ -3081,6 +3087,31 @@ mod tests {
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         restore_xdg_state_home(original_xdg_state_home);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn queue_threshold_reload_reports_restart_required_and_keeps_worker_policy() {
+        let mut app = test_app();
+        let old = app.state.config.sessions.queue_rewrite_bytes;
+        let mut incoming = app.state.config.clone();
+        incoming.sessions.queue_rewrite_bytes = std::num::NonZeroU64::new(old.get() + 1).unwrap();
+        let report = app.apply_live_config(&incoming, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message
+                .contains("sessions.queue_rewrite_bytes changed: restart required")));
+        assert_eq!(app.state.config.sessions.queue_rewrite_bytes, old);
+        assert_eq!(
+            app.state.config_diagnostic.as_deref(),
+            Some(report.diagnostics[0].as_str())
+        );
+        let same = app.state.config.clone();
+        assert_eq!(
+            app.apply_live_config(&same, &[], &[], false).status,
+            crate::config::ConfigReloadStatus::Applied
+        );
     }
 
     #[test]

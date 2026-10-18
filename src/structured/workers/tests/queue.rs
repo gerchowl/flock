@@ -1,0 +1,540 @@
+use super::*;
+use crate::structured::queue::{
+    admission::{Gate, Principal as QueuePrincipal},
+    model::{Kind, State},
+    scheduler::PendingCause,
+    Change, Journal,
+};
+use crate::structured::workers::queue as owner_queue;
+use std::io::Write;
+use std::num::NonZeroU64;
+use std::os::unix::net::{UnixListener, UnixStream};
+
+fn id(n: u32) -> String {
+    format!("00000000-0000-4000-8000-{n:012}")
+}
+fn request(n: u32) -> owner_queue::Request {
+    let mut item = crate::structured::queue::tests::item(&id(n));
+    item.kind = Kind::Command;
+    item.body = "/compact".into();
+    owner_queue::Request {
+        item,
+        principal: QueuePrincipal::Operator,
+        gate: Gate::Send,
+    }
+}
+struct Run {
+    registry: Registry,
+    workers: Workers,
+    notify: Arc<Notify>,
+    case: Case,
+    driver: UnixStream,
+    updates: Vec<owner_queue::Update>,
+    threshold: NonZeroU64,
+}
+impl Run {
+    async fn new(n: u32, mode: &str, seed: impl FnOnce(&Case) -> NonZeroU64) -> Self {
+        let (mut registry, mut workers, notify, _) = owner();
+        let (mut case, mut launch, factory) = Case::prepare(&mut registry, n, mode, vec![]);
+        let threshold = seed(&case);
+        launch.queue_rewrite_bytes = threshold;
+        let listener = UnixListener::bind(case.fixture.root.path().join("queue.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        case.generation = workers.start(&mut registry, launch, factory).unwrap();
+        let mut updates = Vec::new();
+        let mut driver = None;
+        wait(&notify, || {
+            workers.poll(&mut registry, Instant::now(), 1000);
+            while let Some(update) = workers.queue_update(&registry, &case.id, case.generation) {
+                updates.push(update);
+            }
+            assert!(
+                workers.report(&case.id, case.generation).is_none(),
+                "producer ended before socket handshake"
+            );
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    driver = Some(stream);
+                    true
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+                Err(e) => panic!("queue socket stage: {e}"),
+            }
+        })
+        .await;
+        let driver = driver.unwrap();
+        driver.set_write_timeout(Some(LIMIT)).unwrap();
+        let mut run = Self {
+            registry,
+            workers,
+            notify,
+            case,
+            driver,
+            updates,
+            threshold,
+        };
+        run.until(|r| r.raws().iter().any(|v| v["subtype"] == "init"))
+            .await;
+        run
+    }
+    fn pump(&mut self) {
+        self.workers.poll(&mut self.registry, Instant::now(), 1000);
+        while let Some(update) =
+            self.workers
+                .queue_update(&self.registry, &self.case.id, self.case.generation)
+        {
+            self.updates.push(update);
+        }
+    }
+    async fn until(&mut self, mut condition: impl FnMut(&Self) -> bool) {
+        let notify = self.notify.clone();
+        wait(&notify, || {
+            self.pump();
+            assert!(
+                self.workers
+                    .report(&self.case.id, self.case.generation)
+                    .is_none(),
+                "producer ended before expected queue stage"
+            );
+            condition(self)
+        })
+        .await;
+    }
+    fn raws(&self) -> Vec<Value> {
+        let path = self
+            .case
+            .fixture
+            .root
+            .path()
+            .join("sessions")
+            .join(&self.case.id)
+            .join(format!("{}.jsonl", self.case.session));
+        match fs::read_to_string(path) {
+            Ok(text) => text
+                .split_inclusive('\n')
+                .filter(|s| s.ends_with('\n'))
+                .map(|line| {
+                    let envelope: Value = serde_json::from_str(line).unwrap();
+                    serde_json::from_str(envelope["raw"].as_str().unwrap()).unwrap()
+                })
+                .collect(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => vec![],
+            Err(e) => panic!("durable session stream: {e}"),
+        }
+    }
+    fn inputs(&self) -> Vec<Value> {
+        self.raws()
+            .into_iter()
+            .filter(|v| v["type"] == "fixture_input")
+            .collect()
+    }
+    fn control(&mut self, value: Value) {
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        self.driver.write_all(&bytes).unwrap();
+    }
+    async fn admit(&mut self, n: u32) {
+        self.workers
+            .enqueue(
+                &self.registry,
+                &self.case.id,
+                self.case.generation,
+                request(n),
+            )
+            .unwrap();
+        self.until(|r| {
+            r.updates
+                .iter()
+                .any(|u| u.admitted.as_ref().is_some_and(|(key, _)| key == &id(n)))
+        })
+        .await;
+    }
+    fn admission(&self, n: u32) -> &Result<(), crate::structured::queue::admission::Failure> {
+        &self
+            .updates
+            .iter()
+            .rev()
+            .find_map(|u| u.admitted.as_ref().filter(|(key, _)| key == &id(n)))
+            .unwrap()
+            .1
+    }
+    fn latest_item(&self, n: u32) -> Option<&Value> {
+        self.updates
+            .iter()
+            .rev()
+            .filter_map(|u| u.cut.as_ref())
+            .flat_map(|c| c.records.iter().rev())
+            .find_map(|r| {
+                if r["item"]["item_id"] == id(n) {
+                    Some(&r["item"])
+                } else {
+                    r.get("items")
+                        .and_then(Value::as_array)
+                        .and_then(|items| items.iter().find(|i| i["item_id"] == id(n)))
+                }
+            })
+    }
+    fn pending(&self) -> Option<&crate::structured::queue::scheduler::Pending> {
+        self.updates.last().and_then(|u| u.pending.as_ref())
+    }
+    async fn ended(&mut self) {
+        let notify = self.notify.clone();
+        wait(&notify, || {
+            self.pump();
+            self.workers
+                .report(&self.case.id, self.case.generation)
+                .is_some()
+        })
+        .await;
+        self.pump();
+        assert!(
+            !self
+                .workers
+                .report(&self.case.id, self.case.generation)
+                .unwrap()
+                .authority_retained
+        );
+        assert!(self.workers.entries[&self.case.id].thread.is_none());
+    }
+    async fn stop(&mut self) {
+        self.workers.stop(&self.case.id, self.case.generation);
+        self.ended().await;
+    }
+    async fn restart(&mut self) {
+        let old = self.case.generation;
+        let launch = Launch {
+            agent_id: self.case.id.clone(),
+            generation: old,
+            leases: self.case.leases.clone(),
+            state: self.case.fixture.root.path().to_owned(),
+            stall_after: STALL,
+            queue_rewrite_bytes: self.threshold,
+            lineage: None,
+        };
+        // The original driver listener was dropped; rebind its owned socket path.
+        fs::remove_file(self.case.fixture.root.path().join("queue.sock")).unwrap();
+        let listener =
+            UnixListener::bind(self.case.fixture.root.path().join("queue.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        self.case.generation = self
+            .workers
+            .start(
+                &mut self.registry,
+                launch,
+                self.case.factory("queue", vec![]),
+            )
+            .unwrap();
+        assert!(self.case.generation > old);
+        assert_eq!(
+            self.workers
+                .enqueue(&self.registry, &self.case.id, old, request(999))
+                .unwrap_err(),
+            ErrorCode::AgentNotFound
+        );
+        assert!(self
+            .workers
+            .queue_update(&self.registry, &self.case.id, old)
+            .is_none());
+        self.updates.clear();
+        let mut driver = None;
+        let notify = self.notify.clone();
+        wait(&notify, || {
+            self.pump();
+            assert!(self
+                .workers
+                .report(&self.case.id, self.case.generation)
+                .is_none());
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    driver = Some(stream);
+                    true
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+                Err(e) => panic!("restart socket: {e}"),
+            }
+        })
+        .await;
+        self.driver = driver.unwrap();
+        self.driver.set_write_timeout(Some(LIMIT)).unwrap();
+    }
+}
+fn default_policy(_: &Case) -> NonZeroU64 {
+    crate::config::Config::default()
+        .sessions
+        .queue_rewrite_bytes
+}
+fn path(case: &Case) -> std::path::PathBuf {
+    case.fixture
+        .root
+        .path()
+        .join("sessions")
+        .join(&case.id)
+        .join("queue.jsonl")
+}
+fn unknown(case: &Case) -> NonZeroU64 {
+    drop(Journal::open(case.fixture.root.path(), &case.id).unwrap());
+    use std::fs::OpenOptions;
+    let mut f = OpenOptions::new().append(true).open(path(case)).unwrap();
+    writeln!(f, "{{\"seq\":1,\"kind\":\"future\"}}").unwrap();
+    f.sync_all().unwrap();
+    NonZeroU64::new(f.metadata().unwrap().len()).unwrap()
+}
+
+#[tokio::test]
+async fn worker_queue_delivers_fifo_on_real_result_and_keeps_a_single_writer() {
+    let mut r = Run::new(201, "queue", default_policy).await;
+    let e = Journal::open(r.case.fixture.root.path(), &r.case.id)
+        .err()
+        .unwrap();
+    assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+    let raw = r
+        .workers
+        .runtime(&r.case.id, r.case.generation)
+        .unwrap()
+        .try_submit(&json!({"type":"user"}))
+        .unwrap_err();
+    assert_eq!(raw.to_string(), ErrorCode::QueueModeUnsupported.as_str());
+    r.admit(1).await;
+    assert!(r.admission(1).is_ok());
+    r.until(|r| !r.inputs().is_empty()).await;
+    assert_eq!(r.inputs()[0]["input"]["uuid"], id(1));
+    r.admit(2).await;
+    assert!(r.admission(2).is_ok());
+    assert_eq!(r.pending().unwrap().cause, PendingCause::AwaitingResult);
+    assert_eq!(
+        r.pending().unwrap().batch_id.as_deref(),
+        Some(id(1).as_str())
+    );
+    assert!(r.latest_item(2).unwrap().get("awaiting_result").is_none());
+    r.control(json!({"op":"result"}));
+    r.until(|r| {
+        r.inputs().len() >= 2
+            && r.latest_item(1)
+                .is_some_and(|v| v["state"] == "done" || v["state"] == "cancelled")
+    })
+    .await;
+    assert_eq!(
+        r.inputs()
+            .iter()
+            .map(|v| v["input"]["uuid"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>(),
+        [id(1), id(2)]
+    );
+    assert_eq!(r.latest_item(1).unwrap()["state"], "done");
+    r.control(json!({"op":"result"}));
+    r.until(|r| r.latest_item(2).is_some_and(|v| v["state"] == "done"))
+        .await;
+    r.control(json!({"op":"exit"}));
+    r.ended().await;
+    let j = Journal::open(r.case.fixture.root.path(), &r.case.id).unwrap();
+    assert!(j.items().iter().all(|i| i.state == State::Done));
+}
+
+#[tokio::test]
+async fn worker_queue_cancelled_and_unknown_boundaries_stay_pending_until_result() {
+    for (n, op, cause, state) in [
+        (
+            202,
+            "lifecycle",
+            PendingCause::CancelledAwaitingResult,
+            "cancelled",
+        ),
+        (203, "loss", PendingCause::TurnEndUnknown, "queued"),
+    ] {
+        let mut r = Run::new(n, "queue", default_policy).await;
+        r.admit(1).await;
+        r.until(|r| !r.inputs().is_empty()).await;
+        r.admit(2).await;
+        r.control(json!({"op":op,"state":"cancelled"}));
+        r.until(|r| r.pending().is_some_and(|p| p.cause == cause))
+            .await;
+        assert_eq!(r.latest_item(1).unwrap()["state"], state);
+        assert_eq!(r.latest_item(1).unwrap()["awaiting_result"], true);
+        assert!(r.latest_item(2).unwrap().get("awaiting_result").is_none());
+        r.control(json!({"op":"result"}));
+        r.until(|r| {
+            r.inputs().len() >= 2
+                && r.latest_item(1)
+                    .is_some_and(|v| v["state"] == "done" || v["state"] == "cancelled")
+        })
+        .await;
+        assert_eq!(r.inputs()[1]["input"]["uuid"], id(2));
+        r.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn worker_queue_silent_turn_reports_stable_reservation_without_a_second_offer() {
+    let mut r = Run::new(204, "queue-silent", default_policy).await;
+    r.admit(1).await;
+    r.control(json!({"op":"barrier","after_count":1}));
+    r.until(|r| r.raws().iter().any(|v| v["type"] == "fixture_barrier"))
+        .await;
+    r.admit(2).await;
+    assert!(matches!(
+        r.updates
+            .iter()
+            .find(|u| u.admitted.as_ref().is_some_and(|(key, _)| key == &id(2)))
+            .unwrap()
+            .offer,
+        Ok(crate::structured::queue::scheduler::Offer::Pending(_))
+    ));
+    let pending = r.pending().unwrap().clone();
+    assert_eq!(pending.cause, PendingCause::AwaitingResult);
+    assert_eq!(pending.batch_id.as_deref(), Some(id(1).as_str()));
+    let mut held = request(3);
+    held.gate = Gate::Hold;
+    r.workers
+        .enqueue(&r.registry, &r.case.id, r.case.generation, held)
+        .unwrap();
+    r.until(|r| {
+        r.updates
+            .iter()
+            .any(|u| u.admitted.as_ref().is_some_and(|(key, _)| key == &id(3)))
+    })
+    .await;
+    assert_eq!(r.pending(), Some(&pending));
+    assert!(r.latest_item(2).unwrap().get("awaiting_result").is_none());
+    r.stop().await;
+    assert_eq!(r.latest_item(1).unwrap()["state"], "held");
+    assert_eq!(r.latest_item(1).unwrap()["refusal"], "no_result");
+    r.restart().await;
+    r.until(|r| !r.inputs().is_empty()).await;
+    assert_eq!(r.inputs()[0]["input"]["uuid"], id(2));
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn worker_queue_recovery_holds_unconfirmed_items_and_never_resends_them() {
+    let mut r = Run::new(205, "queue", |case| {
+        use crate::structured::queue::admission::{Admission, MAX_BATCH};
+        let j = Journal::open(case.fixture.root.path(), &case.id).unwrap();
+        let mut admission = Admission::new(j, MAX_BATCH).unwrap();
+        for n in [1, 2] {
+            let request = request(n);
+            admission
+                .enqueue(request.item, request.principal, request.gate)
+                .unwrap();
+        }
+        let mut prior = admission.journal().items()[0].clone();
+        prior.metadata.insert("awaiting_result".into(), json!(true));
+        admission.replace(vec![prior]).unwrap();
+        default_policy(case)
+    })
+    .await;
+    r.until(|r| !r.inputs().is_empty()).await;
+    assert_eq!(r.inputs()[0]["input"]["uuid"], id(2));
+    let held = r.latest_item(1).unwrap();
+    assert_eq!(held["state"], "held");
+    assert_eq!(held["refusal"], "session_unconfirmed");
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn worker_queue_production_checkpoint_returns_the_committed_empty_cut() {
+    let mut r = Run::new(206, "queue", |case| {
+        let mut j = Journal::open(case.fixture.root.path(), &case.id).unwrap();
+        let header = j.bytes().unwrap();
+        j.append(Change::Upsert {
+            item: Box::new(request(1).item),
+            position: 0,
+        })
+        .unwrap();
+        j.append(Change::Remove { item_id: id(1) }).unwrap();
+        NonZeroU64::new(header + 1).unwrap()
+    })
+    .await;
+    r.until(|r| {
+        r.updates.iter().any(|u| {
+            u.cut.as_ref().is_some_and(|c| {
+                c.gap
+                    .as_ref()
+                    .is_some_and(|g| g.to == 2 && g.snapshot_to == 2)
+            })
+        })
+    })
+    .await;
+    let cut = r
+        .updates
+        .iter()
+        .find_map(|u| {
+            u.cut
+                .as_ref()
+                .filter(|c| c.gap.as_ref().is_some_and(|g| g.to == 2))
+        })
+        .unwrap();
+    assert_eq!(cut.through, 2);
+    assert!(cut.records.is_empty());
+    let bytes = fs::read_to_string(path(&r.case)).unwrap();
+    assert!(bytes
+        .lines()
+        .any(|s| serde_json::from_str::<Value>(s).unwrap()["high_water"] == 2));
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn worker_queue_unknown_checkpoint_refusal_latches_and_is_rederived_on_reopen() {
+    let mut r = Run::new(207, "queue", unknown).await;
+    r.admit(1).await;
+    assert!(r.admission(1).is_ok());
+    assert_eq!(
+        r.pending().unwrap().cause,
+        PendingCause::QueueJournalCorrupt(crate::structured::queue::QueueJournalCorrupt {
+            seq: Some(2),
+            offset: fs::metadata(path(&r.case)).unwrap().len(),
+            reason: "unknown_data_prevents_checkpoint"
+        })
+    );
+    let bytes = fs::read(path(&r.case)).unwrap();
+    r.admit(2).await;
+    assert_eq!(
+        r.admission(2).as_ref().unwrap_err().code,
+        ErrorCode::QueueJournalCorrupt
+    );
+    assert_eq!(fs::read(path(&r.case)).unwrap(), bytes);
+    assert!(r.latest_item(1).unwrap().get("awaiting_result").is_none());
+    r.stop().await;
+    assert_eq!(fs::read(path(&r.case)).unwrap(), bytes);
+    r.restart().await;
+    r.until(|r| {
+        r.pending()
+            .is_some_and(|p| matches!(p.cause, PendingCause::QueueJournalCorrupt(_)))
+    })
+    .await;
+    r.admit(3).await;
+    assert_eq!(
+        r.admission(3).as_ref().unwrap_err().code,
+        ErrorCode::QueueJournalCorrupt
+    );
+    assert_eq!(fs::read(path(&r.case)).unwrap(), bytes);
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn worker_queue_torn_tail_counts_toward_reopen_threshold_without_repair() {
+    let mut r = Run::new(208, "queue", |case| {
+        let threshold = unknown(case);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path(case))
+            .unwrap();
+        f.write_all(b"{torn").unwrap();
+        f.sync_all().unwrap();
+        threshold
+    })
+    .await;
+    let bytes = fs::read(path(&r.case)).unwrap();
+    assert!(bytes.ends_with(b"{torn"));
+    r.until(|r| {
+        r.pending()
+            .is_some_and(|p| matches!(p.cause, PendingCause::QueueJournalCorrupt(_)))
+    })
+    .await;
+    r.admit(1).await;
+    assert_eq!(
+        r.admission(1).as_ref().unwrap_err().code,
+        ErrorCode::QueueJournalCorrupt
+    );
+    r.stop().await;
+    assert_eq!(fs::read(path(&r.case)).unwrap(), bytes);
+}
