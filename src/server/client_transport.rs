@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -32,6 +32,11 @@ const MIN_CLIENT_ROWS: u16 = 1;
 /// within the 5-second deadline, even with OS timer slack, thread scheduling,
 /// and cleanup overhead.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Disconnect an observer after this long without bytes accepted by its socket.
+/// Idle connections with no pending output are unaffected, and every partial
+/// write restarts the monotonic deadline, even within a single large frame.
+const OBSERVER_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum input payload size (bytes) for a single `ClientMessage::Input`.
 const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
@@ -313,12 +318,31 @@ pub(crate) fn handle_client_handshake(
 }
 
 /// The client writer loop — prioritizes control messages over render frames.
-fn client_writer_loop(
+pub(super) fn client_writer_loop(
+    stream: UnixStream,
+    client_id: u64,
+    control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    render_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    server_event_tx: mpsc::Sender<ServerEvent>,
+) {
+    client_writer_loop_with(
+        stream,
+        client_id,
+        control_rx,
+        render_rx,
+        server_event_tx,
+        |stream, data| write_framed_bytes(stream, data, client_id),
+    );
+}
+
+/// Run the production channel arbitration with an injectable socket writer.
+pub(super) fn client_writer_loop_with(
     mut stream: UnixStream,
     client_id: u64,
     control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     render_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     server_event_tx: mpsc::Sender<ServerEvent>,
+    mut write: impl FnMut(&mut UnixStream, &[u8]) -> bool,
 ) {
     let mut control_closed = false;
     let mut render_closed = false;
@@ -326,7 +350,7 @@ fn client_writer_loop(
     loop {
         match control_rx.try_recv() {
             Ok(data) => {
-                if !write_framed_bytes(&mut stream, &data) {
+                if !write(&mut stream, &data) {
                     break;
                 }
                 continue;
@@ -339,7 +363,7 @@ fn client_writer_loop(
             Ok(data) => {
                 let _ =
                     server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
-                if !write_framed_bytes(&mut stream, &data) {
+                if !write(&mut stream, &data) {
                     break;
                 }
                 continue;
@@ -357,7 +381,7 @@ fn client_writer_loop(
                 Ok(data) => {
                     let _ = server_event_tx
                         .blocking_send(ServerEvent::ClientWriterDrained { client_id });
-                    if !write_framed_bytes(&mut stream, &data) {
+                    if !write(&mut stream, &data) {
                         break;
                     }
                 }
@@ -369,7 +393,7 @@ fn client_writer_loop(
 
         match control_rx.recv_timeout(Duration::from_millis(5)) {
             Ok(data) => {
-                if !write_framed_bytes(&mut stream, &data) {
+                if !write(&mut stream, &data) {
                     break;
                 }
             }
@@ -380,20 +404,79 @@ fn client_writer_loop(
     debug!("client writer thread exiting");
 }
 
-fn write_framed_bytes(stream: &mut UnixStream, data: &[u8]) -> bool {
-    if let Err(err) = stream.write_all(data) {
-        crate::logging::client_conn_write_failed(&err.to_string());
+/// Write an entire frame, preserving offsets and restarting only on socket progress.
+/// `now` and `write` are supplied so tests drive time at actual backpressure.
+pub(super) fn write_with_progress(
+    data: &[u8],
+    mut now: impl FnMut() -> Instant,
+    mut write: impl FnMut(&[u8], Duration) -> io::Result<usize>,
+) -> io::Result<()> {
+    let mut offset = 0;
+    let mut last_progress = now();
+    while offset < data.len() {
+        let elapsed = now().saturating_duration_since(last_progress);
+        if elapsed >= OBSERVER_WRITE_STALL_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "observer write stalled",
+            ));
+        }
+        match write(&data[offset..], OBSERVER_WRITE_STALL_TIMEOUT - elapsed) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(bytes) => {
+                offset += bytes;
+                last_progress = now();
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+fn write_framed_bytes(stream: &mut UnixStream, data: &[u8], client_id: u64) -> bool {
+    let result = write_with_progress(data, Instant::now, |bytes, remaining| {
+        // SO_SNDTIMEO bounds each blocking syscall by the remaining deadline.
+        // Failure to arm it fails closed rather than leaving an unbounded write.
+        stream.set_write_timeout(Some(remaining))?;
+        stream.write(bytes)
+    });
+    finish_write(stream, client_id, result)
+}
+
+/// Finish a frame write and wake the reader on failure so observer cleanup runs.
+pub(super) fn finish_write(
+    stream: &mut UnixStream,
+    client_id: u64,
+    result: io::Result<()>,
+) -> bool {
+    if let Err(err) = result {
+        if err.kind() == io::ErrorKind::TimedOut {
+            crate::logging::client_conn_write_stalled(client_id);
+        } else {
+            crate::logging::client_conn_write_failed(&err.to_string());
+        }
+        // The reader owns another descriptor. Shutdown wakes it so the normal
+        // ClientDisconnected path frees only this observer, never its terminal.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
         return false;
     }
     if let Err(err) = stream.flush() {
         crate::logging::client_conn_flush_failed(&err.to_string());
+        let _ = stream.shutdown(std::net::Shutdown::Both);
         return false;
     }
     true
 }
 
 /// The client read loop — reads messages from the client and forwards to the server event channel.
-fn client_read_loop(
+pub(super) fn client_read_loop(
     mut stream: UnixStream,
     client_id: u64,
     server_event_tx: &mpsc::Sender<ServerEvent>,
@@ -524,6 +607,7 @@ fn client_read_loop(
 
 #[cfg(test)]
 mod tests {
+    mod observer_progress;
     use super::*;
 
     #[test]

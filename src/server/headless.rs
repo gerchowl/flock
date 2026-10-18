@@ -4412,6 +4412,7 @@ fn init_logging() {
 
 #[cfg(test)]
 mod tests {
+    mod observer_stall;
     use super::*;
 
     use crate::app::AppState;
