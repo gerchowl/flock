@@ -5,39 +5,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::{net::UnixStream, process::CommandExt};
 use std::path::Path;
 use std::process::{Child, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Internal worker argument; the worker receives no path or credential.
 pub(crate) const WORKER_ARG: &str = "--client-token-lock";
-/// Owned advisory-lock description whose scope ends independently of child fds.
-///
-/// Close alone waits for every fork/dup reference to disappear. Explicit unlock
-/// keeps admission and revocation bounded to their operation (ADR-0036 §5a).
-/// An unlocked instance is also valid while an owned helper waits to acquire it.
-/// Do not clone the descriptor; [`PendingLock`] is the sole transfer path.
-pub(crate) struct LockFile(File);
-impl LockFile {
-    /// Own the description and release any lock on it when this guard drops.
-    pub(crate) fn new(file: File) -> Self {
-        Self(file)
-    }
-    /// Attempt admission without waiting; active contention retains its refusal.
-    pub(crate) fn try_lock(&self) -> Result<(), TryLockError> {
-        self.0.try_lock()
-    }
-}
-impl AsRawFd for LockFile {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.0.as_raw_fd()
-    }
-}
-impl Drop for LockFile {
-    fn drop(&mut self) {
-        if let Err(error) = self.0.unlock() {
-            crate::logging::client_token_unlock_failed(&error);
-        }
-    }
-}
+use super::file_lock::LockFile;
 
 /// A pending lock owns its helper until acquisition, cancellation or timeout.
 pub(crate) struct PendingLock {
@@ -89,15 +61,11 @@ impl PendingLock {
     /// Wait at most the supplied lock deadline; cleanup also runs when abandoned.
     pub(crate) fn finish(mut self, deadline: Duration) -> io::Result<LockFile> {
         if let Some((_, stream)) = &mut self.helper {
-            stream.set_read_timeout(Some(deadline))?;
+            // A completed peer may reject SO_RCVTIMEO while its ACK is buffered
+            // on Darwin. Readiness waits work for both live and completed peers.
+            wait_readable(stream, deadline)?;
             let mut ack = [0];
-            stream.read_exact(&mut ack).map_err(|e| {
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    io::ErrorKind::TimedOut.into()
-                } else {
-                    e
-                }
-            })?;
+            stream.read_exact(&mut ack)?;
             if ack != [b'L'] {
                 return Err(io::ErrorKind::InvalidData.into());
             }
@@ -107,6 +75,40 @@ impl PendingLock {
             .ok_or_else(|| io::ErrorKind::InvalidData.into())
     }
 }
+/// Wait for the sole-reader acknowledgment socket, including EOF and errors.
+/// Interrupted polls remeasure the monotonic deadline; no retry extends it.
+fn wait_readable(stream: &UnixStream, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let milliseconds = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: this live descriptor and the one-element output buffer are owned.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+        if ready > 0 {
+            // Only finish() reads this endpoint, so readiness cannot be consumed
+            // by another reader before the single-byte read (EOF also completes).
+            return Ok(());
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
 impl Drop for PendingLock {
     fn drop(&mut self) {
         if let Some((child, _)) = &mut self.helper {
@@ -156,14 +158,16 @@ pub(crate) fn worker() -> io::Result<()> {
             let _ = monitor.read(&mut [0]);
             std::process::exit(crate::cli::exit::SUCCESS);
         })?;
+    let file = LockFile::new(file);
     file.lock()?;
-    // The parent retains this same description through the operation. Unlocking
-    // here would break the transfer; the parent guard releases it after admission.
-    std::io::stdout().write_all(b"L")
+    std::io::stdout().write_all(b"L")?;
+    // The acknowledged parent retains the same description and its unlock guard.
+    file.close_after_transfer();
+    Ok(())
 }
 
 #[cfg(test)]
-pub(crate) mod inherited_holder;
+use super::file_lock::inherited_holder;
 
 #[cfg(test)]
 mod tests;

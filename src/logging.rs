@@ -4912,12 +4912,12 @@ pub(crate) fn mesh_custody_failed(operation: &'static str, code: &'static str) {
 }
 
 /// Unexpected scope-release failure, with no token, path or bearer contents.
-pub(crate) fn client_token_unlock_failed(error: &std::io::Error) {
+pub(crate) fn file_lock_unlock_failed(error: &std::io::Error) {
     tracing::warn!(
-        event = "client_token.lock.release_failed",
+        event = "file_lock.release_failed",
         error = %error,
         errno = error.raw_os_error(),
-        "client-token lock release failed"
+        "file lock release failed"
     );
 }
 
