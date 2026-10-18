@@ -320,7 +320,12 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
 **Resume authority (#2047 review amendment).** Resuming an existing structured
 record is operator-only (`operator_only`), including an agent resuming itself.
 The original parent and depth survive every resume and lease generation; resume
-never re-parents a conversation. This rule is adjacent to the `may_stop` policy:
+never re-parents a conversation. Parent and child depth are persisted together
+in the structured record, using the session snapshot's atomic write protocol,
+and supply the pending reservation and lease after restart or handoff.
+Migration limit (#2055): records written without lineage load as lineage unknown
+under ADR-0028 §3a and resume as roots, operator-only; no parent is invented.
+This rule is adjacent to the `may_stop` policy:
 stop remains available only to the operator and the structured agent itself.
 MCP spawn is fresh-only. Mesh relays cannot carry structured start/spawn, and the
 server independently refuses recorded mesh edges. Client token scopes, including

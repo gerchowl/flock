@@ -24,7 +24,11 @@ operator stops the child, and the fake parent then invokes the real CLI against
 both that offline child and itself: both resumes must refuse `operator_only`.
 The operator resumes the child with the same native session identity; another
 MCP spawn must still observe the original parent's fanout/capacity accounting.
-The operator stops the owned sessions and server. A success prints a JSON receipt.
+The restart scenario then starts a new server against the same sandbox snapshot,
+resumes both identities through the public CLI, checks the saved parent/depth,
+and proves that the new live lease still charges the child to its original
+parent's fanout limit. The operator stops the owned sessions and server.
+A success prints a JSON receipt.
 
 Each policy scenario starts a fresh server with its own loaded config.
 Live reload does not apply `[structured]`/`[fleet]` yet (#2043); the `[sessions]`

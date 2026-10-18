@@ -7,7 +7,7 @@ use crate::api::{
 };
 use crate::structured::{
     launch::{LaunchError, LaunchProfile, ProfileConfigDir, VerifiedBinary},
-    registry::{Record, StructuredRuntime},
+    registry::{Lineage, Record, StructuredRuntime},
     workers::{Admission, Launch},
 };
 use std::{io, path::PathBuf, time::Duration};
@@ -42,6 +42,9 @@ impl App {
         }
         if params.argv != ["claude"] {
             return Err(ErrorCode::InvalidAgentArgv);
+        }
+        if params.name == "self" {
+            return Err(ErrorCode::InvalidAgentName);
         }
         let existing = self.structured_target(&params.name)?;
         // ADR-0036 §1a: neither history ownership nor a relay grants resume authority.
@@ -121,6 +124,10 @@ impl App {
                     session_id: session_id()?,
                     cwd,
                     model: params.model,
+                    lineage: Some(Lineage {
+                        parent: lineage.as_ref().map(|l| l.parent_agent_id.clone()),
+                        depth: lineage.as_ref().map_or(0, |l| l.child_depth),
+                    }),
                 })
                 .map_err(|_| ErrorCode::AgentNameTaken)?;
             (id, generation)
@@ -146,7 +153,6 @@ impl App {
                     paused: self.fleet_pause.paused,
                     verb,
                 }),
-                lineage: lineage.map(|l| (l.parent_agent_id, l.child_depth.saturating_sub(1))),
             },
             move |record| {
                 let binary = std::env::split_paths(&path)

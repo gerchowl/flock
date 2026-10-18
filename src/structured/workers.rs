@@ -51,8 +51,6 @@ pub struct Launch {
     pub storage: super::blobs::StorageConfig,
     /// Caller-supplied sessions stall policy, with no guessed default.
     pub stall_after: Duration,
-    /// Optional authenticated delegation lineage.
-    pub lineage: Option<(String, u32)>,
     /// Agent-caller policy; None is the already-attested operator exemption.
     pub(crate) admission: Option<Admission>,
 }
@@ -78,7 +76,6 @@ struct Worker {
     finished: bool,
     events_closed: bool,
     stall_after: Duration,
-    lineage: Option<(String, u32)>,
     thread: Option<JoinHandle<()>>,
 }
 impl Worker {
@@ -167,7 +164,6 @@ impl Workers {
             mcp,
             storage,
             stall_after,
-            lineage,
             admission,
         } = launch;
         if let Some(previous) = self.entries.get_mut(&agent_id) {
@@ -182,17 +178,18 @@ impl Workers {
                 return Err(ErrorCode::SessionBusy);
             }
         }
-        // Resume retains the original admission ancestry, including operator roots.
-        let lineage = self
-            .entries
-            .get(&agent_id)
-            .map_or(lineage, |w| w.lineage.clone());
-        let retained_lineage = lineage.clone();
         let record = registry
             .get(&agent_id)
             .filter(|(_, _, g)| *g == current)
             .map(|(r, _, _)| r.clone())
             .ok_or(ErrorCode::AgentNotFound)?;
+        // The durable record is the sole lineage source, including after cold restore.
+        let lineage = record.lineage.as_ref().and_then(|lineage| {
+            lineage
+                .parent
+                .as_ref()
+                .map(|parent| (parent.clone(), lineage.depth.saturating_sub(1)))
+        });
         if registry
             .get(&agent_id)
             .is_some_and(|(_, p, _)| p.update.state.lifecycle == Lifecycle::Unknown)
@@ -337,7 +334,6 @@ impl Workers {
                 finished: false,
                 events_closed: false,
                 stall_after,
-                lineage: retained_lineage,
                 thread: Some(thread),
             },
         );

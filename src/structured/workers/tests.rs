@@ -63,6 +63,7 @@ impl Case {
                 session_id: session.clone(),
                 cwd,
                 model: Some("fixture-worker-model".into()),
+                lineage: None,
             })
             .unwrap();
         let leases = SessionLeases::default();
@@ -75,7 +76,6 @@ impl Case {
             mcp: fixture.mcp(),
             storage: Default::default(),
             stall_after: STALL,
-            lineage: None,
             admission: None,
         };
         let f = fixture.clone();
@@ -182,7 +182,6 @@ impl Case {
                 finished: false,
                 events_closed: false,
                 stall_after: STALL,
-                lineage: None,
                 thread: Some(std::thread::spawn(|| {})),
             },
         );
@@ -276,6 +275,19 @@ pub(crate) async fn wait(notify: &Arc<Notify>, mut condition: impl FnMut() -> bo
     })
     .await
     .expect("bounded worker condition never arrived");
+}
+/// Join the terminal producer before an immediate resume, without a scheduling race.
+pub(crate) async fn join_reported(workers: &mut Workers, id: &str, generation: u64) {
+    let worker = workers.entries.get_mut(id).unwrap();
+    assert_eq!(worker.generation, generation);
+    assert!(worker.report.is_some());
+    if let Some(thread) = worker.thread.take() {
+        tokio::time::timeout(LIMIT, tokio::task::spawn_blocking(move || thread.join()))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 }
 fn owner() -> (Registry, Workers, Arc<Notify>, Instant) {
     let notify = Arc::new(Notify::new());
@@ -643,7 +655,6 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
             finished: false,
             events_closed: false,
             stall_after: STALL,
-            lineage: None,
             thread: Some(std::thread::spawn(|| {})),
         },
     );
@@ -876,9 +887,18 @@ fn restored_unknown_refuses_before_profile_preparation_and_preserves_epoch() {
     assert!(!case.leases.is_reserved(&case.session).unwrap());
 }
 
+fn record_lineage(registry: &mut Registry, launch: &mut Launch, parent: &str, depth: u32) {
+    let mut record = registry
+        .remove(&launch.agent_id, launch.generation)
+        .unwrap();
+    record.lineage = Some(super::super::registry::Lineage {
+        parent: Some(parent.into()),
+        depth,
+    });
+    launch.generation = registry.register(record).unwrap();
+}
 fn limited_launch(mut launch: Launch, leases: &SessionLeases) -> Launch {
     launch.leases = leases.clone();
-    launch.lineage = Some(("fixture-parent".into(), 0));
     launch.admission = Some(Admission {
         config: crate::spawn::FleetConfig {
             max_concurrent_agents: 1,
@@ -900,7 +920,8 @@ fn limited_launch(mut launch: Launch, leases: &SessionLeases) -> Launch {
 async fn owner_pending_reservation_blocks_concurrent_start_and_failure_frees_it() {
     let (mut registry, mut workers, notify, now) = owner();
     let leases = SessionLeases::default();
-    let (first, launch, _) = Case::prepare(&mut registry, 120, "state-reducer", vec![]);
+    let (first, mut launch, _) = Case::prepare(&mut registry, 120, "state-reducer", vec![]);
+    record_lineage(&mut registry, &mut launch, "fixture-parent", 1);
     let (release, barrier) = mpsc::channel();
     workers.before_reserve = Some(barrier);
     let generation = workers
@@ -916,7 +937,8 @@ async fn owner_pending_reservation_blocks_concurrent_start_and_failure_frees_it(
         Ok((1, 1)),
         "a clock cannot release pending admission"
     );
-    let (_, second, _) = Case::prepare(&mut registry, 121, "state-reducer", vec![]);
+    let (_, mut second, _) = Case::prepare(&mut registry, 121, "state-reducer", vec![]);
+    record_lineage(&mut registry, &mut second, "fixture-parent", 1);
     let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed = prepared.clone();
     let refused = workers.start(&mut registry, limited_launch(second, &leases), move |_| {
@@ -939,7 +961,8 @@ async fn owner_pending_reservation_blocks_concurrent_start_and_failure_frees_it(
         "failed preparation releases reservation"
     );
     cleanup.unwrap();
-    let (_, third, _) = Case::prepare(&mut registry, 122, "state-reducer", vec![]);
+    let (_, mut third, _) = Case::prepare(&mut registry, 122, "state-reducer", vec![]);
+    record_lineage(&mut registry, &mut third, "fixture-parent", 1);
     workers
         .start(&mut registry, limited_launch(third, &leases), |_| {
             Err(io::Error::other("fixture preparation failure").into())
@@ -971,7 +994,8 @@ fn owner_counts_deduplicate_pending_and_leased_identity() {
 async fn owner_failed_lease_acquisition_releases_pending_reservation() {
     let (mut registry, mut workers, notify, _) = owner();
     let leases = SessionLeases::default();
-    let (case, launch, _) = Case::prepare(&mut registry, 124, "state-reducer", vec![]);
+    let (case, mut launch, _) = Case::prepare(&mut registry, 124, "state-reducer", vec![]);
+    record_lineage(&mut registry, &mut launch, "fixture-parent", 1);
     let existing = leases
         .reserve("other-fixture-agent", &case.session, None)
         .unwrap();
@@ -996,7 +1020,8 @@ async fn owner_failed_lease_acquisition_releases_pending_reservation() {
 async fn owner_lease_acquisition_retires_pending_without_double_counting() {
     let (mut registry, mut workers, notify, _) = owner();
     let leases = SessionLeases::default();
-    let (case, launch, _) = Case::prepare(&mut registry, 125, "state-reducer", vec![]);
+    let (case, mut launch, _) = Case::prepare(&mut registry, 125, "state-reducer", vec![]);
+    record_lineage(&mut registry, &mut launch, "fixture-parent", 1);
     let (entered, seen) = mpsc::sync_channel(1);
     let (release, barrier) = mpsc::sync_channel(1);
     let generation = workers
@@ -1089,7 +1114,7 @@ async fn registry_worker_launch_uses_configured_blob_threshold() {
 async fn operator_resume_preserves_original_lease_lineage() {
     let (mut registry, mut workers, notify, now) = owner();
     let (case, mut launch, _) = Case::prepare(&mut registry, 1734, "state-reducer", vec![]);
-    launch.lineage = Some(("original-parent".into(), 2));
+    record_lineage(&mut registry, &mut launch, "original-parent", 3);
     let template = Launch {
         opening_turn: None,
         agent_id: case.id.clone(),
@@ -1099,7 +1124,6 @@ async fn operator_resume_preserves_original_lease_lineage() {
         mcp: case.fixture.mcp(),
         storage: Default::default(),
         stall_after: STALL,
-        lineage: None,
         admission: None,
     };
     let generation = workers
@@ -1121,7 +1145,6 @@ async fn operator_resume_preserves_original_lease_lineage() {
     .await;
     let mut resume = template;
     resume.generation = generation;
-    resume.lineage = None;
     let leases = case.leases.clone();
     let (seen, observed) = mpsc::channel();
     let generation = workers

@@ -1064,7 +1064,7 @@ MCP structured spawn requires a fresh name/identity and accepts only `agent: "cl
 `workspace_id`. No raw binary, argv, profile, lease credential or MCP endpoint is
 accepted as launch authority. Explicit question policies, focus and new-branch
 placement and `unattended: true` are refused for structured starts. The name
-`self` is reserved and cannot be used for a fresh structured identity. Stdio permission decisions and
+`self` is reserved on both `agent.start` and `agent.spawn`. Stdio permission decisions and
 richer question routing remain ADR-0036 S6 work (#1307).
 
 The server attests the caller and enforces spawn opt-in, pause, depth, fanout and

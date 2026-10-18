@@ -11,6 +11,7 @@ fn record(id: &str) -> Record {
         session_id: format!("session-{id}"),
         cwd: std::env::temp_dir().join("registry-fixture"),
         model: Some("fixture-model".into()),
+        lineage: None,
     }
 }
 fn send(registry: &mut Registry, id: &str, generation: u64, event: &SessionEvent, now: Instant) {
@@ -364,4 +365,36 @@ fn fresh_launch_resets_observations_and_fences_the_previous_generation() {
         registry.begin_launch(id, old),
         Err(RegistryError::StaleGeneration)
     ));
+}
+
+/// Old metadata stays unknown rather than inventing a parent; malformed ancestry
+/// stays inactive and raw beside supported entries (ADR-0028 §3a).
+#[test]
+fn legacy_and_invalid_lineage_load_leniently_without_losing_raw_entries() {
+    let legacy = serde_json::to_value(record("legacy")).unwrap();
+    assert!(legacy.get("lineage").is_none());
+    let mut invalid = serde_json::to_value(record("invalid")).unwrap();
+    invalid["lineage"] = serde_json::json!({"parent":null,"depth":2});
+    let raw = serde_json::json!([legacy, invalid]);
+    let registry: Registry = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(registry.get("legacy").unwrap().0.lineage, None);
+    assert!(registry.get("invalid").is_none());
+    assert_eq!(registry.retained_count(), 1);
+    assert_eq!(serde_json::to_value(registry).unwrap(), raw);
+}
+
+#[test]
+fn known_lineage_survives_snapshot_and_cold_restore() {
+    for parent in [None, Some("original-parent".to_owned())] {
+        let mut record = record("child");
+        record.lineage = Some(Lineage {
+            depth: if parent.is_some() { 3 } else { 0 },
+            parent,
+        });
+        let mut registry = Registry::default();
+        registry.register(record.clone()).unwrap();
+        let restored: Registry =
+            serde_json::from_value(serde_json::to_value(registry.snapshot()).unwrap()).unwrap();
+        assert_eq!(restored.get("child").unwrap().0, &record);
+    }
 }

@@ -64,7 +64,7 @@ max_spawn_fanout = {fanout}
         configure(operator=scenario != "default", enabled=scenario != "disabled",
                   capacity=1 if scenario == "capacity" else 8,
                   depth=0 if scenario == "depth" else 2,
-                  fanout=1 if scenario == "fanout" else 2)
+                  fanout=1 if scenario in ("fanout", "restart") else 2)
         def cli(*args, code=0):
             result = subprocess.run([binary, "--json", *args], env=env, cwd=root / "project",
                                     capture_output=True, text=True, timeout=15)
@@ -87,19 +87,29 @@ max_spawn_fanout = {fanout}
                     return agent
                 assert agent["lifecycle"] in ("live", "cold"), agent
                 assert server.poll() is None and time.monotonic() < deadline, (wanted, agent)
-        server = subprocess.Popen([binary, "server"], env=env, cwd=root / "project",
-                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        def start_server():
+            owned = subprocess.Popen([binary, "server"], env=env, cwd=root / "project",
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            try:
+                deadline = time.monotonic() + 15
+                output = b""
+                while b"client socket:" not in output:
+                    assert owned.poll() is None, output.decode(errors="replace")
+                    remaining = deadline - time.monotonic()
+                    assert remaining > 0 and select.select([owned.stdout], [], [], remaining)[0], "server readiness missing"
+                    block = os.read(owned.stdout.fileno(), 65536)
+                    assert block, output.decode(errors="replace")
+                    output += block
+                return owned
+            except BaseException:
+                if owned.poll() is None:
+                    owned.kill()
+                owned.wait(timeout=5)
+                owned.stdout.close()
+                raise
+        server = start_server()
         channel = None
         try:
-            deadline = time.monotonic() + 15
-            output = b""
-            while b"client socket:" not in output:
-                assert server.poll() is None, output.decode(errors="replace")
-                remaining = deadline - time.monotonic()
-                assert remaining > 0 and select.select([server.stdout], [], [], remaining)[0], "server readiness missing"
-                block = os.read(server.stdout.fileno(), 65536)
-                assert block, output.decode(errors="replace")
-                output += block
             start = ["agent", "start", "dogfood-parent", "--runtime", "structured", "--model", "dogfood-parent", "--cwd", str(root / "project"), "--", "claude"]
             if scenario == "default":
                 refused = cli(*start, code=1)
@@ -203,6 +213,47 @@ max_spawn_fanout = {fanout}
             cli("agent", "stop", parent_id)
             cli("server", "stop")
             assert server.wait(timeout=15) == 0
+            if scenario == "restart":
+                # Inspect the real atomic snapshot, then cold-start a new server
+                # using the same sandbox and exercise its resumed lease census.
+                snapshots = list((root / "x").rglob("session.json"))
+                assert len(snapshots) == 1, snapshots
+                def lineage():
+                    records = json.loads(snapshots[0].read_text())["structured_agents"]
+                    return {record["agent_id"]: record["lineage"] for record in records}
+                original = {parent_id:{"parent":None,"depth":0},
+                            child_id:{"parent":parent_id,"depth":1}}
+                assert lineage() == original, lineage()
+                server.stdout.close()
+                # The stopped fake parent owns this old control endpoint.
+                (root / "control").unlink()
+                server = start_server()
+                restored = cli("agent", "list")["result"]["structured_agents"]
+                assert {agent["agent_id"] for agent in restored} == {parent_id, child_id}
+                assert all(agent["lifecycle"] == "offline" for agent in restored)
+                cli("agent", "start", "dogfood-parent", "--runtime", "structured", "--", "claude")
+                assert select.select([ready], [], [], 10)[0], "restarted parent readiness missing"
+                assert os.read(ready, 1) == b"R"
+                control = socket.socket(socket.AF_UNIX)
+                control.settimeout(15)
+                control.connect(str(root / "control"))
+                channel = control.makefile("rwb", buffering=0)
+                mcp("initialize", {})
+                resumed = cli("agent", "start", "dogfood-child", "--runtime", "structured", "--", "claude")["result"]["agent"]
+                assert resumed["session_id"] == child["session_id"]
+                assert select.select([resume_ready], [], [], 10)[0], "cold resume readiness missing"
+                assert os.read(resume_ready, 1) == b"R"
+                assert tool("flock_agent_start", extra)["error"]["data"]["refusal"] == "at_fanout_limit"
+                cli("agent", "stop", child_id)
+                observe(child_id, "offline")
+                control.sendall(b'"close"\n')
+                channel.close()
+                channel = None
+                control.close()
+                cli("agent", "stop", parent_id)
+                cli("server", "stop")
+                assert server.wait(timeout=15) == 0
+                assert lineage() == original, lineage()
             return {"scenario":scenario,"status":"passed", "public_cli":True,"real_mcp":True,
                     "scoped_identity":True,"framed_opening_turn":True,"isolated_home":True}
         finally:
@@ -224,8 +275,11 @@ max_spawn_fanout = {fanout}
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--flk", required=True)
-    binary = str(Path(parser.parse_args().flk).resolve())
-    proofs = [run(binary, scenario) for scenario in ("default", "disabled", "depth", "capacity", "fanout")]
+    parser.add_argument("--scenario", choices=("default", "disabled", "depth", "capacity", "fanout", "restart"))
+    # Parse once after all arguments have been declared.
+    args = parser.parse_args()
+    binary = str(Path(args.flk).resolve())
+    proofs = [run(binary, scenario) for scenario in ([args.scenario] if args.scenario else ("default", "disabled", "depth", "capacity", "fanout", "restart"))]
     assert all(proof["status"] == "passed" for proof in proofs)
     print(json.dumps({"status":"passed", "scenarios":proofs, "real_mcp":True,
                       "framed_opening_turn":True,"spawn_policy_lineage_capacity_fanout":True}))

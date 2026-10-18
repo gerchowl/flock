@@ -41,6 +41,19 @@ pub struct Record {
     pub cwd: PathBuf,
     /// Requested model, absent when the provider selects its default.
     pub model: Option<String>,
+    /// Admission ancestry. Missing legacy metadata is unknown, resumed as a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Lineage>,
+}
+
+/// Persisted admission ancestry, independent of a process or lease generation.
+/// A root has no parent and depth zero. A child stores its own depth, not its parent's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lineage {
+    /// Original parent identity, absent only for a root.
+    pub parent: Option<String>,
+    /// Original distance from the admission root.
+    pub depth: u32,
 }
 
 /// The only runtime represented by a pane-free registry record.
@@ -150,6 +163,15 @@ impl Registry {
 
     fn register_raw(&mut self, record: Record, raw: Value) -> Result<u64, RegistryError> {
         if self.unparsed.is_some()
+            || record
+                .lineage
+                .as_ref()
+                .is_some_and(|lineage| match &lineage.parent {
+                    None => lineage.depth != 0,
+                    Some(parent) => {
+                        parent.is_empty() || parent == &record.agent_id || lineage.depth == 0
+                    }
+                })
             || record.agent_id.is_empty()
             || record.session_id.is_empty()
             || record.harness != "claude"

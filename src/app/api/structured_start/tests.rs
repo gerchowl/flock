@@ -702,3 +702,229 @@ fn endpoint_warning_has_a_closed_path_free_reason() {
         assert!(log["fields"].get("path").is_none());
     }
 }
+
+/// Resume travels through App admission and a real socket, retaining the child's
+/// admitted ancestry rather than taking the operator's root exemption.
+#[tokio::test]
+async fn app_operator_resume_preserves_record_and_lease_lineage() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    fixture.app.state.config.fleet.agent_spawn_enabled = true;
+    fixture.app.state.config.fleet.max_spawn_depth = 4;
+    let params = serde_json::from_value(json!({"name":"lineage-child", "runtime":"structured", "argv":["claude"], "cwd":fixture.fixture.root.path().join("project"), "model":"fixture-worker-model"})).unwrap();
+    fixture
+        .app
+        .start_structured(
+            params,
+            &SpawnCaller::Structured {
+                agent_id: Some("original-parent".into()),
+                depth: 2,
+            },
+        )
+        .unwrap();
+    let record = fixture.app.state.structured_agents.records().pop().unwrap();
+    assert_eq!(
+        record.lineage,
+        Some(crate::structured::registry::Lineage {
+            parent: Some("original-parent".into()),
+            depth: 3
+        })
+    );
+    let id = record.agent_id.clone();
+    let generation = fixture.app.state.structured_agents.get(&id).unwrap().2;
+    let notify = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        assert!(
+            fixture
+                .app
+                .structured_workers
+                .report(&id, generation)
+                .is_none(),
+            "launch failed"
+        );
+        fixture
+            .app
+            .structured_workers
+            .runtime(&id, generation)
+            .is_some()
+            && fixture.fixture.root.path().join("validated").is_file()
+    })
+    .await;
+    let stopped = fixture
+        .request(Method::AgentStop(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert!(stopped.get("error").is_none(), "{stopped}");
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        fixture
+            .app
+            .structured_workers
+            .report(&id, generation)
+            .is_some()
+    })
+    .await;
+    crate::structured::workers::tests::join_reported(
+        &mut fixture.app.structured_workers,
+        &id,
+        generation,
+    )
+    .await;
+    for name in ["model.pid", "validated"] {
+        fs::remove_file(fixture.fixture.root.path().join(name)).unwrap();
+    }
+    let resume = serde_json::from_value(
+        json!({"name":"lineage-child", "runtime":"structured", "argv":["claude"]}),
+    )
+    .unwrap();
+    let resumed = fixture.request(Method::AgentStart(resume)).await;
+    assert_eq!(resumed["result"]["agent"]["agent_id"], id, "{resumed}");
+    let generation = fixture.app.state.structured_agents.get(&id).unwrap().2;
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        assert!(
+            fixture
+                .app
+                .structured_workers
+                .report(&id, generation)
+                .is_none(),
+            "resume failed"
+        );
+        fixture
+            .app
+            .structured_workers
+            .runtime(&id, generation)
+            .is_some()
+            && fixture.fixture.root.path().join("validated").is_file()
+    })
+    .await;
+    assert_eq!(
+        fixture.app.state.structured_agents.get(&id).unwrap().0,
+        &record
+    );
+    let pid = fs::read_to_string(fixture.fixture.root.path().join("model.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        fixture.app.session_leases.caller(Some(pid)),
+        crate::structured::lease::Caller::Agent {
+            agent: id.clone(),
+            depth: 3
+        }
+    );
+    assert_eq!(
+        fixture
+            .app
+            .session_leases
+            .admitted_identities()
+            .unwrap()
+            .get(&id),
+        Some(&Some("original-parent".into()))
+    );
+}
+
+#[tokio::test]
+async fn socket_agent_start_reserves_self_before_any_launch_effect() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    let params = serde_json::from_value(json!({"name":"self", "runtime":"structured", "argv":["claude"], "cwd":fixture.fixture.root.path().join("project")})).unwrap();
+    let response = fixture.request(Method::AgentStart(params)).await;
+    assert_eq!(
+        response["error"]["code"], "invalid_agent_name",
+        "{response}"
+    );
+    assert!(fixture.app.state.structured_agents.records().is_empty());
+    assert!(!fixture.fixture.root.path().join("version.pid").exists());
+}
+
+/// Legacy identity metadata is accepted leniently and only the operator explicitly
+/// starts its root lease, without guessing a historical parent.
+#[tokio::test]
+async fn legacy_unknown_lineage_operator_resume_is_a_root() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    let old = json!([{"runtime":"structured", "agent_id":"legacy-structured", "name":"legacy", "harness":"claude", "session_id":"00000000-0000-4000-8000-000000002055", "cwd":fixture.fixture.root.path().join("project"), "model":"fixture-worker-model"}]);
+    fixture.app.state.structured_agents = serde_json::from_value(old).unwrap();
+    assert!(fixture
+        .app
+        .state
+        .structured_agents
+        .get("legacy-structured")
+        .unwrap()
+        .0
+        .lineage
+        .is_none());
+    let params =
+        serde_json::from_value(json!({"name":"legacy", "runtime":"structured", "argv":["claude"]}))
+            .unwrap();
+    let resumed = fixture.request(Method::AgentStart(params)).await;
+    assert_eq!(
+        resumed["result"]["agent"]["agent_id"], "legacy-structured",
+        "{resumed}"
+    );
+    let generation = fixture
+        .app
+        .state
+        .structured_agents
+        .get("legacy-structured")
+        .unwrap()
+        .2;
+    let notify = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        assert!(
+            fixture
+                .app
+                .structured_workers
+                .report("legacy-structured", generation)
+                .is_none(),
+            "legacy resume failed"
+        );
+        fixture
+            .app
+            .structured_workers
+            .runtime("legacy-structured", generation)
+            .is_some()
+            && fixture.fixture.root.path().join("validated").is_file()
+    })
+    .await;
+    let pid = fs::read_to_string(fixture.fixture.root.path().join("model.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        fixture.app.session_leases.caller(Some(pid)),
+        crate::structured::lease::Caller::Agent {
+            agent: "legacy-structured".into(),
+            depth: 0
+        }
+    );
+    assert_eq!(
+        fixture
+            .app
+            .session_leases
+            .admitted_identities()
+            .unwrap()
+            .get("legacy-structured"),
+        Some(&None)
+    );
+}
