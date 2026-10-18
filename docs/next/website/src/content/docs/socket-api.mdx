@@ -284,6 +284,13 @@ allowance. Remote blocking accounting uses the existing unattested bucket.
 Signature, `allow_from`, native-recipient and
 reply-capability checks run before admission and again on recovery.
 
+Sender `from_host` metadata uses the authoritative origin-name mapping, preferring
+a configured alias over an authenticated inbound name. An unmapped origin has no
+host value: the node-asserted producer carries the claimed sender and signing
+node id in their own fields. A failed name lookup during commitment recovery is
+logged and leaves the host absent, without undoing proven delivery. Display names
+do not grant local agent authority.
+
 A direct `mesh.deliver` acknowledgement for a structured recipient waits for
 queue commit and carries `item_id`; the originating send preserves that ID.
 Background collection acknowledges durable custody independently of queue

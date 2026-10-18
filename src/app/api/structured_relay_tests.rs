@@ -511,7 +511,7 @@ fn relay_queue_reply_routes_by_verified_custody_origin_not_claimed_host() {
                 .unwrap()
                 .from_host
                 .as_deref(),
-            Some(d.envelope.key.origin_node.as_str())
+            None
         );
         r.app.inbound = Default::default();
         let (tx, rx) = mpsc::channel();
@@ -534,6 +534,14 @@ fn relay_queue_reply_routes_by_verified_custody_origin_not_claimed_host() {
             });
         let response = answer(&mut r, &rx).await;
         assert_eq!(response["result"]["state"], "held", "{response}");
+        assert!(
+            !response["result"]["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|warning| warning == "reply_held_for_waiter"),
+            "a remote return path must not be classified as waiting for a local reader: {response}"
+        );
         let keys =
             with_store(|s| s.by_request_key(&d.envelope.key).map_err(|e| e.to_string())).unwrap();
         assert_eq!(keys.len(), 1);
@@ -2053,6 +2061,69 @@ fn relay_origin_presentation_positive_proof_recovery_resolves_name() {
             Some("configured.example")
         );
         r.until(|r| !r.inputs().is_empty()).await;
+        r.stop().await;
+    });
+}
+
+#[test]
+fn relay_origin_presentation_lookup_failure_cannot_revoke_proven_delivery() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2555).await;
+        let d = mail(&r);
+        pin_relay_origin();
+        with_store(|s| {
+            let session = &r
+                .app
+                .state
+                .structured_agents
+                .get(&r.case.id)
+                .unwrap()
+                .0
+                .session_id;
+            s.accept_bound_delivery(
+                &d,
+                (&r.case.id, session),
+                false,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let (ticket, ack) = r.app.admit_queue_custody(&d.envelope).unwrap();
+        r.until(|_| ticket.committed.try_recv().is_ok_and(|x| x.is_ok()))
+            .await;
+        let connection =
+            rusqlite::Connection::open(with_store(|s| Ok(s.path().to_owned())).unwrap()).unwrap();
+        connection
+            .execute_batch("DROP TABLE identity_pins")
+            .unwrap();
+        drop(ack);
+        r.app.retry_queue_custody(
+            d.envelope.clone(),
+            crate::api::error_code::ErrorCode::InputWriteUnknown,
+        );
+        assert_eq!(
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state,
+            "delivered"
+        );
+        let meta = r
+            .app
+            .mailboxes
+            .reply_meta(&d.envelope.correlation_id)
+            .unwrap();
+        assert_eq!(
+            meta.from_host, None,
+            "an unavailable name must not become an id or an untrusted host claim"
+        );
+        assert_eq!(
+            meta.message_key.as_ref().unwrap().origin_node,
+            d.envelope.key.origin_node
+        );
+        r.until(|r| r.inputs().len() == 1).await;
         r.stop().await;
     });
 }

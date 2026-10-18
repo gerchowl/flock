@@ -940,6 +940,13 @@ same queue (owner decision 5): there is no second input path.
   and ADR-0019; custody and the authenticated origin stay as ADR-0026
   defines them). Relayed sends and replies use a typed
   `node_asserted { sender, origin }` producer: "sender as asserted by node origin".
+  Display metadata `from_host` uses the authoritative node-id/name mapping,
+  preferring the configured alias to the authenticated inbound name, as legacy
+  custody does. It is absent for an unmapped origin; the existing node-asserted
+  header retains the claimed sender and signing node id as explicit attribution,
+  never a bare node id posing as a host. A recovery-time name lookup failure is
+  logged with its registered code and leaves the host absent; it cannot revoke
+  proven delivery. Name presentation grants no local sender authority.
   The origin is the verified signing node, independent of the forwarding hop;
   its sender assertion is attribution only, as strong as that node's sender
   policy. It may have been a permitted caller claim on the originating node.

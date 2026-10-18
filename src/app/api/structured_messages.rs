@@ -33,7 +33,6 @@ impl Ack {
     fn custody(signed: &Envelope, mut message: PendingMessage, remote: bool) -> Self {
         if remote {
             message.from_pane = None;
-            message.from_host = Some(signed.key.origin_node.clone());
             message.to_pane = signed.target_agent.clone();
         }
         message.message_key = Some(signed.key.clone());
@@ -208,6 +207,8 @@ impl App {
             encode_error(id, code.as_str(), "local structured message refused")
         })
     }
+    /// Verify signature and native binding, resolving display names from pins.
+    /// An unmapped remote origin retains explicit node-asserted attribution.
     pub(super) fn verified_queue_custody(
         &self,
         signed: &Envelope,
@@ -231,7 +232,7 @@ impl App {
             Some(_) => (),
         }
         let remote = signed.key.origin_node != origin;
-        if remote {
+        let origin_name = if remote {
             if let Some(request) = &signed.request_key {
                 self.verified_mesh_answer(request, signed)
                     .map_err(|_| ErrorCode::NotAuthorized)?;
@@ -240,15 +241,22 @@ impl App {
             if !self.state.config.msg.accepts_origin(name.as_deref()) {
                 return Err(ErrorCode::MsgNotAllowed);
             }
-        } else if record.session_id != signed.target_session {
-            return Err(ErrorCode::RecipientGone);
-        }
-        let data = payload(signed).map_err(|_| ErrorCode::InvalidEnvelope)?;
+            name
+        } else {
+            if record.session_id != signed.target_session {
+                return Err(ErrorCode::RecipientGone);
+            }
+            None
+        };
+        let mut data = payload(signed).map_err(|_| ErrorCode::InvalidEnvelope)?;
         if data.message.from_agent.as_deref().unwrap_or_default() != signed.sender
             || data.message.correlation_id != signed.correlation_id
             || data.message.in_reply_to != signed.in_reply_to
         {
             return Err(ErrorCode::InvalidEnvelope);
+        }
+        if remote {
+            data.message.from_host = origin_name;
         }
         Ok((generation, data))
     }
@@ -495,8 +503,23 @@ impl App {
             // Proof settles even a payload-less expiry. Post-commit accounting
             // can use retained reply material, but never reconstructs deleted data.
             if let Some(ack) = self.node_id.as_deref().and_then(|origin| {
-                payload(&signed).ok().map(|data| {
-                    Ack::custody(&signed, data.message, signed.key.origin_node != origin)
+                payload(&signed).ok().map(|mut data| {
+                    let remote = signed.key.origin_node != origin;
+                    if remote {
+                        // Display lookup cannot revoke a proven commitment.
+                        data.message.from_host =
+                            match stored(|s| s.origin_name(&signed.key.origin_node)) {
+                                Ok(name) => name,
+                                Err(code) => {
+                                    crate::logging::mesh_custody_failed(
+                                        "structured-origin-name",
+                                        code.as_str(),
+                                    );
+                                    None
+                                }
+                            };
+                    }
+                    Ack::custody(&signed, data.message, remote)
                 })
             }) {
                 self.record_queue_delivery(ack, false);
