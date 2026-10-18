@@ -13,6 +13,8 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use crate::api::error_code::ErrorCode;
+use crate::checksum::AssetRef;
 use crate::process::TracedCommand;
 use std::time::{Duration, Instant};
 
@@ -141,46 +143,6 @@ impl UpdateChannel {
         match self {
             Self::Stable => "stable",
             Self::Preview => "preview",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct AssetRef {
-    url: String,
-    sha256: Option<String>,
-}
-
-impl<'de> Deserialize<'de> for AssetRef {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        match value {
-            serde_json::Value::String(url) if !url.trim().is_empty() => Ok(Self {
-                url: url.trim().to_string(),
-                sha256: None,
-            }),
-            serde_json::Value::Object(mut object) => {
-                let url = object
-                    .remove("url")
-                    .and_then(|value| value.as_str().map(str::to_string))
-                    .ok_or_else(|| serde::de::Error::custom("asset object is missing url"))?;
-                let sha256 = object
-                    .remove("sha256")
-                    .and_then(|value| value.as_str().map(str::to_string));
-                if url.trim().is_empty() {
-                    return Err(serde::de::Error::custom("asset url must not be empty"));
-                }
-                Ok(Self {
-                    url: url.trim().to_string(),
-                    sha256: sha256.filter(|value| !value.trim().is_empty()),
-                })
-            }
-            _ => Err(serde::de::Error::custom(
-                "asset must be a URL string or object with url",
-            )),
         }
     }
 }
@@ -557,6 +519,49 @@ fn check_homebrew_latest() -> Result<Option<Version>, String> {
 // Download + install
 // ---------------------------------------------------------------------------
 
+/// Preserve a checksum refusal through the updater's CLI boundary (ADR-0029).
+#[derive(Debug)]
+pub(crate) enum UpdateError {
+    /// A declared checksum is malformed or differs from the downloaded bytes.
+    Checksum(String),
+    /// Existing updater failures retain their original diagnostics and exit.
+    Other(String),
+}
+
+impl UpdateError {
+    pub(crate) fn code(&self) -> Option<ErrorCode> {
+        matches!(self, Self::Checksum(_)).then_some(ErrorCode::ChecksumMismatch)
+    }
+    pub(crate) fn exit(&self) -> i32 {
+        self.code()
+            .map_or(crate::cli::exit::FAILURE, ErrorCode::exit)
+    }
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Checksum(message) | Self::Other(message) => message,
+        }
+    }
+}
+impl From<String> for UpdateError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+impl From<&str> for UpdateError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.into())
+    }
+}
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(code) = self.code() {
+            write!(f, "{code}: ")?;
+        }
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for UpdateError {}
+
 struct DownloadedUpdate {
     current_exe: PathBuf,
     tmp_path: Option<PathBuf>,
@@ -571,7 +576,7 @@ impl Drop for DownloadedUpdate {
 }
 
 /// Download a release to a prepared executable temp file without touching the running server.
-fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
+fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, UpdateError> {
     let current_exe = env::current_exe().map_err(|e| format!("can't find current binary: {e}"))?;
 
     let parent = current_exe.parent().ok_or("can't find binary directory")?;
@@ -584,7 +589,8 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
             "install directory not writable: {} ({}). Try running with appropriate permissions.",
             parent.display(),
             e
-        ));
+        )
+        .into());
     }
     let _ = fs::remove_file(&test_path);
 
@@ -606,13 +612,16 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         return Err("download failed".into());
     }
 
+    if let Err(e) = crate::checksum::verify_asset(&tmp_path, release.sha256.as_deref()) {
+        let _ = fs::remove_file(&tmp_path);
+        let message = format!("downloaded update checksum verification failed: {e}");
+        return Err(if e.kind() == io::ErrorKind::InvalidData {
+            UpdateError::Checksum(message)
+        } else {
+            UpdateError::Other(message)
+        });
+    }
     if let Some(expected) = &release.sha256 {
-        if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!(
-                "downloaded update checksum verification failed: {e}"
-            ));
-        }
         crate::logging::update_checksum_verified(expected);
     }
 
@@ -622,7 +631,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755)) {
             let _ = fs::remove_file(&tmp_path);
-            return Err(format!("chmod failed: {e}"));
+            return Err(format!("chmod failed: {e}").into());
         }
     }
 
@@ -1915,7 +1924,7 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
     clippy::print_stderr,
     reason = "user-facing progress on the controlling terminal during self-update — download / install / already-up-to-date lines belong on the operator's stderr"
 )]
-pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+pub(crate) fn self_update(options: SelfUpdateOptions) -> Result<Version, UpdateError> {
     let channel = UpdateChannel::configured();
     if is_homebrew_managed_install() {
         if channel == UpdateChannel::Preview {
@@ -1925,7 +1934,8 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         }
         return Err(format!(
             "self-update is disabled for Homebrew installs; run `{HOMEBREW_UPDATE_COMMAND}`"
-        ));
+        )
+        .into());
     }
 
     if is_mise_managed_install() {
@@ -1936,7 +1946,8 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         }
         return Err(format!(
             "self-update is disabled for mise installs; run `{MISE_UPDATE_COMMAND}`"
-        ));
+        )
+        .into());
     }
 
     if is_nix_managed_install() {
@@ -3363,6 +3374,52 @@ mod tests {
     }
 
     #[test]
+    fn stable_asset_shapes_and_checksum_mismatch_refuse_corrupt_download() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = env_lock().lock().unwrap();
+        let fixture = crate::test_support::TempDir::socket();
+        let curl = fixture.path().join("curl");
+        fs::write(&curl, b"#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\nif [ \"$1\" = -o ]; then shift; printf corrupt > \"$1\"; exit 0; fi\nshift\ndone\nexit 1\n").unwrap();
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+        let (os, arch) = platform_target();
+        let url = format!("{RELEASE_ASSET_URL_PREFIX}v99.0.0/flock-fixture");
+        for asset in [
+            serde_json::json!(&url),
+            serde_json::json!({"url":url, "sha256":"a".repeat(64)}),
+        ] {
+            let manifest: UpdateManifest = serde_json::from_value(serde_json::json!({
+                "version":"99.0.0", "notes":"fixture", "assets":{format!("{os}-{arch}"): asset.clone()}
+            })).unwrap();
+            let release = release_info_from_manifest(&manifest).unwrap().unwrap();
+            if asset.is_string() {
+                assert!(release.sha256.is_none());
+            } else {
+                assert_eq!(release.sha256.as_deref(), Some("a".repeat(64).as_str()));
+                let prior = std::env::var_os("PATH");
+                // Nextest isolates this test process, and env_lock serializes its fixtures.
+                unsafe {
+                    std::env::set_var("PATH", fixture.path());
+                }
+                let result = download_update(&release);
+                unsafe {
+                    match prior {
+                        Some(path) => std::env::set_var("PATH", path),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("checksum mismatch must refuse"),
+                };
+                assert!(error.to_string().contains("sha256 mismatch"));
+                assert_eq!(error.code(), Some(ErrorCode::ChecksumMismatch));
+                assert_eq!(error.exit(), crate::cli::exit::REFUSED);
+                assert_eq!(ErrorCode::from_code("checksum_mismatch"), error.code());
+            }
+        }
+    }
+
+    #[test]
     fn preview_manifest_reports_update_when_build_id_differs() {
         let (os, arch) = platform_target();
         let asset_key = format!("{os}-{arch}");
@@ -3474,3 +3531,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod checksum_tests;

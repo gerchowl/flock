@@ -462,7 +462,7 @@ fn switch_failure_reason(err: &io::Error) -> String {
 fn main() {
     if let Err(error) = run() {
         eprintln!("Error: {error}");
-        std::process::exit(cli::exit::FAILURE);
+        std::process::exit(cli::io_error_exit(&error));
     }
 }
 
@@ -546,12 +546,12 @@ fn run() -> io::Result<()> {
         match update::self_update(options) {
             Ok(_) => return Ok(()),
             Err(e) => {
-                if e.starts_with("self-update is disabled") {
+                if e.message().starts_with("self-update is disabled") {
                     eprintln!("{e}");
                 } else {
                     eprintln!("update failed: {e}");
                 }
-                std::process::exit(cli::exit::FAILURE);
+                std::process::exit(e.exit());
             }
         }
     }
@@ -757,7 +757,7 @@ fn run() -> io::Result<()> {
     if let Some(remote_launch) = remote_launch {
         if let Err(err) = run_attach_legs(AttachLeg::Remote(remote_launch)) {
             report_attach_chain_error(&err);
-            std::process::exit(cli::exit::FAILURE);
+            std::process::exit(cli::io_error_exit(&err));
         }
         return Ok(());
     }
@@ -771,7 +771,7 @@ fn run() -> io::Result<()> {
     if !no_session {
         if let Err(err) = run_attach_legs(AttachLeg::Local) {
             report_attach_chain_error(&err);
-            std::process::exit(cli::exit::FAILURE);
+            std::process::exit(cli::io_error_exit(&err));
         }
         return Ok(());
     }

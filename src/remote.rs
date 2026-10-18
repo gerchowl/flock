@@ -7,6 +7,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
+use crate::api::error_code::ErrorCode;
+use crate::checksum::AssetRef as RemoteAssetRef;
 use crate::process::TracedCommand;
 
 use serde::Deserialize;
@@ -16,6 +18,11 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// Private install-script signals, never returned directly as CLI statuses.
+/// Ordinary shell/tool errors (including 2, 126, 127) retain their stderr.
+const INSTALL_TRANSFER_MISMATCH: i32 = 30;
+const INSTALL_CHECKSUM_TOOL_MISSING: i32 = 31;
 
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
@@ -528,31 +535,6 @@ impl RemoteFlock {
     fn with_shell_path(mut self, shell_path: String) -> Self {
         self.shell_path = shell_path;
         self
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum RemoteAssetRef {
-    Url(String),
-    Object { url: String, sha256: Option<String> },
-}
-
-impl RemoteAssetRef {
-    fn url(&self) -> &str {
-        match self {
-            Self::Url(url) => url,
-            Self::Object { url, .. } => url,
-        }
-    }
-
-    fn sha256(&self) -> Option<&str> {
-        match self {
-            Self::Url(_) => None,
-            Self::Object { sha256, .. } => {
-                sha256.as_deref().filter(|value| !value.trim().is_empty())
-            }
-        }
     }
 }
 
@@ -1455,14 +1437,12 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
         let _ = fs::remove_dir_all(&dir);
         return Err(io::Error::other("download failed"));
     }
-    if let Some(expected) = &asset.sha256 {
-        if let Err(err) = crate::checksum::verify_sha256(&path, expected) {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(io::Error::new(
-                err.kind(),
-                format!("downloaded remote asset checksum verification failed: {err}"),
-            ));
-        }
+    if let Err(err) = crate::checksum::verify_asset(&path, asset.sha256.as_deref()) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(io::Error::new(
+            err.kind(),
+            format!("downloaded remote asset checksum verification failed: {err}"),
+        ));
     }
 
     Ok(InstallSource::temporary(path, dir))
@@ -1641,19 +1621,11 @@ fn install_remote_flock(
         &source_path.display().to_string(),
         &remote_flock.shell_path,
     );
-    let script = format!(
-        r#"dest="$HOME/{install_suffix}"
-dir="${{dest%/*}}"
-mkdir -p "$dir"
-tmp="${{dest}}.tmp.$$"
-cat > "$tmp"
-chmod 755 "$tmp"
-mv "$tmp" "$dest"
-"#,
-        install_suffix = remote_flock.install_suffix
-    );
+    let mut source = File::open(source_path)?;
+    let expected = crate::checksum::file_sha256(&mut source)?;
+    let script = remote_install_script(remote_flock, &expected);
 
-    let mut child = TracedCommand::new("ssh", "remote")
+    let child = TracedCommand::new("ssh", "remote")
         .args(control_plane_jump_args(target)?)
         .arg("-T")
         .arg("-C")
@@ -1667,7 +1639,23 @@ mv "$tmp" "$dest"
         .spawn_traced()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh install: {err}")))?;
 
-    let mut source = File::open(source_path)?;
+    if let Err(error) = finish_remote_upload(child, &mut source) {
+        crate::logging::remote_install_failed(target, &remote_flock.shell_path, &error.to_string());
+        return Err(error);
+    }
+    crate::logging::remote_install_completed(target, &remote_flock.shell_path);
+    Ok(())
+}
+
+/// Reap the upload process and preserve the originating transfer failure.
+fn finish_remote_upload(
+    mut child: std::process::Child,
+    source: &mut impl io::Read,
+) -> io::Result<()> {
+    let mut source = UploadReader {
+        inner: source,
+        read_failed: false,
+    };
     let copy_result = if let Some(mut stdin) = child.stdin.take() {
         io::copy(&mut source, &mut stdin).map(|_| ())
     } else {
@@ -1676,21 +1664,82 @@ mv "$tmp" "$dest"
             "ssh install stdin missing",
         ))
     };
-    let output = child.wait_with_output()?;
-    let status = output.status;
-    copy_result?;
-
-    if status.success() {
-        crate::logging::remote_install_completed(target, &remote_flock.shell_path);
-        Ok(())
-    } else {
-        let err = match crate::process::shape_stderr_tail(&output.stderr) {
-            Some(tail) => format!("remote install exited with {status}: {tail}"),
-            None => format!("remote install exited with {status}"),
-        };
-        crate::logging::remote_install_failed(target, &remote_flock.shell_path, &err);
-        Err(io::Error::other(err))
+    let output = child.wait_with_output();
+    if source.read_failed {
+        return copy_result;
     }
+    let output = output?;
+    remote_install_result(output.status, &output.stderr)?;
+    copy_result
+}
+
+/// Identify read-side failures without wrapping or replacing the original error.
+struct UploadReader<'a, R> {
+    inner: &'a mut R,
+    read_failed: bool,
+}
+impl<R: io::Read> io::Read for UploadReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let result = self.inner.read(buffer);
+        // A retried Interrupted read must not misclassify a later write failure.
+        self.read_failed = result.is_err();
+        result
+    }
+}
+
+/// Stage and verify a received upload before atomically replacing the binary.
+fn remote_install_script(remote_flock: &RemoteFlock, expected: &str) -> String {
+    format!(
+        r#"dest="$HOME/{install_suffix}"
+dir="${{dest%/*}}"
+mkdir -p "$dir"
+tmp="${{dest}}.tmp.$$"
+trap 'rm -f "$tmp"' 0
+cat > "$tmp"
+if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$tmp")
+elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$tmp")
+else
+    exit {missing_exit}
+fi
+actual=${{actual%% *}}
+[ "$actual" = {expected} ] || exit {mismatch_exit}
+chmod 755 "$tmp"
+mv "$tmp" "$dest"
+"#,
+        install_suffix = remote_flock.install_suffix,
+        expected = shell_quote(expected),
+        mismatch_exit = INSTALL_TRANSFER_MISMATCH,
+        missing_exit = INSTALL_CHECKSUM_TOOL_MISSING,
+    )
+}
+
+/// Decode only the two private signals; every other failure preserves stderr.
+fn remote_install_result(status: std::process::ExitStatus, stderr: &[u8]) -> io::Result<()> {
+    if status.success() {
+        return Ok(());
+    }
+    match status.code() {
+        Some(INSTALL_TRANSFER_MISMATCH) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                ErrorCode::RemoteChecksumMismatch,
+            ))
+        }
+        Some(INSTALL_CHECKSUM_TOOL_MISSING) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                ErrorCode::ChecksumToolMissing,
+            ))
+        }
+        _ => {}
+    }
+    let message = match crate::process::shape_stderr_tail(stderr) {
+        Some(tail) => format!("remote install exited with {status}: {tail}"),
+        None => format!("remote install exited with {status}"),
+    };
+    Err(io::Error::other(message))
 }
 
 /// SSH options applied to every non-interactive control-plane invocation
@@ -5079,6 +5128,29 @@ exit 0
     }
 
     #[test]
+    fn stable_remote_asset_shapes_retain_checksum_for_shared_verification() {
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("binary");
+        fs::write(&path, b"corrupt").unwrap();
+        for value in [
+            serde_json::json!("https://example.invalid/asset"),
+            serde_json::json!({"url":"https://example.invalid/asset", "sha256":"a".repeat(64)}),
+        ] {
+            let manifest: RemoteUpdateManifest = serde_json::from_value(serde_json::json!({
+                "version":"99.0.0", "assets":{"fixture":value.clone()}
+            }))
+            .unwrap();
+            let asset = remote_asset_info(&manifest.assets["fixture"]);
+            let result = crate::checksum::verify_asset(&path, asset.sha256.as_deref());
+            if value.is_string() {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+
+    #[test]
     fn remote_server_restart_reason_requires_stop_for_protocol_mismatch() {
         assert_eq!(
             remote_server_restart_reason(Some(&current_version()), Some(0), false),
@@ -5349,3 +5421,6 @@ exit 0
         );
     }
 }
+
+#[cfg(test)]
+mod install_tests;

@@ -342,8 +342,10 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
 
     if let Err(err) = crate::update::self_update(crate::update::SelfUpdateOptions::default()) {
         eprintln!("update failed: {err}");
-        eprintln!("Run `flk update` to retry.");
-        return Ok(1);
+        if err.code().is_none() {
+            eprintln!("Run `flk update` to retry.");
+        }
+        return Ok(err.exit());
     }
 
     Ok(0)
@@ -1145,6 +1147,14 @@ fn print_response_for(response: &serde_json::Value, send_like: bool) -> std::io:
 
     println!("{}", serde_json::to_string(response).unwrap());
     Ok(0)
+}
+
+/// Preserve registered refusal exits across the launcher I/O error boundary.
+pub(crate) fn io_error_exit(error: &std::io::Error) -> i32 {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<crate::api::error_code::ErrorCode>())
+        .map_or(exit::FAILURE, |code| code.exit())
 }
 
 /// The exit status for an error response. Only a send-like or guarded verb
