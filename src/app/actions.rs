@@ -84,8 +84,8 @@ pub fn notification_toast_for_state_change(
     }
 }
 
-fn toast_agent_label(agent_label: &str) -> &str {
-    agent_label
+fn toast_agent_label(agent_label: &str) -> std::borrow::Cow<'_, str> {
+    crate::terminal::agent_name::display(agent_label)
 }
 
 pub(crate) fn toast_event_text(kind: ToastKind) -> &'static str {
@@ -1014,26 +1014,34 @@ impl AppState {
             let label = terminal
                 .and_then(|terminal| terminal.effective_title())
                 .or_else(|| {
-                    terminal
-                        .and_then(|terminal| terminal.manual_label.as_deref().map(str::to_string))
+                    terminal.and_then(|terminal| {
+                        terminal
+                            .manual_label
+                            .as_deref()
+                            .map(|label| crate::terminal::agent_name::display(label).into_owned())
+                    })
                 })
                 .or_else(|| {
-                    terminal.and_then(|terminal| terminal.agent_name.as_deref().map(str::to_string))
+                    terminal.and_then(|terminal| {
+                        terminal
+                            .agent_name()
+                            .map(|label| crate::terminal::agent_name::display(label).into_owned())
+                    })
                 })
                 .or_else(|| {
-                    terminal
-                        .and_then(|terminal| terminal.effective_agent_label().map(str::to_string))
+                    terminal.and_then(|terminal| {
+                        terminal
+                            .effective_agent_label()
+                            .map(|label| crate::terminal::agent_name::display(label).into_owned())
+                    })
                 })
                 .or_else(|| {
                     launch_label(terminal.and_then(|terminal| terminal.launch_argv.as_ref()))
                 })
                 .unwrap_or_else(|| format!("pane {pane_number}"));
-            let display_agent = terminal.and_then(|terminal| terminal.effective_display_agent());
-            let agent_label = display_agent.as_deref().or_else(|| {
-                terminal
-                    .and_then(|terminal| terminal.agent_name.as_deref())
-                    .or_else(|| terminal.and_then(|terminal| terminal.effective_agent_label()))
-            });
+            let label = crate::terminal::agent_name::presentation(&label);
+            let display_agent = terminal.and_then(|terminal| terminal.display_agent_label());
+            let agent_label = display_agent.as_deref();
             let custom_status = terminal.and_then(|terminal| terminal.effective_custom_status());
             let (state, seen) = terminal
                 .map(|terminal| terminal.presentation_state(pane.seen))
@@ -5669,6 +5677,35 @@ mod tests {
     /// "Which pane has the build at 73%?" must be answerable — and
     /// searchable — from the navigator pane list.
     #[test]
+    fn security2090_navigator_searches_beyond_display_bound() {
+        let mut state = app_with_workspaces(&["one"]);
+        let pane = state.workspaces[0].tabs[0].root_pane;
+        state.ensure_test_terminals();
+        let id = state.workspaces[0].terminal_id(pane).cloned().unwrap();
+        let title = format!("{}needle", "x".repeat(70));
+        let terminal = state.terminals.get_mut(&id).unwrap();
+        terminal.set_agent_metadata(crate::terminal::AgentMetadataReport {
+            source: "custom:fixture".into(),
+            agent_label: None,
+            applies_to_source: None,
+            title: Some(title),
+            display_agent: None,
+            custom_status: None,
+            state_labels: Default::default(),
+            clear_title: false,
+            clear_display_agent: false,
+            clear_custom_status: false,
+            clear_state_labels: false,
+            seq: None,
+            ttl: None,
+        });
+        state.open_navigator();
+        state.navigator.query = "needle".into();
+        assert!(state.navigator_rows().iter().any(|row| matches!(row.target,
+            crate::app::state::NavigatorTarget::Pane {pane_id, ..} if pane_id == pane)));
+    }
+
+    #[test]
     fn navigator_pane_rows_surface_promoted_header_fields() {
         let mut state = app_with_workspaces(&["one"]);
         let pane = state.workspaces[0].tabs[0].root_pane;
@@ -6087,7 +6124,8 @@ mod tests {
             .terminals
             .get_mut(&shell_terminal_id)
             .unwrap()
-            .set_manual_label("wheel notes".into());
+            .set_manual_label("wheel notes".into())
+            .unwrap();
         let working_terminal_id = state.workspaces[0].terminal_id(working).cloned().unwrap();
         state
             .terminals
@@ -6134,7 +6172,8 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_manual_label("weekly review".into());
+            .set_manual_label("weekly review".into())
+            .unwrap();
         state.open_navigator();
         state.navigator.query = "weekly".into();
 
@@ -7718,6 +7757,17 @@ mod tests {
             state.toast.as_ref().map(|toast| toast.kind),
             Some(ToastKind::Finished)
         );
+    }
+
+    #[test]
+    fn security_label_toast_sink_escapes_untrusted_label() {
+        for (case, label) in crate::test_support::hostile_agent_names() {
+            assert_ne!(
+                toast_agent_label(&label).to_string(),
+                label,
+                "raw toast label: {case}"
+            );
+        }
     }
 
     #[test]

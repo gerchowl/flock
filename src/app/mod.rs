@@ -4174,7 +4174,8 @@ sidebar_pane_gap = 99
             .terminals
             .get_mut(&attached_terminal_id)
             .unwrap()
-            .set_agent_name("reviewer".into());
+            .set_agent_name("reviewer".into())
+            .unwrap();
         app.state.active = Some(0);
         app.state.selected = 0;
 
@@ -4218,7 +4219,8 @@ sidebar_pane_gap = 99
             .terminals
             .get_mut(&first_terminal_id)
             .unwrap()
-            .set_agent_name("worker".into());
+            .set_agent_name("worker".into())
+            .unwrap();
         let second_terminal_id = app.state.workspaces[0]
             .pane_state(second)
             .unwrap()
@@ -4228,7 +4230,8 @@ sidebar_pane_gap = 99
             .terminals
             .get_mut(&second_terminal_id)
             .unwrap()
-            .set_agent_name("worker".into());
+            .set_agent_name("worker".into())
+            .unwrap();
         app.state.active = Some(0);
         app.state.selected = 0;
 

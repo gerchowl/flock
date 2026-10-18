@@ -3154,6 +3154,16 @@ impl AppState {
         harness: Option<crate::detect::Agent>,
         label: Option<&str>,
     ) -> String {
+        crate::terminal::agent_name::display(&self.agent_field_label_raw(mode, harness, label))
+            .into_owned()
+    }
+
+    fn agent_field_label_raw(
+        &self,
+        mode: crate::config::AgentLabelConfig,
+        harness: Option<crate::detect::Agent>,
+        label: Option<&str>,
+    ) -> String {
         use crate::config::AgentLabelConfig;
 
         let aliased = label.and_then(|label| self.agent_aliases.get(label));
@@ -3750,6 +3760,24 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn security_agent_name_panel_escapes_peer_labels_and_aliases() {
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut state = super::AppState::test_new();
+            let mode = crate::config::AgentLabelConfig::Name;
+            assert_ne!(
+                state.agent_field_label(mode, None, Some(&name)),
+                name,
+                "raw panel name: {case}"
+            );
+            state.agent_aliases.insert("fixture".into(), name.clone());
+            assert_ne!(
+                state.agent_field_label(mode, None, Some("fixture")),
+                name,
+                "raw alias: {case}"
+            );
+        }
+    }
 
     #[test]
     fn project_keys_reduce_to_github_slugs() {

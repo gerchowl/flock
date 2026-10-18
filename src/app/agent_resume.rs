@@ -762,7 +762,7 @@ mod tests {
                 .terminals
                 .get_mut(&terminal_id)
                 .expect("test terminal should exist");
-            terminal.set_agent_name("reviewer".into());
+            terminal.set_agent_name("reviewer".into()).unwrap();
             terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
                 source: "flock:codex".into(),
                 agent: "codex".into(),
@@ -809,7 +809,7 @@ mod tests {
             .terminals
             .get(&terminal_id)
             .expect("terminal should survive a failed resume");
-        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(terminal.agent_name(), Some("reviewer"));
         assert!(terminal.resume_failed);
         assert!(terminal.pending_agent_resume_plan.is_some());
         assert!(terminal.hibernated_resume_plan.is_none());

@@ -5039,6 +5039,7 @@ impl ThermalReport {
     /// out-of-range rank or an unbounded string into our render pass.
     pub fn sanitized(mut self) -> Self {
         self.severity = self.severity.min(THERMAL_SEVERITY_MAX);
+        self.label = crate::peers::received::text(&self.label);
         if self.label.len() > THERMAL_LABEL_MAX_BYTES {
             let mut end = THERMAL_LABEL_MAX_BYTES;
             while end > 0 && !self.label.is_char_boundary(end) {
@@ -5058,6 +5059,7 @@ impl ThermalReport {
 /// One workspace in a federated peer's `peers.summary` response: just enough
 /// for the sidebar's project-folded remote rows and cross-server attention.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ReceivedWorkspace")]
 pub struct PeerWorkspaceSummary {
     /// Workspace id on the peer server (e.g. "ws_3"), used to focus it
     /// remotely during switch-on-select.
@@ -5097,6 +5099,65 @@ pub struct PeerWorkspaceSummary {
     pub agents: Vec<PeerAgentSummary>,
 }
 
+#[derive(Deserialize)]
+struct ReceivedWorkspace {
+    /// Workspace id on the peer server (e.g. "ws_3"), used to focus it
+    /// remotely during switch-on-select.
+    #[serde(default)]
+    id: String,
+    /// Workspace display name (custom name or derived label).
+    workspace: String,
+    /// Machine-independent project identity (normalized origin URL or
+    /// `dir:<name>`), used to fold remote rows into local project groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_key: Option<String>,
+    /// Repo folder name, labels remote-only project groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(default)]
+    is_linked_worktree: bool,
+    /// Short agent label of the workspace's attention-leading pane (e.g. "cc").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    status: AgentStatus,
+    /// Seconds since the leading pane's state last changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status_age_secs: Option<u64>,
+    /// Live status-line activity while Working (e.g. "Implementing the parser").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activity: Option<String>,
+    /// Every agent in this workspace, by fleet-global identity — the rows that
+    /// make a directory possible (ADR-0008).
+    ///
+    /// Distinct from [`agent`](Self::agent), which is the attention-LEADING
+    /// pane's short label for the sidebar. A directory has to answer "where
+    /// does THIS agent live", so it needs all of them, addressed by a name
+    /// that means the same thing on every host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    agents: Vec<PeerAgentSummary>,
+}
+
+impl From<ReceivedWorkspace> for PeerWorkspaceSummary {
+    fn from(raw: ReceivedWorkspace) -> Self {
+        Self {
+            id: raw.id,
+            workspace: raw.workspace,
+            project_key: raw.project_key,
+            project_label: raw.project_label,
+            branch: raw.branch,
+            is_linked_worktree: raw.is_linked_worktree,
+            agent: raw.agent,
+            status: raw.status,
+            status_age_secs: raw.status_age_secs,
+            activity: raw.activity,
+            agents: raw.agents,
+        }
+        .received()
+    }
+}
+
 /// One agent as the fleet sees it: its identity, and where that identity
 /// currently lives.
 ///
@@ -5104,6 +5165,7 @@ pub struct PeerWorkspaceSummary {
 /// pane moves and workspace renames. Everything else is where it happens to be
 /// right now, and is expected to change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ReceivedAgent")]
 pub struct PeerAgentSummary {
     pub agent_id: String,
     /// Public pane id on the owning server. A routing detail, not a name.
@@ -5111,6 +5173,28 @@ pub struct PeerAgentSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     pub status: AgentStatus,
+}
+
+#[derive(Deserialize)]
+struct ReceivedAgent {
+    agent_id: String,
+    /// Public pane id on the owning server. A routing detail, not a name.
+    pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    status: AgentStatus,
+}
+
+impl From<ReceivedAgent> for PeerAgentSummary {
+    fn from(raw: ReceivedAgent) -> Self {
+        Self {
+            agent_id: raw.agent_id,
+            pane_id: raw.pane_id,
+            agent: raw.agent,
+            status: raw.status,
+        }
+        .received()
+    }
 }
 
 /// `peers.hub_fleet` — down-gossip from a hub to a spoke it polls (#410).
