@@ -53,7 +53,7 @@ function startsTurn(entry: SessionEntry): boolean {
 }
 
 /** The one-line command of a tool call: its command, path or first string input. */
-function commandOf(input: JsonValue | undefined): string {
+export function commandOf(input: JsonValue | undefined): string {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return "";
   for (const key of ["command", "file_path", "path", "pattern", "url"]) {
     const value = input[key];
