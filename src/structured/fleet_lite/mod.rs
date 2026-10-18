@@ -181,20 +181,23 @@ impl Store {
     /// refuses loading even if an older snapshot survives. Lost/corrupt snapshots
     /// recover only with a valid cursor. Never delete both recovery records.
     /// Opening preserves damaged snapshot bytes; a later write replaces them.
+    /// An unmarked lock without either record can safely retry initialization at zero.
+    /// `fleet.lock` carries the initialization marker: deleting it together with
+    /// `fleet.cursor` while an older `fleet.json` survives reopens at that older
+    /// head. Operators must never delete the lock.
     pub fn open(path: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(parent(&path))?;
         let lock_path = path.with_extension("lock");
-        let (mut lock, fresh) = match OpenOptions::new()
+        let mut lock = match OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&lock_path)
         {
-            Ok(file) => (file, true),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (
-                OpenOptions::new().read(true).write(true).open(lock_path)?,
-                false,
-            ),
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                OpenOptions::new().read(true).write(true).open(lock_path)?
+            }
             Err(e) => return Err(e),
         };
         lock.try_lock().map_err(|e| match e {
@@ -223,7 +226,7 @@ impl Store {
         let high_water = match (reserved, snapshot_head) {
             (Some(a), Some(b)) => a.max(b),
             (Some(a), None) | (None, Some(a)) => a,
-            (None, None) if fresh && bytes.is_none() => 0,
+            (None, None) if !initialized && bytes.is_none() => 0,
             _ => {
                 return Err(invalid(
                     "fleet cursor unavailable; restore a trusted high-water floor",

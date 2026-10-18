@@ -1051,7 +1051,7 @@ reason, and retained raw. Unchanged rows retain unknown top-level fields;
 changed rows serialize a fresh projection and drop them, since future fields may
 no longer agree with the changed facts. A missing or corrupt snapshot opens with
 no rows at the independent floor and a typed recovery diagnostic. Corrupt cursor
-metadata, or loss of both records from an existing store, refuses loading rather
+metadata, or loss of both records from an initialized store, refuses loading rather
 than resetting it. A valid legacy snapshot with an unmarked lock seeds the new
 cursor durably; thereafter a durable marker on the locked inode makes cursor
 loss a refusal, not a migration from an older snapshot. When both records are
@@ -1070,12 +1070,18 @@ intact for inspection; save a copy before a subsequent refresh/checkpoint
 replaces them. With a valid cursor, refresh the registry provider and publish a
 recovery snapshot at or above its floor. Unpublished reservations left by a
 failed write are covered by the next inline gap/checkpoint, not reused. If the
-cursor is missing after initialization or damaged, or both records are lost,
+cursor is missing after initialization or damaged, or both records are lost from an initialized store,
 repair offline with the owning store closed: restore a trusted cursor backup or
 atomically replace the cursor with a floor at least as high as both the
 surviving snapshot head and the highest cursor clients have observed. Use
 temp-file fsync, rename, then directory fsync. Never guess zero when that floor
 is unavailable; keep the store closed until trusted recovery evidence exists.
+
+An empty, unmarked lock with neither data record safely retries initialization
+at zero: cursor durability always precedes the initialization marker.
+`fleet.lock` carries that marker, so deleting it together with `fleet.cursor`
+while an older `fleet.json` survives reopens at that older head. The operator
+must never delete the lock.
 
 `cmd agent.decide` takes `AgentDecide { agent, request_id, decision, message? }`,
 where decision is `allow_once`, `allow_always` or `deny`. Only a token-authenticated

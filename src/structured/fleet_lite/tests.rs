@@ -457,6 +457,8 @@ fn cursor_and_snapshot_reconcile_to_the_maximum_and_never_lower_it() {
 #[test]
 fn legacy_snapshot_seeds_cursor_before_it_can_be_lost() {
     let path = path();
+    fs::write(path.with_extension("lock"), b"").unwrap();
+    assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
     fs::write(&path, json!({"high_water":23,"rows":[]}).to_string()).unwrap();
     let store = Store::open(path.clone()).unwrap();
     assert!(store.diagnostics().is_empty());
@@ -572,4 +574,20 @@ fn lost_cursor_after_failed_snapshot_does_not_migrate_the_older_snapshot() {
     );
     assert_eq!(disk(&path)["high_water"], 2);
     assert!(!path.with_extension("cursor").exists());
+}
+
+#[test]
+fn empty_unmarked_lock_without_records_restarts_initialization_at_zero() {
+    let path = path();
+    fs::write(path.with_extension("lock"), b"").unwrap();
+    assert!(!path.exists());
+    assert!(!path.with_extension("cursor").exists());
+    let mut store = Store::open(path.clone()).unwrap();
+    assert!(store.diagnostics().is_empty());
+    assert_eq!(store.snapshot().unwrap().to, 0);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 0);
+    assert_eq!(fs::read(path.with_extension("lock")).unwrap(), b"1");
+    assert_eq!(store.refresh(&Source(vec![agent("a")])).unwrap()[0].seq, 1);
+    drop(store);
+    assert_eq!(Store::open(path).unwrap().snapshot().unwrap().to, 1);
 }
