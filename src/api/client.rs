@@ -107,10 +107,9 @@ impl ApiClient {
     /// Completed-input calls are never retried, including before dispatch;
     /// their shared path reports lost post-dispatch replies as unknown effect.
     ///
-    /// Under load a read timeout surfaces as `EAGAIN` ("Resource temporarily
-    /// unavailable", os error 11 on Linux): the server is there, just slow.
-    /// One such error used to fail a whole CLI command. Now the request is
-    /// retried up to [`TRANSIENT_RETRIES`] times, but only where that is safe:
+    /// An elapsed bounded reply wait reports `TimedOut`; the server may still
+    /// be working. The request is retried up to [`TRANSIENT_RETRIES`] times,
+    /// but only where that is safe:
     /// a failure before the request was written (the connect) retries for any
     /// method, one after it only for a [`Method::is_retry_safe`] read, since
     /// the server may already have applied a write it never answered.

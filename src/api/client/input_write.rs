@@ -96,6 +96,9 @@ pub(super) fn call(
     cap: Duration,
     deadline: Option<Instant>,
 ) -> Result<Value, ApiClientError> {
+    if let Some(refusal) = crate::api::compatibility::refuse_skew(client, request) {
+        return Ok(refusal);
+    }
     let end = deadline.map_or(Instant::now() + cap, |end| end.min(Instant::now() + cap));
     let left = || end.saturating_duration_since(Instant::now());
     let mut request = request.clone();
