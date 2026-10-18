@@ -34,6 +34,7 @@ pub(crate) enum Page {
     /// Generation ended after draining committed publications.
     End,
 }
+// Cut, status, operation error, replay flag, and requested cursor respectively.
 struct Packet(Arc<Cut>, Option<Pending>, Option<ErrorCode>, bool, u64);
 #[derive(Default)]
 struct Live {
@@ -44,6 +45,7 @@ struct Live {
 }
 struct Book {
     retained: Arc<Cut>,
+    bootstrapped: bool,
     status: Option<Pending>,
     error: Option<ErrorCode>,
     ended: bool,
@@ -232,6 +234,7 @@ impl Publisher {
             tx,
             Arc::new(Mutex::new(Book {
                 retained: Arc::new(cut),
+                bootstrapped: false,
                 status: None,
                 error: None,
                 ended: false,
@@ -316,14 +319,15 @@ fn capture_locked<R: parking_lot::lock_api::RawMutex>(
     status: Option<Pending>,
 ) {
     let mut book = owner.lock();
-    match snapshot() {
-        Ok(cut) => {
-            if cut.through != book.retained.through || cut.gap != book.retained.gap {
-                book.publish(cut, status, None);
+    if !book.bootstrapped && book.refusal.is_none() {
+        match snapshot() {
+            Ok(cut) => {
+                if cut.through != book.retained.through || cut.gap != book.retained.gap {
+                    book.publish(cut, status, None);
+                }
+                book.bootstrapped = true;
             }
-        }
-        Err(error) => {
-            live.lock().refusal = Some(error.code);
+            Err(error) => book.refusal = Some(error.code),
         }
     }
     if let Err(error) = book.register(after, live.clone()) {

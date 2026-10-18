@@ -207,6 +207,12 @@ fn queue_provider_bootstrap_refusal_never_claims_a_snapshot_or_sync() {
         Page::Refused(ErrorCode::QueueJournalCorrupt)
     ));
     assert!(matches!(reader.page(), Page::End));
+    let mut again = source.subscribe(None).unwrap();
+    p.capture(|| panic!("failed bootstrap was retried"), None);
+    assert!(matches!(
+        again.page(),
+        Page::Refused(ErrorCode::QueueJournalCorrupt)
+    ));
     assert_eq!(fs::read(path).unwrap(), before);
 }
 #[test]
@@ -454,6 +460,7 @@ fn queue_provider_split_lock_mutation_is_observed_without_racing_threads() {
     let mut j = journal(&root, 1);
     let book = parking_lot::lock_api::Mutex::<Witness, _>::new(Book {
         retained: Arc::new(j.replay(0).unwrap()),
+        bootstrapped: false,
         status: None,
         error: None,
         ended: false,
@@ -477,4 +484,32 @@ fn queue_provider_split_lock_mutation_is_observed_without_racing_threads() {
         live.lock().packets.front(),
         Some(Packet(_, _, _, true, 0))
     ));
+}
+
+#[test]
+fn queue_provider_active_resume_never_recaptures_or_rescans_the_prefix() {
+    let root = root();
+    let mut j = journal(&root, 100);
+    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let mut initial = source.subscribe(None).unwrap();
+    publisher.capture(|| j.subscription().map_err(Into::into), None);
+    let full = pages(&mut initial);
+    let head = full
+        .iter()
+        .find_map(|p| {
+            if let Page::Synced(n) = p {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let mut resumed = source.subscribe(Some(head - 1)).unwrap();
+    publisher.capture(
+        || panic!("resume recaptured or rescanned the already cached prefix"),
+        None,
+    );
+    let tail = pages(&mut resumed);
+    assert_eq!(sequences(&tail), [head]);
+    assert!(tail.len() <= 3);
 }

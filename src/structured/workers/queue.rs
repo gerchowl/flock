@@ -149,11 +149,18 @@ impl Service {
     }
     /// Whether this operation failed at the stdin boundary.
     pub fn tick(&mut self, input: &InputHandle, stopped: bool, notify: &impl Fn()) -> bool {
-        let blocked = self.blocked;
+        let blocked = &mut self.blocked;
+        let scheduler = &mut self.scheduler;
         self.publisher.capture(
-            || match blocked {
-                Some(code) => Err(failure(code)),
-                None => self.scheduler.subscription(),
+            || {
+                let result = match *blocked {
+                    Some(code) => Err(failure(code)),
+                    None => scheduler.subscription(),
+                };
+                if let Err(error) = &result {
+                    *blocked = Some(error.code);
+                }
+                result
             },
             self.status.clone(),
         );
@@ -276,14 +283,6 @@ impl Service {
         error.is_some_and(|e| e.0 == ErrorCode::InputWriteFailed)
     }
     pub fn finish(&mut self, input: &InputHandle, notify: &impl Fn()) -> bool {
-        let blocked = self.blocked;
-        self.publisher.capture(
-            || match blocked {
-                Some(code) => Err(failure(code)),
-                None => self.scheduler.subscription(),
-            },
-            self.status.clone(),
-        );
         let error = self.policy().and_then(|_| self.scheduler.exited()).err();
         self.publish(input, true, None, error);
         let blocked = self.blocked;
