@@ -13,9 +13,14 @@ use serde_json::Value;
 
 pub(crate) mod fixture;
 mod minimal;
+mod permission;
 pub use minimal::{
     AgentDecide, AgentDecideErrorCode, AgentDecideResult, FleetAgentRow, FleetDelta,
     PermissionDecision,
+};
+pub use permission::{
+    IgnoredPermissionReason, IgnoredPermissionSuggestions, PermissionAnswer, PermissionClose,
+    PermissionCloseReason, PermissionRecord, PermissionState,
 };
 #[cfg(test)]
 mod review_tests;

@@ -154,21 +154,18 @@ impl Received {
             }
         }
         if self.record.origin == RecordOrigin::Flk {
+            if let SessionEvent::PermissionRequest(record) = &self.event {
+                return match record.state {
+                    crate::structured_wire::PermissionState::Closed { .. } => {
+                        Some(super::state::Input::ControlAnswered(&record.request_id))
+                    }
+                    _ => None,
+                };
+            }
             if let SessionEvent::Unknown { value, .. } = &self.event {
                 if value.get("type").and_then(Value::as_str) == Some("flk_input_accepted") {
                     // Monotonic stamps belong to this launch, never to replay.
                     return None;
-                }
-                if value.get("type").and_then(Value::as_str) == Some("flk_permission_request") {
-                    return match (
-                        value.get("state").and_then(Value::as_str),
-                        value.get("request_id").and_then(Value::as_str),
-                    ) {
-                        (Some("closed"), Some(id)) => {
-                            Some(super::state::Input::ControlAnswered(id))
-                        }
-                        _ => None,
-                    };
                 }
             }
         }
@@ -587,7 +584,7 @@ impl InputHandle {
     }
 }
 
-fn encode(value: &Value) -> io::Result<Vec<u8>> {
+fn encode(value: &impl Serialize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     serde_json::to_writer(InputBuffer(&mut bytes), value)?;
     bytes.push(b'\n');

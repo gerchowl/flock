@@ -48,18 +48,7 @@ pub struct AgentDecide {
     pub message: Option<String>,
 }
 
-/// Closed permission vocabulary shared by the client and S6-MVP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionDecision {
-    /// Permit only this request.
-    AllowOnce,
-    /// Permit this tool beyond the current request.
-    AllowAlways,
-    /// Refuse the request.
-    Deny,
-}
+pub use super::permission::PermissionDecision;
 
 #[cfg(test)]
 mod tests {
