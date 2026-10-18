@@ -348,6 +348,9 @@ pub(crate) fn handle_connection(
                 );
                 return Ok(());
             };
+            if continuation_refused() {
+                return Ok(());
+            }
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -381,6 +384,9 @@ pub(crate) fn handle_connection(
                 );
                 return Ok(());
             };
+            if continuation_refused() {
+                return Ok(());
+            }
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -407,6 +413,9 @@ pub(crate) fn handle_connection(
                 );
                 return Ok(());
             };
+            if continuation_refused() {
+                return Ok(());
+            }
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -701,14 +710,36 @@ fn read_initial_request_line(
     }
 }
 
-fn stream_subscriptions(
-    mut stream: UnixStream,
+pub(super) fn stream_subscriptions(
+    stream: UnixStream,
     request_id: String,
     params: crate::api::schema::EventsSubscribeParams,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    stream_subscriptions_with(
+        stream,
+        request_id,
+        params,
+        api_tx,
+        event_hub,
+        running,
+        || {},
+    )
+}
+
+/// The callback is the deterministic test seam after poll reply and before write.
+pub(super) fn stream_subscriptions_with(
+    mut stream: UnixStream,
+    request_id: String,
+    params: crate::api::schema::EventsSubscribeParams,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    mut before_event_write: impl FnMut(),
+) -> std::io::Result<()> {
+    let _continuation = super::scoped::Scope::enter_continuation();
     // ADR-0028 §3 (#1030): from the caller's cursor, else from now. A
     // cursor past the newest event is refused, as `events.read` refuses it,
     // rather than streaming nothing until the hub catches up to it.
@@ -723,10 +754,16 @@ fn stream_subscriptions(
                 message: format!("cursor {start} is past this server's newest event {head}"),
             },
         };
+        if continuation_refused() {
+            return Ok(());
+        }
         return write_json_line_allow_disconnect(&mut stream, &refusal);
     }
     let mut subscriptions = Vec::with_capacity(params.subscriptions.len());
     for (index, subscription) in params.subscriptions.into_iter().enumerate() {
+        if continuation_refused() {
+            return Ok(());
+        }
         let active = match ActiveSubscription::new(
             subscription,
             &request_id,
@@ -737,6 +774,9 @@ fn stream_subscriptions(
         ) {
             Ok(active) => active,
             Err(response) => {
+                if continuation_refused() {
+                    return Ok(());
+                }
                 if let Err(err) = write_json_line(&mut stream, &response) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -749,6 +789,9 @@ fn stream_subscriptions(
         subscriptions.push(active);
     }
 
+    if continuation_refused() {
+        return Ok(());
+    }
     if let Err(err) = write_json_line(
         &mut stream,
         &SuccessResponse {
@@ -769,8 +812,15 @@ fn stream_subscriptions(
 
         let mut wrote = false;
         for subscription in &mut subscriptions {
+            if continuation_refused() {
+                return Ok(());
+            }
             if let Some(event) = subscription.poll(api_tx, event_hub) {
+                before_event_write();
                 wrote = true;
+                if continuation_refused() {
+                    return Ok(());
+                }
                 if let Err(err) = write_json_line(&mut stream, &event) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -790,6 +840,9 @@ fn stream_subscriptions(
             .map(ActiveSubscription::hub_cursor)
             .collect::<Option<Vec<u64>>>()
             .and_then(|cursors| cursors.into_iter().min());
+        if continuation_refused() {
+            return Ok(());
+        }
         match cursor {
             // Drain a burst before sleeping: one poll yields one event.
             Some(_) if wrote => {}
@@ -829,11 +882,15 @@ fn write_json_line_allow_disconnect<T: serde::Serialize>(
     write_text_line_allow_disconnect(stream, &encoded)
 }
 
+fn continuation_refused() -> bool {
+    super::scoped::Scope::current().is_some_and(|scope| scope.continuation_refusal().is_some())
+}
+
 pub(super) fn should_stop_connection(
     stream: &mut UnixStream,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
-    if super::scoped::Scope::current().is_some_and(|scope| scope.continuation_refusal().is_some()) {
+    if continuation_refused() {
         return Ok(true);
     }
 

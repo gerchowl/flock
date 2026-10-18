@@ -21,6 +21,7 @@ pub(super) fn wait_for_output(
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
+    let _continuation = super::scoped::Scope::enter_continuation();
     crate::logging::api_wait_started(&request_id, &params.pane_id, params.timeout_ms);
     let deadline = params
         .timeout_ms
@@ -68,6 +69,9 @@ pub(super) fn wait_for_output(
             Some(APP_RESPONSE_TIMEOUT),
             Default::default(),
         );
+        if should_stop_connection(stream, running)? {
+            return Ok(None);
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else {
             return Ok(Some(response));
         };

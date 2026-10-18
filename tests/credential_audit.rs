@@ -102,3 +102,18 @@ fn envelope_encoding_and_parsed_credentials_are_scrubbed_on_success_and_refusal(
     AUDIT.set(false);
     assert_eq!(LEAKED.get(), 0, "credential JSON freed before scrubbing");
 }
+
+#[test]
+fn escaped_credential_is_refused_before_serde_scratch_copies_it() {
+    let secret = base64::engine::general_purpose::STANDARD.encode([42; 32]);
+    let line = format!(r#"{{"credential":"\u004b{}"}}"#, &secret[1..]);
+    LEAKED.set(0);
+    AUDIT.set(true);
+    let refused = secret_json::SecretValue::parse(&line).is_err();
+    AUDIT.set(false);
+    assert_eq!(
+        (refused, LEAKED.get()),
+        (true, 0),
+        "escaped credential must be refused without an unzeroized scratch copy"
+    );
+}

@@ -1209,15 +1209,17 @@ async fn admitted_submit_refuses_revocation_and_fresh_ancestry_loss_under_conten
             .begin_guarded_submit(&pane, "hello", None, Duration::ZERO, now, false)
             .unwrap();
         drain(&mut pty);
-        leases.with_registry_locked(|| {
-            if revoked {
-                drop(lease);
-            }
+        let check = || {
             assert_eq!(
                 app.advance_guarded_submit(&pane, &mut attempt, Instant::now()),
-                Some(Outcome::Unconfirmed("paste_written")),
+                Some(Outcome::Unconfirmed("paste_written"))
             );
-        });
+        };
+        if revoked {
+            crate::api::scoped::tests::with_revocation_under_contention(&leases, lease, check);
+        } else {
+            leases.with_registry_locked(check);
+        }
         assert!(drain(&mut pty).is_empty());
     }
 }

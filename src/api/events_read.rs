@@ -120,6 +120,7 @@ pub(super) fn read_events(
     api_tx: &ApiRequestSender,
     peer: crate::platform::peer::Credentials,
 ) -> std::io::Result<Option<String>> {
+    let _continuation = super::scoped::Scope::enter_continuation();
     if let Some(kind) = params.kinds.iter().find(|kind| !kind.is_persisted()) {
         return Ok(Some(refuse(
             request_id,
@@ -158,6 +159,9 @@ pub(super) fn read_events(
     let mut after = params.after;
     let mut held: Option<HeldWait> = None;
     loop {
+        if should_stop_connection(stream, running)? {
+            return Ok(None);
+        }
         let read = event_hub.read(after, limit, keep);
         let found = !read.events.is_empty() || read.gap.is_some();
         if found || Instant::now() >= deadline {

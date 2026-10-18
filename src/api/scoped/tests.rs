@@ -29,6 +29,7 @@ pub(crate) fn live_scope() -> (SessionLeases, Lease, Scope, Credentials) {
         proof: Arc::default(),
         fact_reader: None,
         probe: true,
+        continuation: false,
     }));
     let policy = UidPolicy {
         operator: peer.uid.unwrap(),
@@ -226,7 +227,8 @@ fn established_feed_survives_contention_but_revocation_still_closes_it() {
     leases.with_registry_locked(|| {
         assert_eq!(scope.refusal(), Some(ErrorCode::LeaseBusy));
         assert!(!crate::api::server::should_stop_connection(&mut socket, &running).unwrap());
-        drop(lease);
+    });
+    with_revocation_under_contention(&leases, lease, || {
         assert!(crate::api::server::should_stop_connection(&mut socket, &running).unwrap());
     });
 }
@@ -253,4 +255,216 @@ fn established_feed_closes_on_fresh_ancestry_loss() {
         CURRENT.with(|slot| *slot.borrow_mut() = Some(ancestry_lost(&scope)));
         assert!(crate::api::server::should_stop_connection(&mut socket, &running).unwrap());
     });
+}
+
+/// Revoke from the owner thread while the table is held; release after unlock.
+pub(crate) fn with_revocation_under_contention(
+    leases: &SessionLeases,
+    lease: Lease,
+    check: impl FnOnce(),
+) {
+    std::thread::scope(|threads| {
+        let (start, started) = std::sync::mpsc::sync_channel(1);
+        let (revoked, published) = std::sync::mpsc::sync_channel(1);
+        let (finish, unlocked) = std::sync::mpsc::sync_channel(1);
+        let worker = threads.spawn(move || {
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            lease.revoke_for_test();
+            revoked.send(()).unwrap();
+            unlocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(lease);
+        });
+        leases.with_registry_locked(|| {
+            start.send(()).unwrap();
+            published.recv_timeout(Duration::from_secs(5)).unwrap();
+            check();
+        });
+        finish.send(()).unwrap();
+        worker.join().unwrap();
+    });
+}
+
+fn read_reply(id: &str) -> String {
+    serde_json::json!({"id":id,"result":{"type":"pane_read","read":{
+        "pane_id":"fixture-pane","workspace_id":"fixture-workspace","tab_id":"fixture-tab",
+        "source":"recent","format":"text","text":"hit","revision":1,"truncated":false
+    }}})
+    .to_string()
+}
+
+fn next_app_message(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
+) -> crate::api::ApiRequestMessage {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        })
+}
+
+#[test]
+fn feed_rechecks_revocation_after_poll_reply_before_writing() {
+    let (_, lease, scope, _) = live_scope();
+    let (server, mut client) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (done, completed) = std::sync::mpsc::channel();
+    let running = Arc::new(AtomicBool::new(true));
+    let worker = std::thread::spawn(move || {
+        let _guard = Guard(CURRENT.with(|slot| slot.borrow_mut().replace(scope)));
+        let params = serde_json::from_value(serde_json::json!({"subscriptions":[{
+            "type":"pane.output_matched","pane_id":"fixture-pane","source":"recent",
+            "match":{"type":"substring","value":"hit"}
+        }]}))
+        .unwrap();
+        let result = crate::api::server::stream_subscriptions_with(
+            server,
+            "feed".into(),
+            params,
+            &tx,
+            &EventHub::default(),
+            &running,
+            || lease.revoke_for_test(),
+        );
+        done.send(result).unwrap();
+    });
+    // Initial subscription probe, then the poll that produces its event.
+    for stage in ["probe", "read"] {
+        let message = next_app_message(&mut rx);
+        assert_eq!(message.request.id, format!("feed:sub:0:{stage}"));
+        assert!(matches!(message.request.method, Method::PaneRead(_)));
+        message
+            .respond_to
+            .send(read_reply(&message.request.id))
+            .unwrap();
+    }
+    completed
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    worker.join().unwrap();
+    let mut bytes = String::new();
+    std::io::Read::read_to_string(&mut client, &mut bytes).unwrap();
+    assert_eq!(
+        bytes.lines().count(),
+        1,
+        "revoked poll leaked an event: {bytes}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(bytes.trim()).unwrap()["result"]["type"],
+        "subscription_started"
+    );
+}
+
+#[test]
+fn held_wait_and_event_read_polls_survive_contention_and_end_on_revoke() {
+    for events in [false, true] {
+        for revoked in [false, true] {
+            let (leases, lease, scope, peer) = live_scope();
+            let (mut server, _client) = UnixStream::pair().unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (done, completed) = std::sync::mpsc::channel();
+            let hub = EventHub::default();
+            let worker_hub = hub.clone();
+            let worker = std::thread::spawn(move || {
+                let _guard = Guard(CURRENT.with(|slot| slot.borrow_mut().replace(scope)));
+                let running = Arc::new(AtomicBool::new(true));
+                let result = if events {
+                    let params =
+                        serde_json::from_value(serde_json::json!({"after":0,"wait_ms":5000}))
+                            .unwrap();
+                    crate::api::events_read::read_events(
+                        "read".into(),
+                        params,
+                        &mut server,
+                        &worker_hub,
+                        &running,
+                        &tx,
+                        peer,
+                    )
+                } else {
+                    let params = serde_json::from_value(serde_json::json!({"pane_id":"fixture-pane","source":"recent","match":{"type":"substring","value":"hit"},"timeout_ms":5000})).unwrap();
+                    crate::api::wait::wait_for_output(
+                        "wait".into(),
+                        params,
+                        &mut server,
+                        &tx,
+                        &running,
+                    )
+                };
+                done.send(result).unwrap();
+            });
+            leases.with_registry_locked(|| {
+                let message = next_app_message(&mut rx);
+                assert!(matches!(
+                    (&message.request.method, events),
+                    (Method::WaitHold(_, _), true) | (Method::PaneRead(_), false)
+                ));
+                let (_, app_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut app = crate::app::App::new(
+                    &crate::config::Config::default(),
+                    true,
+                    None,
+                    app_rx,
+                    EventHub::default(),
+                );
+                app.current_api_scope = message.scope.clone();
+                app.current_api_peer_pid = message.peer_pid;
+                app.current_api_peer_birth = Some(message.peer_birth);
+                app.current_api_peer_uid = Some(message.peer_uid);
+                app.runtime_config.uid_policy = UidPolicy {
+                    operator: peer.uid.unwrap(),
+                    dedicated: Ok(None).into(),
+                };
+                assert_eq!(
+                    app.peer_uid_refusal(&message.request),
+                    None,
+                    "held poll repeated fresh admission"
+                );
+                if revoked {
+                    lease.revoke_for_test();
+                }
+                if events {
+                    hub.push(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::WorkspaceClosed,
+                        data: crate::api::schema::EventData::WorkspaceClosed {
+                            workspace_id: "fixture-workspace".into(),
+                        },
+                    });
+                    message
+                        .respond_to
+                        .send(serde_json::json!({"result":{"wait_id":"fixture-wait"}}).to_string())
+                        .unwrap();
+                } else {
+                    message
+                        .respond_to
+                        .send(read_reply(&message.request.id))
+                        .unwrap();
+                }
+                let result = completed
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    result.is_none(),
+                    revoked,
+                    "held operation returned wrong outcome: {result:?}"
+                );
+                if let Some(result) = result {
+                    assert!(serde_json::from_str::<serde_json::Value>(&result)
+                        .unwrap()
+                        .get("error")
+                        .is_none());
+                }
+            });
+            worker.join().unwrap();
+        }
+    }
 }

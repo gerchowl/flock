@@ -47,12 +47,14 @@ type FactReader = fn(u32) -> Option<(u32, u64)>;
 pub(crate) struct Scope(Arc<ScopeData>);
 #[derive(Clone)]
 struct ScopeData {
+    /// Retained for queued re-admission and zeroized on the final scope drop.
     credential: Option<LeaseCredential>,
     peer: Credentials,
     leases: Arc<OnceLock<SessionLeases>>,
     principal: Arc<OnceLock<(String, u32)>>,
     proof: Arc<OnceLock<ContinuationProof>>,
     probe: bool,
+    continuation: bool,
     #[cfg(test)]
     fact_reader: Option<FactReader>,
 }
@@ -74,6 +76,20 @@ impl Scope {
     /// Context for server-generated continuations on this socket worker only.
     pub(crate) fn current() -> Option<Self> {
         CURRENT.with(|slot| slot.borrow().clone())
+    }
+    /// Mark only server-generated polls of an already admitted operation.
+    /// The marker is private transport state and cannot be supplied on the wire.
+    pub(super) fn enter_continuation() -> Guard {
+        Guard(CURRENT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let next = slot.as_ref().map(|scope| {
+                Self(Arc::new(ScopeData {
+                    continuation: true,
+                    ..scope.0.as_ref().clone()
+                }))
+            });
+            std::mem::replace(&mut *slot, next)
+        }))
     }
     /// Original kernel credentials for server-generated continuations.
     pub(super) fn peer(&self) -> Credentials {
@@ -97,8 +113,13 @@ impl Scope {
                 depth: *depth,
             })
     }
-    /// Scoped admission allows only a current agent proof; busy remains distinct.
+    /// Fresh admissions consult the table; marked internal polls verify the live
+    /// cell and fresh ancestry. A continuation never fails merely on contention.
     pub(crate) fn refusal(&self) -> Option<ErrorCode> {
+        if self.0.continuation {
+            return self.continuation_refusal();
+        }
+
         match self.caller() {
             Caller::Agent { .. } => None,
             Caller::Busy => Some(ErrorCode::LeaseBusy),
@@ -162,6 +183,7 @@ impl Scope {
             #[cfg(test)]
             fact_reader: None,
             probe: true,
+            continuation: false,
         }));
         let (respond_to, response) = std::sync::mpsc::channel();
         api_tx

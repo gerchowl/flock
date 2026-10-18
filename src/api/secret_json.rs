@@ -1,5 +1,5 @@
 //! Zeroizing JSON ownership for local credential envelopes (ADR-0036 §1a).
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -35,6 +35,22 @@ pub(super) struct SecretValue(pub(super) serde_json::Value);
 impl SecretValue {
     /// Parse without transferring ownership to consuming schema deserialization.
     pub(super) fn parse(line: &str) -> serde_json::Result<Self> {
+        // Borrow the raw credential before serde can unescape it into its
+        // ordinary scratch Vec. Base64 credentials never require JSON escapes.
+        #[derive(Deserialize)]
+        struct Credential<'a> {
+            #[serde(borrow)]
+            credential: Option<&'a serde_json::value::RawValue>,
+        }
+        let raw: Credential<'_> = serde_json::from_str(line)?;
+        if raw
+            .credential
+            .is_some_and(|value| value.get().starts_with('"') && value.get().contains('\\'))
+        {
+            return Err(serde::de::Error::custom(
+                "escaped credentials are not accepted",
+            ));
+        }
         serde_json::from_str(line).map(Self)
     }
 }

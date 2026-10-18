@@ -231,28 +231,23 @@ fn scoped_contention_is_retryable_but_ancestry_budget_is_permanent() {
 }
 
 #[test]
-fn continuation_cell_refuses_revoke_expiry_and_generation_change_without_the_table() {
-    let (leases, mut lease) = fixture();
+fn continuation_cell_refuses_revoke_and_expiry_without_the_table() {
+    let (leases, lease) = fixture();
     let (_, proof) = leases
         .admit_with(Some(&lease.credential()), peer(), facts)
         .unwrap();
-    let held = leases.0.lock();
     assert_eq!(proof.verify_with(facts).unwrap(), agent());
-    lease.release();
-    assert!(!lease.released, "cleanup must be deferred under contention");
-    assert_eq!(proof.verify_with(facts).unwrap(), Caller::Uncertain);
-    drop(held);
-    lease.release();
+    crate::api::scoped::tests::with_revocation_under_contention(&leases, lease, || {
+        assert_eq!(proof.verify_with(facts).unwrap(), Caller::Uncertain);
+    });
+    assert!(leases.is_empty());
     let (leases, lease) = fixture();
     let (_, mut proof) = leases
         .admit_with(Some(&lease.credential()), peer(), facts)
         .unwrap();
-    proof.entry.generation.bump();
-    assert_eq!(proof.verify_with(facts).unwrap(), Caller::Uncertain);
     // Give only this fixture cell an already elapsed monotonic deadline.
     proof.entry.generation.cell = Arc::new(GenerationCell {
         revoked: AtomicBool::new(false),
-        version: AtomicU64::new(proof.version),
         deadline: Some(Instant::now()),
     });
     assert_eq!(proof.verify_with(facts).unwrap(), Caller::Uncertain);
@@ -294,4 +289,11 @@ fn revocation_during_fresh_ancestry_read_refuses_the_boundary() {
             Caller::Uncertain
         );
     });
+}
+
+impl Lease {
+    /// Publish revocation without making a test wait for bounded cleanup.
+    pub(crate) fn revoke_for_test(&self) {
+        self.revoke();
+    }
 }

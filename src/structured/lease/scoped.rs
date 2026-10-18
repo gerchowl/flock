@@ -1,6 +1,6 @@
 //! Per-reservation local API credentials, distinct from operator/client tokens.
 use super::*;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// A revocable generation; shared snapshots observe revocation before removal.
@@ -11,7 +11,6 @@ pub(super) struct Generation {
 }
 struct GenerationCell {
     revoked: AtomicBool,
-    version: AtomicU64,
     deadline: Option<Instant>,
 }
 impl Generation {
@@ -21,7 +20,6 @@ impl Generation {
             credential: LeaseCredential::generate()?,
             cell: Arc::new(GenerationCell {
                 revoked: AtomicBool::new(false),
-                version: AtomicU64::new(0),
                 deadline: None,
             }),
         })
@@ -35,7 +33,6 @@ impl Generation {
         self.revoke();
         self.cell = Arc::new(GenerationCell {
             revoked: AtomicBool::new(false),
-            version: AtomicU64::new(self.cell.version.load(Ordering::Acquire).wrapping_add(1)),
             deadline: self.cell.deadline,
         });
     }
@@ -126,7 +123,6 @@ impl SessionLeases {
             .values()
             .find(|e| e.generation.live() && e.generation.credential.matches(credential))
             .map(|entry| ContinuationProof {
-                version: entry.generation.cell.version.load(Ordering::Acquire),
                 entry: entry.clone(),
                 peer,
             });
@@ -159,12 +155,10 @@ impl SessionLeases {
 pub(crate) struct ContinuationProof {
     entry: Entry,
     peer: platform::peer::Credentials,
-    version: u64,
 }
 impl ContinuationProof {
     fn live(&self) -> bool {
         self.entry.generation.live()
-            && self.entry.generation.cell.version.load(Ordering::Acquire) == self.version
     }
     /// Re-read kernel ancestry and the cell at each effect boundary without table locks.
     pub(crate) fn caller(&self) -> Caller {
