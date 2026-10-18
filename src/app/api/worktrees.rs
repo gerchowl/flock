@@ -10,6 +10,10 @@ use crate::app::App;
 
 use super::responses::{encode_error, encode_error_body, encode_error_with_data, encode_success};
 
+/// Bound no-hint repository diagnostics without changing the primary refusal
+/// or stopping the scan before a later hint (ADR-0029 §4, #2205).
+const NO_HINT_PROBE_FAILURE_LIMIT: usize = 32;
+
 struct ApiFailure {
     code: &'static str,
     message: String,
@@ -1391,18 +1395,30 @@ impl App {
                         }
                     }
                 }
-                let mut probe_failures = probe_failures.into_iter();
-                if nearest.is_none() {
-                    if let Some(failure) = probe_failures.next() {
-                        return Err(failure);
-                    }
-                }
+                let limit = if nearest.is_none() {
+                    NO_HINT_PROBE_FAILURE_LIMIT
+                } else {
+                    usize::MAX
+                };
                 let diagnostics: Vec<_> = probe_failures
+                    .iter()
+                    .take(limit)
                     .map(|failure| {
                         serde_json::json!({"code":failure.code, "message":failure.message,
                         "data":failure.data})
                     })
                     .collect();
+                let omitted = probe_failures.len().saturating_sub(diagnostics.len());
+                if nearest.is_none() {
+                    if let Some(mut failure) = probe_failures.into_iter().next() {
+                        // Collected repository failures have object data. Build
+                        // summaries first so the primary detail is not recursive.
+                        let data = failure.data.get_or_insert_with(|| serde_json::json!({}));
+                        data["repository_probe_failures"] = serde_json::Value::Array(diagnostics);
+                        data["repository_probe_failures_omitted"] = serde_json::json!(omitted);
+                        return Err(failure);
+                    }
+                }
                 // ADR-0029 §4: an explicit retarget is required; force cannot
                 // turn an enclosing registered checkout into the requested root.
                 Err(ApiFailure {
@@ -6315,24 +6331,27 @@ mod tests {
         std::fs::remove_dir_all(repo).unwrap();
     }
 
-    #[test]
-    fn two_failed_repositories_without_enclosing_hint_return_first_failure() {
-        let repo = create_committed_repo("two-failures-first")
-            .canonicalize()
-            .unwrap();
-        let other = create_committed_repo("two-failures-second")
-            .canonicalize()
-            .unwrap();
+    fn assert_no_hint_probe_failures(count: usize, retained: usize, omitted: usize) {
+        let roots: Vec<_> = (0..count)
+            .map(|index| {
+                create_committed_repo(&format!("no-hint-failure-{index:03}"))
+                    .canonicalize()
+                    .unwrap()
+            })
+            .collect();
+        let repo = roots[0].clone();
         let mut app = app_with_parent(&repo);
-        let mut workspace = Workspace::test_new("other-failed-owner");
-        workspace.identity_cwd = other.clone();
-        app.state.workspaces.push(workspace);
+        for (index, root) in roots.iter().enumerate().skip(1) {
+            let mut workspace = Workspace::test_new(&format!("failed-owner-{index}"));
+            workspace.identity_cwd = root.clone();
+            app.state.workspaces.push(workspace);
+        }
         for workspace in &mut app.state.workspaces {
             workspace.cached_git_space =
                 crate::workspace::git_space_metadata(&workspace.identity_cwd);
         }
         let mut identities = Vec::new();
-        for root in [&repo, &other] {
+        for root in &roots {
             let expected = crate::workspace::git_space_metadata(root).unwrap().key;
             std::fs::rename(root.join(".git"), root.join("saved-git")).unwrap();
             let replacement = root.join("replacement-admin");
@@ -6342,10 +6361,11 @@ mod tests {
             );
             identities.push((root.clone(), expected, replacement.canonicalize().unwrap()));
         }
+        identities.sort_by_key(|(root, _, _)| (root != &repo, root.clone()));
         let target = repo.join("plain-directory");
         std::fs::create_dir(&target).unwrap();
         let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
-            id: "two-failures-no-hint".into(),
+            id: "failures-no-hint".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
                 path: Some(target.to_string_lossy().into_owned()),
                 force: true,
@@ -6355,16 +6375,24 @@ mod tests {
         }))
         .unwrap();
         assert!(target.is_dir());
-        std::fs::remove_dir_all(&repo).unwrap();
-        std::fs::remove_dir_all(other).unwrap();
+        for root in &roots {
+            std::fs::remove_dir_all(root).unwrap();
+        }
         assert_eq!(
             response["error"]["code"], "worktree_repository_unreachable",
             "{response}"
         );
+        let code = crate::api::error_code::ErrorCode::from_code(
+            response["error"]["code"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(code.exit(), crate::cli::exit::REFUSED);
+        assert_eq!(code.retry().as_str(), "after_human");
         let data = &response["error"]["data"];
-        // The target's current repository sorts first; both saved identities
-        // differ from the replacement Git dirs, so neither provides a hint.
+        // Current target metadata prioritizes its repository, then the scan
+        // follows the remaining canonical repository paths in order.
         assert_eq!(data["repo"], serde_json::json!(repo));
+        assert_eq!(data["path"], serde_json::json!(target));
         assert_eq!(data["reason"], "workspace_repository_identity_changed");
         assert_eq!(
             data["expected_common_dir"],
@@ -6374,17 +6402,55 @@ mod tests {
             data["observed_common_dir"],
             serde_json::json!(identities[0].2)
         );
-        for (_, expected, observed) in &identities {
-            assert_ne!(Path::new(expected), observed);
-        }
         assert!(
             data.get("nearest_enclosing_worktree").is_none(),
             "{response}"
         );
-        assert!(
-            data.get("repository_probe_failures").is_none(),
+        let failures = data["repository_probe_failures"]
+            .as_array()
+            .expect("all probe failures listed");
+        assert_eq!(failures.len(), retained, "{response}");
+        assert_eq!(
+            data["repository_probe_failures_omitted"], omitted,
             "{response}"
         );
+        for (failure, (root, expected, observed)) in failures.iter().zip(&identities) {
+            assert_eq!(failure["code"], "worktree_repository_unreachable");
+            assert_eq!(failure["message"], response["error"]["message"]);
+            assert_eq!(
+                failure["data"],
+                serde_json::json!({
+                    "path": target, "repo": root,
+                    "reason": "workspace_repository_identity_changed",
+                    "expected_common_dir": expected, "observed_common_dir": observed,
+                    "recovery": data["recovery"],
+                })
+            );
+            assert_ne!(Path::new(expected), observed);
+        }
+        let mut original = data.clone();
+        original
+            .as_object_mut()
+            .unwrap()
+            .remove("repository_probe_failures");
+        original
+            .as_object_mut()
+            .unwrap()
+            .remove("repository_probe_failures_omitted");
+        assert_eq!(
+            original, failures[0]["data"],
+            "first-failure data must stay unchanged"
+        );
+    }
+
+    #[test]
+    fn three_failed_repositories_without_enclosing_hint_return_all_failures() {
+        assert_no_hint_probe_failures(3, 3, 0);
+    }
+
+    #[test]
+    fn no_hint_repository_probe_failures_are_capped_at_32() {
+        assert_no_hint_probe_failures(35, 32, 3);
     }
 
     #[test]

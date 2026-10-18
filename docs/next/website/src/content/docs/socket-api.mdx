@@ -426,9 +426,17 @@ or `null` if none is known). Every `worktree_path_not_root` response includes
 collected probe failures from the other owned repositories as `{code, message,
 data}` objects, including expected and observed common directories for changed
 workspace identities; it is `[]` if those probes succeeded. With no enclosing
-hint, any probe failure returns immediately as the top-level typed error, before
-the `worktree_path_not_root` response is constructed; remaining probe failures
-are not returned. Thus a `worktree_path_not_root` response with a null hint has
+hint, the scan still completes first: a later eligible repository can supply
+an enclosing hint. Only after the full scan finds no hint does the first probe
+failure become the top-level `worktree_repository_unreachable` error, with its
+code, message and existing data fields unchanged. That error's data also contains
+`repository_probe_failures`, using the same `{code, message, data}` shape and
+including the first failure, in scan order. This no-hint list is capped at 32
+entries; `repository_probe_failures_omitted` is the number of collected failures
+beyond the cap (zero if all fit). Each entry identifies the repository
+in `data.repo` and retains its typed code, cause-specific data and recovery
+detail; entries do not recursively contain the aggregate list. With no hint and no probe failures, the response is
+`worktree_path_not_root` with `nearest_enclosing_worktree: null` and
 `repository_probe_failures: []`. A hint never grants permission to remove its root.
 Retarget explicitly to that root if intended, supply its repository as `repo`,
 or open a workspace in the owning repository before retrying. Alternatively,
