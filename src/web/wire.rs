@@ -165,26 +165,28 @@ async fn authenticate(
     socket: &mut WebSocket,
     shared: &Shared,
     end: Instant,
-) -> Option<(Session, bool, Bearer)> {
-    let Some(Ok(Message::Text(text))) = before(shared.clock.as_ref(), end, socket.recv()).await?
+) -> Result<(Session, bool, Bearer), HandshakeFailure> {
+    let Some(Ok(Message::Text(text))) = before(shared.clock.as_ref(), end, socket.recv())
+        .await
+        .ok_or(HandshakeFailure::Unavailable)?
     else {
-        return None;
+        return Err(HandshakeFailure::Revoked);
     };
     let ClientFrame::Hello {
         protocol,
         client: _,
         token: Some(token),
-    } = serde_json::from_str(&text).ok()?
+    } = serde_json::from_str(&text).map_err(|_| HandshakeFailure::Revoked)?
     else {
-        return None;
+        return Err(HandshakeFailure::Revoked);
     };
     let token = Bearer(token);
-    let session = verify(shared, end, token.clone()).await.ok()?;
-    Some((session, protocol > WIRE_JSON_VERSION, token))
+    let session = verify(shared, end, token.clone()).await?;
+    Ok((session, protocol > WIRE_JSON_VERSION, token))
 }
-/// Post-verification failures carry credential evidence separately from availability.
+/// Handshake failures carry credential evidence separately from availability.
 enum HandshakeFailure {
-    /// A verified credential no longer authenticates or its principal was revoked.
+    /// A credential does not authenticate or its verified principal was revoked.
     Revoked,
     /// Verification capacity, store I/O or the original handshake deadline failed.
     Unavailable,
@@ -203,7 +205,9 @@ async fn verify(shared: &Shared, end: Instant, token: Bearer) -> Result<Session,
     .ok_or(HandshakeFailure::Unavailable)?
     .map_err(|error| match error {
         TokenError::Unauthorized | TokenError::Revoked => HandshakeFailure::Revoked,
-        _ => HandshakeFailure::Unavailable,
+        TokenError::Scope | TokenError::Busy | TokenError::Unsafe | TokenError::Io(_) => {
+            HandshakeFailure::Unavailable
+        }
     })
 }
 /// Complete the registered handshake under its original ADR-0036 §5a deadline.
@@ -256,9 +260,17 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     }
     let end = shared.clock.now() + Duration::from_millis(HANDSHAKE_DEADLINE_MS);
     let session = tokio::select! { biased; _ = stop.changed() => return, session = authenticate(&mut socket, &shared, end) => session };
-    let Some((session, read_only, token)) = session else {
-        let _ = socket.send(close(AUTH_REFUSED_CLOSE)).now_or_never();
-        return;
+    let (session, read_only, token) = match session {
+        Ok(session) => session,
+        Err(failure) => {
+            let code = match failure {
+                HandshakeFailure::Revoked => AUTH_REFUSED_CLOSE,
+                HandshakeFailure::Unavailable => GOING_AWAY_CLOSE,
+                HandshakeFailure::Transport => return,
+            };
+            let _ = socket.send(close(code)).now_or_never();
+            return;
+        }
     };
     let principal = session.info.principal.clone();
     let (priority, priority_rx) = mpsc::channel(PRIORITY_CAPACITY);
