@@ -284,6 +284,18 @@ impl Workers {
         let (_, _, current) = registry.get(id)?;
         (*generation == current).then_some(source)
     }
+    /// Cold recovery requires a quiescent producer and confirmed cleanup.
+    /// Existing canonical history remains readable while a worker is active.
+    pub(crate) fn history_recovery_allowed(&self, id: &str) -> bool {
+        self.entries.get(id).is_none_or(|worker| {
+            worker.finished
+                && worker.thread.is_none()
+                && worker
+                    .report
+                    .as_ref()
+                    .is_some_and(|report| !report.authority_retained)
+        })
+    }
     /// Install a closed-file source recovered on an I/O worker. A changed epoch,
     /// active producer or already installed source refuses stale recovery.
     pub fn install_retained(

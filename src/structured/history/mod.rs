@@ -2,6 +2,8 @@
 //! Paging performs bounded filesystem work and belongs on the consumer's I/O
 //! worker, never the heartbeat loop. Neither replay nor publication reads Runtime.
 #![deny(missing_docs)]
+pub(crate) mod owner;
+
 use super::transport::StreamRecord;
 use parking_lot::Mutex;
 use std::{
