@@ -69,6 +69,7 @@ fn next(cut: &mut Cut) -> Item {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let item = cut.page().unwrap();
+        assert!(cut.buffer.capacity() <= PAGE_BYTES);
         if !matches!(item, Item::Pending | Item::Progress) {
             return item;
         }
@@ -198,6 +199,7 @@ fn page_budget_and_concurrent_publication_cannot_cross_the_barrier() {
     let mut cut = source.subscribe(None).unwrap();
     assert!(matches!(cut.page().unwrap(), Item::Progress));
     assert_eq!(cut.offset, PAGE_BYTES as u64);
+    assert!(cut.buffer.capacity() <= PAGE_BYTES);
     let (published, ack) = std::sync::mpsc::sync_channel(1);
     let (stop, release) = std::sync::mpsc::sync_channel(1);
     let (done, finished) = std::sync::mpsc::sync_channel(1);
@@ -587,6 +589,29 @@ fn registered_at_head_checkpoint_survives_later_publication() {
         json!({"type":"user","message":{"content":"later"}}),
     ));
     let mut resumed = fixture.source.resume(1, &hint).unwrap();
+    assert_eq!(seq(next(&mut resumed)), 2);
+    assert!(matches!(next(&mut resumed), Item::Synced(2)));
+}
+
+#[test]
+fn recovery_uses_the_same_captured_length_for_head_and_end() {
+    let mut fixture = Fixture::new(vec![record(1, json!({"type":"assistant","message":{}}))]);
+    let length = fixture.file.metadata().unwrap().len();
+    let head = tail_head(&fixture.file, length).unwrap();
+    // Deterministically append between the recovery capture and installation.
+    let second = record(2, json!({"type":"user","message":{}}));
+    let bytes = serde_json::to_vec(&second).unwrap();
+    fixture.file.write_all(&bytes).unwrap();
+    fixture.file.write_all(b"\n").unwrap();
+    fixture.file.sync_all().unwrap();
+    let source = History::default();
+    source.initialize(&fixture.file, head, length).unwrap();
+    let mut initial = source.subscribe(Some(1)).unwrap();
+    assert!(matches!(initial.page().unwrap(), Item::Synced(1)));
+    let hint = initial.checkpoint().unwrap();
+    assert_eq!(hint.offset, length);
+    source.publish(Arc::new(second), bytes.len() + 1).unwrap();
+    let mut resumed = source.resume(1, &hint).unwrap();
     assert_eq!(seq(next(&mut resumed)), 2);
     assert!(matches!(next(&mut resumed), Item::Synced(2)));
 }
