@@ -11,6 +11,8 @@ use crate::api::schema::{
     SubscriptionEventEnvelope, SuccessResponse,
 };
 
+mod input_write;
+
 const MIN_ALLOCATION_PREVIEW_PROTOCOL: u32 = 26;
 
 /// How many times `request_value_retrying` sends a request again after a
@@ -62,6 +64,9 @@ impl ApiClient {
     }
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
+        if input_write::requires(&request.method) {
+            return input_write::call(self, request, input_write::CAP, None);
+        }
         self.check_allocation_preview_protocol(request, None)?;
         if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
             return Ok(refusal);
@@ -84,6 +89,9 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, ApiClientError> {
+        if input_write::requires(&request.method) {
+            return input_write::call(self, request, timeout, None);
+        }
         self.check_allocation_preview_protocol(request, Some(timeout))?;
         if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
             return Ok(refusal);
@@ -94,6 +102,9 @@ impl ApiClient {
 
     /// `request_value_with_timeout`, sent again with backoff when the socket
     /// answers with a transient error (#910).
+    ///
+    /// Completed-input calls are never retried, including before dispatch;
+    /// their shared path reports lost post-dispatch replies as unknown effect.
     ///
     /// Under load a read timeout surfaces as `EAGAIN` ("Resource temporarily
     /// unavailable", os error 11 on Linux): the server is there, just slow.
@@ -112,6 +123,9 @@ impl ApiClient {
         timeout: Duration,
         deadline: Option<Instant>,
     ) -> Result<serde_json::Value, ApiClientError> {
+        if input_write::requires(&request.method) {
+            return input_write::call(self, request, timeout, deadline);
+        }
         self.check_allocation_preview_protocol(request, Some(timeout))?;
         if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
             return Ok(refusal);
@@ -159,21 +173,50 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, Attempt> {
+        self.exchange_until(request, Instant::now() + timeout)
+    }
+
+    /// Preserve the requiring input caller's original absolute deadline.
+    fn exchange_until(
+        &self,
+        request: &Request,
+        deadline: Instant,
+    ) -> Result<serde_json::Value, Attempt> {
         let mut stream = self
             .connect()
             .map_err(|err| Attempt::BeforeSend(err.into()))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Attempt::BeforeSend(ApiClientError::Io(
+                io::ErrorKind::TimedOut.into(),
+            )));
+        }
         stream
-            .set_write_timeout(Some(timeout))
+            .set_write_timeout(Some(remaining))
             .map_err(|err| Attempt::BeforeSend(err.into()))?;
         stream
-            .set_read_timeout(Some(timeout))
+            .set_read_timeout(Some(remaining))
             .map_err(|err| Attempt::BeforeSend(err.into()))?;
         write_request(&mut stream, request).map_err(Attempt::AfterSend)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Attempt::AfterSend(ApiClientError::Io(
+                io::ErrorKind::TimedOut.into(),
+            )));
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| Attempt::AfterSend(e.into()))?;
 
         let mut reader = BufReader::new(stream);
-        let mut response = read_json_line(&mut reader).map_err(Attempt::AfterSend)?;
+        let mut response = read_json_line_until(&mut reader, deadline, Instant::now)
+            .map_err(Attempt::AfterSend)?;
         if matches!(request.method, Method::Ping(_)) {
             super::compatibility::observe_ping(self, &response);
+        } else if input_write::requires(&request.method) {
+            if input_write::normalize(&request.method, &mut response) {
+                response["id"] = serde_json::json!(request.id);
+            }
         } else {
             super::compatibility::normalize(self, &mut response);
         }
@@ -200,6 +243,11 @@ impl ApiClient {
         request: &Request,
         read_timeout: Option<Duration>,
     ) -> Result<(serde_json::Value, EventStream), ApiClientError> {
+        if input_write::requires(&request.method) {
+            return Err(ApiClientError::UnexpectedResult(
+                "input calls are not subscriptions".into(),
+            ));
+        }
         let mut stream = self.connect()?;
         write_request(&mut stream, request)?;
         if let Some(timeout) = read_timeout {
@@ -390,6 +438,38 @@ fn read_json_line<T: DeserializeOwned>(
     serde_json::from_str(&line).map_err(ApiClientError::Json)
 }
 
+/// Re-arm each partial read against one absolute cap; a trickled reply cannot
+/// renew the wait. The clock argument lets tests drive expiry without sleeping.
+fn read_json_line_until(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+) -> Result<serde_json::Value, ApiClientError> {
+    let mut line = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return Err(ApiClientError::Io(io::ErrorKind::TimedOut.into()));
+        }
+        reader.get_ref().set_read_timeout(Some(remaining))?;
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        let end = chunk.iter().position(|byte| *byte == b'\n');
+        let used = end.map_or(chunk.len(), |index| index + 1);
+        line.extend_from_slice(&chunk[..used]);
+        reader.consume(used);
+        if end.is_some() {
+            break;
+        }
+    }
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Err(ApiClientError::EmptyResponse);
+    }
+    serde_json::from_slice(&line).map_err(ApiClientError::Json)
+}
+
 fn read_optional_json_line<T: DeserializeOwned>(
     reader: &mut BufReader<UnixStream>,
 ) -> Result<Option<T>, ApiClientError> {
@@ -426,6 +506,27 @@ pub(crate) fn parse_response_value(
 mod tests {
     use super::*;
 
+    #[test]
+    fn s4_fragmented_reply_cannot_renew_the_absolute_cap() {
+        let (stream, mut producer) = UnixStream::pair().unwrap();
+        producer.write_all(b"{").unwrap();
+        let mut reader = BufReader::new(stream);
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(100);
+        let mut reads = 0;
+        let error = read_json_line_until(&mut reader, deadline, || {
+            reads += 1;
+            if reads == 1 {
+                start
+            } else {
+                deadline + Duration::from_nanos(1)
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(error,ApiClientError::Io(ref e) if e.kind()==io::ErrorKind::TimedOut));
+        assert_eq!(reads, 2, "each fragment rechecks the same cap");
+        drop(producer);
+    }
     #[test]
     fn allocation_dry_run_refuses_old_server_before_sending_allocation() {
         let path = std::env::temp_dir().join(format!("f459-{}.sock", std::process::id()));

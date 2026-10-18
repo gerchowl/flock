@@ -255,8 +255,8 @@ impl fmt::Display for BoundedError {
 ///
 /// - 60 s: creates / kills / closes / `AgentStart` — a write that may block
 ///   on filesystem work the operator sees.
-/// - 10 s: `PaneSendInput` — the brief submit is a human-latency write and
-///   must not stall the whole command if the socket goes quiet mid-type.
+/// - 10 s: raw input and guarded submit. The shared client reserves reply
+///   time and selects a shorter raw-write deadline (ADR-0028 §5a).
 /// - 2 s: every poll, get, and list.
 fn cap_for(method: &Method) -> Duration {
     match method {
@@ -265,7 +265,13 @@ fn cap_for(method: &Method) -> Duration {
         | Method::WorkspaceCreate(_)
         | Method::WorkspaceClose(_)
         | Method::AgentStart(_) => Duration::from_secs(60),
-        Method::PaneSendInput(_) | Method::PaneSubmit(_) => Duration::from_secs(10),
+        Method::PaneSendInput(_)
+        | Method::PaneSendKeys(_)
+        | Method::PaneSendText(_)
+        | Method::PaneWriteInput(_)
+        | Method::PaneWriteKeys(_)
+        | Method::PaneWriteText(_)
+        | Method::PaneSubmit(_) => Duration::from_secs(10),
         _ => REQUEST_TIMEOUT,
     }
 }
@@ -274,12 +280,22 @@ fn cap_for(method: &Method) -> Duration {
 ///
 /// The socket timeout is `cap_for(method).min(deadline - now)`; past the
 /// deadline, nothing is sent. On the way back the deadline is re-checked —
-/// a reply that lands late is a `TimedOut` regardless of its content, so a
+/// a read reply that lands late is a `TimedOut`, so a
 /// caller that has run out of clock does not act on what it read on the way
 /// past.
 ///
 /// Returns the raw response; the caller checks for a server-level `error`.
 fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Value, BoundedError> {
+    let input = matches!(
+        method,
+        Method::PaneSendInput(_)
+            | Method::PaneWriteInput(_)
+            | Method::PaneSubmit(_)
+            | Method::PaneWriteText(_)
+            | Method::PaneWriteKeys(_)
+            | Method::PaneSendText(_)
+            | Method::PaneSendKeys(_)
+    );
     let cap = cap_for(&method);
     // Check if deadline has already passed.
     if let Some(deadline) = deadline {
@@ -316,10 +332,8 @@ fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Valu
         response.map_err(|e| BoundedError::Transport(super::api_client_error_to_io(e)))?;
 
     // Check if deadline passed after the response.
-    if let Some(deadline) = deadline {
-        if Instant::now() >= deadline {
-            return Err(BoundedError::TimedOut);
-        }
+    if !input && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(BoundedError::TimedOut);
     }
 
     if let Some(message) = super::compatibility::capability_error_message(&response, "flk delegate")

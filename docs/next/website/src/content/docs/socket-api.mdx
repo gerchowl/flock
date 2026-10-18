@@ -349,9 +349,25 @@ margin inside the remaining caller budget. The write timeout covers writing,
 not observation. `agent.send` with `submit: true` keeps its guarded-submission
 budget and refuses a supplied raw-write timeout before any input.
 
-`pane_input_write_ack` remains false during rollout; client capability and caller
-budget enforcement follows in #1639. A lost paste reply is still an unknown
-outcome even when its writer completed; inspect the pane before another action.
+The server advertises `pane_input_write_ack: true`. Current clients probe it
+for each operation and bind raw input to `pane.write_*`; an absent capability
+or an unknown write method refuses with `server_version_gap` (exit 78), without
+falling back to a legacy send. Older wire clients can keep using `pane.send_*`.
+The shared CLI/MCP client uses a bounded 10-second response cap, selects at most
+8000 ms for a raw write, and reduces it further to leave a strict 1000 ms reply
+margin (plus 2000 ms observation for paste). Explicit write timeouts are upper
+bounds within that effective caller budget. A guarded `pane.submit` keeps its
+existing guarded budget; a caller with 8 seconds or less remaining refuses before
+input instead of shortening that server flow. An exhausted raw-write budget
+likewise refuses before dispatch with `invalid_params`.
+
+After a dispatched input loses its reply, clients return `input_write_unknown`
+(exit 8, retry `after_inspecting`), with null byte counts and
+`remainder_discarded: false`. These calls are never automatically retried, even
+on connect failure. A lost paste reply is unknown even when its writer completed;
+inspect the pane before another action. MCP preserves the same evidence and
+retry classification. This contract does not introduce cross-host pane-input
+forwarding or change mesh VERSION 5.
 
 ## Checks
 

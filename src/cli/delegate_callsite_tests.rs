@@ -852,3 +852,30 @@ fn keep_on_failure_is_a_start_flag() {
         assert!(parse_flags(verb, &args(&["d1", "--keep-on-failure"])).is_err());
     }
 }
+
+#[test]
+fn s4_delegate_write_budget_fits_the_actual_cap_and_preserves_unknown_effect() {
+    let peer = crate::test_support::ScriptedApi::new(vec![
+        (
+            "ping",
+            Some(
+                json!({"result":{"version":"fixture","protocol":crate::protocol::PROTOCOL_VERSION,"capabilities":{"pane_input_write_ack":true}}}),
+            ),
+        ),
+        ("pane.write_input", None),
+    ]);
+    std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, peer.path());
+    let method = Method::PaneSendInput(crate::api::schema::PaneSendInputParams {
+        write_timeout_ms: None,
+        pane_id: "p_fixture".into(),
+        text: "hello".into(),
+        keys: vec![],
+        raw: false,
+    });
+    assert_eq!(cap_for(&method), Duration::from_secs(10));
+    let result = bounded(method, Some(Instant::now() + Duration::from_millis(2500))).unwrap();
+    std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+    assert_eq!(result["error"]["code"], "input_write_unknown");
+    let calls = peer.finish();
+    assert!(calls[1]["params"]["write_timeout_ms"].as_u64().unwrap() < 1500);
+}
