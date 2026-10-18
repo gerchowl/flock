@@ -1134,7 +1134,12 @@ fn custody_completion_recovered_conflict_cannot_revoke_committed_key() {
     run(async {
         let _store = crate::mesh::runtime_store::TestStore::new();
         let mut r = setup(2521).await;
-        let d = mail(&r);
+        let mut d = mail(&r);
+        let mut payload: Value = serde_json::from_slice(&d.envelope.body).unwrap();
+        payload["message"]["intent"] = json!("blocking");
+        d.envelope.intent = "\"blocking\"".into();
+        d.envelope.body = serde_json::to_vec(&payload).unwrap();
+        crate::mesh::sign::seal(&mut d.envelope, &NodeIdentity::fixture([41; 32]));
         let record = &r.app.state.structured_agents.get(&r.case.id).unwrap().0;
         with_store(|s| {
             s.accept_bound_delivery(
@@ -1187,6 +1192,22 @@ fn custody_completion_recovered_conflict_cannot_revoke_committed_key() {
         assert_eq!(
             state, "delivered",
             "a replay conflict cannot revoke committed custody"
+        );
+        let budget = super::messages::blocking_budget_key(None, None);
+        let now = crate::app::notifications::now_ms();
+        assert!(
+            r.app
+                .mailboxes
+                .blocking_retry_after(&budget, now, 1)
+                .is_err(),
+            "committed recovery must apply the ordinary post-commit accounting"
+        );
+        assert!(
+            r.app
+                .mailboxes
+                .blocking_retry_after(&budget, now, 2)
+                .is_ok(),
+            "recovered accounting must happen exactly once"
         );
         assert_eq!(r.inputs().len(), 1);
         r.stop().await;

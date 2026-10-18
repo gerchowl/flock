@@ -30,6 +30,27 @@ pub(super) struct Ack {
     warnings: Vec<String>,
 }
 impl Ack {
+    fn custody(signed: &Envelope, mut message: PendingMessage, remote: bool) -> Self {
+        if remote {
+            message.from_pane = None;
+            message.from_host = Some(signed.key.origin_node.clone());
+            message.to_pane = signed.target_agent.clone();
+        }
+        message.message_key = Some(signed.key.clone());
+        Self {
+            key: signed.key.clone(),
+            signed: signed.clone(),
+            recovered: remote,
+            relay: remote,
+            message,
+            request: if remote {
+                None
+            } else {
+                signed.request_key.clone()
+            },
+            warnings: vec![],
+        }
+    }
     pub(super) fn refusal(
         &self,
         id: String,
@@ -235,7 +256,7 @@ impl App {
         &mut self,
         signed: &Envelope,
     ) -> Result<(super::structured_queue::Ticket, Ack), ErrorCode> {
-        let (generation, mut data) = self.verified_queue_custody(signed)?;
+        let (generation, data) = self.verified_queue_custody(signed)?;
         // Recovery snapshots can predate an owner's terminal refusal.
         let current = stored(|s| s.get(&signed.key))?.ok_or(ErrorCode::MessageNotFound)?;
         match current.state.as_str() {
@@ -250,11 +271,7 @@ impl App {
             .runtime(&signed.target_agent, generation)
             .ok_or(ErrorCode::QueueSourceCold)?;
         let remote = signed.key.origin_node != self.node_id.as_deref().unwrap_or_default();
-        if remote {
-            data.message.from_pane = None;
-            data.message.from_host = Some(signed.key.origin_node.clone());
-            data.message.to_pane = signed.target_agent.clone();
-        }
+        let ack = Ack::custody(signed, data.message, remote);
         let principal = if remote {
             Principal::Origin(Producer::NodeAsserted {
                 sender: signed.sender.clone(),
@@ -272,37 +289,22 @@ impl App {
             state: State::Queued,
             delivery: Delivery::AtIdle,
             priority: Priority::Normal,
-            body: data.message.body.clone(),
+            body: ack.message.body.clone(),
             attachments: vec![],
             metadata: [
                 ("message_key".into(), json!(signed.key)),
                 ("correlation_id".into(), json!(signed.correlation_id)),
                 ("in_reply_to".into(), json!(signed.in_reply_to)),
-                ("intent".into(), json!(data.message.intent)),
+                ("intent".into(), json!(ack.message.intent)),
             ]
             .into(),
         };
         let ticket =
             self.structured_enqueue(signed.target_agent.clone(), generation, item, principal)?;
-        data.message.message_key = Some(signed.key.clone());
-        Ok((
-            ticket,
-            Ack {
-                key: signed.key.clone(),
-                signed: signed.clone(),
-                recovered: remote,
-                relay: remote,
-                message: data.message,
-                request: if remote {
-                    None
-                } else {
-                    signed.request_key.clone()
-                },
-                warnings: vec![],
-            },
-        ))
+        Ok((ticket, ack))
     }
-    /// Recovery waits for an owner/capacity wake, never writes a journal itself.
+    /// Recovery runs on owner/capacity wakes and its scheduled backoff deadline.
+    /// The queue journal is written only by its owner.
     /// Unknown origin is retained in custody and refused, never re-attributed.
     pub(crate) fn finish_structured_messages(&mut self, changed: bool, now: std::time::Instant) {
         for (ack, code) in std::mem::take(&mut self.structured_sends.failed) {
@@ -337,51 +339,7 @@ impl App {
                 self.retry_queue_custody(ack.signed, code);
                 continue;
             }
-            self.structured_sends.retries.remove(&ack.key);
-            self.mailboxes.record_delivered(&ack.message);
-            if settled {
-                continue;
-            }
-            if ack.message.intent == crate::api::schema::MsgIntent::Blocking {
-                self.mailboxes.record_blocking(
-                    &if ack.relay {
-                        super::messages::blocking_budget_key(None, None)
-                    } else {
-                        super::messages::blocking_budget_key(
-                            ack.message.from_agent.as_deref(),
-                            ack.message.from_pane.as_deref(),
-                        )
-                    },
-                    ack.message.enqueued_at_ms,
-                );
-            }
-            if self.state.config.msg.channel_push {
-                if let (Some(key), Some(agent)) = (ack.request, ack.message.from_agent) {
-                    let result: Result<(), ErrorCode> = (|| {
-                        let original =
-                            stored(|s| s.get(&key))?.ok_or(ErrorCode::MessageNotFound)?;
-                        if original.envelope.target_agent != agent {
-                            return Ok(());
-                        }
-                        let legacy = self
-                            .mailboxes
-                            .queued_message(ack.message.in_reply_to.as_deref().unwrap_or_default())
-                            .filter(|m| m.message_key.as_ref() == Some(&key))
-                            .cloned();
-                        if let Some(message) = legacy {
-                            self.settle_original_in(&message.to_pane, &message.correlation_id);
-                        } else {
-                            stored(|s| {
-                                s.finish(&key, Outcome::Read, super::messages::now_ms() as i64)
-                            })?;
-                        }
-                        Ok(())
-                    })();
-                    if let Err(code) = result {
-                        crate::logging::mesh_custody_failed("structured-settle", code.as_str());
-                    }
-                }
-            }
+            self.record_queue_delivery(ack, settled);
         }
         for signed in std::mem::take(&mut self.structured_sends.recovering) {
             if self.fleet_pause.paused
@@ -408,6 +366,53 @@ impl App {
             }
         }
     }
+    /// Apply the same post-commit effects to live acknowledgements and proven replays.
+    fn record_queue_delivery(&mut self, ack: Ack, settled: bool) {
+        self.structured_sends.retries.remove(&ack.key);
+        self.mailboxes.record_delivered(&ack.message);
+        if settled {
+            return;
+        }
+        if ack.message.intent == crate::api::schema::MsgIntent::Blocking {
+            self.mailboxes.record_blocking(
+                &if ack.relay {
+                    super::messages::blocking_budget_key(None, None)
+                } else {
+                    super::messages::blocking_budget_key(
+                        ack.message.from_agent.as_deref(),
+                        ack.message.from_pane.as_deref(),
+                    )
+                },
+                ack.message.enqueued_at_ms,
+            );
+        }
+        if self.state.config.msg.channel_push {
+            if let (Some(key), Some(agent)) = (ack.request, ack.message.from_agent) {
+                let result: Result<(), ErrorCode> = (|| {
+                    let original = stored(|s| s.get(&key))?.ok_or(ErrorCode::MessageNotFound)?;
+                    if original.envelope.target_agent != agent {
+                        return Ok(());
+                    }
+                    let legacy = self
+                        .mailboxes
+                        .queued_message(ack.message.in_reply_to.as_deref().unwrap_or_default())
+                        .filter(|m| m.message_key.as_ref() == Some(&key))
+                        .cloned();
+                    if let Some(message) = legacy {
+                        self.settle_original_in(&message.to_pane, &message.correlation_id);
+                    } else {
+                        stored(|s| {
+                            s.finish(&key, Outcome::Read, super::messages::now_ms() as i64)
+                        })?;
+                    }
+                    Ok(())
+                })();
+                if let Err(code) = result {
+                    crate::logging::mesh_custody_failed("structured-settle", code.as_str());
+                }
+            }
+        }
+    }
     /// Retry the same authenticated envelope using the existing bounded backoff.
     /// Permanent refusals use the ordinary status event, never a log-only outcome.
     pub(super) fn retry_queue_custody(&mut self, signed: Envelope, code: ErrorCode) -> ErrorCode {
@@ -422,17 +427,22 @@ impl App {
         let committed = self
             .structured_workers
             .queue_custody_committed(&signed.target_agent, &signed.key);
-        if committed == Some(true)
-            && stored(|s| {
+        let ack = if committed == Some(true) {
+            self.node_id.as_deref().and_then(|origin| {
+                payload(&signed).ok().map(|data| {
+                    Ack::custody(&signed, data.message, signed.key.origin_node != origin)
+                })
+            })
+        } else {
+            None
+        };
+        if let Some(ack) = ack.filter(|_| {
+            stored(|s| {
                 s.settle_queue_admission(&signed.key, None, super::messages::now_ms() as i64)
             })
             .is_ok()
-        {
-            self.structured_sends.retries.remove(&signed.key);
-            if let Ok(mut data) = payload(&signed) {
-                data.message.message_key = Some(signed.key.clone());
-                self.mailboxes.record_delivered(&data.message);
-            }
+        }) {
+            self.record_queue_delivery(ack, false);
             return ErrorCode::InputWriteUnknown;
         }
         if committed == Some(false)

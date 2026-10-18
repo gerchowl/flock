@@ -240,6 +240,7 @@ including on an otherwise idle headless server; fleet pause suspends admission.
 The sole journal owner retains an in-memory index of committed custody keys,
 rebuilt from the journal on reopen. Recovery checks that proof before refusing a
 key: a later admission conflict cannot revoke an already committed message.
+First settlement still applies blocking accounting and reply settlement once.
 While ownership is unknown, custody remains retryable instead of being revoked.
 Permanent refusals settle the
 existing `refused` or `recipient_gone` outcome and emit `message_delivered` with
