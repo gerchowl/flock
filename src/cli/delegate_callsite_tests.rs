@@ -880,6 +880,25 @@ fn s4_delegate_write_budget_fits_the_actual_cap_and_preserves_unknown_effect() {
     assert!(calls[1]["params"]["write_timeout_ms"].as_u64().unwrap() < 1500);
 }
 
+/// Restore both caller settings on success or unwinding, including absent values.
+struct SubmitTestEnv([(&'static str, Option<std::ffi::OsString>); 2]);
+impl SubmitTestEnv {
+    fn capture() -> Self {
+        Self(["XDG_STATE_HOME", "FLOCK_SOCKET_PATH"].map(|key| (key, std::env::var_os(key))))
+    }
+}
+impl Drop for SubmitTestEnv {
+    fn drop(&mut self) {
+        for (key, previous) in &self.0 {
+            if let Some(value) = previous {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}
+
 /// Run the real submit client and start/send completion handlers against an isolated peer.
 fn r2_unknown_submit_keeps_round(start: bool, failure: Option<&str>, codex: bool) {
     for &keep_on_failure in if start {
@@ -888,6 +907,7 @@ fn r2_unknown_submit_keeps_round(start: bool, failure: Option<&str>, codex: bool
         &[false][..]
     } {
         let root = crate::test_support::TempDir::socket();
+        let _environment = SubmitTestEnv::capture();
         std::env::set_var("XDG_STATE_HOME", root.path());
         let mut script = vec![
         ("ping", Some(json!({"result":{"capabilities":{"pane_input_write_ack":true}}}))),
@@ -942,8 +962,6 @@ fn r2_unknown_submit_keeps_round(start: bool, failure: Option<&str>, codex: bool
             call["method"].as_str(),
             Some("workspace.close" | "worktree.kill")
         )));
-        std::env::remove_var("FLOCK_SOCKET_PATH");
-        std::env::remove_var("XDG_STATE_HOME");
     }
 }
 
@@ -974,6 +992,6 @@ fn r2_submit_cap_exceeds_the_server_waits_and_reply_margin() {
         self_submit_confirmed: None,
     });
     // Three 1s draft steps, three 2s windows, a 120ms gap and seven 50ms polls.
-    let server_waits = Duration::from_millis(9470);
+    let server_waits = crate::app::guarded_submit::SUBMIT_WAIT_BOUND;
     assert!(cap_for(&method) > server_waits + Duration::from_secs(1));
 }

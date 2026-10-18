@@ -183,6 +183,17 @@ impl ApiClient {
         request: &Request,
         deadline: Instant,
     ) -> Result<serde_json::Value, Attempt> {
+        self.exchange_until_after_write(request, deadline, || {})
+    }
+
+    /// Test seam: gate the first read until the peer has replied and closed.
+    /// Production uses a no-op hook and the same transport path.
+    fn exchange_until_after_write(
+        &self,
+        request: &Request,
+        deadline: Instant,
+        after_write: impl FnOnce(),
+    ) -> Result<serde_json::Value, Attempt> {
         let mut stream = self
             .connect()
             .map_err(|err| Attempt::BeforeSend(err.into()))?;
@@ -199,19 +210,9 @@ impl ApiClient {
             .set_read_timeout(Some(remaining))
             .map_err(|err| Attempt::BeforeSend(err.into()))?;
         write_request(&mut stream, request).map_err(Attempt::AfterSend)?;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Attempt::AfterSend(ApiClientError::Io(
-                io::ErrorKind::TimedOut.into(),
-            )));
-        }
-        stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|e| Attempt::AfterSend(e.into()))?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response = read_json_line_until(&mut reader, deadline, Instant::now)
-            .map_err(Attempt::AfterSend)?;
+        after_write();
+        let mut response =
+            read_json_line_until(&stream, deadline, Instant::now).map_err(Attempt::AfterSend)?;
         if matches!(request.method, Method::Ping(_)) {
             super::compatibility::observe_ping(self, &response);
         } else if input_write::requires(&request.method) {
@@ -439,28 +440,41 @@ fn read_json_line<T: DeserializeOwned>(
     serde_json::from_str(&line).map_err(ApiClientError::Json)
 }
 
-/// Re-arm each partial read against one absolute cap; a trickled reply cannot
-/// renew the wait. The clock argument lets tests drive expiry without sleeping.
+/// Poll each partial read against one absolute cap without post-write setsockopt.
+/// Peer close is readable: queued reply bytes must survive it. The clock seam
+/// lets tests drive expiry without sleeps or input replay.
 fn read_json_line_until(
-    reader: &mut BufReader<UnixStream>,
+    stream: &UnixStream,
     deadline: Instant,
     mut now: impl FnMut() -> Instant,
 ) -> Result<serde_json::Value, ApiClientError> {
     let mut line = Vec::new();
+    let mut chunk = [0; 8192];
     loop {
         let remaining = deadline.saturating_duration_since(now());
         if remaining.is_zero() {
             return Err(ApiClientError::Io(io::ErrorKind::TimedOut.into()));
         }
-        reader.get_ref().set_read_timeout(Some(remaining))?;
-        let chunk = reader.fill_buf()?;
-        if chunk.is_empty() {
+        let read = match crate::platform::socket::read_ready(stream, &mut chunk, remaining) {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if read == 0 {
             break;
         }
+        let chunk = &chunk[..read];
         let end = chunk.iter().position(|byte| *byte == b'\n');
-        let used = end.map_or(chunk.len(), |index| index + 1);
-        line.extend_from_slice(&chunk[..used]);
-        reader.consume(used);
+        line.extend_from_slice(&chunk[..end.map_or(chunk.len(), |index| index + 1)]);
         if end.is_some() {
             break;
         }
@@ -507,15 +521,80 @@ pub(crate) fn parse_response_value(
 mod tests {
     use super::*;
 
+    /// Joining the peer gates the client after write until the reply and EOF exist.
+    fn closed_reply(method: Method, result: serde_json::Value) {
+        let tag = if matches!(method, Method::PaneSubmit(_)) {
+            "pane.submit"
+        } else {
+            "ping"
+        };
+        let peer = crate::test_support::ScriptedApi::new(vec![(tag, Some(result.clone()))]);
+        let client = peer.client();
+        let request = Request {
+            id: "closed-peer".into(),
+            method,
+        };
+        let response = client
+            .exchange_until_after_write(&request, Instant::now() + input_write::SUBMIT_CAP, || {
+                assert_eq!(peer.finish().len(), 1);
+            })
+            .unwrap_or_else(|error| match error {
+                Attempt::BeforeSend(error) => panic!("before dispatch: {error}"),
+                Attempt::AfterSend(error) => panic!("discarded a complete reply: {error}"),
+            });
+        let mut expected = result;
+        expected["id"] = serde_json::json!(request.id);
+        assert_eq!(response, expected);
+    }
+    fn closed_submit() -> Method {
+        Method::PaneSubmit(
+            serde_json::from_value(serde_json::json!({
+            "pane_id":"fixture-pane", "text":"brief" }))
+            .unwrap(),
+        )
+    }
+    #[test]
+    fn r3_closed_peer_submit_refusal_stays_a_refusal() {
+        closed_reply(
+            closed_submit(),
+            serde_json::json!({"error":{
+            "code":"input_not_empty", "message":"draft is present"}}),
+        );
+    }
+    #[test]
+    fn r3_closed_peer_submit_success_stays_a_success() {
+        closed_reply(
+            closed_submit(),
+            serde_json::json!({"result":{
+            "type":"guarded_submit", "outcome":"accepted", "reason":null, "retried":false}}),
+        );
+    }
+    #[test]
+    fn r3_closed_peer_ping_refusal_stays_a_refusal() {
+        closed_reply(
+            Method::Ping(PingParams::default()),
+            serde_json::json!({"error":{
+            "code":"invalid_params", "message":"invalid probe"}}),
+        );
+    }
+    #[test]
+    fn r3_closed_peer_ping_success_stays_a_success() {
+        closed_reply(
+            Method::Ping(PingParams::default()),
+            serde_json::json!({"result":{
+            "type":"pong", "pid":1, "version":"fixture", "protocol_version":crate::protocol::PROTOCOL_VERSION,
+            "capabilities":{"pane_input_write_ack":true}}}),
+        );
+    }
+
     #[test]
     fn s4_fragmented_reply_cannot_renew_the_absolute_cap() {
         let (stream, mut producer) = UnixStream::pair().unwrap();
         producer.write_all(b"{").unwrap();
-        let mut reader = BufReader::new(stream);
         let start = Instant::now();
         let deadline = start + Duration::from_millis(100);
         let mut reads = 0;
-        let error = read_json_line_until(&mut reader, deadline, || {
+        let error = read_json_line_until(&stream, deadline, || {
             reads += 1;
             if reads == 1 {
                 start
@@ -751,7 +830,7 @@ mod tests {
             .request_value_retrying(&close, ATTEMPT, None)
             .unwrap_err();
         assert!(
-            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::WouldBlock),
+            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::TimedOut),
             "the timeout is reported as it happened: {error:?}"
         );
         let (listener, seen, _held) = server.join().unwrap();
@@ -769,7 +848,7 @@ mod tests {
             .request_value_retrying(&agent_get(), ATTEMPT, None)
             .unwrap_err();
         assert!(
-            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::WouldBlock),
+            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::TimedOut),
             "{error:?}"
         );
         let (listener, seen, _held) = server.join().unwrap();
