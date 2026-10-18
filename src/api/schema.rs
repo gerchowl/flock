@@ -938,6 +938,11 @@ pub struct WorktreeKillParams {
     /// routed through the workspace, so the workspace is closed with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Explicit repository proof for a path kill, even with no open workspace.
+    /// Must be absolute and cannot be combined with `workspace_id`. Only an
+    /// exact registered linked root of this repo is eligible for removal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// Remove the checkout even when it has uncommitted or untracked changes.
     /// Never widens the BRANCH decision — an unmerged branch survives `force`.
     #[serde(default)]
