@@ -1,8 +1,8 @@
 # ADR-0038: The GUI is a tiled workbench over one wire: a client that holds only presentation state, artifacts in opaque-origin sandboxes with feedback through questions, and goals and work as records on the same log
 
-- Status: Proposed; the §11 owner decisions were taken on 2026-10-16 (recorded on #1591)
-- Date: 2026-10-15, amended 2026-10-16 (#1606; then #1641: the client side of ADR-0036 §5a's transport recovery)
-- Issues: [#1307](https://github.com/gerchowl/flock/issues/1307) (ADR-0036 slices), [#1310](https://github.com/gerchowl/flock/issues/1310), [#1323](https://github.com/gerchowl/flock/issues/1323) (superseded by the vigil decision), [#1614](https://github.com/gerchowl/flock/issues/1614), [#1380](https://github.com/gerchowl/flock/issues/1380), [#1401](https://github.com/gerchowl/flock/issues/1401), [#1402](https://github.com/gerchowl/flock/issues/1402), [#1546](https://github.com/gerchowl/flock/issues/1546) (settled by ADR-0036 §5a), [#1641](https://github.com/gerchowl/flock/issues/1641), [#1076](https://github.com/gerchowl/flock/issues/1076)
+- Status: Proposed; the §11 owner decisions 1–11 were taken on 2026-10-16 and 2026-10-17 (recorded on #1591); decisions 12–14 (§5b) are open
+- Date: 2026-10-15, amended 2026-10-16 (#1606; then #1641: the client side of ADR-0036 §5a's transport recovery), and 2026-10-18 (#1717: §5b, question threads)
+- Issues: [#1307](https://github.com/gerchowl/flock/issues/1307) (ADR-0036 slices), [#1310](https://github.com/gerchowl/flock/issues/1310), [#1323](https://github.com/gerchowl/flock/issues/1323) (superseded by the vigil decision), [#1614](https://github.com/gerchowl/flock/issues/1614), [#1380](https://github.com/gerchowl/flock/issues/1380), [#1401](https://github.com/gerchowl/flock/issues/1401), [#1402](https://github.com/gerchowl/flock/issues/1402), [#1546](https://github.com/gerchowl/flock/issues/1546) (settled by ADR-0036 §5a), [#1641](https://github.com/gerchowl/flock/issues/1641), [#1076](https://github.com/gerchowl/flock/issues/1076), [#1717](https://github.com/gerchowl/flock/issues/1717) (question threads, §5b), [#1719](https://github.com/gerchowl/flock/issues/1719), [#1673](https://github.com/gerchowl/flock/issues/1673)
 - Builds on: ADR-0036 §5–§8, §10a, §12 (wire contract, generated types, reference client, unknown events, collapsible turns, reserved extension points); ADR-0011 (conversation-first GUI, Accepted, not built); ADR-0012 (read model); ADR-0026 (mesh); ADR-0027 (delegate edges); ADR-0030 and ADR-0031 (goals); ADR-0034 (question routing); ADR-0035 (repo owner)
 - Wireframes: [`0038-gui/wireframes.html`](0038-gui/wireframes.html) (static, self-contained; open it in a browser)
 - Implemented: nothing.
@@ -467,6 +467,112 @@ pub struct WorkEdge { from: WorkId, to: WorkId, kind: WorkEdgeKind /* contains |
 
 Layout and tile state have **no wire type** (§2).
 
+### 5b. Question threads (#1717)
+
+The owner's direction of 2026-10-16 (#1717, quoted there verbatim) asks for three things:
+1. One question surface. Every question an agent asks reaches the person through the GUI inbox.
+2. A question does not block, unless the agent has literally nothing else to work on.
+3. A person can take a question as a **thread**. The asking agent is forked at the question, the person discusses it with the fork, and the fork's compact answer is **merged back**. That closes the question, while the original agent keeps working throughout.
+
+This section is the GUI side. It builds on ADR-0036 §2a, which already holds:
+- the question record, with its `ask_point`;
+- `question.fork` and `question.resolve`, and exactly one reply;
+- ADR-0036 §9's forks at a message boundary.
+
+The changes ADR-0036 needs are for its owner to make, and are listed at the end of this section. The fork-and-merge-back mechanism is shared with #1719's aside capture (below).
+
+**One channel.** An agent asks through `flock_question_ask` (ADR-0034 §3, ADR-0036 S6c). Every question record becomes an `InboxItem { kind: question }` (§5), whatever produced it: the MCP tool, a stdio `AskUserQuestion` until ADR-0036 retires that as a question path, or ADR-0036's E9 recap parsers. The inbox never shows which channel a question came through. The card shows the prompt, the choices, `context` and `refs`, and the blocking state below.
+
+**The five decisions.** Each is stated with its reason.
+
+1. **Origin: the asker's lease.**
+   - A question's `asked_by` is the agent whose session lease admitted the `flock_question_ask` call. That is ADR-0036 §1a's lease-based caller identity (S3b #1426), with the scoped session credential of #1734.
+   - A `pty` asker has no lease. Its origin is the pane attribution that ADR-0008 and ADR-0026 already give its socket calls.
+   - The tool takes no asker field. A call that reaches neither a lease nor a pane is refused, as every anonymous agent send is (ADR-0036 §1a).
+   - The card shows `asked_by` as server-attested. The prompt, `context` and `refs` are the agent's own words: they are rendered as untrusted text, never as a control.
+   - *Reason:* a thread forks the asker, and an answer is delivered into the asker's queue. An origin the agent could name itself would fork, and answer, the wrong agent.
+2. **Fork points: at the question when the session allows it, said plainly when it doesn't.**
+   - *Take as thread* sends `question.fork` at the question's `ask_point`.
+   - Inside the current compaction segment, that is ADR-0036 §9's `resume_at` path (E9), a warm cache read.
+   - Behind the last `compact_boundary` (ADR-0036 E11), it is that section's `rehydrate` path from the native transcript's byte prefix (ADR-0036 owner decision 14). It is a cache write, not a read.
+   - Before forking, the card shows the path and the expected cost (ADR-0036 §9's `dry_run`), and the person confirms.
+   - If that prefix is no longer stored, the fork at the question is refused with `invalid_fork_point`, and the card offers only *Thread from now*.
+   - A `pty` asker can fork only at its latest point (ADR-0036 §9, `latest`). Its card offers only *Thread from now* and says that the fork starts after the question, with everything the agent did since.
+   - *Reason:* the person must know what the fork has seen. A thread presented as "at the question" that started later, or that paid a cold write unannounced, would mislead both the discussion and the bill.
+3. **Restart and handoff: ADR-0028's lifetime rules, nothing new.**
+   - The question record is durable (ADR-0028 §8a), so an open question stays open across a restart or an orderly handoff of its asker.
+   - A held `blocking` call ends with the asker's process. Its record stays open, and a later answer is delivered as the deferred `reply` item (ADR-0036 §2a).
+   - A thread's fork is an agent of its own, so it survives with its tile. Any wait pinned to the asker's old epoch ends with `observation_reset` (`after_inspecting`; ADR-0028, #1577). The thread tile re-reads the question record and the asker, then re-subscribes under §3.
+   - If the asker's identity is replaced, its pinned question ends with `subject_replaced` (`never`). The record closes as `withdrawn`, and the thread's merge-back is refused under the stale-answer rule below.
+   - The fork's own restart follows the same rules.
+   - *Reason:* ADR-0028 already says which waits survive and which never come back. A question tied to a replaced agent must not be answered into its successor.
+4. **Who may answer: only the owner's authenticated client applies an answer.**
+   - An answer, a merge-back included, is applied only by `inbox.answer` from a GUI principal that authenticates as the owner (#1673). That is the `operate`-scoped token, which ADR-0036 §5 makes the operator's identity.
+   - For a question, a token with only the `answer` scope does not suffice. This narrows §5's `inbox.answer` row for questions. Permission prompts and feedback requests keep that row's scope.
+   - An answer never comes from another agent's pane input, and never from an agent's tool call.
+   - The fork **composes** the answer: its `question.resolve` records a **proposal**, not an answer. The person **applies** it.
+   - *Reason:* in #1673 a stray keystroke from another agent was recorded as an owner decision. An answer carries the owner's authority, so only the owner may apply one.
+5. **Blocking: the asker decides, and says why.**
+   - `flock_question_ask { blocking: true }` requires a non-empty `blocking_reason`: what the asker cannot proceed on, and why nothing else is open.
+   - Without `blocking`, a question is non-blocking. The server records the reason and never decides on the agent's behalf: ADR-0036 S6d's System-One check no longer holds a turn. A held turn is the asker's choice under the tool contract.
+   - The GUI orders a blocking card first (§1) and shows "Blocking: <reason>" in the agent's own words. The agent's row shows the amber *needs you* mark (§2a), and its composer line states the server's phase (`waiting_on_human`).
+   - A non-blocking card puts no mark on the agent. The GUI never judges whether a reason is honest.
+   - *Reason:* "literally nothing else to work on" is a fact only the agent can know. A server-side guess either blocks an agent that had other work, or misses an honest blocker. A stated reason makes the choice visible and open to review.
+
+**A thread's life.** States follow the question record: `open → threaded → proposed → answered | withdrawn | expired`.
+- *Take as thread* forks the asker (decision 2) and opens the fork's `transcript` tile (§2) with its composer (§2a). It is not a new tile kind: the subject is the fork, and the tile header names the question it answers.
+- By default the thread fork is read-only: ADR-0036 §9's E12 `tools` (for example `Read,Grep,Glob`) under a deny-all permission policy. A thread is for discussion; work stays with the asker. Whether a person can widen a fork's tools is owner decision 14.
+- The fork's last step is the proposal (decision 4).
+- *Review and merge back* shows the proposal as editable text, next to the question and its choices. *Apply* sends `inbox.answer { item_id, text, proposal_id }`. Whether the person must review the proposal is owner decision 12. This record assumes yes.
+- Apply is §3's atomic verify-then-apply: the same question id, still open. The server then records `question.answered { via: fork }` and queues the one `reply` item to the asker (ADR-0036 §2a).
+- What happens to the fork after the merge is owner decision 13.
+
+**The card in each state** (§2a's inbox region):
+
+| State | The card shows | Actions |
+|---|---|---|
+| `open` | prompt, choices, `context`, `refs`; "Blocking: <reason>" when blocking | one button per choice, *Edit…*, *Take as thread* (or *Thread from now*, decision 2) |
+| `threaded` | as `open`, plus each thread's turn count | as `open`, plus *Open thread*. Answering in place stays possible. |
+| `proposed` | as `threaded`, plus the proposal's first lines | *Review and merge back* |
+| `answered`, `withdrawn`, `expired` | nothing: the card leaves when the server closes the item (§1). Open thread tiles state how the question ended. | none |
+
+**The stale-answer rule.** The question may be answered in place, answered from another thread, or closed (`withdrawn` or `expired`) while a thread runs. Applying the proposal then fails with `question_closed`, as §3 already requires for any stale answer, and the card shows the question's current state. The proposal is kept as text. The person may send it to the asker as an ordinary message through the composer, but nothing sends it automatically. Of several threads on one question, the first applied wins, and the others' cards say so.
+
+**Shared with #1719.** #1719's aside capture routes a remark to a side context and leaves a breadcrumb. It reuses this mechanism:
+- a fork at a boundary (ADR-0036 §9);
+- a return that is a proposal the person reviews;
+- the fork's tile and its proposal review;
+- the atomic apply.
+
+The only difference is what the return becomes. A question thread applies an answer through `inbox.answer`. An aside's return is an ADR-0036 §9 `finding` item, or a filed issue, applied the same way. The question record, the stale-answer rule and the blocking contract are not shared.
+
+**Wire additions** (sketch; names final in G14, §10):
+
+```rust
+// §5's InboxItem gains:
+blocking_reason: Option<String>,               // the asker's words; required when blocking
+threads: Vec<ThreadRef>,
+fork_points: ForkPoints,                       // which forks are possible, and their cost
+
+pub struct ThreadRef   { fork_agent: AgentId, turns: u32, proposal: Option<Proposal>, closed: Option<ThreadEnd> }
+pub struct Proposal    { proposal_id: ProposalId, text: RenderedText, created_ms: u64 }
+pub struct ForkPoints  { at_question: Option<ForkCost> /* None: pty, or the prefix is gone */, latest: ForkCost }
+pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | fork_session */, prefix_tokens: u64, warm: bool }
+```
+
+| Verb | Scope | Effect |
+|---|---|---|
+| `inbox.thread { item_id, at: question \| latest, dry_run? }` | `operate` | `question.fork` with `return_to_parent` and `answers`, read-only by default. `dry_run` returns the cost only. |
+| `inbox.answer { item_id, choice_index?, text?, proposal_id? }` | `operate` for a question (decision 4) | As in §5, and with `proposal_id` it records `via: fork`. Atomic (§3). |
+
+**What ADR-0036 must change** (its owner amends it; this record does not):
+- owner decision 3's channel order;
+- `flock_question_ask`'s `blocking` default and `blocking_reason`, and S6d's check no longer holding;
+- the lease origin;
+- `question.resolve` as a proposal;
+- `subject_replaced` closing a question as `withdrawn`;
+- the fork-point cost on the inbox item.
+
 ### 6. Shells: one bundle, two hosts, one transport
 
 - **One bundle.**
@@ -607,14 +713,20 @@ Each slice is at most about 400 production lines; TypeScript counts the same. **
 | G11 | Artifact carriage over the mesh | G6, ADR-0026 | no | 300 |
 | G12 | `work` records, phase 2 (§8) | G8, owner decision 7 | no | 400 |
 | G13 | Telemetry views (§4a): `telemetry/traces`, `telemetry/logs` and `audit` reads in the server; trace, logs and audit tiles | S7, #1614, a vigil release (#1300) | no | 400 |
+| S6e | ADR-0036's question amendment, by its owner (§5b, "What ADR-0036 must change"): `flock_question_ask` as the one question path, `blocking` false by default with a required `blocking_reason`, the lease as the attested origin, `question.resolve` as a proposal, `subject_replaced` closing a question as `withdrawn` | S6b, S6c, S3b #1426, #1734 | no | ADR + 250 |
+| G14 | Threads on the wire: `InboxItem`'s `blocking_reason`, `threads` and `fork_points` (with `dry_run` cost), `inbox.thread`, `inbox.answer { proposal_id }`, and the `operate` check for question answers (#1673) | S6e, G5, S12, S8b | no | 300 |
+| G15 | The thread UX: *Take as thread* and *Thread from now*, the fork's tile, *Review and merge back* with editing, the card states and the stale-answer display (§5b) | G14, S9a, G2 | no | 400 TS |
+| G16 | Thread lifecycle against the scripted server: asker restart and handoff (`observation_reset`), identity replacement (`subject_replaced` → `withdrawn`), two threads racing on one question, a `pty` asker | G15, #1577 | no | 200 TS |
 
 Before S3 means a slice depends on nothing in the -p chain's runtime (S3a, S3b). S8a, S7a, G1, G2, G3 and the G9 shell qualify. Everything that serves live data needs S7 and therefore S3.
+
+S6e, G14, G15 and G16 are post-MVP and run in that order. #1719's aside capture reuses G14's proposals and G15's review (§5b); it is not sliced here.
 
 The first end-to-end milestone is **"a structured agent in a browser tile"**: G1 + G2 + G3 + S7 + S8b + S9a, against the -p MVP's runtime. It follows the MVP and does not compete with it.
 
 ### 11. Owner decisions (decided by the owner, 2026-10-16, recorded on #1591)
 
-Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day. Item 11 was added on 2026-10-17, when the owner chose between two wireframe directions after rejecting the first preview.
+Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day. Item 11 was added on 2026-10-17, when the owner chose between two wireframe directions after rejecting the first preview. Items 12–14 were added on 2026-10-18 with §5b (#1717) and are open; each names a recommended outcome and its cost.
 
 | # | Decision | Outcome | Consequence |
 |---|---|---|---|
@@ -629,6 +741,9 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 | 9 | Layout persistence | **Decided: client-local per device**; server-synced named layouts later | A layout doesn't follow you between devices. |
 | 10 | Client build tool (added 2026-10-16) | **Decided: Vite with `vite-plugin-solid`.** Bun remains the package manager and test runner. Output stays static assets embedded by `rust-embed`, and the Tauri v2 shell loads the same bundle. | Hot reload in development and the standard Tauri v2 setup. A Vite config joins the toolchain, pinned through `bun.lock`. ADR-0036 §7 is amended to match. |
 | 11 | MVP workbench design (added 2026-10-17, after the owner rejected the first preview's look and UX) | **Decided: "Mission control"** (§2a): sidebar, focus pane and inbox on desktop; inbox-first tabs on the phone | The tile manager becomes machinery under that screen. G2's views follow §2a. |
+| 12 | Does the person review, and may edit, a thread's proposal before it is applied? (§5b) | **Open: owner.** Recommended: yes, always. The proposal opens as editable text, and only *Apply* answers. | Cost: one more step per thread, and the asker waits on the person even when the proposal is right. Applying without review would let a fork's words carry the owner's authority, which §5b decision 4 excludes. |
+| 13 | What happens to a thread's fork after the merge-back? (§5b) | **Open: owner.** Recommended: it is stopped and kept in the lineage (the `AgentForked` edge, its transcript under ADR-0036 §4's retention), and the sidebar folds ended threads. | Cost: stored transcripts, and lineage rows to fold. Reaping at the merge saves the storage but loses the record of how the answer came about. A rehydrated copy is deleted when the fork ends either way (ADR-0036 owner decision 14). |
+| 14 | A thread fork's tools (§5b) | **Open: owner.** Recommended: read-only (ADR-0036 E12's `tools` under a deny-all permission policy), with no way to widen them from the GUI. | Cost: a fork that would have to run a command to answer must say so in its proposal instead. Widening needs a per-thread permission preset (ADR-0036 S19, #1321), which would be a later slice. |
 
 ## Failure modes and known limits
 
@@ -641,6 +756,11 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 - **A stale command after the idempotency window** is shown as "unknown outcome", never resent automatically.
 - **Cross-node commands** are refused until #1380. The UI shows the refusal in place.
 - **Layout loss.** Clearing browser storage resets the layout. Server state is unaffected.
+- **A thread's proposal is untrusted text.** The fork read the asker's context, which can hold injected content. The proposal is shown as text and applied only by the owner (§5b decision 4; owner decision 12).
+- **A thread behind a compaction costs a cache write.** The rehydrate path is cold. The card shows the path and cost before forking (§5b decision 2).
+- **A thread on a `pty` asker starts after the question.** The card says so, and offers only *Thread from now*.
+- **The GUI cannot verify a blocking reason.** It is shown as the agent's own words. A dishonest reason costs that agent its own turn and puts its card first; it never holds another agent.
+- **Racing answers.** Of an in-place answer and any number of threads, the first applied wins. The rest fail with `question_closed`, and each card says so (§5b).
 
 ## Prior art: vig-os/revkit
 
