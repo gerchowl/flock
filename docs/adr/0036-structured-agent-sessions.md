@@ -968,10 +968,12 @@ back-to-back turns. For a structured agent there is no polling at all:
   first writes never lock, since racing Missing writers publish identical verified
   bytes without repair events. Contended nonblocking acquisition backs off on
   the supplied monotonic clock: sleep 1 ms, doubling thereafter and clipping each
-  request to the remaining 20 ms budget. Elapsed time bounds normal contention;
+  request to the remaining 20 ms budget. Every sleep leads to another acquisition
+  attempt, including the final clipped sleep. Elapsed time bounds normal contention;
   eight attempts only guard against a clock/sleeper that fails to advance.
-  Clock expiry reports `TimedOut`; attempt exhaustion reports `WouldBlock`.
-  The bounds apply to requested sleeps, not OS scheduling or filesystem latency.
+  Clock expiry after an unsuccessful attempt reports `TimedOut`; attempt exhaustion
+  reports `WouldBlock`. A contended repair stalls the stream pump for about 20 ms
+  plus scheduling overshoot at worst. Filesystem latency is separately unbounded.
   On a lock error or exhaustion, one `structured.blob.repair_lock_unavailable`
   warning names only the error kind
   and blob hash, then publication proceeds without the lock. The current object

@@ -624,7 +624,7 @@ fn contended_repair_waits_through_the_clock_budget_then_warns_and_publishes() {
         REPAIR_LOCK_WAIT,
         "the clock, not a tight retry loop, bounds contention"
     );
-    assert_eq!(attempts.get(), 5);
+    assert_eq!(attempts.get(), 6);
     assert_eq!(sleeps, [1, 2, 4, 8, 5].map(Duration::from_millis));
     assert_eq!(holder.get(ABC).unwrap(), b"abc");
     let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
@@ -639,6 +639,37 @@ fn contended_repair_waits_through_the_clock_budget_then_warns_and_publishes() {
     );
     assert_eq!(events[0]["fields"]["error_kind"], "TimedOut");
     assert_eq!(events[1]["fields"]["event"], "structured.blob.repaired");
+}
+
+#[test]
+fn repair_lock_retries_after_the_final_clipped_sleep() {
+    use std::cell::Cell;
+    let (root, holder) = setup();
+    let mut held = Some(holder.0.try_publication_lock().unwrap());
+    let contender = BlobStore::open(root.path()).unwrap();
+    let start = Instant::now();
+    let elapsed = Cell::new(Duration::ZERO);
+    let attempts = Cell::new(0);
+    let mut sleeps = Vec::new();
+    let result = BlobStore::repair_lock(
+        &mut || start + elapsed.get(),
+        &mut |delay| {
+            sleeps.push(delay);
+            elapsed.set(elapsed.get() + delay);
+            if elapsed.get() == REPAIR_LOCK_WAIT {
+                drop(held.take());
+            }
+        },
+        &mut || {
+            attempts.set(attempts.get() + 1);
+            assert!(attempts.get() <= MAX_REPAIR_LOCK_ATTEMPTS);
+            contender.0.try_publication_lock()
+        },
+    );
+    assert!(result.is_ok(), "released lock must be retried: {result:?}");
+    assert_eq!(attempts.get(), 6);
+    assert_eq!(sleeps, [1, 2, 4, 8, 5].map(Duration::from_millis));
+    assert_eq!(elapsed.get(), REPAIR_LOCK_WAIT);
 }
 
 #[test]

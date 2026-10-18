@@ -143,10 +143,12 @@ impl BlobStore {
     /// On contention the supplied clock sleeps for 1 ms, then doubles the
     /// backoff, clipping every request to the remaining 20 ms budget. Eight
     /// attempts guard only against a clock/sleeper that fails to advance.
+    /// Every sleep is followed by an attempt, including the final clipped sleep.
     /// Clock expiry warns with TimedOut; attempt exhaustion warns with WouldBlock.
     /// Other lock errors warn immediately. Each warns once and falls back to
     /// unlocked publication; duplicate diagnostics are then possible, but locking
-    /// never loses content. Sleep requests are bounded, not OS scheduling or I/O.
+    /// never loses content. Contention stalls the stream pump for about 20 ms
+    /// plus scheduling overshoot. Filesystem latency is separately unbounded.
     /// Non-cooperating filesystem mutations are outside this advisory lock.
     /// Read/write/rename/sync failures remain explicit; reads report corruption.
     pub fn put(&self, reader: impl Read, max_bytes: u64) -> Result<BlobRef, BlobError> {
@@ -242,6 +244,7 @@ impl BlobStore {
     }
     /// A bounded, best-effort wait using the caller's matching now/sleep pair.
     /// Only contention backs off; unsupported locking immediately falls back.
+    /// The attempt after the final sleep can acquire a newly released lock.
     fn repair_lock(
         now: &mut impl FnMut() -> Instant,
         sleep: &mut impl FnMut(Duration),
@@ -249,7 +252,9 @@ impl BlobStore {
     ) -> io::Result<File> {
         let started = now();
         let mut backoff = REPAIR_LOCK_BACKOFF;
-        for attempt in 0..MAX_REPAIR_LOCK_ATTEMPTS {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
             match lock() {
                 Ok(guard) => return Ok(guard),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
@@ -260,16 +265,12 @@ impl BlobStore {
             if remaining.is_zero() {
                 return Err(io::ErrorKind::TimedOut.into());
             }
-            if attempt + 1 == MAX_REPAIR_LOCK_ATTEMPTS {
+            if attempts == MAX_REPAIR_LOCK_ATTEMPTS {
                 return Err(io::ErrorKind::WouldBlock.into());
             }
             sleep(backoff.min(remaining));
-            if now().saturating_duration_since(started) >= REPAIR_LOCK_WAIT {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
             backoff = backoff.saturating_mul(2).min(REPAIR_LOCK_WAIT);
         }
-        Err(io::ErrorKind::WouldBlock.into())
     }
     fn publish(&self, temporary: &str, blob: &str) -> Result<(), BlobError> {
         #[cfg(test)]

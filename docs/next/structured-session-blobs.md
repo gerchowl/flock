@@ -28,11 +28,13 @@ Only corrupt-object repairs attempt an advisory lock on the pinned directory.
 First writes never lock: racing Missing writers rename identical verified bytes
 and emit no repair event. On contention, nonblocking acquisition sleeps on the
 supplied monotonic clock: 1 ms initially, doubling thereafter, with each request
-clipped to the remaining 20 ms budget. Normal contention is bounded by elapsed
+clipped to the remaining 20 ms budget. Every sleep leads to another acquisition
+attempt, including the final clipped sleep. Normal contention is bounded by elapsed
 time; an eight-attempt cap only guards against a clock/sleeper that does not
-advance. `TimedOut` means the clock budget expired; `WouldBlock` means the attempt
-guard fired. Requested sleeps are bounded; filesystem and OS scheduling latency
-can exceed the budget. Unsupported locking, other lock errors, or exhaustion emit one
+advance. `TimedOut` means an unsuccessful attempt exhausted the clock budget;
+`WouldBlock` means the attempt guard fired. The worst-case stream-pump stall from
+contention is about 20 ms plus scheduling overshoot. Filesystem latency is
+separately unbounded. Unsupported locking, other lock errors, or exhaustion emit one
 `structured.blob.repair_lock_unavailable` warning carrying the error kind and
 blob hash, never content or OS error text. The put then proceeds without the lock,
 so these diagnostic-coordination failures cannot lose content or stop the pump.
