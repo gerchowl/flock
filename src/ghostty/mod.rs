@@ -2624,6 +2624,8 @@ impl<'a> RowCellIter<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn detection_revision_tracks_writes_resize_and_modes_not_viewport() {
         let mut terminal = super::Terminal::new(80, 24, 1000).unwrap();
@@ -2641,8 +2643,6 @@ mod tests {
         terminal.scroll_viewport_bottom();
         assert_eq!(terminal.detection_revision(), revision);
     }
-
-    use super::*;
 
     fn write_numbered_lines(terminal: &mut Terminal, count: usize) {
         for i in 0..count {
