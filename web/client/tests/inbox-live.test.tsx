@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { render } from "solid-js/web";
 
 import type { AgentState } from "../src/gen/AgentState";
+import { fixtureExamples } from "../src/gen/FixtureExamples";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import { SUMMARY_MAX, TITLE_MAX } from "../src/views/turns";
 import { emptyLayout } from "../src/layout/model";
@@ -65,7 +66,7 @@ function mountInbox(mode: Mode = "desktop"): App {
         ev: { type: "flk_permission_request", state: "open", request_id: id, request_seq: requestSeq, request: { subtype: "can_use_tool", tool_name: tool, input, tool_use_id: `tool-${id}` } } as never,
       }),
     close: (agent, id) =>
-      send({ t: "ev", sub_id: agentSub(agent), stream: `agent/${agent}`, seq: ++agentSeq, ts_ms: 0, ev: { type: "flk_permission_request", state: "closed", request_id: id, decision: "allow_once", message: null, principal: "p", source: "token" } as never }),
+      send({ t: "ev", sub_id: agentSub(agent), stream: `agent/${agent}`, seq: ++agentSeq, ts_ms: 0, ev: { type: "flk_permission_request", state: "closed", request_id: id, request_seq: 7, decision: "allow_once", message: null, principal: "p", source: "token" } as never }),
     raw: (agent, ev) => send({ t: "ev", sub_id: agentSub(agent), stream: `agent/${agent}`, seq: ++agentSeq, ts_ms: 0, ev: ev as never }),
     reset: (agent) => send({ t: "subfail", sub_id: agentSub(agent), code: "cursor_ahead", message: "ahead" }),
     gap: (agent) => {
@@ -95,6 +96,23 @@ describe("live permission inbox", () => {
     expect(cards(root)).toEqual([]);
     // The fleet may still list the id for a moment; the closed record wins, so no pending card returns.
     fleet("atlas", ["request-one"]);
+    expect(cards(root)).toEqual([]);
+  });
+
+  test("#2224's real permission-decision frames open and close a card", () => {
+    const { root, fleet, raw } = mountInbox();
+    const records = fixtureExamples["permission-decision"].flatMap((line) => {
+      const ev = line.step === "send" && line.frame?.t === "ev" ? (line.frame.ev as { type?: string }) : null;
+      return ev?.type === "flk_permission_request" ? [ev] : [];
+    });
+    expect(records.map((record) => (record as { state: string }).state)).toEqual(["open", "closed"]);
+    fleet("fixture", ["typed-request"]);
+    raw("fixture", records[0] as object);
+    expect(cards(root)).toHaveLength(1);
+    expect(cards(root)[0]).toContain("Bash");
+    expect(cards(root)[0]).toContain("true");
+    expect($$(root, "inbox-card")[0]?.getAttribute("data-request-seq")).toBe("1");
+    raw("fixture", records[1] as object);
     expect(cards(root)).toEqual([]);
   });
 
@@ -200,7 +218,7 @@ describe("live permission inbox", () => {
   test("an unlisted or unreadable bad record gets a notice card, and a good record for a listed id replaces the error", () => {
     const { root, fleet, event, raw } = mountInbox();
     fleet("atlas", ["r1"]);
-    raw("atlas", { type: "flk_permission_request", state: "open", request_id: "auto-1" });
+    raw("atlas", { type: "flk_permission_request", state: "open", request_id: "auto-1", request_seq: 1 });
     raw("atlas", { type: "flk_permission_request", state: "open" });
     expect(cards(root).length).toBe(3);
     expect(cards(root)[1]).toContain("permission auto-1 (not awaiting you)");
@@ -217,13 +235,13 @@ describe("live permission inbox", () => {
     fleet("atlas", ["r1", "r2"]);
     event("atlas", "r1");
     event("atlas", "r2");
-    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r1", decision: "maybe", principal: "p", source: "token" });
+    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r1", request_seq: 7, decision: "maybe", principal: "p", source: "token" });
     expect(cards(root)).toHaveLength(2);
     expect(cards(root)[0]).toContain('decision "maybe" is not one of allow_once, allow_always, deny');
-    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r2", reason: "ended" });
+    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r2", request_seq: 7, reason: "ended" });
     expect(cards(root)).toHaveLength(1);
-    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r1", reason: "bogus" });
-    expect(cards(root)[0]).toContain("reason \"bogus\" is not one of ended, cancelled, result, interrupted");
+    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r1", request_seq: 7, reason: "bogus" });
+    expect(cards(root)[0]).toContain("reason \"bogus\" is not one of ended, cancelled, result, interrupted, session_ended, permission_request_limit, permission_request_too_large");
     close("atlas", "r1");
     expect(cards(root)).toEqual([]);
   });
@@ -242,7 +260,7 @@ describe("live permission inbox", () => {
     const { root, fleet, event, raw } = mountInbox();
     fleet("atlas", ["r1"]);
     event("atlas", "r1");
-    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r1", reason: "session_ended" });
+    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r1", request_seq: 7, reason: "session_ended" });
     expect(cards(root)).toEqual([]);
   });
 
@@ -276,7 +294,7 @@ describe("live permission inbox", () => {
   test("a notice for an unlisted id's bad record expires on the next synced or reset", () => {
     const { root, fleet, raw, synced, reset } = mountInbox();
     fleet("atlas", ["r1"]);
-    raw("atlas", { type: "flk_permission_request", state: "open", request_id: "auto-1" });
+    raw("atlas", { type: "flk_permission_request", state: "open", request_id: "auto-1", request_seq: 1 });
     expect(cards(root)).toHaveLength(2);
     synced("atlas");
     expect(cards(root)).toHaveLength(1);

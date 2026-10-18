@@ -1,57 +1,45 @@
 /**
- * The server's permission record on `agent/<id>` (#2224): the one place that
- * declares its shape. Hand-typed until #2224 lands; replace with gen/ then (#2224).
- *
- * `{"type":"flk_permission_request","state":"open"|"closed","request_id",
- * "request_seq","request":ToolRequest,…}`. A record is open until a closed
- * record with the same `request_id` arrives; there is no "decided" state.
+ * The runtime guard for the server's permission record on `agent/<id>`
+ * (#2224). The shape is the generated {@link PermissionRecord}; the server
+ * sends it as a known session event. A record that does not match fails
+ * visibly instead of being dropped: {@link permissionRecord} names what is
+ * wrong, and the inbox shows it.
  *
  * @module
  */
-import type { ToolRequest } from "../gen/ToolRequest";
+import type { KnownSessionEvent } from "../gen/KnownSessionEvent";
+import type { PermissionCloseReason } from "../gen/PermissionCloseReason";
+import type { PermissionDecision } from "../gen/PermissionDecision";
+import type { PermissionRecord } from "../gen/PermissionRecord";
 
 /** An open permission request, with its server-assigned `request_seq`. */
-export type OpenPermissionRecord = {
-  readonly type: "flk_permission_request";
-  readonly state: "open";
-  readonly request_id: string;
-  /** Echoed verbatim by `agent.decide`; never computed here. */
-  readonly request_seq: number;
-  readonly request: ToolRequest;
-};
-
-/** The operator's decision on a closed record (`agent.decide`'s vocabulary). */
-export type PermissionDecision = "allow_once" | "allow_always" | "deny";
-/** Why a host fact closed a request without a decision. */
-export type CloseReason = "ended" | "cancelled" | "result" | "interrupted" | "session_ended";
-
-/** The same request, closed: by a decision with its principal and source, or by a typed reason. */
-export type ClosedPermissionRecord = {
-  readonly type: "flk_permission_request";
-  readonly state: "closed";
-  readonly request_id: string;
-} & (
-  | { readonly decision: PermissionDecision; readonly principal: string; readonly source: string; readonly message?: string | null }
-  | { readonly reason: CloseReason }
-);
-
-/** One record, tagged on `state`. */
-export type PermissionRecord = OpenPermissionRecord | ClosedPermissionRecord;
+export type OpenPermissionRecord = Extract<PermissionRecord, { state: "open" }>;
 
 /**
- * A `flk_permission_request` payload that does not match the shape above. It
- * is shown, never dropped: `request_id` is `null` only when it cannot be read.
+ * A permission record that does not match the generated shape. It is shown,
+ * never dropped; `request_id` is `null` only when it cannot be read.
  */
 export type InvalidPermissionRecord = { readonly state: "invalid"; readonly request_id: string | null; readonly problem: string };
 
-const DECISIONS: readonly string[] = ["allow_once", "allow_always", "deny"] satisfies readonly PermissionDecision[];
-const REASONS: readonly string[] = ["ended", "cancelled", "result", "interrupted", "session_ended"] satisfies readonly CloseReason[];
+/** Typed against the generated unions, so a new decision or reason fails `tsc` until listed. */
+const DECISIONS: { readonly [D in PermissionDecision]: true } = { allow_once: true, allow_always: true, deny: true };
+const REASONS: { readonly [R in PermissionCloseReason]: true } = {
+  ended: true,
+  cancelled: true,
+  result: true,
+  interrupted: true,
+  session_ended: true,
+  permission_request_limit: true,
+  permission_request_too_large: true,
+};
 
-const isObject = (value: unknown): value is { readonly [key: string]: unknown } => typeof value === "object" && value !== null && !Array.isArray(value);
+type Json = { readonly [key: string]: unknown };
+const isObject = (value: unknown): value is Json => typeof value === "object" && value !== null && !Array.isArray(value);
+const oneOf = (set: object, value: unknown): boolean => typeof value === "string" && Object.hasOwn(set, value);
+const listed = (set: object): string => Object.keys(set).join(", ");
 
 /** The first thing wrong with an open record, or `null`. */
-function openProblem(ev: { readonly [key: string]: unknown }): string | null {
-  if (typeof ev["request_seq"] !== "number" || !Number.isSafeInteger(ev["request_seq"])) return "request_seq is missing or not an integer";
+function openProblem(ev: Json): string | null {
   const request = ev["request"];
   if (!isObject(request)) return "request is missing";
   if (typeof request["tool_name"] !== "string") return "request.tool_name is missing";
@@ -59,29 +47,34 @@ function openProblem(ev: { readonly [key: string]: unknown }): string | null {
   return null;
 }
 
-/** The first thing wrong with a closed record, or `null`. */
-function closedProblem(ev: { readonly [key: string]: unknown }): string | null {
-  const [decided, reasoned] = ["decision" in ev, "reason" in ev];
-  if (decided === reasoned) return decided ? "closed record has both decision and reason" : "closed record has neither decision nor reason";
-  if (reasoned) return typeof ev["reason"] === "string" && REASONS.includes(ev["reason"]) ? null : `reason ${JSON.stringify(ev["reason"])} is not one of ${REASONS.join(", ")}`;
-  if (typeof ev["decision"] !== "string" || !DECISIONS.includes(ev["decision"])) return `decision ${JSON.stringify(ev["decision"])} is not one of ${DECISIONS.join(", ")}`;
+/** The first thing wrong with a closed record, or `null`: an answer, or a typed reason. */
+function closedProblem(ev: Json): string | null {
+  const reasonProblem = (key: "reason" | "error_code"): string | null => (oneOf(REASONS, ev[key]) ? null : `${key} ${JSON.stringify(ev[key])} is not one of ${listed(REASONS)}`);
+  if (!("decision" in ev)) return "reason" in ev ? reasonProblem("reason") : "closed record has neither decision nor reason";
+  if (!oneOf(DECISIONS, ev["decision"])) return `decision ${JSON.stringify(ev["decision"])} is not one of ${listed(DECISIONS)}`;
   if (typeof ev["principal"] !== "string") return "principal is missing";
   if (typeof ev["source"] !== "string") return "source is missing";
-  const message = ev["message"];
-  return message === undefined || message === null || typeof message === "string" ? null : "message is not a string";
+  if (ev["message"] !== null && typeof ev["message"] !== "string") return "message is not a string or null";
+  for (const key of ["reason", "error_code"] as const) {
+    const problem = key in ev ? reasonProblem(key) : null;
+    if (problem !== null) return problem;
+  }
+  return null;
 }
 
 /**
- * Reads one agent-stream payload: a {@link PermissionRecord}, an
- * {@link InvalidPermissionRecord} naming what is wrong when it is a permission
- * record that does not match, or `null` when it is some other event.
+ * Reads one known session event: the generated {@link PermissionRecord}, an
+ * {@link InvalidPermissionRecord} naming what is wrong when it is a
+ * permission record that does not match, or `null` for any other event.
  */
-export function permissionRecord(ev: unknown): PermissionRecord | InvalidPermissionRecord | null {
-  if (!isObject(ev) || ev["type"] !== "flk_permission_request") return null;
-  const id = typeof ev["request_id"] === "string" ? ev["request_id"] : null;
+export function permissionRecord(ev: KnownSessionEvent): PermissionRecord | InvalidPermissionRecord | null {
+  if (ev.type !== "flk_permission_request") return null;
+  const raw: Json = ev;
+  const id = typeof raw["request_id"] === "string" ? raw["request_id"] : null;
   const invalid = (problem: string): InvalidPermissionRecord => ({ state: "invalid", request_id: id, problem });
   if (id === null) return invalid("request_id is missing");
-  if (ev["state"] !== "open" && ev["state"] !== "closed") return invalid(`state ${JSON.stringify(ev["state"])} is not open or closed`);
-  const problem = ev["state"] === "open" ? openProblem(ev) : closedProblem(ev);
-  return problem === null ? (ev as PermissionRecord) : invalid(problem);
+  if (raw["state"] !== "open" && raw["state"] !== "closed") return invalid(`state ${JSON.stringify(raw["state"])} is not open or closed`);
+  if (typeof raw["request_seq"] !== "number" || !Number.isSafeInteger(raw["request_seq"])) return invalid("request_seq is missing or not an integer");
+  const problem = raw["state"] === "open" ? openProblem(raw) : closedProblem(raw);
+  return problem === null ? ev : invalid(problem);
 }
