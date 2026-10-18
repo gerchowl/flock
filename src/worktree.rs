@@ -4224,9 +4224,7 @@ mod tests {
         let failure = check_worktree_remove(&fixture.repo, &fixture.checkout);
         std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o700)).unwrap();
         if access.is_ok() {
-            tracing::warn!(
-                "skipping permission-denied scenario: process bypasses fixture permissions"
-            );
+            eprintln!("skipping permission-denied scenario: process bypasses fixture permissions"); // guardrails-ok(no-debug-leftovers): intentional nextest runtime-skip diagnostic
             return;
         }
         assert_eq!(
