@@ -84,7 +84,7 @@ pub(crate) fn start_server_for_mode(
             clone_detection_warning: identity.clone_detection_warning.clone(),
             agent_start_label: true,
             agent_questions: true,
-            pane_input_write_ack: false,
+            pane_input_write_ack: true,
         }),
         uid_policy,
     )

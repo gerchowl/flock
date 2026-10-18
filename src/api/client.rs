@@ -11,6 +11,9 @@ use crate::api::schema::{
     SubscriptionEventEnvelope, SuccessResponse,
 };
 
+mod input_write;
+pub(crate) use input_write::SUBMIT_CAP;
+
 const MIN_ALLOCATION_PREVIEW_PROTOCOL: u32 = 26;
 
 /// How many times `request_value_retrying` sends a request again after a
@@ -62,6 +65,9 @@ impl ApiClient {
     }
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
+        if input_write::requires(&request.method) {
+            return input_write::call(self, request, input_write::cap(&request.method), None);
+        }
         self.check_allocation_preview_protocol(request, None)?;
         if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
             return Ok(refusal);
@@ -84,6 +90,9 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, ApiClientError> {
+        if input_write::requires(&request.method) {
+            return input_write::call(self, request, timeout, None);
+        }
         self.check_allocation_preview_protocol(request, Some(timeout))?;
         if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
             return Ok(refusal);
@@ -95,10 +104,12 @@ impl ApiClient {
     /// `request_value_with_timeout`, sent again with backoff when the socket
     /// answers with a transient error (#910).
     ///
-    /// Under load a read timeout surfaces as `EAGAIN` ("Resource temporarily
-    /// unavailable", os error 11 on Linux): the server is there, just slow.
-    /// One such error used to fail a whole CLI command. Now the request is
-    /// retried up to [`TRANSIENT_RETRIES`] times, but only where that is safe:
+    /// Completed-input calls are never retried, including before dispatch;
+    /// their shared path reports lost post-dispatch replies as unknown effect.
+    ///
+    /// An elapsed bounded reply wait reports `TimedOut`; the server may still
+    /// be working. The request is retried up to [`TRANSIENT_RETRIES`] times,
+    /// but only where that is safe:
     /// a failure before the request was written (the connect) retries for any
     /// method, one after it only for a [`Method::is_retry_safe`] read, since
     /// the server may already have applied a write it never answered.
@@ -112,6 +123,9 @@ impl ApiClient {
         timeout: Duration,
         deadline: Option<Instant>,
     ) -> Result<serde_json::Value, ApiClientError> {
+        if input_write::requires(&request.method) {
+            return input_write::call(self, request, timeout, deadline);
+        }
         self.check_allocation_preview_protocol(request, Some(timeout))?;
         if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
             return Ok(refusal);
@@ -159,21 +173,51 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, Attempt> {
+        self.exchange_until(request, Instant::now() + timeout)
+    }
+
+    /// Preserve the requiring input caller's original absolute deadline.
+    fn exchange_until(
+        &self,
+        request: &Request,
+        deadline: Instant,
+    ) -> Result<serde_json::Value, Attempt> {
+        self.exchange_until_after_write(request, deadline, || {})
+    }
+
+    /// Test seam: gate the first read until the peer has replied and closed.
+    /// Production uses a no-op hook and the same transport path.
+    fn exchange_until_after_write(
+        &self,
+        request: &Request,
+        deadline: Instant,
+        after_write: impl FnOnce(),
+    ) -> Result<serde_json::Value, Attempt> {
         let mut stream = self
             .connect()
             .map_err(|err| Attempt::BeforeSend(err.into()))?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Attempt::BeforeSend(ApiClientError::Io(
+                io::ErrorKind::TimedOut.into(),
+            )));
+        }
         stream
-            .set_write_timeout(Some(timeout))
+            .set_write_timeout(Some(remaining))
             .map_err(|err| Attempt::BeforeSend(err.into()))?;
         stream
-            .set_read_timeout(Some(timeout))
+            .set_read_timeout(Some(remaining))
             .map_err(|err| Attempt::BeforeSend(err.into()))?;
         write_request(&mut stream, request).map_err(Attempt::AfterSend)?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response = read_json_line(&mut reader).map_err(Attempt::AfterSend)?;
+        after_write();
+        let mut response =
+            read_json_line_until(&stream, deadline, Instant::now).map_err(Attempt::AfterSend)?;
         if matches!(request.method, Method::Ping(_)) {
             super::compatibility::observe_ping(self, &response);
+        } else if input_write::requires(&request.method) {
+            if input_write::normalize(&request.method, &mut response) {
+                response["id"] = serde_json::json!(request.id);
+            }
         } else {
             super::compatibility::normalize(self, &mut response);
         }
@@ -200,6 +244,11 @@ impl ApiClient {
         request: &Request,
         read_timeout: Option<Duration>,
     ) -> Result<(serde_json::Value, EventStream), ApiClientError> {
+        if input_write::requires(&request.method) {
+            return Err(ApiClientError::UnexpectedResult(
+                "input calls are not subscriptions".into(),
+            ));
+        }
         let mut stream = self.connect()?;
         write_request(&mut stream, request)?;
         if let Some(timeout) = read_timeout {
@@ -343,6 +392,10 @@ pub enum ApiClientError {
     Json(serde_json::Error),
     ErrorResponse(ErrorResponse),
     EmptyResponse,
+    /// A bounded API reply exceeded its payload limit, excluding the newline.
+    ReplyLineTooLarge {
+        limit: usize,
+    },
     UnexpectedResult(String),
 }
 
@@ -353,6 +406,7 @@ impl fmt::Display for ApiClientError {
             Self::Json(err) => write!(f, "{err}"),
             Self::ErrorResponse(response) => write!(f, "{}", response.error.message),
             Self::EmptyResponse => write!(f, "empty api response"),
+            Self::ReplyLineTooLarge { limit } => write!(f, "api reply line exceeds {limit} bytes"),
             Self::UnexpectedResult(result) => write!(f, "unexpected api result: {result}"),
         }
     }
@@ -388,6 +442,62 @@ fn read_json_line<T: DeserializeOwned>(
         return Err(ApiClientError::EmptyResponse);
     }
     serde_json::from_str(&line).map_err(ApiClientError::Json)
+}
+
+/// Maximum bounded reply payload: 8 MiB, excluding the terminating newline.
+/// Legacy unbounded requests and streaming subscriptions retain their own readers.
+const MAX_REPLY_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Poll each partial read against one absolute cap without post-write setsockopt.
+/// Refuse payloads larger than [`MAX_REPLY_LINE_BYTES`] before growing the buffer.
+/// Peer close is readable: queued reply bytes must survive it. The clock seam
+/// lets tests drive expiry without sleeps or input replay.
+fn read_json_line_until(
+    stream: &UnixStream,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+) -> Result<serde_json::Value, ApiClientError> {
+    let mut line = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return Err(ApiClientError::Io(io::ErrorKind::TimedOut.into()));
+        }
+        let read = match crate::platform::socket::read_ready(stream, &mut chunk, remaining) {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if read == 0 {
+            break;
+        }
+        let chunk = &chunk[..read];
+        let end = chunk.iter().position(|byte| *byte == b'\n');
+        let payload = end.unwrap_or(chunk.len());
+        if payload > MAX_REPLY_LINE_BYTES - line.len() {
+            return Err(ApiClientError::ReplyLineTooLarge {
+                limit: MAX_REPLY_LINE_BYTES,
+            });
+        }
+        line.extend_from_slice(&chunk[..payload]);
+        if end.is_some() {
+            break;
+        }
+    }
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Err(ApiClientError::EmptyResponse);
+    }
+    serde_json::from_slice(&line).map_err(ApiClientError::Json)
 }
 
 fn read_optional_json_line<T: DeserializeOwned>(
@@ -426,6 +536,138 @@ pub(crate) fn parse_response_value(
 mod tests {
     use super::*;
 
+    #[test]
+    fn bounded_reply_line_refuses_oversize_and_accepts_the_exact_limit() {
+        // The documented bounded-reply payload limit excludes its newline.
+        const LIMIT: usize = 8 * 1024 * 1024;
+        fn read_payload(bytes: usize) -> Result<serde_json::Value, ApiClientError> {
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            writer
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let task = std::thread::spawn(move || {
+                let data = format!("\"{}\"\n", "x".repeat(bytes - 2));
+                if let Err(error) = writer.write_all(data.as_bytes()) {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                        ),
+                        "{error}"
+                    );
+                }
+            });
+            let result = read_json_line_until(
+                &reader,
+                Instant::now() + Duration::from_secs(10),
+                Instant::now,
+            );
+            drop(reader);
+            task.join().unwrap();
+            result
+        }
+        let oversized = read_payload(LIMIT + 1);
+        assert!(oversized.is_err(), "oversized JSON reply must be refused");
+        let error = oversized.unwrap_err();
+        assert!(matches!(&error, ApiClientError::ReplyLineTooLarge { limit } if *limit == LIMIT));
+        assert_eq!(
+            error.to_string(),
+            format!("api reply line exceeds {LIMIT} bytes")
+        );
+        for bytes in [LIMIT - 1, LIMIT] {
+            assert_eq!(
+                read_payload(bytes).unwrap().as_str().unwrap().len(),
+                bytes - 2
+            );
+        }
+    }
+
+    /// Joining the peer gates the client after write until the reply and EOF exist.
+    fn closed_reply(method: Method, result: serde_json::Value) {
+        let tag = if matches!(method, Method::PaneSubmit(_)) {
+            "pane.submit"
+        } else {
+            "ping"
+        };
+        let peer = crate::test_support::ScriptedApi::new(vec![(tag, Some(result.clone()))]);
+        let client = peer.client();
+        let request = Request {
+            id: "closed-peer".into(),
+            method,
+        };
+        let response = client
+            .exchange_until_after_write(&request, Instant::now() + input_write::SUBMIT_CAP, || {
+                assert_eq!(peer.finish().len(), 1);
+            })
+            .unwrap_or_else(|error| match error {
+                Attempt::BeforeSend(error) => panic!("before dispatch: {error}"),
+                Attempt::AfterSend(error) => panic!("discarded a complete reply: {error}"),
+            });
+        let mut expected = result;
+        expected["id"] = serde_json::json!(request.id);
+        assert_eq!(response, expected);
+    }
+    fn closed_submit() -> Method {
+        Method::PaneSubmit(
+            serde_json::from_value(serde_json::json!({
+            "pane_id":"fixture-pane", "text":"brief" }))
+            .unwrap(),
+        )
+    }
+    #[test]
+    fn r3_closed_peer_submit_refusal_stays_a_refusal() {
+        closed_reply(
+            closed_submit(),
+            serde_json::json!({"error":{
+            "code":"input_not_empty", "message":"draft is present"}}),
+        );
+    }
+    #[test]
+    fn r3_closed_peer_submit_success_stays_a_success() {
+        closed_reply(
+            closed_submit(),
+            serde_json::json!({"result":{
+            "type":"guarded_submit", "outcome":"accepted", "reason":null, "retried":false}}),
+        );
+    }
+    #[test]
+    fn r3_closed_peer_ping_refusal_stays_a_refusal() {
+        closed_reply(
+            Method::Ping(PingParams::default()),
+            serde_json::json!({"error":{
+            "code":"invalid_params", "message":"invalid probe"}}),
+        );
+    }
+    #[test]
+    fn r3_closed_peer_ping_success_stays_a_success() {
+        closed_reply(
+            Method::Ping(PingParams::default()),
+            serde_json::json!({"result":{
+            "type":"pong", "pid":1, "version":"fixture", "protocol_version":crate::protocol::PROTOCOL_VERSION,
+            "capabilities":{"pane_input_write_ack":true}}}),
+        );
+    }
+
+    #[test]
+    fn fragmented_reply_cannot_renew_the_absolute_cap() {
+        let (stream, mut producer) = UnixStream::pair().unwrap();
+        producer.write_all(b"{").unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(100);
+        let mut reads = 0;
+        let error = read_json_line_until(&stream, deadline, || {
+            reads += 1;
+            if reads == 1 {
+                start
+            } else {
+                deadline + Duration::from_nanos(1)
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(error,ApiClientError::Io(ref e) if e.kind()==io::ErrorKind::TimedOut));
+        assert_eq!(reads, 2, "each fragment rechecks the same cap");
+        drop(producer);
+    }
     #[test]
     fn allocation_dry_run_refuses_old_server_before_sending_allocation() {
         let path = std::env::temp_dir().join(format!("f459-{}.sock", std::process::id()));
@@ -649,7 +891,7 @@ mod tests {
             .request_value_retrying(&close, ATTEMPT, None)
             .unwrap_err();
         assert!(
-            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::WouldBlock),
+            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::TimedOut),
             "the timeout is reported as it happened: {error:?}"
         );
         let (listener, seen, _held) = server.join().unwrap();
@@ -667,7 +909,7 @@ mod tests {
             .request_value_retrying(&agent_get(), ATTEMPT, None)
             .unwrap_err();
         assert!(
-            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::WouldBlock),
+            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::TimedOut),
             "{error:?}"
         );
         let (listener, seen, _held) = server.join().unwrap();
