@@ -139,7 +139,7 @@ enum EraseState {
     #[default]
     Ground,
     Escape,
-    EscapeIntermediate,
+    EscapeIntermediate(bool),
     Csi,
     Osc,
     String,
@@ -179,7 +179,7 @@ impl SelectionEraseTracker {
                     b'[' => self.start_csi(),
                     b']' => self.state = Osc,
                     b'P' | b'X' | b'^' | b'_' => self.state = String,
-                    0x20..=0x2f => self.state = EscapeIntermediate,
+                    0x20..=0x2f => self.state = EscapeIntermediate(byte == b'#'),
                     0x30..=0x7e => {
                         if byte == b'c' {
                             self.invalidate();
@@ -189,7 +189,16 @@ impl SelectionEraseTracker {
                     }
                     _ => {}
                 },
-                EscapeIntermediate if (0x30..=0x7e).contains(&byte) => self.state = Ground,
+                EscapeIntermediate(decaln) => match byte {
+                    0x20..=0x2f => self.state = EscapeIntermediate(false),
+                    0x30..=0x7e => {
+                        if decaln && byte == b'8' {
+                            self.invalidate();
+                        }
+                        self.state = Ground;
+                    }
+                    _ => {}
+                },
                 Csi => match byte {
                     b'?' if !self.parameter_started
                         && self.parameters_len == 0
@@ -253,7 +262,9 @@ impl SelectionEraseTracker {
         let screen_clear = screen_mode
             && parameters
                 .iter()
-                .any(|p| matches!(p, 1047 | 1049) || (final_byte == b'r' && *p == 47));
+                // Mode 3 clears through Ghostty's internal resize when mode 40
+                // permits it. Conservatively refuse even if mode 40 is disabled.
+                .any(|p| matches!(p, 3 | 1047 | 1049) || (final_byte == b'r' && *p == 47));
         // XTRESTORE can switch/clear using either saved value. Avoid mirroring
         // saved mode bits: conservatively remember possible alternate allocation.
         self.alternate_exists |= screen_mode
@@ -428,6 +439,74 @@ mod mode_restore_tests {
             assert_eq!(
                 terminal.read_text_viewport((0, 0), (39, 5), false).unwrap(),
                 before
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod full_screen_clear_tests {
+    use super::*;
+
+    #[test]
+    fn deccolm_set_reset_and_restore_clear_both_native_screens() {
+        for alternate in [false, true] {
+            for final_byte in ['h', 'l', 'r'] {
+                let mut terminal = Terminal::new(40, 6, 256 * 1024).unwrap();
+                if alternate {
+                    terminal.write(b"\x1b[?47h");
+                }
+                terminal.write(b"SELECTA\x1b[?40h");
+                let generation = terminal.selection_erases.generation;
+                for byte in format!("\x1b[?3{final_byte}").bytes() {
+                    terminal.write(&[byte]);
+                }
+                assert_eq!(
+                    terminal.cols().unwrap(),
+                    if final_byte == 'h' { 132 } else { 80 }
+                );
+                assert!(!terminal
+                    .read_text_viewport((0, 0), (39, 5), false)
+                    .unwrap()
+                    .contains("SELECTA"));
+                assert_eq!(terminal.selection_erases.generation, generation + 1);
+            }
+        }
+        // Mode 40 is deliberately not mirrored, including across XTRESTORE.
+        let mut terminal = Terminal::new(40, 6, 256 * 1024).unwrap();
+        terminal.write(b"SELECTA\x1b[?3h");
+        assert_eq!(terminal.cols().unwrap(), 40);
+        assert_eq!(terminal.selection_erases.generation, 1);
+        assert!(terminal
+            .read_text_viewport((0, 0), (39, 5), false)
+            .unwrap()
+            .contains("SELECTA"));
+    }
+
+    #[test]
+    fn decaln_matches_native_esc_intermediates_across_fragments() {
+        for (bytes, clears) in [
+            (b"\x1b#8".as_slice(), true),
+            (b"\x1b#\x00\x7f8", true),
+            (b"\x1b8", false),
+            (b"\x1b##8", false),
+            (b"\x1b #8", false),
+            (b"\x1b#\x188", false),
+            (b"\x1b]0;\x1b#8\x07", true),
+            (b"\x1b]0;#8\x07", false),
+            (b"\x1bP#8\x1b\\", false),
+        ] {
+            let mut terminal = Terminal::new(40, 6, 256 * 1024).unwrap();
+            terminal.write(b"SELECTA");
+            for byte in bytes {
+                terminal.write(&[*byte]);
+            }
+            let text = terminal.read_text_viewport((0, 0), (39, 5), false).unwrap();
+            assert_eq!(text.contains("SELECTA"), !clears, "native: {bytes:?}");
+            assert_eq!(
+                terminal.selection_erases.generation,
+                u64::from(clears),
+                "generation: {bytes:?}"
             );
         }
     }

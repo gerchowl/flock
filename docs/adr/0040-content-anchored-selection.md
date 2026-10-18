@@ -37,6 +37,20 @@ ED 2 (`CSI 2 J`) normally clears the main screen's active cells **in place**
 via `clearRows`; at a semantic shell prompt it may first scroll them into
 history. Neither path reliably invalidates pins. Treat ED 2 as a destructive
 boundary too. ED 22 scrolls active rows into history and retains the anchors.
+DECCOLM (private mode 3 when mode 40 permits it) calls `Terminal.deccolm`
+through `stream_terminal.zig:502`, resizing internally and then calling
+`eraseDisplay(.complete)` (`Terminal.zig:2866–2878`). That bypasses flock's
+resize hook. Invalidate on private mode 3 set/reset/restore (`h`, `l`, `r`)
+without mirroring mode 40; this intentionally refuses even when mode 40
+would suppress the operation. DECALN (`ESC # 8`) calls `Terminal.decaln`,
+which clears all active rows in place and fills them with E
+(`Terminal.zig:2638–2675`). Recognize its single `#` intermediate across
+fragmented writes and invalidate before resolving either endpoint. Both
+operations invalidate on primary and alternate screens. This adopts the
+full-screen-clear refusal policy for #2151; the broader partial/in-place
+erase policy, including ED 0 after cursor-home, remains tracked by #2143.
+Ordinary retained-cell rewrites still follow the copy policy in §2.
+
 Full reset (`ESC c`), mode 1047/1049 screen clears and no-scrollback resize
 also invalidate the generation. The latter calls `eraseHistory` in
 `Screen.resize`. `Terminal.resize` resizes an allocated alternate screen

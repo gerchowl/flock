@@ -75,6 +75,16 @@ while IFS= read -r command; do
         reset_restore)
             printf '\033c\033[?1049rSELECTA\r\nSELECTB\r\nDONE_reset\r\n'
             ;;
+        top_select)
+            printf '\033[2J\033[HSELECTA\r\nSELECTB\r\nDONE_top\r\n'
+            ;;
+        deccolmh|deccolml|deccolmr)
+            final=${command#deccolm}
+            printf '\033[?40h\033[?3%s\033[HOTHER_A\r\nOTHER_B\r\nDONE_%s\r\n' "$final" "$command"
+            ;;
+        decaln)
+            printf '\033#8\033[6;1HDONE_decaln'
+            ;;
         erase2)
             printf '\033[2J'
             printf 'DONE_erase2\r\n'
@@ -404,4 +414,44 @@ async fn real_read_xtrestore_after_reset_keeps_resize_invalidation() {
     fixture.state.request_clipboard_write = Some(b"previous clipboard".to_vec());
     fixture.runtime().resize(8, 6, 0, 0);
     assert_restored_selection_refused(&mut fixture);
+}
+
+async fn assert_full_screen_clear_refuses(command: &str, alternate: bool) {
+    let mut fixture = Fixture::new().await;
+    if alternate {
+        fixture.write_and_wait("alternate", "DONE_alternate").await;
+    } else {
+        fixture.write_and_wait("top_select", "DONE_top").await;
+    }
+    fixture.select();
+    fixture.state.request_clipboard_write = Some(b"previous clipboard".to_vec());
+    fixture
+        .write_and_wait(command, &format!("DONE_{command}"))
+        .await;
+    fixture.copy();
+    assert_eq!(
+        fixture.state.request_clipboard_write.as_deref(),
+        Some(b"previous clipboard".as_slice()),
+        "{command}, alternate={alternate}"
+    );
+    let toast = fixture.state.toast.as_ref().expect("visible clear refusal");
+    assert_eq!(toast.kind, ToastKind::NeedsAttention);
+    assert_eq!(toast.title, "Cannot copy selection");
+    assert!(toast.context.contains("erased"));
+}
+
+#[tokio::test]
+async fn real_read_deccolm_refuses_copy_on_both_screens() {
+    for alternate in [false, true] {
+        for command in ["deccolmh", "deccolml", "deccolmr"] {
+            assert_full_screen_clear_refuses(command, alternate).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn real_read_decaln_refuses_copy_on_both_screens() {
+    for alternate in [false, true] {
+        assert_full_screen_clear_refuses("decaln", alternate).await;
+    }
 }
