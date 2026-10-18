@@ -107,6 +107,12 @@ pub(super) fn clear_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Persist a metadata-only transaction atomically, leaving pane-history storage intact.
+/// Directory-sync failures after replacement retain the existing durability-warning policy.
+pub(crate) fn save_metadata(snapshot: &SessionSnapshot) -> std::io::Result<()> {
+    save_to_path(&session_path(), snapshot)
+}
+
 pub fn save(snapshot: &SessionSnapshot, history: Option<&SessionHistorySnapshot>) {
     let path = session_path();
     let history_path = session_history_path();

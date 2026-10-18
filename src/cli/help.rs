@@ -325,6 +325,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("goal", "pause", "flk goal pause [--minutes N] [--agent TARGET] [--json]"),
     ("goal", "resume", "flk goal resume [--agent TARGET] [--json]"),
     ("goal", "stop", "flk goal stop [--reason TEXT] [--agent TARGET] [--json]"),
+    ("session", "retained", super::retained::USAGE),
     ("session", "list", "flk session list [--json]"),
     ("session", "attach", "flk session attach <name>"),
     ("session", "stop", "flk session stop <name> [--json]"),
@@ -564,6 +565,8 @@ mod tests {
     const SELF_SERVED: &[&str] = &[
         // Nested credential verbs share their complete operator-only usage.
         "client",
+        // Retained-record diagnostics have no action verb.
+        "doctor",
         // What a target resolves from, and how reused branch names disambiguate.
         "lineage",
         // `--since` suffixes and where the rendered file lands by default.
@@ -639,8 +642,9 @@ mod tests {
             "adapter" => include_str!("adapter.rs"),
             // `wait park` shares the `events` parser.
             "wait" => concat!(include_str!("../cli.rs"), include_str!("events.rs")),
-            // These five live inline in the dispatcher itself.
-            "config" | "channel" | "terminal" | "session" | "hook" => {
+            "session" => concat!(include_str!("../cli.rs"), include_str!("retained.rs")),
+            // These four live inline in the dispatcher itself.
+            "config" | "channel" | "terminal" | "hook" => {
                 include_str!("../cli.rs")
             }
             _ => "",

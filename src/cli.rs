@@ -44,6 +44,7 @@ mod preflight;
 pub(crate) mod questions;
 mod ready;
 mod report;
+mod retained;
 mod revert;
 mod server;
 mod settled;
@@ -235,6 +236,7 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "fleet" => fleet::run_fleet_command(&args[2..])?,
         "goal" => goal::run_goal_command(&args[2..])?,
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
+        "doctor" => retained::run(&args[2..], true)?,
         "session" => run_session_command(&args[2..])?,
         "client" => client::run(&args[2..])?,
         "web" => run_web_command(&args[2..])?,
@@ -733,6 +735,7 @@ fn run_session_command(args: &[String]) -> std::io::Result<i32> {
         "attach" => session_attach_help(&args[1..]),
         "stop" => session_stop(&args[1..]),
         "delete" => session_delete(&args[1..]),
+        "retained" => retained::run(&args[1..], false),
         "help" | "--help" | "-h" => {
             print_session_help();
             Ok(0)
@@ -1444,6 +1447,7 @@ fn print_wait_help() {
 fn print_session_help() {
     eprintln!("flk session commands:");
     eprintln!("  flk session list [--json]");
+    eprintln!("  {}", retained::USAGE);
     eprintln!("  flk session attach <name>");
     eprintln!("  flk session stop <name> [--json]");
     eprintln!("  flk session delete <name> [--json]");
