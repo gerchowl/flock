@@ -4938,6 +4938,16 @@ pub(crate) fn mesh_custody_failed(operation: &'static str, code: &'static str) {
     tracing::warn!(target: "flock::mesh", event = "mesh.custody.failed", operation, code, "mesh custody operation failed");
 }
 
+/// Unexpected scope-release failure, with no token, path or bearer contents.
+pub(crate) fn client_token_unlock_failed(error: &std::io::Error) {
+    tracing::warn!(
+        event = "client_token.lock.release_failed",
+        error = %error,
+        errno = error.raw_os_error(),
+        "client-token lock release failed"
+    );
+}
+
 /// An untrusted client-token entry was ignored; never log its contents or bearer.
 pub(crate) fn client_token_entry_unsafe(entry: &str) {
     tracing::warn!(
