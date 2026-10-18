@@ -683,11 +683,19 @@ fn queue_provider_late_capture_has_synced_before_end_at_every_registration_unloc
             );
         }))
     });
-    register_live(
-        &witnessed,
-        Packet(source.1.lock().retained.clone(), None, None, true, 0),
-        true,
-    );
+    let retained = source.1.lock().retained.clone();
+    let mut book = Book::<Witness> {
+        retained,
+        bootstrapped: true,
+        status: None,
+        error: None,
+        ended: true,
+        refusal: None,
+        readers: vec![],
+    };
+    book.register(None, witnessed).unwrap();
+    REGISTRATION_WITNESS
+        .with(|w| assert!(w.borrow().is_none(), "registration unlock was not observed"));
     drop(publisher);
     let replay = pages(&mut reader);
     assert_eq!(sequences(&replay), [3, 4]);

@@ -45,17 +45,21 @@ struct Live {
     refusal: Option<ErrorCode>,
     ended: bool,
 }
-struct Book {
+struct Book<R: parking_lot::lock_api::RawMutex = parking_lot::RawMutex> {
     retained: Arc<Cut>,
     bootstrapped: bool,
     status: Option<Pending>,
     error: Option<ErrorCode>,
     ended: bool,
     refusal: Option<ErrorCode>,
-    readers: Vec<Weak<Mutex<Live>>>,
+    readers: Vec<Weak<parking_lot::lock_api::Mutex<R, Live>>>,
 }
-impl Book {
-    fn register(&mut self, after: Option<u64>, live: Arc<Mutex<Live>>) -> Result<(), ErrorCode> {
+impl<R: parking_lot::lock_api::RawMutex> Book<R> {
+    fn register(
+        &mut self,
+        after: Option<u64>,
+        live: Arc<parking_lot::lock_api::Mutex<R, Live>>,
+    ) -> Result<(), ErrorCode> {
         if let Some(code) = self.refusal {
             live.lock().refusal = Some(code);
             return Ok(());
