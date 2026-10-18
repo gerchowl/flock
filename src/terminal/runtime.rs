@@ -292,6 +292,21 @@ impl TerminalRuntime {
         self.0.visible_ansi()
     }
 
+    /// Recheck and track one guarded choice, including deferred write evidence.
+    pub(crate) fn try_resolve_codex_lock_at(
+        &self,
+        bytes: Bytes,
+        deadline: std::time::Instant,
+        now: std::time::Instant,
+    ) -> Result<crate::pty::write_receipt::WriteReceipt, &'static str> {
+        self.0.try_resolve_codex_lock_at(bytes, deadline, now)
+    }
+
+    /// Lock diagnosis cached against the terminal content revision.
+    pub(crate) fn codex_conversation_locked(&self) -> crate::pane::CodexLockState {
+        self.0.codex_conversation_locked()
+    }
+
     pub fn detection_text(&self) -> String {
         self.0.detection_text()
     }
@@ -509,6 +524,10 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    pub(crate) fn test_poison_detection_core(&self) {
+        self.0.test_poison_detection_core();
+    }
+
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
         let (runtime, rx) = crate::pane::PaneRuntime::test_with_channel(cols, rows);
         (Self(runtime), rx)

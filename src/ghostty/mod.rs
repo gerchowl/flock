@@ -553,6 +553,7 @@ pub fn encode_focus(event: FocusEvent) -> Result<Vec<u8>, Error> {
 }
 
 pub struct Terminal {
+    detection_revision: u64,
     raw: ffi::GhosttyTerminal_ptr,
     write_pty_callback: Option<Box<WritePtyCallbackState>>,
 }
@@ -572,10 +573,17 @@ impl Terminal {
         Ok(Self {
             raw,
             write_pty_callback: None,
+            detection_revision: 0,
         })
     }
 
+    /// Revision of content or geometry affecting bottom-buffer detection.
+    pub(crate) fn detection_revision(&self) -> u64 {
+        self.detection_revision
+    }
+
     pub fn write(&mut self, bytes: &[u8]) {
+        self.detection_revision = self.detection_revision.wrapping_add(1);
         // SAFETY: self.raw is a live terminal handle for self's lifetime.
         unsafe {
             ffi::ghostty_terminal_vt_write(self.raw, bytes.as_ptr(), bytes.len());
@@ -589,6 +597,7 @@ impl Terminal {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> Result<(), Error> {
+        self.detection_revision = self.detection_revision.wrapping_add(1);
         let cell_width_px = cell_width_px.max(1);
         let cell_height_px = cell_height_px.max(1);
         // SAFETY: self.raw is valid and sizes are plain values.
@@ -676,6 +685,7 @@ impl Terminal {
     }
 
     pub fn mode_set(&mut self, mode: u16, value: bool) -> Result<(), Error> {
+        self.detection_revision = self.detection_revision.wrapping_add(1);
         unsafe { ffi::ghostty_terminal_mode_set(self.raw, mode, value).into_result() }
     }
 
@@ -2615,6 +2625,24 @@ impl<'a> RowCellIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detection_revision_tracks_writes_resize_and_modes_not_viewport() {
+        let mut terminal = super::Terminal::new(80, 24, 1000).unwrap();
+        let mut revision = terminal.detection_revision();
+        terminal.write(b"fixture");
+        assert_ne!(terminal.detection_revision(), revision);
+        revision = terminal.detection_revision();
+        terminal.resize(100, 24, 1, 1).unwrap();
+        assert_ne!(terminal.detection_revision(), revision);
+        revision = terminal.detection_revision();
+        terminal.mode_set(1049, true).unwrap();
+        assert_ne!(terminal.detection_revision(), revision);
+        revision = terminal.detection_revision();
+        terminal.scroll_viewport_delta(-1);
+        terminal.scroll_viewport_bottom();
+        assert_eq!(terminal.detection_revision(), revision);
+    }
 
     fn write_numbered_lines(terminal: &mut Terminal, count: usize) {
         for i in 0..count {

@@ -164,6 +164,76 @@ receipts addressed to nobody.
   can therefore at most remove a worktree whose work is already merged.
   `DelegateReassigned` records `by` for the audit.
 
+### 1b. Named dialogs and explicit conversation-lock choices (#1667)
+
+The existing CLI registry (§1) also records the latest explicit Codex lock
+choice in its JSON entry, without a new event kind or persistence format.
+`codex_conversation_locked` is a named human block in the harness dialog table,
+recognised only in the live screen tail by the lock notice, continuation
+instruction and retry/fork/exit footer. Quoted history above a later composer
+is not this state. Detection feeds ADR-0028 §1's human-attention axis.
+
+The live-tail footer may end exactly at `r retry f fork`: this is accepted as
+a truncated footer, including blank trailing lines. Text or a composer after
+the footer invalidates the match; scrollback alone is not a lock.
+
+No automatic path answers the lock. A start blocked there retains its pane,
+checkout and round-0 record and returns `agent_blocked` (ADR-0029 exit 6).
+Status and wait name the same dialog at startup or later; wait exits 6.
+Readiness consumes the lock diagnosis in `agent.get`'s existing
+`blocked_reason`, without another screen RPC. A lock reason requires
+`agent_status: blocked`; the server caches the live diagnosis per terminal
+content revision and projects that status with its reason, even before the
+asynchronous detector publishes the transition. `pane.get` / `pane.list` and
+agent reads use the same live status derivation. Internal lock evidence is
+`Locked`, `Unlocked`, or `Unavailable(reason)`. A poisoned terminal-core mutex
+or snapshot failure yields `Unknown`, with its typed reason logged once per
+terminal, and no lock reason. It never fails a list request or proves an unlock.
+PTY writes, resize and mode
+changes invalidate the cache; user viewport scrolling does not. Offline and
+hibernated lifecycle states still outrank a lock diagnosis. Other reasons retain their
+existing semantics: `resume_failed` can describe an offline identity. A plain
+brief send refuses with the registered `codex_conversation_locked` code.
+
+`delegate send --resolve-lock retry|fork` is the explicit choice, mutually
+exclusive with a brief or await. The CLI holds the existing delegate lock,
+subscribes before observing, durably records the intent, then calls guarded
+`pane.resolve_codex_lock`. That operation rechecks the live screen in the
+server's owner turn and admits exactly one `r` or `f` with no Enter. A per-pane
+fence refuses another choice with `injection_pending` during the bounded write
+and a fixed 60-second settle window measured from its completed write. The
+actual receipt releases the fence immediately on zero-byte failure, including
+deferred failure; an observed unlock releases it only once the pending write
+has finished or been retired, so a transient repaint cannot admit two keys. Failed or partial
+writes retain their first terminal-write timestamp, so later cancellation or
+observation cannot extend the settle window. Pending writes retain their
+existing bounded write budget. The fence is runtime-only and resets on server
+handoff. A pane without a runtime refuses with `pane_not_found` rather than
+`agent_not_ready`.
+The CLI uses the same 60-second maximum for confirmation, with smaller
+`--ready-timeout` values shortening its wait. After inspecting a still-locked
+pane, the operator can choose again after the settle window; flock never
+re-sends a key automatically. An older
+server rejects this method; it cannot silently ignore a guard and send a raw
+key. MCP exposes no new keyboard tool. Mesh VERSION remains 5.
+
+After admission the CLI confirms that the live screen left the lock, using
+status notifications and bounded condition polling within the existing
+readiness budget, never re-sending. The registry holds only the latest choice,
+its timestamp and confirmation bit while the lock remains; unknown future
+metadata is preserved raw. Resolution, an observed unlocked screen in status,
+an observed unlocked outcome, or the next submitted round clears it. Older flock versions read the additive
+key but drop it when rewriting an entry. Status or wait that needs to clear
+metadata refuses with `injection_pending` if a concurrent registry writer holds
+the lock; wait then returns that typed refusal instead of its normal outcome.
+An unconfirmed intent is not proof of delivery. A silent producer, stream
+loss, or uncertain write returns registered `codex_lock_unconfirmed` with
+ADR-0029's after-inspection exit 8. The operator inspects before another choice.
+A pre-request registry durability failure sends nothing; a post-request write
+failure can retain an unconfirmed intent. Successful resolution leaves the round
+unchanged and does not promise that the next dialog is ready for a brief.
+Restoring a missing registry entry remains #1285.
+
 ### 2. `delegate.list` is the one read, and every surface is a projection of it
 
 A socket verb `delegate.list { architect: self | <AgentId> | all, branch?, repo? }`
