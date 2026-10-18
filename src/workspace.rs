@@ -1153,11 +1153,16 @@ impl Workspace {
         self.git_identity_resolved = true;
     }
 
-    pub fn git_status_snapshot_for_cwd_with_cache(
+    /// Read a snapshot within the owned round deadline, preserving typed probe failures.
+    pub(crate) fn git_status_snapshot_for_cwd_with_cache(
         resolved_identity_cwd: &std::path::Path,
         cached: Option<&GitStatusCacheEntry>,
-    ) -> (WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>) {
-        self::git::git_status_snapshot_for_cwd(resolved_identity_cwd, cached)
+        deadline: std::time::Instant,
+    ) -> Result<
+        (WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>),
+        crate::health::GitRefreshErrorKind,
+    > {
+        self::git::git_status_snapshot_for_cwd(resolved_identity_cwd, cached, deadline)
     }
 
     pub fn find_tab_index_for_pane(&self, pane_id: PaneId) -> Option<usize> {

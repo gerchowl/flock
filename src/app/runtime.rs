@@ -8,6 +8,7 @@ use super::{
     RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
 };
 use crate::events::AppEvent;
+use crate::health::GitRefreshErrorKind;
 use crate::workspace::{GitStatusCacheEntry, Workspace, WorkspaceGitStatus};
 use std::collections::HashMap;
 
@@ -32,8 +33,9 @@ pub(crate) struct WorkspaceGitRefreshJob {
     pub(crate) targets: Vec<WorkspaceGitRefreshTarget>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceGitRefreshOutput {
+    pub(crate) error: Option<GitRefreshErrorKind>,
     pub(crate) results: Vec<WorkspaceGitStatus>,
     pub(crate) cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
 }
@@ -616,6 +618,7 @@ impl App {
     }
 
     pub(crate) fn start_git_status_refresh_if_due(&mut self, now: Instant) {
+        self.check_git_refresh_watchdog(now);
         let Some(deadline) = self.git_refresh_deadline() else {
             return;
         };
@@ -624,40 +627,58 @@ impl App {
             return;
         }
 
-        // Reap a stuck refresh BEFORE deciding to dispatch (#295): if the
-        // previous worker died without delivering `GitStatusRefreshed`, the
-        // `git_refresh_in_flight` guard would latch and every later tick
-        // would silently skip forever. Reaping stamps a `Timeout` and
-        // releases the guard — the same recovery `pr_poll` runs.
-        if self.git_refresh_health.reap_stuck_round(
-            now,
-            crate::health::GIT_REFRESH_MAX_ROUND_SECS,
-            crate::health::GitRefreshErrorKind::Timeout,
-        ) {
-            self.git_refresh_in_flight = false;
-        }
-
         let workspaces = self.workspace_git_refresh_items();
 
         if workspaces.is_empty() {
+            self.git_refresh_idle = Some(crate::api::schema::PollerReason::NoEligibleWorkspaces);
             self.last_git_remote_status_refresh = now;
             return;
         }
 
+        self.git_refresh_idle = None;
+        let cache = self.git_status_cache.clone();
+        let deadline = now + Duration::from_secs(crate::health::GIT_REFRESH_MAX_ROUND_SECS);
+        self.dispatch_git_refresh(
+            now,
+            move || refresh_workspace_git_statuses_with_cache(workspaces, &cache, deadline),
+            spawn_git_refresh_worker,
+        );
+    }
+
+    /// Run an owned refresh operation and deliver its completion on the app channel.
+    /// The spawn boundary also permits deterministic worker-failure fixtures.
+    fn dispatch_git_refresh(
+        &mut self,
+        now: Instant,
+        run: impl FnOnce() -> WorkspaceGitRefreshOutput + Send + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) {
         self.git_refresh_in_flight = true;
+        self.git_refresh_timed_out = false;
         self.git_refresh_health.mark_started(now);
         let event_tx = self.event_tx.clone();
-        let cache = self.git_status_cache.clone();
-        std::thread::spawn(move || {
-            let output = refresh_workspace_git_statuses_with_cache(workspaces, &cache);
+        let spawned = spawn(Box::new(move || {
+            let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+                .unwrap_or_else(|_| WorkspaceGitRefreshOutput {
+                    error: Some(GitRefreshErrorKind::WorkerPanic),
+                    ..Default::default()
+                });
             let _ = event_tx.blocking_send(AppEvent::GitStatusRefreshed {
                 results: output.results,
                 cache_updates: output.cache_updates,
+                error: output.error,
             });
-        });
+        }));
+        if spawned.is_err() {
+            self.git_refresh_in_flight = false;
+            self.git_refresh_health
+                .mark_failure(now, GitRefreshErrorKind::WorkerSpawn);
+            self.last_git_remote_status_refresh = now;
+        }
     }
 
     pub(crate) fn mark_git_status_refresh_due(&mut self, now: Instant) {
+        self.git_refresh_idle = None;
         if self.git_refresh_in_flight {
             self.git_refresh_due_after_in_flight = true;
             return;
@@ -668,8 +689,37 @@ impl App {
         self.git_refresh_due_after_in_flight = false;
     }
 
+    /// Report a stalled round once without releasing ownership of its worker.
+    /// Native filesystem calls cannot be cancelled, so no replacement overlaps it.
+    pub(crate) fn check_git_refresh_watchdog(&mut self, now: Instant) {
+        if !self.git_refresh_in_flight || self.git_refresh_timed_out {
+            return;
+        }
+        let Some(started) = self.git_refresh_health.in_flight_since else {
+            return;
+        };
+        if now.saturating_duration_since(started).as_secs()
+            < crate::health::GIT_REFRESH_MAX_ROUND_SECS
+        {
+            return;
+        }
+        self.git_refresh_health
+            .mark_failure(now, GitRefreshErrorKind::Stalled);
+        self.git_refresh_health.in_flight_since = Some(started);
+        self.git_refresh_timed_out = true;
+    }
+
     pub(crate) fn git_refresh_deadline(&self) -> Option<Instant> {
-        (!self.git_refresh_in_flight && !self.state.workspaces.is_empty())
+        if self.git_refresh_in_flight {
+            return self
+                .git_refresh_health
+                .in_flight_since
+                .filter(|_| !self.git_refresh_timed_out)
+                .map(|start| {
+                    start + Duration::from_secs(crate::health::GIT_REFRESH_MAX_ROUND_SECS)
+                });
+        }
+        (!self.state.workspaces.is_empty())
             .then_some(self.last_git_remote_status_refresh + GIT_REMOTE_STATUS_REFRESH_INTERVAL)
     }
 
@@ -710,7 +760,7 @@ impl App {
             self.action_notice_deadline,
             self.copy_feedback_deadline,
             self.next_animation_tick,
-            include_git_refresh
+            (include_git_refresh || self.git_refresh_in_flight)
                 .then(|| self.git_refresh_deadline())
                 .flatten(),
             self.next_auto_update_check,
@@ -773,8 +823,11 @@ impl App {
             .filter_map(|ws| {
                 let cwd =
                     ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)?;
-                let git_key = crate::workspace::git_status_cache_key(&cwd);
-                let cache_key = git_key.unwrap_or_else(|| cwd.clone());
+                if cwd.as_os_str().is_empty() {
+                    return None;
+                }
+                // Filesystem discovery belongs to the watched worker, not the app loop.
+                let cache_key = cwd.clone();
                 Some(WorkspaceGitRefreshItem {
                     workspace_id: ws.id.clone(),
                     resolved_identity_cwd: cwd,
@@ -1772,6 +1825,10 @@ fn post_error_comment(gh_bin: &str, repo: &str, issue: u64, reason: &str) -> Res
     Ok(())
 }
 
+fn spawn_git_refresh_worker(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new().spawn(job).map(|_| ())
+}
+
 pub(crate) fn deduplicate_git_refresh_items(
     items: Vec<WorkspaceGitRefreshItem>,
     cache: &HashMap<std::path::PathBuf, GitStatusCacheEntry>,
@@ -1803,30 +1860,53 @@ pub(crate) fn deduplicate_git_refresh_items(
     jobs
 }
 
+/// Refresh deduplicated repositories within the dispatch deadline. Preserve
+/// healthy results in a partially failed round, but never cache a failed probe.
 pub(crate) fn refresh_workspace_git_statuses_with_cache(
-    items: Vec<WorkspaceGitRefreshItem>,
+    mut items: Vec<WorkspaceGitRefreshItem>,
     cache: &HashMap<std::path::PathBuf, GitStatusCacheEntry>,
+    deadline: Instant,
 ) -> WorkspaceGitRefreshOutput {
-    let mut results = Vec::new();
-    let mut cache_updates = Vec::new();
-
-    for job in deduplicate_git_refresh_items(items, cache) {
-        let (snapshot, cache_entry) =
-            Workspace::git_status_snapshot_for_cwd_with_cache(&job.status_cwd, job.cached.as_ref());
-        if let Some(cache_entry) = cache_entry {
-            cache_updates.push((job.cache_key.clone(), cache_entry));
+    let mut output = WorkspaceGitRefreshOutput::default();
+    for item in &mut items {
+        if Instant::now() >= deadline {
+            output.error = Some(GitRefreshErrorKind::Timeout);
+            return output;
         }
-        results.extend(job.targets.into_iter().map(move |target| {
-            snapshot
-                .clone()
-                .into_workspace_status(target.workspace_id, target.resolved_identity_cwd)
-        }));
+        item.cache_key = crate::workspace::git_status_cache_key(&item.resolved_identity_cwd)
+            .unwrap_or_else(|| item.resolved_identity_cwd.clone());
+    }
+    for job in deduplicate_git_refresh_items(items, cache) {
+        if Instant::now() >= deadline {
+            output.error = Some(GitRefreshErrorKind::Timeout);
+            break;
+        }
+        let (snapshot, cache_entry) = match Workspace::git_status_snapshot_for_cwd_with_cache(
+            &job.status_cwd,
+            job.cached.as_ref(),
+            deadline,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                output.error = Some(error);
+                continue;
+            }
+        };
+        if let Some(cache_entry) = cache_entry {
+            output
+                .cache_updates
+                .push((job.cache_key.clone(), cache_entry));
+        }
+        output
+            .results
+            .extend(job.targets.into_iter().map(move |target| {
+                snapshot
+                    .clone()
+                    .into_workspace_status(target.workspace_id, target.resolved_identity_cwd)
+            }));
     }
 
-    WorkspaceGitRefreshOutput {
-        results,
-        cache_updates,
-    }
+    output
 }
 
 #[cfg(test)]
@@ -2148,10 +2228,11 @@ mod tests {
                 },
             ],
             &HashMap::new(),
+            Instant::now() + Duration::from_secs(crate::health::GIT_REFRESH_MAX_ROUND_SECS),
         );
 
         assert_eq!(output.cache_updates.len(), 1);
-        assert_eq!(output.cache_updates[0].0, repo);
+        assert_eq!(output.cache_updates[0].0, repo.canonicalize().unwrap());
         assert_eq!(output.results.len(), 2);
         assert_eq!(output.results[0].workspace_id, "one");
         assert_eq!(
@@ -2280,6 +2361,7 @@ mod tests {
         assert!(app.git_refresh_due_after_in_flight);
 
         app.handle_internal_event(crate::events::AppEvent::GitStatusRefreshed {
+            error: None,
             results: Vec::new(),
             cache_updates: Vec::new(),
         });
@@ -2916,3 +2998,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "git_refresh_tests.rs"]
+mod git_refresh_tests;

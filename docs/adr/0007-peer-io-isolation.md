@@ -98,3 +98,35 @@ Concretely (implemented in #176):
 - New surface to keep honest: any future code that writes to a slot must go
   through `SlotWriter::send`, never a raw stream — the invariant is a convention,
   not yet a type-level guarantee.
+
+## Server git-refresh worker (#1722)
+
+The same isolation principle applies to the sidebar git refresh: filesystem
+repository discovery and git probes run in one owned worker, outside the app
+loop. The #262/#265 viewer gate remains a dispatch gate, not cancellation of an
+already owned round. A worker panic returns a typed failure outcome; failure to
+start the worker is also counted. Neither is a successful refresh.
+
+The existing per-command ceiling is **10 seconds**, clamped to the round's
+**60-second** deadline. This covers `rev-list`, reftable `symbolic-ref` and
+`rev-parse`; command groups are killed and reaped by the common process runner.
+Nonzero `rev-list`, command I/O and invalid UTF-8/counts fail the round and never
+produce a cache entry for that probe. Other repositories can still publish
+healthy results within the remaining round budget. Detached symbolic refs (exit 1) and absent
+optional revisions (exit 128) retain their normal absence semantics.
+
+The app watchdog stays scheduled while a round is in flight, including without
+viewers. At 60 seconds it records `round_stalled` once and retains worker
+ownership: native filesystem calls cannot be forcibly cancelled, so dispatching
+a replacement could accumulate blocked threads. The existing worker's eventual
+completion permits recovery. If the filesystem never returns, git refresh stays
+broken and in flight, with its rising age visible, while other app work continues.
+The operator should restore access to the checkout's filesystem; this change
+does not restart the server or terminate an unconfirmed filesystem operation.
+
+Summary `last_error` is a closed code: `timeout` (command/round deadline),
+`git_io` (process I/O), `git_exit` (unsuccessful command), `git_output`
+(malformed output), `worker_panic`, `worker_spawn`, or `round_stalled`.
+No command output, path, host or panic payload is exposed in that field. Each
+owned round increments failures at most once, even when its watchdog fires
+before an error completion. Only a successful completion resets failures.
