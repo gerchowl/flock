@@ -286,15 +286,38 @@ fn git_common_dir_for_git_dir(git_dir: &Path) -> PathBuf {
 }
 
 pub fn git_branch(cwd: &Path) -> Option<String> {
-    let repo_root = git_repo_root(cwd)?;
-    let git_dir = git_dir_for_repo_root(&repo_root)?;
+    git_branch_with_deadline(
+        cwd,
+        std::time::Instant::now() + super::probe::GIT_EXEC_TIMEOUT,
+    )
+    .ok()
+    .flatten()
+}
+
+/// Preserve branch-only discovery when a cache fingerprint is unavailable.
+/// Reftable discovery shares the refresh round deadline, including this fallback.
+pub(super) fn git_branch_with_deadline(
+    cwd: &Path,
+    deadline: std::time::Instant,
+) -> Result<Option<String>, crate::health::GitRefreshErrorKind> {
+    let Some(repo_root) = git_repo_root(cwd) else {
+        return Ok(None);
+    };
+    let Some(git_dir) = git_dir_for_repo_root(&repo_root) else {
+        return Ok(None);
+    };
     let git_common_dir = git_common_dir_for_git_dir(&git_dir);
     if git_ref_storage_is_reftable(&git_common_dir) {
-        return git_symbolic_head_short(&repo_root);
+        return super::probe::text(
+            &repo_root,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            Some(1),
+            deadline,
+        );
     }
-
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    parse_git_head_branch(&head)
+    Ok(std::fs::read_to_string(git_dir.join("HEAD"))
+        .ok()
+        .and_then(|head| parse_git_head_branch(&head)))
 }
 
 pub(super) fn git_dir_for_repo_root(repo_root: &Path) -> Option<PathBuf> {
@@ -323,10 +346,6 @@ pub(super) fn git_symbolic_head_full(
         Some(1),
         deadline,
     )
-}
-
-fn git_symbolic_head_short(repo_root: &Path) -> Option<String> {
-    git_trimmed_stdout(repo_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
 }
 
 pub(super) fn git_rev_parse_verify(
@@ -427,22 +446,6 @@ fn strip_git_config_comment(value: &str) -> &str {
         }
     }
     value
-}
-
-fn git_trimmed_stdout(repo_root: &Path, args: &[&str]) -> Option<String> {
-    let output = crate::process::TracedCommand::new("git", "git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .output_traced_with_timeout(super::probe::GIT_EXEC_TIMEOUT)
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let stdout = stdout.trim();
-    (!stdout.is_empty()).then(|| stdout.to_string())
 }
 
 pub(super) fn git_repo_root(start: &Path) -> Option<PathBuf> {

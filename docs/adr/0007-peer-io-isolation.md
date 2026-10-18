@@ -110,10 +110,21 @@ start the worker is also counted. Neither is a successful refresh.
 The existing per-command ceiling is **10 seconds**, clamped to the round's
 **60-second** deadline. This covers `rev-list`, reftable `symbolic-ref` and
 `rev-parse`; command groups are killed and reaped by the common process runner.
-Nonzero `rev-list`, command I/O and invalid UTF-8/counts fail the round and never
-produce a cache entry for that probe. Other repositories can still publish
-healthy results within the remaining round budget. Detached symbolic refs (exit 1) and absent
-optional revisions (exit 128) retain their normal absence semantics.
+Nonzero `rev-list`, command I/O and invalid UTF-8/counts fail that repository's
+probe and never produce a cache entry for it. Other repositories keep refreshing
+within the remaining round budget. `rev-parse --verify --quiet` exit 1 means
+optional absence; fatal errors, including exit 128, remain `git_exit`. Quiet
+verification also hides malformed loose refs, so absence is confirmed by a bounded
+`show-ref` database check (exit 1 for an empty database). Neither command parses
+stderr. An absent revision also requires a symbolic or resolvable detached HEAD:
+a damaged reftable stack can otherwise appear to be an empty database. Detached
+symbolic refs retain their exit-1 absence semantics.
+
+A missing fingerprint keeps the earlier branch-only fallback, with the same
+round/command bounds on reftable discovery. Symbolic reftable HEAD outside
+`refs/heads/` has no branch fingerprint, rather than being malformed output:
+the branch-only fallback may still show its shortened symbolic target. Such
+snapshots are not cached and carry no ahead/behind counts.
 
 The app watchdog stays scheduled while a round is in flight, including without
 viewers. At 60 seconds it records `round_stalled` once and retains worker
@@ -128,5 +139,20 @@ Summary `last_error` is a closed code: `timeout` (command/round deadline),
 `git_io` (process I/O), `git_exit` (unsuccessful command), `git_output`
 (malformed output), `worker_panic`, `worker_spawn`, or `round_stalled`.
 No command output, path, host or panic payload is exposed in that field. Each
-owned round increments failures at most once, even when its watchdog fires
-before an error completion. Only a successful completion resets failures.
+worker failure increments the worker streak at most once, even when its watchdog
+fires before an error completion. A completed worker resets its own streak,
+independently of repository failures. Each failed repository has a separate
+consecutive-probe count, reset only by its own successful snapshot. Completed
+partial rounds are `degraded`, not permanently `broken` because one checkout
+fails repeatedly. Worker panics, spawn errors and stalled rounds retain their
+worker-level failure semantics.
+
+Summary `repositories` is an additive optional list of failed repositories,
+with checkout basenames, workspace IDs, counts and typed error codes. Basenames
+can collide; workspace IDs disambiguate them. No absolute paths enter these
+rows. Older mesh-v5 JSON summary readers ignore the extra field. Failed
+workspaces retain their last values with `[git stale]` in sidebar labels until
+a successful snapshot for that workspace's current cwd. Results for removed or
+moved workspace/cwd pairs do not mutate their current health. Operators should
+repair the named checkout's repository or filesystem and let the next scheduled
+round confirm recovery; healthy checkouts continue independently.

@@ -100,6 +100,18 @@ recover yet. Worker panics and spawn failures are reported as broken; subsequent
 rounds use the existing cadence. No command output or paths appear in the error
 code.
 
+Repository failures are separate from worker failures. A completed round with
+failed checkouts reports `degraded` and includes `repositories`: each row has a
+checkout basename (`repo`), `workspace_ids`, its own `consecutive_failures` and a
+typed `last_error`. The poller's `last_error` shows a worker error, or the first
+listed repository error when the worker completed a partial round. No absolute
+paths or git stderr are included. Workspace IDs
+disambiguate identical basenames. Other checkouts keep refreshing, while failed
+workspaces display their last known values with `[git stale]`. Repair the named
+checkout; its next successful refresh clears its streak and stale marker.
+Worker panics, spawn failures and stuck rounds still report worker-level failures.
+
+
 ## Peer enrollment
 
 `flk peers` and `flk status` show each peer's name, pin direction, short node

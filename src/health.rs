@@ -591,8 +591,8 @@ impl GitRefreshErrorKind {
 
 /// Longest a git-status refresh round can legitimately be in flight. Git
 /// operations against a slow filesystem (or an SMB-mounted checkout) can take
-/// several seconds; anything past this ceiling is a worker that never
-/// delivered its `GitStatusRefreshed` event.
+/// several seconds. Past this ceiling the watchdog records a stalled round
+/// and retains ownership until completion, rather than reaping its worker.
 pub(crate) const GIT_REFRESH_MAX_ROUND_SECS: u64 = 60;
 
 /// Why the checks runner tick did not stamp success.

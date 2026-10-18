@@ -12,6 +12,7 @@ pub(crate) mod agent_restart;
 mod agent_resume;
 mod agents;
 mod api;
+pub(crate) mod git_repository_health;
 pub(crate) use api::mesh_mail::RecoveredMessage;
 pub(crate) use api::mesh_routes::Completion as MeshRoutesCompletion;
 pub(crate) use api::responses::encode_error_with_data;
@@ -309,6 +310,8 @@ pub struct App {
     pub(crate) issue_guard_fetch_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
+    pub(crate) git_repository_failures:
+        HashMap<std::path::PathBuf, (git_repository_health::RepositoryFailure, u32)>,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) next_resize_poll: Instant,
@@ -1021,6 +1024,7 @@ impl App {
             issue_guard_fetch_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_status_cache: HashMap::new(),
+            git_repository_failures: HashMap::new(),
             last_sidebar_divider_click: None,
             last_pane_click: None,
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
@@ -2687,6 +2691,7 @@ mod tests {
         app.last_git_remote_status_refresh = previous_refresh;
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            failures: Vec::new(),
             error: None,
             results: Vec::new(),
             cache_updates: Vec::new(),
@@ -2705,6 +2710,7 @@ mod tests {
         let resolved_identity_cwd = app.state.workspaces[0].resolved_identity_cwd().unwrap();
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            failures: Vec::new(),
             error: None,
             results: vec![crate::workspace::WorkspaceGitStatus {
                 workspace_id,

@@ -63,7 +63,7 @@ pub(crate) fn git_status_snapshot_for_cwd(
     let Some(fingerprint) = git_status_fingerprint(cwd, deadline)? else {
         return Ok((
             WorkspaceGitStatusSnapshot {
-                branch: None,
+                branch: super::discovery::git_branch_with_deadline(cwd, deadline)?,
                 ahead_behind: None,
                 space,
             },
@@ -166,10 +166,9 @@ fn read_head_identity(
         return Ok(read_head_identity_from_files(info));
     }
     if let Some(full_ref) = git_symbolic_head_full(&info.repo_root, deadline)? {
-        let short_name = full_ref
-            .strip_prefix("refs/heads/")
-            .ok_or(Error::GitOutput)?
-            .to_owned();
+        let Some(short_name) = full_ref.strip_prefix("refs/heads/").map(str::to_owned) else {
+            return Ok(None);
+        };
         let oid = git_rev_parse_verify(&info.repo_root, &full_ref, deadline)?;
         return Ok(Some(GitHeadIdentity::Branch {
             full_ref,
@@ -425,6 +424,25 @@ mod tests {
         );
 
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn git2034_non_branch_reftable_head_keeps_legacy_branch_fallback() {
+        let root = crate::test_support::TempDir::socket();
+        run_git(
+            root.path(),
+            &["init", "-q", "--ref-format=reftable", "-b", "main"],
+        );
+        run_git(
+            root.path(),
+            &["symbolic-ref", "HEAD", "refs/tags/unborn-fixture"],
+        );
+        let expected = super::super::discovery::git_branch(root.path());
+        assert_eq!(expected.as_deref(), Some("unborn-fixture"));
+        let (snapshot, cache) = git_status_snapshot_for_cwd(root.path(), None, deadline()).unwrap();
+        assert_eq!(snapshot.branch, expected);
+        assert!(snapshot.ahead_behind.is_none());
+        assert!(cache.is_none());
     }
 
     #[test]

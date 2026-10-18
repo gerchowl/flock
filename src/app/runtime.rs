@@ -37,6 +37,7 @@ pub(crate) struct WorkspaceGitRefreshJob {
 pub(crate) struct WorkspaceGitRefreshOutput {
     pub(crate) error: Option<GitRefreshErrorKind>,
     pub(crate) results: Vec<WorkspaceGitStatus>,
+    pub(crate) failures: Vec<super::git_repository_health::RepositoryFailure>,
     pub(crate) cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
 }
 
@@ -665,6 +666,7 @@ impl App {
                 });
             let _ = event_tx.blocking_send(AppEvent::GitStatusRefreshed {
                 results: output.results,
+                failures: output.failures,
                 cache_updates: output.cache_updates,
                 error: output.error,
             });
@@ -1888,7 +1890,13 @@ pub(crate) fn refresh_workspace_git_statuses_with_cache(
         ) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                output.error = Some(error);
+                output
+                    .failures
+                    .push(super::git_repository_health::RepositoryFailure {
+                        cache_key: job.cache_key,
+                        targets: job.targets,
+                        error,
+                    });
                 continue;
             }
         };
@@ -2361,6 +2369,7 @@ mod tests {
         assert!(app.git_refresh_due_after_in_flight);
 
         app.handle_internal_event(crate::events::AppEvent::GitStatusRefreshed {
+            failures: Vec::new(),
             error: None,
             results: Vec::new(),
             cache_updates: Vec::new(),

@@ -4937,6 +4937,19 @@ pub enum PollerReason {
     Unknown,
 }
 
+/// One repository's failed refresh, independent of the worker's health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRepositoryHealth {
+    /// Checkout basename only, never an absolute filesystem path.
+    pub repo: String,
+    /// Workspace identities disambiguate repositories sharing a basename.
+    pub workspace_ids: Vec<String>,
+    /// Failed probes since this repository's last successful completion.
+    pub consecutive_failures: u32,
+    /// Closed git-refresh error code, never command output or a path.
+    pub last_error: String,
+}
+
 /// One poller's health.
 ///
 /// Carries the raw facts AND a computed verdict on purpose: a watchdog wants
@@ -4945,6 +4958,9 @@ pub enum PollerReason {
 /// colour a badge. Making either reconstruct the other guarantees they disagree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollerHealth {
+    /// Failed git repositories. Empty/absent for healthy repositories and other pollers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repositories: Vec<GitRepositoryHealth>,
     /// `ok` | `idle` | `degraded` | `broken`; unknown future values remain readable.
     pub status: String,
     /// Typed inactivity or pending-refresh reason; absent for other pollers.
@@ -4964,6 +4980,7 @@ pub struct PollerHealth {
     /// Rounds skipped because the previous one had not finished. Sustained
     /// growth means the cadence is shorter than the work.
     pub skipped_rounds: u64,
+    /// Worker error, or the first listed repository error for a partial git round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }

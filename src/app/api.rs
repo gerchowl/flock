@@ -223,6 +223,7 @@ impl App {
         }
 
         if let AppEvent::GitStatusRefreshed {
+            failures,
             error,
             results,
             cache_updates,
@@ -258,12 +259,12 @@ impl App {
             } else {
                 self.last_git_remote_status_refresh = Instant::now();
             }
+            let repository_changed = self.apply_git_repository_outcome(&results, failures);
             let adopted = self.state.adopt_external_worktrees();
-            if self
+            let statuses_changed = self
                 .state
-                .apply_workspace_git_statuses(&self.terminal_runtimes, results)
-                || adopted
-            {
+                .apply_workspace_git_statuses(&self.terminal_runtimes, results);
+            if repository_changed || statuses_changed || adopted {
                 self.render_dirty.store(true, Ordering::Release);
                 self.render_notify.notify_one();
             }

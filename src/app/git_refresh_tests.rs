@@ -28,6 +28,7 @@ fn empty_output() -> WorkspaceGitRefreshOutput {
     WorkspaceGitRefreshOutput {
         error: None,
         results: vec![],
+        failures: vec![],
         cache_updates: vec![],
     }
 }
@@ -227,13 +228,14 @@ async fn failed_probe(script: Option<&str>, code: &str) {
     app.handle_internal_event(event);
     let row = summary(&mut app);
     assert_eq!(row["status"], "degraded");
+    assert_eq!(row["repositories"][0]["consecutive_failures"], 1);
     assert_eq!(
         (
             row["consecutive_failures"].as_u64(),
             row["last_error"].as_str(),
             app.git_status_cache.len()
         ),
-        (Some(1), Some(code), 0)
+        (Some(0), Some(code), 0)
     );
 }
 
@@ -281,7 +283,7 @@ async fn git_refresh_timeout_is_counted_and_never_cached() {
             row["last_error"].as_str(),
             app.git_status_cache.len()
         ),
-        (Some(1), Some("timeout"), 0)
+        (Some(0), Some("timeout"), 0)
     );
 }
 
@@ -335,11 +337,94 @@ async fn git_refresh_failed_repository_does_not_starve_healthy_repositories() {
         .await
         .expect("probe did not complete");
     app.handle_internal_event(event);
-    assert_eq!(app.git_refresh_health.consecutive_failures, 1);
+    assert_eq!(app.git_refresh_health.consecutive_failures, 0);
     assert_eq!(app.git_status_cache.len(), 1);
     assert_eq!(
         app.state.workspaces[1].cached_git_ahead_behind,
         Some((3, 1))
     );
     assert_eq!(summary(&mut app)["last_error"], "git_exit");
+}
+
+async fn git2034_partial_round(app: &mut App) {
+    let now = Instant::now();
+    app.mark_git_status_refresh_due(now);
+    app.start_git_status_refresh_if_due(now);
+    let event = tokio::time::timeout(Duration::from_secs(30), git_completion(app))
+        .await
+        .expect("producer never completed");
+    app.handle_internal_event(event);
+}
+
+#[tokio::test]
+async fn git2034_repository_failure_isolated_and_recovery_clears_stale() {
+    let mut app = app();
+    app.state.app_client_attached = true;
+    let fixture = GitFixture::new(Some("if [ -f \"$2/fail\" ]; then exit 7; fi\nprintf '3 1'"));
+    std::fs::write(fixture.cwd().join("fail"), "").unwrap();
+    let healthy = crate::test_support::TempDir::socket();
+    crate::workspace::git::test_support::write_fake_tracked_repo(healthy.path());
+    app.state.workspaces[0].identity_cwd = fixture.cwd();
+    app.state.workspaces[0].tabs.clear();
+    app.state.workspaces[0].cached_git_branch = Some("last-known".into());
+    let mut second = Workspace::test_new("healthy-git");
+    second.identity_cwd = healthy.path().to_owned();
+    second.tabs.clear();
+    app.state.workspaces.push(second);
+    for round in 1..=8 {
+        std::fs::write(
+            healthy.path().join(".git/refs/heads/main"),
+            format!("{:040x}\n", 100 + round),
+        )
+        .unwrap();
+        git2034_partial_round(&mut app).await;
+        assert_eq!(
+            app.git_refresh_health.consecutive_failures, 0,
+            "repository failure became worker failure"
+        );
+        let row = summary(&mut app);
+        assert_eq!(row["status"], "degraded");
+        assert_eq!(row["repositories"][0]["consecutive_failures"], round);
+        assert_eq!(row["repositories"][0]["last_error"], "git_exit");
+        assert_eq!(
+            row["repositories"][0]["repo"],
+            fixture.cwd().file_name().unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            row["repositories"][0]["workspace_ids"][0],
+            app.state.workspaces[0].id
+        );
+        assert_eq!(
+            app.state.workspaces[1].cached_git_ahead_behind,
+            Some((3, 1))
+        );
+        assert!(!crate::ui::grammar::local_member_label(
+            &app.state,
+            &app.state.workspaces[1],
+            &app.terminal_runtimes
+        )
+        .contains("[git stale]"));
+        assert!(crate::ui::grammar::local_member_label(
+            &app.state,
+            &app.state.workspaces[0],
+            &app.terminal_runtimes
+        )
+        .contains("[git stale]"));
+        assert!(crate::ui::grammar::leader_label(
+            &app.state,
+            &app.state.workspaces[0],
+            &app.terminal_runtimes
+        )
+        .contains("[git stale]"));
+    }
+    std::fs::remove_file(fixture.cwd().join("fail")).unwrap();
+    git2034_partial_round(&mut app).await;
+    assert_eq!(summary(&mut app)["status"], "ok");
+    assert!(summary(&mut app).get("repositories").is_none());
+    assert!(!crate::ui::grammar::local_member_label(
+        &app.state,
+        &app.state.workspaces[0],
+        &app.terminal_runtimes
+    )
+    .contains("[git stale]"));
 }

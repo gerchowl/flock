@@ -16,22 +16,7 @@ pub(super) fn text(
     absent: Option<i32>,
     deadline: Instant,
 ) -> Result<Option<String>, Error> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(Error::Timeout);
-    }
-    let output = crate::process::TracedCommand::new("git", "git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output_traced_with_timeout(remaining.min(GIT_EXEC_TIMEOUT))
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                Error::Timeout
-            } else {
-                Error::GitIo
-            }
-        })?;
+    let output = run(cwd, args, deadline)?;
     if !output.status.success() {
         return if absent.is_some() && output.status.code() == absent {
             Ok(None)
@@ -47,8 +32,29 @@ pub(super) fn text(
     Ok(Some(trimmed.to_owned()))
 }
 
-/// `symbolic-ref --quiet` exits 1 for a detached HEAD. `rev-parse --verify`
-/// exits 128 for an absent optional ref (including an unborn branch).
+/// One bounded subprocess, shared by output probes and quiet database validation.
+fn run(cwd: &Path, args: &[&str], deadline: Instant) -> Result<std::process::Output, Error> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(Error::Timeout);
+    }
+    crate::process::TracedCommand::new("git", "git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output_traced_with_timeout(remaining.min(GIT_EXEC_TIMEOUT))
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                Error::Timeout
+            } else {
+                Error::GitIo
+            }
+        })
+}
+
+/// Quiet verification exits 1 for absence, while fatal exit codes remain errors.
+/// On absence, validate the ref database too: quiet verification also hides a
+/// malformed loose ref. Both commands share the original deadline.
 pub(super) fn revision(
     cwd: &Path,
     revision: &str,
@@ -56,10 +62,31 @@ pub(super) fn revision(
 ) -> Result<Option<String>, Error> {
     let oid = text(
         cwd,
-        &["rev-parse", "--verify", revision],
-        Some(128),
+        &["rev-parse", "--verify", "--quiet", revision],
+        Some(1),
         deadline,
     )?;
+    if oid.is_none() {
+        // show-ref exits 1 for an empty database, but fails on corrupt refs.
+        let refs = run(cwd, &["show-ref", "--quiet"], deadline)?;
+        if !refs.status.success() && refs.status.code() != Some(1) {
+            return Err(Error::GitExit);
+        }
+        // Reftable readers can present an unreadable table stack as empty.
+        // Even an unborn repository must retain a symbolic HEAD. A detached
+        // repository instead needs a resolvable HEAD identity.
+        if text(cwd, &["symbolic-ref", "--quiet", "HEAD"], Some(1), deadline)?.is_none()
+            && text(
+                cwd,
+                &["rev-parse", "--verify", "--quiet", "HEAD"],
+                Some(1),
+                deadline,
+            )?
+            .is_none()
+        {
+            return Err(Error::GitExit);
+        }
+    }
     if oid
         .as_ref()
         .is_some_and(|s| !matches!(s.len(), 40 | 64) || !s.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -68,3 +95,7 @@ pub(super) fn revision(
     }
     Ok(oid)
 }
+
+#[cfg(test)]
+#[path = "probe_tests.rs"]
+mod tests;

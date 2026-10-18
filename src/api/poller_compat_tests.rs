@@ -36,3 +36,17 @@ fn poller_idle_and_future_values_are_additive_for_old_and_new_readers() {
         assert_eq!(current_from_old.reason, None);
     }
 }
+
+#[test]
+fn git2034_repository_failure_rows_are_additive_to_legacy_summaries() {
+    let json = serde_json::json!({"status":"degraded", "consecutive_failures":0, "in_flight":false, "skipped_rounds":0,
+        "last_error":"git_exit", "repositories":[{"repo":"fixture-repo", "workspace_ids":["fixture-workspace"], "consecutive_failures":8, "last_error":"git_exit"}]});
+    let current: PollerHealth = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(current.repositories[0].consecutive_failures, 8);
+    let legacy: LegacyPollerHealth = serde_json::from_value(json).unwrap();
+    assert_eq!(legacy.status, "degraded");
+    assert_eq!(legacy.last_error.as_deref(), Some("git_exit"));
+    let restored: PollerHealth =
+        serde_json::from_value(serde_json::to_value(legacy).unwrap()).unwrap();
+    assert!(restored.repositories.is_empty());
+}

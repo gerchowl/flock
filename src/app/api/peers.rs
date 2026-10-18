@@ -132,6 +132,7 @@ impl App {
             health.in_flight_since,
             |kind| kind.as_str().to_owned(),
         );
+        row.repositories = self.git_repository_health_rows();
         if self.git_refresh_timed_out
             || health
                 .in_flight_age_secs(now)
@@ -162,6 +163,10 @@ impl App {
             )
         ) {
             row.status = "broken".into();
+        }
+        if !row.repositories.is_empty() && row.last_error.is_none() {
+            row.status = "degraded".into();
+            row.last_error = Some(row.repositories[0].last_error.clone());
         }
         if row.last_error.is_some() && row.status == "ok" {
             row.status = "degraded".into();
@@ -455,6 +460,7 @@ fn project_poller_health<E: Copy + Eq>(
         .as_str()
         .to_string();
     crate::api::schema::PollerHealth {
+        repositories: Vec::new(),
         status,
         reason: None,
         last_success_age_secs: health.last_success_age_secs(now),
