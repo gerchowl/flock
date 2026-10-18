@@ -1017,17 +1017,8 @@ fn persist(
         file.sync_data()?;
         let stored = Arc::new(record);
         storage.2.publish(stored.clone(), encoded.len())?;
-        record = StreamRecord {
-            raw: live_raw,
-            seq: stored.seq,
-            known: stored.known,
-            shape: stored.shape.clone(),
-            received_at_ms: stored.received_at_ms,
-            origin: stored.origin,
-            result_subtype: stored.result_subtype.clone(),
-            permission_grant_request_id: stored.permission_grant_request_id.clone(),
-            permission_request_seq: stored.permission_request_seq,
-        };
+        record = Arc::unwrap_or_clone(stored);
+        record.raw = live_raw;
     }
     if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {
         uncertain.store(false, Ordering::Release);
