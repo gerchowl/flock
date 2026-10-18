@@ -10,6 +10,7 @@ use crate::structured::{
     },
     transport::{InputHandle, Received},
 };
+pub(crate) mod publication;
 use std::{cell::RefCell, io, num::NonZeroU64, path::Path, sync::mpsc};
 
 /// S4 projection after reducing every session record through this sequence.
@@ -44,6 +45,7 @@ pub(crate) struct Update {
 }
 /// Bounded, nonblocking server-side endpoint. It never owns a file or writer.
 pub(in crate::structured) struct Client {
+    pub source: publication::Source,
     requests: mpsc::SyncSender<Request>,
     states: mpsc::SyncSender<Snapshot>,
     updates: mpsc::Receiver<Update>,
@@ -80,6 +82,7 @@ impl Client {
 /// Constructed on the launch worker, then moved once to the session event pump.
 /// Normal completion releases the lease after durable final-event processing.
 pub(in crate::structured) struct Service {
+    publisher: publication::Publisher,
     scheduler: Scheduler,
     requests: mpsc::Receiver<Request>,
     states: mpsc::Receiver<Snapshot>,
@@ -88,7 +91,7 @@ pub(in crate::structured) struct Service {
     state: AgentState,
     covered: u64,
     required: u64,
-    error: Option<ErrorCode>,
+    error: Option<(ErrorCode, Option<(io::ErrorKind, String)>)>,
     cursor: u64,
     initial: bool,
     blocked: Option<ErrorCode>,
@@ -99,12 +102,15 @@ impl Service {
     pub fn open(data: &Path, agent: &str, bytes: NonZeroU64) -> Result<(Self, Client), Failure> {
         let journal = Journal::open_with_policy(data, agent, RewritePolicy::new(bytes))?;
         let scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH)?)?;
+        let (publisher, source) =
+            publication::Publisher::new(agent, scheduler.journal().replay(0)?);
         let (tx, requests) = mpsc::sync_channel(1);
         let (state_tx, states) = mpsc::sync_channel(1);
         // Same four-completion bound as the session stream; no unbounded spool.
         let (updates, rx) = mpsc::sync_channel(4);
         Ok((
             Self {
+                publisher,
                 scheduler,
                 requests,
                 states,
@@ -121,6 +127,7 @@ impl Service {
                 lost: false,
             },
             Client {
+                source,
                 requests: tx,
                 states: state_tx,
                 updates: rx,
@@ -143,6 +150,8 @@ impl Service {
     }
     /// Whether this operation failed at the stdin boundary.
     pub fn tick(&mut self, input: &InputHandle, stopped: bool, notify: &impl Fn()) -> bool {
+        self.publisher
+            .capture(|| self.scheduler.subscription(), self.status.clone());
         let mut changed = self.initial;
         if let Ok(state) = self.states.try_recv() {
             if state.through >= self.required {
@@ -234,7 +243,10 @@ impl Service {
                 None
             }
         };
-        let error = offer.as_ref().err().map(|e| e.code);
+        let error = offer
+            .as_ref()
+            .err()
+            .map(|e| (e.code, e.source.as_ref().map(|s| (s.kind(), s.to_string()))));
         let changed = self.initial
             || cut.as_ref().is_some_and(|c| c.through != self.cursor)
             || pending != self.status
@@ -245,18 +257,22 @@ impl Service {
                 self.cursor = cut.through;
             }
             self.initial = false;
-            self.error = error;
+            self.error = error.clone();
             self.status = pending.clone();
-            self.pending = Some(Update {
+            let update = Update {
                 admitted,
                 offer,
                 pending,
                 cut,
-            });
+            };
+            self.publisher.publish(&update);
+            self.pending = Some(update);
         }
-        error == Some(ErrorCode::InputWriteFailed)
+        error.is_some_and(|e| e.0 == ErrorCode::InputWriteFailed)
     }
     pub fn finish(&mut self, input: &InputHandle, notify: &impl Fn()) -> bool {
+        self.publisher
+            .capture(|| self.scheduler.subscription(), self.status.clone());
         let error = self.policy().and_then(|_| self.scheduler.exited()).err();
         self.publish(input, true, None, error);
         self.flush(true, notify);

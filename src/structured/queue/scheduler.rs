@@ -252,6 +252,10 @@ impl Scheduler {
         self.virgin = false;
         Ok(Offer::Submitted { batch_id: batch.id })
     }
+    /// Capture a bootstrapped subscription under this sole writer's ownership.
+    pub(crate) fn subscription(&mut self) -> Result<super::Cut, Failure> {
+        self.admission.subscription()
+    }
     /// Check configured rewrite policy under the scheduler's sole write ownership.
     pub(crate) fn checkpoint_if_required(&mut self) -> Result<Option<super::Cut>, Failure> {
         self.admission.checkpoint_if_required()
