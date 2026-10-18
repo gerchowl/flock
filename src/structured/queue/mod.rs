@@ -1,14 +1,14 @@
 //! Worker-owned queue journal (ADR-0036 §3/§4). Never call on the server loop.
 //!
 //! One non-cloneable writer holds a stable sidecar OS lock across rename and
-//! handoff. Close/drop it before handing ownership to another process. Appends
+//! handoff. Drop explicitly unlocks before another process takes ownership. Appends
 //! and checkpoint publication require &mut self; replay returns an owned cut.
 //! A failed write/sync/rename poisons the handle: reopen under the lease to learn
 //! which bytes committed. No success or in-memory change precedes durability.
 //! Threshold configuration and worker/event-loop wiring belong to #1803.
 #![deny(missing_docs)]
 pub mod model;
-use crate::platform::structured as private_fs;
+use crate::platform::{file_lock::LockFile, structured as private_fs};
 pub use model::{Change, Item, Record};
 use serde_json::{json, Value};
 use std::fs::{self, File};
@@ -49,7 +49,7 @@ pub struct Journal {
     checkpoint: Option<(u64, u64)>,
     future: bool,
     poisoned: bool,
-    _lease: File,
+    _lease: LockFile,
 }
 fn problem(message: &str) -> io::Error {
     io::Error::other(message)
@@ -100,7 +100,7 @@ impl Journal {
             .collect();
         let dir = sessions.join(component);
         private_fs::ensure_private_dir(&dir)?;
-        let lease = open_file(&dir.join(".queue.lock"))?;
+        let lease = LockFile::new(open_file(&dir.join(".queue.lock"))?);
         lease.try_lock().map_err(|error| match error {
             fs::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
             fs::TryLockError::Error(error) => error,

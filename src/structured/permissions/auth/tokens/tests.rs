@@ -641,7 +641,7 @@ fn revocation_intent_blocks_new_admissions_across_handles_without_starvation() {
     let session = store.authenticate(&issued.token).unwrap();
     let intent = priority::Intent::begin(&store.0, store.random::<16>().unwrap()).unwrap();
     // The primary lock is free, so Busy proves intent priority rather than contention.
-    assert!(store.lock_file().unwrap().try_lock().is_ok());
+    assert!(LockFile::new(store.lock_file().unwrap()).try_lock().is_ok());
     for _ in 0..4096 {
         assert!(matches!(
             store.admit(&session, Scope::Send, |_| panic!(
@@ -774,4 +774,24 @@ fn intent_is_observed_by_an_independent_process_with_no_primary_lock_held() {
     );
     drop(intent);
     assert!(store.lock().is_ok());
+}
+
+#[test]
+fn completed_token_operations_release_the_lock_before_inherited_descriptors_close() {
+    let (_root, store, mut app) = setup();
+    let guard = store.lock().unwrap();
+    let mut holder = crate::platform::file_lock::inherited_holder::Holder::spawn(&guard).unwrap();
+    drop(guard);
+    let result = store.operator_token(&app.client_token_authority().unwrap());
+    holder
+        .verify()
+        .expect("the same inherited descriptor must remain open through admission");
+    assert!(
+        result.is_ok(),
+        "completed token lock is retained by child pid={} descriptor={} inode={}: {:?}",
+        holder.pid,
+        holder.descriptor,
+        holder.inode,
+        result.err()
+    );
 }

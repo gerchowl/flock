@@ -5,18 +5,21 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::{net::UnixStream, process::CommandExt};
 use std::path::Path;
 use std::process::{Child, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Internal worker argument; the worker receives no path or credential.
 pub(crate) const WORKER_ARG: &str = "--client-token-lock";
+use super::file_lock::LockFile;
+
 /// A pending lock owns its helper until acquisition, cancellation or timeout.
 pub(crate) struct PendingLock {
-    file: Option<File>,
+    file: Option<LockFile>,
     helper: Option<(Child, UnixStream)>,
 }
 impl PendingLock {
     /// Start without blocking the caller. Only a contended lock needs a helper.
     pub(crate) fn begin(file: File, executable: &Path) -> io::Result<Self> {
+        let file = LockFile::new(file);
         let contended = match file.try_lock() {
             Ok(()) => false,
             Err(TryLockError::WouldBlock) => true,
@@ -56,17 +59,13 @@ impl PendingLock {
         })
     }
     /// Wait at most the supplied lock deadline; cleanup also runs when abandoned.
-    pub(crate) fn finish(mut self, deadline: Duration) -> io::Result<File> {
+    pub(crate) fn finish(mut self, deadline: Duration) -> io::Result<LockFile> {
         if let Some((_, stream)) = &mut self.helper {
-            stream.set_read_timeout(Some(deadline))?;
+            // A completed peer may reject SO_RCVTIMEO while its ACK is buffered
+            // on Darwin. Readiness waits work for both live and completed peers.
+            wait_readable(stream, deadline)?;
             let mut ack = [0];
-            stream.read_exact(&mut ack).map_err(|e| {
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    io::ErrorKind::TimedOut.into()
-                } else {
-                    e
-                }
-            })?;
+            stream.read_exact(&mut ack)?;
             if ack != [b'L'] {
                 return Err(io::ErrorKind::InvalidData.into());
             }
@@ -76,6 +75,40 @@ impl PendingLock {
             .ok_or_else(|| io::ErrorKind::InvalidData.into())
     }
 }
+/// Wait for the sole-reader acknowledgment socket, including EOF and errors.
+/// Interrupted polls remeasure the monotonic deadline; no retry extends it.
+fn wait_readable(stream: &UnixStream, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let milliseconds = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: this live descriptor and the one-element output buffer are owned.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+        if ready > 0 {
+            // Only finish() reads this endpoint, so readiness cannot be consumed
+            // by another reader before the single-byte read (EOF also completes).
+            return Ok(());
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
 impl Drop for PendingLock {
     fn drop(&mut self) {
         if let Some((child, _)) = &mut self.helper {
@@ -125,9 +158,16 @@ pub(crate) fn worker() -> io::Result<()> {
             let _ = monitor.read(&mut [0]);
             std::process::exit(crate::cli::exit::SUCCESS);
         })?;
+    let file = LockFile::new(file);
     file.lock()?;
-    std::io::stdout().write_all(b"L")
+    std::io::stdout().write_all(b"L")?;
+    // The acknowledged parent retains the same description and its unlock guard.
+    file.close_after_transfer();
+    Ok(())
 }
+
+#[cfg(test)]
+use super::file_lock::inherited_holder;
 
 #[cfg(test)]
 mod tests;
