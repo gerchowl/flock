@@ -3406,6 +3406,7 @@ impl AppState {
         // rendered lines, not the PTY grid — the panel isn't a runtime
         // surface. Resolve to the pane's TerminalState + PaneInfo and hand
         // off to the panes helper that mirrors the renderer's geometry.
+        let mut pane_closed = false;
         let text = if sel.source == crate::selection::SelectionSource::PromptPanel {
             let info = self.pane_info_by_id(sel.pane_id).cloned();
             let terminal_id = self
@@ -3426,14 +3427,12 @@ impl AppState {
                 .visible_float_for_active_workspace()
                 .filter(|float| float.pane_id == sel.pane_id)
                 .map(|float| float.terminal_id.clone());
-            match float_terminal {
-                Some(terminal_id) => terminal_runtimes
-                    .get(&terminal_id)
-                    .and_then(|rt| rt.extract_selection(&sel)),
-                None => self
-                    .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id)
-                    .and_then(|rt| rt.extract_selection(&sel)),
-            }
+            let runtime = match float_terminal {
+                Some(terminal_id) => terminal_runtimes.get(&terminal_id),
+                None => self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id),
+            };
+            pane_closed = runtime.is_none();
+            runtime.and_then(|rt| rt.extract_selection(&sel))
         };
         if let Some(text) = text {
             if !text.is_empty() {
@@ -3441,11 +3440,16 @@ impl AppState {
                 info!("copied selection to clipboard");
             }
         } else if sel.content_revision.is_some() {
-            crate::logging::selection_content_unavailable();
+            crate::logging::selection_content_unavailable(pane_closed);
             self.toast = Some(ToastNotification {
                 kind: ToastKind::NeedsAttention,
                 title: "Cannot copy selection".into(),
-                context: "Selected content was evicted or is unavailable".into(),
+                context: if pane_closed {
+                    "Selected pane closed"
+                } else {
+                    "Selected content was evicted, erased or is unavailable"
+                }
+                .into(),
                 position: None,
                 target: None,
             });

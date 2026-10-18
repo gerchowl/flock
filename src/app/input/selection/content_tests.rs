@@ -37,6 +37,14 @@ while IFS= read -r command; do
             n=$((n+1))
             printf 'DONE_chunk_%s\r\n' "$n"
             ;;
+        erase3)
+            printf '\033[3J'
+            printf 'DONE_erase3\r\n'
+            ;;
+        erase2)
+            printf '\033[2J'
+            printf 'DONE_erase2\r\n'
+            ;;
         evict)
             i=0
             while [ "$i" -lt 5000 ]; do printf 'replacement_%s\r\n' "$i"; i=$((i+1)); done
@@ -232,4 +240,54 @@ async fn real_read_selection_survives_resize() {
     fixture.select();
     fixture.runtime().resize(8, 6, 0, 0);
     fixture.assert_copy();
+}
+
+async fn assert_erased_selection_refuses(command: &str) {
+    let mut fixture = Fixture::new().await;
+    fixture.select();
+    if command == "erase3" {
+        // Move the anchored rows into history before deleting that history.
+        fixture.write_and_wait("chunk", "DONE_chunk_1").await;
+    }
+    fixture.state.request_clipboard_write = Some(b"previous clipboard".to_vec());
+    fixture
+        .write_and_wait(command, &format!("DONE_{command}"))
+        .await;
+    fixture.copy();
+    assert_eq!(
+        fixture.state.request_clipboard_write.as_deref(),
+        Some(b"previous clipboard".as_slice())
+    );
+    let toast = fixture.state.toast.as_ref().expect("visible erase refusal");
+    assert_eq!(toast.kind, ToastKind::NeedsAttention);
+    assert_eq!(toast.title, "Cannot copy selection");
+    assert!(toast.context.contains("erased"));
+}
+
+#[tokio::test]
+async fn real_read_scrollback_erase_refuses_copy_visibly() {
+    assert_erased_selection_refuses("erase3").await;
+}
+
+#[tokio::test]
+async fn real_read_display_erase_refuses_copy_visibly() {
+    assert_erased_selection_refuses("erase2").await;
+}
+
+#[tokio::test]
+async fn closed_pane_selection_refuses_with_distinct_reason() {
+    let mut fixture = Fixture::new().await;
+    fixture.select();
+    fixture.state.workspaces[0]
+        .test_runtimes
+        .remove(&fixture.pane)
+        .unwrap()
+        .shutdown();
+    fixture.state.copy_selection(&fixture.runtimes);
+    let toast = fixture
+        .state
+        .toast
+        .as_ref()
+        .expect("visible closed pane refusal");
+    assert_eq!(toast.context, "Selected pane closed");
 }

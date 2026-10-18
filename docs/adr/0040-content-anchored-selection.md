@@ -18,6 +18,26 @@ The terminal model follows scrolling and resize/reflow and invalidates a
 reference whose content was pruned or reset. An unavailable endpoint, wrong
 revision or different active screen refuses the copy with a typed attention
 toast; do not substitute the rows now occupying the old coordinates.
+Flock also records a terminal erase generation in each runtime anchor.
+ED 3 (`CSI 3 J`) calls `Screen.eraseHistory` → `PageList.eraseRows` /
+`erasePage`. Those operations relocate tracked pins into a surviving row
+without marking them garbage. A generation mismatch therefore refuses in
+`resolve_content_selection` before either copying or highlighting. Tracking
+runs at `Terminal.write`, across fragmented PTY reads, and leaves vendored
+libghostty-vt unchanged.
+
+ED 2 (`CSI 2 J`) normally clears the main screen's active cells **in place**
+via `clearRows`; at a semantic shell prompt it may first scroll them into
+history. Neither path reliably invalidates pins. Treat ED 2 as a destructive
+boundary too. ED 22 scrolls active rows into history and retains the anchors.
+Full reset (`ESC c`), mode 1047/1049 screen clears and no-scrollback resize
+also invalidate the generation. The latter calls `eraseHistory` in
+`Screen.resize`; ordinary resize/reflow with scrollback remains supported.
+The other `erasePage` path trims blank trailing resize rows only after
+checking that no tracked pin occupies them; normal history pruning already
+marks evicted pins garbage. Flock does not expose the full application's
+`Termio.clearScreen` / `eraseActive` API.
+
 Highlighting resolves the same endpoints before painting. Each terminal retains
 at most one pair of pins until its next selection or destruction. Soft wraps
 are unwrapped on copy, so reflow does not insert new line breaks.
@@ -27,7 +47,12 @@ are unwrapped on copy, so reflow does not insert new line breaks.
 This anchors terminal positions, not immutable text snapshots: a program that
 rewrites retained cells changes what a later copy reads. Copying while another
 terminal screen is active refuses; returning to a surviving original screen
-can resolve again. Evicted or reset content cannot be recovered. Runtime
+can resolve again if no erase boundary occurred. Generation invalidation is
+conservative: an erase anywhere invalidates the terminal's selection, even
+if its selected rows survived (for example ED 2 over a history selection).
+An exhausted generation counter refuses all subsequent anchors. Evicted,
+erased or reset content cannot be recovered. A missing runtime refuses with
+the distinct `pane_closed` reason and a “Selected pane closed” toast. Runtime
 anchors do not survive process restart or live handoff. Prompt-history panel
 selection remains separate from the terminal grid. Existing release-to-copy
 behavior is unchanged; copy_on_select configuration is tracked by #2127.
