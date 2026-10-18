@@ -28,7 +28,7 @@ sub_id: string,
 stream: string,
 /**
  * JSON number; exact in JavaScript below 2^53.
- * Omitted for bootstrap and cursorless agent/<id>/live.
+ * Omitted for bootstrap and cursorless `agent/<id>/live`.
  */
 after?: number, } | { "t": "pong",
 /**
