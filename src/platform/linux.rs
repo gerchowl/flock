@@ -149,6 +149,22 @@ pub fn process_parent_id(pid: u32) -> Option<u32> {
     u32::try_from(ppid).ok()
 }
 
+/// One kernel snapshot of a living process; unknown/dead states fail closed.
+pub fn live_process_facts(pid: u32) -> Option<(u32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<_> = stat
+        .get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .collect();
+    if !matches!(
+        *fields.first()?,
+        "R" | "S" | "D" | "T" | "t" | "W" | "I" | "K" | "P"
+    ) {
+        return None;
+    }
+    Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+}
+
 /// Every live process id, from the numeric entries under `/proc`.
 pub fn all_process_ids() -> Vec<u32> {
     let mut pids = Vec::new();
