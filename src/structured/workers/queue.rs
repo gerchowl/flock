@@ -102,7 +102,8 @@ impl Service {
     pub fn open(data: &Path, agent: &str, bytes: NonZeroU64) -> Result<(Self, Client), Failure> {
         let journal = Journal::open_with_policy(data, agent, RewritePolicy::new(bytes))?;
         let scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH)?)?;
-        let (publisher, source) = publication::Publisher::new(scheduler.journal().replay(0)?);
+        let (publisher, source) =
+            publication::Publisher::new(agent, scheduler.journal().replay(0)?);
         let (tx, requests) = mpsc::sync_channel(1);
         let (state_tx, states) = mpsc::sync_channel(1);
         // Same four-completion bound as the session stream; no unbounded spool.

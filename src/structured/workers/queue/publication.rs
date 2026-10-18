@@ -116,9 +116,32 @@ impl Book {
     }
 }
 struct Capture(Option<u64>, Arc<Mutex<Live>>);
-/// Retained live-generation source. Cold recovery belongs to part 2 of #1956.
+/// Retained generation source. Cold opening belongs exclusively on an I/O worker.
 #[derive(Clone)]
-pub(crate) struct Source(mpsc::SyncSender<Capture>, Arc<Mutex<Book>>, Arc<Notify>);
+pub(crate) struct Source(
+    mpsc::SyncSender<Capture>,
+    Arc<Mutex<Book>>,
+    Arc<Notify>,
+    String,
+);
+impl Source {
+    /// Blocking recovery for an I/O worker only, never the server loop. The
+    /// exclusive journal lease rejects a concurrent writer. This source is ended
+    /// at its recovered cut; install must recheck the registry generation.
+    pub fn open_retained(data: &Path, agent: &str) -> Result<Self, Failure> {
+        let mut journal = Journal::open(data, agent)?;
+        let result = journal.subscription();
+        let (publisher, source) = Publisher::new(agent, journal.replay(0)?);
+        if let Err(error) = result {
+            source.1.lock().error = Some(Failure::from(error).code);
+        }
+        drop(publisher);
+        Ok(source)
+    }
+    pub(in crate::structured) fn belongs_to(&self, agent: &str) -> bool {
+        self.3 == agent
+    }
+}
 impl Provider for Source {
     type Error = ErrorCode;
     type Subscription = Reader;
@@ -208,7 +231,7 @@ impl Subscription for Reader {
 /// Sole writer's publication half; capture and registration share its book lock.
 pub(super) struct Publisher(Source, mpsc::Receiver<Capture>);
 impl Publisher {
-    pub fn new(cut: Cut) -> (Self, Source) {
+    pub fn new(agent: &str, cut: Cut) -> (Self, Source) {
         let (tx, rx) = mpsc::sync_channel(1);
         let source = Source(
             tx,
@@ -220,6 +243,7 @@ impl Publisher {
                 readers: Vec::new(),
             })),
             Arc::new(Notify::new()),
+            agent.into(),
         );
         (Self(source.clone(), rx), source)
     }
