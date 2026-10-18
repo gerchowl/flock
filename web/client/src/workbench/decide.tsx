@@ -22,7 +22,7 @@
  *
  * @module
  */
-import { For, Show, createEffect, createMemo, createSignal, createUniqueId, on, type JSX, type Signal } from "solid-js";
+import { For, Show, createEffect, createSignal, createUniqueId, type JSX, type Signal } from "solid-js";
 
 import type { AgentDecideErrorCode } from "../gen/AgentDecideErrorCode";
 import type { PermissionDecision } from "../gen/PermissionDecision";
@@ -100,12 +100,13 @@ export type Target = { readonly agent: string; readonly id: string; readonly seq
 export type DecideUi = {
   readonly message: Signal<string>;
   readonly confirming: Signal<Target | null>;
-  readonly error: Signal<string | null>;
+  /** A caught error and the status it was raised under: it shows only while the status is still that one. */
+  readonly error: Signal<{ readonly text: string; readonly under: string | null } | null>;
 };
 
 /** Creates one card's {@link DecideUi}. */
 export function createDecideUi(): DecideUi {
-  return { message: createSignal(""), confirming: createSignal<Target | null>(null), error: createSignal<string | null>(null) };
+  return { message: createSignal(""), confirming: createSignal<Target | null>(null), error: createSignal<{ readonly text: string; readonly under: string | null } | null>(null) };
 }
 
 /** The message box, choices and status line of one live permission card. */
@@ -131,11 +132,12 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
   };
   /** The request the card shows now, for a click to capture. */
   const target = (): Target | null => (props.card.requestSeq === undefined ? null : { agent: props.card.agent, id: props.card.id, seq: props.card.requestSeq, title: props.card.title });
+  const fail = (text: string): void => void setError({ text, under: blocked() });
   const send = (decision: PermissionDecision, at: Target | null): void => {
     if (props.sender === null || at === null || blocked() !== null) return;
     if (at.id !== props.card.id || at.seq !== props.card.requestSeq) {
       setConfirming(null);
-      setError("The request changed; review it again.");
+      fail("The request changed; review it again.");
       return;
     }
     const note = message().trim();
@@ -143,7 +145,7 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
       props.sender.decide({ agent: at.agent, request_id: at.id, request_seq: at.seq, decision, ...(note === "" ? {} : { message: note }) });
       setError(null);
     } catch (thrown) {
-      setError((thrown as Error).message);
+      fail((thrown as Error).message);
     }
     setConfirming(null);
   };
@@ -155,11 +157,10 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
   createEffect(() => {
     if (!changed()) return;
     setConfirming(null);
-    setError("The request changed; review it again.");
+    fail("The request changed; review it again.");
   });
-  // A send error covers the status only until the status moves on.
-  const stateKey = createMemo(() => blocked());
-  createEffect(on(stateKey, () => setError(null), { defer: true }));
+  // A send error covers the status only while the status is the one it was raised under.
+  const shownError = (): string | null => (error()?.under === blocked() ? (error()?.text ?? null) : null);
   return (
     <div class="decide" data-testid="decide">
       <input
@@ -212,7 +213,7 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
         )}
       </Show>
       <p id={reason} class="waits__reason" data-testid="decide-status">
-        {error() ?? blocked() ?? "Answering sends your decision to the agent."}
+        {shownError() ?? blocked() ?? "Answering sends your decision to the agent."}
       </p>
     </div>
   );
