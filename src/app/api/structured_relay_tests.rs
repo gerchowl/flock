@@ -1110,11 +1110,8 @@ fn custody_completion_recovery_wakes_the_real_headless_loop_deadline() {
             .app
             .next_headless_loop_deadline_with_git_refresh(now, false, false)
             .expect("recovery must schedule a wake on an otherwise idle server");
-        assert!(
-            deadline <= due,
-            "deadline {deadline:?} misses retry {due:?}"
-        );
-        r.app.service_structured_workers(due);
+        assert_eq!(deadline, due, "only the custody retry is due");
+        r.app.handle_scheduled_tasks(deadline, false);
         assert!(
             r.app.structured_sends.recovering.is_empty(),
             "the due wake must retry, not merely reschedule"
