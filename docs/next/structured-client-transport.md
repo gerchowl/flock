@@ -35,7 +35,10 @@ initial baseline is the successful welcome. A supplied monotonic clock governs
 handshake, write and heartbeat deadlines; wall-clock changes grant no liveness.
 
 There are at most 32 HTTP connections before upgrade, plus at most 16 upgraded
-sockets. HTTP headers must complete within five seconds. Only four unverified
+sockets. HTTP overflow closes the accepted I/O before reading a request. The entire HTTP connection has a five-second ceiling, including headers,
+body receipt, response writes and keepalive. Expiry closes its I/O. Successful
+upgrades leave that HTTP lifetime and use the core's independent deadlines. Only
+four unverified
 hello/recheck attempts may be in flight at once; a verified token principal may
 register at most four sockets. Pending overload refuses upgrade with 503; principal overload closes
 1001. Existing authenticated connections retain capacity when slow hellos fill
@@ -95,9 +98,9 @@ codes are not transferred; obtain a fresh URL after handoff or restart. A change
 nonzero configured address requires a restart rather than adopting a mismatched
 listener. A listener failure ends the owning server loop; shutdown cancels owned
 HTTP connection tasks, closes accepted I/O and checks core lease release before
-returning. HTTP/1 half-close handling and header deadlines are configured on the
+returning. HTTP/1 half-close handling and admission deadlines are configured on the
 owned connection driver.
 
-Exchange failures remain uniform 401 with no-store, including oversized bodies
+Completed exchange failures remain uniform 401 with no-store, including oversized bodies
 and internal store/worker errors. Only internal typed classes and I/O kinds enter
 server diagnostics; neither credentials, one-time codes nor raw errors do.

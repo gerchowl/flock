@@ -25,8 +25,8 @@ use tokio::{
 };
 /// Concurrent HTTP connections before upgrade; upgraded sockets have the core's cap.
 const HTTP_CONNECTIONS: usize = 32;
-/// Absolute ceiling for receiving complete HTTP headers, before hello begins.
-const HTTP_HEADER_DEADLINE: Duration = Duration::from_secs(5);
+/// Absolute HTTP lifetime, including headers, body, writes and keepalive before upgrade.
+const HTTP_ADMISSION_DEADLINE: Duration = Duration::from_secs(5);
 /// Maximum time for the startup public-funnel probe.
 const FUNNEL_DEADLINE: Duration = Duration::from_secs(5);
 /// Maximum status JSON bytes accepted from the public-funnel probe.
@@ -47,12 +47,15 @@ async fn serve(socket: tokio::net::TcpListener, router: Router) -> io::Result<()
             let mut builder = hyper::server::conn::http1::Builder::new();
             builder
                 .half_close(true)
-                .header_read_timeout(HTTP_HEADER_DEADLINE)
+                .header_read_timeout(HTTP_ADMISSION_DEADLINE)
                 .timer(TokioTimer::new());
-            let _ = builder
-                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
-                .with_upgrades()
-                .await;
+            let _ = tokio::time::timeout(
+                HTTP_ADMISSION_DEADLINE,
+                builder
+                    .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                    .with_upgrades(),
+            )
+            .await;
         });
     }
 }
@@ -141,18 +144,9 @@ async fn guard(
     next: Next,
 ) -> Response {
     let authority = bind.to_string();
-    let canonical = authority.strip_suffix(":80").unwrap_or(&authority);
     let headers = request.headers();
     if peer.ip() != Ipv4Addr::LOCALHOST
-        || headers.get_all(header::HOST).iter().count() != 1
-        || headers
-            .get(header::HOST)
-            .is_none_or(|v| v != authority.as_str() && v != canonical)
-        || headers.get_all(header::ORIGIN).iter().count() > 1
-        || headers.get(header::ORIGIN).is_some_and(|v| {
-            v != format!("http://{authority}").as_str()
-                && v != format!("http://{canonical}").as_str()
-        })
+        || !gui::origin_allowed(headers, &authority)
         || (request.uri().path().starts_with("/v1/") && !headers.contains_key(header::ORIGIN))
     {
         return StatusCode::FORBIDDEN.into_response();

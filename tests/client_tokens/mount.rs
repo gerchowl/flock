@@ -531,3 +531,26 @@ fn real_server_refuses_wildcard_and_ipv6_client_binds() {
         assert!(result.is_err(), "only numeric IPv4 loopback is permitted");
     }
 }
+
+#[test]
+fn real_server_stalled_http_body_expires_but_upgraded_socket_stays_usable() {
+    let server = Server::start();
+    let endpoint = endpoint(&server);
+    let token = bearer(&endpoint);
+    let mut active = WebSocket::open(&endpoint);
+    assert_eq!(active.hello(&token).0, 1);
+    let mut stalled = stream(endpoint.address);
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(stalled, "POST /v1/client/exchange HTTP/1.1\r\nHost: {}\r\nOrigin: http://{}\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{{", endpoint.address, endpoint.address).unwrap();
+    match stalled.read(&mut [0]) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        outcome => panic!("HTTP deadline must close the peer: {outcome:?}"),
+    }
+    active.send(2, b"still usable after HTTP ownership ends");
+    let (kind, close) = active.receive();
+    assert_eq!(kind, 8);
+    assert_eq!(u16::from_be_bytes(close[..2].try_into().unwrap()), 1008);
+}
