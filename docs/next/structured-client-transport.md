@@ -59,15 +59,36 @@ before all sockets for that token close 4403. Scope shrink instead returns
 not cancelled by revocation. Deleting a token alone does not proactively close
 an idle read-only socket; the next command or reconnect detects it.
 
-Each socket permits four pending commands independently of heartbeat and
-subscription tasks. Command IDs are at most 128 bytes; retain at most 1024
-identities per connection. A repeated ID is refused as `session_unconfirmed`
-after rechecking authorization, even if it is sent again as a first send.
-The command ID is claimed only after authorization and provider acceptance;
-refusals leave it unclaimed. Exhausting the identity budget returns `session_busy`
-before dispatch. The owner mailbox and pending durable receipts each hold
-at most 32 entries. Exhausted connection/mailbox capacity closes 1001. Existing
-64 KiB message and 45-second blocked-writer bounds apply to command acks too.
+Only `agent.send` and `agent.decide` are implemented on this wire surface.
+Other verbs, including `agent.interrupt`, receive `server_version_gap` (exit 78)
+before allocating a command task, owner request or permission check. Command
+IDs above 128 bytes receive `invalid_params`. Four pending commands are allowed
+per socket; a fifth receives `session_busy`, leaving the socket open. Writer
+backpressure still applies to refusal acks, including the existing 64 KiB
+encoded-message cap and 45-second blocked-writer ceiling.
+
+The app owner has independent 32-entry send and decision mailboxes. Full
+admission returns `session_busy`, including a race between the connection's
+capacity check and enqueue. It does not disconnect a healthy socket. At most
+32 durable-send receipts remain pending; decision admission is serviced first
+and does not consume receipt capacity. Each owner turn handles at most 32
+requests from each lane. The per-socket limit still applies to both verbs.
+
+Duplicate detection is keyed by `(principal, cmd_id)` across that principal's
+sockets. Pending send keys remain pinned until the receipt resolves, even if
+the original socket disconnects. The owner also retains the last 1024 completed
+admissions across all principals, evicting the oldest completed key in FIFO
+order. Refused commands do not claim a key. A retained duplicate returns
+`session_unconfirmed` after authorization, without dispatch. This is a bounded
+in-memory fence, not a recovery journal: eviction, restart and handoff can
+forget completed keys. Clients must never repeat a first send; uncertain
+resends must use `resume_only: true`, which cannot dispatch even if its key is
+absent. There is no cached outcome lookup in this slice.
+
+An unknown local agent receives `agent_not_found`; an advertised remote agent
+or a known terminal target receives `unsupported_for_agent`. Neither creates a
+runtime or lifecycle item. The decision `message` is currently bounded by the
+frame limit; its separate field limit is tracked in #2249.
 
 This slice implements first sends, not the durable command journal of ADR-0036
 section 5a. `resume_only: true` always returns `session_unconfirmed` without

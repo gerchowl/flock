@@ -19,7 +19,7 @@ use axum::{
 use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     future::Future,
     io,
     path::PathBuf,
@@ -401,7 +401,6 @@ async fn connection(
         session.clone(),
         priority.clone(),
     );
-    let command_ids = Arc::new(parking_lot::Mutex::new(HashSet::new()));
     let mut running = tokio::task::JoinSet::new();
     let mut heartbeat = Heartbeat::new(shared.clock.now());
     let code = loop {
@@ -426,9 +425,25 @@ async fn connection(
                     }
                     Ok(ClientFrame::Unsub { sub_id }) => subscriptions.unsubscribe(&sub_id),
                     Ok(ClientFrame::Cmd { cmd_id, verb, args, resume_only }) => {
-                        // Four pending commands leave heartbeat and subscription tasks independent.
-                        if running.len() == COMMANDS_PER_SOCKET || cmd_id.len() > 128 { break GOING_AWAY_CLOSE; }
-                        running.spawn(commands::execute(shared.clone(), session.clone(), data.clone(), commands::Command { id: cmd_id, verb, args, resume_only, read_only, ids: command_ids.clone() }));
+                        let refusal = if !matches!(verb.as_str(), "agent.send" | "agent.decide") || read_only {
+                            Some(crate::api::error_code::ErrorCode::ServerVersionGap)
+                        } else if cmd_id.len() > 128 {
+                            Some(crate::api::error_code::ErrorCode::InvalidParams)
+                        } else if running.len() == COMMANDS_PER_SOCKET || shared.commands.full(&verb) {
+                            Some(crate::api::error_code::ErrorCode::SessionBusy)
+                        } else { None };
+                        if let Some(code) = refusal {
+                            let Some(ack) = output::encode(commands::ack(cmd_id, Err(code))) else { break GOING_AWAY_CLOSE };
+                            tokio::select! { biased;
+                                _ = stop.changed() => return,
+                                _ = revoked.changed() => break AUTH_REVOKED_CLOSE,
+                                _ = &mut writer => return,
+                                _ = shared.clock.until(heartbeat.expires()) => break GOING_AWAY_CLOSE,
+                                sent = priority.send(ack) => if sent.is_err() { return },
+                            }
+                            continue;
+                        }
+                        running.spawn(commands::execute(shared.clone(), session.clone(), data.clone(), commands::Command { id: cmd_id, verb, args, resume_only, read_only }));
                     }
                     _ => break POLICY_VIOLATION_CLOSE,
                 },

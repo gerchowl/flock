@@ -10,11 +10,14 @@ use crate::{
     },
 };
 use serde_json::Value;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::{
+    collections::VecDeque,
+    sync::mpsc::{Receiver, TryRecvError},
+};
 use tokio::sync::{oneshot, Notify};
-/// Pending owner messages and durable tickets each have this fixed capacity.
+/// Each command lane and the send receipt set have this fixed capacity.
 const CAPACITY: usize = 32;
-/// Successful admissions retained per connection; overflow refuses before dispatch.
+/// Completed principal/command keys retained in FIFO order; pending sends never evict.
 const COMMAND_IDS: usize = 1024;
 /// One decoded first-send command; identity and authority never come from args.
 pub(super) struct Command {
@@ -23,7 +26,6 @@ pub(super) struct Command {
     pub(super) args: Value,
     pub(super) resume_only: bool,
     pub(super) read_only: bool,
-    pub(super) ids: Arc<parking_lot::Mutex<HashSet<String>>>,
 }
 struct Request {
     command: Command,
@@ -34,31 +36,43 @@ struct Request {
 /// Connection-side mailbox; cancelling a waiter cannot cancel committed input.
 #[derive(Clone)]
 pub(super) struct Client {
-    tx: mpsc::Sender<Request>,
+    tx: [mpsc::Sender<Request>; 2],
     wake: Arc<Notify>,
 }
 type Receipt = Receiver<Result<AgentSendResult, ErrorCode>>;
 struct Pending {
-    id: String,
+    key: (String, String),
     // Shared core shutdown requires Sync; the app owner uses get_mut, never a blocking lock.
     receipt: parking_lot::Mutex<Receipt>,
     response: oneshot::Sender<ServerFrame>,
 }
 /// Only the app owner touches App, runtime permission books and send admission.
 pub(super) struct Owner {
-    rx: mpsc::Receiver<Request>,
+    rx: [mpsc::Receiver<Request>; 2],
+    completed: VecDeque<(String, String)>,
     pending: Vec<Pending>,
 }
 /// Share the existing app-loop wake without introducing a second state owner.
 pub(super) fn channel(wake: Arc<Notify>) -> (Client, Owner) {
-    let (tx, rx) = mpsc::channel(CAPACITY);
+    let (send, sends) = mpsc::channel(CAPACITY);
+    let (decide, decisions) = mpsc::channel(CAPACITY);
     (
-        Client { tx, wake },
+        Client {
+            tx: [send, decide],
+            wake,
+        },
         Owner {
-            rx,
+            rx: [sends, decisions],
+            completed: VecDeque::new(),
             pending: Vec::new(),
         },
     )
+}
+impl Client {
+    /// Check admission pressure without allocating a command task or owner request.
+    pub(super) fn full(&self, verb: &str) -> bool {
+        self.tx[usize::from(verb == "agent.decide")].capacity() == 0
+    }
 }
 enum Outcome {
     Queued(Receipt),
@@ -76,21 +90,14 @@ fn dispatch(
     if command.resume_only {
         return Err(ErrorCode::SessionUnconfirmed);
     }
-    if !matches!(command.verb.as_str(), "agent.send" | "agent.decide") {
-        return Err(ErrorCode::UnsupportedForAgent);
+    dispatch_verb(app, command, principal)
+}
+fn missing_target(app: &App, target: &str) -> ErrorCode {
+    if app.locate_agent(target).is_some() || app.resolve_terminal_target(target).is_ok() {
+        ErrorCode::UnsupportedForAgent
+    } else {
+        ErrorCode::AgentNotFound
     }
-    let mut ids = command.ids.try_lock().ok_or(ErrorCode::SessionBusy)?;
-    if ids.contains(&command.id) {
-        return Err(ErrorCode::SessionUnconfirmed);
-    }
-    if ids.len() == COMMAND_IDS {
-        return Err(ErrorCode::SessionBusy);
-    }
-    let result = dispatch_verb(app, command, principal);
-    if result.is_ok() {
-        ids.insert(command.id.clone());
-    }
-    result
 }
 fn dispatch_verb(
     app: &mut App,
@@ -113,20 +120,21 @@ fn dispatch_verb(
             };
             // Let the shared service supply its refusal before any queue mutation.
             if params.submit && app.structured_send_target(&params.target)?.is_none() {
-                return Err(ErrorCode::UnsupportedForAgent);
+                return Err(missing_target(app, &params.target));
             }
             Ok(Outcome::Queued(
                 app.structured_send(params, principal)?.committed,
             ))
         }
         "agent.decide" => {
+            // TODO(#2249): Bound decide message independently of the frame limit.
             let args: AgentDecide = serde_json::from_value(command.args.clone())
                 .map_err(|_| ErrorCode::InvalidParams)?;
             let (_, _, generation) = app
                 .state
                 .structured_agents
                 .get(&args.agent)
-                .ok_or(ErrorCode::UnsupportedForAgent)?;
+                .ok_or_else(|| missing_target(app, &args.agent))?;
             let runtime = app
                 .structured_workers
                 .runtime(&args.agent, generation)
@@ -144,10 +152,11 @@ fn dispatch_verb(
                 .map_err(|_| ErrorCode::SerializationError)?,
             ))
         }
-        _ => Err(ErrorCode::UnsupportedForAgent),
+        _ => Err(ErrorCode::ServerVersionGap),
     }
 }
-fn ack(id: String, result: Result<Value, ErrorCode>) -> ServerFrame {
+/// Preserve the registered error envelope on ingress refusals and owner outcomes.
+pub(super) fn ack(id: String, result: Result<Value, ErrorCode>) -> ServerFrame {
     use crate::cli::exit::Retry;
     let (result, error) = match result {
         Ok(result) => (Some(result), None),
@@ -184,10 +193,15 @@ fn ack(id: String, result: Result<Value, ErrorCode>) -> ServerFrame {
     }
 }
 impl Owner {
+    fn remember(&mut self, key: (String, String)) {
+        if self.completed.len() == COMMAND_IDS {
+            self.completed.pop_front();
+        }
+        self.completed.push_back(key);
+    }
     /// Revalidate under the token revocation lock through bounded admission.
     /// Queue completion is polled separately; no model or stdin completion is awaited.
     pub(super) fn service(&mut self, app: &mut App) {
-        self.pending.retain(|pending| !pending.response.is_closed());
         let mut i = 0;
         while i < self.pending.len() {
             let result = match self.pending[i].receipt.get_mut().try_recv() {
@@ -202,47 +216,63 @@ impl Owner {
             let result = result.and_then(|result| {
                 serde_json::to_value(result).map_err(|_| ErrorCode::SerializationError)
             });
-            let _ = pending.response.send(ack(pending.id, result));
+            self.remember(pending.key.clone());
+            let _ = pending.response.send(ack(pending.key.1, result));
         }
-        for _ in 0..CAPACITY {
-            if self.pending.len() == CAPACITY {
-                break;
-            }
-            let Ok(request) = self.rx.try_recv() else {
-                break;
-            };
-            if request.response.is_closed() {
-                continue;
-            }
-            let scope = match request.command.verb.as_str() {
-                "agent.send" => Scope::Send,
-                "agent.decide" => Scope::Answer,
-                _ => Scope::Read,
-            };
-            let outcome = request
-                .store
-                .admit(&request.session, scope, |token| {
-                    dispatch(app, &request.command, &Principal::Token(token))
-                })
-                .unwrap_or_else(|error| {
-                    Err(match error {
-                        TokenError::Revoked | TokenError::Unauthorized => ErrorCode::AuthRevoked,
-                        TokenError::Scope => ErrorCode::Scope,
-                        TokenError::Busy => ErrorCode::SessionBusy,
-                        TokenError::Unsafe | TokenError::Io(_) => ErrorCode::InternalError,
-                    })
-                });
-            match outcome {
-                Ok(Outcome::Queued(receipt)) => self.pending.push(Pending {
-                    id: request.command.id,
-                    receipt: parking_lot::Mutex::new(receipt),
-                    response: request.response,
-                }),
-                Ok(Outcome::Decided(value)) => {
-                    let _ = request.response.send(ack(request.command.id, Ok(value)));
+        // Decisions have independent capacity even when every send receipt is pending.
+        for lane in [1, 0] {
+            for _ in 0..CAPACITY {
+                if lane == 0 && self.pending.len() == CAPACITY {
+                    break;
                 }
-                Err(code) => {
-                    let _ = request.response.send(ack(request.command.id, Err(code)));
+                let Ok(request) = self.rx[lane].try_recv() else {
+                    break;
+                };
+                if request.response.is_closed() {
+                    continue;
+                }
+                let key = (
+                    request.session.info.principal.clone(),
+                    request.command.id.clone(),
+                );
+                let scope = if lane == 1 {
+                    Scope::Answer
+                } else {
+                    Scope::Send
+                };
+                let outcome = request
+                    .store
+                    .admit(&request.session, scope, |token| {
+                        if self.completed.contains(&key)
+                            || self.pending.iter().any(|p| p.key == key)
+                        {
+                            return Err(ErrorCode::SessionUnconfirmed);
+                        }
+                        dispatch(app, &request.command, &Principal::Token(token))
+                    })
+                    .unwrap_or_else(|error| {
+                        Err(match error {
+                            TokenError::Revoked | TokenError::Unauthorized => {
+                                ErrorCode::AuthRevoked
+                            }
+                            TokenError::Scope => ErrorCode::Scope,
+                            TokenError::Busy => ErrorCode::SessionBusy,
+                            TokenError::Unsafe | TokenError::Io(_) => ErrorCode::InternalError,
+                        })
+                    });
+                match outcome {
+                    Ok(Outcome::Queued(receipt)) => self.pending.push(Pending {
+                        key,
+                        receipt: parking_lot::Mutex::new(receipt),
+                        response: request.response,
+                    }),
+                    Ok(Outcome::Decided(value)) => {
+                        self.remember(key);
+                        let _ = request.response.send(ack(request.command.id, Ok(value)));
+                    }
+                    Err(code) => {
+                        let _ = request.response.send(ack(request.command.id, Err(code)));
+                    }
                 }
             }
         }
@@ -257,18 +287,22 @@ pub(super) async fn execute(
     command: Command,
 ) -> Result<(), ()> {
     let (response, received) = oneshot::channel();
-    shared
-        .commands
-        .tx
-        .try_send(Request {
-            command,
-            store: shared.store.clone(),
-            session: session.clone(),
-            response,
-        })
-        .map_err(|_| ())?;
-    shared.commands.wake.notify_one();
-    let frame = received.await.map_err(|_| ())?;
+    let lane = usize::from(command.verb == "agent.decide");
+    let frame = match shared.commands.tx[lane].try_send(Request {
+        command,
+        store: shared.store.clone(),
+        session: session.clone(),
+        response,
+    }) {
+        Ok(()) => {
+            shared.commands.wake.notify_one();
+            received.await.map_err(|_| ())?
+        }
+        Err(mpsc::error::TrySendError::Full(request)) => {
+            ack(request.command.id, Err(ErrorCode::SessionBusy))
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => return Err(()),
+    };
     let revoked = matches!(&frame, ServerFrame::Ack { error: Some(error), .. } if error.code == ErrorCode::AuthRevoked.as_str());
     let (delivered, flushed) = oneshot::channel();
     data.send(output::Delivery {

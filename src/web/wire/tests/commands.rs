@@ -204,6 +204,21 @@ fn agent_send_fixture_ack_matches_one_durable_user_turn() {
 fn draft_unknown_remote_verb_and_resume_only_refuse_before_mutation() {
     runtime(async {
         let mut case = Case::new(183102).await;
+        let remote = "00000000-0000-4000-8000-000000183110";
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "remote.example".into(),
+            ..Default::default()
+        });
+        peer.node_id = Some("a".repeat(64));
+        peer.workspaces = vec![serde_json::from_value(json!({
+            "workspace":"remote", "is_linked_worktree":false, "status":crate::api::schema::AgentStatus::Idle,
+            "agents":[{"agent_id":remote,"pane_id":"w1:p1","status":crate::api::schema::AgentStatus::Idle}]
+        }))
+        .unwrap()];
+        case.queue.app.state.peer_summaries.push(peer);
+        let location = case.queue.app.locate_agent(remote).unwrap();
+        assert!(!location.local);
+        assert_eq!(location.node.as_deref(), Some("a".repeat(64).as_str()));
         let mut socket = case.open().await;
         let before = case.journal();
         for (verb, args, code) in [
@@ -214,13 +229,23 @@ fn draft_unknown_remote_verb_and_resume_only_refuse_before_mutation() {
             ),
             (
                 "agent.send",
-                json!({"target":"remote.example","text":"remote","submit":true}),
+                json!({"target":remote,"text":"remote","submit":true}),
                 "unsupported_for_agent",
+            ),
+            (
+                "agent.send",
+                json!({"target":"unknown-local","text":"missing","submit":true}),
+                "agent_not_found",
+            ),
+            (
+                "agent.decide",
+                json!({"agent":"unknown-local","request_id":"missing","request_seq":1,"decision":"deny"}),
+                "agent_not_found",
             ),
             (
                 "agent.interrupt",
                 json!({"agent":case.queue.case.id}),
-                "unsupported_for_agent",
+                "server_version_gap",
             ),
         ] {
             assert_eq!(
@@ -420,6 +445,170 @@ fn permission_decisions_use_the_named_request_handle_and_typed_refusals() {
             inputs[0]["input"]["response"]["request_id"],
             "first-request"
         );
+        case.stop().await;
+    });
+}
+
+async fn enqueue_without_owner(server: &Server, socket: &mut Socket, id: String, target: &str) {
+    let admitted = server.wake.notified();
+    tokio::pin!(admitted);
+    admitted.as_mut().enable();
+    socket.send(json!({"t":"cmd","cmd_id":id,"verb":"agent.send","args":{"target":target,"text":"queued","submit":false},"resume_only":false})).await;
+    within(async {
+        tokio::select! {
+            _ = &mut admitted => (),
+            frame = socket.receive() => panic!("queue producer ended before admission: {frame:?}"),
+        }
+    })
+    .await;
+}
+fn refusal(frame: Value, code: &str, exit: i32) {
+    assert_eq!(frame["t"], "ack");
+    assert_eq!(frame["ok"], false);
+    assert_eq!(frame["error"]["code"], code);
+    assert_eq!(frame["error"]["exit"], exit);
+}
+#[test]
+fn unknown_verbs_and_oversized_ids_refuse_without_owner_or_read_scope() {
+    runtime(async {
+        let case = Case::new(183111).await;
+        let mut socket = case.open().await;
+        case.scopes(json!(["send", "answer", "operate"]));
+        for (id, verb, code, exit) in [
+            (
+                "future".to_owned(),
+                "future.command",
+                "server_version_gap",
+                crate::cli::exit::PROTOCOL_GAP,
+            ),
+            (
+                "x".repeat(129),
+                "agent.send",
+                "invalid_params",
+                crate::cli::exit::FAILURE,
+            ),
+        ] {
+            socket
+                .send(json!({"t":"cmd","cmd_id":id,"verb":verb,"args":{},"resume_only":false}))
+                .await;
+            let frame = socket.text().await;
+            assert_eq!(frame["cmd_id"], id);
+            refusal(frame, code, exit);
+        }
+        case.stop().await;
+    });
+}
+#[test]
+fn fifth_concurrent_command_is_busy_and_keeps_the_socket_open() {
+    runtime(async {
+        let case = Case::new(183112).await;
+        let mut socket = case.open().await;
+        for n in 0..4 {
+            enqueue_without_owner(
+                &case.server,
+                &mut socket,
+                format!("pending-{n}"),
+                &case.queue.case.id,
+            )
+            .await;
+        }
+        for n in 4..6 {
+            socket.send(json!({"t":"cmd","cmd_id":format!("excess-{n}"),"verb":"agent.send","args":{},"resume_only":false})).await;
+            refusal(
+                socket.text().await,
+                "session_busy",
+                crate::cli::exit::FAILURE,
+            );
+        }
+        case.stop().await;
+    });
+}
+#[test]
+fn full_owner_queue_refuses_other_principals_without_closing_or_blocking_decisions() {
+    runtime(async {
+        let mut case = Case::new(183113).await;
+        let mut producers = Vec::new();
+        // One principal is already limited to four sockets times four commands.
+        // Two principals fill all 32 owner slots through real socket producers.
+        for token in ["a", "d"] {
+            for connection in 0..4 {
+                let mut socket = Socket::open(&case.server).await;
+                socket.hello(1, &token.repeat(64)).await;
+                for n in 0..4 {
+                    enqueue_without_owner(
+                        &case.server,
+                        &mut socket,
+                        format!("{connection}-{n}"),
+                        &case.queue.case.id,
+                    )
+                    .await;
+                }
+                producers.push(socket);
+            }
+        }
+        let mut socket = Socket::open(&case.server).await;
+        socket.hello(1, &"b".repeat(64)).await;
+        socket.send(json!({"t":"cmd","cmd_id":"overflow","verb":"agent.send","args":{},"resume_only":false})).await;
+        refusal(
+            socket.text().await,
+            "session_busy",
+            crate::cli::exit::FAILURE,
+        );
+        let args = json!({"agent":case.queue.case.id,"request_id":"missing","request_seq":1,"decision":"deny"});
+        let result = case.command(&mut socket, "agent.decide", args).await;
+        refusal(
+            result,
+            "permission_request_unknown",
+            crate::cli::exit::FAILURE,
+        );
+        drop(producers);
+        case.stop().await;
+    });
+}
+#[test]
+fn same_principal_command_id_is_fenced_across_sockets() {
+    runtime(async {
+        let mut case = Case::new(183114).await;
+        let mut first = case.open().await;
+        let mut second = case.open().await;
+        first
+            .send(send_script("agent-send", &case.queue.case.id))
+            .await;
+        assert_eq!(case.ack(&mut first).await["ok"], true);
+        second
+            .send(send_script("agent-send", &case.queue.case.id))
+            .await;
+        refusal(
+            case.ack(&mut second).await,
+            "session_unconfirmed",
+            crate::cli::exit::UNCONFIRMED,
+        );
+        let journal = String::from_utf8(case.journal()).unwrap();
+        let identities: std::collections::HashSet<String> = journal
+            .lines()
+            .filter_map(|line| {
+                let row: Value = serde_json::from_str(line).unwrap();
+                row["item"]["item_id"].as_str().map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(identities.len(), 1);
+        case.stop().await;
+    });
+}
+
+#[test]
+fn oversized_command_id_is_a_typed_refusal_without_owner_admission() {
+    runtime(async {
+        let case = Case::new(183115).await;
+        let mut socket = case.open().await;
+        case.scopes(json!(["send", "answer", "operate"]));
+        let id = "x".repeat(129);
+        socket
+            .send(json!({"t":"cmd","cmd_id":id,"verb":"agent.send","args":{},"resume_only":false}))
+            .await;
+        let frame = socket.text().await;
+        assert_eq!(frame["cmd_id"], id);
+        refusal(frame, "invalid_params", crate::cli::exit::FAILURE);
         case.stop().await;
     });
 }
