@@ -565,8 +565,11 @@ impl TracedCommand {
 ///
 /// Callers should keep secrets out of argv entirely (argv is also world-visible
 /// via `ps`); this is the backstop for when someone forgets, not the primary
-/// defence.
+/// defence. ADR-0036 §5 records the one-use opener URL exception; its code
+/// still needs log masking.
 fn redact_arg(arg: &str) -> String {
+    let urls = redact_url_credentials(arg);
+    let arg = urls.as_str();
     const SECRET_PREFIXES: [&str; 4] = [
         "authorization:",
         "proxy-authorization:",
@@ -575,13 +578,14 @@ fn redact_arg(arg: &str) -> String {
     ];
     let lowered = arg.to_ascii_lowercase();
     for prefix in SECRET_PREFIXES {
-        if let Some(rest) = lowered.strip_prefix(prefix) {
+        if let Some(start) = lowered.find(prefix) {
+            let rest = &lowered[start + prefix.len()..];
             // Keep the scheme word only when it IS a scheme. For a header like
             // `x-api-key: <secret>` the first word after the colon is the
             // secret itself, so preserving it would defeat the whole point.
             const AUTH_SCHEMES: [&str; 5] = ["bearer", "basic", "digest", "negotiate", "token"];
             let first = rest.split_whitespace().next().unwrap_or("");
-            let label = &arg[..prefix.len()];
+            let label = &arg[..start + prefix.len()];
             return if AUTH_SCHEMES.contains(&first) {
                 format!("{label} {first} <redacted>")
             } else {
@@ -589,7 +593,7 @@ fn redact_arg(arg: &str) -> String {
             };
         }
     }
-    redact_url_credentials(arg)
+    arg.to_owned()
 }
 
 /// Preserve URL destinations and ordinary parameters while masking credentials.
@@ -602,12 +606,16 @@ fn redact_url_credentials(arg: &str) -> String {
     }
     static URL: OnceLock<Regex> = OnceLock::new();
     static PARAM: OnceLock<Regex> = OnceLock::new();
+    // Apostrophes are legal userinfo: scan through them to find the authority @.
     let url = URL.get_or_init(|| {
-        Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+"#).expect("static argv URL pattern")
+        Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"<>]+"#).expect("static argv URL pattern")
     });
     let param = PARAM.get_or_init(|| {
-        Regex::new(r"(?i)([?#&](?:code|token|secret|key)=)[^&#]*")
-            .expect("static secret URL parameter pattern")
+        Regex::new(&format!(
+            r"(?i)([?#&](?:code|key|{})=)[^&#]*",
+            crate::report::redact::SECRET_LABEL_PATTERN
+        ))
+        .expect("static secret URL parameter pattern")
     });
     url.replace_all(arg, |captures: &regex::Captures<'_>| {
         let value = &captures[0];
@@ -658,15 +666,26 @@ pub(crate) fn shape_stderr_tail(stderr: &[u8]) -> Option<String> {
     Some(format!("{ARG_TRUNCATED_MARKER}{}", &tail[cut..]))
 }
 
+/// Long secret-flag aliases are matched only for logging, never execution.
+fn secret_flag(flag: &str) -> bool {
+    flag.strip_prefix("--").is_some_and(|name| {
+        let name = name.to_ascii_lowercase();
+        ["token", "secret", "password", "api-key"]
+            .iter()
+            .any(|label| name.contains(label))
+    })
+}
+
 /// Shape a `Command`'s argv into a single log-safe string: args joined with
 /// spaces, capped at `MAX_ARG_LOG_CHARS`, with an ellipsis marker on overflow.
 /// Non-UTF8 args become lossy strings so the audit trail never fails to render.
 /// Known token shapes, URL credentials and named secret flag values are masked
 /// before the cap. A separate secret flag consumes the next argument as its value.
 /// Arbitrary unlabelled secrets cannot be identified; callers must use stdin/env.
+/// Short `-t` is ambiguous (for example, a type or terminal option), so only
+/// descriptive long secret flags consume a value. Callers must keep secrets off argv.
 #[allow(dead_code)] // Called from the wrapper commit's impl (also under #[allow]); real callers land in the migration.
 fn shape_args(command: &Command) -> String {
-    const SECRET_FLAGS: [&str; 4] = ["--password", "--token", "--api-key", "--secret"];
     let mut buf = String::new();
     let mut secret_value = false;
     for arg in command.get_args() {
@@ -677,14 +696,11 @@ fn shape_args(command: &Command) -> String {
         if secret_value {
             buf.push_str("<redacted>");
             secret_value = false;
-        } else if let Some((flag, _)) = arg
-            .split_once('=')
-            .filter(|(flag, _)| SECRET_FLAGS.contains(flag))
-        {
+        } else if let Some((flag, _)) = arg.split_once('=').filter(|(flag, _)| secret_flag(flag)) {
             buf.push_str(flag);
             buf.push_str("=<redacted>");
         } else {
-            secret_value = SECRET_FLAGS.contains(&arg.as_ref());
+            secret_value = secret_flag(&arg);
             buf.push_str(&redact_arg(&arg));
         }
         if buf.len() >= MAX_ARG_LOG_CHARS {
@@ -921,6 +937,98 @@ mod tests {
         }
         let logs = logged_fixture_args(&[format!("https://example.com/#code={secret}")]);
         assert!(!logs.contains(&secret));
+    }
+
+    #[test]
+    fn s2060_apostrophe_in_url_userinfo_is_masked() {
+        let credentials = ["fixture-user", "p'ss-fixture"].join(":");
+        let logs = logged_fixture_args(&[format!(
+            "--url=https://{credentials}@example.com/repo?view=diff"
+        )]);
+        assert!(!logs.contains("fixture-user"), "{logs}");
+        assert!(!logs.contains("p'ss-fixture"), "{logs}");
+        assert!(logs.contains("https://***@example.com/repo?view=diff"));
+    }
+
+    #[test]
+    fn s2060_suffixed_url_secret_labels_are_masked() {
+        let secret = ["fixture", "credential"].join("-");
+        for name in [
+            "access_token",
+            "client_secret",
+            "api_key",
+            "id_token",
+            "REFRESH_TOKEN",
+        ] {
+            for separator in ['?', '#', '&'] {
+                let prefix = if separator == '&' { "?view=diff" } else { "" };
+                let logs = logged_fixture_args(&[format!(
+                    "https://example.com/{prefix}{separator}{name}={secret}&page=2"
+                )]);
+                assert!(!logs.contains(&secret), "{name}: {logs}");
+                assert!(logs.contains(&format!("{name}=<redacted>&page=2")));
+            }
+        }
+    }
+
+    #[test]
+    fn s2060_secret_flag_patterns_mask_logs_but_preserve_executed_argv() {
+        let secret = ["fixture", "credential"].join("-");
+        for flag in [
+            "--TOKEN",
+            "--auth-token",
+            "--github-token",
+            "--CLIENT-SECRET",
+            "--db-password-file",
+            "--my-API-KEY-extra",
+        ] {
+            for args in [
+                vec![flag.into(), secret.clone(), "--verbose".into()],
+                vec![format!("{flag}={secret}"), "--verbose".into()],
+            ] {
+                let logs = logged_fixture_args(&args);
+                assert!(!logs.contains(&secret), "{flag}: {logs}");
+                assert!(logs.contains(flag) && logs.contains("--verbose"));
+            }
+        }
+        let args = vec![
+            "--auth-token".to_owned(),
+            secret.clone(),
+            "-t".into(),
+            "ordinary".into(),
+        ];
+        let mut output = None;
+        let logs = capture_logs(|| {
+            output = Some(
+                TracedCommand::new(crate::test_support::program_path("sh"), "argv-fixture")
+                    .args(["-c", "printf '%s\\n' \"$@\"", "argv-fixture"])
+                    .args(&args)
+                    .output_traced()
+                    .unwrap(),
+            );
+        });
+        let output = output.unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            args.join("\n") + "\n"
+        );
+        assert!(!logs.contains(&secret), "{logs}");
+        assert!(logs.contains("-t ordinary"));
+    }
+
+    #[test]
+    fn s2060_authorization_inside_git_config_is_masked() {
+        let secret = ["fixture", "credential"].join("-");
+        let logs = logged_fixture_args(&[
+            "-c".into(),
+            format!("http.extraheader=Authorization: Bearer {secret}"),
+            "fetch".into(),
+            "origin".into(),
+        ]);
+        assert!(!logs.contains(&secret), "{logs}");
+        assert!(logs.contains("-c http.extraheader=Authorization:"));
+        assert!(logs.contains("bearer <redacted> fetch origin"));
     }
 
     #[test]

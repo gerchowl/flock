@@ -217,6 +217,10 @@ fn secret_token_re() -> &'static Regex {
     })
 }
 
+/// Shared secret-label suffixes for diagnostic text and URL parameter names.
+/// Each caller supplies value boundaries appropriate to its input format.
+pub(crate) const SECRET_LABEL_PATTERN: &str = r"\w*(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|api[-_]?key)";
+
 fn labeled_secret_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -229,9 +233,9 @@ fn labeled_secret_re() -> &'static Regex {
         // at the first space, so `authorization: Bearer ab12…` masked only
         // "Bearer" and emitted the credential itself in the clear. Consume the
         // scheme and the token that follows it as one value.
-        Regex::new(
-            r"(?i)(?:^|[^A-Za-z0-9])(\w*(?:authorization|bearer|token|password|passwd|secret|credentials?|cookie|session|api[-_]?key))\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?\S+",
-        )
+        Regex::new(&format!(
+            r"(?i)(?:^|[^A-Za-z0-9])({SECRET_LABEL_PATTERN})\s*[=:]\s*(?:(?:bearer|basic|digest|token)\s+)?\S+",
+        ))
         .expect("static labeled-secret pattern")
     })
 }
