@@ -493,6 +493,16 @@ impl InputHandle {
     /// Loss with no identifiable event type yields `structured_turn_end_unknown`
     /// until a real result confirms the boundary; never retry it as ordinary busy.
     pub(super) fn try_submit(&self, user: &Value) -> io::Result<()> {
+        self.try_submit_observed(user, || {})
+    }
+
+    /// Offer input and request supervisor shutdown only if its acceptance fact
+    /// cannot reach the pump. Existing I/O cancellation does not imply stop intent.
+    pub(super) fn try_submit_observed(
+        &self,
+        user: &Value,
+        observer_unavailable: impl FnOnce(),
+    ) -> io::Result<()> {
         if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -543,7 +553,11 @@ impl InputHandle {
             self.busy.store(false, Ordering::Release);
             return Err(io::Error::other(err.to_string()));
         }
+        // The busy gate admits one input per turn, and the pump drains facts
+        // before each stdout line and poll. The bounded queue cannot fill while
+        // that pump is connected, so failure means its observer disconnected.
         if self.accepted.try_send(Accepted { at, at_ms }).is_err() {
+            observer_unavailable();
             self.cancel.store(true, Ordering::Release);
             self.busy.store(false, Ordering::Release);
             return Err(io::Error::new(
