@@ -574,16 +574,18 @@ fn redact_arg(arg: &str) -> String {
     static COMPACT_HEADER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let header = HEADER.get_or_init(|| {
         // Capture complete names, including ref paths and glued curl options.
+        // Stop at the first viable H/header pair so no credential enters the label.
         regex::Regex::new(&format!(
-            r"(?i)(([\w/-]*{})[ \t]*:)",
+            r"(?i)(((?:-[A-Za-z0-9#:]*?(?-i:H))?[\w/-]*{})[ \t]*:)",
             crate::report::redact::secret_label_pattern("")
         ))
         .expect("static secret header pattern")
     });
     let compact = COMPACT_HEADER.get_or_init(|| {
-        // A single-dash ASCII short-flag cluster may end in curl's H option.
+        // Curl clusters include digit, # and : flags. H is intentionally
+        // uppercase-only: lowercase h requests help, not a header.
         regex::Regex::new(&format!(
-            r"^(?:-[A-Za-z]*H)?(?i:authorization|proxy-authorization|private-token|cookie|set-cookie|{}|x-[\w-]*{})$",
+            r"^(?:-[A-Za-z0-9#:]*H)?(?i:authorization|proxy-authorization|private-token|cookie|set-cookie|{}|x-[\w-]*{})$",
             crate::report::redact::API_KEY_LABEL_PATTERN,
             crate::report::redact::secret_label_pattern("")
         ))

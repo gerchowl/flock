@@ -1190,8 +1190,10 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   credential-header family)
   allow horizontal whitespace before `:` and mask values even without space
   after it, including names glued to curl's `-H` option or a short-flag
-  cluster ending in `H`, such as `-sSLH`. Header recognition
-  classifies the complete name, so `refs/heads/cookie` is a ref name rather
+  cluster ending in uppercase `H`, such as `-sSLH`, `-4H`, `-0sH`, `-#H`
+  or `-:H`. Digit, progress-meter and next-transfer flags are valid cluster
+  members; lowercase `h` requests help and is not a header option. Header
+  recognition classifies the complete name, so `refs/heads/cookie` is a ref name rather
   than a `Cookie` header. Generic credential labels such as `token`, `session`
   and `secret`, including prefixed labels, require whitespace or end-of-string
   after `:`. This preserves refspecs and terminal targets such as
