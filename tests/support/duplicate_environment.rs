@@ -38,7 +38,14 @@ impl Exec {
 }
 
 /// Spawn with the isolated builder's environment plus one raw duplicate entry.
+/// Reject `env_clear`: `get_envs` cannot distinguish cleared inherited variables.
 pub fn spawn(command: Command, key: &OsStr, duplicate: &OsStr) -> io::Result<Child> {
+    if command.environment_was_cleared() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "duplicate environment does not support env_clear",
+        ));
+    }
     let mut command = command.into_std();
     let mut environment: BTreeMap<_, _> = std::env::vars_os().collect();
     for (key, value) in command.get_envs() {
@@ -88,4 +95,17 @@ pub fn spawn(command: Command, key: &OsStr, duplicate: &OsStr) -> io::Result<Chi
     // The fixture needs CommandExt and retains the preparation above.
     #[allow(clippy::disallowed_methods)]
     command.spawn()
+}
+
+#[test]
+fn duplicate_environment_rejects_env_clear_before_exec() {
+    let mut command = Command::new("/bin/sh");
+    command.env_clear().args(["-c", "exit 0"]);
+    match spawn(command, OsStr::new("FIXTURE_KEY"), OsStr::new("duplicate")) {
+        Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidInput),
+        Ok(mut child) => {
+            child.wait().unwrap();
+            panic!("env_clear must be refused before execution");
+        }
+    }
 }

@@ -203,15 +203,15 @@ fn hardened_comparison_checks_every_encoded_position() {
         let mut wrong = credential.0.to_string().into_bytes();
         wrong[i] ^= 1;
         assert!(
-            !credential.matches(&LeaseCredential(zeroize::Zeroizing::new(
-                String::from_utf8(wrong).unwrap()
-            )))
+            !credential.matches(&super::super::credential::LeaseCredential(
+                zeroize::Zeroizing::new(String::from_utf8(wrong).unwrap())
+            ))
         );
     }
 }
 
 #[test]
-fn scoped_busy_failures_map_to_retryable_refusals_and_never_operator() {
+fn scoped_contention_is_retryable_but_ancestry_budget_is_permanent() {
     let (leases, lease) = fixture();
     let busy = {
         let _guard = leases.0.lock();
@@ -219,10 +219,79 @@ fn scoped_busy_failures_map_to_retryable_refusals_and_never_operator() {
     };
     let exhausted =
         leases.scoped_for_test(Some(&lease.credential()), peer(), |pid| Some((pid + 1, 20)));
-    for caller in [busy, exhausted] {
-        assert_eq!(caller, Caller::Busy);
-        let code = caller.refusal().unwrap();
-        assert_eq!(code, crate::api::error_code::ErrorCode::LeaseBusy);
-        assert_eq!(code.retry(), crate::cli::exit::Retry::Later);
-    }
+    assert_eq!(busy, Caller::Busy);
+    assert_eq!(
+        busy.refusal().unwrap().retry(),
+        crate::cli::exit::Retry::Later
+    );
+    assert_eq!(exhausted, Caller::AncestryLimit);
+    let code = exhausted.refusal().unwrap();
+    assert_eq!(code.as_str(), "lease_ancestry_limit");
+    assert_eq!(code.retry(), crate::cli::exit::Retry::Never);
+}
+
+#[test]
+fn continuation_cell_refuses_revoke_expiry_and_generation_change_without_the_table() {
+    let (leases, mut lease) = fixture();
+    let (_, proof) = leases
+        .admit_with(Some(&lease.credential()), peer(), facts)
+        .unwrap();
+    let held = leases.0.lock();
+    assert_eq!(proof.verify_with(facts).unwrap(), agent());
+    lease.release();
+    assert!(!lease.released, "cleanup must be deferred under contention");
+    assert_eq!(proof.verify_with(facts).unwrap(), Caller::Uncertain);
+    drop(held);
+    lease.release();
+    let (leases, lease) = fixture();
+    let (_, mut proof) = leases
+        .admit_with(Some(&lease.credential()), peer(), facts)
+        .unwrap();
+    proof.entry.generation.bump();
+    assert_eq!(proof.verify_with(facts).unwrap(), Caller::Uncertain);
+    // Give only this fixture cell an already elapsed monotonic deadline.
+    proof.entry.generation.cell = Arc::new(GenerationCell {
+        revoked: AtomicBool::new(false),
+        version: AtomicU64::new(proof.version),
+        deadline: Some(Instant::now()),
+    });
+    assert_eq!(proof.verify_with(facts).unwrap(), Caller::Uncertain);
+}
+
+#[test]
+fn root_rebinding_revokes_the_old_continuation_cell_before_publication() {
+    let leases = SessionLeases::default();
+    let mut lease = leases.reserve("agent", "session", None).unwrap();
+    lease.bind_test_peer(std::process::id());
+    let peer =
+        crate::platform::peer::credentials(&std::os::unix::net::UnixStream::pair().unwrap().0);
+    let (_, proof) = leases.admit(Some(&lease.credential()), peer).unwrap();
+    assert!(matches!(proof.caller(), Caller::Agent { .. }));
+    lease.bind_test_peer(std::process::id());
+    assert_eq!(proof.caller(), Caller::Uncertain);
+    assert!(matches!(
+        leases.scoped_caller(Some(&lease.credential()), peer),
+        Caller::Agent { .. }
+    ));
+}
+
+#[test]
+fn revocation_during_fresh_ancestry_read_refuses_the_boundary() {
+    let (leases, lease) = fixture();
+    let (_, proof) = leases
+        .admit_with(Some(&lease.credential()), peer(), facts)
+        .unwrap();
+    leases.with_registry_locked(|| {
+        assert_eq!(
+            proof
+                .verify_with(|pid| {
+                    if pid == 100 {
+                        lease.revoke();
+                    }
+                    facts(pid)
+                })
+                .unwrap(),
+            Caller::Uncertain
+        );
+    });
 }

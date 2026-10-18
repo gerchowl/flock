@@ -377,6 +377,7 @@ impl App {
                 };
             }
             crate::structured::lease::Caller::Uncertain
+            | crate::structured::lease::Caller::AncestryLimit
             | crate::structured::lease::Caller::Busy => {
                 return SpawnCaller::Structured {
                     agent_id: None,

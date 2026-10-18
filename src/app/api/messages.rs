@@ -1391,6 +1391,7 @@ impl App {
         match self.lease_caller() {
             crate::structured::lease::Caller::Agent { agent, .. } => return Some(agent),
             crate::structured::lease::Caller::Uncertain
+            | crate::structured::lease::Caller::AncestryLimit
             | crate::structured::lease::Caller::Busy => return None,
             crate::structured::lease::Caller::Unrelated => (),
         }

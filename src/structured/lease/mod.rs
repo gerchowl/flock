@@ -2,12 +2,14 @@
 //! Reserve before launch. Unconfirmed process cleanup retains the reservation;
 //! an unresolved reservation never grants operator authority. UID policy is #1629.
 #![deny(missing_docs)]
+mod credential;
 mod scoped;
 use super::supervision::ProcessIdentity;
 use crate::platform;
+pub(crate) use credential::LeaseCredential;
 use parking_lot::Mutex;
 use scoped::Generation;
-pub(crate) use scoped::LeaseCredential;
+pub(crate) use scoped::{ContinuationProof, ScopedRefusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
@@ -46,7 +48,9 @@ pub enum Caller {
     },
     /// Missing/reused process identity, pending launch or unavailable registry.
     Uncertain,
-    /// Scoped verification could not acquire the registry or exhausts its fact budget.
+    /// Scoped ancestry exceeds the supported permanent depth limit.
+    AncestryLimit,
+    /// Scoped verification could not acquire the registry.
     Busy,
 }
 impl Caller {
@@ -55,6 +59,7 @@ impl Caller {
         use crate::api::error_code::ErrorCode;
         match self {
             Self::Busy => Some(ErrorCode::LeaseBusy),
+            Self::AncestryLimit => Some(ErrorCode::LeaseAncestryLimit),
             Self::Uncertain => Some(ErrorCode::NotAuthorized),
             _ => None,
         }
@@ -285,10 +290,12 @@ impl Lease {
     /// Publish PID/birth before the runtime handle, retaining uncertainty on failure.
     pub(super) fn bind(&mut self, pid: u32) -> io::Result<()> {
         let process = ProcessIdentity::capture(pid);
+        self.generation.bump();
         self.leases.update(|entries| {
             let entry = entries
                 .get_mut(&self.session)
                 .ok_or_else(|| io::Error::other("lease missing"))?;
+            entry.generation = self.generation.clone();
             entry.root = Root::Process(pid);
             entry.process = process.as_ref().ok().copied();
             Ok::<_, io::Error>(())

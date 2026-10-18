@@ -256,12 +256,11 @@ pub(crate) fn handle_connection(
         return Ok(());
     };
 
-    let line = line.trim();
-    if line.is_empty() {
+    if line.trim().is_empty() {
         return Ok(());
     }
 
-    let (request, credential) = match super::scoped::decode(line) {
+    let (request, credential) = match super::scoped::decode(line.trim()) {
         Ok(request) => request,
         Err(detail) => {
             write_json_line_allow_disconnect(
@@ -281,6 +280,8 @@ pub(crate) fn handle_connection(
             return Ok(());
         }
     };
+
+    drop(line);
 
     let _scope = match credential {
         Some(credential) => match super::scoped::Scope::enter(credential, peer, &request, api_tx) {
@@ -652,27 +653,29 @@ fn api_response_outcome(response: &str) -> &'static str {
     }
 }
 
-fn read_initial_request_line(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
+fn read_initial_request_line(
+    stream: &mut UnixStream,
+) -> std::io::Result<Option<zeroize::Zeroizing<String>>> {
     stream.set_nonblocking(true)?;
     let deadline = Instant::now() + INITIAL_REQUEST_TIMEOUT;
-    let mut bytes = Vec::new();
-    let mut byte = [0u8; 1];
+    let mut bytes = super::secret_json::Buffer::default();
+    let mut byte = zeroize::Zeroizing::new([0u8; 1]);
 
     loop {
-        match stream.read(&mut byte) {
+        match stream.read(&mut *byte) {
             Ok(0) => {
                 stream.set_nonblocking(false)?;
                 return Ok(None);
             }
             Ok(_) => {
-                bytes.push(byte[0]);
+                bytes.write_all(&*byte)?;
                 if byte[0] == b'\n' {
                     stream.set_nonblocking(false)?;
-                    return String::from_utf8(bytes)
-                        .map(Some)
+                    return std::str::from_utf8(&bytes.0)
+                        .map(|text| Some(zeroize::Zeroizing::new(text.to_owned())))
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
                 }
-                if bytes.len() > MAX_INITIAL_REQUEST_BYTES {
+                if bytes.0.len() > MAX_INITIAL_REQUEST_BYTES {
                     stream.set_nonblocking(false)?;
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -830,7 +833,7 @@ pub(super) fn should_stop_connection(
     stream: &mut UnixStream,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
-    if super::scoped::Scope::current().is_some_and(|scope| scope.refusal().is_some()) {
+    if super::scoped::Scope::current().is_some_and(|scope| scope.continuation_refusal().is_some()) {
         return Ok(true);
     }
 

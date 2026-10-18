@@ -462,11 +462,11 @@ fn write_request(
         credential: &'a crate::structured::lease::LeaseCredential,
     }
     let wire = match credential {
-        Some(credential) => serde_json::to_vec(&Envelope {
+        Some(credential) => super::secret_json::encode(&Envelope {
             request,
             credential,
         })?,
-        None => serde_json::to_vec(request)?,
+        None => super::secret_json::encode(request)?,
     };
     stream.write_all(&wire)?;
     stream.write_all(b"\n")?;

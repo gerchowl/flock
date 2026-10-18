@@ -131,59 +131,6 @@ fn local_calls_compatibility_probes_and_channel_reattachment_share_scoping() {
         .expect("transport fixture must complete within fail ceiling");
 }
 
-#[global_allocator]
-static ALLOCATOR: SecretAudit = SecretAudit;
-struct SecretAudit;
-thread_local! {
-    static AUDIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static LEAKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-// SAFETY: System owns every allocation. Zero-initializing capacity also makes
-// inspection of unused bytes valid. Inspection precedes deallocation and never
-// allocates itself. This allocator exists only in the test binary.
-unsafe impl std::alloc::GlobalAlloc for SecretAudit {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        // The audited startup path's matching allocations are encoded UTF-8
-        // byte buffers. Exclude object layouts and inspect only their live bytes.
-        if layout.size() == 44
-            && layout.align() == 1
-            && AUDIT.try_with(|active| active.get()).unwrap_or(false)
-        {
-            // SAFETY: the allocation is still live and contains at least eight bytes.
-            if unsafe { std::slice::from_raw_parts(ptr, 8) } == b"KioqKioq" {
-                let _ = LEAKED.try_with(|count| count.set(count.get() + 1));
-            }
-        }
-        unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, ptr, layout) }
-    }
-}
-#[test]
-fn startup_credential_buffers_are_zeroized_before_deallocation() {
-    let secret = base64::engine::general_purpose::STANDARD.encode([42; 32]);
-    // Prove the audit catches an ordinary unzeroized buffer before relying on
-    // its zero count for the startup path. Black-box ownership keeps it live.
-    let control = OsString::from(&secret);
-    LEAKED.set(0);
-    AUDIT.set(true);
-    drop(std::hint::black_box(control));
-    AUDIT.set(false);
-    assert_eq!(LEAKED.get(), 1, "audit failed to detect its control buffer");
-    for structured in [true, false] {
-        let raw = OsString::from(&secret);
-        let socket = OsString::from("/tmp/fixture.sock");
-        LEAKED.set(0);
-        AUDIT.set(true);
-        let result = std::hint::black_box(configured(structured, Some(raw), Some(socket)));
-        assert_eq!(result.is_ok(), structured);
-        drop(result);
-        AUDIT.set(false);
-        assert_eq!(LEAKED.get(), 0, "credential bytes freed before zeroization");
-    }
-}
-
 #[test]
 fn credential_take_precedes_endpoint_lookup_on_configuration_refusal() {
     let taken = std::cell::Cell::new(false);

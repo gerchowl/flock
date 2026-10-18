@@ -868,7 +868,7 @@ impl App {
         if attempt
             .scope
             .as_ref()
-            .is_some_and(|scope| scope.refusal().is_some())
+            .is_some_and(|scope| scope.continuation_refusal().is_some())
         {
             return Some(self.conclude_guarded_attempt(
                 pane,

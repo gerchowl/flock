@@ -912,6 +912,23 @@ fn structured_mcp_scrubs_exec_time_environment_before_ready() {
         !environment.iter().any(|entry| entry.contains(duplicate)),
         "a later duplicate credential remains in the child's exec-time environment"
     );
+    let scrubbed: Vec<_> = environment
+        .iter()
+        .filter_map(|entry| entry.strip_prefix("FLOCK_MCP_LEASE_CREDENTIAL="))
+        .collect();
+    assert_eq!(
+        scrubbed.len(),
+        2,
+        "both duplicate entries must reach the child"
+    );
+    assert!(scrubbed
+        .iter()
+        .all(|value| !value.is_empty() && value.bytes().all(|byte| byte == b'0')));
+    let mut lengths: Vec<_> = scrubbed.iter().map(|value| value.len()).collect();
+    lengths.sort_unstable();
+    let mut expected = [secret.len(), duplicate.len()];
+    expected.sort_unstable();
+    assert_eq!(lengths, expected);
     drop(child);
     cleanup_test_base(&base);
 }

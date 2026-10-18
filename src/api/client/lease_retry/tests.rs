@@ -27,6 +27,7 @@ fn only_scoped_busy_admission_retries_and_final_refusal_is_typed() {
         (true, "lease_busy", 3),
         (false, "lease_busy", 1),
         (true, "not_authorized", 1),
+        (true, "lease_ancestry_limit", 1),
     ] {
         let clock = ClockLog::default();
         let calls = Cell::new(0);

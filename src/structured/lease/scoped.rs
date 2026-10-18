@@ -1,79 +1,50 @@
 //! Per-reservation local API credentials, distinct from operator/client tokens.
 use super::*;
-use base64::Engine;
-use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// Secret for exactly one reservation generation. Never grants operator authority.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct LeaseCredential(zeroize::Zeroizing<String>);
-impl std::fmt::Debug for LeaseCredential {
-    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        out.write_str("LeaseCredential([redacted])")
-    }
-}
-impl LeaseCredential {
-    /// Generate independent OS entropy for this reservation only.
-    pub(super) fn generate() -> io::Result<Self> {
-        let mut bytes = zeroize::Zeroizing::new([0; 32]);
-        getrandom::fill(bytes.as_mut()).map_err(io::Error::other)?;
-        Ok(Self(zeroize::Zeroizing::new(
-            base64::engine::general_purpose::STANDARD.encode(*bytes),
-        )))
-    }
-    /// Consume environment bytes only into buffers that zeroize on every exit.
-    pub(crate) fn from_env_bytes(bytes: Vec<u8>) -> io::Result<Self> {
-        let bytes = zeroize::Zeroizing::new(bytes);
-        let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
-        let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
-        let mut decoded = zeroize::Zeroizing::new([0; 33]);
-        if base64::engine::general_purpose::STANDARD
-            .decode_slice(&bytes, decoded.as_mut())
-            .map_err(|_| invalid())?
-            != 32
-        {
-            return Err(invalid());
-        }
-        let mut credential = zeroize::Zeroizing::new(String::with_capacity(text.len()));
-        credential.push_str(text);
-        Ok(Self(credential))
-    }
-    fn matches(&self, other: &Self) -> bool {
-        self.0.len() == other.0.len()
-            && self
-                .0
-                .bytes()
-                .zip(other.0.bytes())
-                // Opaque accumulation prevents optimizer replacement with an
-                // early-exit comparison. Encoded length is public wire shape.
-                .fold(0, |diff, (a, b)| {
-                    std::hint::black_box(diff | std::hint::black_box(a ^ b))
-                })
-                == std::hint::black_box(0)
-    }
-}
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 /// A revocable generation; shared snapshots observe revocation before removal.
 #[derive(Clone)]
 pub(super) struct Generation {
     credential: LeaseCredential,
-    revoked: Arc<AtomicBool>,
+    cell: Arc<GenerationCell>,
+}
+struct GenerationCell {
+    revoked: AtomicBool,
+    version: AtomicU64,
+    deadline: Option<Instant>,
 }
 impl Generation {
     /// Create a fresh live reservation generation.
     pub(super) fn new() -> io::Result<Self> {
         Ok(Self {
             credential: LeaseCredential::generate()?,
-            revoked: Arc::new(AtomicBool::new(false)),
+            cell: Arc::new(GenerationCell {
+                revoked: AtomicBool::new(false),
+                version: AtomicU64::new(0),
+                deadline: None,
+            }),
         })
     }
     /// Publish irrevocable revocation before any registry removal.
     pub(super) fn revoke(&self) {
-        self.revoked.store(true, Ordering::Release);
+        self.cell.revoked.store(true, Ordering::Release);
+    }
+    /// Revoke the old proof before publishing a new root generation.
+    pub(super) fn bump(&mut self) {
+        self.revoke();
+        self.cell = Arc::new(GenerationCell {
+            revoked: AtomicBool::new(false),
+            version: AtomicU64::new(self.cell.version.load(Ordering::Acquire).wrapping_add(1)),
+            deadline: self.cell.deadline,
+        });
     }
     fn live(&self) -> bool {
-        !self.revoked.load(Ordering::Acquire)
+        !self.cell.revoked.load(Ordering::Acquire)
+            && self
+                .cell
+                .deadline
+                .is_none_or(|deadline| Instant::now() < deadline)
     }
 }
 
@@ -92,8 +63,20 @@ impl Lease {
 pub(crate) enum ScopedRefusal {
     /// The registry is busy. App dispatch must never wait for it.
     RegistryContended,
+    /// Missing, revoked or mismatched credential evidence.
+    Invalid,
     /// More than sixteen process facts would be needed to attest ancestry.
     AncestryBudget,
+}
+
+impl ScopedRefusal {
+    fn caller(self) -> Caller {
+        match self {
+            Self::RegistryContended => Caller::Busy,
+            Self::AncestryBudget => Caller::AncestryLimit,
+            Self::Invalid => Caller::Uncertain,
+        }
+    }
 }
 
 impl SessionLeases {
@@ -104,58 +87,54 @@ impl SessionLeases {
         peer: platform::peer::Credentials,
     ) -> Caller {
         self.scoped_with(credential, peer, platform::live_process_facts)
-            .unwrap_or(Caller::Busy)
+            .unwrap_or_else(ScopedRefusal::caller)
     }
     fn scoped_with(
         &self,
         credential: Option<&LeaseCredential>,
         peer: platform::peer::Credentials,
-        mut read: impl FnMut(u32) -> Option<(u32, u64)>,
+        read: impl FnMut(u32) -> Option<(u32, u64)>,
     ) -> Result<Caller, ScopedRefusal> {
-        let (Some(credential), Some(mut pid), Some(peer_birth), Some(_)) =
+        self.admit_with(credential, peer, read)
+            .map(|(caller, _)| caller)
+    }
+    /// Capture the registry-owned generation for an independently verified admission.
+    pub(crate) fn admit(
+        &self,
+        credential: Option<&LeaseCredential>,
+        peer: platform::peer::Credentials,
+    ) -> Result<(Caller, ContinuationProof), ScopedRefusal> {
+        self.admit_with(credential, peer, platform::live_process_facts)
+    }
+    fn admit_with(
+        &self,
+        credential: Option<&LeaseCredential>,
+        peer: platform::peer::Credentials,
+        mut read: impl FnMut(u32) -> Option<(u32, u64)>,
+    ) -> Result<(Caller, ContinuationProof), ScopedRefusal> {
+        let (Some(credential), Some(_), Some(_), Some(_)) =
             (credential, peer.pid, peer.birth, peer.uid)
         else {
-            return Ok(Caller::Uncertain);
+            return Err(ScopedRefusal::Invalid);
         };
         // Unlike ancestry's compatibility snapshot, scoped auth must never use a
         // stale view after registry contention or generation replacement.
-        let entry = self
+        let proof = self
             .0
             .try_lock()
             .ok_or(ScopedRefusal::RegistryContended)?
             .values()
             .find(|e| e.generation.live() && e.generation.credential.matches(credential))
-            .cloned();
-        let Some(entry) = entry else {
-            return Ok(Caller::Uncertain);
+            .map(|entry| ContinuationProof {
+                version: entry.generation.cell.version.load(Ordering::Acquire),
+                entry: entry.clone(),
+                peer,
+            });
+        let Some(proof) = proof else {
+            return Err(ScopedRefusal::Invalid);
         };
-        let Some(root) = entry.process else {
-            return Ok(Caller::Uncertain);
-        };
-        let mut seen = BTreeSet::new();
-        for _ in 0..16 {
-            if pid <= 1 || !seen.insert(pid) {
-                return Ok(Caller::Uncertain);
-            }
-            let Some((parent, birth)) = read(pid) else {
-                return Ok(Caller::Uncertain);
-            };
-            if Some(pid) == peer.pid && birth != peer_birth {
-                return Ok(Caller::Uncertain);
-            }
-            if pid == root.pid {
-                return Ok(if birth == root.birth && entry.generation.live() {
-                    Caller::Agent {
-                        agent: entry.agent,
-                        depth: entry.depth,
-                    }
-                } else {
-                    Caller::Uncertain
-                });
-            }
-            pid = parent;
-        }
-        Err(ScopedRefusal::AncestryBudget)
+        let caller = proof.verify_with(&mut read)?;
+        Ok((caller, proof))
     }
     /// Hold registry contention only inside synchronous deterministic tests.
     #[cfg(test)]
@@ -171,7 +150,63 @@ impl SessionLeases {
         read: impl FnMut(u32) -> Option<(u32, u64)>,
     ) -> Caller {
         self.scoped_with(credential, peer, read)
-            .unwrap_or(Caller::Busy)
+            .unwrap_or_else(ScopedRefusal::caller)
+    }
+}
+
+/// Admission-bound identity plus live revocation state, never a cached authorization.
+#[derive(Clone)]
+pub(crate) struct ContinuationProof {
+    entry: Entry,
+    peer: platform::peer::Credentials,
+    version: u64,
+}
+impl ContinuationProof {
+    fn live(&self) -> bool {
+        self.entry.generation.live()
+            && self.entry.generation.cell.version.load(Ordering::Acquire) == self.version
+    }
+    /// Re-read kernel ancestry and the cell at each effect boundary without table locks.
+    pub(crate) fn caller(&self) -> Caller {
+        self.verify_with(platform::live_process_facts)
+            .unwrap_or(Caller::Uncertain)
+    }
+    pub(crate) fn verify_with(
+        &self,
+        mut read: impl FnMut(u32) -> Option<(u32, u64)>,
+    ) -> Result<Caller, ScopedRefusal> {
+        if !self.live() {
+            return Ok(Caller::Uncertain);
+        }
+        let (Some(mut pid), Some(peer_birth), Some(root)) =
+            (self.peer.pid, self.peer.birth, self.entry.process)
+        else {
+            return Ok(Caller::Uncertain);
+        };
+        let mut seen = BTreeSet::new();
+        for _ in 0..16 {
+            if pid <= 1 || !seen.insert(pid) {
+                return Ok(Caller::Uncertain);
+            }
+            let Some((parent, birth)) = read(pid) else {
+                return Ok(Caller::Uncertain);
+            };
+            if Some(pid) == self.peer.pid && birth != peer_birth {
+                return Ok(Caller::Uncertain);
+            }
+            if pid == root.pid {
+                return Ok(if birth == root.birth && self.live() {
+                    Caller::Agent {
+                        agent: self.entry.agent.clone(),
+                        depth: self.entry.depth,
+                    }
+                } else {
+                    Caller::Uncertain
+                });
+            }
+            pid = parent;
+        }
+        Err(ScopedRefusal::AncestryBudget)
     }
 }
 

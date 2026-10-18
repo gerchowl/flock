@@ -9,6 +9,7 @@ pub mod question;
 mod reply_wait;
 pub mod schema;
 pub(crate) mod scoped;
+mod secret_json;
 pub(crate) mod server;
 mod status;
 mod subscriptions;

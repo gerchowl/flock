@@ -26,6 +26,8 @@ pub(crate) fn live_scope() -> (SessionLeases, Lease, Scope, Credentials) {
         peer,
         leases: Arc::default(),
         principal: Arc::default(),
+        proof: Arc::default(),
+        fact_reader: None,
         probe: true,
     }));
     let policy = UidPolicy {
@@ -212,5 +214,43 @@ fn admitted_policy_identity_does_not_repeat_a_busy_registry_walk() {
     leases.with_registry_locked(|| {
         assert_eq!(scope.refusal(), Some(ErrorCode::LeaseBusy));
         assert!(matches!(scope.principal(), Caller::Agent { .. }));
+    });
+}
+
+#[test]
+fn established_feed_survives_contention_but_revocation_still_closes_it() {
+    let (leases, lease, scope, _) = live_scope();
+    let _guard = Guard(CURRENT.with(|slot| slot.borrow_mut().replace(scope.clone())));
+    let (mut socket, _peer) = UnixStream::pair().unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    leases.with_registry_locked(|| {
+        assert_eq!(scope.refusal(), Some(ErrorCode::LeaseBusy));
+        assert!(!crate::api::server::should_stop_connection(&mut socket, &running).unwrap());
+        drop(lease);
+        assert!(crate::api::server::should_stop_connection(&mut socket, &running).unwrap());
+    });
+}
+
+/// Inject failed fresh process facts at the same continuation verification boundary.
+pub(crate) fn ancestry_lost(scope: &Scope) -> Scope {
+    Scope(Arc::new(ScopeData {
+        fact_reader: Some(|pid| {
+            let (parent, birth) = crate::platform::live_process_facts(pid)?;
+            Some((parent, birth.wrapping_add(1)))
+        }),
+        ..scope.0.as_ref().clone()
+    }))
+}
+
+#[test]
+fn established_feed_closes_on_fresh_ancestry_loss() {
+    let (leases, _lease, scope, _) = live_scope();
+    let _guard = Guard(CURRENT.with(|slot| slot.borrow_mut().replace(scope.clone())));
+    let (mut socket, _peer) = UnixStream::pair().unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    leases.with_registry_locked(|| {
+        assert!(!crate::api::server::should_stop_connection(&mut socket, &running).unwrap());
+        CURRENT.with(|slot| *slot.borrow_mut() = Some(ancestry_lost(&scope)));
+        assert!(crate::api::server::should_stop_connection(&mut socket, &running).unwrap());
     });
 }

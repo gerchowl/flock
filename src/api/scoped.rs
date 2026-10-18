@@ -6,7 +6,7 @@ use super::{schema::Request, ApiRequestMessage, ApiRequestSender};
 use crate::platform::peer::Credentials;
 use crate::structured::{
     identity::{Principal, UidPolicy},
-    lease::{Caller, LeaseCredential, SessionLeases},
+    lease::{Caller, ContinuationProof, LeaseCredential, ScopedRefusal, SessionLeases},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,16 +28,19 @@ pub(crate) struct ScopedRequest {
 pub(super) fn decode(
     line: &str,
 ) -> Result<(Request, Option<Option<LeaseCredential>>), Option<serde_json::Error>> {
-    let value: serde_json::Value = serde_json::from_str(line).map_err(Some)?;
-    if value.get("request").is_some() || value.get("credential").is_some() {
-        let scoped: ScopedRequest = serde_json::from_value(value).map_err(|_| None)?;
+    let value = super::secret_json::SecretValue::parse(line).map_err(Some)?;
+    if value.0.get("request").is_some() || value.0.get("credential").is_some() {
+        let scoped: ScopedRequest = ScopedRequest::deserialize(&value.0).map_err(|_| None)?;
         Ok((scoped.request, Some(scoped.credential)))
     } else {
-        serde_json::from_value(value)
+        Request::deserialize(&value.0)
             .map(|request| (request, None))
             .map_err(Some)
     }
 }
+
+#[cfg(test)]
+type FactReader = fn(u32) -> Option<(u32, u64)>;
 
 /// Sealed transport context shared by queued/parked requests and the socket loop.
 #[derive(Clone)]
@@ -48,7 +51,10 @@ struct ScopeData {
     peer: Credentials,
     leases: Arc<OnceLock<SessionLeases>>,
     principal: Arc<OnceLock<(String, u32)>>,
+    proof: Arc<OnceLock<ContinuationProof>>,
     probe: bool,
+    #[cfg(test)]
+    fact_reader: Option<FactReader>,
 }
 impl std::fmt::Debug for Scope {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -96,6 +102,21 @@ impl Scope {
         match self.caller() {
             Caller::Agent { .. } => None,
             Caller::Busy => Some(ErrorCode::LeaseBusy),
+            Caller::AncestryLimit => Some(ErrorCode::LeaseAncestryLimit),
+            _ => Some(ErrorCode::NotAuthorized),
+        }
+    }
+    /// Established effects require a live generation and fresh kernel ancestry.
+    pub(crate) fn continuation_refusal(&self) -> Option<ErrorCode> {
+        let caller = self.0.proof.get().map(|proof| {
+            #[cfg(test)]
+            if let Some(read) = self.0.fact_reader {
+                return proof.verify_with(read).unwrap_or(Caller::Uncertain);
+            }
+            proof.caller()
+        });
+        match caller {
+            Some(Caller::Agent { .. }) => None,
             _ => Some(ErrorCode::NotAuthorized),
         }
     }
@@ -111,13 +132,15 @@ impl Scope {
         if policy.classify(self.0.peer.uid) == Principal::Unknown {
             return Some("scoped_refused");
         }
-        match leases.scoped_caller(self.0.credential.as_ref(), self.0.peer) {
-            Caller::Agent { agent, depth } => {
+        match leases.admit(self.0.credential.as_ref(), self.0.peer) {
+            Ok((Caller::Agent { agent, depth }, proof)) => {
+                let _ = self.0.proof.set(proof);
                 let _ = self.0.principal.set((agent, depth));
                 let _ = self.0.leases.set(leases.clone());
                 Some("scoped_ok")
             }
-            Caller::Busy => Some("scoped_busy"),
+            Err(ScopedRefusal::RegistryContended) => Some("scoped_busy"),
+            Err(ScopedRefusal::AncestryBudget) => Some("scoped_ancestry_limit"),
             _ => Some("scoped_refused"),
         }
     }
@@ -135,6 +158,9 @@ impl Scope {
             peer,
             leases: Arc::new(OnceLock::new()),
             principal: Arc::new(OnceLock::new()),
+            proof: Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            fact_reader: None,
             probe: true,
         }));
         let (respond_to, response) = std::sync::mpsc::channel();
@@ -154,6 +180,7 @@ impl Scope {
             .as_str()
         {
             "scoped_busy" => return Err(ErrorCode::LeaseBusy),
+            "scoped_ancestry_limit" => return Err(ErrorCode::LeaseAncestryLimit),
             "scoped_ok" => {}
             _ => return Err(ErrorCode::NotAuthorized),
         }
