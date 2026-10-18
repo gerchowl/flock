@@ -2622,6 +2622,78 @@ mod tests {
         );
     }
 
+    fn security2252_hub_destination(host: &str) -> String {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        for (name, node) in [
+            ("node-hub.example", "hub-node"),
+            ("node-destination.example", "destination-node"),
+        ] {
+            app.state.peers.push(crate::config::PeerConfig {
+                name: name.into(),
+                ..Default::default()
+            });
+            app.state.server_nodes.insert(name.into(), node.into());
+        }
+        app.emit_event(EventEnvelope {
+            event: EventKind::MessageRelayed,
+            data: EventData::MessageRelayed {
+                correlation_id: "hub-destination".into(),
+                from_agent: "agent_atlas_cafe".into(),
+                to_agent: "agent_nodea_beef".into(),
+                to_host: host.into(),
+                route: "node-hub.example".into(),
+                via: Some("node-hub.example".into()),
+                relayed_at_ms: 1,
+                intent: MsgIntent::Fyi,
+            },
+        });
+        let ResponseResult::MsgStatus {
+            detail,
+            to_host,
+            path,
+            ..
+        } = status_of(&mut app, "hub-destination")
+        else {
+            panic!("expected message status")
+        };
+        assert_eq!(to_host.as_deref(), Some(host));
+        assert_eq!(path.as_deref(), Some("via node-hub.example"));
+        let detail = detail.unwrap();
+        detail
+            .split_once("delivered it to ")
+            .unwrap()
+            .1
+            .split(';')
+            .next()
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn security2252_hub_claim_cannot_borrow_the_route_alias() {
+        let destination = security2252_hub_destination("node-hub.example");
+        assert!(
+            destination.starts_with(crate::peer_name::BADGE),
+            "{destination:?}"
+        );
+        assert!(!destination.contains("node-hub.example"), "{destination:?}");
+    }
+
+    #[tokio::test]
+    async fn security2252_configured_destination_behind_hub_has_a_nonempty_label() {
+        let destination = security2252_hub_destination("node-destination.example");
+        let label = destination.strip_prefix(crate::peer_name::BADGE).unwrap();
+        assert!(
+            !label.trim().is_empty(),
+            "a badge needs a destination label: {destination:?}"
+        );
+        assert!(
+            !label.contains("node-destination.example"),
+            "{destination:?}"
+        );
+    }
+
     #[tokio::test]
     async fn security2166_r4_status_detail_resolves_trusted_route_names() {
         for (host, route, pinned, expected) in [
