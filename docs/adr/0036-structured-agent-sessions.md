@@ -1597,7 +1597,7 @@ reach clients only through §8's `UnknownEvent` wrapper and use §8's rendering.
 S7a (#1604) defines separate `ClientFrame` and `ServerFrame` enums tagged by
 `t`, with unknown transport tags rejected as protocol errors and additive fields
 ignored. `WireEvent = UnknownEvent | KnownSessionEvent | JsonValue`: the known-only
-projection is the S8a catalogue type supplied by #1723. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
+projection is the S8a catalogue type defined by the adapter’s `events!` macro. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
 client-version-ineligible event uses `{type:"unknown", raw, shape}`. `raw` is
 the exact original line as a string (including non-JSON diagnostics); `shape`
 is the sender's §8 canonical key, never recomputed with the client version.
@@ -1631,8 +1631,13 @@ only reads files, so a normal test run cannot repair stale generated output.
 The generator normalises trailing whitespace, and checks the complete TS file
 inventory as well as contents. ts-rs reports unsupported custom deserializers;
 these affect lenient input reading, while the emitted types describe serialization.
+The stored `SessionEvent` and wire `WireEvent` are distinct contracts.
 The adapter's `Unknown.raw` retains the exact line; its `shape` is Rust metadata
-until the server constructs the explicit wire wrapper. The existing serde_json
+until the server constructs §5/§8's explicit
+`UnknownEvent = {type:"unknown", raw:string, shape:string}` wrapper.
+A bare stored unknown is never an agent-stream wire payload. The wire alias
+remains `UnknownEvent | KnownSessionEvent | JsonValue`; `JsonValue` supports
+non-agent streams and does not remove the agent-stream wrapper requirement. The existing serde_json
 serializer preserves JSON token spelling and interior whitespace, trims surrounding whitespace, and
 encodes non-JSON diagnostics as a JSON string.
 
