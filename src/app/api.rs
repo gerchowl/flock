@@ -1431,9 +1431,7 @@ impl App {
                 .uid_policy
                 .refusal(uid, attributed, &request.method)
         }?;
-        let code = if matches!(&request.method, Method::AgentSend(p)
-            if matches!(self.structured_send_target(&p.target), Ok(Some(_))))
-        {
+        let code = if matches!(&request.method, Method::AgentSend(_)) {
             ErrorCode::NotAuthorized
         } else {
             code

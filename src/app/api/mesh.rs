@@ -174,7 +174,8 @@ impl App {
     /// ADR-0014's operator boundary for an operator-only verb: a local
     /// caller with no flk pane in its process ancestry that is not an inbound
     /// mesh relay. It fails closed: a caller whose pid the socket could not
-    /// read is not the operator.
+    /// read is not the operator. An unknown or changed process start time also
+    /// refuses authority, even when no session leases exist.
     ///
     /// Kernel UID is checked before ancestry (ADR-0036 §1a): detached dedicated
     /// agents never become operators. Same-UID PTYs remain cooperative (#1177).
@@ -182,7 +183,9 @@ impl App {
         self.current_api_peer_uid.is_none_or(|uid| {
             self.runtime_config.uid_policy.classify(uid)
                 == crate::structured::identity::Principal::Operator
-        }) && self.lease_caller() == crate::structured::lease::Caller::Unrelated
+        }) && self.current_api_peer_birth.flatten().is_some()
+            && self.socket_birth_valid()
+            && self.lease_caller() == crate::structured::lease::Caller::Unrelated
             && self.current_api_peer_pid.is_some()
             && self.caller_pane_candidate().is_none()
             && self
