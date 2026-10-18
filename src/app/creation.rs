@@ -354,6 +354,25 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+        let status = super::api_helpers::pane_agent_observation(
+            terminal,
+            pane.seen,
+            self.terminal_runtimes.get(&terminal.id),
+        )
+        .0;
+        self.pane_info_with_status(ws_idx, pane_id, status)
+    }
+
+    /// Build the pane fields using the caller's single live status observation.
+    pub(super) fn pane_info_with_status(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        status: crate::api::schema::AgentStatus,
+    ) -> Option<crate::api::schema::PaneInfo> {
+        let ws = self.state.workspaces.get(ws_idx)?;
+        let pane = ws.pane_state(pane_id)?;
+        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
         let tab_idx = ws.find_tab_index_for_pane(pane_id)?;
         let focused = self.state.active == Some(ws_idx)
             && ws.active_tab == tab_idx
@@ -377,12 +396,7 @@ impl App {
             agent: terminal.effective_agent_label().map(str::to_string),
             title: presentation.title,
             display_agent: presentation.display_agent,
-            agent_status: super::api_helpers::pane_agent_observation(
-                terminal,
-                pane.seen,
-                self.terminal_runtimes.get(&terminal.id),
-            )
-            .0,
+            agent_status: status,
             custom_status: presentation.custom_status,
             state_labels: presentation.state_labels,
             agent_session: terminal_agent_session_info(terminal),

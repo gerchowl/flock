@@ -184,6 +184,11 @@ pub(super) fn pane_agent_status_from_terminal(
     pane_agent_status_for_state(terminal, terminal.state, seen, runtime_present)
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_AGENT_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Apply live lock evidence once for both pane and agent reporting (ADR-0027 §1b).
 /// Offline and hibernated identities keep their lifecycle status. A snapshot
 /// failure is Unknown and cannot supply a lock reason or prove an unlock.
@@ -197,6 +202,8 @@ pub(super) fn pane_agent_observation(
 ) {
     use crate::api::schema::AgentStatus;
     use crate::pane::CodexLockState;
+    #[cfg(test)]
+    TEST_AGENT_OBSERVATIONS.with(|count| count.set(count.get() + 1));
     let status = pane_agent_status_from_terminal(terminal, seen, runtime.is_some());
     if matches!(status, AgentStatus::Offline | AgentStatus::Hibernated)
         || terminal.effective_known_agent() != Some(crate::detect::Agent::Codex)

@@ -1284,10 +1284,23 @@ impl App {
             pane_state.seen,
             self.terminal_runtimes.get(&terminal.id),
         );
+        Some((
+            terminal.agent_id.to_string(),
+            self.agent_state_for_status(terminal, status, now),
+        ))
+    }
+
+    /// Project state from the same status used by the rest of this record.
+    fn agent_state_for_status(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+        status: crate::api::schema::AgentStatus,
+        now: Instant,
+    ) -> crate::api::agent_state::AgentState {
         let provider_wait = (status == crate::api::schema::AgentStatus::Blocked)
             .then_some(terminal.provider_limit.as_ref())
             .flatten();
-        let state = super::api_helpers::agent_state(
+        super::api_helpers::agent_state(
             status,
             terminal.last_state_authority(),
             terminal.effective_known_agent(),
@@ -1301,8 +1314,7 @@ impl App {
                 terminal.question.as_ref(),
             ),
             self.waits.waiting(&terminal.agent_id.to_string()),
-        );
-        Some((terminal.agent_id.to_string(), state))
+        )
     }
 
     pub(super) fn agent_info(
@@ -1325,12 +1337,12 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
-        let pane = self.pane_info(ws_idx, pane_id)?;
         let (status, lock) = super::api_helpers::pane_agent_observation(
             terminal,
             pane_state.seen,
             self.terminal_runtimes.get(&terminal.id),
         );
+        let pane = self.pane_info_with_status(ws_idx, pane_id, status)?;
         let codex_lock = lock == Some(crate::pane::CodexLockState::Locked);
         let provider_wait = (status == crate::api::schema::AgentStatus::Blocked)
             .then_some(terminal.provider_limit.as_ref())
@@ -1349,9 +1361,7 @@ impl App {
                     status,
                     crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
                 ),
-            state: self
-                .agent_state_of_at(ws_idx, pane_id, now)
-                .map(|(_, state)| state),
+            state: Some(self.agent_state_for_status(terminal, status, now)),
             agent_status: status,
             blocked_reason: if codex_lock {
                 Some(
@@ -1608,6 +1618,41 @@ mod tests {
                 assert_lock_read_status(&mut app, &pane, "unknown");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn codex_lock_snapshot_failure_projects_unknown_without_failing_lists() {
+        let (mut app, terminal_id, pane) = locked_codex_app();
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_fail_detection_snapshot();
+        let before = crate::pane::PaneRuntime::test_detection_text_reads();
+        for _ in 0..3 {
+            assert_lock_read_status(&mut app, &pane, "unknown");
+        }
+        assert_eq!(
+            crate::pane::PaneRuntime::test_detection_text_reads() - before,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_info_uses_one_status_observation() {
+        let (app, _, public_pane) = locked_codex_app();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let before = super::super::api_helpers::TEST_AGENT_OBSERVATIONS.with(std::cell::Cell::get);
+        let info = app.agent_info(0, pane).unwrap();
+        assert_eq!(info.pane_id, public_pane);
+        assert_eq!(info.agent_status, crate::api::schema::AgentStatus::Blocked);
+        assert_eq!(
+            info.state.unwrap().turn,
+            crate::api::agent_state::Turn::Unknown
+        );
+        assert_eq!(
+            super::super::api_helpers::TEST_AGENT_OBSERVATIONS.with(std::cell::Cell::get) - before,
+            1
+        );
     }
 
     #[tokio::test]

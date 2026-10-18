@@ -187,8 +187,10 @@ content revision and projects that status with its reason, even before the
 asynchronous detector publishes the transition. `pane.get` / `pane.list` and
 agent reads use the same live status derivation. Internal lock evidence is
 `Locked`, `Unlocked`, or `Unavailable(reason)`. A poisoned terminal-core mutex
-or snapshot failure yields `Unknown`, with its typed reason logged once per
-terminal, and no lock reason. It never fails a list request or proves an unlock.
+or snapshot failure yields `Unknown`, with each typed reason class logged once per
+terminal, and no lock reason. Snapshot failures are cached until the content
+revision changes, just like successful diagnoses. Each agent record derives status
+once and reuses that observation for its status, reason and state. It never fails a list request or proves an unlock.
 PTY writes, resize and mode
 changes invalidate the cache; user viewport scrolling does not. Offline and
 hibernated lifecycle states still outrank a lock diagnosis. Other reasons retain their

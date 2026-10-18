@@ -524,6 +524,10 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    pub(crate) fn test_fail_detection_snapshot(&self) {
+        self.0.test_fail_detection_snapshot();
+    }
+
     pub(crate) fn test_poison_detection_core(&self) {
         self.0.test_poison_detection_core();
     }

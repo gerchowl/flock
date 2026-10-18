@@ -51,6 +51,11 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[cfg(test)]
+pub(crate) fn test_snapshot_error() -> Error {
+    Error(ffi::GhosttyResult_GHOSTTY_OUT_OF_MEMORY)
+}
+
 trait GhosttyResultExt {
     fn into_result(self) -> Result<(), Error>;
 }

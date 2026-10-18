@@ -2326,6 +2326,17 @@ impl PaneRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_fail_detection_snapshot(&self) {
+        self.terminal
+            .ghostty
+            .core
+            .lock()
+            .unwrap()
+            .snapshot_failure
+            .set(true);
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_detection_text_reads() -> usize {
         DETECTION_TEXT_READS.with(Cell::get)
     }
@@ -2346,8 +2357,8 @@ impl PaneRuntime {
     }
 
     pub fn detection_text(&self) -> String {
-        let text = self.terminal.detection_text();
-        self.observe_codex_lock(|| self.terminal.codex_conversation_locked());
+        let (text, lock) = self.terminal.detection_text_with_lock();
+        self.observe_codex_lock(|| lock);
         text
     }
 
@@ -2923,6 +2934,30 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn detection_text_reuses_snapshot_for_pending_lock() {
+        let (runtime, mut bytes) = PaneRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(
+            include_str!("../tests/fixtures/codex/conversation-locked.txt")
+                .replace('\n', "\r\n")
+                .as_bytes(),
+        );
+        let now = std::time::Instant::now();
+        runtime
+            .try_resolve_codex_lock_at(
+                Bytes::from_static(b"r"),
+                now + std::time::Duration::from_secs(10),
+                now,
+            )
+            .unwrap();
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"r");
+        runtime.test_process_pty_bytes(b"\x1b[2J\x1b[H> unlocked");
+        let before = PaneRuntime::test_detection_text_reads();
+        assert!(runtime.detection_text().contains("unlocked"));
+        assert!(runtime.codex_lock_pending.borrow().is_none());
+        assert_eq!(PaneRuntime::test_detection_text_reads() - before, 1);
+    }
 
     #[tokio::test]
     async fn codex_lock_unavailable_does_not_prove_unlock() {
