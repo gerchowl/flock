@@ -1,4 +1,4 @@
-//! One-time browser handoff router; slice 2 supplies the real listener and peer address.
+//! One-time browser handoff router mounted on the guarded structured listener.
 use crate::{client_open::Codes, structured::permissions::auth::tokens::TokenStore};
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, State},
@@ -8,11 +8,11 @@ use axum::{
     Json, Router,
 };
 use std::{net::SocketAddr, path::PathBuf, time::Instant};
+/// Maximum browser-code exchange body bytes, before JSON parsing.
+const EXCHANGE_BODY_BYTES: usize = 1024;
 
 /// Mount only on the configured IPv4 loopback listener; never trust forwarding headers.
-/// The listener must serve with `into_make_service_with_connect_info::<SocketAddr>()`.
-// Slice 2 (#1828) mounts this router after the loopback listener is constructed.
-#[allow(dead_code)]
+/// The listener supplies the actual peer through `ConnectInfo<SocketAddr>`.
 pub(crate) fn router(
     codes: Codes,
     data: PathBuf,
@@ -22,14 +22,14 @@ pub(crate) fn router(
         crate::client_open::endpoint(Some(bind)).ok_or("client endpoint must be IPv4 loopback")?;
     Ok(Router::new()
         .route("/v1/client/exchange", post(exchange))
-        .layer(DefaultBodyLimit::max(1024))
+        .layer(DefaultBodyLimit::max(EXCHANGE_BODY_BYTES))
         .with_state((codes, data, origin.trim_end_matches('/').to_owned())))
 }
 async fn exchange(
     State((codes, data, origin)): State<(Codes, PathBuf, String)>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
+    body: Result<axum::body::Bytes, axum::extract::rejection::BytesRejection>,
 ) -> Response {
     let authority = origin.strip_prefix("http://").unwrap_or_default();
     let canonical = authority.strip_suffix(":80").unwrap_or(authority);
@@ -50,13 +50,30 @@ async fn exchange(
     if forbidden {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let code = serde_json::from_slice::<serde_json::Value>(&body)
+    let code = body
         .ok()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
         .and_then(|v| v.get("code").and_then(|v| v.as_str()).map(str::to_owned))
         .unwrap_or_default();
     let token = codes.exchange(&code, Instant::now());
-    let token =
-        token.filter(|token| TokenStore::open(&data).is_ok_and(|s| s.authenticate(token).is_ok()));
+    let token = match token {
+        Some(token) => super::store_io::shared()
+            .run(move || {
+                TokenStore::open(&data)?.authenticate(&token)?;
+                Ok::<_, crate::structured::permissions::auth::tokens::TokenError>(token)
+            })
+            .await
+            .or_else(|| {
+                crate::logging::client_exchange_failed(None);
+                None
+            })
+            .and_then(|result| {
+                result
+                    .map_err(|error| crate::logging::client_exchange_failed(Some(&error)))
+                    .ok()
+            }),
+        None => None,
+    };
     let response = match token {
         Some(token) => Json(serde_json::json!({"token": token})).into_response(),
         None => (StatusCode::UNAUTHORIZED, "client exchange refused").into_response(),

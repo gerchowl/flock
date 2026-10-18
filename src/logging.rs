@@ -50,6 +50,53 @@ pub(crate) fn structured_stream_repaired(bytes_dropped: u64) {
     );
 }
 
+/// Classify internal browser-exchange failures without formatting credential-bearing data.
+#[cfg(feature = "web")]
+pub(crate) fn client_exchange_failed(
+    error: Option<&crate::structured::permissions::auth::tokens::TokenError>,
+) {
+    use crate::structured::permissions::auth::tokens::TokenError;
+    let (reason, io_kind) = match error {
+        Some(TokenError::Io(error)) => ("store_io", Some(error.kind())),
+        Some(TokenError::Unsafe) => ("unsafe_store", None),
+        Some(TokenError::Busy) => ("store_busy", None),
+        Some(TokenError::Unauthorized | TokenError::Revoked | TokenError::Scope) => return,
+        None => ("worker_unavailable", None),
+    };
+    tracing::warn!(event = "client.exchange.internal_failure", subsystem = "structured_client", reason, io_kind = ?io_kind, "browser credential exchange unavailable");
+}
+
+/// Report a forwarding exposure or failed safety check without raw command output.
+#[cfg(feature = "web")]
+pub(crate) fn client_listener_probe_failed(
+    status: crate::api::client_listener::Status,
+    error: &io::Error,
+) {
+    tracing::warn!(event = "client.listener.probe_failed", subsystem = "structured_client", status = ?status, kind = ?error.kind(), "client listener stopped by forwarding guard");
+}
+
+/// Report secondary listener cleanup errors without replacing the primary server failure.
+#[cfg(feature = "web")]
+pub(crate) fn client_listener_shutdown_failed(error: &std::io::Error) {
+    tracing::warn!(event = "client.listener.shutdown_failed", subsystem = "structured_client", kind = ?error.kind(), errno = ?error.raw_os_error(), "client listener cleanup failed after server failure");
+}
+
+/// Report accept failures with typed classes and errno, never request contents.
+#[cfg(feature = "web")]
+pub(crate) fn client_accept_failed(
+    error: &std::io::Error,
+    class: crate::platform::client_listener::AcceptFailure,
+) {
+    use crate::platform::client_listener::AcceptFailure;
+    let errno = error.raw_os_error();
+    let event = "client.listener.accept";
+    match class {
+        AcceptFailure::Connection => tracing::debug!(event, errno, ?class),
+        AcceptFailure::Resource | AcceptFailure::Unknown => tracing::warn!(event, errno, ?class),
+        AcceptFailure::Fatal => tracing::error!(event, errno, ?class),
+    }
+}
+
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),
