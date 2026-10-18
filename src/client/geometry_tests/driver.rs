@@ -2,11 +2,13 @@
 use super::*;
 use std::process::Stdio;
 
-/// Allow real startup to expire, plus three seconds for scheduling and cleanup.
-const DRIVER_FINISH_CAP: Duration = INITIAL_GEOMETRY_TIMEOUT.saturating_add(Duration::from_secs(3));
-/// Quit should finish within half the startup deadline, rather than timing out.
-const INTERRUPT_FINISH_CAP: Duration =
-    Duration::from_millis(INITIAL_GEOMETRY_TIMEOUT.as_millis() as u64 / 2);
+/// Scheduling and cleanup margin for exec-isolated probes on loaded runners.
+const DRIVER_CLEANUP_MARGIN: Duration = Duration::from_secs(3);
+/// Allow the real startup deadline to expire before the fixture cancels the child.
+const DRIVER_FINISH_CAP: Duration = INITIAL_GEOMETRY_TIMEOUT.saturating_add(DRIVER_CLEANUP_MARGIN);
+/// Allow one second for quit plus cleanup margin. A geometry timeout still fails
+/// the clean-exit and diagnostic assertions, even when it precedes this ceiling.
+const INTERRUPT_FINISH_CAP: Duration = Duration::from_secs(1).saturating_add(DRIVER_CLEANUP_MARGIN);
 
 pub(super) fn expect_failure(mode: &str, expected: &str) {
     let (status, output) = probe(mode);
@@ -25,7 +27,7 @@ fn stdout_file_with_stdin_tty_attaches_through_real_driver() {
 }
 
 #[test]
-fn failed_client_keeps_its_diagnostic_when_the_server_times_out() {
+fn failed_client_keeps_its_diagnostic_when_the_server_is_cancelled() {
     expect_failure(
         "stdin_tty_deadline",
         "timeout: terminal geometry did not become nonzero",
@@ -45,15 +47,25 @@ fn real_sigint_during_geometry_wait_exits_cleanly_before_the_deadline() {
 
 /// Return errors instead of panicking on a server-side timeout. The caller must
 /// be able to see the client's stderr when startup fails before connecting.
-fn serve(listener: std::os::unix::net::UnixListener) -> io::Result<()> {
+fn serve(
+    listener: std::os::unix::net::UnixListener,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let mut peer = runtime
         .block_on(async {
             let listener = tokio::net::UnixListener::from_std(listener)?;
-            tokio::time::timeout(DRIVER_FINISH_CAP, listener.accept())
-                .await
+            let accepted = tokio::time::timeout(DRIVER_FINISH_CAP, listener.accept());
+            let result = tokio::select! {
+                biased;
+                _ = &mut stop => return Err(io::Error::new(
+                    io::ErrorKind::Interrupted, "client exited before connecting",
+                )),
+                result = accepted => result,
+            };
+            result
                 .map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -98,6 +110,16 @@ fn serve(listener: std::os::unix::net::UnixListener) -> io::Result<()> {
 }
 
 fn probe(mode: &str) -> (portable_pty::ExitStatus, String) {
+    probe_with_interrupt(
+        mode,
+        crate::platform::terminal_geometry::tests::interrupt_child,
+    )
+}
+
+fn probe_with_interrupt(
+    mode: &str,
+    interrupt: impl FnOnce(&mut (dyn portable_pty::Child + Send + Sync)) -> io::Result<()>,
+) -> (portable_pty::ExitStatus, String) {
     let root = geometry_fixture_dir();
     let socket = root.path().join("s");
     assert!(
@@ -108,8 +130,12 @@ fn probe(mode: &str) -> (portable_pty::ExitStatus, String) {
     listener.set_nonblocking(true).unwrap();
     let success = mode == "stdin_tty";
     let has_server = success || mode == "stdin_tty_deadline";
+    let (stop_server, stopped) = tokio::sync::oneshot::channel();
     let (server, idle_listener) = if has_server {
-        (Some(std::thread::spawn(move || serve(listener))), None)
+        (
+            Some(std::thread::spawn(move || serve(listener, stopped))),
+            None,
+        )
     } else {
         (None, Some(listener))
     };
@@ -221,18 +247,23 @@ fn probe(mode: &str) -> (portable_pty::ExitStatus, String) {
     } else {
         true
     };
-    if mode == "interrupt" && ready {
-        crate::platform::terminal_geometry::tests::interrupt_child(child.as_mut()).unwrap();
-    }
+    let interrupt_error = if mode == "interrupt" && ready {
+        interrupt(child.as_mut()).err()
+    } else {
+        None
+    };
     let status = finish_pty_child_with_timeout(
         child,
-        !ready,
+        !ready || interrupt_error.is_some(),
         if mode == "interrupt" {
             INTERRUPT_FINISH_CAP
         } else {
             DRIVER_FINISH_CAP
         },
     );
+    // Cancel a pending accept as soon as the owned client has exited. An
+    // accepted peer sees EOF when that client closes its socket.
+    let _ = stop_server.send(());
     drop(pair);
     let mut output = String::from_utf8_lossy(&reading.join().unwrap()).into_owned();
     assert!(
@@ -255,7 +286,47 @@ fn probe(mode: &str) -> (portable_pty::ExitStatus, String) {
             );
         }
     }
+    if let Some(error) = interrupt_error {
+        panic!("failed to interrupt geometry client: {error}\n{output}");
+    }
     (status, output)
+}
+
+#[test]
+fn interrupt_failure_includes_the_real_client_output() {
+    let failure = std::panic::catch_unwind(|| {
+        probe_with_interrupt("interrupt", |_| {
+            Err(io::Error::other("geometry client exited before SIGINT"))
+        });
+    })
+    .expect_err("an interrupt failure must fail the probe");
+    let diagnostic = failure.downcast_ref::<String>().unwrap();
+    assert!(
+        diagnostic.contains("geometry client exited before SIGINT"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("client.geometry_query_failed"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("waiting_geometry"), "{diagnostic}");
+}
+
+#[test]
+fn exited_client_cancels_a_pending_server_accept() {
+    let root = geometry_fixture_dir();
+    let listener = std::os::unix::net::UnixListener::bind(root.path().join("s")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let (done, finished) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || done.send(serve(listener, stopped)).unwrap());
+    stop.send(()).unwrap();
+    let error = finished
+        .recv_timeout(DRIVER_FINISH_CAP.saturating_add(DRIVER_CLEANUP_MARGIN))
+        .expect("cancelled fixture server must return within its fail ceiling")
+        .expect_err("client exit must cancel accept");
+    server.join().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
 }
 
 #[test]

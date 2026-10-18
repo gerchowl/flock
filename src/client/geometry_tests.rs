@@ -430,7 +430,8 @@ fn finish_pty_child_with_timeout(
         let _ = sent.send(status);
     });
     if cancel {
-        stop.send(()).unwrap();
+        // The child may already have exited before cancellation was requested.
+        let _ = stop.send(());
     }
     let status = match received.recv_timeout(timeout) {
         Ok(status) => status,
@@ -810,6 +811,16 @@ fn geometry_fixture_dir() -> GeometryFixture {
     let mut random = [0; 4];
     getrandom::fill(&mut random).unwrap();
     let path = std::env::temp_dir().join(format!("g{:08x}", u32::from_ne_bytes(random)));
-    std::fs::create_dir(&path).unwrap();
+    crate::platform::structured::create_private_dir(&path).unwrap();
     GeometryFixture(path)
+}
+
+#[test]
+fn geometry_fixture_directory_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = geometry_fixture_dir();
+    assert_eq!(
+        std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
 }
