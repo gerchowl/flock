@@ -186,7 +186,8 @@
   cursor: pointer;
 }
 
-.action[aria-disabled="true"] {
+.action[aria-disabled="true"],
+.action:disabled {
   color: var(--muted);
   cursor: not-allowed;
 }
@@ -557,4 +558,29 @@
   border-color: var(--working);
   background: var(--working);
   color: var(--bg);
+}
+
+.decide {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.decide__message {
+  min-height: 44px;
+  padding: 0 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+}
+
+.decide__confirm p {
+  margin: 0;
+}
+
+.phone .decide__message {
+  min-height: 48px;
 }

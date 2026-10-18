@@ -26,7 +26,7 @@ import { browserClock, browserSockets, endpointUrl } from "./wire/env";
 import { createWireFleet } from "./wire/fleet";
 import { createWireTransport } from "./wire/transport";
 import { ConnectionBar } from "./workbench/ConnectionBar";
-import type { Sender } from "./workbench/Composer";
+import { createWireSender } from "./workbench/sender";
 import { SAMPLE_INBOX } from "./workbench/inbox";
 import { SAMPLE_AGENTS } from "./workbench/samples";
 import { Workbench } from "./workbench/Workbench";
@@ -68,12 +68,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const connection = new WireConnection({ url, token: props.config.token, client: CLIENT, ...props.env });
   const [revision, setRevision] = createSignal(0);
   onCleanup(connection.onChange(() => setRevision(revision() + 1)));
-  const sender: Sender = {
-    commands: () => (revision(), connection.commands()),
-    // `submit` sends the message, not only types it (`AgentSendParams`; S7a's agent-send script).
-    send: (agent, text) => connection.command("agent.send", { target: agent, text, submit: true }),
-    blocked: () => (revision(), connection.principal === null ? "Sending opens once the server has welcomed this client." : null),
-  };
+  const sender = createWireSender(connection, revision);
   connection.connect();
   onCleanup(() => connection.disconnect());
   const store = createLayoutStore({ serverKey: url, initial: emptyLayout });

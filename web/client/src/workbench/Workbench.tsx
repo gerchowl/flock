@@ -146,7 +146,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
       </main>
       <aside class="inbox" aria-label="Inbox" data-testid="inbox">
         <h2 class="inbox__title">Inbox</h2>
-        <InboxCards cards={cards()} source={props.source} />
+        <InboxCards cards={cards()} source={props.source} sender={props.sender} />
       </aside>
     </div>
   );

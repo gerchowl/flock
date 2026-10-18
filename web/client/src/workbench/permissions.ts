@@ -69,7 +69,6 @@ type Tracked = {
 };
 
 const CHOICES = ["Allow once", "Always allow", "Deny"] as const;
-const WAITS_FOR = "#1749 PR 2 (answering prompts)";
 
 /** The live permission inbox over `transport`. */
 export type PermissionInbox = {
@@ -97,7 +96,6 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
     agentLabel: tracked.label,
     choices: CHOICES,
     blocking: true,
-    waitsFor: WAITS_FOR,
     ...(tracked.stale ? { stale: true as const } : {}),
   });
 
@@ -136,8 +134,7 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
       detail: `Unusable permission record: ${problem}`,
       choices: [],
       blocking: false,
-      waitsFor: WAITS_FOR,
-    },
+      },
   });
 
   const publish = (): void => {

@@ -6,6 +6,8 @@
 import { For, Show, createUniqueId, type JSX } from "solid-js";
 
 import type { AgentRow } from "../fleet";
+import type { Sender } from "./Composer";
+import { PermissionActions } from "./decide";
 import { sortInbox, type InboxCard } from "./inbox";
 import { PHASE_LABELS, StatusMark, markFor } from "./marks";
 
@@ -45,7 +47,7 @@ export function AgentRowButton(props: { readonly row: AgentRow; readonly focused
 }
 
 /** The inbox's cards, blocking first. */
-export function InboxCards(props: { readonly cards: readonly InboxCard[]; readonly source: "replay" | "live" }): JSX.Element {
+export function InboxCards(props: { readonly cards: readonly InboxCard[]; readonly source: "replay" | "live"; readonly sender: Sender | null }): JSX.Element {
   const note = (): string | null =>
     props.source === "live"
       ? props.cards.length === 0
@@ -73,13 +75,22 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
               </p>
             </Show>
             <Show when={card.choices.length > 0}>
-              <div class="card__choices">
-                <For each={card.choices}>{(choice) => <Waits label={choice} reasonId={reason} />}</For>
-                <Waits label="Edit…" reasonId={reason} />
-              </div>
-              <p id={reason} class="waits__reason">
-                Answering waits for {card.waitsFor}.
-              </p>
+              <Show
+                when={card.waitsFor === undefined}
+                fallback={
+                  <>
+                    <div class="card__choices">
+                      <For each={card.choices}>{(choice) => <Waits label={choice} reasonId={reason} />}</For>
+                      <Waits label="Edit…" reasonId={reason} />
+                    </div>
+                    <p id={reason} class="waits__reason">
+                      Answering waits for {card.waitsFor}.
+                    </p>
+                  </>
+                }
+              >
+                <PermissionActions card={card} sender={props.sender} />
+              </Show>
             </Show>
           </article>
           );

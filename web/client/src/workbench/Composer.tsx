@@ -21,6 +21,9 @@
  * Drafts are kept per agent while the workbench is open, so switching
  * agents never loses one.
  *
+ * `agent.decide` (answering a permission prompt) is sent the same way, from
+ * `workbench/decide.tsx`.
+ *
  * `agent.send`'s args are the socket API's `AgentSendParams` (`target`,
  * `text`, `submit`), opaque on the wire until S8b #1677 types them.
  *
@@ -28,6 +31,7 @@
  */
 import { For, createSignal, type JSX } from "solid-js";
 
+import type { AgentDecide } from "../gen/AgentDecide";
 import type { OutboxStatus } from "../gen/OutboxStatus";
 import type { Phase } from "../gen/Phase";
 import type { AgentRow } from "../fleet";
@@ -39,6 +43,8 @@ export type Sender = {
   readonly commands: () => readonly OutboxEntry[];
   /** Queues `agent.send`; throws when no principal is known yet. */
   readonly send: (agent: string, text: string) => string;
+  /** Queues `agent.decide`; throws when no principal is known yet. */
+  readonly decide: (args: AgentDecide) => string;
   /** Why sending is impossible right now, or null. */
   readonly blocked: () => string | null;
 };

@@ -585,7 +585,7 @@ describe("composer", () => {
     const phases: Phase[] = ["working", "settling", "finished", "waiting_on_event", "finished_with_background", "blocked", "needs_human", "offline", "hibernated", "limit_reached", "unknown", "gone"];
     const statuses = Object.keys(STATUS_LABELS) as (keyof typeof STATUS_LABELS)[];
     const commands = statuses.map((status, i) => ({ cmd_id: `c${i}`, verb: "agent.send", args: { target: "p0", text: `m${i}`, submit: true }, principal: "p", created_ms: 0, status }));
-    const all: Sender = { commands: () => commands, send: () => "c9", blocked: () => null };
+    const all: Sender = { commands: () => commands, send: () => "c9", decide: () => "c10", blocked: () => null };
     const agents: AgentRow[] = [...phases.map((state, i) => ({ id: `p${i}`, label: `p${i}`, state, activity: "", waitingOnHuman: [] })), { id: "unlisted", label: "unlisted", state: "working", activity: "", waitingOnHuman: [] }];
     let shown: AgentRow[] = agents;
     const root = mount(() => <Workbench fleet={{ subscribe: (o) => (queueMicrotask(() => o.rows(shown)), () => undefined) }} transport={createFixtureTransport("")} inbox={[]} sender={all} layout={emptyLayout()} saveLayout={() => undefined} source="live" />);
@@ -637,7 +637,7 @@ describe("composer", () => {
     expect(listed(root)).toEqual([]);
   });
 
-  const sender: Sender = { commands: () => [], send: () => "c1", blocked: () => null };
+  const sender: Sender = { commands: () => [], send: () => "c1", decide: () => "c2", blocked: () => null };
   const rows: AgentRow[] = [
     { id: "atlas", label: "atlas", state: "working", activity: "", waitingOnHuman: [] },
     { id: "kite", label: "kite", state: "gone", activity: "", waitingOnHuman: [] },

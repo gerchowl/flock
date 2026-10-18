@@ -6,80 +6,12 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { render } from "solid-js/web";
 
-import type { AgentState } from "../src/gen/AgentState";
 import { fixtureExamples } from "../src/gen/FixtureExamples";
-import type { ServerFrame } from "../src/gen/ServerFrame";
 import { SUMMARY_MAX, TITLE_MAX } from "../src/views/turns";
-import { emptyLayout } from "../src/layout/model";
-import type { Mode } from "../src/layout/phone";
-import { createWireFleet } from "../src/wire/fleet";
-import { createWireTransport } from "../src/wire/transport";
-import { Workbench } from "../src/workbench/Workbench";
-import { Harness, live, sentFrames, step } from "./wire/harness";
+import { $$, cards, frames, mountInbox, unmountInbox } from "./wire/inbox-app";
 
-let dispose: (() => void) | undefined;
-afterEach(() => {
-  dispose?.();
-  dispose = undefined;
-  document.body.innerHTML = "";
-  localStorage.clear();
-});
-
-const state: AgentState = { turn: "idle", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "needs_human", source: {} };
-const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAll(`[data-testid="${id}"]`)];
-
-type App = { h: Harness; root: HTMLElement; fleet: (id: string, waiting: string[]) => void; event: (agent: string, id: string, tool?: string, input?: object, requestSeq?: number, tsMs?: number) => void;
-  close: (agent: string, id: string) => void;
-  raw: (agent: string, ev: object) => void;
-  gap: (agent: string) => void;
-  reset: (agent: string) => void; synced: (agent: string) => void };
-
-function mountInbox(mode: Mode = "desktop"): App {
-  const h = new Harness();
-  live(h);
-  const root = document.createElement("div");
-  document.body.append(root);
-  dispose = render(
-    () => <Workbench fleet={createWireFleet(h.connection)} transport={createWireTransport(h.connection)} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} mode={mode} source="live" />,
-    root,
-  );
-  const fleetSub = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
-  const send = (frame: ServerFrame): void => h.step(step({ step: "send", frame }));
-  send({ t: "gap", sub_id: fleetSub, from: 1, to: 0, snapshot_to: 0 });
-  send({ t: "synced", sub_id: fleetSub, seq: 0 });
-  let fleetSeq = 0;
-  let agentSeq = 0;
-  const agentSub = (agent: string): string => (sentFrames(h).filter((f) => (f as { stream?: string }).stream === `agent/${agent}`).at(-1) as { sub_id: string }).sub_id;
-  return {
-    h,
-    root,
-    fleet: (id, waiting) => send({ t: "ev", sub_id: fleetSub, stream: "fleet", seq: ++fleetSeq, ts_ms: 0, ev: { type: "fleet.upsert", row: { id, label: id.toUpperCase(), state, waiting_on_human: waiting } } }),
-    event: (agent, id, tool = "Bash", input = { command: "just check" }, requestSeq = 7, tsMs = 0) =>
-      send({
-        t: "ev",
-        sub_id: agentSub(agent),
-        stream: `agent/${agent}`,
-        seq: ++agentSeq,
-        ts_ms: tsMs,
-        ev: { type: "flk_permission_request", state: "open", request_id: id, request_seq: requestSeq, request: { subtype: "can_use_tool", tool_name: tool, input, tool_use_id: `tool-${id}` } } as never,
-      }),
-    close: (agent, id) =>
-      send({ t: "ev", sub_id: agentSub(agent), stream: `agent/${agent}`, seq: ++agentSeq, ts_ms: 0, ev: { type: "flk_permission_request", state: "closed", request_id: id, request_seq: 7, decision: "allow_once", message: null, principal: "p", source: "token" } as never }),
-    raw: (agent, ev) => send({ t: "ev", sub_id: agentSub(agent), stream: `agent/${agent}`, seq: ++agentSeq, ts_ms: 0, ev: ev as never }),
-    reset: (agent) => send({ t: "subfail", sub_id: agentSub(agent), code: "cursor_ahead", message: "ahead" }),
-    gap: (agent) => {
-      send({ t: "gap", sub_id: agentSub(agent), from: agentSeq + 1, to: agentSeq + 2 });
-      agentSeq += 2;
-    },
-    synced: (agent) => send({ t: "synced", sub_id: agentSub(agent), seq: agentSeq }),
-  };
-}
-
-const cards = (root: HTMLElement): string[] => $$(root, "inbox-card").map((card) => card.textContent ?? "");
-const frames = (h: Harness, t: string, stream?: string): { sub_id: string }[] =>
-  sentFrames(h).filter((f) => (f as { t: string }).t === t && (stream === undefined || (f as { stream?: string }).stream === stream)) as { sub_id: string }[];
+afterEach(unmountInbox);
 
 describe("live permission inbox", () => {
   test("an open record shows a card with its tool, input and agent; the closed record removes it", () => {
@@ -352,15 +284,14 @@ describe("live permission inbox", () => {
     expect(unsubbed[0]).toBe(subs[0]);
   });
 
-  test("the decide actions are disabled with their reason, and nothing sends a command", () => {
-    const { h, root, fleet, event } = mountInbox();
+  test("a card with no record yet has its decide actions disabled, naming why, and sends nothing", () => {
+    const { h, root, fleet } = mountInbox("desktop", { sender: true });
     fleet("atlas", ["r1"]);
-    event("atlas", "r1");
     const buttons = [...(root.querySelector('[data-testid="inbox-card"]')?.querySelectorAll("button") ?? [])];
-    expect(buttons.map((b) => b.textContent)).toEqual(expect.arrayContaining(["Allow once", "Always allow", "Deny"]));
+    expect(buttons.map((b) => b.textContent)).toEqual(["Allow once", "Always allow", "Deny"]);
     for (const button of buttons) {
-      expect(button.getAttribute("aria-disabled")).toBe("true");
-      expect(document.getElementById(button.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Answering waits for #1749 PR 2 (answering prompts).");
+      expect(button.hasAttribute("disabled")).toBe(true);
+      expect(document.getElementById(button.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Answering needs the server's open permission record.");
       button.click();
     }
     expect(frames(h, "cmd")).toHaveLength(0);
