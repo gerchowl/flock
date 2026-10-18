@@ -3035,6 +3035,15 @@ pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
     );
 }
 
+/// Discard untrusted agent identity text without logging its content.
+pub(crate) fn agent_name_dropped(source: &'static str) {
+    tracing::warn!(
+        code = crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+        source,
+        "agent name dropped"
+    );
+}
+
 // --- agent-resume family (logging redesign PR-6) ---------------------------
 // The three deferred agent-resume paths (empty argv, shell spawn failure,
 // send-command failure) all reach tracing with %terminal_id / %plan.agent /
@@ -3963,6 +3972,14 @@ pub(crate) fn peer_summary_applied(
         latency_ms,
         "peer summary applied"
     );
+}
+
+/// A malformed peer routing token was discarded. The field is a fixed schema
+/// name; rejected values never enter this typed, content-free warning.
+pub(crate) fn peer_summary_identifier_dropped(field: &'static str) {
+    tracing::warn!(target: "flock::peers", event = "peer.summary.identifier_dropped",
+        code = crate::api::error_code::ErrorCode::InvalidParams.as_str(), field,
+        "discarding invalid peer summary identifier");
 }
 
 /// A gossiped fleet row carried an ssh destination or `ProxyJump` this host

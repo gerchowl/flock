@@ -101,6 +101,17 @@ impl TerminalState {
         report: AgentMetadataReport,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
+        if [
+            report.agent_label.as_deref(),
+            report.display_agent.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            crate::logging::agent_name_dropped("agent_metadata");
+            return None;
+        }
         if !self.accept_metadata_report(&report.source, report.seq) {
             return None;
         }
@@ -369,7 +380,9 @@ impl TerminalState {
         enforce_ttl: bool,
     ) -> EffectivePresentation {
         let mut presentation = EffectivePresentation::empty();
-        presentation.title = self.newest_metadata_title(now, enforce_ttl);
+        presentation.title = self
+            .newest_metadata_title(now, enforce_ttl)
+            .map(|title| crate::terminal::agent_name::presentation(&title));
         presentation.display_agent = self.newest_metadata_display_agent(now, enforce_ttl);
         presentation.state_labels = self.effective_metadata_state_labels(now, enforce_ttl);
         presentation.custom_status =
@@ -719,7 +732,7 @@ mod tests {
     fn metadata_title_takes_pane_border_priority() {
         let mut terminal = test_terminal();
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
-        terminal.set_manual_label("manual".into());
+        terminal.set_manual_label("manual".into()).unwrap();
         terminal.set_agent_metadata(AgentMetadataReport {
             source: "user:presentation".into(),
             agent_label: Some("claude".into()),

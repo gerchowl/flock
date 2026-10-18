@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+pub(crate) mod received;
+
 use crate::api::schema::PeerWorkspaceSummary;
 use crate::config::PeerConfig;
 
@@ -512,7 +514,7 @@ pub struct FleetSnapshotState {
 impl FleetSnapshotState {
     pub fn from_wire(snapshot: crate::protocol::FleetSnapshot) -> Self {
         Self {
-            origin: snapshot.origin,
+            origin: received::text(&snapshot.origin),
             peers: snapshot.peers.into_iter().map(peer_from_wire).collect(),
             origin_summary: snapshot.origin_summary.map(|p| peer_from_wire(*p)),
             received_at: Instant::now(),
@@ -670,12 +672,15 @@ pub struct RelayedEntry {
 pub fn relayed_entry_from_wire(
     entry: crate::api::schema::RelayedFleetPeer,
 ) -> Option<RelayedEntry> {
-    if !crate::remote::is_valid_ssh_destination(&entry.ssh_target) {
+    let entry = entry.received()?;
+    if entry.ssh_target.len() > received::MAX_TOKEN_BYTES
+        || !crate::remote::is_valid_ssh_destination(&entry.ssh_target)
+    {
         crate::logging::peer_relay_entry_rejected(
-            &entry.origin,
-            &entry.name,
+            &received::text(&entry.origin),
+            &received::text(&entry.name),
             "ssh_target",
-            &entry.ssh_target,
+            &received::text(&entry.ssh_target),
         );
         return None;
     }
@@ -687,45 +692,31 @@ pub fn relayed_entry_from_wire(
         .as_deref()
         .filter(|value| !value.is_empty())
     {
-        if !crate::remote::is_valid_ssh_proxy_jump(jump) {
+        if jump.len() > received::MAX_TOKEN_BYTES || !crate::remote::is_valid_ssh_proxy_jump(jump) {
             crate::logging::peer_relay_entry_rejected(
-                &entry.origin,
-                &entry.name,
+                &received::text(&entry.origin),
+                &received::text(&entry.name),
                 "proxy_jump",
-                jump,
+                &received::text(jump),
             );
             return None;
         }
     }
-    // Everything below renders in the sidebar, so it is cleaned the way every
-    // other receive boundary cleans it: the host-declared system summary is
-    // clamped, and free-form names lose any control bytes a peer planted.
-    let strip = |text: String| crate::control_bytes::strip(&text);
     Some(RelayedEntry {
         peer: PeerSummaryState {
             node_id: entry.node_id,
             dial: Default::default(),
             stream_error: None,
-            peer: strip(entry.name),
+            peer: entry.name,
             ssh_target: entry.ssh_target,
-            host: entry.host.map(strip),
-            version: entry.version.map(strip),
+            host: entry.host,
+            version: entry.version,
             protocol: entry.protocol,
             system: entry
                 .system
                 .map(crate::api::schema::PeerSystemSummary::sanitized),
             latency_ms: entry.latency_ms,
-            workspaces: entry
-                .workspaces
-                .into_iter()
-                .map(|mut ws| {
-                    ws.workspace = strip(ws.workspace);
-                    ws.project_label = ws.project_label.map(strip);
-                    ws.branch = ws.branch.map(strip);
-                    ws.agent = ws.agent.map(strip);
-                    ws
-                })
-                .collect(),
+            workspaces: entry.workspaces,
             last_ok: entry
                 .age_secs
                 .and_then(|secs| Instant::now().checked_sub(Duration::from_secs(secs))),
@@ -737,7 +728,8 @@ pub fn relayed_entry_from_wire(
             ingested_at: Some(Instant::now()),
             proxy_jump: entry.proxy_jump,
             icon: entry.icon,
-        },
+        }
+        .received(),
         via: None,
         hub_pushed: false,
     })
@@ -782,20 +774,21 @@ fn merge_relayed_rows(
     via: &str,
     hub_pushed: bool,
 ) {
+    if !received::identity(via, "via") {
+        return;
+    }
     let self_host = crate::app::short_host_name();
     let self_host_lower = self_host.to_ascii_lowercase();
     for entry in entries {
+        let Some(entry) = entry.received() else {
+            continue;
+        };
         if entry.origin.eq_ignore_ascii_case(&self_host) {
             continue;
         }
         let host_key = wire_row_identity(&entry);
-        // Identity is keyed before the row's names are cleaned, so a host
-        // carrying control bytes (`hopper\x07`) would slip past every exact
-        // comparison and then render as a second `hopper`. No real host has
-        // one: drop the row.
-        if host_key.chars().any(char::is_control) {
-            continue;
-        }
+        // Admission rejects unsafe host identities before presentation cleaning.
+        // Key only after admission; a host identity is preserved exactly.
         if host_key == self_host_lower {
             // Never store an entry about ourselves as a relayed row — the self
             // row lives on the origin_summary path.
@@ -806,10 +799,11 @@ fn merge_relayed_rows(
         };
         // #410: remember which edge told us, so a message for this row's
         // agents has a route instead of a refusal.
-        materialised.via = Some(via.to_string());
+        materialised.via = Some(via.to_owned());
         if hub_pushed {
             materialised.hub_pushed = true;
-            materialised.peer.proxy_jump = Some(via.to_string());
+            materialised.peer.proxy_jump =
+                crate::remote::is_valid_ssh_proxy_jump(via).then(|| via.to_string());
         }
         let challenger_age = materialised.peer.carried_age_secs();
         let insert = match cache.get(&host_key) {
@@ -903,6 +897,7 @@ pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
         proxy_jump: peer.proxy_jump,
         icon: peer.icon,
     }
+    .received()
 }
 
 /// Parsed summary payload from one peer (everything its `peers.summary` carries).
@@ -1577,7 +1572,7 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
             .take()
             .map(crate::api::schema::PeerSystemSummary::sanitized);
     }
-    Ok(PeerSummaryPayload {
+    PeerSummaryPayload {
         node_id: result
             .get("node_id")
             .and_then(serde_json::Value::as_str)
@@ -1594,7 +1589,8 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
         workspaces,
         latency_ms,
         relayed_fleet,
-    })
+    }
+    .received()
 }
 
 #[cfg(test)]
@@ -1625,6 +1621,391 @@ mod tests {
             proxy_jump: proxy_jump.map(Into::into),
             icon: None,
         }
+    }
+
+    fn assert_safe_project_row(ws: crate::api::schema::PeerWorkspaceSummary) {
+        assert_eq!(ws.project_key.as_deref(), Some("dir:reportfdp.exe"));
+        let mut app = crate::app::state::AppState::test_new();
+        let mut peer = PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "peer.invalid".into(),
+            ..Default::default()
+        });
+        peer.workspaces.push(ws);
+        app.peer_summaries.push(peer);
+        let row = crate::ui::test_remote_entry_label(
+            &app,
+            &crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
+            0,
+            false,
+        );
+        assert!(row.contains("reportfdp.exe"));
+        let gui = serde_json::to_string(&peer_to_wire(&app.peer_summaries[0])).unwrap();
+        assert!(!gui.chars().any(|c| c.is_control() || c == '\u{202e}'));
+    }
+
+    #[test]
+    fn security2117_unsafe_host_cannot_replace_plain_host_through_either_ingress() {
+        for bad in ['\u{202e}', '\u{9d}', '\u{1b}', '\u{200b}'] {
+            let mut plain = wire_peer("node-a.invalid", None);
+            plain.host = Some("node-a.invalid".into());
+            let mut hostile = plain.clone();
+            hostile.host = Some(format!("node-a.invalid{bad}"));
+            hostile.ssh_target = "node-b.invalid".into();
+            hostile.age_secs = Some(0);
+            for json in [false, true] {
+                let mut cache = std::collections::HashMap::new();
+                super::merge_relayed_fleet(&mut cache, vec![plain.clone()], "hub.invalid");
+                let entries = if json {
+                    let response = serde_json::json!({"id":"fixture", "result":{
+                        "host":"hub.invalid", "relayed_fleet":[hostile.clone()]}})
+                    .to_string();
+                    super::parse_summary_response(&response, 0)
+                        .unwrap()
+                        .relayed_fleet
+                } else {
+                    vec![hostile.clone()]
+                };
+                super::merge_relayed_fleet(&mut cache, entries, "hub.invalid");
+                assert_eq!(cache.len(), 1);
+                assert_eq!(
+                    cache["node-a.invalid"].peer.ssh_target, "node-a.invalid",
+                    "unsafe host must not replace the plain identity (JSON: {json})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn security2117_reported_host_refusal_is_consistent_and_content_free() {
+        for raw in [
+            "node-a.invalid\u{202e}".into(),
+            "node-a.invalid\u{9d}".into(),
+            "node-a.invalid\u{200b}".into(),
+            "x".repeat(257),
+        ] {
+            let response = serde_json::json!({"id":"fixture", "result":{"host":raw}}).to_string();
+            let mut row = wire_peer("node-a.invalid", None);
+            row.host = Some(raw.clone());
+            let wire =
+                super::peer_to_wire(&super::PeerSummaryState::new(&crate::config::PeerConfig {
+                    name: "node-a.invalid".into(),
+                    ..Default::default()
+                }));
+            let mut wire = wire;
+            wire.host = Some(raw.clone());
+            let logs = crate::logging::capture_logs(|| {
+                assert_eq!(
+                    super::parse_summary_response(&response, 0).unwrap_err(),
+                    "invalid_params"
+                );
+                assert!(super::relayed_entry_from_wire(row).is_none());
+                let peer = super::peer_from_wire(wire);
+                assert!(peer.host.is_none());
+                assert!(peer.ssh_target.is_empty());
+                assert_eq!(peer.error.as_deref(), Some("invalid_params"));
+            });
+            assert!(logs.contains("peer.summary.identifier_dropped"));
+            assert!(logs.contains("invalid_params"));
+            assert!(!logs.contains(&raw));
+        }
+    }
+
+    #[test]
+    fn security2117_routing_via_is_validated_never_cleaned() {
+        for via in [
+            "hub.invalid\u{202e}".into(),
+            "hub.invalid\u{9d}".into(),
+            "x".repeat(257),
+        ] {
+            let mut cache = std::collections::HashMap::new();
+            let logs = crate::logging::capture_logs(|| {
+                super::merge_relayed_fleet(
+                    &mut cache,
+                    vec![wire_peer("node-a.invalid", None)],
+                    &via,
+                );
+            });
+            assert!(cache.is_empty(), "an invalid route must never be admitted");
+            assert!(logs.contains("peer.summary.identifier_dropped"));
+            assert!(logs.contains("invalid_params"));
+            assert!(!logs.contains(&via));
+        }
+        let mut cache = std::collections::HashMap::new();
+        super::merge_relayed_fleet(
+            &mut cache,
+            vec![wire_peer("node-a.invalid", None)],
+            "Hub.invalid",
+        );
+        assert_eq!(
+            cache.values().next().unwrap().via.as_deref(),
+            Some("Hub.invalid")
+        );
+    }
+
+    #[test]
+    fn security2117_non_peer_deserialization_has_no_peer_admission_side_effects() {
+        let raw = serde_json::json!({"id":"ws\u{202e}", "workspace":"title\u{9d}", "status":"idle",
+            "agents":[{"agent_id":"agent\u{9d}", "pane_id":"pane_fixture", "status":"idle"}]});
+        let mut decoded = None;
+        let logs = crate::logging::capture_logs(|| {
+            decoded = Some(serde_json::from_value::<PeerWorkspaceSummary>(raw.clone()).unwrap());
+        });
+        assert!(!logs.contains("peer.summary.identifier_dropped"), "{logs}");
+        assert_eq!(
+            serde_json::to_value(decoded.unwrap()).unwrap()["id"],
+            raw["id"]
+        );
+        let response = serde_json::json!({"id":"fixture", "result":{
+            "host":"node-a.invalid", "workspaces":[raw]}})
+        .to_string();
+        let logs = crate::logging::capture_logs(|| {
+            let received = super::parse_summary_response(&response, 0).unwrap();
+            assert!(received.workspaces[0].id.is_empty());
+            assert!(received.workspaces[0].agents.is_empty());
+            assert_eq!(received.workspaces[0].workspace, "title");
+        });
+        assert!(logs.contains("peer.summary.identifier_dropped"));
+        assert!(logs.contains("invalid_params"));
+    }
+
+    #[test]
+    fn security2090_project_key_json_receive_protects_sidebar_and_gui() {
+        for bad in ['\u{202e}', '\u{9d}', '\u{1b}'] {
+            let response = serde_json::json!({"id":"fixture","result":{"host":"peer.invalid",
+                "workspaces":[{"workspace":"fixture", "status":"idle",
+                "project_key":format!("dir:report{bad}fdp.exe")}]
+            }})
+            .to_string();
+            assert_safe_project_row(
+                parse_summary_response(&response, 0)
+                    .unwrap()
+                    .workspaces
+                    .remove(0),
+            );
+        }
+    }
+
+    #[test]
+    fn security2090_project_key_binary_receive_protects_sidebar_and_gui() {
+        for bad in ['\u{202e}', '\u{9d}', '\u{1b}'] {
+            let raw: PeerWorkspaceSummary = serde_json::from_value(serde_json::json!({
+                "workspace":"fixture", "status":"idle"}))
+            .unwrap();
+            let mut raw: crate::protocol::FleetWorkspace = raw.into();
+            raw.project_key = Some(format!("dir:report{bad}fdp.exe"));
+            let bytes = bincode::serde::encode_to_vec(&raw, bincode::config::standard()).unwrap();
+            let (decoded, _): (crate::protocol::FleetWorkspace, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            assert_safe_project_row(decoded.into());
+        }
+    }
+
+    #[test]
+    fn security2090_project_key_relay_receive_protects_sidebar_and_gui() {
+        for bad in ['\u{202e}', '\u{9d}', '\u{1b}'] {
+            let mut relay = wire_peer("peer.invalid", None);
+            let mut raw: PeerWorkspaceSummary = serde_json::from_value(serde_json::json!({
+                "workspace":"fixture", "status":"idle"}))
+            .unwrap();
+            raw.project_key = Some(format!("dir:report{bad}fdp.exe"));
+            relay.workspaces.push(raw);
+            assert_safe_project_row(
+                relayed_entry_from_wire(relay)
+                    .unwrap()
+                    .peer
+                    .workspaces
+                    .remove(0),
+            );
+        }
+    }
+
+    #[test]
+    fn security2090_peer_receive_caps_each_presentation_field() {
+        let long = "界".repeat(300);
+        let response = serde_json::json!({"id":"fixture","result":{
+            "host":"peer.invalid","version":long,"icon":long,"workspaces":[{
+                "workspace":long,"status":"idle","project_key":long,
+                "project_label":long,"branch":long,"activity":long
+            }]
+        }})
+        .to_string();
+        let parsed = parse_summary_response(&response, 0).unwrap();
+        for text in [
+            &parsed.host,
+            parsed.version.as_ref().unwrap(),
+            parsed.icon.as_ref().unwrap(),
+        ] {
+            assert!(text.chars().count() <= 256);
+        }
+        let ws = &parsed.workspaces[0];
+        for text in [
+            &ws.workspace,
+            ws.project_key.as_ref().unwrap(),
+            ws.project_label.as_ref().unwrap(),
+            ws.branch.as_ref().unwrap(),
+            ws.activity.as_ref().unwrap(),
+        ] {
+            assert_eq!(text, &"界".repeat(256));
+        }
+    }
+
+    #[test]
+    fn security2090_peer_audit_bounds_fleet_and_relay_fields() {
+        let long = "界".repeat(300);
+        let hostile = format!("ok\u{202e}\u{9d}\u{200b}{long}");
+        let mut entry = wire_peer("peer.invalid", None);
+        entry.name = hostile.clone();
+        entry.host = Some("peer.invalid".into());
+        entry.version = Some(hostile.clone());
+        entry.error = Some(hostile.clone());
+        entry.icon = Some(hostile.clone());
+        let mut workspace: PeerWorkspaceSummary = serde_json::from_value(serde_json::json!({
+            "id":"ws_fixture", "workspace":"fixture", "status":"idle"}))
+        .unwrap();
+        workspace.workspace = hostile.clone();
+        workspace.project_key = Some(hostile.clone());
+        workspace.project_label = Some(hostile.clone());
+        workspace.branch = Some(hostile.clone());
+        workspace.activity = Some(hostile.clone());
+        entry.workspaces.push(workspace);
+        let relay = relayed_entry_from_wire(entry).unwrap().peer;
+        let mut binary = peer_to_wire(&relay);
+        binary.name = hostile.clone();
+        binary.host = Some("peer.invalid".into());
+        binary.version = Some(hostile.clone());
+        binary.error = Some(hostile.clone());
+        binary.icon = Some(hostile.clone());
+        let ws = &mut binary.workspaces[0];
+        ws.workspace = hostile.clone();
+        ws.project_key = Some(hostile.clone());
+        ws.project_label = Some(hostile.clone());
+        ws.branch = Some(hostile.clone());
+        ws.activity = Some(hostile.clone());
+        let binary = peer_from_wire(binary);
+        for peer in [relay, binary] {
+            assert_eq!(peer.host.as_deref(), Some("peer.invalid"));
+            let ws = &peer.workspaces[0];
+            for text in [
+                &peer.peer,
+                peer.version.as_ref().unwrap(),
+                peer.error.as_ref().unwrap(),
+                peer.icon.as_ref().unwrap(),
+                &ws.workspace,
+                ws.project_key.as_ref().unwrap(),
+                ws.project_label.as_ref().unwrap(),
+                ws.branch.as_ref().unwrap(),
+                ws.activity.as_ref().unwrap(),
+            ] {
+                assert_eq!(text.chars().count(), 256);
+                assert!(text.starts_with("ok界"));
+                assert!(!text.contains(['\u{202e}', '\u{9d}', '\u{200b}']));
+            }
+        }
+    }
+
+    #[test]
+    fn security2090_opaque_identifiers_are_preserved_or_discarded() {
+        let raw = serde_json::json!({"id":"ws_fixture", "workspace":"fixture", "status":"idle",
+            "agents":[{"agent_id":"agent_fixture", "pane_id":"pane_fixture", "status":"idle"}]});
+        let good = serde_json::from_value::<PeerWorkspaceSummary>(raw.clone())
+            .unwrap()
+            .received();
+        assert_eq!(good.id, "ws_fixture");
+        assert_eq!(good.agents[0].agent_id, "agent_fixture");
+        for value in [
+            "bad\u{202e}".into(),
+            "bad\u{9d}".into(),
+            "bad\u{1b}".into(),
+            "x".repeat(257),
+        ] {
+            let mut planted = raw.clone();
+            planted["id"] = value.clone().into();
+            planted["agents"][0]["agent_id"] = value.clone().into();
+            planted["agents"][0]["pane_id"] = value.into();
+            let received = serde_json::from_value::<PeerWorkspaceSummary>(planted)
+                .unwrap()
+                .received();
+            assert!(received.id.is_empty());
+            assert!(received.agents.is_empty());
+        }
+        let mut route = peer_to_wire(&PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "peer.invalid".into(),
+            ..Default::default()
+        }));
+        route.ssh_target = "bad\u{9d}".into();
+        let received = peer_from_wire(route);
+        assert!(received.ssh_target.is_empty());
+        assert_eq!(received.error.as_deref(), Some("invalid_params"));
+    }
+
+    #[test]
+    fn security2090_peer_json_and_relay_sanitize_presentation() {
+        for text in ["task\u{202e}tail", "task\u{9d}tail", "task\u{200b}tail"] {
+            let response = serde_json::json!({"id":"text-fixture","result":{
+                "host":"fixture.example","workspaces":[{"workspace":text,"status":"working","activity":text}]
+            }}).to_string();
+            let payload = parse_summary_response(&response, 0).unwrap();
+            assert_eq!(payload.workspaces[0].workspace, "tasktail");
+            assert_eq!(payload.workspaces[0].activity.as_deref(), Some("tasktail"));
+            let mut relay = wire_peer("spoke.invalid", None);
+            let mut ws = payload.workspaces[0].clone();
+            ws.workspace = text.into();
+            ws.activity = Some(text.into());
+            relay.workspaces.push(ws);
+            let accepted = relayed_entry_from_wire(relay).unwrap();
+            let ws = &accepted.peer.workspaces[0];
+            assert_eq!(ws.workspace, "tasktail");
+            assert_eq!(ws.activity.as_deref(), Some("tasktail"));
+            assert!(
+                !serde_json::to_string(ws).unwrap().contains(text),
+                "GUI snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn security_agent_name_typed_relay_rows_drop_bad_labels() {
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut row = wire_peer("spoke.invalid", None);
+            let mut ws: crate::api::schema::PeerWorkspaceSummary = serde_json::from_value(
+                serde_json::json!({"id":"fixture-workspace", "workspace":"fixture", "status":"idle"})
+            ).unwrap();
+            ws.agent = Some(name.clone());
+            ws.agents.push(crate::api::schema::PeerAgentSummary {
+                agent_id: "fixture-agent".into(),
+                pane_id: "fixture-pane".into(),
+                agent: Some(name),
+                status: crate::api::schema::AgentStatus::Idle,
+            });
+            row.workspaces.push(ws);
+            let accepted = relayed_entry_from_wire(row).unwrap();
+            assert!(
+                accepted.peer.workspaces[0].agent.is_none(),
+                "workspace name retained: {case}"
+            );
+            assert!(
+                accepted.peer.workspaces[0].agents[0].agent.is_none(),
+                "agent name retained: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_agent_name_peer_json_drops_only_the_bad_name() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let response = serde_json::json!({"id":"name-peer","result":{"host":"fixture.example","workspaces":[{"id":"workspace-fixture","workspace":"fixture","agent":name,"status":"idle","agents":[{"agent_id":"agent-fixture","pane_id":"pane-fixture","agent":name,"status":"idle"}]}]}}).to_string();
+            let payload = parse_summary_response(&response, 0).unwrap();
+            let ws = &payload.workspaces[0];
+            if ws.agent.is_some() || ws.agents[0].agent.is_some() {
+                failures.push(case);
+            }
+            assert_eq!(ws.agents[0].agent_id, "agent-fixture");
+        }
+        assert!(
+            failures.is_empty(),
+            "retained peer name cases: {failures:?}"
+        );
     }
 
     #[test]
