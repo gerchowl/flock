@@ -37,9 +37,18 @@ pub(crate) struct QueueEvents {
     observations: HashMap<String, (u64, Observation)>,
 }
 impl QueueEvents {
-    fn publish(workers: &Workers, hub: &EventHub, terminal: bool) -> bool {
+    fn publish(
+        workers: &Workers,
+        hub: &EventHub,
+        sends: &mut super::api::structured_queue::Sends,
+        terminal: bool,
+    ) -> bool {
         let mut changed = false;
-        for (_, _, update) in workers.queue_completions(terminal) {
+        for (agent, generation, update) in workers.queue_completions(terminal) {
+            if let Some((id, result)) = update.admitted {
+                sends.complete(agent, generation, id, result);
+                changed = true;
+            }
             for fact in update.facts {
                 hub.push(EventEnvelope {
                     event: EventKind::QueueItemState,
@@ -53,7 +62,13 @@ impl QueueEvents {
     /// Drain at most four completions and 64 provider pages per agent per wake.
     /// No recovery, retry, extra journal writer or filesystem read is started.
     /// Global appends use the existing EventHub durability/retention policy.
-    pub(crate) fn poll(&mut self, workers: &Workers, registry: &Registry, hub: &EventHub) -> bool {
+    pub(crate) fn poll(
+        &mut self,
+        workers: &Workers,
+        registry: &Registry,
+        hub: &EventHub,
+        sends: &mut super::api::structured_queue::Sends,
+    ) -> bool {
         let before = self.observations.clone();
         let observations = &mut self.observations;
         self.readers.retain(|id, (generation, _)| {
@@ -68,7 +83,8 @@ impl QueueEvents {
                 .get(id)
                 .is_some_and(|(_, _, current)| current == *generation)
         });
-        let changed = Self::publish(workers, hub, false);
+        let changed = Self::publish(workers, hub, sends, false);
+        sends.poll(workers, registry);
         for record in registry.records() {
             let id = &record.agent_id;
             let Some((_, _, generation)) = registry.get(id) else {
@@ -140,7 +156,14 @@ impl super::App {
             .structured_workers
             .shutdown(&mut self.state.structured_agents);
         // Fixed capacity plus one peek and one terminal tail; no producer retry.
-        QueueEvents::publish(&self.structured_workers, &self.event_hub, true);
+        QueueEvents::publish(
+            &self.structured_workers,
+            &self.event_hub,
+            &mut self.structured_sends,
+            true,
+        );
+        self.structured_sends
+            .poll(&self.structured_workers, &self.state.structured_agents);
         result
     }
 }

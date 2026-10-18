@@ -401,7 +401,12 @@ async fn explicit_stop_closes_open_request_and_releases_only_after_completion() 
     registry.remove(&a.id, a.generation).unwrap();
     workers.poll(&mut registry, now, 1000);
     let hub = crate::api::EventHub::default();
-    crate::app::queue_events::QueueEvents::default().poll(&workers, &registry, &hub);
+    crate::app::queue_events::QueueEvents::default().poll(
+        &workers,
+        &registry,
+        &hub,
+        &mut Default::default(),
+    );
     assert!(
         hub.events_after(0)
             .iter()
@@ -873,3 +878,5 @@ mod queue;
 mod recovery;
 
 mod global;
+
+mod send;

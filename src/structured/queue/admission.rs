@@ -415,6 +415,10 @@ fn nonce(
         }
     }
 }
+/// Allocate a lifecycle UUID using the same entropy and format as queue batches.
+pub(crate) fn item_uuid() -> Result<String, Failure> {
+    batch_uuid(&mut getrandom::fill)
+}
 fn batch_uuid(fill: Entropy<'_>) -> Result<String, Failure> {
     let mut h = nonce("", fill)?.into_bytes();
     h[12] = b'4';
@@ -440,7 +444,8 @@ fn serialization(error: serde_json::Error) -> Failure {
         source: Some(error.into()),
     }
 }
-fn canonical_uuid(id: &str) -> bool {
+/// Canonical lower-case UUID spelling used by admission identities.
+pub(crate) fn canonical_uuid(id: &str) -> bool {
     valid_id(id) && !id.bytes().any(|b| b.is_ascii_uppercase())
 }
 

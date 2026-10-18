@@ -147,9 +147,8 @@ impl Workers {
     /// and checked on both sides of the factory. Live/unconfirmed workers and
     /// unread terminal queue completions refuse replacement with session_busy.
     /// Failure may advance the observation epoch but never the record.
-    /// Until #1957/#1958 provide a production `Workers::queue_update` consumer,
-    /// relaunch with a queue returns session_busy even after process exit.
-    /// Tests and internal adapters must drain terminal completions first.
+    /// The application drains terminal completions for lifecycle facts and send
+    /// acknowledgements. Internal adapters must likewise drain before relaunch.
     pub fn start(
         &mut self,
         registry: &mut Registry,

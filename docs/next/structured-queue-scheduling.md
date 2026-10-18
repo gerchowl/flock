@@ -85,12 +85,11 @@ available after process exit. Relaunch refuses with `session_busy` while any
 completion remains unread. An unchanged storage refusal does not generate another
 completion per harness event.
 
-Until #1957/#1958 supply a production `Workers::queue_update` consumer, relaunch
-with a queue returns `session_busy` even after the process exits. Tests and
-internal adapters explicitly drain those terminal completions first. Shutdown
-cancellation explicitly reports incomplete notification delivery and requires durable replay. Final persisted records drain
-before reservation retirement. Producer routing is #1957/#1958 and queue/global
-publication is #1956, without new queue deadlines or public endpoints here.
+The application drains completions for lifecycle publication and durable send
+acknowledgements before relaunch. Shutdown cancellation explicitly reports
+incomplete notification delivery and requires durable replay. Final persisted
+records drain before reservation retirement. Operator admission uses the shared
+send service (#1957); authenticated message custody routing remains #1958.
 
 The worker machinery in #1955 is not production enforcement by itself. The
 production launch path is #1843; #1928 remains open until that path exists.

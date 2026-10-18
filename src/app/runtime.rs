@@ -57,7 +57,8 @@ impl App {
         changed
     }
 
-    pub(super) fn handle_api_request_message(
+    /// Dispatch one socket request with its captured credentials and response owner.
+    pub(crate) fn handle_api_request_message(
         &mut self,
         msg: crate::api::ApiRequestMessage,
     ) -> bool {
@@ -222,6 +223,7 @@ impl App {
             &self.structured_workers,
             &self.state.structured_agents,
             &self.event_hub,
+            &mut self.structured_sends,
         ) || changed
     }
 
