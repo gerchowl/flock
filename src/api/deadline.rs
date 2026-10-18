@@ -16,6 +16,23 @@ pub(crate) const OPERATION_MARGIN: Duration = Duration::from_secs(5);
 /// Finite cap for a wait or event stream whose caller supplied no timeout.
 pub(crate) const MAX_WAIT: Duration = Duration::from_millis(MSG_WAIT_REPLY_MAX_MS);
 
+/// Total client patience for creation and cleanup, including transport work.
+/// This does not bound or cancel server work. After dispatch, expiry reports
+/// outcome unknown (exit 14). Server cancellation is tracked in #2209.
+pub(crate) const CLIENT_WORK_ALLOWANCE: Duration = Duration::from_secs(60);
+
+/// The shared creation/cleanup allowance table for ordinary CLI and delegate.
+pub(crate) fn client_work_allowance(method: &Method) -> Option<Duration> {
+    match method {
+        Method::WorktreeCreate(_)
+        | Method::WorktreeKill(_)
+        | Method::WorkspaceCreate(_)
+        | Method::WorkspaceClose(_)
+        | Method::AgentStart(_) => Some(CLIENT_WORK_ALLOWANCE),
+        _ => None,
+    }
+}
+
 /// Reject durations that the monotonic clock cannot represent.
 pub(crate) fn end_after(started: Instant, timeout: Duration) -> io::Result<Instant> {
     started
@@ -32,6 +49,9 @@ pub(crate) fn request_timeout(request: &Request, ordinary: Duration) -> Duration
 /// Shared client cap table, including the server's write and confirmation budgets.
 /// Explicit caller deadlines may still shorten this transport allowance.
 pub(crate) fn operation_timeout(method: &Method, ordinary: Duration) -> Duration {
+    if let Some(allowance) = client_work_allowance(method) {
+        return ordinary.max(allowance);
+    }
     let wait = match method {
         Method::MsgWaitReply(p) => Some(Duration::from_millis(
             p.timeout_ms

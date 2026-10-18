@@ -76,6 +76,15 @@ async fn creation_work_outlasts_the_ordinary_request_cap() {
 }
 
 #[tokio::test]
+async fn agent_start_outlasts_the_ordinary_request_cap() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "id": "agent-budget", "method": "agent.start", "params": {"name": "budget-fixture"}
+    }))
+    .unwrap();
+    delayed_operation(request.method).await;
+}
+
+#[tokio::test]
 async fn default_guarded_write_reserves_write_and_confirmation() {
     let method = Method::PaneSendInput(crate::api::schema::PaneSendInputParams {
         pane_id: "w1:p1".into(),

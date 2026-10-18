@@ -21,6 +21,12 @@ Blocking output/reply/event waits and long polls use at least their requested
 operation timeout plus a fixed 5-second transport margin, rather than the
 ordinary cap. An omitted output/reply/event wait timeout has a finite 24-hour
 transport cap plus that margin. Explicit caller deadlines can be shorter.
+Worktree create/kill, workspace create/close and agent start have a shared
+60-second total client allowance, also used by delegate. This is client patience,
+not a server execution limit: server work can continue after a dispatched
+request expires with `request_outcome_unknown` (exit 14). Server cancellation
+and partial-state cleanup are tracked in
+[#2209](https://github.com/gerchowl/flock/issues/2209).
 Input writes reserve the declared raw-write budget, or the server's 10-second
 raw-write default when omitted, plus the server's 2-second confirmation window
 and the 5-second transport margin. Live handoff reserves the server's shutdown,

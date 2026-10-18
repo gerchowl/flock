@@ -160,6 +160,19 @@ their meaning where they do not collide; collisions are resolved once:
 - MCP returns the same retry class in `data.retry` and the exit code in
   `data.exit`, beside the existing `data.refusal`.
 
+#### Client operation allowances (#921, #2189)
+
+Creation and cleanup requests (`worktree.create`, `worktree.kill`,
+`workspace.create`, `workspace.close`, `agent.start`) share the named
+`CLIENT_WORK_ALLOWANCE` through `client_work_allowance` in both delegate and
+the CLI operation table. Its 60 seconds include transport overhead and describe
+client patience, not a server execution or cancellation guarantee. Explicit
+caller deadlines may be shorter. After dispatch, expiry is outcome unknown,
+exit 14, and must not trigger an automatic retry. Server-side bounds require
+cancellation and partial-state cleanup semantics, tracked separately in #2209.
+Input writes instead reserve their server write budget, confirmation window
+and transport margin. Live handoff reserves its synchronous phase bounds.
+
 ### 3. Output: the result on stdout, selectable; diagnostics on stderr
 
 - **`--format json|text`** is global. Each verb keeps its current default (most
@@ -630,4 +643,3 @@ accepted as recommended. The rejected alternative is kept for the record.
 4. **Refuse multi-row text without bracketed paste** (`unsafe_text`) instead
    of typing it line by line. Decided: yes; line-by-line typing submits the
    first line early in every harness.
-

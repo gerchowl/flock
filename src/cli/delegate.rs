@@ -248,26 +248,12 @@ impl fmt::Display for BoundedError {
         }
     }
 }
-/// The one cap table: how long THIS module waits for each method on a quiet
-/// socket. The actual socket timeout is `cap.min(remaining deadline)` — a
-/// caller with a shorter deadline wins (K5). A cap handed in by hand would be
-/// a second table drifting from this one; `bounded` reads it, nothing else.
-///
-/// - 60 s: creates / kills / closes / `AgentStart` — a write that may block
-///   on filesystem work the operator sees.
-/// - 10 s: `PaneSendInput` — the brief submit is a human-latency write and
-///   must not stall the whole command if the socket goes quiet mid-type.
-/// - 2 s: every poll, get, and list.
+/// Use the shared CLI operation table with delegate's ordinary poll cap.
+/// Creation/cleanup uses the named client allowance, writes reserve their
+/// server write/confirmation budgets, and ordinary polls retain their short cap.
+/// The caller's remaining deadline may shorten any allowance (K5).
 fn cap_for(method: &Method) -> Duration {
-    match method {
-        Method::WorktreeCreate(_)
-        | Method::WorktreeKill(_)
-        | Method::WorkspaceCreate(_)
-        | Method::WorkspaceClose(_)
-        | Method::AgentStart(_) => Duration::from_secs(60),
-        Method::PaneSendInput(_) | Method::PaneSubmit(_) => Duration::from_secs(10),
-        _ => REQUEST_TIMEOUT,
-    }
+    crate::api::deadline::operation_timeout(method, REQUEST_TIMEOUT)
 }
 
 /// Make a socket request bounded by its cap and the caller's deadline.
