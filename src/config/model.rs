@@ -653,8 +653,6 @@ pub enum AgentAccount {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
-    /// Structured persistence policy (ADR-0036 §4).
-    pub sessions: crate::structured::blobs::StorageConfig,
     /// Local socket identity policy (ADR-0036 §1a).
     pub security: SecurityConfig,
     /// Structured Claude launch policy (ADR-0036 §1); activation is #1439.

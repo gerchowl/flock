@@ -35,7 +35,6 @@ pub(super) mod responses;
 mod revert;
 mod spawn;
 mod structured_agents;
-mod structured_start;
 mod tabs;
 pub(crate) mod workspaces;
 mod worktrees;

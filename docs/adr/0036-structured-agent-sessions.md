@@ -271,14 +271,7 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   requests by `request_id`, and the agent stays `waiting_on_human` until
   every one of them is answered. Working is `system/status: requesting` or
   an open `message_start`. A stall is an accepted or started input with no stdout event for
-  `[sessions] stall_ms` while no control request and no tool call is open.
-  This optional setting defaults to **120000 ms** (2 minutes), with an inclusive
-  range of **5000..=3600000 ms**. Out-of-range values, including zero, are config
-  validation errors; there is no disabled value or silent clamping. A stall is
-  an observation that leaves the phase unchanged, so false positives are cheap.
-  Provider retries and rate-limit backoff can produce tens of seconds of silence;
-  two minutes avoids reporting those as stalls while exposing a hung harness.
-  The production worker caller passes the loaded value, without another default;
+  `[sessions] stall_ms` while no control request and no tool call is open;
   a long-running tool is not a stall (its `tool_use` is open). A stall is
   reported as `agent.session_stalled{since}` and leaves the phase as it is
   (ADR-0028 §1 derivation is unchanged); it is an observation, not a timeout
@@ -2931,3 +2924,18 @@ Operator cleanup is explicit: inspect the retained directory and associated
 processes, establish that none still uses it, then remove the directory by hand.
 No automatic PID-only reaping and no cleanup CLI is introduced in this slice;
 operator tooling is a follow-up owned by the architect.
+
+### Amendment: Atomic structured admission (#1843 part 2a)
+
+The Workers owner is the single admission authority for structured launches.
+It checks limits and reserves a pending slot keyed by agent id in one owner
+operation before starting a producer. Counts combine live leases with pending
+slots, deduplicated by agent id. Agent-started launches count toward capacity
+and parent fanout; the attested operator exemption is unchanged. Lease-table
+contention refuses with `spawn_caller_unknown` without waiting on the App thread.
+
+A pending slot ends on lease acquisition or launch failure, never on elapsed
+time alone. Pending metadata grants neither caller identity nor signaling
+rights. Preparation remains off-thread and bounded by its owner. Part 2b adds
+the production CLI/socket caller and its loaded session policy; public client
+and server start remain gated until part 3 completes narrowed MCP admission.

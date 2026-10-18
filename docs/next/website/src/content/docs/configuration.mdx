@@ -1100,24 +1100,3 @@ survey, trust, login, or update settings.
 The goal supervisor tracked in #573 is not implemented in this checkout, so this
 restart lifecycle does not yet re-arm or re-inject a Flock goal. Stable agent
 identity and spawning-supervisor routing are retained for that integration.
-
-
-### Structured session observations
-
-```toml
-[sessions]
-stall_ms = 120000
-```
-
-`stall_ms` is optional and defaults to 120000 milliseconds (2 minutes). Valid
-values are 5000 through 3600000 milliseconds, inclusive. Other values, including
-zero, produce a config validation error through the sessions table loader;
-invalid reloads retain the previous table settings and report the failure.
-There is no disabled value, and values are never clamped.
-
-A stall reports accepted or started input with no stdout progress and no open
-control request or tool call. It leaves the phase unchanged and never kills or
-retries a process. Provider retries and rate-limit backoff can cause tens of
-seconds of silence, so the default avoids reporting those as stalls. A
-long-running tool is never a stall while its tool call is open. Public
-structured start remains gated until the final #1843 routing slice.

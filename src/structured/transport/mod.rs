@@ -73,8 +73,6 @@ struct ControlPlane {
 pub struct StreamLocation {
     /// Existing flock data root (not the harness profile).
     pub data_dir: PathBuf,
-    /// Caller-supplied persistence policy captured for this session.
-    pub storage: super::blobs::StorageConfig,
     /// Agent identifier, containing only ASCII letters, digits, '-' or '_'.
     pub agent: String,
     /// Session identifier with the same restrictions; `queue` is reserved (any case).
@@ -110,12 +108,10 @@ pub struct StreamRecord {
     pub raw: String,
 }
 
-/// A live event paired with its envelope and explicit persistence status.
+/// A persisted record paired with S1's infallible adapter interpretation.
 #[derive(Debug)]
 pub struct Received {
-    /// False for live-only partial deltas; their seq must not advance a cursor.
-    pub persisted: bool,
-    /// Durable envelope, or a live-only delta with the preceding durable seq.
+    /// Durable envelope; written before this notification is offered.
     pub record: StreamRecord,
     /// Interpretation using the observed harness version.
     pub event: SessionEvent,
@@ -741,19 +737,9 @@ fn pump(
     cancel: &AtomicBool,
     controls: &ControlPlane,
 ) -> io::Result<()> {
-    let blobs = super::blobs::BlobStore::open(&location.data_dir).map_err(io::Error::other)?;
-    let threshold = location.storage.blob_min_bytes;
     let (mut file, mut seq) = open_stream(location, cancel)?;
     let mut recorder = control::Recorder::new(
-        &mut file,
-        &mut seq,
-        version,
-        &tx,
-        busy,
-        uncertain,
-        cancel,
-        controls,
-        (&blobs, threshold),
+        &mut file, &mut seq, version, &tx, busy, uncertain, cancel, controls,
     );
     let result = (|| {
         let mut line = Vec::new();
@@ -846,10 +832,9 @@ fn emit(
     uncertain: &AtomicBool,
     cancel: &AtomicBool,
     synthetic: bool,
-    storage: (&super::blobs::BlobStore, usize),
 ) -> io::Result<()> {
     let received = persist(
-        file, seq, line, count, version, busy, uncertain, synthetic, None, storage,
+        file, seq, line, count, version, busy, uncertain, synthetic, None,
     )?;
     publish(received, tx, cancel)
 }
@@ -864,7 +849,6 @@ fn persist(
     uncertain: &AtomicBool,
     synthetic: bool,
     grant_request_id: Option<&str>,
-    storage: (&super::blobs::BlobStore, usize),
 ) -> io::Result<Received> {
     let origin = if synthetic || count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err()
     {
@@ -903,21 +887,10 @@ fn persist(
         }
         _ => (false, None),
     };
-    let stored_raw = if kind.as_deref() == Some("stream_event") {
-        None
-    } else {
-        storage
-            .0
-            .project(&raw, storage.1)
-            .map_err(io::Error::other)?
-    };
-    let persisted = stored_raw.is_some();
-    if persisted {
-        *seq = seq
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("session sequence exhausted"))?;
-    }
-    let mut record = StreamRecord {
+    *seq = seq
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("session sequence exhausted"))?;
+    let record = StreamRecord {
         seq: *seq,
         received_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -928,14 +901,10 @@ fn persist(
         permission_grant_request_id: grant_request_id.map(str::to_owned),
         raw,
     };
-    if let Some(raw) = stored_raw {
-        let live_raw = std::mem::replace(&mut record.raw, raw);
-        let mut encoded = serde_json::to_vec(&record)?;
-        encoded.push(b'\n');
-        file.write_all(&encoded)?;
-        file.sync_data()?;
-        record.raw = live_raw;
-    }
+    let mut encoded = serde_json::to_vec(&record)?;
+    encoded.push(b'\n');
+    file.write_all(&encoded)?;
+    file.sync_data()?;
     if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {
         uncertain.store(false, Ordering::Release);
         busy.store(false, Ordering::Release);
@@ -947,7 +916,6 @@ fn persist(
         uncertain.store(true, Ordering::Release);
     }
     Ok(Received {
-        persisted,
         record,
         event,
         accepted: None,

@@ -249,6 +249,5 @@ mod tests {
     }
 }
 
-pub(crate) mod blobs;
 pub(crate) mod client_token_lock;
 pub(crate) mod client_tokens;

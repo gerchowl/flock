@@ -275,7 +275,7 @@ struct McpConfig {
 
 /// Pinned MCP executable and explicit socket of the server owning the lease.
 /// Never resolved through the model's PATH or inherited FLOCK_* variables.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SessionMcp {
     binary: PathBuf,
     socket: PathBuf,

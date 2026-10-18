@@ -52,11 +52,6 @@ impl Drop for ServerHandle {
 }
 
 impl ServerHandle {
-    /// Pin MCP to this listener, independent of inherited client variables.
-    pub(crate) fn session_mcp(&self) -> std::io::Result<crate::structured::launch::SessionMcp> {
-        crate::structured::launch::SessionMcp::new(&std::env::current_exe()?, &self.path)
-    }
-
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
         remove_socket_file_if_owned(&self.path, self.identity)
     }

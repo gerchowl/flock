@@ -128,8 +128,6 @@ impl SpawnCaller {
 pub(super) struct SpawnLineage {
     pub parent_agent_id: String,
     pub child_depth: u32,
-    /// PTY-only facts; the owner adds lease and pending identities atomically.
-    pub pty_census: SpawnCensus,
 }
 
 impl App {
@@ -476,7 +474,6 @@ impl App {
             }
             SpawnCaller::Operator { .. } => return Ok(None),
         };
-        let pty_census = census;
         let (leased, children) = self
             .structured_workers
             .counts(&self.session_leases, agent_id)
@@ -497,10 +494,6 @@ impl App {
         Ok(Some(SpawnLineage {
             parent_agent_id: agent_id.clone(),
             child_depth: census.child_depth,
-            pty_census: SpawnCensus {
-                child_depth: census.child_depth,
-                ..pty_census
-            },
         }))
     }
 
