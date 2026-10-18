@@ -376,7 +376,8 @@ impl App {
                     depth,
                 };
             }
-            crate::structured::lease::Caller::Uncertain => {
+            crate::structured::lease::Caller::Uncertain
+            | crate::structured::lease::Caller::Busy => {
                 return SpawnCaller::Structured {
                     agent_id: None,
                     depth: 0,

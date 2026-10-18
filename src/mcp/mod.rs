@@ -30,6 +30,7 @@ use serde_json::Value;
 
 mod bridge;
 pub(crate) mod channel;
+mod client;
 mod framing;
 mod resources;
 mod tools;
@@ -40,7 +41,10 @@ use framing::{error_response, parse_message, success_response};
 
 /// Run the MCP stdio server on this process's stdin/stdout. Returns when
 /// stdin reaches EOF or an IO error interrupts the loop.
-pub(crate) fn serve_over_stdio() -> std::io::Result<i32> {
+pub(crate) fn serve_over_stdio(structured: bool) -> std::io::Result<i32> {
+    // Keep this first: it scrubs the credential's original environment storage
+    // while main's synchronous CLI path still has no other threads.
+    let client = client::capture(structured)?;
     let stdin = std::io::stdin();
     let reader = BufReader::new(stdin.lock());
     // Shared, not locked for the process lifetime: with channel push on, a
@@ -52,9 +56,15 @@ pub(crate) fn serve_over_stdio() -> std::io::Result<i32> {
     }
     let feed_out = out.clone();
     let feed_opts = channel.clone();
-    serve_loop(reader, &out, &LocalApi, &channel, move || {
-        channel::spawn_push_feed(feed_out, feed_opts);
-    })
+    serve_loop(
+        reader,
+        &out,
+        &LocalApi(client.clone()),
+        &channel,
+        move || {
+            channel::spawn_push_feed(feed_out, feed_opts, client);
+        },
+    )
 }
 
 /// The serve loop, parameterised over its IO and the flock transport so

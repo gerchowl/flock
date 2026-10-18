@@ -6,6 +6,8 @@ import signal
 import select
 import socket
 import stat
+import subprocess
+import time
 import sys
 
 root = pathlib.Path(__file__).parent
@@ -48,7 +50,16 @@ assert "fixture-token-not-a-credential" not in json.dumps(sys.argv), "token in a
 settings = pathlib.Path(sys.argv[sys.argv.index("--settings") + 1])
 mcp = pathlib.Path(sys.argv[sys.argv.index("--mcp-config") + 1])
 assert json.loads(settings.read_text()) == {"permissions": {"defaultMode": "default", "allow": [], "deny": []}}
-assert json.loads(mcp.read_text()) == {"mcpServers": {}}
+registration = json.loads(mcp.read_text())
+assert set(registration["mcpServers"]) == {"flock"}, "missing session flock MCP"
+server = registration["mcpServers"]["flock"]
+assert server["type"] == "stdio" and server["args"] == ["mcp", "serve", "--structured"]
+assert pathlib.Path(server["command"]).is_absolute(), "unpinned MCP executable"
+assert set(server["env"]) == {"FLOCK_SOCKET_PATH", "FLOCK_MCP_LEASE_CREDENTIAL"}, "MCP env shape"
+assert "FLOCK_MCP_LEASE_CREDENTIAL" not in os.environ, "credential in Claude launch env"
+assert len(server["env"]["FLOCK_MCP_LEASE_CREDENTIAL"]) == 44, "lease credential shape"
+assert "fixture-token-not-a-credential" not in mcp.read_text(), "token in MCP JSON"
+(root / "observed-mcp.json").write_text(json.dumps(registration))
 assert stat.S_IMODE(settings.stat().st_mode) == 0o600
 assert stat.S_IMODE(mcp.stat().st_mode) == 0o600
 assert "--no-session-persistence" not in sys.argv
@@ -137,6 +148,47 @@ if mode.startswith("init-socket"):
     else:
         init["messaging_socket_path"] = 42 if mode.endswith("wrong-type") else None
 emit(init)
+if mode == "mcp-lease-calls":
+    # Execute precisely the registration received via --mcp-config.
+    env = dict(os.environ)
+    env.update(server["env"])
+    responses = []
+    with (root / "mcp.stderr").open("wb") as errors:
+        tool = subprocess.Popen([server["command"], *server["args"]], env=env,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+        (root / "tool.pid").write_text(str(tool.pid))
+        pending = b""
+        try:
+            for request in json.loads((root / "mcp-requests.json").read_text()):
+                tool.stdin.write((json.dumps(request) + "\n").encode())
+                tool.stdin.flush()
+                deadline = time.monotonic() + 10
+                while b"\n" not in pending:
+                    remaining = deadline - time.monotonic()
+                    assert remaining > 0 and tool.poll() is None, "MCP producer failed or silent"
+                    readable, _, _ = select.select([tool.stdout], [], [], remaining)
+                    assert readable, "MCP response ceiling"
+                    chunk = os.read(tool.stdout.fileno(), 65536)
+                    assert chunk, "MCP producer closed without response"
+                    pending += chunk
+                    assert len(pending) <= 1048576, "MCP response cap"
+                line, pending = pending.split(b"\n", 1)
+                response = json.loads(line)
+                assert response["id"] == request["id"], "unexpected MCP stage"
+                responses.append(response)
+            (root / "tool-responses.json").write_text(json.dumps(responses))
+        finally:
+            tool.stdin.close()
+            try:
+                assert tool.wait(timeout=10) == 0, "MCP failed"
+            except subprocess.TimeoutExpired:
+                tool.kill()
+                tool.wait(timeout=10)
+                raise AssertionError("MCP did not exit on EOF")
+            tool.stdout.close()
+    emit(find("result", "success"))
+    sys.stdin.read()
+    sys.exit(0)
 if mode in ("state-reducer", "worker-exit", "worker-exit-ok", "worker-stubborn"):
     if mode == "worker-stubborn":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -152,6 +204,7 @@ if mode in ("state-reducer", "worker-exit", "worker-exit-ok", "worker-stubborn")
         parent_gone()
     if mode.startswith("worker-exit"):
         sys.exit(0 if mode == "worker-exit-ok" else 7)
+
     sys.stdin.read()
     sys.exit(0)
 if mode == "lease-calls":
