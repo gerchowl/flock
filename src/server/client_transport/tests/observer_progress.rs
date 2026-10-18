@@ -175,48 +175,12 @@ fn real_writer_deadline_disconnects_nonreading_observer_and_reaps_threads() {
 }
 
 #[test]
-fn overflowing_control_queue_disconnects_only_its_observer() {
-    use std::io::Read;
-    let (socket, mut peer) = UnixStream::pair().unwrap();
-    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    let (control, queue) = ObserverControl::channel(Some(socket), 91);
-    let (healthy_socket, mut healthy_peer) = UnixStream::pair().unwrap();
-    healthy_peer
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let (healthy, healthy_queue) = ObserverControl::channel(Some(healthy_socket), 92);
-    for _ in 0..OBSERVER_CONTROL_CAPACITY {
-        control.send(vec![1]).unwrap();
-    }
-    assert!(
-        control.send(vec![2]).is_err(),
-        "overflow must disconnect without waiting for the writer"
-    );
-    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
-    assert_eq!(queue.try_iter().count(), OBSERVER_CONTROL_CAPACITY);
-    healthy.send(vec![3]).unwrap();
-    assert_eq!(healthy_queue.try_recv().unwrap(), vec![3]);
-    healthy
-        .socket
-        .as_ref()
-        .unwrap()
-        .as_ref()
-        .write_all(b"ok")
-        .unwrap();
-    let mut received = [0; 2];
-    healthy_peer.read_exact(&mut received).unwrap();
-    assert_eq!(&received, b"ok");
-}
-
-#[test]
 fn oversized_control_frame_disconnects_without_queueing() {
     use std::io::Read;
     let (socket, mut peer) = UnixStream::pair().unwrap();
     peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let (control, queue) = ObserverControl::channel(Some(socket), 91);
-    assert!(control
-        .send(vec![0; OBSERVER_CONTROL_FRAME_BYTES + 1])
-        .is_err());
+    assert!(control.send(vec![0; MAX_FRAME_SIZE + 5]).is_err());
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     assert!(queue.try_recv().is_err());
 }

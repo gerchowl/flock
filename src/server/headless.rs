@@ -2305,7 +2305,11 @@ impl HeadlessServer {
         let mut broken_clients: Vec<u64> = Vec::new();
         for (&client_id, client) in &mut self.clients {
             if let Some(writer) = &client.writer {
-                if writer.control.send(serialized.clone()).is_err() {
+                if writer
+                    .control
+                    .send_message(&msg, serialized.clone())
+                    .is_err()
+                {
                     debug!(client_id, "client writer channel closed during broadcast");
                     broken_clients.push(client_id);
                 }
@@ -2343,7 +2347,7 @@ impl HeadlessServer {
 
         if let Some(client) = self.clients.get(&client_id) {
             if let Some(writer) = &client.writer {
-                if writer.control.send(serialized).is_err() {
+                if writer.control.send_message(&msg, serialized).is_err() {
                     debug!(
                         client_id,
                         "client writer channel closed during targeted send"
@@ -3211,7 +3215,11 @@ impl HeadlessServer {
             let Some(writer) = &client.writer else {
                 continue;
             };
-            if writer.control.send(serialized.clone()).is_err() {
+            if writer
+                .control
+                .send_message(&ServerMessage::MouseCapture { enabled }, serialized.clone())
+                .is_err()
+            {
                 debug!(
                     client_id,
                     "client writer channel closed during mouse capture update"
@@ -5318,7 +5326,7 @@ mod tests {
 
     fn test_client_writer() -> (
         ClientWriter,
-        std::sync::mpsc::Receiver<Vec<u8>>,
+        crate::server::client_transport::ControlReceiver,
         std::sync::mpsc::Receiver<Vec<u8>>,
     ) {
         let (control_tx, control_rx) =
@@ -9047,7 +9055,7 @@ next_tab = ""
     /// client whose control channel the test can read.
     fn window_title_test_server() -> (
         HeadlessServer,
-        std::sync::mpsc::Receiver<Vec<u8>>,
+        crate::server::client_transport::ControlReceiver,
         std::sync::mpsc::Receiver<Vec<u8>>,
     ) {
         let mut server = test_headless_server();
@@ -9092,7 +9100,9 @@ next_tab = ""
             .set_detected_state(Some(crate::detect::Agent::Codex), state);
     }
 
-    fn published_titles(control_rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<String> {
+    fn published_titles(
+        control_rx: &crate::server::client_transport::ControlReceiver,
+    ) -> Vec<String> {
         let mut titles = Vec::new();
         while let Ok(bytes) = control_rx.try_recv() {
             if let ServerMessage::SetWindowTitle { title } = read_server_message(bytes) {
