@@ -37,6 +37,8 @@ use serde::{Deserialize, Serialize};
 /// Every one of these is a low-cardinality enum-ish value or a bare program
 /// name — never a path, host, branch, or user-authored string. Adding to this
 /// list is a privacy decision, not a formatting one.
+// Legacy input fields reused `code` and `bytes`, so even those generic names
+// cannot be exported safely from old logs (#1698, ADR-0039 §1).
 const ALLOWED_FIELDS: &[&str] = &[
     "event",
     "subsystem",
@@ -44,13 +46,11 @@ const ALLOWED_FIELDS: &[&str] = &[
     "status",
     "duration_ms",
     "elapsed_ms",
-    "code",
     "protocol",
     "pid",
     "attempt",
     "count",
     "lines",
-    "bytes",
     "kind",
     "state",
     "reason",
@@ -520,6 +520,39 @@ mod tests {
 
     fn rendered(line: &str) -> String {
         extract_one(line).render()
+    }
+
+    #[test]
+    fn reports_never_allow_input_fields() {
+        let mut record =
+            serde_json::json!({"timestamp":"t", "level":"DEBUG", "event":"raw_input.parsed"});
+        for field in [
+            "input_len",
+            "input_class",
+            "key_class",
+            "named_key",
+            "function_key",
+            "modifiers",
+            "input_metadata",
+            "raw_bytes",
+            "parsed",
+            "key",
+            "code",
+            "bytes",
+            "sequence",
+            "encoded",
+        ] {
+            record[field] = serde_json::json!("PaneSecret1698🦩");
+            assert!(
+                !ALLOWED_FIELDS.contains(&field),
+                "input field allowed: {field}"
+            );
+            assert!(
+                !SCRUBBED_FIELDS.contains(&field),
+                "input field scrubbed: {field}"
+            );
+        }
+        assert!(!rendered(&record.to_string()).contains("PaneSecret1698🦩"));
     }
 
     #[test]
