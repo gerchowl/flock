@@ -597,7 +597,7 @@ impl App {
                     let reply = status.reply.or_else(|| {
                         crate::api::best_answer(
                             self.event_hub
-                                .events_after(0)
+                                .ring_snapshot_after(0)
                                 .iter()
                                 .map(|(_, event)| event),
                             &params.correlation_id,
@@ -637,7 +637,7 @@ impl App {
             }
         }
         let mut found: Option<ResponseResult> = None;
-        for (_, event) in self.event_hub.events_after(0) {
+        for (_, event) in self.event_hub.ring_snapshot_after(0) {
             match &event.data {
                 EventData::MessageQueued { correlation_id, .. }
                     if *correlation_id == params.correlation_id =>
@@ -735,7 +735,7 @@ impl App {
         // can be the only trace of the exchange on this server.
         let answer = crate::api::best_answer(
             self.event_hub
-                .events_after(0)
+                .ring_snapshot_after(0)
                 .iter()
                 .map(|(_, event)| event),
             &params.correlation_id,
@@ -1834,7 +1834,7 @@ mod tests {
             assert_eq!(value["result"]["messages"].as_array().unwrap().len(), 0);
         }
         app.expire_undeliverable_messages();
-        let events = app.event_hub.events_after(0);
+        let events = app.event_hub.ring_snapshot_after(0);
         assert_eq!(
             events
                 .iter()
@@ -1912,7 +1912,7 @@ mod tests {
         assert_eq!(correlation_id, "c-1");
         assert_eq!(state, "queued");
         let queued_events = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter(|(_, envelope)| matches!(envelope.data, EventData::MessageQueued { .. }))
             .count();
@@ -1926,7 +1926,7 @@ mod tests {
         };
         assert_eq!(state, "duplicate");
         let queued_events = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter(|(_, envelope)| matches!(envelope.data, EventData::MessageQueued { .. }))
             .count();
@@ -2791,7 +2791,7 @@ mod tests {
         assert_eq!(value["result"]["state"], "queued", "{value}");
         assert!(value["result"]["message_key"].is_object());
         let relayed = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .filter(|(_, event)| matches!(event.data, EventData::MessageRelayed { .. }))
             .count();
@@ -2974,7 +2974,7 @@ mod tests {
         basic_send(&mut app, "c-read", "body");
 
         let delivered = |hub: &crate::api::EventHub| {
-            hub.events_after(0)
+            hub.ring_snapshot_after(0)
                 .iter()
                 .filter(|(_, event)| {
                     matches!(
@@ -3014,7 +3014,7 @@ mod tests {
         let _ = basic_send(&mut app, "c-pause", "hi during pause");
 
         let dropped = |hub: &crate::api::EventHub| {
-            hub.events_after(0)
+            hub.ring_snapshot_after(0)
                 .iter()
                 .filter(|(_, event)| {
                     matches!(
@@ -3392,10 +3392,12 @@ mod tests {
         );
         assert_eq!(app.mailboxes.queued_len(&answerer), 1, "still unread");
         assert!(
-            !hub.events_after(0).into_iter().any(|(_, e)| matches!(
-                &e.data,
-                EventData::MessageDelivered { correlation_id, .. } if correlation_id == "c-anon"
-            )),
+            !hub.ring_snapshot_after(0)
+                .into_iter()
+                .any(|(_, e)| matches!(
+                    &e.data,
+                    EventData::MessageDelivered { correlation_id, .. } if correlation_id == "c-anon"
+                )),
             "no durable settle for a reply that never went out"
         );
     }
@@ -3748,7 +3750,7 @@ mod tests {
         // the way a restart does has to bring the kind and the pane back.
         // Otherwise the operator reads it correctly until they reboot.
         let events: Vec<EventEnvelope> = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .map(|(_, envelope)| envelope)
             .collect();
@@ -4069,7 +4071,7 @@ mod tests {
     }
 
     fn deferred_events(hub: &crate::api::EventHub) -> Vec<EventData> {
-        hub.events_after(0)
+        hub.ring_snapshot_after(0)
             .into_iter()
             .map(|(_, envelope)| envelope.data)
             .filter(|data| matches!(data, EventData::MessageDeferred { .. }))

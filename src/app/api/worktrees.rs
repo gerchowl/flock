@@ -2031,7 +2031,7 @@ mod tests {
             panic!("expected worktree_created response");
         };
 
-        let events = event_hub.events_after(0);
+        let events = event_hub.ring_snapshot_after(0);
         let parent_created = events
             .iter()
             .filter_map(|(_, event)| match &event.data {
@@ -2281,7 +2281,7 @@ mod tests {
         assert!(already_open);
         assert_eq!(workspace.workspace_id, child_id);
         assert_eq!(workspace.label, "review");
-        assert!(event_hub.events_after(0).iter().any(|(_, event)| {
+        assert!(event_hub.ring_snapshot_after(0).iter().any(|(_, event)| {
             matches!(
                 &event.data,
                 EventData::WorkspaceUpdated { workspace }
@@ -2292,7 +2292,7 @@ mod tests {
                             .is_some_and(|worktree| worktree.is_linked_worktree)
             )
         }));
-        assert!(event_hub.events_after(0).iter().any(|(_, event)| {
+        assert!(event_hub.ring_snapshot_after(0).iter().any(|(_, event)| {
             matches!(
                 &event.data,
                 EventData::WorkspaceRenamed {
@@ -2338,7 +2338,7 @@ mod tests {
         assert!(!already_open);
         assert_eq!(workspace.label, "source checkout");
         assert_eq!(app.state.workspaces.len(), 1);
-        assert!(event_hub.events_after(0).iter().any(|(_, event)| {
+        assert!(event_hub.ring_snapshot_after(0).iter().any(|(_, event)| {
             matches!(
                 &event.data,
                 EventData::WorkspaceCreated { workspace }
@@ -2350,7 +2350,7 @@ mod tests {
             )
         }));
         assert!(!event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .any(|(_, event)| { matches!(&event.data, EventData::WorkspaceRenamed { .. }) }));
 
@@ -4069,7 +4069,7 @@ mod tests {
 
         let closed = |id: &str| {
             event_hub
-                .events_after(0)
+                .ring_snapshot_after(0)
                 .iter()
                 .filter(|(_, event)| {
                     matches!(&event.data, EventData::WorkspaceClosed { workspace_id } if workspace_id == id)
@@ -4144,7 +4144,7 @@ mod tests {
         ));
         assert!(app.state.workspaces.is_empty());
         assert!(app.state.terminal_runtime_shutdowns.is_empty());
-        assert!(event_hub.events_after(0).iter().any(|(_, event)| {
+        assert!(event_hub.ring_snapshot_after(0).iter().any(|(_, event)| {
             matches!(
                 &event.data,
                 EventData::WorkspaceClosed { workspace_id } if workspace_id == &child_id
@@ -4308,7 +4308,7 @@ mod tests {
         );
 
         // #175 O2: the lineage/telemetry event is emitted with the verb.
-        let events = event_hub.events_after(0);
+        let events = event_hub.ring_snapshot_after(0);
         let forked = events
             .iter()
             .find_map(|(_, event)| match &event.data {
@@ -4445,7 +4445,7 @@ mod tests {
         // #959: and the dispatcher is recorded as the child's architect.
         let edges: Vec<_> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter_map(|(_, event)| match event.data {
                 EventData::AgentDelegated {
@@ -4563,7 +4563,7 @@ mod tests {
         );
         assert!(
             !app.event_hub
-                .events_after(0)
+                .ring_snapshot_after(0)
                 .iter()
                 .any(|(_, event)| matches!(event.data, EventData::AgentDelegated { .. })),
             "#959: the operator is not an architect, so its fork records no edge"

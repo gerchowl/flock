@@ -316,7 +316,7 @@ pub(super) fn wait_for_reply(
     // disagree. NOT the durable log: `persisted_events_after` re-reads every
     // log file while holding the hub's lock, and every `emit_event` on the
     // app thread waits on that lock — a retried typo would stall the server.
-    for (_, event) in event_hub.events_after(0) {
+    for (_, event) in event_hub.ring_snapshot_after(0) {
         watch.observe(&event, &correlation_id);
     }
     if let Err(reason) = watch.refresh_mesh(
@@ -404,23 +404,34 @@ pub(super) fn wait_for_reply(
             .min(CONNECTION_POLL_INTERVAL);
         if event_hub.wait_after(cursor, slice) {
             event_woke = true;
-            let fresh = event_hub.events_after(cursor);
-            // More than the ring holds arrived between two wakes: the events
-            // just past the cursor are gone. Re-read what the ring still has
-            // rather than miss an answer among them silently.
-            let gap = fresh
-                .first()
-                .is_some_and(|(sequence, _)| *sequence > cursor + 1);
-            let batch = if gap {
-                event_hub.events_after(0)
-            } else {
-                fresh
+            let batch = match reply_events(event_hub, cursor) {
+                Ok(events) => events,
+                Err(error) => {
+                    crate::logging::msg_wait_reply_completed(&request_id, &correlation_id, "error");
+                    return Ok(Some(encode(&ErrorResponse {
+                        id: request_id,
+                        error,
+                    })));
+                }
             };
             for (sequence, event) in batch {
                 cursor = cursor.max(sequence);
                 watch.observe(&event, &correlation_id);
             }
         }
+    }
+}
+
+// Shared continuation policy for the active socket wait.
+fn reply_events(hub: &EventHub, cursor: u64) -> Result<Vec<(u64, EventEnvelope)>, ErrorBody> {
+    match hub.events_after(cursor) {
+        Ok(events) => Ok(events),
+        // A reply wait folds retained facts into its existing message state.
+        // Losing unrelated events must not discard a retained or future reply.
+        Err(error) if error.code == super::error_code::ErrorCode::EventsLost.as_str() => {
+            Ok(hub.ring_snapshot_after(0))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -476,6 +487,182 @@ mod tests {
                 from_agent: None,
                 held: true,
             },
+        }
+    }
+
+    /// Existing outage diagnostics provide synchronous boundaries after history
+    /// capture and on continuation. No scheduler race decides where the gap lands.
+    struct ReplyLoopEvents {
+        hub: EventHub,
+        retained_reply: Option<bool>,
+        injected_gap: std::sync::atomic::AtomicBool,
+        injected_reply: std::sync::atomic::AtomicBool,
+        completed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct ReplyLoopFields {
+        event: String,
+        outcome: String,
+    }
+    impl tracing::field::Visit for ReplyLoopFields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "event" => self.event = value.into(),
+                "outcome" => self.outcome = value.into(),
+                _ => {}
+            }
+        }
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReplyLoopEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            use std::sync::atomic::Ordering;
+            let mut fields = ReplyLoopFields::default();
+            event.record(&mut fields);
+            match fields.event.as_str() {
+                "mesh.custody.failed"
+                    if self.retained_reply.is_some()
+                        && !self.injected_gap.swap(true, Ordering::SeqCst) =>
+                {
+                    for id in ["noise1", "noise2", "noise3"] {
+                        self.hub.push(queued(id, None, "noise"));
+                    }
+                    if self.retained_reply == Some(true) {
+                        self.hub.push(held("q", "answer", "body"));
+                    }
+                }
+                "mesh.wait.read_unavailable"
+                    if self.retained_reply == Some(false)
+                        && !self.injected_reply.swap(true, Ordering::SeqCst) =>
+                {
+                    self.hub.push(held("q", "answer", "body"));
+                }
+                "api.msg_wait_reply.complete" => {
+                    self.completed.lock().unwrap().push(fields.outcome);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn run_reply_loop(retained_reply: Option<bool>, timeout_ms: u64) -> serde_json::Value {
+        use std::sync::atomic::Ordering;
+        use tracing_subscriber::prelude::*;
+        struct Recovery;
+        impl Drop for Recovery {
+            fn drop(&mut self) {
+                crate::mesh::runtime_store::recovered();
+            }
+        }
+        crate::mesh::runtime_store::begin_recovery();
+        let _recovery = Recovery;
+        let hub = EventHub::default();
+        hub.set_ring_cap(2);
+        hub.push(queued("q", None, "question"));
+        let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(ReplyLoopEvents {
+            hub: hub.clone(),
+            retained_reply,
+            injected_gap: Default::default(),
+            injected_reply: Default::default(),
+            completed: completed.clone(),
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        let stop = running.clone();
+        let events = hub.clone();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let owner = std::thread::spawn(move || {
+            let result = tracing::subscriber::with_default(subscriber, || {
+                wait_for_reply(
+                    "loop".into(),
+                    MsgWaitReplyParams {
+                        reference: None,
+                        correlation_id: "q".into(),
+                        timeout_ms: Some(timeout_ms),
+                    },
+                    None,
+                    &mut server,
+                    &events,
+                    &stop,
+                )
+            });
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        running.store(false, Ordering::Relaxed);
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        owner.join().expect("reply waiter panicked");
+        let response = result
+            .expect("reply loop exceeded its fail ceiling")
+            .expect("reply loop I/O")
+            .expect("client stayed connected");
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let expected = if retained_reply.is_none() {
+            "timeout"
+        } else {
+            "replied"
+        };
+        assert_eq!(response["result"]["outcome"], expected, "{response}");
+        assert_eq!(*completed.lock().unwrap(), [expected]);
+        assert!(hub.reply_waits().is_empty(), "active-wait guard released");
+        if retained_reply.is_some() {
+            assert_eq!(hub.current_sequence(), 5);
+        }
+        response
+    }
+
+    #[test]
+    fn reply_wait_loop_recovers_gap_and_continues_to_retained_or_next_reply() {
+        for retained in [true, false] {
+            let response = run_reply_loop(Some(retained), 10_000);
+            assert_eq!(response["result"]["correlation_id"], "q");
+            assert_eq!(response["result"]["reply"]["body"], "body");
+        }
+    }
+
+    #[test]
+    fn reply_wait_loop_expires_and_reports_the_last_state() {
+        for timeout_ms in [0, 250] {
+            let response = run_reply_loop(None, timeout_ms);
+            assert_eq!(response["result"]["state"], "queued");
+            assert!(response["result"]["reply"].is_null());
+        }
+    }
+
+    #[test]
+    fn reply_wait_recovers_a_gap_before_a_retained_or_later_reply() {
+        for retained in [true, false] {
+            let hub = EventHub::default();
+            hub.set_ring_cap(2);
+            let original = queued("q", None, "question");
+            hub.push(original.clone());
+            let mut watch = Watch::default();
+            watch.observe(&original, "q");
+            let mut cursor = hub.current_sequence();
+            for id in ["noise1", "noise2", "noise3"] {
+                hub.push(queued(id, None, "noise"));
+            }
+            if retained {
+                hub.push(held("q", "answer", "body"));
+            }
+            for (seq, event) in reply_events(&hub, cursor).expect("a gap keeps the wait alive") {
+                cursor = seq;
+                watch.observe(&event, "q");
+            }
+            if !retained {
+                assert!(watch.answer.is_none());
+                hub.push(held("q", "answer", "body"));
+                for (_, event) in reply_events(&hub, cursor).unwrap() {
+                    watch.observe(&event, "q");
+                }
+            }
+            assert_eq!(watch.answer.unwrap().into_reply().unwrap().body, "body");
         }
     }
 

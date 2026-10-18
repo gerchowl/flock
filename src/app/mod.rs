@@ -5921,7 +5921,7 @@ sidebar_pane_gap = 99
 
     fn workspace_closed_count(app: &App, workspace_id: &str) -> usize {
         app.event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .filter(|(_, event)| {
                 matches!(

@@ -1522,6 +1522,7 @@ impl HeadlessServer {
                 agent_start_label: true,
                 agent_questions: true,
                 pane_input_write_ack: false,
+                events_live_start: true,
             }),
             self.app.runtime_config.uid_policy.clone(),
         )?;
@@ -6640,7 +6641,7 @@ next_tab = ""
         let done_in_hub = server
             .app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .any(|(_, event)| {
                 matches!(
@@ -6732,7 +6733,7 @@ next_tab = ""
         assert!(server
             .app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .any(|(_, event)| {
                 event.event == crate::api::schema::EventKind::PaneAgentStatusChanged
@@ -9596,7 +9597,7 @@ next_tab = ""
             server
                 .app
                 .event_hub
-                .events_after(0)
+                .ring_snapshot_after(0)
                 .iter()
                 .any(|(_, event)| { event.event == api::schema::EventKind::NotificationFiled }),
             "the projection is only as durable as the event it queued"
