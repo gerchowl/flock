@@ -140,6 +140,7 @@ mod tests {
     fn operator(app: &mut App) {
         // The test process runs in no pane, so it attests as the operator.
         app.current_api_peer_pid = Some(std::process::id());
+        app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
     }
 
     /// ADR-0035 §6.2: a merged change is reported as pending and does not

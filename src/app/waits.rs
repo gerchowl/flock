@@ -254,6 +254,7 @@ impl App {
         id: String,
         predicate: WaitPredicate,
         hold_ms: u64,
+        admission: Option<&crate::api::schema::WaitAdmission>,
     ) -> String {
         let wait_id = match self.spawn_caller() {
             SpawnCaller::Agent {
@@ -268,6 +269,21 @@ impl App {
                 .map(|(wait_id, _)| wait_id),
             SpawnCaller::Operator { .. } | SpawnCaller::Structured { .. } => None,
         };
+        if let (Some(wait_id), Some(admission)) = (wait_id.as_ref(), admission) {
+            let authority = self
+                .runtime_config
+                .uid_policy
+                .classify(self.current_api_peer_uid.flatten());
+            if let Some(grant) =
+                crate::api::schema::WaitReleaseAuthority::admitted(wait_id.clone(), authority)
+            {
+                if let Err(grant) = admission.set(grant) {
+                    // The reader already left, or this cell already owns another hold.
+                    // Only the rejected grant's exact hold is closed.
+                    self.handle_wait_release(id.clone(), grant.release_id());
+                }
+            }
+        }
         encode_success(id, ResponseResult::WaitHeld { wait_id })
     }
 

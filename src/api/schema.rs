@@ -2,6 +2,79 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Shared in-process admission and reader-lifetime handoff, never serialized.
+pub type WaitAdmission = std::sync::Arc<WaitAdmissionState>;
+
+/// Publishes one hold's grant unless its reader has already abandoned the request.
+/// The local mutex serializes publication with abandonment; no App dispatch or
+/// channel send runs while it is held. The published grant remains immutable.
+#[derive(Debug, Default)]
+pub struct WaitAdmissionState {
+    grant: std::sync::OnceLock<WaitReleaseAuthority>,
+    abandoned: parking_lot::Mutex<bool>,
+}
+
+impl WaitAdmissionState {
+    /// Publish once. The App must close the returned grant's hold on refusal.
+    pub(crate) fn set(&self, grant: WaitReleaseAuthority) -> Result<(), WaitReleaseAuthority> {
+        let abandoned = self.abandoned.lock();
+        if *abandoned {
+            return Err(grant);
+        }
+        self.grant.set(grant)
+    }
+
+    /// Inspect the immutable grant, including after its hold has closed.
+    pub(crate) fn get(&self) -> Option<&WaitReleaseAuthority> {
+        self.grant.get()
+    }
+
+    /// End the reader's ownership. A published grant is released by its holder;
+    /// otherwise a late publisher gets the grant back and closes that exact hold.
+    pub(crate) fn abandon(&self) -> Option<WaitReleaseAuthority> {
+        let mut abandoned = self.abandoned.lock();
+        *abandoned = true;
+        self.get().cloned()
+    }
+
+    fn is_abandoned(&self) -> bool {
+        *self.abandoned.lock()
+    }
+}
+
+impl PartialEq for WaitAdmissionState {
+    fn eq(&self, other: &Self) -> bool {
+        self.grant == other.grant && self.is_abandoned() == other.is_abandoned()
+    }
+}
+
+/// App-issued authority to close exactly one already-admitted hold.
+/// Private fields prevent retargeting; this grants no other request authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaitReleaseAuthority {
+    wait_id: String,
+    authority: crate::structured::identity::Principal,
+}
+
+impl WaitReleaseAuthority {
+    /// Mint after admission; an unknown UID class never grants release authority.
+    /// Private fields make this the only constructor, so `release_id` need not
+    /// re-check the captured authority class or the caller's later liveness.
+    pub(crate) fn admitted(
+        wait_id: String,
+        authority: crate::structured::identity::Principal,
+    ) -> Option<Self> {
+        use crate::structured::identity::Principal;
+        matches!(authority, Principal::Operator | Principal::Agent)
+            .then_some(Self { wait_id, authority })
+    }
+
+    /// The original hold this grant can close, independent of caller lifetime.
+    pub(crate) fn release_id(&self) -> &str {
+        &self.wait_id
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
@@ -248,14 +321,28 @@ pub enum Method {
     /// return at once, so the agent can end its turn.
     #[serde(rename = "wait.park")]
     WaitPark(WaitParkParams),
-    /// In-process only: a held `events.read` registers its blocking wait
-    /// against the attested caller. Never on the wire, so no client can open
-    /// or close a wait it does not hold.
+    /// Direct registry driver for unit tests; production holds carry admission grants.
+    #[cfg(test)]
     #[serde(skip)]
     WaitHold(crate::api::wait_predicate::WaitPredicate, u64),
-    /// In-process only: the held `events.read` returned.
+    /// In-process held read: publish its release grant only after admission.
+    #[serde(skip)]
+    WaitHoldAdmitted(
+        crate::api::wait_predicate::WaitPredicate,
+        u64,
+        WaitAdmission,
+    ),
+    /// In-process cleanup using a grant bound to the admitted hold, even after exit.
+    #[serde(skip)]
+    WaitReleaseAdmitted(WaitReleaseAuthority),
+    /// Direct registry cleanup for unit tests; production releases require a grant.
+    #[cfg(test)]
     #[serde(skip)]
     WaitRelease(String),
+    /// In-process only: admit a socket read fast path before any target lookup.
+    /// UID and ancestry checks run in the App. Never accepted from wire JSON.
+    #[serde(skip)]
+    AuthorizeRead,
     /// ADR-0035 §1: bind a repo to its resident owner. Operator verb.
     #[serde(rename = "owner.bind")]
     OwnerBind(OwnerBindParams),
@@ -447,8 +534,11 @@ impl Method {
             | Self::ChecksList(_)
             | Self::DigestRender(_)
             | Self::FleetStatus(_)
-            | Self::WaitHold(..)
-            | Self::WaitRelease(_) => false,
+            | Self::WaitHoldAdmitted(..)
+            | Self::WaitReleaseAdmitted(_)
+            | Self::AuthorizeRead => false,
+            #[cfg(test)]
+            Self::WaitHold(..) | Self::WaitRelease(_) => false,
             Self::NotificationShow(_)
             | Self::NotificationAck(_)
             | Self::WorkspaceCreate(_)
@@ -1091,8 +1181,20 @@ pub const AGENT_HISTORY_DEFAULT_TURNS: u32 = 20;
 /// poll and a response nobody can read.
 pub const AGENT_HISTORY_MAX_TURNS: u32 = 200;
 
+/// Durable `agent.send` acknowledgement shared with the operator queue API.
+/// This lifecycle UUID names custody; execution is reported by queue facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AgentSendResult {
+    /// Canonical queue item identity, stable across identical admission retries.
+    pub item_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSendParams {
+    /// Optional canonical UUID for idempotent structured admission retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
     /// Raw-write milliseconds: integer 1..=30000, default 10000. Not a submit budget.
     #[serde(
         default,
@@ -1102,7 +1204,9 @@ pub struct AgentSendParams {
     pub write_timeout_ms: Option<serde_json::Value>,
     pub target: String,
     pub text: String,
-    /// Guard an empty idle composer, send delayed Enter and confirm with one retry.
+    /// Terminal: guard the composer, send delayed Enter and confirm the submit.
+    /// Structured: admit one durable at-idle item and acknowledge its lifecycle UUID.
+    /// False is refused for structured targets before queue or stdin work.
     #[serde(default)]
     pub submit: bool,
     /// Without `submit`, type even when the target is an agent pane whose composer holds a
@@ -2664,6 +2768,8 @@ pub enum EventMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
+    /// ADR-0036 §4: committed queue item transition, linked to its queue cursor.
+    QueueItemState,
     MeshRoutesChanged,
     MeshOutboundPending,
     WorkspaceCreated,
@@ -2797,7 +2903,8 @@ impl EventKind {
     /// story; every lifecycle + lineage kind persists.
     pub fn is_persisted(self) -> bool {
         match self {
-            Self::WorkspaceCreated
+            Self::QueueItemState
+            | Self::WorkspaceCreated
             | Self::WorkspaceUpdated
             | Self::WorkspaceClosed
             | Self::WorkspaceRenamed
@@ -2975,6 +3082,10 @@ pub struct ApiListenerHealth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    /// Durable structured admission, before eventual harness delivery.
+    AgentQueued {
+        item_id: String,
+    },
     ClientTokenIssued {
         issued: super::client_tokens::Issued,
     },
@@ -3373,7 +3484,7 @@ pub enum ResponseResult {
         predicate: String,
         deadline: u64,
     },
-    /// The in-process `WaitHold`: the wait it opened, `None` when the caller
+    /// The in-process `WaitHoldAdmitted`: the wait it opened, `None` when the caller
     /// is no agent and nothing was recorded.
     WaitHeld {
         wait_id: Option<String>,
@@ -4282,6 +4393,8 @@ pub struct AgentPhaseEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
+    /// ADR-0036 §4: only state changes, never adds, edits or checkpoints.
+    QueueItemState(crate::api::queue_event::QueueItemState),
     MeshRoutesChanged {},
     MeshOutboundPending {},
     WorkspaceCreated {
@@ -6364,5 +6477,55 @@ mod pr_info_tests {
         let invalid = serde_json::json!({"bytes_written":-1,"bytes_total":5,
             "reason":"deadline","remainder_discarded":true});
         assert!(serde_json::from_value::<InputWriteDetails>(invalid).is_err());
+    }
+}
+
+#[cfg(test)]
+mod wait_admission_tests {
+    use super::*;
+    use crate::structured::identity::Principal;
+
+    fn grant(id: &str) -> WaitReleaseAuthority {
+        WaitReleaseAuthority::admitted(id.into(), Principal::Operator).unwrap()
+    }
+
+    #[test]
+    fn unattested_authority_cannot_mint_a_release_grant() {
+        assert!(WaitReleaseAuthority::admitted("unknown".into(), Principal::Unknown).is_none());
+    }
+
+    #[test]
+    fn publication_before_abandonment_returns_only_its_own_grant() {
+        let admission = WaitAdmissionState::default();
+        admission.set(grant("first")).unwrap();
+        assert_eq!(admission.abandon().unwrap().release_id(), "first");
+        assert_eq!(
+            admission.set(grant("later")).unwrap_err().release_id(),
+            "later"
+        );
+        assert_eq!(admission.get().unwrap().release_id(), "first");
+        assert!(admission.eq(&admission));
+    }
+
+    #[test]
+    fn abandonment_before_publication_returns_the_late_grant_to_the_app() {
+        let admission = WaitAdmissionState::default();
+        assert!(admission.abandon().is_none());
+        assert_eq!(
+            admission.set(grant("late")).unwrap_err().release_id(),
+            "late"
+        );
+        assert!(admission.get().is_none());
+    }
+
+    #[test]
+    fn a_second_publication_cannot_replace_an_existing_hold() {
+        let admission = WaitAdmissionState::default();
+        admission.set(grant("first")).unwrap();
+        assert_eq!(
+            admission.set(grant("second")).unwrap_err().release_id(),
+            "second"
+        );
+        assert_eq!(admission.abandon().unwrap().release_id(), "first");
     }
 }

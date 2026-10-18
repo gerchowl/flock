@@ -1153,11 +1153,7 @@ impl HeadlessServer {
     /// S3a-3 deliberately stops structured sessions before transferring ownership.
     /// Full single-writer session handoff belongs to S7-rest.
     fn stop_structured_before_handoff(&mut self) -> Vec<String> {
-        if let Err(error) = self
-            .app
-            .structured_workers
-            .shutdown(&mut self.app.state.structured_agents)
-        {
+        if let Err(error) = self.app.shutdown_structured_workers() {
             crate::logging::structured_worker_shutdown_failed(&error);
         }
         self.app.state.structured_agents.handoff_unknown()
@@ -5210,6 +5206,108 @@ mod tests {
             should_quit: Arc::new(AtomicBool::new(false)),
             server_event_rx,
             server_event_tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_hold_release_survives_caller_exit_in_headless_dispatch() {
+        use api::schema::{Method, Request, WaitReleaseAuthority};
+        for uid in [7, 42] {
+            let mut server = test_headless_server();
+            server.app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+                operator: 7,
+                dedicated: Ok(Some(42)).into(),
+            };
+            server.app.state.workspaces =
+                vec![crate::workspace::Workspace::test_new("headless-held-read")];
+            server.app.state.ensure_test_terminals();
+            let pane = server.app.state.workspaces[0].focused_pane_id().unwrap();
+            let terminal_id = server.app.state.workspaces[0]
+                .pane_state(pane)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.launch_argv = Some(vec!["claude".into()]);
+            let agent_id = terminal.agent_id.to_string();
+            crate::test_support::attest_pane_caller(&mut server.app, pane);
+            let pid = server.app.current_api_peer_pid.unwrap();
+            let birth = crate::platform::process_start_time(pid);
+            let call = |server: &mut HeadlessServer, method| {
+                let (respond_to, response) = std::sync::mpsc::channel();
+                server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                    request: Request {
+                        id: "held-read-cleanup".into(),
+                        method,
+                    },
+                    respond_to,
+                    peer_pid: Some(pid),
+                    peer_birth: birth,
+                    peer_uid: Some(uid),
+                });
+                serde_json::from_str::<serde_json::Value>(
+                    &response.recv_timeout(Duration::from_secs(2)).unwrap(),
+                )
+                .unwrap()
+            };
+            let mut grants = Vec::<WaitReleaseAuthority>::new();
+            for _ in 0..2 {
+                let admission = std::sync::Arc::default();
+                let response = call(
+                    &mut server,
+                    Method::WaitHoldAdmitted(
+                        crate::api::wait_predicate::WaitPredicate::Events {
+                            kinds: vec![],
+                            subjects: vec![],
+                            after: 0,
+                        },
+                        600_000,
+                        std::sync::Arc::clone(&admission),
+                    ),
+                );
+                assert!(response.get("result").is_some(), "{response}");
+                grants.push(admission.get().expect("App issued the grant").clone());
+            }
+            assert_ne!(grants[0].release_id(), grants[1].release_id());
+            assert!(serde_json::to_value(Method::WaitReleaseAdmitted(grants[0].clone())).is_err());
+            for method in ["wait.hold", "wait.release"] {
+                let error = serde_json::from_value::<Request>(serde_json::json!({
+                    "id":"forged", "method":method,
+                    "params":{"wait_id":grants[0].release_id(), "authority":"Operator"}
+                }))
+                .unwrap_err();
+                assert!(error.to_string().contains(method), "{error}");
+            }
+            let due = server.app.waits.next_deadline().unwrap();
+            server
+                .app
+                .terminal_runtimes
+                .remove(&terminal_id)
+                .unwrap()
+                .shutdown();
+            crate::platform::assert_owned_child_reaped(pid);
+            assert!(crate::platform::process_start_time(pid).is_none());
+            let response = call(&mut server, Method::WaitReleaseAdmitted(grants[0].clone()));
+            assert!(response.get("result").is_some(), "{response}");
+            let crate::api::agent_state::Waiting::On { wait_id, .. } =
+                server.app.waits.waiting(&agent_id)
+            else {
+                panic!("releasing one hold must leave the other open");
+            };
+            assert_eq!(wait_id.as_str(), grants[1].release_id());
+            let response = call(&mut server, Method::WaitReleaseAdmitted(grants[1].clone()));
+            assert!(response.get("result").is_some(), "{response}");
+            assert!(matches!(
+                server.app.waits.waiting(&agent_id),
+                crate::api::agent_state::Waiting::None
+            ));
+            server.app.tick_waits(due);
+            assert!(!server
+                .app
+                .event_hub
+                .events_after(0)
+                .iter()
+                .any(|(_, event)| event.event == api::schema::EventKind::WaitExpired));
         }
     }
 

@@ -868,6 +868,7 @@ async fn a_paste_held_by_an_injection_claims_no_evidence() {
     let response = app.handle_api_request(Request {
         id: "paste".into(),
         method: Method::AgentSend(crate::api::schema::AgentSendParams {
+            item_id: None,
             write_timeout_ms: None,
             raw: true,
             target: pane.clone(),
@@ -921,6 +922,7 @@ fn typing_verbs(pane: &str, raw: bool) -> Vec<(&'static str, Method)> {
         (
             "agent send --no-submit",
             Method::AgentSend(crate::api::schema::AgentSendParams {
+                item_id: None,
                 write_timeout_ms: None,
                 target: pane.into(),
                 text: "note".into(),
@@ -1090,6 +1092,7 @@ async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
         let agent = harness.agent;
         let send_submit = |pane: &str| {
             Method::AgentSend(crate::api::schema::AgentSendParams {
+                item_id: None,
                 write_timeout_ms: None,
                 target: pane.into(),
                 text: "hello".into(),
@@ -1155,6 +1158,70 @@ async fn a_submit_into_an_agent_pane_stashes_one_row_and_refuses_several() {
         assert_eq!(
             app.delivery_attempts()[0].draft.as_deref(),
             Some("restored")
+        );
+    }
+}
+
+/// Cooperative terminal sends retain their PTY effect for shell and mesh callers.
+#[tokio::test]
+async fn cooperative_shell_terminal_send_reaches_the_pty() {
+    cooperative_terminal_send(false);
+}
+
+#[tokio::test]
+async fn cooperative_mesh_terminal_send_reaches_the_pty() {
+    cooperative_terminal_send(true);
+}
+
+fn cooperative_terminal_send(mesh: bool) {
+    {
+        let Rig {
+            mut app,
+            pane,
+            mut pty,
+        } = lock_rig(&CLAUDE);
+        let pid = std::process::id();
+        let birth = crate::platform::process_start_time(pid).unwrap();
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: 7,
+            dedicated: Ok(Some(42)).into(),
+        };
+        app.current_api_peer_uid = Some(Some(7));
+        app.current_api_peer_pid = Some(pid);
+        app.current_api_peer_birth = Some(Some(birth));
+        if mesh {
+            app.inbound
+                .attach(pid, birth, crate::platform::process_start_time)
+                .unwrap();
+            let edge = app
+                .inbound
+                .edge_mut(Some(pid), crate::platform::process_start_time)
+                .unwrap();
+            edge.enrollment.peer = "relay.example".into();
+            edge.enrollment.node_id = Some("fixture-node".into());
+            edge.enrollment.state = "pinned".into();
+        } else {
+            let shell = app.state.workspaces[0].focused_pane_id().unwrap();
+            app.test_pane_child_pids.insert(shell, pid);
+        }
+        let response = app.handle_api_request(Request {
+            id: "cooperative-send".into(),
+            method: Method::AgentSend(crate::api::schema::AgentSendParams {
+                target: pane,
+                text: "cooperative note".into(),
+                raw: true,
+                submit: false,
+                item_id: None,
+                write_timeout_ms: None,
+            }),
+        });
+        assert!(response.is_empty(), "mesh={mesh}: {response}");
+        let bytes: Vec<u8> = drain(&mut pty).into_iter().flatten().collect();
+        assert!(
+            bytes
+                .windows(b"cooperative note".len())
+                .any(|part| part == b"cooperative note"),
+            "mesh={mesh}: {bytes:?}"
         );
     }
 }

@@ -35,6 +35,7 @@ pub(super) fn match_output(
 }
 
 pub(super) struct ActiveOutputMatchedSubscription {
+    peer: crate::platform::peer::Credentials,
     pane_id: String,
     source: crate::api::schema::ReadSource,
     lines: Option<u32>,
@@ -46,6 +47,7 @@ pub(super) struct ActiveOutputMatchedSubscription {
 }
 
 pub(super) struct ActiveAgentStatusChangedSubscription {
+    peer: crate::platform::peer::Credentials,
     pane_id: String,
     status_filter: Option<crate::api::schema::AgentStatus>,
     last_status: Option<crate::api::schema::AgentStatus>,
@@ -117,6 +119,7 @@ impl ActiveSubscription {
         start: u64,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
+        peer: crate::platform::peer::Credentials,
     ) -> Result<Self, ErrorResponse> {
         match subscription {
             Subscription::MeshRoutesChanged {} => Ok(Self::Event(ActiveEventSubscription {
@@ -222,10 +225,12 @@ impl ActiveSubscription {
                     lines,
                     strip_ansi,
                     api_tx,
+                    peer,
                 );
                 probe?;
 
                 Ok(Self::OutputMatched(ActiveOutputMatchedSubscription {
+                    peer,
                     pane_id,
                     source,
                     lines,
@@ -241,7 +246,12 @@ impl ActiveSubscription {
                 agent_status,
             } => {
                 let last_sequence = event_hub.current_sequence();
-                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
+                let probe = pane_get(
+                    format!("{request_id}:sub:{index}:probe"),
+                    &pane_id,
+                    api_tx,
+                    peer,
+                )?;
                 let last_status = probe.agent_status;
                 let last_presentation = PanePresentationSnapshot::from(&probe);
                 let initial_event = agent_status
@@ -259,6 +269,7 @@ impl ActiveSubscription {
 
                 Ok(Self::AgentStatusChanged(Box::new(
                     ActiveAgentStatusChangedSubscription {
+                        peer,
                         pane_id,
                         status_filter: agent_status,
                         last_status: Some(last_status),
@@ -356,6 +367,7 @@ impl ActiveOutputMatchedSubscription {
             self.lines,
             self.strip_ansi,
             api_tx,
+            self.peer,
         )
         .ok()?;
 
@@ -460,6 +472,7 @@ impl ActiveAgentStatusChangedSubscription {
             format!("{}:pane", self.request_prefix),
             &self.pane_id,
             api_tx,
+            self.peer,
         )
         .ok()?;
         let after_snapshot_sequence = event_hub.current_sequence();
@@ -519,6 +532,7 @@ fn pane_read(
     lines: Option<u32>,
     strip_ansi: bool,
     api_tx: &ApiRequestSender,
+    peer: crate::platform::peer::Credentials,
 ) -> Result<crate::api::schema::PaneReadResult, ErrorResponse> {
     let response = dispatch_to_app_with_timeout(
         Request {
@@ -533,7 +547,7 @@ fn pane_read(
         },
         api_tx,
         Some(APP_RESPONSE_TIMEOUT),
-        Default::default(),
+        peer,
     );
     let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
         id: request_id.clone(),
@@ -569,6 +583,7 @@ fn pane_get(
     request_id: String,
     pane_id: &str,
     api_tx: &ApiRequestSender,
+    peer: crate::platform::peer::Credentials,
 ) -> Result<crate::api::schema::PaneInfo, ErrorResponse> {
     let response = dispatch_to_app_with_timeout(
         Request {
@@ -579,7 +594,7 @@ fn pane_get(
         },
         api_tx,
         Some(APP_RESPONSE_TIMEOUT),
-        Default::default(),
+        peer,
     );
     let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
         id: request_id.clone(),
@@ -632,6 +647,9 @@ mod tests {
                     .expect("probe producer closed")
             });
             assert_eq!(message.request.id, "probe");
+            assert_eq!(message.peer_uid, Some(7));
+            assert_eq!(message.peer_pid, Some(11));
+            assert_eq!(message.peer_birth, Some(13));
             assert!(matches!(
                 (&message.request.method, read),
                 (Method::PaneRead(_), true) | (Method::PaneGet(_), false)
@@ -646,10 +664,25 @@ mod tests {
                 None,
                 true,
                 &tx,
+                crate::platform::peer::Credentials {
+                    uid: Some(7),
+                    pid: Some(11),
+                    birth: Some(13),
+                },
             )
             .unwrap_err()
         } else {
-            pane_get("probe".into(), "pane_1", &tx).unwrap_err()
+            pane_get(
+                "probe".into(),
+                "pane_1",
+                &tx,
+                crate::platform::peer::Credentials {
+                    uid: Some(7),
+                    pid: Some(11),
+                    birth: Some(13),
+                },
+            )
+            .unwrap_err()
         };
         responder.join().unwrap();
         error
@@ -711,6 +744,7 @@ mod tests {
     fn agent_status_subscription_replays_queued_metadata_set_and_expiry_events() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
+            peer: Default::default(),
             pane_id: "pane_1".into(),
             status_filter: None,
             last_status: Some(AgentStatus::Working),
@@ -749,6 +783,7 @@ mod tests {
     fn agent_status_subscription_prefers_setup_window_events_over_initial_snapshot() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
+            peer: Default::default(),
             pane_id: "pane_1".into(),
             status_filter: Some(AgentStatus::Working),
             last_status: Some(AgentStatus::Working),
@@ -796,6 +831,7 @@ mod tests {
     fn agent_status_subscription_emits_setup_window_event_already_reflected_by_probe() {
         let event_hub = EventHub::default();
         let mut subscription = ActiveAgentStatusChangedSubscription {
+            peer: Default::default(),
             pane_id: "pane_1".into(),
             status_filter: Some(AgentStatus::Working),
             last_status: Some(AgentStatus::Working),

@@ -23,8 +23,8 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "questions",
     "remote",
     "session",
-    "security",
     "sessions",
+    "security",
     "slots",
     "spawn",
     "structured",
@@ -1552,6 +1552,25 @@ mouse_capture = false
                  — add it there AND wire it into load_live_config_from_table"
             );
         }
+    }
+
+    #[test]
+    fn sessions_queue_threshold_survives_live_loading_and_rejects_zero() {
+        let text = "[sessions]\nqueue_rewrite_bytes = 4096\n";
+        let loaded = load_live_config_from_table(toml::from_str(text).unwrap()).unwrap();
+        assert_eq!(loaded.config.sessions.queue_rewrite_bytes.get(), 4096);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert!(loaded.invalid_sections.is_empty());
+        let loaded = load_live_config_from_table(
+            toml::from_str("[sessions]\nqueue_rewrite_bytes = 0\n").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loaded.invalid_sections, ["sessions"]);
+        assert_eq!(
+            loaded.config.sessions.queue_rewrite_bytes.get(),
+            crate::config::model::DEFAULT_QUEUE_REWRITE_BYTES
+        );
+        assert!(loaded.diagnostics.iter().any(|d| d.contains("sessions")));
     }
 
     #[test]
