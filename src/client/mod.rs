@@ -574,6 +574,8 @@ pub fn take_switch_target(path: &std::path::Path) -> Option<RecordedSwitch> {
 pub enum ClientError {
     /// Could not connect to the server's client socket.
     ConnectionFailed(io::Error),
+    /// No usable startup terminal geometry was obtained within its budget.
+    TerminalGeometry(io::Error),
     /// Server rejected our handshake.
     HandshakeRejected { version: u32, error: String },
     /// Server shut down.
@@ -596,6 +598,7 @@ impl std::fmt::Display for ClientError {
                 write!(f, "\nIs flk server running? Start it with `flk server`.")?;
                 write!(f, "\nSocket path: {}", path.display())
             }
+            ClientError::TerminalGeometry(err) => write!(f, "terminal geometry: {err}"),
             ClientError::HandshakeRejected { version, error } => {
                 write!(f, "server rejected handshake (version {version}): {error}")
             }
@@ -644,7 +647,7 @@ impl std::fmt::Display for ClientError {
 impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ClientError::ConnectionFailed(err) => Some(err),
+            ClientError::ConnectionFailed(err) | ClientError::TerminalGeometry(err) => Some(err),
             ClientError::ConnectionLost(err) => Some(err),
             ClientError::Protocol(err) => Some(err),
             _ => None,
@@ -1678,7 +1681,7 @@ fn run_attach_attempt(
     attach_request: Option<&(String, bool)>,
     direct_attach: bool,
     kitty_graphics_enabled: bool,
-    geometry_probe: impl FnOnce(bool) -> Result<TerminalGeometry, GeometryError>,
+    mut geometry_probe: GeometryQuery,
     host_theme: Option<crate::terminal_theme::TerminalTheme>,
     pending_stdin: &mut Option<Vec<u8>>,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
@@ -1697,9 +1700,12 @@ fn run_attach_attempt(
     // Read the terminal geometry before the handshake, while still outside
     // raw mode. Re-read on every attempt so a resize that happens during a
     // handoff window is honored.
-    let Some((cols, rows, cell_width_px, cell_height_px)) =
-        resolve_terminal_geometry(None, geometry_probe(kitty_graphics_enabled), "handshake")
-            .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?
+    let Some((cols, rows, cell_width_px, cell_height_px)) = wait_for_initial_geometry(
+        || geometry_probe(kitty_graphics_enabled),
+        Instant::now,
+        std::thread::park_timeout,
+    )
+    .map_err(|err| AttachAttemptError::Handshake(ClientError::TerminalGeometry(err)))?
     else {
         return Ok(());
     };
@@ -1768,7 +1774,7 @@ fn run_attach_attempt(
     let result = rt.block_on(run_client_loop(
         stream,
         (cols, rows, cell_width_px, cell_height_px),
-        current_terminal_geometry(kitty_graphics_enabled),
+        geometry_probe,
         should_quit.clone(),
         sound_config.clone(),
         mouse_scroll_lines,
@@ -1982,7 +1988,7 @@ fn run_client_with_mode(
                 attach_request.as_ref(),
                 direct_attach,
                 kitty_graphics_enabled,
-                current_terminal_geometry,
+                terminal_geometry_query(),
                 host_theme,
                 &mut pending_stdin,
                 stdin_rx,
@@ -2110,7 +2116,7 @@ fn run_client_with_mode(
 async fn run_client_loop(
     stream: UnixStream,
     initial_geometry: TerminalGeometry,
-    initial_observation: Result<TerminalGeometry, GeometryError>,
+    mut geometry_probe: GeometryQuery,
     should_quit: Arc<AtomicBool>,
     sound_config: crate::config::SoundConfig,
     mouse_scroll_lines: usize,
@@ -2124,9 +2130,12 @@ async fn run_client_loop(
     attach_t0: Instant,
 ) -> Result<(), ClientError> {
     let (cols, rows, _, _) = initial_geometry;
-    let Some((_, _, initial_cell_width, initial_cell_height)) =
-        resolve_terminal_geometry(Some(initial_geometry), initial_observation, "loop_startup")
-            .map_err(ClientError::ConnectionLost)?
+    let Some((_, _, initial_cell_width, initial_cell_height)) = resolve_terminal_geometry(
+        Some(initial_geometry),
+        geometry_probe(kitty_graphics_enabled),
+        "loop_startup",
+    )
+    .map_err(ClientError::TerminalGeometry)?
     else {
         // Closing this connection detaches the observer if its terminal vanished
         // between the handshake and starting the event loop.
@@ -2173,6 +2182,7 @@ async fn run_client_loop(
             initial_geometry,
             kitty_graphics_enabled,
             &resize_quit,
+            geometry_probe,
         );
     });
 
@@ -4302,25 +4312,120 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 type TerminalGeometry = (u16, u16, u32, u32);
 use crate::platform::terminal_geometry::GeometryError;
 
-fn current_terminal_geometry(
-    kitty_graphics_enabled: bool,
-) -> Result<TerminalGeometry, GeometryError> {
-    let (cols, rows, width, height) = crate::platform::terminal_geometry::query()?;
-    let (cell_width, cell_height) = if !kitty_graphics_enabled {
-        (0, 0)
-    } else if width == 0 || height == 0 {
-        (8, 16)
-    } else {
-        (
-            (u32::from(width) / u32::from(cols)).max(1),
-            (u32::from(height) / u32::from(rows)).max(1),
-        )
-    };
-    Ok((cols, rows, cell_width, cell_height))
+/// Startup may precede the first PTY resize (for example in an exec session).
+/// Wait at most two monotonic seconds for nonzero cells; never invent geometry.
+const INITIAL_GEOMETRY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Share the established geometry polling cadence while waiting for startup.
+const GEOMETRY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+type GeometryQuery = Box<dyn FnMut(bool) -> Result<TerminalGeometry, GeometryError> + Send>;
+
+fn terminal_geometry_query() -> GeometryQuery {
+    let mut probe = crate::platform::terminal_geometry::GeometryProbe::default();
+    Box::new(move |kitty| {
+        let (cols, rows, width, height) = probe.query()?;
+        let (cell_width, cell_height) = if !kitty {
+            (0, 0)
+        } else if width == 0 || height == 0 {
+            (8, 16)
+        } else {
+            (
+                (u32::from(width) / u32::from(cols)).max(1),
+                (u32::from(height) / u32::from(rows)).max(1),
+            )
+        };
+        Ok((cols, rows, cell_width, cell_height))
+    })
 }
 
-/// Only verified tty loss ends an attach. A transient error retains known
-/// geometry; before the first measurement it remains a startup error.
+/// A registered startup refusal is also visible in the human error message.
+#[derive(Debug)]
+struct GeometryStartupError(crate::api::error_code::ErrorCode, &'static str);
+impl std::fmt::Display for GeometryStartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.0, self.1)
+    }
+}
+impl std::error::Error for GeometryStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+fn geometry_startup_error(no_tty: bool) -> io::Error {
+    use crate::api::error_code::ErrorCode;
+    let (kind, code, message) = if no_tty {
+        (
+            io::ErrorKind::NotConnected,
+            ErrorCode::TerminalUnavailable,
+            "no terminal is available; attach from a terminal",
+        )
+    } else {
+        (
+            io::ErrorKind::TimedOut,
+            ErrorCode::Timeout,
+            "terminal geometry did not become nonzero before the startup deadline",
+        )
+    };
+    io::Error::new(kind, GeometryStartupError(code, message))
+}
+
+fn wait_for_initial_geometry(
+    mut geometry: impl FnMut() -> Result<TerminalGeometry, GeometryError>,
+    now: impl Fn() -> Instant,
+    mut wait: impl FnMut(Duration),
+) -> io::Result<Option<TerminalGeometry>> {
+    let deadline = now() + INITIAL_GEOMETRY_TIMEOUT;
+    let mut last_failure = None;
+    loop {
+        match geometry() {
+            Ok(size) => return Ok(Some(size)),
+            Err(GeometryError::Gone(error)) => {
+                crate::logging::client_geometry_query_failed(
+                    "handshake",
+                    "tty_gone",
+                    "detached",
+                    &error,
+                );
+                return Ok(None);
+            }
+            Err(GeometryError::Unavailable(error)) => {
+                crate::logging::client_geometry_query_failed(
+                    "handshake",
+                    "no_tty",
+                    "startup_failed",
+                    &error,
+                );
+                return Err(geometry_startup_error(true));
+            }
+            Err(GeometryError::Transient(error)) => {
+                let key = (error.kind(), error.raw_os_error());
+                if last_failure != Some(key) {
+                    crate::logging::client_geometry_query_failed(
+                        "handshake",
+                        "transient_query_failure",
+                        "waiting_geometry",
+                        &error,
+                    );
+                    last_failure = Some(key);
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            let error = geometry_startup_error(false);
+            crate::logging::client_geometry_query_failed(
+                "handshake",
+                "geometry_deadline",
+                "startup_failed",
+                &error,
+            );
+            return Err(error);
+        }
+        wait(remaining.min(GEOMETRY_POLL_INTERVAL));
+    }
+}
+
+/// Resolve an established-session observation without inventing geometry.
+/// Initial measurements instead use the bounded startup wait above.
 fn resolve_terminal_geometry(
     previous: Option<TerminalGeometry>,
     observed: Result<TerminalGeometry, GeometryError>,
@@ -4329,13 +4434,23 @@ fn resolve_terminal_geometry(
     match observed {
         Ok(geometry) => Ok(Some(geometry)),
         Err(GeometryError::Gone(error)) => {
-            crate::logging::client_geometry_query_failed(stage, true, previous.is_some(), &error);
+            crate::logging::client_geometry_query_failed(stage, "tty_gone", "detached", &error);
             Ok(None)
         }
         Err(GeometryError::Transient(error)) => {
-            crate::logging::client_geometry_query_failed(stage, false, previous.is_some(), &error);
+            crate::logging::client_geometry_query_failed(
+                stage,
+                "transient_query_failure",
+                if previous.is_some() {
+                    "geometry_retained"
+                } else {
+                    "startup_failed"
+                },
+                &error,
+            );
             previous.map(Some).ok_or(error)
         }
+        Err(GeometryError::Unavailable(_)) => Err(geometry_startup_error(true)),
     }
 }
 
@@ -4345,13 +4460,14 @@ fn resize_poll_loop(
     initial_geometry: TerminalGeometry,
     kitty_graphics_enabled: bool,
     should_quit: &Arc<AtomicBool>,
+    mut geometry_probe: GeometryQuery,
 ) {
     resize_poll_loop_with(
         resize_tx,
         initial_geometry,
         should_quit,
-        || current_terminal_geometry(kitty_graphics_enabled),
-        || std::thread::sleep(Duration::from_millis(100)),
+        || geometry_probe(kitty_graphics_enabled),
+        || std::thread::sleep(GEOMETRY_POLL_INTERVAL),
     );
 }
 
@@ -4365,16 +4481,31 @@ fn resize_poll_loop_with(
     mut wait: impl FnMut(),
 ) {
     let mut last_size = initial_geometry;
+    let mut last_failure = None;
     while !should_quit.load(Ordering::Acquire) {
         let new_size = match geometry() {
-            Ok(size) => size,
-            Err(GeometryError::Gone(error)) => {
-                crate::logging::client_geometry_query_failed("poll", true, true, &error);
+            Ok(size) => {
+                last_failure = None;
+                size
+            }
+            Err(GeometryError::Gone(error) | GeometryError::Unavailable(error)) => {
+                crate::logging::client_geometry_query_failed(
+                    "poll", "tty_gone", "detached", &error,
+                );
                 let _ = resize_tx.blocking_send(ClientLoopEvent::Detach);
                 return;
             }
             Err(GeometryError::Transient(error)) => {
-                crate::logging::client_geometry_query_failed("poll", false, true, &error);
+                let key = (error.kind(), error.raw_os_error());
+                if last_failure != Some(key) {
+                    crate::logging::client_geometry_query_failed(
+                        "poll",
+                        "transient_query_failure",
+                        "geometry_retained",
+                        &error,
+                    );
+                    last_failure = Some(key);
+                }
                 last_size
             }
         };

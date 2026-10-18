@@ -174,25 +174,33 @@ fn clean_terminal_loss_exit_is_final_even_with_reconnect_enabled() {
 /// Exercise the real guard only in an exec'd child with its own controlling PTY.
 #[test]
 fn startup_loss_paths_restore_an_isolated_terminal_guard() {
-    use portable_pty::{CommandBuilder, PtySize};
-    const MARKER: &[u8] = b"GEOMETRY_GUARD_RESTORED";
-    let pair = portable_pty::native_pty_system()
-        .openpty(PtySize {
+    use portable_pty::PtySize;
+    run_pty_worker(
+        "startup_guard_worker",
+        PtySize {
             rows: 40,
             cols: 132,
             pixel_width: 0,
             pixel_height: 0,
-        })
-        .unwrap();
+        },
+        true,
+    );
+}
+
+fn run_pty_worker(worker: &str, size: portable_pty::PtySize, controlling: bool) {
+    use portable_pty::CommandBuilder;
+    const MARKER: &[u8] = b"GEOMETRY_GUARD_RESTORED";
+    let pair = portable_pty::native_pty_system().openpty(size).unwrap();
     let before = pair.master.get_termios().expect("owned PTY modes");
     let mut command = CommandBuilder::new(std::env::current_exe().unwrap());
     command.args([
         "--exact",
-        "client::geometry_tests::startup_guard_worker",
+        &format!("client::geometry_tests::{worker}"),
         "--ignored",
         "--nocapture",
         "--test-threads=1",
     ]);
+    command.set_controlling_tty(controlling);
     command.env("TERM", "xterm-256color");
     for (key, _) in std::env::vars_os() {
         if key.to_str().is_some_and(|key| key.starts_with("FLOCK_")) {
@@ -203,7 +211,7 @@ fn startup_loss_paths_restore_an_isolated_terminal_guard() {
     if std::env::var_os("FLOCK_TEST_TTY_SILENT").is_some() {
         command.env("FLOCK_TEST_TTY_SILENT", "1");
     }
-    let mut child = pair.slave.spawn_command(command).unwrap();
+    let child = pair.slave.spawn_command(command).unwrap();
     let mut reader = pair.master.try_clone_reader().unwrap();
     let (sent, received) = std::sync::mpsc::channel();
     let reading = std::thread::spawn(move || {
@@ -231,24 +239,26 @@ fn startup_loss_paths_restore_an_isolated_terminal_guard() {
             break false;
         }
         match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(chunk) => output.extend(chunk),
+            Ok(chunk) => {
+                output.extend(chunk);
+                if output
+                    .windows(b"RESIZE_GEOMETRY_NOW".len())
+                    .any(|part| part == b"RESIZE_GEOMETRY_NOW")
+                {
+                    pair.master
+                        .resize(portable_pty::PtySize {
+                            rows: 40,
+                            cols: 132,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        })
+                        .unwrap();
+                }
+            }
             Err(_) => break false,
         }
     };
-    if !restored {
-        crate::platform::terminal_geometry::terminate_test_child(child.as_mut()).unwrap();
-    }
-    let exit_deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= exit_deadline {
-            crate::platform::terminal_geometry::terminate_test_child(child.as_mut()).unwrap();
-            break child.wait().unwrap();
-        }
-        std::thread::yield_now();
-    };
+    let status = finish_pty_child(child, !restored);
     let after = pair.master.get_termios().expect("retained owned PTY modes");
     drop(pair.slave);
     drop(received);
@@ -262,7 +272,12 @@ fn startup_loss_paths_restore_an_isolated_terminal_guard() {
     assert_eq!(before.input_flags, after.input_flags);
     assert_eq!(before.output_flags, after.output_flags);
     assert_eq!(before.control_flags, after.control_flags);
-    assert_eq!(before.local_flags, after.local_flags);
+    assert_eq!(
+        crate::platform::terminal_geometry::tests::configured_local_flags(
+            before.local_flags.bits()
+        ),
+        crate::platform::terminal_geometry::tests::configured_local_flags(after.local_flags.bits()),
+    );
     assert_eq!(before.control_chars, after.control_chars);
 }
 
@@ -281,7 +296,7 @@ fn startup_guard_worker() {
     }
 
     io::stdout().write_all(b"GEOMETRY_STAGE_QUERY\n").unwrap();
-    let initial = current_terminal_geometry(false).unwrap();
+    let initial = terminal_geometry_query()(false).unwrap();
     assert_eq!((initial.0, initial.1), (132, 40));
     assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     // Drive the actual pre-handshake return against an isolated socket.
@@ -304,7 +319,7 @@ fn startup_guard_worker() {
         None,
         true,
         false,
-        |_| Err(GeometryError::Gone(io::ErrorKind::NotConnected.into())),
+        Box::new(|_| Err(GeometryError::Gone(io::ErrorKind::NotConnected.into()))),
         None,
         &mut pending,
         &mut input,
@@ -336,7 +351,7 @@ fn startup_guard_worker() {
             run_client_loop(
                 socket,
                 initial,
-                Err(GeometryError::Gone(io::ErrorKind::NotConnected.into())),
+                Box::new(|_| Err(GeometryError::Gone(io::ErrorKind::NotConnected.into()))),
                 quit.clone(),
                 sound,
                 3,
@@ -377,4 +392,358 @@ fn startup_guard_worker() {
         .write_all(b"GEOMETRY_GUARD_RESTORED\n")
         .unwrap();
     io::stdout().flush().unwrap();
+}
+
+/// The waiter owns the child throughout: no copied PID can outlive reaping.
+/// A bounded channel wait replaces the former yield loop. Cancellation kills
+/// only this owned child through its standard process handle.
+fn finish_pty_child(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    cancel: bool,
+) -> portable_pty::ExitStatus {
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let (sent, received) = std::sync::mpsc::channel();
+    let waiting = std::thread::spawn(move || {
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            match stopped.recv_timeout(Duration::from_millis(100)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    terminate_test_child(child.as_mut()).unwrap();
+                    break child.wait().unwrap();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
+            }
+        };
+        let _ = sent.send(status);
+    });
+    if cancel {
+        stop.send(()).unwrap();
+    }
+    let status = match received.recv_timeout(Duration::from_secs(5)) {
+        Ok(status) => status,
+        Err(_) => {
+            let _ = stop.send(());
+            received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("owned helper must stop")
+        }
+    };
+    waiting.join().unwrap();
+    status
+}
+fn terminate_test_child(child: &mut (dyn portable_pty::Child + Send + Sync)) -> io::Result<()> {
+    let child = child
+        .as_any_mut()
+        .downcast_mut::<std::process::Child>()
+        .expect("the Unix PTY backend owns a standard child");
+    if child.try_wait()?.is_none() {
+        child.kill()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn zero_startup_geometry_waits_until_sized_and_transient_logs_only_transition() {
+    let clock = std::cell::Cell::new(Instant::now());
+    let samples = std::cell::Cell::new(0);
+    let logs = crate::logging::capture_logs(|| {
+        let result = wait_for_initial_geometry(
+            || {
+                let sample = samples.get();
+                samples.set(sample + 1);
+                if sample < 3 {
+                    Err(GeometryError::Transient(io::ErrorKind::WouldBlock.into()))
+                } else {
+                    Ok((132, 40, 0, 0))
+                }
+            },
+            || clock.get(),
+            |duration| clock.set(clock.get() + duration),
+        )
+        .unwrap();
+        assert_eq!(result, Some((132, 40, 0, 0)));
+    });
+    assert_eq!(samples.get(), 4);
+    assert_eq!(
+        logs.matches("client.geometry_query_failed").count(),
+        1,
+        "{logs}"
+    );
+}
+
+#[test]
+fn zero_geometry_deadline_is_visible_typed_and_nonzero_without_invented_size() {
+    let clock = std::cell::Cell::new(Instant::now());
+    let started = clock.get();
+    let result = wait_for_initial_geometry(
+        || Err(GeometryError::Transient(io::ErrorKind::WouldBlock.into())),
+        || clock.get(),
+        |duration| clock.set(clock.get() + duration),
+    );
+    assert_eq!(clock.get() - started, INITIAL_GEOMETRY_TIMEOUT);
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    let client_error = ClientError::TerminalGeometry(error);
+    assert!(client_error
+        .to_string()
+        .contains("timeout: terminal geometry"));
+    assert!(!client_error.to_string().contains("80x24"));
+    assert!(!AttachAttemptError::Handshake(client_error).is_redial_failure());
+}
+
+#[test]
+fn stdio_pty_without_controlling_tty_attaches() {
+    run_pty_worker(
+        "stdio_attach_worker",
+        portable_pty::PtySize {
+            rows: 40,
+            cols: 132,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        false,
+    );
+}
+
+#[test]
+#[ignore = "exec-only fixture requires stdio on an isolated PTY without a controlling tty"]
+fn stdio_attach_worker() {
+    assert!(std::env::var_os("FLOCK_TEST_TTY_CHILD").is_some());
+    // guardrails-ok(hermetic): this exec fixture owns a session without a controlling tty.
+    assert!(std::fs::File::open("/dev/tty").is_err());
+    exercise_geometry_attach(terminal_geometry_query());
+    io::stdout()
+        .write_all(b"GEOMETRY_GUARD_RESTORED\n")
+        .unwrap();
+    io::stdout().flush().unwrap();
+}
+
+/// A successful real Hello/Welcome exchange proves startup reached attachment.
+fn exercise_geometry_attach(mut probe: GeometryQuery) {
+    let directory = crate::structured::launch::SessionConfigDir::create(Path::new("/tmp")).unwrap();
+    let path = directory.path().join("geometry.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    // A finite nonblocking accept wait lets cleanup work even if startup fails.
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut socket = runtime
+            .block_on(async {
+                let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("startup never connected")
+                    .unwrap()
+                    .0
+            })
+            .into_std()
+            .unwrap();
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let hello: ClientMessage = protocol::read_message(&mut socket, MAX_FRAME_SIZE).unwrap();
+        assert!(matches!(
+            hello,
+            ClientMessage::Hello {
+                cols: 132,
+                rows: 40,
+                ..
+            }
+        ));
+        protocol::write_message(
+            &mut socket,
+            &ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                encoding: RenderEncoding::TerminalAnsi,
+                error: None,
+            },
+        )
+        .unwrap();
+        let mut end = [0];
+        assert_eq!(io::Read::read(&mut socket, &mut end).unwrap(), 0);
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut measured = false;
+    let query: GeometryQuery = Box::new(move |kitty| {
+        if measured {
+            Err(GeometryError::Gone(io::Error::from_raw_os_error(libc::EIO)))
+        } else {
+            let result = probe(kitty);
+            measured = result.is_ok();
+            result
+        }
+    });
+    let (_sent, mut input) = tokio::sync::mpsc::channel(4);
+    let mut pending = None;
+    let signal = AttachSignal::default();
+    let result = run_attach_attempt(
+        &path,
+        RenderEncoding::TerminalAnsi,
+        None,
+        true,
+        false,
+        query,
+        None,
+        &mut pending,
+        &mut input,
+        &runtime,
+        &Arc::new(AtomicBool::new(false)),
+        &crate::config::SoundConfig::default(),
+        3,
+        false,
+        Instant::now(),
+        false,
+        &signal,
+    );
+    server.join().unwrap();
+    assert!(result.is_ok());
+    assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
+}
+
+#[test]
+fn transient_poll_logging_is_only_on_failure_state_transitions() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let quit = Arc::new(AtomicBool::new(false));
+    let mut count = 0;
+    let logs = crate::logging::capture_logs(|| {
+        resize_poll_loop_with(
+            tx,
+            (132, 40, 0, 0),
+            &quit,
+            || {
+                count += 1;
+                if count == 5 {
+                    quit.store(true, Ordering::Release);
+                }
+                if count == 3 {
+                    Ok((132, 40, 0, 0))
+                } else {
+                    Err(GeometryError::Transient(io::ErrorKind::Interrupted.into()))
+                }
+            },
+            || {},
+        )
+    });
+    assert_eq!(
+        logs.matches("client.geometry_query_failed").count(),
+        2,
+        "{logs}"
+    );
+}
+
+#[test]
+fn real_zero_pty_startup_attaches_when_sized_before_deadline() {
+    run_pty_worker(
+        "zero_attach_worker",
+        portable_pty::PtySize {
+            rows: 0,
+            cols: 0,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        true,
+    );
+}
+#[test]
+#[ignore = "exec-only fixture starts with an isolated zero-size PTY"]
+fn zero_attach_worker() {
+    assert!(std::env::var_os("FLOCK_TEST_TTY_CHILD").is_some());
+    let mut probe = terminal_geometry_query();
+    let mut signaled = false;
+    exercise_geometry_attach(Box::new(move |kitty| {
+        let result = probe(kitty);
+        if !signaled
+            && matches!(&result, Err(GeometryError::Transient(error)) if error.kind() == io::ErrorKind::WouldBlock)
+        {
+            signaled = true;
+            io::stdout().write_all(b"RESIZE_GEOMETRY_NOW\n").unwrap();
+            io::stdout().flush().unwrap();
+        }
+        result
+    }));
+    io::stdout()
+        .write_all(b"GEOMETRY_GUARD_RESTORED\n")
+        .unwrap();
+    io::stdout().flush().unwrap();
+}
+
+fn startup_error_child(mode: &str, expected: &str) {
+    use std::process::Stdio;
+    let mut command = crate::platform::terminal_geometry::tests::detached_command();
+    command
+        .args([
+            "--exact",
+            "client::geometry_tests::startup_error_worker",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|key| key.starts_with("FLOCK_")) {
+            command.env_remove(key);
+        }
+    }
+    command.env("FLOCK_TEST_GEOMETRY_ERROR", mode);
+    let mut child = crate::process::TracedCommand::from_command(command, "geometry-startup-error")
+        .spawn_traced()
+        .unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let status = finish_pty_child(Box::new(child), false);
+    let mut output = String::new();
+    io::Read::read_to_string(&mut stderr, &mut output).unwrap();
+    assert_eq!(
+        status.exit_code(),
+        crate::cli::exit::FAILURE as u32,
+        "{output}"
+    );
+    assert!(output.contains(expected), "{output}");
+}
+#[test]
+fn no_tty_startup_has_visible_error_and_nonzero_exit() {
+    startup_error_child("no_tty", "terminal_unavailable: no terminal is available");
+}
+#[test]
+fn unsized_startup_has_visible_deadline_error_and_nonzero_exit() {
+    startup_error_child(
+        "deadline",
+        "timeout: terminal geometry did not become nonzero",
+    );
+}
+#[test]
+#[ignore = "exec-only fixture needs explicitly isolated stdio and session"]
+fn startup_error_worker() {
+    let mode = std::env::var("FLOCK_TEST_GEOMETRY_ERROR").expect("requires explicit fixture mode");
+    let mut probe = terminal_geometry_query();
+    let clock = std::cell::Cell::new(Instant::now());
+    let result = wait_for_initial_geometry(
+        || {
+            if mode == "deadline" {
+                Err(GeometryError::Transient(io::ErrorKind::WouldBlock.into()))
+            } else {
+                probe(false)
+            }
+        },
+        || clock.get(),
+        |duration| clock.set(clock.get() + duration),
+    );
+    match result {
+        Err(error) => {
+            // The exec fixture must expose the user-facing error to its parent.
+            writeln!(io::stderr(), "{}", ClientError::TerminalGeometry(error)).unwrap();
+            std::process::exit(crate::cli::exit::FAILURE);
+        }
+        other => panic!("startup must report a visible error: {other:?}"),
+    }
 }
