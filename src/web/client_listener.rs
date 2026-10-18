@@ -2,7 +2,7 @@
 use super::listener_foundation::accept_next;
 use super::wire::timing::{Clock, SystemClock};
 use super::{client_exchange, gui, wire::Core};
-use crate::api::client_listener::{publish, Status};
+use crate::api::client_listener::{Health, Status};
 use crate::client_open::Codes;
 use axum::{
     extract::{ConnectInfo, Request, State},
@@ -36,7 +36,12 @@ const FUNNEL_DEADLINE: Duration = Duration::from_secs(5);
 /// Maximum status JSON bytes accepted from the public-funnel probe.
 const FUNNEL_STATUS_BYTES: usize = 65_536;
 /// Own every HTTP task; acceptance and its monotonic clock are injectable without test sleeps.
-async fn serve<A, F>(mut accept: A, router: Router, clock: Arc<dyn Clock>) -> io::Result<()>
+async fn serve<A, F>(
+    mut accept: A,
+    router: Router,
+    clock: Arc<dyn Clock>,
+    health: Health,
+) -> io::Result<()>
 where
     A: FnMut() -> F,
     F: Future<Output = io::Result<(tokio::net::TcpStream, SocketAddr)>>,
@@ -45,7 +50,7 @@ where
     let mut clients = JoinSet::new();
     loop {
         while clients.try_join_next().is_some() {}
-        let (socket, peer) = accept_next(&mut accept, clock.as_ref()).await?;
+        let (socket, peer) = accept_next(&mut accept, clock.as_ref(), &health).await?;
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             continue;
         };
@@ -70,6 +75,7 @@ where
 /// Prepared before handoff ready; only run activates acceptance, after commit.
 pub(crate) struct Listener {
     pub(crate) socket: TcpListener,
+    pub(crate) health: Health,
     core: Core,
     prepared: Option<(tokio::net::TcpListener, Router)>,
     task: Option<JoinHandle<io::Result<()>>>,
@@ -88,6 +94,7 @@ impl Listener {
         codes: Codes,
         data: PathBuf,
         inherited: Option<TcpListener>,
+        health: Health,
     ) -> io::Result<Option<Self>> {
         let Some(bind) = bind else {
             return if inherited.is_none() {
@@ -96,6 +103,7 @@ impl Listener {
                 Err(io::ErrorKind::InvalidInput.into())
             };
         };
+        crate::platform::client_listener::require_loopback(bind)?;
         if bind.ip() != Ipv4Addr::LOCALHOST {
             return Err(io::ErrorKind::InvalidInput.into());
         }
@@ -104,6 +112,7 @@ impl Listener {
             None => TcpListener::bind(bind)?,
         };
         let actual = socket.local_addr()?;
+        crate::platform::client_listener::require_loopback(actual)?;
         if actual.ip() != bind.ip() || (bind.port() != 0 && actual.port() != bind.port()) {
             return Err(io::ErrorKind::InvalidInput.into());
         }
@@ -120,6 +129,7 @@ impl Listener {
             .merge(gui::router(actual)?)
             .layer(middleware::from_fn_with_state((actual, csp), guard));
         Ok(Some(Self {
+            health,
             socket,
             core,
             prepared: Some((acceptor, router)),
@@ -129,9 +139,10 @@ impl Listener {
     /// Start only inside the owning server loop, after handoff commit if importing.
     pub(crate) fn activate(&mut self) {
         if let Some((socket, router)) = self.prepared.take() {
-            publish(Status::Listening);
+            self.health.publish(Status::Listening);
+            let health = self.health.clone();
             self.task = Some(tokio::spawn(async move {
-                serve(|| socket.accept(), router, Arc::new(SystemClock)).await
+                serve(|| socket.accept(), router, Arc::new(SystemClock), health).await
             }));
         }
     }
@@ -164,7 +175,7 @@ async fn guard(
         .insert(header::CONTENT_SECURITY_POLICY, csp);
     response
 }
-/// Only the declared funnel map grants a known inactive result; additions are tolerated.
+/// Inspect forwarding targets while tolerating unrelated configuration metadata.
 #[derive(serde::Deserialize)]
 struct FunnelStatus {
     #[serde(rename = "AllowFunnel", default)]
@@ -204,7 +215,7 @@ fn validate_funnel(output: std::process::Output, port: u16) -> io::Result<()> {
 
 /// Proxy strings may be a bare port, an authority, or an HTTP(S) URL (Tailscale serve schema).
 fn target_port(target: &str) -> Option<u16> {
-    let default = if target.to_ascii_lowercase().starts_with("https") {
+    let default = if target.to_ascii_lowercase().starts_with("https://") {
         443
     } else {
         80

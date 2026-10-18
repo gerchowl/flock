@@ -72,6 +72,11 @@ fictional credential to an isolated deterministic token record. It does not
 claim full client/subscription-script conformance before the later slices and
 S8's complete adapter have landed.
 
+Both the configured listener address and every adopted listening descriptor
+must be in IPv4's `127.0.0.0/8` block. Wildcard and non-loopback addresses receive
+a typed `NonLoopback` refusal before the forwarding probe or router construction
+(#1960). Descriptor adoption closes a refused socket through its sole owner.
+
 The listener requires numeric Host and same-origin Origin matching its actual
 bound IPv4 authority (normalizing HTTP's default port only). API routes require
 Origin; top-level GUI navigation may omit it. Forwarded headers grant nothing.
@@ -110,15 +115,24 @@ server diagnostics; neither credentials, one-time codes nor raw errors do.
 
 The separately reviewed foundation supplies the reusable accept policy. It treats peer resets,
 interrupted accepts and other per-connection errors as recoverable and logs them
-at debug level. Descriptor or buffer exhaustion emits a structured warning and
-waits `ACCEPT_RESOURCE_BACKOFF` (100 ms) on the supplied monotonic clock before
+at debug level. Resource exhaustion and unclassified errors (including errors
+without an errno) emit a structured warning and
+wait `ACCEPT_RESOURCE_BACKOFF` (100 ms) on the supplied monotonic clock before
 accepting again. Only an invalid listener descriptor (`EBADF`, `EINVAL`,
 `ENOTSOCK`) ends that listener task and publishes the typed `failed` state once.
 It does not end the headless server loop or its agents. Ping carries the optional
 `client_listener` state (`listening` or `failed`), absent when disabled.
+This state belongs to the logical server and is injected into its API socket
+and listener owner. Handoff rollback retains it when replacing the API socket;
+independent server instances never share a process static.
 
-Every SCM_RIGHTS descriptor is made close-on-exec at the receive boundary before
-import can spawn a child. The listener descriptor helper additionally verifies
-that a transferred socket is listening and retains exporter rollback ownership
-through duplication. The mounting change integrates those helpers into the listener lifecycle and
-the handoff manifest described above.
+On Linux, `MSG_CMSG_CLOEXEC` makes every SCM_RIGHTS descriptor close-on-exec
+atomically at receipt. Darwin has no equivalent receive flag: the immediate
+fcntl leaves a residual receive-to-fcntl window against concurrent fork/exec.
+The importer is already multithreaded: its deadline watchdog starts before
+receipt (logging may also own a worker), but those threads do not spawn children.
+The importer does not spawn its own children until descriptor protection is done.
+Every returned descriptor is protected before import can spawn a child. The listener descriptor helper additionally verifies
+that a transferred socket is IPv4, stream-typed and listening and retains exporter rollback ownership
+through duplication. This mount integrates the helpers into the listener lifecycle
+and the handoff manifest described above.

@@ -14,7 +14,8 @@ async fn recover(errno: i32, resource: bool) {
     let attempts = Arc::new(AtomicUsize::new(0));
     let count = attempts.clone();
     let clock = Arc::new(TestClock::new());
-    publish(Status::Listening);
+    let health = Health::default();
+    health.publish(Status::Listening);
     let task = tokio::spawn(serve(
         move || {
             let listener = listener.clone();
@@ -29,6 +30,7 @@ async fn recover(errno: i32, resource: bool) {
         },
         Router::new().route("/", axum::routing::get(|| async { "accepted" })),
         clock.clone(),
+        health.clone(),
     ));
     if resource {
         clock.deadline(100).await;
@@ -52,10 +54,7 @@ async fn recover(errno: i32, resource: bool) {
         .unwrap();
     assert!(response.starts_with("HTTP/1.1 200"));
     assert!(response.ends_with("accepted"));
-    assert_eq!(
-        crate::api::client_listener::status(),
-        Some(Status::Listening)
-    );
+    assert_eq!(health.status(), Some(Status::Listening));
     assert!(!task.is_finished());
     task.abort();
     let _ = task.await;
@@ -82,11 +81,13 @@ pub(crate) async fn failed_listener() -> (crate::test_support::TempDir, Listener
     let data = crate::test_support::TempDir::socket();
     let core = Core::new(data.path().to_owned()).await.unwrap();
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
-    publish(Status::Listening);
+    let health = Health::default();
+    health.publish(Status::Listening);
     let task = tokio::spawn(serve(
         || async { Err(io::Error::from_raw_os_error(libc::EBADF)) },
         Router::new(),
         Arc::new(SystemClock),
+        health.clone(),
     ));
     // Observe termination with a bounded executor wait, without a test sleep.
     bounded(async {
@@ -98,6 +99,7 @@ pub(crate) async fn failed_listener() -> (crate::test_support::TempDir, Listener
     (
         data,
         Listener {
+            health,
             socket,
             core,
             prepared: None,
@@ -108,7 +110,7 @@ pub(crate) async fn failed_listener() -> (crate::test_support::TempDir, Listener
 #[tokio::test]
 async fn fatal_accept_marks_only_the_listener_failed() {
     let (_data, listener) = failed_listener().await;
-    assert_eq!(crate::api::client_listener::status(), Some(Status::Failed));
+    assert_eq!(listener.health.status(), Some(Status::Failed));
     listener.shutdown().await.unwrap();
 }
 
@@ -174,8 +176,46 @@ fn serve_proxy_port_forms_match_the_bound_authority() {
         ("127.0.0.1:45678", 45678),
         ("http://127.0.0.1:45678/path", 45678),
         ("https://fixture.example", 443),
+        ("https-proxy.example", 80),
         ("http://fixture.example", 80),
     ] {
         assert_eq!(target_port(target), Some(port));
     }
+}
+
+async fn refuse_wildcard(inherit_as_loopback: bool) {
+    use crate::platform::client_listener::InvalidListener;
+    let socket = TcpListener::bind("0.0.0.0:0").unwrap();
+    let actual = socket.local_addr().unwrap();
+    let requested = if inherit_as_loopback {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, actual.port()))
+    } else {
+        actual
+    };
+    let root = crate::test_support::TempDir::socket();
+    let error = Listener::prepare(
+        Some(requested),
+        Codes::default(),
+        root.path().to_owned(),
+        Some(socket),
+        Health::default(),
+    )
+    .await
+    .err()
+    .expect("wildcard must refuse before the forwarding probe");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<InvalidListener>()),
+        Some(&InvalidListener::NonLoopback)
+    );
+}
+#[tokio::test]
+async fn configured_wildcard_listener_is_a_typed_refusal_before_any_probe() {
+    refuse_wildcard(false).await;
+}
+#[tokio::test]
+async fn inherited_wildcard_listener_is_a_typed_refusal_before_any_probe() {
+    refuse_wildcard(true).await;
 }

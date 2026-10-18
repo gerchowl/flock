@@ -241,6 +241,7 @@ sys.stdin.read()
                 &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 None,
                 &std::sync::Mutex::default(),
+                &crate::api::client_listener::Health::default(),
             )
             .unwrap();
         }

@@ -9,14 +9,16 @@ async fn bounded<T>(work: impl Future<Output = T>) -> T {
         .await
         .expect("accept producer stayed silent")
 }
-async fn recover(errno: i32, resource: bool) {
+async fn recover(errno: Option<i32>, resource: bool) {
     let listener = Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
     let address = listener.local_addr().unwrap();
     let attempts = Arc::new(AtomicUsize::new(0));
     let count = attempts.clone();
     let clock = Arc::new(TestClock::new());
     let supplied = clock.clone();
-    publish(Status::Listening);
+    let health = Health::default();
+    health.publish(Status::Listening);
+    let shared = health.clone();
     let task = tokio::spawn(async move {
         accept_next(
             &mut move || {
@@ -24,13 +26,16 @@ async fn recover(errno: i32, resource: bool) {
                 let count = count.clone();
                 async move {
                     if count.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Err(io::Error::from_raw_os_error(errno))
+                        Err(errno
+                            .map(io::Error::from_raw_os_error)
+                            .unwrap_or_else(|| io::Error::other("unclassified accept failure")))
                     } else {
                         listener.accept().await
                     }
                 }
             },
             supplied.as_ref(),
+            &shared,
         )
         .await
     });
@@ -54,10 +59,7 @@ async fn recover(errno: i32, resource: bool) {
     let mut client = client;
     bounded(client.read_exact(&mut bytes)).await.unwrap();
     assert_eq!(&bytes, b"ok");
-    assert_eq!(
-        crate::api::client_listener::status(),
-        Some(Status::Listening)
-    );
+    assert_eq!(health.status(), Some(Status::Listening));
 }
 #[tokio::test]
 async fn connection_accept_errors_keep_serving() {
@@ -67,20 +69,21 @@ async fn connection_accept_errors_keep_serving() {
         libc::EINTR,
         libc::EPROTO,
     ] {
-        recover(errno, false).await;
+        recover(Some(errno), false).await;
     }
 }
 #[tokio::test]
 async fn resource_accept_errors_use_the_supplied_clock_then_keep_serving() {
     for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
-        recover(errno, true).await;
+        recover(Some(errno), true).await;
     }
 }
 #[tokio::test]
 async fn fatal_accept_marks_only_the_listener_failed() {
     let clock = TestClock::new();
+    let health = Health::default();
     for errno in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
-        publish(Status::Listening);
+        health.publish(Status::Listening);
         let mut calls = 0;
         let result: io::Result<()> = bounded(accept_next(
             &mut || {
@@ -88,11 +91,12 @@ async fn fatal_accept_marks_only_the_listener_failed() {
                 async move { Err(io::Error::from_raw_os_error(errno)) }
             },
             &clock,
+            &health,
         ))
         .await;
         assert_eq!(result.unwrap_err().raw_os_error(), Some(errno));
         assert_eq!(calls, 1);
-        assert_eq!(crate::api::client_listener::status(), Some(Status::Failed));
+        assert_eq!(health.status(), Some(Status::Failed));
     }
 }
 #[test]
@@ -128,4 +132,10 @@ fn listener_status_is_typed_and_optional_in_ping() {
             matches!(decoded,ResponseResult::Pong{client_listener:Some(observed),..} if observed==status)
         );
     }
+}
+
+#[tokio::test]
+async fn unknown_accept_errors_back_off_with_the_supplied_clock() {
+    recover(Some(libc::EIO), true).await;
+    recover(None, true).await;
 }

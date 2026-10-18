@@ -35,7 +35,7 @@ retries = 0
 
 [[profile.default.overrides]]
 # #1894: foundation accept and descriptor safety must fail on their first attempt.
-filter = 'binary(=flk) & (test(web::listener_foundation::) | test(platform::client_listener::) | test(platform::received_fd::) | test(receiver_accumulates_150_fds_across_batches_in_order))'
+filter = 'binary(=flk) & (test(api::client_listener::) | test(api::server::tests::ping_reports_only_) | test(web::listener_foundation::) | test(platform::client_listener::) | test(platform::received_fd::) | test(receiver_accumulates_150_fds_across_batches_in_order))'
 retries = 0
 
 [[profile.default.overrides]]

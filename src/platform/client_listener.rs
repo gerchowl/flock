@@ -1,39 +1,128 @@
 //! Owned listening-socket descriptors exchanged by the live-handoff protocol.
 use std::{
     io,
-    net::TcpListener,
-    os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
+    net::{SocketAddr, TcpListener},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 /// Accept recovery classes shared by the listener owner and structured logging.
+#[cfg(feature = "web")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AcceptFailure {
     Connection,
     Resource,
     Fatal,
+    Unknown,
 }
 /// Only invalid listener descriptors are fatal; all other peer/protocol errors are recoverable.
+#[cfg(feature = "web")]
 pub(crate) fn accept_failure(error: &io::Error) -> AcceptFailure {
     match error.raw_os_error() {
         Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK) => AcceptFailure::Fatal,
         Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => AcceptFailure::Resource,
-        _ => AcceptFailure::Connection,
+        Some(
+            libc::ECONNABORTED
+            | libc::ECONNRESET
+            | libc::EINTR
+            | libc::EPROTO
+            | libc::ENETDOWN
+            | libc::ENETUNREACH
+            | libc::EHOSTUNREACH
+            | libc::ENOPROTOOPT
+            | libc::EOPNOTSUPP
+            | libc::ETIMEDOUT
+            | libc::ENETRESET,
+        ) => AcceptFailure::Connection,
+        _ => AcceptFailure::Unknown,
     }
 }
 /// Duplicate without relinquishing the exporter's rollback ownership.
-pub(crate) fn duplicate(listener: &TcpListener) -> io::Result<RawFd> {
-    Ok(listener.try_clone()?.into_raw_fd())
+// Non-web builds transfer PTYs but do not adopt the optional TCP listener.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub(crate) fn duplicate(listener: &TcpListener) -> io::Result<OwnedFd> {
+    Ok(listener.try_clone()?.into())
 }
-/// Consume the final transferred descriptor and require an actual listening socket.
+/// Typed refusal of a descriptor that cannot satisfy the IPv4 listener contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InvalidListener {
+    Missing,
+    Family,
+    SocketType,
+    NotListening,
+    /// The bound socket would permit exposure beyond IPv4 loopback.
+    NonLoopback,
+}
+impl std::fmt::Display for InvalidListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "missing structured listener descriptor",
+            Self::Family => "structured listener must use the IPv4 address family",
+            Self::SocketType => "structured listener must be a stream socket",
+            Self::NotListening => "structured listener socket is not listening",
+            Self::NonLoopback => "structured listener must bind IPv4 loopback",
+        })
+    }
+}
+impl std::error::Error for InvalidListener {}
+/// Refuse any address outside IPv4's loopback block, including wildcard binds.
+pub(crate) fn require_loopback(address: SocketAddr) -> io::Result<()> {
+    if !matches!(address,SocketAddr::V4(address) if address.ip().is_loopback()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            InvalidListener::NonLoopback,
+        ));
+    }
+    Ok(())
+}
+/// Consume the final owned descriptor, requiring IPv4, stream type and listening state.
+// Non-web builds transfer PTYs but do not adopt the optional TCP listener.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
 pub(crate) fn take(fds: &mut Vec<RawFd>) -> io::Result<TcpListener> {
     let fd = fds
         .pop()
-        .ok_or_else(|| io::Error::other("missing structured listener descriptor"))?;
-    // The authenticated SCM_RIGHTS receiver transferred exclusive ownership of this fd.
-    let listener = unsafe { TcpListener::from_raw_fd(fd) };
-    crate::platform::received_fd::close_on_exec(listener.as_raw_fd())?;
-    if !listening(listener.as_raw_fd())? {
-        return Err(io::ErrorKind::InvalidInput.into());
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, InvalidListener::Missing))?;
+    // SCM_RIGHTS transferred exclusive ownership; every return drops this owner exactly once.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    crate::platform::received_fd::close_on_exec(owned.as_raw_fd())?;
+    // Zeroed storage is a valid initialized output buffer for getsockname.
+    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of_val(&address) as libc::socklen_t;
+    // The output pointer references the full initialized storage and its capacity.
+    if unsafe {
+        libc::getsockname(
+            fd,
+            (&mut address as *mut libc::sockaddr_storage).cast(),
+            &mut length,
+        )
+    } < 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            InvalidListener::SocketType,
+        ));
     }
+    let mut socket_type: libc::c_int = 0;
+    // SO_TYPE returns an initialized C integer.
+    unsafe {
+        option(fd, libc::SOL_SOCKET, libc::SO_TYPE, &mut socket_type).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, InvalidListener::SocketType)
+        })?;
+    }
+    let refusal = if address.ss_family as libc::c_int != libc::AF_INET {
+        Some(InvalidListener::Family)
+    } else if socket_type != libc::SOCK_STREAM {
+        Some(InvalidListener::SocketType)
+    } else if !listening(fd)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, InvalidListener::NotListening))?
+    {
+        Some(InvalidListener::NotListening)
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+    }
+    let listener = TcpListener::from(owned);
+    require_loopback(listener.local_addr()?)?;
     Ok(listener)
 }
 /// # Safety
@@ -76,11 +165,12 @@ fn listening(fd: RawFd) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn transferred_listener_keeps_the_port_and_is_close_on_exec() {
+    use std::os::fd::IntoRawFd;
+    #[tokio::test]
+    async fn transferred_listener_keeps_the_port_and_is_close_on_exec() {
         let original = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = original.local_addr().unwrap();
-        let mut descriptors = vec![duplicate(&original).unwrap()];
+        let mut descriptors = vec![duplicate(&original).unwrap().into_raw_fd()];
         // Simulate the absence of CLOEXEC on the received SCM_RIGHTS descriptor.
         assert_eq!(unsafe { libc::fcntl(descriptors[0], libc::F_SETFD, 0) }, 0);
         let inherited = take(&mut descriptors).unwrap();
@@ -89,17 +179,126 @@ mod tests {
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
         drop(original);
         assert!(TcpListener::bind(address).is_err());
-        let _client = std::net::TcpStream::connect(address).unwrap();
         inherited.set_nonblocking(true).unwrap();
-        let _accepted = inherited.accept().unwrap();
+        let inherited = tokio::net::TcpListener::from_std(inherited).unwrap();
+        let _client = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .expect("connection producer stayed silent")
+        .unwrap();
+        let _accepted = tokio::time::timeout(std::time::Duration::from_secs(5), inherited.accept())
+            .await
+            .expect("connected peer never became accept-ready")
+            .unwrap();
+    }
+    #[test]
+    fn duplicated_listener_has_owned_close_on_drop_semantics() {
+        let original = TcpListener::bind("127.0.0.1:0").unwrap();
+        let owned: OwnedFd = duplicate(&original).unwrap();
+        let fd = owned.as_raw_fd();
+        drop(owned);
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert!(original.local_addr().is_ok());
     }
     #[test]
     fn missing_or_non_listening_descriptor_is_refused() {
-        assert!(take(&mut Vec::new()).is_err());
+        let reason = |error: io::Error, expected| {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<InvalidListener>()),
+                Some(&expected)
+            );
+        };
+        reason(take(&mut Vec::new()).unwrap_err(), InvalidListener::Missing);
+        let root = crate::test_support::TempDir::socket();
+        let file = std::fs::File::create(root.path().join("not-a-socket")).unwrap();
+        reason(
+            take(&mut vec![file.into_raw_fd()]).unwrap_err(),
+            InvalidListener::SocketType,
+        );
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        assert!(take(&mut vec![socket.into_raw_fd()]).is_err());
+        reason(
+            take(&mut vec![socket.into_raw_fd()]).unwrap_err(),
+            InvalidListener::SocketType,
+        );
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        assert!(take(&mut vec![socket.into_raw_fd()]).is_err());
+        reason(
+            take(&mut vec![socket.into_raw_fd()]).unwrap_err(),
+            InvalidListener::NotListening,
+        );
+    }
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+    use std::os::fd::IntoRawFd;
+    fn refused(fd: RawFd) {
+        let mut fds = vec![fd];
+        let error = take(&mut fds).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<InvalidListener>()),
+            Some(&InvalidListener::Family)
+        );
+        assert!(fds.is_empty());
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+    #[test]
+    fn listening_unix_socket_is_refused_with_owned_descriptor_cleanup() {
+        let root = crate::test_support::TempDir::socket();
+        let socket = std::os::unix::net::UnixListener::bind(root.path().join("l.sock")).unwrap();
+        refused(socket.into_raw_fd());
+    }
+    #[test]
+    fn listening_ipv6_socket_is_refused_with_owned_descriptor_cleanup() {
+        refused(TcpListener::bind("[::1]:0").unwrap().into_raw_fd());
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::*;
+    use std::os::fd::IntoRawFd;
+    #[test]
+    fn received_wildcard_listener_is_refused_and_closed() {
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let fd = listener.into_raw_fd();
+        let mut fds = vec![fd];
+        let error = take(&mut fds).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<InvalidListener>()),
+            Some(&InvalidListener::NonLoopback)
+        );
+        assert!(fds.is_empty());
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+    #[test]
+    fn loopback_exposure_boundary_is_the_entire_ipv4_loopback_block() {
+        for address in ["127.0.0.1:1", "127.0.1.2:1", "127.255.255.255:1"] {
+            require_loopback(address.parse().unwrap()).unwrap();
+        }
+        for address in ["0.0.0.0:1", "192.0.2.1:1", "[::1]:1"] {
+            let error = require_loopback(address.parse().unwrap()).unwrap_err();
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<InvalidListener>()),
+                Some(&InvalidListener::NonLoopback)
+            );
+        }
     }
 }

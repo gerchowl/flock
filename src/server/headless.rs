@@ -212,6 +212,8 @@ pub struct HeadlessServer {
     app: app::App,
     api_tx: Option<api::ApiRequestSender>,
     api_server: Option<api::ServerHandle>,
+    /// Logical-server health survives API socket replacement during handoff rollback.
+    client_wire_health: crate::api::client_listener::Health,
     client_listener: UnixListener,
     /// Bound structured listener and acceptor lifetime, including handoff preparation.
     #[cfg(feature = "web")]
@@ -597,10 +599,15 @@ impl HeadlessServer {
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(config_diagnostics);
 
+        let client_wire_health = api_server
+            .as_ref()
+            .map(|server| server.client_listener.clone())
+            .unwrap_or_default();
         Ok(Self {
             app,
             api_tx,
             api_server,
+            client_wire_health,
             client_listener: listener,
             #[cfg(feature = "web")]
             client_wire: None,
@@ -662,6 +669,7 @@ impl HeadlessServer {
             self.app.client_codes.clone(),
             crate::session::data_dir(),
             inherited,
+            self.client_wire_health.clone(),
         )
         .await?;
         if let Some(wire) = &self.client_wire {
@@ -1437,7 +1445,8 @@ impl HeadlessServer {
             }
             #[cfg(feature = "web")]
             if let Some(wire) = &self.client_wire {
-                fds.push(crate::platform::client_listener::duplicate(&wire.socket)?);
+                use std::os::fd::IntoRawFd;
+                fds.push(crate::platform::client_listener::duplicate(&wire.socket)?.into_raw_fd());
             }
             Ok::<(), io::Error>(())
         })();
@@ -1560,7 +1569,7 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
-        let api_server = api::start_server_with_capabilities(
+        let api_server = api::server::start_server_with_capabilities_and_health(
             api_tx,
             self.app.event_hub.clone(),
             Some(crate::api::schema::ServerCapabilities {
@@ -1571,6 +1580,7 @@ impl HeadlessServer {
                 agent_questions: true,
                 pane_input_write_ack: false,
             }),
+            self.client_wire_health.clone(),
         )?;
 
         let client_path = client_socket_path();
@@ -5244,6 +5254,7 @@ mod tests {
             value
         }
         let (data, failed) = crate::web::client_listener::tests::failed_listener().await;
+        let health = failed.health.clone();
         let mut server = test_headless_server();
         server.app.state.default_shell = "/bin/sh".into();
         server.app.state.config.terminal.default_shell = "/bin/sh".into();
@@ -5251,11 +5262,13 @@ mod tests {
         server.app.next_auto_update_check = None;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         server.app.api_rx = rx;
+        server.client_wire_health = health.clone();
         server.client_wire = Some(failed);
         let quit = server.should_quit.clone();
+        let wake = server.server_event_tx.clone();
         let exercise = async {
             assert_eq!(
-                crate::api::client_listener::status(),
+                health.status(),
                 Some(crate::api::client_listener::Status::Failed)
             );
             let created = request(
@@ -5285,6 +5298,9 @@ mod tests {
             .await
             .expect("shell producer stayed silent after listener failure");
             quit.store(true, Ordering::Release);
+            wake.send(ServerEvent::QuitSignal)
+                .await
+                .expect("owned server shutdown wake");
         };
         let (result, ()) = tokio::time::timeout(Duration::from_secs(15), async {
             tokio::join!(server.run(), exercise)
@@ -5328,6 +5344,7 @@ mod tests {
             app,
             api_tx: None,
             api_server: None,
+            client_wire_health: Default::default(),
             client_listener: listener,
             #[cfg(feature = "web")]
             client_wire: None,

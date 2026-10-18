@@ -148,6 +148,10 @@ impl WebSocket {
 fn real_server_mounts_gui_csp_code_exchange_and_authenticated_wire() {
     let server = Server::start();
     let endpoint = endpoint(&server);
+    assert_eq!(
+        server.api("ping", json!({}))["result"]["client_listener"],
+        "listening"
+    );
     let index = http(&endpoint, "/", &endpoint.address.to_string(), None, None);
     if let Some(expected) = GuiAssets::get("index.html") {
         assert!(index.starts_with("HTTP/1.1 200"));
@@ -332,6 +336,42 @@ fn real_server_refuses_active_and_unknown_funnel_producers() {
         assert!(Server::with_probe(probe).is_err());
     }
 }
+#[test]
+fn real_server_refuses_serve_and_funnel_targeting_its_bound_port() {
+    let server = Server::start();
+    let endpoint = endpoint(&server);
+    let token = bearer(&endpoint);
+    for public in [false, true] {
+        let config = json!({"AllowFunnel":{"fixture.example:443":public},"Web":{"fixture.example:443":{"Handlers":{"/":{"Proxy":format!("http://{}",endpoint.address)}}}}});
+        let probe = format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", config);
+        fs::write(server.root.join("tools/tailscale"), probe).unwrap();
+        // The importer adopts the real port-0 listener, so no reservation/rebind race exists.
+        let refused = server.api("server.live_handoff", json!({}));
+        assert_eq!(refused["error"]["code"], "handoff_failed", "{refused}");
+        assert_eq!(
+            refused["error"]["data"]["kind"], "import_refused",
+            "{refused}"
+        );
+        assert!(refused.get("result").is_none(), "{refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("tailscale serve/funnel may expose the client port"),
+            "{refused}"
+        );
+        // Park until rollback recovery is processed, then prove the exporter still serves.
+        assert!(server.api("msg.list", json!({})).get("result").is_some());
+        assert_eq!(
+            server.api("ping", json!({}))["result"]["client_listener"],
+            "listening"
+        );
+        assert_eq!(self::endpoint(&server).address, endpoint.address);
+        let mut socket = WebSocket::open(&endpoint);
+        assert_eq!(socket.hello(&token).0, 1);
+    }
+}
+
 #[test]
 fn real_handoff_transfers_the_bound_listener_and_survives_import_refusal() {
     let server = Server::start();
