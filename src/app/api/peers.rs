@@ -172,11 +172,11 @@ impl App {
         // relay. A row about some other machine is not the hub speaking for
         // itself.
         //
-        let hub_key = hub.to_ascii_lowercase();
+        let hub_key = crate::peers::row_host_key(None, &hub);
         let hub_self =
             params.hub_self.map(|row| *row).filter(|row| {
                 match crate::peers::row_host_key(row.host.as_deref(), &row.ssh_target) {
-                    Some(key) => key == hub_key,
+                    Some(key) => hub_key.as_deref() == Some(key.as_str()),
                     None => {
                         crate::logging::peer_summary_identifier_dropped("host");
                         false
@@ -458,8 +458,8 @@ fn merge_fleet_peers(
     exclude_ssh_target: &str,
     origin: &str,
 ) -> Vec<crate::protocol::FleetPeer> {
-    let exclude_lower = exclude_ssh_target.to_ascii_lowercase();
-    let origin_lower = origin.to_ascii_lowercase();
+    let exclude_key = crate::peers::row_host_key(None, exclude_ssh_target);
+    let origin_key = crate::peers::row_host_key(Some(origin), "");
     let mut merged: Vec<crate::protocol::FleetPeer> = Vec::new();
     let mut by_host: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for peer in first.into_iter().chain(rest) {
@@ -467,8 +467,8 @@ fn merge_fleet_peers(
             crate::logging::peer_summary_identifier_dropped("host");
             continue;
         };
-        if key == exclude_lower
-            || key == origin_lower
+        if exclude_key.as_deref() == Some(key.as_str())
+            || origin_key.as_deref() == Some(key.as_str())
             || peer.ssh_target.eq_ignore_ascii_case(exclude_ssh_target)
         {
             continue;
@@ -1147,6 +1147,19 @@ mod tests {
                 if accepted { target } else { "node-a.invalid" }
             );
         }
+    }
+
+    #[test]
+    fn security2200_carried_fleet_excludes_the_same_host_across_ssh_authorities() {
+        let row =
+            crate::peers::peer_to_wire(&summary("node-a.invalid", "different@node-a.invalid:2222"));
+        let rows = super::merge_fleet_peers(
+            vec![row],
+            Vec::new(),
+            "operator@NODE-A.invalid:22",
+            "origin.invalid",
+        );
+        assert!(rows.is_empty());
     }
 
     fn carried_snapshot() -> crate::peers::FleetSnapshotState {
