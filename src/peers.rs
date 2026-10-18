@@ -568,7 +568,7 @@ impl FleetSnapshotState {
 
     /// Refresh the carried origin from the hub's own row (#424). The caller has
     /// already checked that the enrolled hub is the snapshot's origin by ID.
-    /// Legacy self readings require the exact bound legacy home name.
+    /// A home without a known identity cannot be refreshed by name alone.
     ///
     /// The origin summary is the only view a spoke has of the server the
     /// client came from, and it was stamped once, at switch time. A fresher

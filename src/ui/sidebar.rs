@@ -2165,13 +2165,28 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 let Some(snapshot) = app.fleet_snapshot.as_ref() else {
                     continue;
                 };
-                home_server_rows(
+                let mut build = home_server_rows(
                     snapshot,
                     p,
                     app.server_label,
                     now,
                     stale_after_secs.as_secs(),
-                )
+                );
+                if let Some(origin) = snapshot.origin_summary.as_ref() {
+                    if let Some(name) = origin
+                        .node_id
+                        .as_deref()
+                        .and_then(|id| app.server_node_name(id))
+                    {
+                        build.name = server_name_spans(
+                            origin.icon.as_deref(),
+                            name,
+                            app.server_label,
+                            build.name.last().map(|span| span.style).unwrap_or_default(),
+                        );
+                    }
+                }
+                build
             }
             Some(crate::app::state::PeerSwitchRequest::SnapshotPeer { entry_idx, .. }) => {
                 let Some(peer) = app
@@ -2545,22 +2560,44 @@ fn home_server_rows(
         Style::default().fg(p.text).add_modifier(Modifier::BOLD)
     };
     // #164: the origin's self-declared icon, carried in its summary.
+    let identity = snapshot
+        .origin_summary
+        .as_ref()
+        .and_then(|peer| peer.node_id.as_deref());
+    let label = if snapshot.origin.is_empty() {
+        identity
+            .map(|node| {
+                node.chars()
+                    .take(8)
+                    .flat_map(char::escape_default)
+                    .collect()
+            })
+            .unwrap_or_else(|| "legacy/unverified".to_string())
+    } else {
+        snapshot.origin.clone()
+    };
     let name = server_name_spans(
         snapshot
             .origin_summary
             .as_ref()
             .and_then(|origin| origin.icon.as_deref()),
-        &snapshot.origin,
+        &label,
         mode,
         name_style,
     );
     // #422: the band is one fleet-wide order, so position no longer says which
     // row is home. The glyph does, in place, leading the rest of the title the
     // way `via <hub>` does on a relayed row.
-    let title_rest = vec![Span::styled(
+    let mut title_rest = vec![Span::styled(
         HOME_ROW_GLYPH.to_string(),
         Style::default().fg(p.overlay0),
     )];
+    if identity.is_none() {
+        title_rest.push(Span::styled(
+            " legacy/unverified",
+            Style::default().fg(p.overlay0),
+        ));
+    }
     let age_span = |sep: &str| {
         Span::styled(
             format!("{sep}snapshot {} old", format_age(age_secs)),
@@ -3993,6 +4030,18 @@ mod tests {
             2,
             "only self and home remain"
         );
+        app.server_nodes
+            .insert("home-alias.example".into(), "node-home".into());
+        let area = Rect::new(0, 0, 120, 16);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_servers_section(&app, frame, area, false))
+            .unwrap();
+        let text = (0..area.height)
+            .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("home-alias.example"));
         app.fleet_snapshot
             .as_mut()
             .unwrap()
@@ -4345,7 +4394,7 @@ mod tests {
     #[test]
     fn consolidated_dedup_makes_band_and_spaces_list_agree_on_same_host() {
         // Gossip v3 (#101 part 4) RED: the band and the spaces list share a
-        // single deduped remote-row list (lowercased reported host as key).
+        // single deduped remote-row list (shared node ID as key).
         // Two-source fixture: same host advertised via a carried snapshot AND
         // a local config peer. Both surfaces must show ONE row about that
         // host, and the LOCALLY-POLLED config peer must win the tie.
@@ -4759,6 +4808,20 @@ mod tests {
         assert!(row.tally.is_none());
         assert!(health.starts_with("snapshot"), "{health}");
         assert!(health.contains("old"), "{health}");
+        assert!(spans_text(&row.title_rest).contains("legacy/unverified"));
+        let mut unnamed = snapshot;
+        unnamed.origin.clear();
+        let mut origin = peer_named_with_host("", "node-home.example");
+        origin.node_id = Some("0123456789abcdef".into());
+        unnamed.origin_summary = Some(origin);
+        let row = home_server_rows(
+            &unnamed,
+            &app.palette,
+            crate::config::ServerLabelConfig::Name,
+            std::time::Instant::now(),
+            crate::peers::PEER_STALE_AFTER_SECS,
+        );
+        assert_eq!(spans_text(&row.name), "01234567");
     }
 
     #[test]

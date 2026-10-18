@@ -173,9 +173,8 @@ impl App {
             );
         };
         let mut fleet = params.fleet;
-        // #424: the hub's own row, heard only under the name bound to this
-        // relay. A row about some other machine is not the hub speaking for
-        // itself.
+        // The hub's own row must match its enrolled ID. Only ID-less legacy
+        // self reports use the exact bound-name guard.
         //
         let hub_key = hub.to_ascii_lowercase();
         let hub_self = params
@@ -199,10 +198,7 @@ impl App {
                         .origin_summary
                         .as_ref()
                         .and_then(|peer| peer.node_id.as_deref());
-                    let is_home = match home_node {
-                        Some(node) => hub_node.as_deref() == Some(node),
-                        None => row.node_id.is_none() && snapshot.origin.eq_ignore_ascii_case(&hub),
-                    };
+                    let is_home = home_node.is_some() && home_node == hub_node.as_deref();
                     if is_home {
                         // A legacy self reading cannot erase an established identity.
                         row.node_id = home_node.map(str::to_owned);
@@ -700,9 +696,8 @@ impl App {
     /// there after the switch is reachable too. `None` when nothing carried a
     /// route: the row stays display-only.
     ///
-    /// The match is the exact host the relay cache keys the row under, never
-    /// the domain-stripped sort key: `kiln.other` is not `kiln`, and a click
-    /// on one must not dial the other's route.
+    /// Known rows match by node ID. Legacy rows match only the exact complete
+    /// host key, never a domain-stripped spelling or a known-ID route.
     fn switch_via_carried_route(
         &self,
         host_key: &str,
@@ -1871,6 +1866,7 @@ mod tests {
         // showed on B. A's own row now rides the push it already makes down the
         // relay it holds into B, on every poll.
         let mut hub = test_app();
+        hub.node_id = Some("fixture-home-node".into());
         hub.state.workspaces = vec![
             git_workspace("flock", "github.com/gerchowl/flock"),
             git_workspace("notes", "github.com/gerchowl/notes"),
@@ -1901,6 +1897,15 @@ mod tests {
         // One refresh window: A's next poll of B pushes down, exactly what
         // `PeerPollDue` hands `push_hub_fleet`.
         bind_relay(&mut spoke, &crate::app::short_host_name());
+        spoke
+            .inbound
+            .edge_mut(
+                Some(std::process::id()),
+                crate::platform::process_start_time,
+            )
+            .unwrap()
+            .enrollment
+            .node_id = Some("fixture-home-node".into());
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
@@ -1965,6 +1970,41 @@ mod tests {
             .iter()
             .map(|ws| ws.workspace.clone())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn server_identity1076_idless_home_stays_separate_from_same_name_observation() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut spoke = test_app();
+        spoke.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "node-home.example".into(),
+            peers: vec![],
+            origin_summary: Some(summary(
+                "node-home.example",
+                crate::protocol::HOME_SWITCH_TARGET,
+            )),
+            received_at: std::time::Instant::now(),
+        });
+        bind_relay(&mut spoke, "node-home.example");
+        let mut row = hub_row("node-home.example", "node-home.example", 0);
+        row.workspaces = vec![planted_space("unverified-space")];
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "node-home.example".into(),
+                fleet: vec![],
+                hub_self: Some(Box::new(row)),
+            },
+        );
+        assert!(
+            home_workspaces(&spoke).is_empty(),
+            "a name alone cannot refresh home"
+        );
+        assert_eq!(
+            spoke.state.relayed_fleet_cache.len(),
+            1,
+            "keep the unverified observation separate"
+        );
     }
 
     #[tokio::test]
@@ -2170,6 +2210,25 @@ mod tests {
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(carried_home());
         bind_relay(&mut spoke, "hopper");
+        let node = spoke
+            .inbound
+            .edge(
+                Some(std::process::id()),
+                crate::platform::process_start_time,
+            )
+            .unwrap()
+            .enrollment
+            .node_id
+            .clone();
+        spoke
+            .state
+            .fleet_snapshot
+            .as_mut()
+            .unwrap()
+            .origin_summary
+            .as_mut()
+            .unwrap()
+            .node_id = node.clone();
         let mut row = hub_row("hopper", "hopper", 0);
         row.workspaces = vec![planted_space("ok\u{1b}]52;c;cGF5bG9hZA==\u{7}name")];
         push_down(
@@ -2187,6 +2246,19 @@ mod tests {
             !names[0].chars().any(char::is_control),
             "control bytes stripped: {:?}",
             names[0]
+        );
+        assert_eq!(
+            spoke
+                .state
+                .fleet_snapshot
+                .as_ref()
+                .unwrap()
+                .origin_summary
+                .as_ref()
+                .unwrap()
+                .node_id,
+            node,
+            "legacy self readings preserve the authenticated home identity"
         );
     }
 
