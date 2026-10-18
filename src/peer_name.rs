@@ -16,8 +16,9 @@ fn invisible(ch: char) -> bool {
 
 /// Two comparison keys after removing invisible/whitespace scalars (ADR-0026).
 /// K1 is skeleton(fold(x)); K2 starts at fold(skeleton(x)) and repeats that
-/// composition to its fixed point. Folding first preserves case equivalence;
-/// skeleton first preserves confusables such as capital I/lowercase l.
+/// composition to its fixed point, with at most eight further steps. If that
+/// backstop is exhausted, the last value is used. Folding first preserves case
+/// equivalence, while skeleton first preserves capital I/lowercase l confusables.
 /// Keys are never displayed, persisted, or used to bind routing identities.
 pub(crate) fn comparison_keys(name: &str) -> (String, String) {
     let stripped: String = name
@@ -26,19 +27,26 @@ pub(crate) fn comparison_keys(name: &str) -> (String, String) {
         .collect();
     let folded: String = stripped.chars().default_case_fold().collect();
     let fold_first = unicode_security::skeleton(&folded).collect();
-    let mut skeleton_first: String = unicode_security::skeleton(&stripped)
+    let skeleton_first = unicode_security::skeleton(&stripped)
         .default_case_fold()
         .collect();
-    // The bounded exhaustive data test guards convergence when Unicode data changes.
-    loop {
-        let next = unicode_security::skeleton(&skeleton_first)
+    let skeleton_first = fixed_point(skeleton_first, |value| {
+        unicode_security::skeleton(value)
             .default_case_fold()
-            .collect::<String>();
-        if next == skeleton_first {
-            return (fold_first, skeleton_first);
+            .collect()
+    });
+    (fold_first, skeleton_first)
+}
+
+fn fixed_point(mut value: String, mut step: impl FnMut(&str) -> String) -> String {
+    for _ in 0..8 {
+        let next = step(&value);
+        if next == value {
+            return value;
         }
-        skeleton_first = next;
+        value = next;
     }
+    value
 }
 
 fn escaped(name: &str) -> String {
@@ -182,6 +190,48 @@ mod tests {
     }
 
     #[test]
+    fn security2166_r4_fixed_point_caps_nonconverging_data() {
+        let mut calls = 0;
+        let last = fixed_point(String::new(), |value| {
+            calls += 1;
+            assert!(calls <= 8, "normalization exceeded its eight-step backstop");
+            format!("{value}x")
+        });
+        assert_eq!(calls, 8);
+        assert_eq!(last, "xxxxxxxx");
+    }
+
+    #[test]
+    fn security2166_r4_fast_convergence_cases() {
+        for text in [
+            "M",
+            "I",
+            "i",
+            "l",
+            "1",
+            "kiIn",
+            "kiln",
+            "n\u{43e}de",
+            "M\u{301}I",
+            "\u{345}\u{310}M",
+            "Straße",
+            "\u{212a}",
+            "\u{1d400}",
+            "\u{feff}",
+        ] {
+            let (_, key) = comparison_keys(text);
+            assert_eq!(
+                unicode_security::skeleton(&key)
+                    .default_case_fold()
+                    .collect::<String>(),
+                key,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "exhaustive Unicode-data audit; run explicitly when updating normalization dependencies"]
     fn security2166_r3_unicode_data_converges_with_a_bounded_reference() {
         let step = |s: &str| {
             unicode_security::skeleton(s)

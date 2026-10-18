@@ -662,8 +662,8 @@ impl App {
                     via,
                     ..
                 } if *correlation_id == params.correlation_id => {
-                    // Stored destination metadata has no identity proof.
-                    let host_label = self.state.server_claim_name(to_host, None);
+                    // Only an exact local route binding admits a trusted destination label.
+                    let host_label = self.state.server_delivery_name(to_host, route);
                     // #410: say whether the hop was ours or a hub's.
                     let (path, how) = match via {
                         Some(hub) => (
@@ -2620,6 +2620,124 @@ mod tests {
             value["result"]["route"], "kiln",
             "the route is what a reader needs to reproduce the hop"
         );
+    }
+
+    #[tokio::test]
+    async fn security2166_r4_status_detail_resolves_trusted_route_names() {
+        for (host, route, pinned, expected) in [
+            (
+                "node-trusted.example",
+                "node-trusted.example",
+                false,
+                "node-trusted.example",
+            ),
+            (
+                "node-dial.example",
+                "node-trusted.example",
+                false,
+                "node-trusted.example",
+            ),
+            (
+                "node-pinned.example",
+                "node-pinned.example",
+                true,
+                "node-pinned.example",
+            ),
+            (
+                "node-pinned.example",
+                "node-trusted.example",
+                true,
+                "node-trusted.example",
+            ),
+        ] {
+            let mut app = test_app_with_hub(crate::api::EventHub::default());
+            app.state.peers.push(crate::config::PeerConfig {
+                name: "node-trusted.example".into(),
+                ssh: "node-dial.example".into(),
+                ..Default::default()
+            });
+            if pinned {
+                app.state
+                    .server_nodes
+                    .insert("node-pinned.example".into(), "node-id".into());
+                if route != host {
+                    app.state
+                        .server_nodes
+                        .insert(route.into(), "node-id".into());
+                }
+            }
+            app.emit_event(EventEnvelope {
+                event: EventKind::MessageRelayed,
+                data: EventData::MessageRelayed {
+                    correlation_id: "trusted-host".into(),
+                    from_agent: "agent_atlas_cafe".into(),
+                    to_agent: "agent_nodea_beef".into(),
+                    to_host: host.into(),
+                    route: route.into(),
+                    via: None,
+                    relayed_at_ms: 1,
+                    intent: MsgIntent::Fyi,
+                },
+            });
+            let ResponseResult::MsgStatus {
+                detail, to_host, ..
+            } = status_of(&mut app, "trusted-host")
+            else {
+                panic!("expected message status")
+            };
+            let detail = detail.unwrap();
+            assert!(
+                detail.starts_with(&format!("handed to {expected} via")),
+                "{host} over {route}: {detail:?}"
+            );
+            assert!(!detail.contains(crate::peer_name::BADGE), "{detail:?}");
+            assert_eq!(to_host.as_deref(), Some(host));
+        }
+    }
+
+    #[tokio::test]
+    async fn security2166_r4_status_detail_never_trusts_route_lookalikes() {
+        for (host, route) in [
+            ("node-trusted.example\u{200b}", "node-trusted.example"),
+            ("node-trusted.example ", "node-trusted.example"),
+            ("n\u{43e}de-trusted.example", "node-trusted.example"),
+            ("NODE-TRUSTED.EXAMPLE", "node-trusted.example"),
+            ("node-other.example", "node-trusted.example"),
+            ("", "node-trusted.example"),
+            ("node-trusted.example", ""),
+            ("node-trusted.example", "node-trusted.example\u{200b}"),
+            ("node-trusted.example", "node-other.example"),
+        ] {
+            let mut app = test_app_with_hub(crate::api::EventHub::default());
+            app.state.peers.push(crate::config::PeerConfig {
+                name: "node-trusted.example".into(),
+                ..Default::default()
+            });
+            app.emit_event(EventEnvelope {
+                event: EventKind::MessageRelayed,
+                data: EventData::MessageRelayed {
+                    correlation_id: "claimed-host".into(),
+                    from_agent: "agent_atlas_cafe".into(),
+                    to_agent: "agent_nodea_beef".into(),
+                    to_host: host.into(),
+                    route: route.into(),
+                    via: None,
+                    relayed_at_ms: 1,
+                    intent: MsgIntent::Fyi,
+                },
+            });
+            let ResponseResult::MsgStatus {
+                detail, to_host, ..
+            } = status_of(&mut app, "claimed-host")
+            else {
+                panic!("expected message status")
+            };
+            assert!(
+                detail.unwrap().contains(crate::peer_name::BADGE),
+                "{host:?}"
+            );
+            assert_eq!(to_host.as_deref(), Some(host));
+        }
     }
 
     #[tokio::test]

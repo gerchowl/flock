@@ -219,8 +219,12 @@ folding and skeletons do not commute: fold-first catches `I`/`i`, while
 skeleton-first preserves `I`/`l`, `1`/`l` and `kiIn`/`kiln`. Reapplying a
 fold-first composition cannot recover the capital I already folded away.
 A further skeleton-first pass is sometimes necessary: `M` first becomes `m`,
-then `rn`. A bounded exhaustive test over Unicode scalars guards convergence
-of the maintained data without running the production fixed-point loop.
+then `rn`. Normalization performs at most eight further skeleton-first steps,
+returning its last value if future data fails to converge by that backstop.
+Fast deterministic cases and a nonconverging-step test run normally. The
+exhaustive Unicode-scalar audit is ignored by default and run explicitly when
+updating normalization dependencies; it checks the data with a bounded reference,
+without running the production fixed-point loop.
 The maintained
 [`unicode-security`](https://docs.rs/unicode-security/0.1.2/unicode_security/)
 0.1.2 implementation supplies the skeleton and default-ignorable properties;
@@ -253,8 +257,13 @@ observation separately from display, preventing repeated badge/escape growth.
 Agent locations keep the raw reported `host` separate from `display_host`.
 Message API `to_host` and persisted mesh payload host metadata use the raw
 observation; fleet directory labels and message/wait notices use presentation.
-Message-status details also protect destinations read from older events; those
-records carry no owner proof, so their destination label remains unverified.
+Message-status details first resolve the raw destination through local delivery
+route bindings. Exact configured alias/dial-target keys on that route, or exact
+pinned aliases bound to the same node as that route, use the trusted local alias.
+Empty keys, lookalikes, case variants and unrelated route claims never gain trust
+through the Unicode comparison keys. Unresolved destinations, including older
+events without a matching local binding, use escaped, badged presentation.
+The raw destination metadata remains unchanged.
 None of this rewrites cache keys, identity proofs, policy bindings or dial
 targets. Wire summaries remain observations, not authority to borrow aliases.
 

@@ -2896,6 +2896,33 @@ impl AppState {
         )
     }
 
+    /// Resolve delivery presentation through exact local route keys, never
+    /// through a confusable comparison or an unproven reported node ID.
+    pub(crate) fn server_delivery_name(&self, host: &str, route: &str) -> String {
+        if host.is_empty() || route.is_empty() {
+            return self.server_claim_name(host, None);
+        }
+        let configured = self
+            .peers
+            .iter()
+            .find(|peer| peer.name == route || peer.ssh == route);
+        if let Some(peer) = configured.filter(|peer| host == peer.name || host == peer.ssh) {
+            return peer.name.clone();
+        }
+        let route_node = self
+            .server_nodes
+            .get(route)
+            .or_else(|| configured.and_then(|peer| self.server_nodes.get(&peer.name)));
+        if let Some(node) = self
+            .server_nodes
+            .get(host)
+            .filter(|node| Some(*node) == route_node)
+        {
+            return self.server_node_name(node).unwrap_or(host).to_string();
+        }
+        self.server_claim_name(host, None)
+    }
+
     /// Prefer a proven binding or the locally configured source name. All
     /// other names pass the same alias-collision rule on every UI surface.
     pub(crate) fn server_peer_name(&self, peer: &crate::peers::PeerSummaryState) -> String {
