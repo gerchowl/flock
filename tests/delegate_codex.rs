@@ -154,6 +154,8 @@ fn start_server_with_rows(rows: u16) -> Server {
 
 fn request(server: &Server, json: &str) -> serde_json::Value {
     let mut stream = UnixStream::connect(&server.socket).unwrap();
+    stream.set_read_timeout(Some(WITHIN)).unwrap();
+    stream.set_write_timeout(Some(WITHIN)).unwrap();
     stream.write_all(json.as_bytes()).unwrap();
     stream.write_all(b"\n").unwrap();
     stream.flush().unwrap();
@@ -1545,3 +1547,213 @@ mod hint_1581;
 mod narrow_1315;
 #[path = "delegate_codex/wrap_slack_1141.rs"]
 mod wrap_slack_1141;
+
+#[test]
+fn codex_conversation_lock_is_named_mid_life() {
+    let server = start_server_with_rows(40);
+    operator_workspace(&server);
+    let b = brief(&server, "lock.md", "do it\n");
+    let mut child = start_codex(&server, "locked", &b, &[]);
+    let pane = make_ready(&server, "locked");
+    wait_typed(&server, 1);
+    assert_eq!(exited_within(&mut child, WITHIN).unwrap().code(), Some(0));
+    let _ = finish(child);
+    fs::write(
+        server.base.join("screen"),
+        include_str!("fixtures/codex/conversation-locked.txt"),
+    )
+    .unwrap();
+    let deadline = Instant::now() + WITHIN;
+    let captured = loop {
+        let out = cli(
+            &server,
+            &[
+                "pane", "read", &pane, "--source", "recent", "--format", "text",
+            ],
+        );
+        let screen = stdout(&out);
+        if screen.contains("press R to continue here") {
+            break screen;
+        }
+        assert!(agent_get(&server, "locked").is_some());
+        assert!(
+            Instant::now() < deadline,
+            "lock fixture did not paint: {screen}"
+        );
+        thread::yield_now();
+    };
+    loop {
+        let out = cli(&server, &["delegate", "status", "locked", "--json"]);
+        let status = stdout_json(&out);
+        if status["startup_dialog"] == "codex_conversation_locked" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lock not named: {status}; captured pane: {captured}"
+        );
+        thread::yield_now();
+    }
+    let out = cli(
+        &server,
+        &[
+            "delegate",
+            "wait",
+            "locked",
+            "--settle",
+            SETTLE,
+            "--timeout",
+            "5000",
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(6), "{}", stderr(&out));
+    assert_eq!(
+        stdout_json(&out)["startup_dialog"],
+        "codex_conversation_locked"
+    );
+    let before = typed(&server);
+    let out = cli(
+        &server,
+        &["delegate", "send", "locked", "--brief", &b, "--json"],
+    );
+    assert_eq!(out.status.code(), Some(6), "{}", stderr(&out));
+    assert_eq!(
+        stdout_json(&out)["error"]["code"],
+        "codex_conversation_locked"
+    );
+    assert_eq!(typed(&server), before);
+}
+
+fn start_locked_codex(stay: bool) -> Server {
+    let server = start_server_with_rows(40);
+    operator_workspace(&server);
+    fs::write(
+        server.base.join("screen"),
+        include_str!("fixtures/codex/conversation-locked.txt"),
+    )
+    .unwrap();
+    fs::create_dir_all(server.base.join("raw")).unwrap();
+    let script = server.base.join("raw/codex");
+    fs::write(&script, include_str!("fixtures/codex/lock-harness.py")).unwrap();
+    fs::write(
+        bin_dir(&server.base).join("codex"),
+        format!("#!/bin/sh\nexec python3 '{}'\n", script.display()),
+    )
+    .unwrap();
+    if stay {
+        fs::write(server.base.join("stay-locked"), "").unwrap();
+    }
+    let b = brief(&server, "locked.md", "do it\n");
+    let mut child = start_codex(
+        &server,
+        "locked",
+        &b,
+        &["--json", "--ready-timeout", "20000"],
+    );
+    let status = exited_within(&mut child, WITHIN);
+    let out = finish(child);
+    assert_eq!(status.and_then(|s| s.code()), Some(6), "{}", stderr(&out));
+    assert_eq!(
+        stdout_json(&out)["startup_dialog"],
+        "codex_conversation_locked"
+    );
+    assert_eq!(stdout_json(&out)["round"], 0);
+    assert_eq!(fs::read(server.base.join("startup-input")).unwrap(), b"");
+    server
+}
+
+fn assert_lock_choice(choice: &str, expected: &[u8]) {
+    let server = start_locked_codex(false);
+    let pane = delegate_pane(&server, "locked");
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "send",
+            "locked",
+            "--resolve-lock",
+            choice,
+            "--json",
+            "--ready-timeout",
+            "5000",
+        ],
+    );
+    let status = exited_within(&mut child, WITHIN);
+    let out = finish(child);
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "{}", stderr(&out));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let result = stdout_json(&out);
+    assert_eq!(result["outcome"], "lock_resolved");
+    assert_eq!(result["lock_resolution"]["choice"], choice);
+    assert_eq!(result["lock_resolution"]["confirmed"], true);
+    assert_eq!(result["round"], 0);
+    assert_eq!(
+        fs::read(server.base.join("startup-input")).unwrap(),
+        expected
+    );
+    let status = cli(&server, &["delegate", "status", "locked", "--json"]);
+    assert_eq!(
+        stdout_json(&status)["lock_resolution"],
+        result["lock_resolution"]
+    );
+    let refused = cli(
+        &server,
+        &[
+            "delegate",
+            "send",
+            "locked",
+            "--resolve-lock",
+            choice,
+            "--json",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(10), "{}", stderr(&refused));
+    assert_eq!(stdout_json(&refused)["error"]["code"], "agent_not_ready");
+    // The owner guard also refuses stale clients, independently of CLI preflight.
+    let refused = request(&server, &serde_json::json!({"id":"stale", "method":"pane.resolve_codex_lock", "params":{"pane_id":pane,"choice":choice}}).to_string());
+    assert_eq!(refused["error"]["code"], "agent_not_ready");
+    assert_eq!(
+        fs::read(server.base.join("startup-input")).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn codex_lock_retry_sends_only_r_and_refuses_when_unlocked() {
+    assert_lock_choice("retry", b"r");
+}
+
+#[test]
+fn codex_lock_fork_sends_only_f_and_refuses_when_unlocked() {
+    assert_lock_choice("fork", b"f");
+}
+
+#[test]
+fn codex_lock_silent_producer_fails_confirmation_without_resending() {
+    let server = start_locked_codex(true);
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "send",
+            "locked",
+            "--resolve-lock",
+            "retry",
+            "--json",
+            "--ready-timeout",
+            "1000",
+        ],
+    );
+    let status = exited_within(&mut child, WITHIN);
+    let out = finish(child);
+    assert_eq!(status.and_then(|s| s.code()), Some(8), "{}", stderr(&out));
+    assert_eq!(stdout_json(&out)["error"]["code"], "codex_lock_unconfirmed");
+    assert_eq!(fs::read(server.base.join("startup-input")).unwrap(), b"r");
+    let status = cli(&server, &["delegate", "status", "locked", "--json"]);
+    assert_eq!(stdout_json(&status)["lock_resolution"]["confirmed"], false);
+    assert_eq!(
+        stdout_json(&status)["startup_dialog"],
+        "codex_conversation_locked"
+    );
+}

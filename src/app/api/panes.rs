@@ -1367,6 +1367,40 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Recheck the live lock in the owner's turn before admitting the chosen key.
+    pub(super) fn handle_resolve_codex_lock(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneResolveCodexLockParams,
+    ) -> String {
+        let (ws, pane) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
+        };
+        let locked = self.lookup_runtime(ws, pane).is_some_and(|(runtime, _)| {
+            crate::detect::codex_conversation_locked(&runtime.detection_text())
+        });
+        if !locked {
+            return encode_error(
+                id,
+                "agent_not_ready",
+                "codex_conversation_locked is not currently detected; no key sent",
+            );
+        }
+        let key = match params.choice {
+            crate::api::schema::CodexLockChoice::Retry => "r",
+            crate::api::schema::CodexLockChoice::Fork => "f",
+        };
+        self.handle_pane_send_keys(
+            id,
+            PaneSendKeysParams {
+                pane_id: params.pane_id,
+                keys: vec![key.into()],
+                write_timeout_ms: params.write_timeout_ms,
+            },
+        )
+    }
+
     pub(super) fn handle_pane_send_keys(
         &mut self,
         id: String,

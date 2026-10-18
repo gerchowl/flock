@@ -724,6 +724,35 @@ The delegate runs in a workspace it created and **never requests focus**, so you
 
 **The brief is only typed into an agent that is at its prompt.** `start` and `send` both wait out a permission prompt rather than answering it, and time out with the status named (`delegate <name> is blocked`) rather than typing into a dialog. That wait also covers readiness — a pane that has painted nothing yet reports `unknown`, which is a booting TUI, not a crash. Claude Code asks `Quick safety check: Is this a project you created or one you trust?` the first time it starts in a directory, and a `--worktree` checkout is always such a directory: that dialog has no input box, so the delegate names it (`delegate <name>: Claude Code is waiting on its folder-trust dialog (see #605)`) and refuses instead of typing at it. When the directory is a linked worktree of a repository already trusted in that Claude profile, flock records the worktree as trusted before starting `claude`, so the dialog does not appear (#605, `[worktrees] pretrust_claude`); anywhere else accepting it stays a human action. Codex has its own `Trust this folder?` dialog for a repository it has never trusted; the delegate names it `codex_folder_trust` and refuses the same way. Codex records trust for the repository root, so accepting it once in the main checkout covers every later worktree of that repository. `delegate status` names a startup dialog the agent is blocked on (`startup_dialog` in `--json`).
 
+Codex's live conversation-lock screen is named `codex_conversation_locked`,
+including when it appears after a capacity stop and restart. Flock never chooses
+retry or fork automatically. `delegate start` keeps the pane and delegate record
+at round 0 and reports `agent_blocked` (exit 6) without submitting the brief.
+`delegate status` and `delegate wait` name the same dialog; wait exits 6.
+
+Choose explicitly with `flk delegate send <name> --resolve-lock retry` or
+`--resolve-lock fork`. These send exactly one `r` or `f`, without Enter or a
+brief, and cannot be combined with `--brief` or `--await`. The server checks the
+live lock again before admitting the key; a changed or unlocked pane refuses
+with `agent_not_ready` (exit 10) and receives no key. A plain send while locked
+refuses with `codex_conversation_locked` (exit 6), naming both choices.
+
+The existing delegate registry retains only the latest explicit lock choice,
+its timestamp, and whether the pane was observed leaving the lock. JSON status
+and outcome reports expose this as `lock_resolution`. The intent is synced
+before the key request; `confirmed: false` does **not** prove whether a key was
+sent. A registry-write failure before the request sends nothing. Confirmation
+uses live screen checks, status notifications and bounded condition polling,
+within `--ready-timeout` (default 60000 ms). Success reports `lock_resolved`
+(exit 0), without changing the round or submitting a brief; leaving the lock
+does not imply the next screen is ready for a brief. An uncertain write,
+missing confirmation, or silent producer returns `codex_lock_unconfirmed`
+(exit 8): inspect the pane before choosing again. The key is never re-sent.
+A failure saving confirmation can leave the recorded intent unconfirmed even
+though the screen changed. Older servers refuse the guarded operation rather
+than receiving an unguarded fallback. This does not recover a lost delegate
+record (#1285).
+
 If the pane disappears before the readiness subscription is established, `delegate start --json` reports `start_failed`; its `reason` retains the preflight error envelope with code `pane_not_found` and names the pane's exit or loss of resolution. Other preflight errors retain their server code and diagnostic. This is a failed start (exit 1), with the usual rollback or `--keep-on-failure` behavior; it is not a successful readiness verdict.
 
 A Codex that is still starting can swallow the typed brief: the composer stays empty and no turn begins. When a Codex submit cannot be confirmed, `start` watches for the same evidence `not_started` uses — an empty idle composer, no turn and no queued or startup marker, held for 30 s plus `--settle` — and only then types the brief once more. A brief that appears anywhere on screen, or a turn that starts late, is never typed again. opencode keeps its rule that a dropped brief is reported, not retyped.
