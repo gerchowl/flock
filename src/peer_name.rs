@@ -14,15 +14,31 @@ fn invisible(ch: char) -> bool {
         || ch.identifier_type() == Some(IdentifierType::Default_Ignorable)
 }
 
-/// Compare names after removing invisible/whitespace scalars, full Unicode
-/// casefolding, and the maintained UTS #39 skeleton. Never display this key.
-pub(crate) fn skeleton(name: &str) -> String {
-    let folded: String = name
+/// Two comparison keys after removing invisible/whitespace scalars (ADR-0026).
+/// K1 is skeleton(fold(x)); K2 starts at fold(skeleton(x)) and repeats that
+/// composition to its fixed point. Folding first preserves case equivalence;
+/// skeleton first preserves confusables such as capital I/lowercase l.
+/// Keys are never displayed, persisted, or used to bind routing identities.
+pub(crate) fn comparison_keys(name: &str) -> (String, String) {
+    let stripped: String = name
         .chars()
         .filter(|ch| !invisible(*ch) && !ch.is_whitespace())
+        .collect();
+    let folded: String = stripped.chars().default_case_fold().collect();
+    let fold_first = unicode_security::skeleton(&folded).collect();
+    let mut skeleton_first: String = unicode_security::skeleton(&stripped)
         .default_case_fold()
         .collect();
-    unicode_security::skeleton(&folded).collect()
+    // The bounded exhaustive data test guards convergence when Unicode data changes.
+    loop {
+        let next = unicode_security::skeleton(&skeleton_first)
+            .default_case_fold()
+            .collect::<String>();
+        if next == skeleton_first {
+            return (fold_first, skeleton_first);
+        }
+        skeleton_first = next;
+    }
 }
 
 fn escaped(name: &str) -> String {
@@ -54,8 +70,11 @@ pub(crate) fn claimed<'a>(
     node: Option<&str>,
     aliases: impl Iterator<Item = &'a str>,
 ) -> String {
-    let key = skeleton(name);
-    let collision = aliases.into_iter().any(|alias| skeleton(alias) == key);
+    let (fold_first, skeleton_first) = comparison_keys(name);
+    let collision = aliases.into_iter().any(|alias| {
+        let (alias_fold_first, alias_skeleton_first) = comparison_keys(alias);
+        fold_first == alias_fold_first || skeleton_first == alias_skeleton_first
+    });
     let label = if collision || name.is_empty() {
         escaped(&node.unwrap_or_default().chars().take(8).collect::<String>())
     } else {
@@ -115,10 +134,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn security2166_r3_capital_i_in_a_lowercase_alias_collides() {
+        assert_eq!(
+            claimed("kiIn", Some("abcdefgh"), ["kiln"].into_iter()),
+            "[unverified] abcdefgh"
+        );
+    }
+
+    #[test]
+    fn security2166_r3_capital_i_and_lowercase_l_collide() {
+        assert_eq!(
+            claimed("I", Some("abcdefgh"), ["l"].into_iter()),
+            "[unverified] abcdefgh"
+        );
+    }
+
+    #[test]
+    fn security2166_r3_capital_i_and_lowercase_i_remain_case_equivalent() {
+        assert_eq!(
+            claimed("I", Some("abcdefgh"), ["i"].into_iter()),
+            "[unverified] abcdefgh"
+        );
+    }
+
+    #[test]
+    fn security2166_r3_distinct_names_keep_their_escaped_claim() {
+        assert_eq!(
+            claimed(
+                "node-distinct.example",
+                Some("abcdefgh"),
+                ["node-trusted.example"].into_iter()
+            ),
+            "[unverified] node-distinct.example"
+        );
+    }
+
+    #[test]
+    fn security2166_r3_skeleton_first_requires_a_fixed_point() {
+        assert_eq!(
+            unicode_security::skeleton("M")
+                .default_case_fold()
+                .collect::<String>(),
+            "m"
+        );
+        assert_eq!(comparison_keys("M").1, "rn");
+        assert_eq!(comparison_keys("M").1, comparison_keys("rn").1);
+    }
+
+    #[test]
+    fn security2166_r3_unicode_data_converges_with_a_bounded_reference() {
+        let step = |s: &str| {
+            unicode_security::skeleton(s)
+                .default_case_fold()
+                .collect::<String>()
+        };
+        for ch in (0..=0x10ffff).filter_map(char::from_u32) {
+            let first = step(&ch.to_string());
+            let second = step(&first);
+            let third = step(&second);
+            // Never call the production loop here: changed data must fail, not hang.
+            assert_eq!(
+                step(&third),
+                third,
+                "Unicode data did not converge for {ch:?}"
+            );
+        }
+        for text in ["M\u{301}I", "\u{345}\u{310}M", "Straße", "kiIn"] {
+            let (_, key) = comparison_keys(text);
+            assert_eq!(step(&key), key);
+        }
+    }
+
+    #[test]
+    fn security2166_r3_digit_one_and_lowercase_l_remain_confusable() {
+        assert_eq!(
+            claimed("1", Some("abcdefgh"), ["l"].into_iter()),
+            "[unverified] abcdefgh"
+        );
+    }
+
+    #[test]
     fn security2166_r2_unicode_casefold_and_skeleton_are_comparison_only() {
-        assert_eq!(skeleton("Straße"), skeleton("STRASSE"));
-        assert_eq!(skeleton("café"), skeleton("cafe\u{301}"));
-        assert_eq!(skeleton("node"), skeleton("n\u{43e}de"));
+        assert_eq!(comparison_keys("Straße"), comparison_keys("STRASSE"));
+        assert_eq!(comparison_keys("café"), comparison_keys("cafe\u{301}"));
+        assert_eq!(comparison_keys("node"), comparison_keys("n\u{43e}de"));
         assert_eq!(
             claimed("Straße", None, std::iter::empty()),
             "[unverified] Straße"

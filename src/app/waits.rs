@@ -230,7 +230,7 @@ impl App {
                 format!(
                     "{delegate} runs on {}; a wait on another host's agent is not \
                      supported, park on that host",
-                    location.host
+                    location.display_host
                 ),
             )),
             None if self

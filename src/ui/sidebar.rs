@@ -2229,6 +2229,17 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                     app.server_label,
                     build.name.last().map(|span| span.style).unwrap_or_default(),
                 );
+                // Keep the Home affordance before the name when the badge consumes space.
+                build.name.insert(
+                    0,
+                    Span::styled(
+                        format!("{HOME_ROW_GLYPH} "),
+                        Style::default().fg(p.overlay0),
+                    ),
+                );
+                build
+                    .title_rest
+                    .retain(|span| span.content != HOME_ROW_GLYPH);
                 let claims = app
                     .remote_peers()
                     .iter()
@@ -3905,6 +3916,26 @@ mod tests {
                 "width {width}: {shown:?}"
             );
         }
+    }
+
+    #[test]
+    fn security2166_r3_narrow_home_keeps_affordance_and_badge() {
+        let mut app = security2166_alias_fixture();
+        app.fleet_snapshot.as_mut().unwrap().origin = "node-long-origin.example".into();
+        let area = Rect::new(0, 0, 26, 16);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_servers_section(&app, frame, area, false))
+            .unwrap();
+        let rows: Vec<_> = (0..area.height)
+            .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
+            .collect();
+        let home = rows.iter().find(|row| row.contains(HOME_ROW_GLYPH));
+        assert!(
+            home.is_some(),
+            "Home affordance must remain visible: {rows:?}"
+        );
+        assert!(home.unwrap().contains(crate::peer_name::BADGE));
     }
 
     #[test]

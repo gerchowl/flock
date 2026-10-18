@@ -208,16 +208,27 @@ name.
 
 Configured names and locally pinned/enrolled bindings are authoritative;
 reported node IDs and carried snapshot names are claims. One shared
-claimed-name presentation function owns comparison and escaping. Alias
-comparison removes format, bidi, control, default-ignorable and whitespace
-scalars, applies full Unicode casefolding, then the UTS #39 confusable skeleton
-to both the claim and the configured/pinned aliases. The maintained
+claimed-name presentation function owns comparison and escaping. Comparison
+first removes format, bidi, control, default-ignorable and whitespace scalars.
+One function returns two keys for each claim and each configured/pinned alias:
+`K1 = skeleton(fold(x))`, and `K2 = fold(skeleton(x))`, repeating the latter
+composition until its fixed point. Two names collide exactly when their K1
+keys match OR their K2 keys match. Here `fold` is full Unicode casefolding and
+`skeleton` is the UTS #39 confusable skeleton. Two keys are necessary because
+folding and skeletons do not commute: fold-first catches `I`/`i`, while
+skeleton-first preserves `I`/`l`, `1`/`l` and `kiIn`/`kiln`. Reapplying a
+fold-first composition cannot recover the capital I already folded away.
+A further skeleton-first pass is sometimes necessary: `M` first becomes `m`,
+then `rn`. A bounded exhaustive test over Unicode scalars guards convergence
+of the maintained data without running the production fixed-point loop.
+The maintained
 [`unicode-security`](https://docs.rs/unicode-security/0.1.2/unicode_security/)
 0.1.2 implementation supplies the skeleton and default-ignorable properties;
 `caseless` 0.2.2 supplies full casefolding and `unicode-general-category` 1.1.0
 supplies format categories. These dependencies pass the existing cargo-deny
 license and advisory policy without exceptions. No local confusables table is
-used. Skeletons are comparison keys, never display text or routing keys.
+used. These keys are local comparison forms, never display text, persisted
+metadata, or routing keys.
 
 On collision the claimed alias is hidden behind its escaped short node ID;
 otherwise the name is escaped. Every claim carries `[unverified]`, including
@@ -239,6 +250,11 @@ its Home badge remains as a deliberate UX trade-off. Only proof from that
 observation's source permits a trusted name. Stored owner hints from earlier
 versions pass the same function on read. New owner records preserve the raw
 observation separately from display, preventing repeated badge/escape growth.
+Agent locations keep the raw reported `host` separate from `display_host`.
+Message API `to_host` and persisted mesh payload host metadata use the raw
+observation; fleet directory labels and message/wait notices use presentation.
+Message-status details also protect destinations read from older events; those
+records carry no owner proof, so their destination label remains unverified.
 None of this rewrites cache keys, identity proofs, policy bindings or dial
 targets. Wire summaries remain observations, not authority to borrow aliases.
 

@@ -3782,7 +3782,8 @@ pub struct FleetAgentInfo {
     /// that means the same thing on every host, so this is what goes in a
     /// `msg.send` `{"type":"agent"}` target.
     pub agent_id: String,
-    /// Short host name of the server the agent lives on.
+    /// Viewer-safe server label, including a badge for unverified claims.
+    /// Presentation only: delivery targets `agent_id`, never this label.
     pub host: String,
     /// Public pane id **on that host**. A routing detail, not an address:
     /// meaningless as a `{"type":"pane"}` target unless `local` is true.
