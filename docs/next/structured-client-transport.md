@@ -72,10 +72,13 @@ fictional credential to an isolated deterministic token record. It does not
 claim full client/subscription-script conformance before the later slices and
 S8's complete adapter have landed.
 
-Both the configured listener address and every adopted listening descriptor
-must be in IPv4's `127.0.0.0/8` block. Wildcard and non-loopback addresses receive
-a typed `NonLoopback` refusal before the forwarding probe or router construction
-(#1960). Descriptor adoption closes a refused socket through its sole owner.
+The mounted listener accepts exactly `127.0.0.1`. Other addresses, including
+other members of IPv4's loopback block, receive a typed `NonLoopback` refusal
+before the forwarding probe or router construction. The lower-level descriptor
+adopter independently rejects sockets outside `127.0.0.0/8` (#1960).
+An inherited socket without a configured bind receives `Unconfigured`; an
+address or nonzero-port mismatch receives `BindMismatch`. Descriptor adoption
+closes a refused socket through its sole owner (#1972).
 
 The listener requires numeric Host and same-origin Origin matching its actual
 bound IPv4 authority (normalizing HTTP's default port only). API routes require
@@ -85,9 +88,10 @@ self plus the exact WebSocket URL for connections, and no objects, base URL,
 framing or form actions. There is no generated configuration script.
 
 Startup runs `tailscale serve status --json` off the async executor, bounded at
-five seconds and 64 KiB. Any serve or funnel configuration targeting the bound port, unsuccessful or malformed status,
-and an unavailable probe refuse the configured listener and server startup;
-there is no silent fallback. Exit status is checked before parsing JSON. Forwarding changes after startup are not
+five seconds and 64 KiB. Any serve or funnel configuration targeting the bound
+port, unsuccessful or malformed status, and an unavailable probe refuse the
+configured listener and server startup; there is no silent fallback. Exit status
+is checked before parsing JSON. Forwarding changes after startup are not
 monitored. The operator must keep forwarding to this port disabled.
 
 Live handoff transfers the bound listening descriptor rather than rebinding its
@@ -101,10 +105,13 @@ reconnect path. Failed imports preserve the exporter's listener. Received socket
 are close-on-exec so later children cannot retain the port. Process-local browser
 codes are not transferred; obtain a fresh URL after handoff or restart. A changed
 nonzero configured address requires a restart rather than adopting a mismatched
-listener. A fatal accept failure stops only the listener and publishes typed failed status;
+listener. A fatal accept failure stops only the listener and publishes typed
+failed status;
 the server loop and its agents continue. Server shutdown cancels owned
 HTTP connection tasks, closes accepted I/O and checks core lease release before
-returning. HTTP/1 half-close handling and admission deadlines are configured on the
+returning. If the event loop and listener cleanup both fail, the event-loop error
+is returned and the secondary cleanup error is logged by kind and errno.
+HTTP/1 half-close handling and admission deadlines are configured on the
 owned connection driver.
 
 Completed exchange failures remain uniform 401 with no-store, including oversized bodies
@@ -115,7 +122,8 @@ server diagnostics; neither credentials, one-time codes nor raw errors do.
 
 The separately reviewed foundation supplies the reusable accept policy. It treats peer resets,
 interrupted accepts and other per-connection errors as recoverable and logs them
-at debug level. Resource exhaustion and unclassified errors (including errors
+at debug level. Unsupported accept operations (`EOPNOTSUPP`, `ENOPROTOOPT`),
+resource exhaustion and unclassified errors (including errors
 without an errno) emit a structured warning and
 wait `ACCEPT_RESOURCE_BACKOFF` (100 ms) on the supplied monotonic clock before
 accepting again. Only an invalid listener descriptor (`EBADF`, `EINVAL`,
