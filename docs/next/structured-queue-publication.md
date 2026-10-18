@@ -45,12 +45,37 @@ waiting for filesystem work on the server loop. Subscription requests are
 serviced even when the worker's completion channel is full. There is no queue
 deadline. Final and bootstrap status retain the last operation error.
 
-Cold recovery and its I/O-worker/generation-fenced installation are #1956 part 2.
-Until that lands, a registered generation without a retained live source returns
-`queue_source_cold` (`retry: later`), never an empty successful subscription.
-This is distinct from the permanent `queue_mode_unsupported` mode refusal.
-Retry becomes useful when part 2 installs the I/O recovery provider. A stale or
-unknown generation returns `agent_not_found`. This limit does not affect the
-retained source of a worker that has exited in the current process. Global
-lifecycle facts are #1956 part 3; producer routing/acknowledgements remain #1957
-and #1958.
+Cold sources return `queue_source_cold` (`retry: later`) until the registry
+owner installs a completed recovery. `Workers::recover_queue` admits at most one
+I/O loader per worker owner. It opens an existing private journal and lease;
+a missing namespace never creates an empty successful queue. An existing
+checkpoint retains its original sequences and bytes. A first uncheckpointed
+subscription uses the same durable bootstrap as a live owner.
+
+All opening, fsync, supported torn-tail repair and bootstrap run on that I/O
+worker. The completion owns no journal lease or file, and polling/dropping the
+handle never joins the thread on the server loop. Cancelling a consumer does
+not interrupt filesystem operations; the slot stays occupied until loading
+ends. The same agent's launch is `session_busy` while that slot is active.
+Unrelated agents can still launch. Consumer request/result retention limits
+belong to the subscription adapter (#1830); recovered snapshot memory remains
+proportional to the journal, as for the live provider.
+
+Installation rechecks the registry generation, namespace and active or
+unconfirmed owner. A live producer or the first installed recovery wins
+canonically; later completions cannot replace it. Terminal recovered sources
+serve their immutable replay and `synced`, then `End`. A later live generation
+uses its own fenced owner and continues at the persisted queue sequence.
+Retired sources are removed from the owner cache during registry polling.
+
+Lease contention is `session_busy`. I/O/opening failures, including a missing
+journal, are `queue_recovery_failed` with `retry: after_inspecting`: recovery
+may have repaired a tail or completed a bootstrap before the failure. No
+mutation is automatically retried. Worker loss/panic is
+`structured_worker_panicked`. The configured rewrite policy re-derives
+`queue_journal_newer`/`queue_journal_corrupt` refusals without repairing or
+rewriting read-only bytes; these sources refuse rather than claim a snapshot.
+A stale or unknown registry generation remains `agent_not_found`.
+
+Global lifecycle facts are #1956 part 3; producer routing/acknowledgements
+remain #1957 and #1958.

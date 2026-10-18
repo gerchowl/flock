@@ -10,7 +10,7 @@ use std::{
     os::{fd::OwnedFd, unix::net::UnixStream},
     time::{Duration, Instant},
 };
-pub(in crate::structured::workers::queue) fn root() -> SessionConfigDir {
+pub(in crate::structured::workers) fn root() -> SessionConfigDir {
     SessionConfigDir::create(&std::env::temp_dir()).unwrap()
 }
 fn item(n: u32) -> Item {
@@ -19,7 +19,7 @@ fn item(n: u32) -> Item {
     item.state = State::Held;
     item
 }
-pub(in crate::structured::workers::queue) fn journal(root: &SessionConfigDir, n: u32) -> Journal {
+pub(in crate::structured::workers) fn journal(root: &SessionConfigDir, n: u32) -> Journal {
     let mut j = Journal::open(root.path(), "publication-fixture").unwrap();
     for i in 0..n {
         j.append(Change::Upsert {
@@ -38,7 +38,7 @@ fn update(cut: Cut) -> Update {
         cut: Some(cut),
     }
 }
-pub(in crate::structured::workers::queue) fn pages(reader: &mut Reader) -> Vec<Page> {
+pub(in crate::structured::workers) fn pages(reader: &mut Reader) -> Vec<Page> {
     let mut result = vec![];
     for _ in 0..1000 {
         let page = reader.page();
@@ -49,7 +49,7 @@ pub(in crate::structured::workers::queue) fn pages(reader: &mut Reader) -> Vec<P
     }
     panic!("bounded in-memory replay did not finish");
 }
-pub(in crate::structured::workers::queue) fn sequences(pages: &[Page]) -> Vec<u64> {
+pub(in crate::structured::workers) fn sequences(pages: &[Page]) -> Vec<u64> {
     pages
         .iter()
         .filter_map(|p| {

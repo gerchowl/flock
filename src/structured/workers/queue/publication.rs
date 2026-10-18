@@ -165,15 +165,24 @@ impl Source {
     pub(super) fn open_retained(
         data: &Path,
         agent: &str,
-        _policy: RewritePolicy,
+        policy: RewritePolicy,
     ) -> Result<Self, Failure> {
-        let mut journal = Journal::open(data, agent)?;
-        let result = journal.subscription();
-        let (publisher, source) = Publisher::new(agent, journal.replay(0)?);
-        if let Err(error) = result {
-            source.1.lock().error = Some(Failure::from(error).code);
-        }
+        use super::recovery::{open_error, storage_error};
+        let mut journal =
+            Journal::open_existing_with_policy(data, agent, policy).map_err(open_error)?;
+        let (mut publisher, source) =
+            Publisher::new(agent, journal.replay(0).map_err(storage_error)?);
+        publisher.finish(
+            || {
+                if let Some(reason) = journal.read_only() {
+                    return Err(Failure::from(io::Error::from(reason)));
+                }
+                journal.subscription().map_err(storage_error)
+            },
+            None,
+        );
         drop(publisher);
+        drop(journal);
         Ok(source)
     }
     pub(in crate::structured) fn belongs_to(&self, agent: &str) -> bool {
@@ -400,4 +409,4 @@ fn capture_locked<R: parking_lot::lock_api::RawMutex>(
 }
 
 #[cfg(test)]
-pub(in crate::structured::workers::queue) mod tests;
+pub(in crate::structured::workers) mod tests;

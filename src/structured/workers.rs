@@ -117,6 +117,7 @@ impl Worker {
 /// Completed reports are bounded to the latest launch per agent. Removed records
 /// discard confirmed completions, while uncertain ownership remains recoverable.
 pub struct Workers {
+    recovery_slot: Option<(String, std::sync::Weak<()>)>,
     retained_queues: BTreeMap<String, (u64, queue::publication::Source)>,
     entries: BTreeMap<String, Worker>,
     notify: Arc<Notify>,
@@ -134,6 +135,7 @@ impl Workers {
             wake,
             wakes,
             shutdown_result: None,
+            recovery_slot: None,
             retained_queues: BTreeMap::new(),
             entries: BTreeMap::new(),
             notify,
@@ -163,6 +165,13 @@ impl Workers {
             queue_rewrite_bytes,
             lineage,
         } = launch;
+        if self
+            .recovery_slot
+            .as_ref()
+            .is_some_and(|(id, slot)| id == &agent_id && slot.strong_count() != 0)
+        {
+            return Err(ErrorCode::SessionBusy);
+        }
         if let Some(previous) = self.entries.get_mut(&agent_id) {
             previous.join_finished();
             if !previous.finished
@@ -312,47 +321,6 @@ impl Workers {
             .ok_or(ErrorCode::AgentNotFound)?
             .queue_enqueue(request)
     }
-    /// Warm or recovered generation source; this never performs filesystem work.
-    /// Until recovery installs a source, return retryable queue_source_cold.
-    pub(crate) fn queue_source(
-        &self,
-        registry: &Registry,
-        id: &str,
-        generation: u64,
-    ) -> Result<queue::publication::Source, ErrorCode> {
-        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
-            return Err(ErrorCode::AgentNotFound);
-        }
-        self.runtime(id, generation)
-            .and_then(Runtime::queue_source)
-            .or_else(|| {
-                self.retained_queues
-                    .get(id)
-                    .filter(|(g, _)| *g == generation)
-                    .map(|(_, source)| source.clone())
-            })
-            .ok_or(ErrorCode::QueueSourceCold)
-    }
-    /// Install only a matching namespace/epoch with no live or unconfirmed owner.
-    pub(crate) fn install_queue_source(
-        &mut self,
-        registry: &Registry,
-        id: &str,
-        generation: u64,
-        source: queue::publication::Source,
-    ) -> Result<(), ErrorCode> {
-        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
-            return Err(ErrorCode::AgentNotFound);
-        }
-        if self.entries.contains_key(id) {
-            return Err(ErrorCode::SessionBusy);
-        }
-        if !source.belongs_to(id) {
-            return Err(ErrorCode::InvalidRequest);
-        }
-        self.retained_queues.insert(id.into(), (generation, source));
-        Ok(())
-    }
     /// Consume an immutable completion/cut from the current generation only.
     /// Terminal cuts remain available after exit; drain before relaunch/removal.
     /// A cancelled notification report requires durable replay through #1956.
@@ -390,6 +358,9 @@ impl Workers {
     /// Drain bounded batches and due observations. Old generations are cancelled
     /// and fenced by the pure registry; terminal reports cannot overtake stdout.
     pub fn poll(&mut self, registry: &mut Registry, now: Instant, unix_ms: u64) -> bool {
+        self.retained_queues.retain(|id, (generation, _)| {
+            registry.get(id).is_some_and(|(_, _, g)| g == *generation)
+        });
         let mut changed = false;
         for (id, worker) in &mut self.entries {
             if worker.finished {

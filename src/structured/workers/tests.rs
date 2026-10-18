@@ -860,3 +860,5 @@ fn drop_after_failed_shutdown_does_not_wait_a_second_time() {
 }
 
 mod queue;
+
+mod recovery;

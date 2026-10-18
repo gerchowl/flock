@@ -38,7 +38,8 @@ fn cold_queue_recovery_missing_journal_never_creates_an_empty_source() {
     let error = Source::open_retained(root.path(), "missing-fixture", policy())
         .err()
         .expect("created a missing queue");
-    assert_eq!(error.code.as_str(), "agent_not_found");
+    assert_eq!(error.code.as_str(), "queue_recovery_failed");
+    assert_eq!(error.source.unwrap().kind(), std::io::ErrorKind::NotFound);
     assert!(!root.path().join("sessions/missing-fixture").exists());
 }
 #[test]
@@ -91,4 +92,53 @@ fn cold_queue_recovery_rederives_policy_refusal_before_torn_tail_repair() {
     ));
     assert!(matches!(reader.page(), Page::End));
     assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn cold_queue_recovery_loader_and_panic_completion_run_off_the_caller() {
+    let root = root();
+    let mut j = journal(&root, 1);
+    j.checkpoint().unwrap();
+    drop(j);
+    let data = root.path().to_owned();
+    let caller = std::thread::current().id();
+    for panic_loader in [false, true] {
+        let data = data.clone();
+        let mut recovery = Recovery::spawn(AGENT.into(), 7, move || {
+            assert_ne!(
+                std::thread::current().id(),
+                caller,
+                "I/O loader ran on the caller"
+            );
+            assert!(!panic_loader, "injected I/O producer panic");
+            Source::open_retained(&data, AGENT, policy())
+        })
+        .unwrap();
+        let wake = recovery.waker();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let notified = wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                match recovery.poll() {
+                    Step::Pending => notified.await,
+                    step => break step,
+                }
+            }
+        })
+        .await
+        .expect("I/O producer disappeared without a completion");
+        if panic_loader {
+            assert!(matches!(
+                outcome,
+                Step::Refused(Failure {
+                    code: ErrorCode::StructuredWorkerPanicked,
+                    ..
+                })
+            ));
+        } else {
+            assert!(matches!(outcome, Step::Ready(_)));
+        }
+        assert!(matches!(recovery.poll(), Step::Closed));
+    }
 }

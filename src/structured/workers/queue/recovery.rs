@@ -1,11 +1,13 @@
 //! Cold queue source assembly on an owned I/O worker (ADR-0036 §4/§5).
 //! Installation is a separate registry-owner step, fenced again after I/O.
 use super::{publication::Source, Failure, RewritePolicy};
+use crate::structured::runtime::Runtime;
 use crate::{
     api::error_code::ErrorCode,
     structured::{registry::Registry, workers::Workers},
 };
 use std::{
+    io,
     path::PathBuf,
     sync::{mpsc, Arc},
     thread::JoinHandle,
@@ -48,14 +50,16 @@ pub(crate) struct Recovery {
 }
 impl Recovery {
     /// Start only I/O here; success accepts the request, not a completed source.
-    pub fn start(
+    pub(in crate::structured::workers) fn start(
         data: PathBuf,
         id: String,
         generation: u64,
         policy: RewritePolicy,
+        slot: Arc<()>,
     ) -> Result<Self, Failure> {
         let agent = id.clone();
         Self::spawn(id, generation, move || {
+            let _slot = slot;
             Source::open_retained(&data, &agent, policy)
         })
     }
@@ -122,6 +126,111 @@ impl Recovery {
             }),
             Err(error) => Step::Refused(error),
         }
+    }
+}
+
+/// Opening a busy exclusive lease is retryable; no write was attempted here.
+pub(super) fn open_error(source: io::Error) -> Failure {
+    if source.kind() == io::ErrorKind::WouldBlock {
+        Failure {
+            code: ErrorCode::SessionBusy,
+            source: Some(source),
+        }
+    } else {
+        storage_error(source)
+    }
+}
+/// Recovery can sync/repair/bootstrap. Inspect failures before requesting more I/O.
+pub(super) fn storage_error(source: io::Error) -> Failure {
+    let mut failure = Failure::from(source);
+    if failure.code == ErrorCode::InputWriteUnknown {
+        failure.code = ErrorCode::QueueRecoveryFailed;
+    }
+    failure
+}
+impl Workers {
+    /// Warm or recovered generation source; this never performs filesystem work.
+    /// Until recovery installs a source, return retryable queue_source_cold.
+    pub(crate) fn queue_source(
+        &self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+    ) -> Result<Source, ErrorCode> {
+        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        self.runtime(id, generation)
+            .and_then(Runtime::queue_source)
+            .or_else(|| {
+                self.retained_queues
+                    .get(id)
+                    .filter(|(g, _)| *g == generation)
+                    .map(|(_, source)| source.clone())
+            })
+            .ok_or(ErrorCode::QueueSourceCold)
+    }
+
+    fn queue_owned(&self, id: &str) -> bool {
+        self.entries.get(id).is_some_and(|w| {
+            !w.finished
+                || w.thread.is_some()
+                || w.report.as_ref().is_some_and(|r| r.authority_retained)
+        })
+    }
+    /// Admit one I/O loader per owner. A live/canonical source wins without I/O.
+    /// The same agent cannot launch until this load releases its slot. Completion
+    /// is not installation: the caller must recheck the current registry owner.
+    pub(crate) fn recover_queue(
+        &mut self,
+        registry: &Registry,
+        data: PathBuf,
+        id: &str,
+        generation: u64,
+        policy: RewritePolicy,
+    ) -> Result<Recovery, Failure> {
+        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
+            return Err(Failure {
+                code: ErrorCode::AgentNotFound,
+                source: None,
+            });
+        }
+        if self.queue_owned(id)
+            || self.queue_source(registry, id, generation).is_ok()
+            || self
+                .recovery_slot
+                .as_ref()
+                .is_some_and(|(_, s)| s.strong_count() != 0)
+        {
+            return Err(Failure {
+                code: ErrorCode::SessionBusy,
+                source: None,
+            });
+        }
+        let slot = Arc::new(());
+        self.recovery_slot = Some((id.into(), Arc::downgrade(&slot)));
+        Recovery::start(data, id.into(), generation, policy, slot)
+    }
+    /// Atomically install only the first matching source with no active owner.
+    /// Another recovery or a live producer wins canonically; no file is opened.
+    pub(crate) fn install_queue_source(
+        &mut self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+        source: Source,
+    ) -> Result<(), ErrorCode> {
+        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        if !source.belongs_to(id) {
+            return Err(ErrorCode::InvalidRequest);
+        }
+        if self.queue_owned(id) || self.queue_source(registry, id, generation).is_ok() {
+            return Err(ErrorCode::SessionBusy);
+        }
+        self.retained_queues.insert(id.into(), (generation, source));
+        Ok(())
     }
 }
 

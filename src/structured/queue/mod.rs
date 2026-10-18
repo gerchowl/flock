@@ -115,9 +115,14 @@ impl Journal {
     /// Unknown data are logged and preserved raw, never interpreted for delivery.
     /// Only a supported journal's unterminated final tail is repaired.
     pub fn open(data: &Path, agent: &str) -> io::Result<Self> {
-        Self::open_inner(data, agent, None)
+        Self::open_inner(data, agent, None, true)
     }
-    fn open_inner(data: &Path, agent: &str, rewrite: Option<RewritePolicy>) -> io::Result<Self> {
+    fn open_inner(
+        data: &Path,
+        agent: &str,
+        rewrite: Option<RewritePolicy>,
+        create: bool,
+    ) -> io::Result<Self> {
         if agent.is_empty()
             || !agent
                 .bytes()
@@ -127,7 +132,17 @@ impl Journal {
         }
         let root = data.canonicalize()?;
         let sessions = root.join("sessions");
-        private_fs::ensure_private_dir(&sessions)?;
+        let directory = if create {
+            private_fs::ensure_private_dir
+        } else {
+            private_fs::check_private_dir
+        };
+        let open = if create {
+            open_file
+        } else {
+            private_fs::open_append_file
+        };
+        directory(&sessions)?;
         let component: String = agent
             .chars()
             .map(|c| {
@@ -139,14 +154,14 @@ impl Journal {
             })
             .collect();
         let dir = sessions.join(component);
-        private_fs::ensure_private_dir(&dir)?;
-        let lease = open_file(&dir.join(".queue.lock"))?;
+        directory(&dir)?;
+        let lease = open(&dir.join(".queue.lock"))?;
         lease.try_lock().map_err(|error| match error {
             fs::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
             fs::TryLockError::Error(error) => error,
         })?;
         let path = dir.join("queue.jsonl");
-        let file = open_file(&path)?;
+        let file = open(&path)?;
         for path in [&root, &sessions, &dir] {
             File::open(path)?.sync_all()?;
         }
