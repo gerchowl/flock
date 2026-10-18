@@ -64,6 +64,9 @@ pub(crate) struct HandoffManifest {
     pub expected_version: Option<String>,
     pub expected_protocol: Option<u32>,
     pub snapshot: crate::persist::SessionSnapshot,
+    /// Unconfirmed structured cleanup survives transfer as Unknown, never authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structured_unknown: Vec<String>,
     pub panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
     /// One listening TCP descriptor follows the PTY descriptors when present.
     #[serde(default)]
@@ -72,6 +75,17 @@ pub(crate) struct HandoffManifest {
     /// drop them. Absent from an older server's manifest.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub kept_drafts: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[cfg(unix)]
+impl HandoffManifest {
+    /// Reapply only uncertainty after the registry metadata has been restored.
+    pub(crate) fn restore_structured_unknown(
+        &self,
+        registry: &mut crate::structured::registry::Registry,
+    ) {
+        registry.restore_handoff_unknown(&self.structured_unknown);
+    }
 }
 
 #[cfg(unix)]
@@ -546,6 +560,7 @@ pub(crate) fn manifest_for(
         expected_version,
         expected_protocol,
         snapshot,
+        structured_unknown: Vec::new(),
         panes,
         kept_drafts: Default::default(),
         client_listener: false,
@@ -936,6 +951,7 @@ mod tests {
         assert_eq!(manifest.panes.len(), 1);
         assert_eq!(manifest.snapshot.workspaces.len(), 1);
         assert!(manifest.kept_drafts.is_empty());
+        assert!(manifest.structured_unknown.is_empty());
         assert!(
             !manifest.panes[0].agent_session_hook_confirmed,
             "an older sender knows nothing of confirmation, so nothing is confirmed"
