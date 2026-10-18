@@ -85,7 +85,7 @@ fn registry_s4_and_s6_project_into_the_generated_structured_only_contract() {
         record,
         state: &update.state,
         activity: Some("Reading source"),
-        waiting_on_human: &waiting,
+        waiting_on_human: &waiting.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
     });
     assert_eq!(row.state, update.state);
     assert_eq!(row.waiting_on_human, vec!["p1"]);
