@@ -1333,6 +1333,31 @@ fn keep_on_failure_keeps_a_start_whose_readiness_timed_out() {
 
 #[test]
 fn permission_trust_start_keeps_the_named_block_for_status_and_wait() {
+    assert_permission_trust_start(include_str!(
+        "fixtures/attention-1023/claude-trust-with-permissions.txt"
+    ));
+}
+
+#[test]
+fn gated_permission_trust_start_keeps_the_named_block_for_status_and_wait() {
+    assert_permission_trust_start(include_str!(
+        "fixtures/attention-1023/claude-trust-gated-grants.txt"
+    ));
+}
+
+#[test]
+fn directory_permission_trust_start_keeps_the_named_block_for_status_and_wait() {
+    let screen = include_str!("fixtures/attention-1023/claude-trust-gated-grants.txt")
+        .replace("Accessing workspace:", "Now in a new directory:")
+        .replace(
+            "Quick safety check: Is this a project you created or one you trust?",
+            "This session hasn't worked here before. Is this a directory you created or one you trust?",
+        )
+        .replace("Yes, I trust this folder", "Yes, trust it and apply them");
+    assert_permission_trust_start(&screen);
+}
+
+fn assert_permission_trust_start(screen: &str) {
     let server = start_server();
     operator_workspace(&server);
     let repo = committed_repo(&server);
@@ -1358,11 +1383,7 @@ fn permission_trust_start_keeps_the_named_block_for_status_and_wait() {
         ],
     );
     let pane = delegate_pane(&server, "permissions");
-    fs::write(
-        server.base.join("screen"),
-        include_str!("fixtures/attention-1023/claude-trust-with-permissions.txt"),
-    )
-    .unwrap();
+    fs::write(server.base.join("screen"), screen).unwrap();
     let deadline = Instant::now() + WITHIN;
     let captured = loop {
         let out = cli(
@@ -1372,7 +1393,7 @@ fn permission_trust_start_keeps_the_named_block_for_status_and_wait() {
             ],
         );
         let screen = String::from_utf8_lossy(&out.stdout).into_owned();
-        if screen.contains("pre-approves 17 tool permissions") {
+        if screen.contains("pre-approves") {
             break screen;
         }
         assert!(

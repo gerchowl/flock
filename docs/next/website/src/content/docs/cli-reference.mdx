@@ -725,18 +725,19 @@ The delegate runs in a workspace it created and **never requests focus**, so you
 **The brief is only typed into an agent that is at its prompt.** `start` and `send` both wait out a permission prompt rather than answering it, and time out with the status named (`delegate <name> is blocked`) rather than typing into a dialog. That wait also covers readiness — a pane that has painted nothing yet reports `unknown`, which is a booting TUI, not a crash. Claude Code asks `Quick safety check: Is this a project you created or one you trust?` the first time it starts in a directory, and a `--worktree` checkout is always such a directory: that dialog has no input box, so the delegate names it (`delegate <name>: Claude Code is waiting on its folder-trust dialog (see #605)`) and refuses instead of typing at it. When the directory is a linked worktree of a repository already trusted in that Claude profile, flock records the worktree as trusted before starting `claude`, so the dialog does not appear (#605, `[worktrees] pretrust_claude`); anywhere else accepting it stays a human action. Codex has its own `Trust this folder?` dialog for a repository it has never trusted; the delegate names it `codex_folder_trust` and refuses the same way. Codex records trust for the repository root, so accepting it once in the main checkout covers every later worktree of that repository. `delegate status` names a startup dialog the agent is blocked on (`startup_dialog` in `--json`).
 
 Claude's folder-trust variant with `This folder pre-approves N tool permissions`
-is named `claude_folder_trust_with_permissions`. Recognition requires its live
-workspace title, permission notice, trust/refusal choices and confirm footer;
-counts and workspace paths do not select the dialog. Flock never answers it.
+is named `claude_folder_trust_with_permissions`. Recognition requires the
+permission notice and live folder-trust controls. Both known question/answer
+variants are recognised, including `No, exit` and `No, continue without these
+permissions`; counts, workspace paths and cancel labels do not select the dialog.
+Flock never answers it.
 `delegate start` returns `agent_blocked` (exit 6, `cli::exit::AGENT_BLOCKED`) and
 keeps the pane, checkout and delegate record at round 0 without requiring
 `--keep-on-failure`. No brief has been submitted. `delegate status` and
-`delegate wait` report the same `startup_dialog` name; JSON blocked outcomes
-include that field (null when no named dialog is observed). After the operator
+`delegate wait` report the same `startup_dialog` name. JSON outcome reports always
+include that field (null when absent). After the operator
 answers in the pane, `delegate send` can submit round 1. If recording the block
 or syncing its registry directory fails, start returns failure (exit 1) while
 retaining the pane and naming its ID in the diagnostic.
-
 
 If the pane disappears before the readiness subscription is established, `delegate start --json` reports `start_failed`; its `reason` retains the preflight error envelope with code `pane_not_found` and names the pane's exit or loss of resolution. Other preflight errors retain their server code and diagnostic. This is a failed start (exit 1), with the usual rollback or `--keep-on-failure` behavior; it is not a successful readiness verdict.
 

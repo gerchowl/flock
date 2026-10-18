@@ -5831,6 +5831,62 @@ mod tests {
         assert_eq!(shown(&history), None);
     }
 
+    fn assert_permissions_variant(directory_question: bool, cancel: &str) {
+        let screen =
+            include_str!("../../tests/fixtures/attention-1023/claude-trust-gated-grants.txt")
+                .replace("No, continue without these permissions", cancel);
+        let screen = if directory_question {
+            screen
+                .replace("Accessing workspace:", "Now in a new directory:")
+                .replace(
+                    "Quick safety check: Is this a project you created or one you trust?",
+                    "This session hasn't worked here before. Is this a directory you created or one you trust?",
+                )
+                .replace("Yes, I trust this folder", "Yes, trust it and apply them")
+        } else {
+            screen
+        };
+        let harness = validate_harness(Some("claude")).unwrap();
+        let shown = |screen: &str| {
+            harness
+                .startup_dialogs
+                .iter()
+                .find(|dialog| (dialog.shows)(screen))
+        };
+        let dialog = shown(&screen).expect("the live dialog must have a name");
+        assert_eq!(dialog.code, "claude_folder_trust_with_permissions");
+        assert!(dialog.keep_on_start);
+        assert_eq!(
+            shown(&screen.replace("This folder pre-approves 3 tool permissions in", ""))
+                .unwrap()
+                .code,
+            "claude_folder_trust",
+            "the permission notice distinguishes this from plain trust",
+        );
+        let history = format!("{screen}\n{}\n❯ \n{}\n", "─".repeat(30), "─".repeat(30));
+        assert!(shown(&history).is_none(), "a later composer owns the pane");
+    }
+
+    #[test]
+    fn permission_trust_project_without_grants_is_named() {
+        assert_permissions_variant(false, "No, continue without these permissions");
+    }
+
+    #[test]
+    fn permission_trust_project_exit_is_named() {
+        assert_permissions_variant(false, "No, exit");
+    }
+
+    #[test]
+    fn permission_trust_directory_without_grants_is_named() {
+        assert_permissions_variant(true, "No, continue without these permissions");
+    }
+
+    #[test]
+    fn permission_trust_directory_exit_is_named() {
+        assert_permissions_variant(true, "No, exit");
+    }
+
     #[test]
     fn expired_report_uses_cached_screen_without_io_or_advice() {
         let deadline = Some(Instant::now());
