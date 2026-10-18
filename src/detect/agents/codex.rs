@@ -523,16 +523,20 @@ pub(in crate::detect) fn is_progress_chrome(line: &str) -> bool {
     codex_working_status_line(line)
 }
 
-/// Codex's live conversation lock, bounded by its retry/fork/exit footer (#1667).
-/// Joining the final transcript label tolerates terminal wrapping inside a word.
+/// Live lock controls, including a wrapped or right-truncated final footer.
+/// Blank rows are ignored; any non-footer content after the controls rejects history.
 pub(in crate::detect) fn has_codex_conversation_lock(content: &str) -> bool {
-    let tail = bottom_non_empty_lines(content, 8).join(" ").to_lowercase();
-    let flat = tail.split_whitespace().collect::<Vec<_>>().join(" ");
-    flat.contains("this conversation is open in another app")
-        && flat.contains("close it there and press r to continue here")
-        && flat
-            .rsplit_once("r retry f fork esc/ctrl+c/q exit ctrl+t ")
-            .is_some_and(|(_, end)| end.replace(' ', "") == "transcript")
+    let compact: String = bottom_non_empty_lines(content, 16)
+        .join("")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    compact.contains("thisconversationisopeninanotherapp")
+        && compact.contains("closeitthereandpressrtocontinuehere")
+        && compact.rsplit_once("rretryffork").is_some_and(|(_, end)| {
+            "esc/ctrl+c/qexitctrl+ttranscript".starts_with(end.trim_end_matches('…'))
+        })
 }
 
 pub(in crate::detect) fn has_codex_hook_review(content: &str) -> bool {
@@ -578,6 +582,31 @@ mod tests {
         let history = format!("{screen}\n› Ask Codex to do anything\n  ? for shortcuts\n");
         assert_eq!(detect(&history), AgentState::Idle);
         assert!(!has_visible_blocker(&history));
+    }
+
+    #[test]
+    fn conversation_lock_narrow_live_footer_and_truncation_exclude_history() {
+        // Captured from Codex 0.160.1 in an isolated split pane via recent text.
+        let screen = include_str!("../../../tests/fixtures/codex/conversation-locked-narrow.txt");
+        for screen in [
+            screen.to_owned(),
+            format!("{screen}\n\n\n"),
+            screen[..screen.find("ctrl+c/q").unwrap()].to_string(),
+            screen.replace("ctrl+c/q exit   ctrl+t\n  transcript", "…"),
+        ] {
+            assert!(has_codex_conversation_lock(&screen), "{screen}");
+            assert_eq!(detect(&screen), AgentState::Blocked, "{screen}");
+            for tail in [
+                "› Ask Codex to do anything",
+                "• Working (1s • esc to interrupt)",
+                "Allow command?\n[y/n]",
+            ] {
+                assert!(
+                    !has_codex_conversation_lock(&format!("{screen}\n{tail}")),
+                    "{tail}"
+                );
+            }
+        }
     }
 
     const HOLLOW_WORKING: &str =

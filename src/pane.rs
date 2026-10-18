@@ -767,6 +767,8 @@ pub struct PaneRuntime {
     /// Flock's hold on operator input during one guarded injection (#850).
     injection_lease: injection_lease::InjectionLease,
     spawned_with_default_shell: bool,
+    /// One explicit lock choice remains pending until an unlocked snapshot is observed.
+    codex_lock_pending: Cell<bool>,
     // Task handles for deterministic shutdown
     detect_handle: tokio::task::AbortHandle,
 }
@@ -1742,6 +1744,7 @@ impl PaneRuntime {
             has_been_typed_into: Cell::new(true),
             injection_lease: Default::default(),
             spawned_with_default_shell: false,
+            codex_lock_pending: Cell::new(false),
             detect_handle,
         })
     }
@@ -2200,6 +2203,7 @@ impl PaneRuntime {
             has_been_typed_into: Cell::new(false),
             injection_lease: Default::default(),
             spawned_with_default_shell: initial_state.spawned_with_default_shell,
+            codex_lock_pending: Cell::new(false),
             detect_handle,
         })
     }
@@ -2292,7 +2296,27 @@ impl PaneRuntime {
     }
 
     pub fn detection_text(&self) -> String {
-        self.terminal.detection_text()
+        let text = self.terminal.detection_text();
+        if self.codex_lock_pending.get() && !crate::detect::codex_conversation_locked(&text) {
+            self.codex_lock_pending.set(false);
+        }
+        text
+    }
+
+    /// Release a choice for which the input layer proved that no byte was written.
+    pub(crate) fn cancel_codex_lock_choice(&self) {
+        self.codex_lock_pending.set(false);
+    }
+
+    /// Admit one owner-checked lock choice, clearing the fence only after unlock.
+    pub(crate) fn admit_codex_lock_choice(&self) -> Result<(), &'static str> {
+        if !crate::detect::codex_conversation_locked(&self.detection_text()) {
+            return Err("agent_not_ready");
+        }
+        if self.codex_lock_pending.replace(true) {
+            return Err("injection_pending");
+        }
+        Ok(())
     }
 
     pub fn detection_ansi(&self) -> String {
@@ -2823,6 +2847,7 @@ impl PaneRuntime {
                 has_been_typed_into: Cell::new(false),
                 injection_lease: Default::default(),
                 spawned_with_default_shell: false,
+                codex_lock_pending: Cell::new(false),
                 detect_handle: tokio::spawn(async {}).abort_handle(),
             },
             rx,
@@ -3326,6 +3351,7 @@ mod tests {
             has_been_typed_into: Cell::new(true),
             injection_lease: Default::default(),
             spawned_with_default_shell: false,
+            codex_lock_pending: Cell::new(false),
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 
@@ -3359,6 +3385,7 @@ mod tests {
             has_been_typed_into: Cell::new(true),
             injection_lease: Default::default(),
             spawned_with_default_shell: false,
+            codex_lock_pending: Cell::new(false),
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 

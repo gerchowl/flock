@@ -1373,32 +1373,51 @@ impl App {
         id: String,
         params: crate::api::schema::PaneResolveCodexLockParams,
     ) -> String {
+        if crate::app::input_writes::deadline(params.write_timeout_ms.as_ref()).is_none() {
+            return encode_error(
+                id,
+                "invalid_params",
+                "write_timeout_ms must be an integer in 1..=30000",
+            );
+        }
         let (ws, pane) = match self.resolve_pane_target(&params.pane_id) {
             Ok(target) => target,
             Err(error) => return target_refusal(id, error),
         };
-        let locked = self.lookup_runtime(ws, pane).is_some_and(|(runtime, _)| {
-            crate::detect::codex_conversation_locked(&runtime.detection_text())
-        });
-        if !locked {
-            return encode_error(
-                id,
-                "agent_not_ready",
-                "codex_conversation_locked is not currently detected; no key sent",
-            );
+        let admission = self
+            .lookup_runtime(ws, pane)
+            .map_or(Err("agent_not_ready"), |(runtime, _)| {
+                runtime.admit_codex_lock_choice()
+            });
+        if let Err(code) = admission {
+            return encode_error(id, code, "No key sent: lock absent or a choice is pending until an unlocked screen is observed");
         }
         let key = match params.choice {
             crate::api::schema::CodexLockChoice::Retry => "r",
             crate::api::schema::CodexLockChoice::Fork => "f",
         };
-        self.handle_pane_send_keys(
+        let response = self.handle_pane_send_keys(
             id,
             PaneSendKeysParams {
                 pane_id: params.pane_id,
                 keys: vec![key.into()],
                 write_timeout_ms: params.write_timeout_ms,
             },
-        )
+        );
+        if serde_json::from_str::<serde_json::Value>(&response)
+            .ok()
+            .is_some_and(|reply| {
+                reply
+                    .pointer("/error/data/input_write/bytes_written")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(0)
+            })
+        {
+            if let Some((runtime, _)) = self.lookup_runtime(ws, pane) {
+                runtime.cancel_codex_lock_choice();
+            }
+        }
+        response
     }
 
     pub(super) fn handle_pane_send_keys(
@@ -1532,6 +1551,80 @@ mod tests {
             peer_uid: Some(crate::platform::peer::effective_uid()),
         });
         response
+    }
+
+    #[tokio::test]
+    async fn codex_lock_raw_callers_share_one_pending_choice_until_unlocked() {
+        let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
+        let runtime = &app.state.workspaces[0].tabs[0].runtimes[&pane];
+        runtime.test_process_pty_bytes(
+            include_str!("../../../tests/fixtures/codex/conversation-locked.txt")
+                .replace('\n', "\r\n")
+                .as_bytes(),
+        );
+        let params = serde_json::json!({"pane_id":public,"choice":"retry"});
+        let invalid = raw_request(
+            &mut app,
+            "pane.resolve_codex_lock",
+            serde_json::json!({"pane_id":public,"choice":"retry","write_timeout_ms":0}),
+        );
+        let invalid: serde_json::Value =
+            serde_json::from_str(&invalid.try_recv().unwrap()).unwrap();
+        assert_eq!(invalid["error"]["code"], "invalid_params");
+        let _first = raw_request(&mut app, "pane.resolve_codex_lock", params.clone());
+        let second = raw_request(&mut app, "pane.resolve_codex_lock", params.clone());
+        let response: serde_json::Value =
+            serde_json::from_str(&second.try_recv().unwrap()).unwrap();
+        assert_eq!(response["error"]["code"], "injection_pending", "{response}");
+        let runtime = &app.state.workspaces[0].tabs[0].runtimes[&pane];
+        assert!(runtime.end_injection_lease("held"));
+        app.input_writes.service();
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"r");
+        assert!(bytes.try_recv().is_err());
+        let runtime = &app.state.workspaces[0].tabs[0].runtimes[&pane];
+        runtime.test_process_pty_bytes(b"\x1b[2J\x1b[H> ready");
+        let response = raw_request(&mut app, "pane.resolve_codex_lock", params.clone());
+        let response: serde_json::Value =
+            serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(response["error"]["code"], "agent_not_ready");
+        app.state.workspaces[0].tabs[0].runtimes[&pane].test_process_pty_bytes(
+            format!(
+                "\x1b[2J\x1b[H{}",
+                include_str!("../../../tests/fixtures/codex/conversation-locked.txt")
+                    .replace('\n', "\r\n")
+            )
+            .as_bytes(),
+        );
+        let _next = raw_request(&mut app, "pane.resolve_codex_lock", params);
+        app.input_writes.service();
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"r");
+    }
+
+    #[tokio::test]
+    async fn codex_lock_zero_byte_failure_releases_the_choice_fence() {
+        let (mut app, pane, public, bytes) = s3b_leased_app(8);
+        drop(bytes);
+        let runtime = &app.state.workspaces[0].tabs[0].runtimes[&pane];
+        assert!(runtime.end_injection_lease("held"));
+        runtime.test_process_pty_bytes(
+            include_str!("../../../tests/fixtures/codex/conversation-locked.txt")
+                .replace('\n', "\r\n")
+                .as_bytes(),
+        );
+        for _ in 0..2 {
+            let response = raw_request(
+                &mut app,
+                "pane.resolve_codex_lock",
+                serde_json::json!({"pane_id":public,"choice":"retry"}),
+            );
+            let response: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(
+                response["error"]["code"], "input_write_cancelled",
+                "{response}"
+            );
+            assert_eq!(response["error"]["data"]["input_write"]["bytes_written"], 0);
+        }
     }
 
     #[tokio::test]

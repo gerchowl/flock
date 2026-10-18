@@ -175,26 +175,35 @@ is not this state. Detection feeds ADR-0028 §1's human-attention axis.
 
 No automatic path answers the lock. A start blocked there retains its pane,
 checkout and round-0 record and returns `agent_blocked` (ADR-0029 exit 6).
-Status and wait name the same dialog at startup or later; wait exits 6. A plain
+Status and wait name the same dialog at startup or later; wait exits 6.
+Readiness consumes the fresh lock diagnosis in `agent.get`'s existing
+`blocked_reason`, without another screen RPC or reliance on cached status. A plain
 brief send refuses with the registered `codex_conversation_locked` code.
 
 `delegate send --resolve-lock retry|fork` is the explicit choice, mutually
 exclusive with a brief or await. The CLI holds the existing delegate lock,
 subscribes before observing, durably records the intent, then calls guarded
 `pane.resolve_codex_lock`. That operation rechecks the live screen in the
-server's owner turn and admits exactly one `r` or `f` with no Enter. An older
+server's owner turn and admits exactly one `r` or `f` with no Enter. A per-pane
+fence refuses another choice with `injection_pending` until an unlocked
+snapshot is observed, including two raw callers before repaint. An uncertain
+write keeps the fence; this is not permission to resend. An older
 server rejects this method; it cannot silently ignore a guard and send a raw
 key. MCP exposes no new keyboard tool. Mesh VERSION remains 5.
 
 After admission the CLI confirms that the live screen left the lock, using
 status notifications and bounded condition polling within the existing
 readiness budget, never re-sending. The registry holds only the latest choice,
-its timestamp and confirmation bit; unknown future metadata is preserved raw.
+its timestamp and confirmation bit while the lock remains; unknown future
+metadata is preserved raw. Resolution, an observed unlocked screen in status,
+an observed unlocked outcome, or the next submitted round clears it. Older flock versions read the additive
+key but drop it when rewriting an entry. A status that needs to clear metadata
+refuses with `injection_pending` if a concurrent registry writer holds the lock.
 An unconfirmed intent is not proof of delivery. A silent producer, stream
 loss, or uncertain write returns registered `codex_lock_unconfirmed` with
 ADR-0029's after-inspection exit 8. The operator inspects before another choice.
 A pre-request registry durability failure sends nothing; a post-request write
-failure can leave confirmation false. Successful resolution leaves the round
+failure can retain an unconfirmed intent. Successful resolution leaves the round
 unchanged and does not promise that the next dialog is ready for a brief.
 Restoring a missing registry entry remains #1285.
 

@@ -4017,7 +4017,7 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     // The whole entry, kept. A round that fails to submit has to put the file
     // back the way it found it, and decrementing one field of a mutated copy is
     // how a brief path from the failed round ends up recorded as the live one.
-    let original = entry.clone();
+    let mut original = entry.clone();
 
     let ready_timeout = flags
         .ready_timeout_ms
@@ -4055,6 +4055,8 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         Err(reason) => return Ok(fail(reason)),
     };
     let submitted_at_ms = now_ms();
+    entry.lock_resolution = None;
+    original.lock_resolution = None;
     entry.round += 1;
     entry.brief = brief;
     entry.submitted_at_ms = submitted_at_ms;
@@ -4136,21 +4138,12 @@ fn await_prompt(
     loop {
         match agent_record(&entry.terminal_id, Some(deadline)) {
             AgentFetch::Found(record) => {
-                if harness_for(entry).name == "codex" {
-                    if let Some(refusal) =
-                        startup_dialog_refusal(name, harness_for(entry), &entry.pane_id, deadline)
-                            .filter(|failure| {
-                                failure
-                                    .startup_dialog
-                                    .is_some_and(|dialog| dialog.code == lock::NAME)
-                            })
-                    {
-                        return Err(refusal);
-                    }
-                }
                 let status = field(&record, "agent_status")
                     .unwrap_or("unknown")
                     .to_string();
+                if let Some(refusal) = prompt_lock_refusal(name, harness_for(entry), &record) {
+                    return Err(refusal);
+                }
                 if matches!(status.as_str(), "idle" | "done") {
                     return Ok(record);
                 }
@@ -4174,6 +4167,26 @@ fn await_prompt(
             AgentFetch::Failed(reason) => return Err((format!("delegate {name}: {reason}")).into()),
         }
     }
+}
+
+/// Diagnose the live lock from the readiness poll's existing agent record.
+fn prompt_lock_refusal(
+    name: &str,
+    harness: &HarnessSpec,
+    record: &serde_json::Value,
+) -> Option<ReadyFailure> {
+    if harness.name != "codex" || field(record, "blocked_reason") != Some(lock::NAME) {
+        return None;
+    }
+    let dialog = harness
+        .startup_dialogs
+        .iter()
+        .find(|dialog| dialog.code == lock::NAME)?;
+    Some(ReadyFailure {
+        reason: format!("delegate {name}: {}: {}", dialog.code, dialog.refusal),
+        deadline_reached: false,
+        startup_dialog: Some(dialog),
+    })
 }
 
 fn cursor_of(record: &serde_json::Value) -> Result<String, String> {
@@ -4390,7 +4403,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
         Ok(flags) => flags,
         Err(reason) => return Ok(usage(reason)),
     };
-    let (entry, gone) = match require_delegate_no_deadline(name) {
+    let (mut entry, gone) = match require_delegate_no_deadline(name) {
         Ok(Recorded::Live(entry)) => (entry, false),
         Ok(Recorded::Gone(entry)) => (entry, true),
         Err(code) => return Ok(code),
@@ -4411,7 +4424,11 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
             }
         }
     };
-    let status = field(&record, "agent_status").unwrap_or("unknown");
+    let status = if field(&record, "blocked_reason") == Some(lock::NAME) {
+        "blocked"
+    } else {
+        field(&record, "agent_status").unwrap_or("unknown")
+    };
     let latest = load_observation(&entry);
     // A turn that ended with shells still running is settled (#911), and says
     // so, rather than leaving the caller to wonder what the footer counts.
@@ -4419,26 +4436,42 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
     // the field when false, and an older server never sends it, so an absent
     // field falls back to reading the screen here. Telling the two apart would
     // take a capability ping, which a successful delegate command never sends.
+    let screen = (!gone
+        && (status == "blocked"
+            || entry.lock_resolution.is_some()
+            || matches!(status, "idle" | "done")))
+    .then(|| detection_screen(&entry.pane_id, None))
+    .flatten();
     let background_shells = !gone
         && matches!(status, "idle" | "done")
         && (record
             .get("settled_with_background_shells")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
-            || detection_screen(&entry.pane_id, None)
-                .is_some_and(|screen| crate::detect::settled_with_background_shells(&screen)));
-    // A bare `blocked` gives the operator nothing to act on when the harness is
-    // sitting on a dialog it shows before any input (#828).
+            || screen
+                .as_deref()
+                .is_some_and(crate::detect::settled_with_background_shells));
     let startup_dialog = (!gone && status == "blocked")
         .then(|| {
-            startup_dialog_shown(
-                harness_for(&entry),
-                &entry.pane_id,
-                Instant::now() + REQUEST_TIMEOUT,
-            )
+            screen.as_deref().and_then(|screen| {
+                harness_for(&entry)
+                    .startup_dialogs
+                    .iter()
+                    .find(|dialog| (dialog.shows)(screen))
+                    .map(|dialog| dialog.code)
+            })
         })
-        .flatten()
-        .map(|dialog| dialog.code);
+        .flatten();
+    if entry.lock_resolution.is_some()
+        && (gone
+            || screen
+                .as_deref()
+                .is_some_and(|screen| !crate::detect::codex_conversation_locked(screen)))
+    {
+        if let Some(code) = lock::clear_observed(&mut entry)? {
+            return Ok(code);
+        }
+    }
     if flags.json {
         // `goal` is reserved for #573 and is always present and null: a field
         // that appears with its first value is not a field a caller can test for.
@@ -5188,8 +5221,17 @@ impl Await<'_> {
                 }
                 info["settled_with_background_shells"] =
                     serde_json::json!(crate::detect::settled_with_background_shells(&screen));
+                let mut report_entry = self.entry.clone();
+                if report_entry.lock_resolution.is_some()
+                    && !screen.is_empty()
+                    && !crate::detect::codex_conversation_locked(&screen)
+                {
+                    if let Some(code) = lock::clear_observed(&mut report_entry)? {
+                        return Ok(code);
+                    }
+                }
                 emit_outcome(
-                    self.entry,
+                    &report_entry,
                     outcome.as_str(),
                     Some(&info),
                     self.json,
@@ -5823,6 +5865,26 @@ fn emit_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_diagnosis_reuses_the_record_without_screen_io_or_cached_status() {
+        let harness = HARNESSES.iter().find(|h| h.name == "codex").unwrap();
+        for status in ["working", "idle", "done", "unknown", "blocked"] {
+            assert!(prompt_lock_refusal(
+                "fixture",
+                harness,
+                &serde_json::json!({"agent_status":status})
+            )
+            .is_none());
+            let failure = prompt_lock_refusal(
+                "fixture",
+                harness,
+                &serde_json::json!({"agent_status":status,"blocked_reason":lock::NAME}),
+            )
+            .unwrap();
+            assert_eq!(failure.startup_dialog.unwrap().code, lock::NAME);
+        }
+    }
 
     #[test]
     fn expired_report_uses_cached_screen_without_io_or_advice() {

@@ -19,5 +19,5 @@ while True:
         break
     with log.open('ab') as out:
         out.write(byte)
-    if byte in (b'r', b'f') and not (base / 'stay-locked').exists():
+    if byte in (b'r', b'f', b'u') and not (base / 'stay-locked').exists():
         paint("OpenAI Codex\n› Ask Codex to do anything\n  ? for shortcuts\n")

@@ -3886,7 +3886,8 @@ pub struct AgentInfo {
     /// false, and an older server never sends it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub settled_with_background_shells: bool,
-    /// Provider-limit wait or `resume_failed` while a retained identity is offline.
+    /// Live Codex lock, provider-limit wait, or `resume_failed` for an offline identity.
+    /// A live lock diagnosis can precede the cached agent-status update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub blocked_reason: Option<String>,

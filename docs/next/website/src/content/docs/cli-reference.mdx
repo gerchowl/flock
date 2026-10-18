@@ -733,13 +733,23 @@ at round 0 and reports `agent_blocked` (exit 6) without submitting the brief.
 Choose explicitly with `flk delegate send <name> --resolve-lock retry` or
 `--resolve-lock fork`. These send exactly one `r` or `f`, without Enter or a
 brief, and cannot be combined with `--brief` or `--await`. The server checks the
-live lock again before admitting the key; a changed or unlocked pane refuses
+live lock again before admitting the key. A second choice before an unlocked
+screen is observed refuses with `injection_pending`; two raw socket callers
+cannot both send a key before repaint. A changed or unlocked pane refuses
 with `agent_not_ready` (exit 10) and receives no key. A plain send while locked
 refuses with `codex_conversation_locked` (exit 6), naming both choices.
 
-The existing delegate registry retains only the latest explicit lock choice,
-its timestamp, and whether the pane was observed leaving the lock. JSON status
-and outcome reports expose this as `lock_resolution`. The intent is synced
+The delegate registry retains the explicit lock choice, its timestamp and
+confirmation bit while the lock remains. Successful resolution, a status read
+that observes unlock, or a new round clears `lock_resolution`; it never describes
+an earlier round. An older flock can read the additive key but drops it when
+rewriting the entry. A status blocked by a concurrent registry writer refuses
+with `injection_pending` rather than overwriting that writer's entry.
+
+Every JSON outcome report includes `startup_dialog` (the named blocked dialog,
+or null) and `lock_resolution` (the current intent object, or null). JSON status
+uses the same nullable fields. The intent object contains `choice` (`retry` or
+`fork`), `chosen_at_ms` (Unix milliseconds) and `confirmed` (a boolean). The intent is synced
 before the key request; `confirmed: false` does **not** prove whether a key was
 sent. A registry-write failure before the request sends nothing. Confirmation
 uses live screen checks, status notifications and bounded condition polling,
@@ -748,7 +758,7 @@ within `--ready-timeout` (default 60000 ms). Success reports `lock_resolved`
 does not imply the next screen is ready for a brief. An uncertain write,
 missing confirmation, or silent producer returns `codex_lock_unconfirmed`
 (exit 8): inspect the pane before choosing again. The key is never re-sent.
-A failure saving confirmation can leave the recorded intent unconfirmed even
+A failure clearing the intent can leave it recorded as unconfirmed even
 though the screen changed. Older servers refuse the guarded operation rather
 than receiving an unguarded fallback. This does not recover a lost delegate
 record (#1285).

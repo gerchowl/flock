@@ -292,6 +292,16 @@ impl TerminalRuntime {
         self.0.visible_ansi()
     }
 
+    /// Release a choice only after the input layer proves zero written bytes.
+    pub(crate) fn cancel_codex_lock_choice(&self) {
+        self.0.cancel_codex_lock_choice();
+    }
+
+    /// Admit one lock choice through the pane's owner-side fence.
+    pub(crate) fn admit_codex_lock_choice(&self) -> Result<(), &'static str> {
+        self.0.admit_codex_lock_choice()
+    }
+
     pub fn detection_text(&self) -> String {
         self.0.detection_text()
     }

@@ -34,11 +34,33 @@ fn screen(entry: &Entry, deadline: Instant) -> io::Result<String> {
         .ok_or_else(|| io::Error::other(response.to_string()))
 }
 
-/// Emit a registered refusal with the named state and the two explicit choices.
+/// Attach lock choices only to a refusal that actually diagnoses that lock.
 pub(super) fn refuse(code: ErrorCode, message: &str) -> i32 {
     let response = serde_json::json!({"error": {"code": code.as_str(), "message": message,
-        "data": {"startup_dialog": NAME, "choices": ["retry", "fork"]}}});
+        "data": (code == ErrorCode::CodexConversationLocked).then(|| serde_json::json!({"startup_dialog": NAME, "choices": ["retry", "fork"]}))}});
     crate::cli::output::error(&response, crate::cli::refusal_exit(code.as_str()))
+}
+
+/// Clear an observed obsolete intent without overwriting a concurrent round.
+pub(super) fn clear_observed(entry: &mut Entry) -> io::Result<Option<i32>> {
+    let _guard = match take_lock(&entry.name) {
+        Ok(guard) => guard,
+        Err("busy") => {
+            return Ok(Some(refuse(
+                ErrorCode::InjectionPending,
+                "A delegate write is pending; lock metadata was not changed",
+            )))
+        }
+        Err(reason) => return Err(io::Error::other(reason)),
+    };
+    if let Some(mut fresh) = read_entry(&entry.name) {
+        if fresh.round == entry.round && fresh.lock_resolution == entry.lock_resolution {
+            fresh.lock_resolution = None;
+            save(&fresh)?;
+        }
+    }
+    entry.lock_resolution = None;
+    Ok(None)
 }
 
 /// Report an unsubmitted start while retaining its durably recorded pane.
@@ -91,9 +113,16 @@ pub(super) fn resolve(name: &str, choice: CodexLockChoice, flags: &SendFlags) ->
         )
         .map_err(crate::cli::api_client_error_to_io)?;
     crate::api::client::parse_response_value(ack).map_err(crate::cli::api_client_error_to_io)?;
-    if harness_for(&entry).name != "codex"
-        || !crate::detect::codex_conversation_locked(&screen(&entry, deadline)?)
-    {
+    if harness_for(&entry).name != "codex" {
+        return Ok(refuse(
+            ErrorCode::AgentNotReady,
+            "This delegate is not Codex; no key sent",
+        ));
+    }
+    if !crate::detect::codex_conversation_locked(&screen(&entry, deadline)?) {
+        if entry.lock_resolution.take().is_some() {
+            save(&entry)?;
+        }
         return Ok(refuse(
             ErrorCode::AgentNotReady,
             "codex_conversation_locked is not currently detected; no key sent",
@@ -135,9 +164,7 @@ pub(super) fn resolve(name: &str, choice: CodexLockChoice, flags: &SendFlags) ->
                 &format!("could not confirm the lock screen changed: {error}; inspect before choosing again"))),
         };
         if !crate::detect::codex_conversation_locked(&current) {
-            if let Some(resolution) = &mut entry.lock_resolution {
-                resolution["confirmed"] = serde_json::json!(true);
-            }
+            entry.lock_resolution = None;
             save(&entry)?;
             emit_outcome(
                 &entry,
