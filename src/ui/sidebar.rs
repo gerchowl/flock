@@ -3844,6 +3844,28 @@ mod tests {
     }
 
     #[test]
+    fn server_identity1076_legacy_peer_keeps_unverified_label() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.peer_summaries.push(crate::peers::PeerSummaryState::new(
+            &crate::config::PeerConfig {
+                name: "node-a.invalid".into(),
+                ..Default::default()
+            },
+        ));
+        let area = Rect::new(0, 0, 80, 12);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_servers_section(&app, frame, area, false))
+            .unwrap();
+        let text = (0..area.height)
+            .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("node-a.invalid"));
+        assert!(text.contains("legacy/unverified"));
+    }
+
+    #[test]
     fn server_identity1076_icon_rows_always_include_the_node_name() {
         for mode in [
             crate::config::ServerLabelConfig::Icon,

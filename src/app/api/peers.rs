@@ -255,7 +255,9 @@ impl App {
             .map(|peer| {
                 let age_secs = peer.last_ok.map(|at| at.elapsed().as_secs());
                 RelayedFleetPeer {
-                    node_id: self.state.server_peer_node(peer).map(str::to_owned),
+                    // Gossip carries the ingress-validated report, not a local
+                    // sidebar binding that could recreate a rejected claim.
+                    node_id: peer.node_id.clone(),
                     // #418: how this server's dials to the peer are failing,
                     // which is what `flk peers` shows.
                     dial: peer.dial_report(std::time::Instant::now()),
@@ -1123,6 +1125,36 @@ mod tests {
             proxy_jump: None,
             icon: None,
         }
+    }
+
+    #[tokio::test]
+    async fn server_identity1076_gossip_does_not_recreate_a_rejected_summary_identity() {
+        let mut app = test_app();
+        let pinned = "a".repeat(64);
+        let mut peer = summary("node-b.example", "node-b.example");
+        peer.node_id = crate::peers::validated_summary_node(Some("b".repeat(64)), Some(&pinned));
+        assert!(
+            peer.node_id.is_none(),
+            "the forged report is rejected at ingress"
+        );
+        app.state
+            .server_nodes
+            .insert(peer.peer.clone(), pinned.clone());
+        app.state.peer_summaries.push(peer);
+        assert_eq!(
+            app.state.server_peer_node(&app.state.peer_summaries[0]),
+            Some(pinned.as_str())
+        );
+        let row = app.own_relayed_fleet().remove(0);
+        assert!(
+            row.age_secs.is_some(),
+            "the legitimate summary was accepted"
+        );
+        assert!(
+            row.node_id.is_none(),
+            "gossip must not recreate the rejected identity from a local UI binding"
+        );
+        assert_eq!(row.ssh_target, "node-b.example");
     }
 
     fn carried_snapshot() -> crate::peers::FleetSnapshotState {
