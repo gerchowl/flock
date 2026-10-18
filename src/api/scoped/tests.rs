@@ -25,6 +25,7 @@ pub(crate) fn live_scope() -> (SessionLeases, Lease, Scope, Credentials) {
         credential: Some(lease.credential()),
         peer,
         leases: Arc::default(),
+        principal: Arc::default(),
         probe: true,
     }));
     let policy = UidPolicy {
@@ -108,7 +109,7 @@ fn scoped_socket_rejects_missing_and_wrong_credentials_before_a_fast_path() {
     let mut secrets = Vec::new();
     let logs = crate::logging::capture_logs_across_threads(|| {
         runtime.block_on(async {
-    for mode in ["valid","missing","wrong","malformed"] {
+    for mode in ["valid","busy","missing","wrong","malformed"] {
         let (server,mut client)=UnixStream::pair().unwrap();
         client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let (tx,rx)=tokio::sync::mpsc::unbounded_channel();
@@ -121,7 +122,7 @@ fn scoped_socket_rejects_missing_and_wrong_credentials_before_a_fast_path() {
         let secret=serde_json::to_value(&credential).unwrap().as_str().unwrap().to_owned();
         secrets.push(secret.clone());
         let payload=match mode {
-            "valid"=>serde_json::json!({"request":{"id":"scope","method":"ping","params":{}},"credential":secret}),
+            "valid"|"busy"=>serde_json::json!({"request":{"id":"scope","method":"ping","params":{}},"credential":secret}),
             "missing"=>serde_json::json!({"request":{"id":"scope","method":"ping","params":{}}}),
             "wrong"=>serde_json::json!({"request":{"id":"scope","method":"ping","params":{}},"credential":"wrong"}),
             _=>serde_json::json!({"request":{"id":"scope","method":"ping","params":{"unexpected":secret}},"credential":secret,"extra":true}),
@@ -131,13 +132,20 @@ fn scoped_socket_rejects_missing_and_wrong_credentials_before_a_fast_path() {
         writeln!(client,"{payload}").unwrap();
         if mode!="malformed" {
             let msg=tokio::time::timeout(Duration::from_secs(5),app.api_rx.recv()).await.unwrap().unwrap();
-            assert!(app.respond_scope_probe(&msg));
+            if mode == "busy" {
+                app.session_leases.with_registry_locked(|| assert!(app.respond_scope_probe(&msg)));
+            } else {
+                assert!(app.respond_scope_probe(&msg));
+            }
         }
         let mut response=String::new();
         BufReader::new(&mut client).read_line(&mut response).unwrap();
         task.join().unwrap();
         assert!(!response.contains(&secret));
         assert_eq!(serde_json::from_str::<serde_json::Value>(&response).unwrap().get("error").is_none(),mode=="valid","{response}");
+        if mode == "busy" {
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&response).unwrap()["error"]["code"], "lease_busy");
+        }
         assert!(!app.state.should_quit);
         let debug=format!("{:?}",ScopedRequest {request:request(),credential:Some(credential)});
         assert!(!debug.contains(&secret));
@@ -176,4 +184,33 @@ fn legacy_invalid_request_keeps_serde_detail_but_scoped_detail_is_redacted() {
         .unwrap();
     assert!(legacy.to_string().contains("unknown-fixture-method"));
     assert!(decode(r#"{"request":{"id":"x","method":"secret-canary","params":{}},"credential":"credential-canary"}"#).unwrap_err().is_none());
+}
+
+#[tokio::test]
+async fn queued_busy_admission_returns_typed_refusal_before_effect() {
+    let (leases, _lease, scope, _) = live_scope();
+    let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = crate::app::App::new(
+        &crate::config::Config::default(),
+        true,
+        None,
+        rx,
+        EventHub::default(),
+    );
+    app.current_api_scope = Some(scope);
+    let response = leases.with_registry_locked(|| app.handle_api_request(request()));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response).unwrap()["error"]["code"],
+        "lease_busy"
+    );
+    assert!(!app.state.should_quit);
+}
+
+#[test]
+fn admitted_policy_identity_does_not_repeat_a_busy_registry_walk() {
+    let (leases, _lease, scope, _) = live_scope();
+    leases.with_registry_locked(|| {
+        assert_eq!(scope.refusal(), Some(ErrorCode::LeaseBusy));
+        assert!(matches!(scope.principal(), Caller::Agent { .. }));
+    });
 }

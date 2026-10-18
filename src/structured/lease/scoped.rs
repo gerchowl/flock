@@ -22,6 +22,23 @@ impl LeaseCredential {
             base64::engine::general_purpose::STANDARD.encode(*bytes),
         )))
     }
+    /// Consume environment bytes only into buffers that zeroize on every exit.
+    pub(crate) fn from_env_bytes(bytes: Vec<u8>) -> io::Result<Self> {
+        let bytes = zeroize::Zeroizing::new(bytes);
+        let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+        let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+        let mut decoded = zeroize::Zeroizing::new([0; 33]);
+        if base64::engine::general_purpose::STANDARD
+            .decode_slice(&bytes, decoded.as_mut())
+            .map_err(|_| invalid())?
+            != 32
+        {
+            return Err(invalid());
+        }
+        let mut credential = zeroize::Zeroizing::new(String::with_capacity(text.len()));
+        credential.push_str(text);
+        Ok(Self(credential))
+    }
     fn matches(&self, other: &Self) -> bool {
         self.0.len() == other.0.len()
             && self
@@ -87,7 +104,7 @@ impl SessionLeases {
         peer: platform::peer::Credentials,
     ) -> Caller {
         self.scoped_with(credential, peer, platform::live_process_facts)
-            .unwrap_or(Caller::Uncertain)
+            .unwrap_or(Caller::Busy)
     }
     fn scoped_with(
         &self,
@@ -140,6 +157,12 @@ impl SessionLeases {
         }
         Err(ScopedRefusal::AncestryBudget)
     }
+    /// Hold registry contention only inside synchronous deterministic tests.
+    #[cfg(test)]
+    pub(crate) fn with_registry_locked<T>(&self, run: impl FnOnce() -> T) -> T {
+        let _guard = self.0.lock();
+        run()
+    }
     #[cfg(test)]
     fn scoped_for_test(
         &self,
@@ -148,7 +171,7 @@ impl SessionLeases {
         read: impl FnMut(u32) -> Option<(u32, u64)>,
     ) -> Caller {
         self.scoped_with(credential, peer, read)
-            .unwrap_or(Caller::Uncertain)
+            .unwrap_or(Caller::Busy)
     }
 }
 

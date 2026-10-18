@@ -16,7 +16,7 @@ impl App {
             return crate::structured::lease::Caller::Uncertain;
         }
         if let Some(scope) = &self.current_api_scope {
-            return scope.caller();
+            return scope.principal();
         }
         let evidence = self.caller_pane_evidence();
         let pane = evidence

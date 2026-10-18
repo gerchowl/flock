@@ -736,3 +736,92 @@ fn a_dropped_file_is_listed_and_read_as_an_mcp_resource() {
     drop(server);
     cleanup_test_base(&base);
 }
+
+#[test]
+fn structured_mcp_real_argv_preserves_scoped_transport() {
+    use base64::Engine;
+    use std::os::unix::net::UnixListener;
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("a");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let peer = thread::spawn(move || {
+        let ceiling = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < ceiling, "MCP never connected");
+                    thread::yield_now();
+                }
+                Err(error) => panic!("fixture accept: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        assert!(BufReader::new(&stream).read_line(&mut line).unwrap() > 0);
+        let request: Value = serde_json::from_str(&line).unwrap();
+        let reply = json!({"id":request["request"]["id"],"error":{"code":"not_authorized","message":"refused"}});
+        writeln!(stream, "{reply}").unwrap();
+        sent.send(request).unwrap();
+    });
+    let secret = base64::engine::general_purpose::STANDARD.encode([42; 32]);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
+    for (name, _) in
+        std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("FLOCK_"))
+    {
+        command.env_remove(name);
+    }
+    command.envs(support::environment::isolated_env(
+        &base.join("c"),
+        &base.join("r"),
+    ));
+    let mut child = command
+        .args(["mcp", "serve", "--structured"])
+        .env("FLOCK_SOCKET_PATH", &socket_path)
+        .env("FLOCK_MCP_LEASE_CREDENTIAL", &secret)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let (done, completed) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).unwrap();
+        done.send(bytes).unwrap();
+    });
+    let mut input = child.stdin.take().unwrap();
+    writeln!(input, "{}", json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"flock_agent_list","arguments":{}}})).unwrap();
+    drop(input);
+    let ceiling = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= ceiling {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("MCP startup or EOF producer stayed silent");
+        }
+        thread::yield_now();
+    };
+    assert!(status.success());
+    let output =
+        String::from_utf8(completed.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+    reader.join().unwrap();
+    let request = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    peer.join().unwrap();
+    assert_eq!(request["credential"], secret);
+    assert_eq!(request["request"]["method"], "agent.list");
+    assert!(request.get("method").is_none());
+    assert!(output.contains("not_authorized"), "{output}");
+    assert!(!output.contains(&secret));
+    cleanup_test_base(&base);
+}

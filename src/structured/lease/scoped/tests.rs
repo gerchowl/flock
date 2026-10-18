@@ -209,3 +209,20 @@ fn hardened_comparison_checks_every_encoded_position() {
         );
     }
 }
+
+#[test]
+fn scoped_busy_failures_map_to_retryable_refusals_and_never_operator() {
+    let (leases, lease) = fixture();
+    let busy = {
+        let _guard = leases.0.lock();
+        leases.scoped_for_test(Some(&lease.credential()), peer(), facts)
+    };
+    let exhausted =
+        leases.scoped_for_test(Some(&lease.credential()), peer(), |pid| Some((pid + 1, 20)));
+    for caller in [busy, exhausted] {
+        assert_eq!(caller, Caller::Busy);
+        let code = caller.refusal().unwrap();
+        assert_eq!(code, crate::api::error_code::ErrorCode::LeaseBusy);
+        assert_eq!(code.retry(), crate::cli::exit::Retry::Later);
+    }
+}

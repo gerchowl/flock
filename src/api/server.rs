@@ -285,13 +285,13 @@ pub(crate) fn handle_connection(
     let _scope = match credential {
         Some(credential) => match super::scoped::Scope::enter(credential, peer, &request, api_tx) {
             Ok(guard) => Some(guard),
-            Err(()) => {
+            Err(code) => {
                 return write_text_line_allow_disconnect(
                     &mut stream,
                     &error_response_json(
                         request.id,
-                        crate::api::error_code::ErrorCode::NotAuthorized.as_str(),
-                        "scoped caller authentication refused".into(),
+                        code.as_str(),
+                        "scoped caller admission refused".into(),
                     ),
                 )
             }
@@ -830,9 +830,7 @@ pub(super) fn should_stop_connection(
     stream: &mut UnixStream,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
-    if super::scoped::Scope::current()
-        .is_some_and(|scope| scope.caller() == crate::structured::lease::Caller::Uncertain)
-    {
+    if super::scoped::Scope::current().is_some_and(|scope| scope.refusal().is_some()) {
         return Ok(true);
     }
 

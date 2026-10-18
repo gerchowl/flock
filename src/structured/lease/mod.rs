@@ -46,6 +46,19 @@ pub enum Caller {
     },
     /// Missing/reused process identity, pending launch or unavailable registry.
     Uncertain,
+    /// Scoped verification could not acquire the registry or exhausts its fact budget.
+    Busy,
+}
+impl Caller {
+    /// Refusals never acquire unrelated/operator authority, including under churn.
+    pub(crate) fn refusal(&self) -> Option<crate::api::error_code::ErrorCode> {
+        use crate::api::error_code::ErrorCode;
+        match self {
+            Self::Busy => Some(ErrorCode::LeaseBusy),
+            Self::Uncertain => Some(ErrorCode::NotAuthorized),
+            _ => None,
+        }
+    }
 }
 /// Exclusive session reservation. Drop releases only a never-spawned launch.
 pub struct Lease {

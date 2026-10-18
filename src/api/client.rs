@@ -11,6 +11,8 @@ use crate::api::schema::{
     SubscriptionEventEnvelope, SuccessResponse,
 };
 
+mod lease_retry;
+
 const MIN_ALLOCATION_PREVIEW_PROTOCOL: u32 = 26;
 
 /// How many times `request_value_retrying` sends a request again after a
@@ -42,6 +44,7 @@ impl ConnectionTarget {
 pub struct ApiClient {
     target: ConnectionTarget,
     credential: Option<std::sync::Arc<crate::structured::lease::LeaseCredential>>,
+    retry_clock: std::sync::Arc<dyn lease_retry::Clock>,
 }
 
 impl ApiClient {
@@ -53,6 +56,7 @@ impl ApiClient {
         Self {
             target,
             credential: None,
+            retry_clock: std::sync::Arc::new(lease_retry::SystemClock),
         }
     }
 
@@ -64,6 +68,7 @@ impl ApiClient {
         Self {
             target: ConnectionTarget::SocketPath(path),
             credential: Some(std::sync::Arc::new(credential)),
+            retry_clock: std::sync::Arc::new(lease_retry::SystemClock),
         }
     }
 
@@ -81,6 +86,15 @@ impl ApiClient {
         if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
             return Ok(refusal);
         }
+        lease_retry::attempts(
+            self.credential.is_some(),
+            self.retry_clock.as_ref(),
+            None,
+            || self.request_once(request),
+            |response| response,
+        )
+    }
+    fn request_once(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
         let mut stream = self.connect()?;
         write_request(&mut stream, request, self.credential.as_deref())?;
 
@@ -118,6 +132,10 @@ impl ApiClient {
     /// method, one after it only for a [`Method::is_retry_safe`] read, since
     /// the server may already have applied a write it never answered.
     ///
+    /// Scoped clients instead use the three-attempt `lease_busy` admission
+    /// budget. Their transport failures return immediately, preserving the
+    /// caller's deadline and the ambiguity of an unanswered write.
+    ///
     /// `timeout` bounds each attempt and `deadline`, when given, bounds all of
     /// them: no attempt is granted more than the time left, and no retry
     /// starts that its backoff would carry past the deadline.
@@ -130,6 +148,26 @@ impl ApiClient {
         self.check_allocation_preview_protocol(request, Some(timeout))?;
         if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
             return Ok(refusal);
+        }
+        if self.credential.is_some() {
+            return lease_retry::attempts(
+                true,
+                self.retry_clock.as_ref(),
+                deadline,
+                || {
+                    let timeout = deadline.map_or(timeout, |end| {
+                        timeout.min(end.saturating_duration_since(self.retry_clock.now()))
+                    });
+                    if timeout.is_zero() {
+                        return Err(Attempt::BeforeSend(ApiClientError::Io(
+                            io::ErrorKind::TimedOut.into(),
+                        )));
+                    }
+                    self.exchange_once(request, timeout)
+                },
+                |response| response,
+            )
+            .map_err(Attempt::into_error);
         }
         let mut backoff = TRANSIENT_BACKOFF;
         let mut retries = 0;
@@ -170,6 +208,19 @@ impl ApiClient {
     /// One bounded round trip, saying whether it failed before the request
     /// reached the socket.
     fn exchange_with_timeout(
+        &self,
+        request: &Request,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, Attempt> {
+        lease_retry::attempts(
+            self.credential.is_some(),
+            self.retry_clock.as_ref(),
+            None,
+            || self.exchange_once(request, timeout),
+            |response| response,
+        )
+    }
+    fn exchange_once(
         &self,
         request: &Request,
         timeout: Duration,
@@ -216,12 +267,24 @@ impl ApiClient {
         request: &Request,
         read_timeout: Option<Duration>,
     ) -> Result<(serde_json::Value, EventStream), ApiClientError> {
+        lease_retry::attempts(
+            self.credential.is_some(),
+            self.retry_clock.as_ref(),
+            None,
+            || self.subscribe_once(request, read_timeout),
+            |(ack, _)| ack,
+        )
+    }
+    fn subscribe_once(
+        &self,
+        request: &Request,
+        read_timeout: Option<Duration>,
+    ) -> Result<(serde_json::Value, EventStream), ApiClientError> {
         let mut stream = self.connect()?;
         write_request(&mut stream, request, self.credential.as_deref())?;
         if let Some(timeout) = read_timeout {
             stream.set_read_timeout(Some(timeout))?;
         }
-
         let mut reader = BufReader::new(stream);
         let mut ack = read_json_line(&mut reader)?;
         super::compatibility::normalize(self, &mut ack);

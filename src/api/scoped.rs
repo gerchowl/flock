@@ -1,6 +1,7 @@
 //! Scoped local requests and connection-local transport context (ADR-0036 §1a).
 //! Each fresh connection authenticates independently; continuations retain the
 //! revocable generation, not a connection's past authorization result.
+use super::error_code::ErrorCode;
 use super::{schema::Request, ApiRequestMessage, ApiRequestSender};
 use crate::platform::peer::Credentials;
 use crate::structured::{
@@ -46,6 +47,7 @@ struct ScopeData {
     credential: Option<LeaseCredential>,
     peer: Credentials,
     leases: Arc<OnceLock<SessionLeases>>,
+    principal: Arc<OnceLock<(String, u32)>>,
     probe: bool,
 }
 impl std::fmt::Debug for Scope {
@@ -77,6 +79,26 @@ impl Scope {
             leases.scoped_caller(self.0.credential.as_ref(), self.0.peer)
         })
     }
+    /// Sealed agent identity for work past a successful admission boundary.
+    /// Admission itself always calls `refusal` afresh. Policy helpers must not
+    /// perform a second registry walk and lose a typed busy result mid-dispatch.
+    pub(crate) fn principal(&self) -> Caller {
+        self.0
+            .principal
+            .get()
+            .map_or(Caller::Uncertain, |(agent, depth)| Caller::Agent {
+                agent: agent.clone(),
+                depth: *depth,
+            })
+    }
+    /// Scoped admission allows only a current agent proof; busy remains distinct.
+    pub(crate) fn refusal(&self) -> Option<ErrorCode> {
+        match self.caller() {
+            Caller::Agent { .. } => None,
+            Caller::Busy => Some(ErrorCode::LeaseBusy),
+            _ => Some(ErrorCode::NotAuthorized),
+        }
+    }
     /// Private App probe: publishes the registry handle only after authentication.
     pub(crate) fn probe_reply(
         &self,
@@ -86,18 +108,20 @@ impl Scope {
         if !self.0.probe {
             return None;
         }
-        if policy.classify(self.0.peer.uid) != Principal::Unknown
-            && matches!(
-                leases.scoped_caller(self.0.credential.as_ref(), self.0.peer),
-                Caller::Agent { .. }
-            )
-        {
-            let _ = self.0.leases.set(leases.clone());
-            Some("scoped_ok")
-        } else {
-            Some("scoped_refused")
+        if policy.classify(self.0.peer.uid) == Principal::Unknown {
+            return Some("scoped_refused");
+        }
+        match leases.scoped_caller(self.0.credential.as_ref(), self.0.peer) {
+            Caller::Agent { agent, depth } => {
+                let _ = self.0.principal.set((agent, depth));
+                let _ = self.0.leases.set(leases.clone());
+                Some("scoped_ok")
+            }
+            Caller::Busy => Some("scoped_busy"),
+            _ => Some("scoped_refused"),
         }
     }
+
     /// Authenticate before any fast path; no model-selected request is executed
     /// by the internal probe, including ping or subscription requests.
     pub(super) fn enter(
@@ -105,11 +129,12 @@ impl Scope {
         peer: Credentials,
         request: &Request,
         api_tx: &ApiRequestSender,
-    ) -> Result<Guard, ()> {
+    ) -> Result<Guard, ErrorCode> {
         let scope = Self(Arc::new(ScopeData {
             credential,
             peer,
             leases: Arc::new(OnceLock::new()),
+            principal: Arc::new(OnceLock::new()),
             probe: true,
         }));
         let (respond_to, response) = std::sync::mpsc::channel();
@@ -122,14 +147,18 @@ impl Scope {
                 peer_uid: peer.uid,
                 scope: Some(scope.clone()),
             })
-            .map_err(|_| ())?;
-        if response
+            .map_err(|_| ErrorCode::NotAuthorized)?;
+        match response
             .recv_timeout(super::server::APP_RESPONSE_TIMEOUT)
-            .map_err(|_| ())?
-            != "scoped_ok"
-            || !matches!(scope.caller(), Caller::Agent { .. })
+            .map_err(|_| ErrorCode::NotAuthorized)?
+            .as_str()
         {
-            return Err(());
+            "scoped_busy" => return Err(ErrorCode::LeaseBusy),
+            "scoped_ok" => {}
+            _ => return Err(ErrorCode::NotAuthorized),
+        }
+        if let Some(code) = scope.refusal() {
+            return Err(code);
         }
         let scope = Self(Arc::new(ScopeData {
             probe: false,

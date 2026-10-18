@@ -1406,15 +1406,15 @@ impl App {
         request: &crate::api::schema::Request,
     ) -> Option<String> {
         use crate::api::{error_code::ErrorCode, schema::Method};
-        if self
+        if let Some(code) = self
             .current_api_scope
             .as_ref()
-            .is_some_and(|scope| scope.caller() == crate::structured::lease::Caller::Uncertain)
+            .and_then(|scope| scope.refusal())
         {
             return Some(responses::encode_error(
                 request.id.clone(),
-                ErrorCode::NotAuthorized.as_str(),
-                "scoped caller authentication refused",
+                code.as_str(),
+                "scoped caller admission refused",
             ));
         }
         let uid = self.current_api_peer_uid?;
@@ -1438,7 +1438,7 @@ impl App {
             };
             let attributed = self.runtime_config.uid_policy.classify(uid)
                 == crate::structured::identity::Principal::Agent
-                && self.lease_caller() != crate::structured::lease::Caller::Uncertain;
+                && self.lease_caller().refusal().is_none();
             self.runtime_config
                 .uid_policy
                 .refusal(uid, attributed, &request.method)
