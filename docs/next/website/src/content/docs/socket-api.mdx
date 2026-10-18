@@ -405,7 +405,14 @@ name an admin directory rather than the real main checkout. Open workspace
 membership uses canonical Git common-directory identity, including adopted
 workspaces whose main checkout is not open. Adoption retains a known real main
 checkout; branch deletion runs from the surviving common directory rather than
-from the removed linked checkout.
+from the removed linked checkout. If that stored repository path is invalid,
+branch-deletion setup refuses `worktree_repository_invalid_proof`; retarget the
+repository or reopen its workspace before retrying. An open workspace whose
+stored common-directory identity no longer matches is a repository probe
+failure (`worktree_repository_unreachable`, retry `after_human`), not ownership
+of the replacement repository. Its diagnostic includes
+`reason: "workspace_repository_identity_changed"`, `expected_common_dir`,
+`observed_common_dir`, and recovery guidance to reopen the intended workspace.
 Subdirectories,
 plain directories and checkouts of unowned repositories refuse
 `worktree_path_not_root` (exit 10, retry `after_human`), even with `--force`.
