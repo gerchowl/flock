@@ -152,12 +152,12 @@ impl Runtime {
     pub fn waiting_on_human(&self) -> Result<Vec<String>, crate::api::error_code::ErrorCode> {
         self.transport.waiting_on_human()
     }
-    /// Poll persisted events. Empty is not EOF; monitor the owning worker result too.
+    /// Poll complete events and live-only partial deltas. Empty is not EOF; monitor the owning worker result too.
     /// Feed `Received::state_input` into S4 so book closures clear attention.
     pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
         self.events.try_recv()
     }
-    /// Wait for a persisted event on a worker, with a finite deadline.
+    /// Wait for a complete event or live-only delta on a worker, with a finite deadline.
     /// Server-loop callers must use `try_receive` instead.
     pub fn receive_timeout(&self, timeout: Duration) -> Result<Received, mpsc::RecvTimeoutError> {
         self.events.recv_timeout(timeout)

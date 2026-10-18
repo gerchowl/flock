@@ -152,6 +152,7 @@ impl Fixture {
         let state = self.root.path().to_owned();
         let location = StreamLocation {
             data_dir: state.clone(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: session.into(),
         };
@@ -575,6 +576,7 @@ fn failed_model_spawn_removes_armed_files_and_preserves_profile() {
             .expect("lease"),
         StreamLocation {
             data_dir: fixture.root.path().to_owned(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
@@ -835,6 +837,7 @@ fn publication_panic_shuts_down_owned_process_and_retains_uncertain_files() {
             .expect("lease"),
         StreamLocation {
             data_dir: fixture.root.path().to_owned(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
@@ -897,6 +900,7 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
             lease,
             StreamLocation {
                 data_dir: fixture.root.path().to_owned(),
+                storage: Default::default(),
                 agent: "fixture-agent".into(),
                 session: session.into(),
             },
@@ -1186,6 +1190,7 @@ fn registry_launch_metadata_reaches_the_child_and_events_wake_the_owner() {
     let state = fixture.root.path().to_owned();
     let location = StreamLocation {
         data_dir: state.clone(),
+        storage: Default::default(),
         agent: "fixture-agent".into(),
         session: SESSION.into(),
     };
@@ -1270,6 +1275,7 @@ fn queue_cancelled_input_requests_stop_through_the_real_event_pump() {
         File::from(OwnedFd::from(stdin)),
         StreamLocation {
             data_dir: root.path().into(),
+            storage: Default::default(),
             agent: "queue-cancel-fixture".into(),
             session: "fixture-session".into(),
         },
@@ -1338,6 +1344,7 @@ async fn queue_subscriptions_are_serviced_when_completion_channel_is_full() {
         File::from(OwnedFd::from(stdin)),
         StreamLocation {
             data_dir: root.path().into(),
+            storage: Default::default(),
             agent: "saturated-fixture".into(),
             session: "fixture-session".into(),
         },

@@ -660,12 +660,15 @@ pub struct SessionsConfig {
     /// Rewrite before the next append when committed bytes exceed this value.
     /// Zero is invalid: checkpointing cannot be disabled for writable journals.
     pub queue_rewrite_bytes: std::num::NonZeroU64,
+    /// Replace structured JSON blocks strictly larger than this encoded size.
+    pub blob_min_bytes: usize,
 }
 impl Default for SessionsConfig {
     fn default() -> Self {
         Self {
             queue_rewrite_bytes: std::num::NonZeroU64::new(DEFAULT_QUEUE_REWRITE_BYTES)
                 .expect("nonzero queue rewrite default"),
+            blob_min_bytes: crate::structured::blobs::StorageConfig::default().blob_min_bytes,
         }
     }
 }
@@ -673,7 +676,7 @@ impl Default for SessionsConfig {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
-    /// Per-session durable queue storage policy.
+    /// Per-session durable queue and structured content storage policy.
     pub sessions: SessionsConfig,
     /// Local socket identity policy (ADR-0036 §1a).
     pub security: SecurityConfig,

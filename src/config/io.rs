@@ -23,8 +23,8 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "questions",
     "remote",
     "session",
-    "sessions",
     "security",
+    "sessions",
     "slots",
     "spawn",
     "structured",
@@ -568,14 +568,6 @@ fn load_live_config_from_table(
     );
     load_live_section(
         &table,
-        "sessions",
-        "sessions config",
-        &mut diagnostics,
-        &mut invalid_sections,
-        |section| config.sessions = section,
-    );
-    load_live_section(
-        &table,
         "session",
         "session config",
         &mut diagnostics,
@@ -741,6 +733,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.channels = section,
+    );
+    load_live_section(
+        &table,
+        "sessions",
+        "sessions config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.sessions = section,
     );
     // #397: canonicalise the declared agent names and merge them over the
     // compiled default, so a fleet declaring one agent does not un-declare the
@@ -1911,5 +1911,21 @@ mod spoke_config_tests {
             vec!["unknown msg.future_setting setting ignored"]
         );
         assert!(loaded.invalid_sections.is_empty());
+    }
+}
+#[cfg(test)]
+mod blob_storage_tests {
+    use super::*;
+    #[test]
+    fn live_loader_applies_sessions_threshold_and_defaults() {
+        let default = load_live_config_from_str("").unwrap();
+        assert_eq!(default.config.sessions.blob_min_bytes, 2048);
+        let loaded = load_live_config_from_str(
+            "[sessions]\nblob_min_bytes = 17\nqueue_rewrite_bytes = 4096\n",
+        )
+        .unwrap();
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.config.sessions.blob_min_bytes, 17);
+        assert_eq!(loaded.config.sessions.queue_rewrite_bytes.get(), 4096);
     }
 }
