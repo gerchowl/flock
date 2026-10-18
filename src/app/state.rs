@@ -2896,11 +2896,25 @@ impl AppState {
         )
     }
 
-    /// Resolve delivery presentation through exact local route keys, never
-    /// through a confusable comparison or an unproven reported node ID.
-    pub(crate) fn server_delivery_name(&self, host: &str, route: &str) -> String {
-        if host.is_empty() || route.is_empty() {
-            return self.server_claim_name(host, None);
+    /// Resolve direct delivery presentation through exact local route keys.
+    /// Hub events carry no destination node proof, so their names remain claims.
+    /// An unresolved alias has a visible label even when collision protection hides it.
+    pub(crate) fn server_delivery_name(
+        &self,
+        host: &str,
+        route: &str,
+        via: Option<&str>,
+    ) -> String {
+        let unverified = || {
+            let label = self.server_claim_name(host, None);
+            if label == crate::peer_name::BADGE {
+                format!("{label} unknown destination")
+            } else {
+                label
+            }
+        };
+        if via.is_some() || host.is_empty() || route.is_empty() {
+            return unverified();
         }
         let configured = self
             .peers
@@ -2920,7 +2934,7 @@ impl AppState {
         {
             return self.server_node_name(node).unwrap_or(host).to_string();
         }
-        self.server_claim_name(host, None)
+        unverified()
     }
 
     /// Prefer a proven binding or the locally configured source name. All

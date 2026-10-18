@@ -662,8 +662,10 @@ impl App {
                     via,
                     ..
                 } if *correlation_id == params.correlation_id => {
-                    // Only an exact local route binding admits a trusted destination label.
-                    let host_label = self.state.server_delivery_name(to_host, route);
+                    // A hub route identifies the hop, never the destination.
+                    let host_label =
+                        self.state
+                            .server_delivery_name(to_host, route, via.as_deref());
                     // #410: say whether the hop was ours or a hub's.
                     let (path, how) = match via {
                         Some(hub) => (

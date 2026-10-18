@@ -257,12 +257,19 @@ observation separately from display, preventing repeated badge/escape growth.
 Agent locations keep the raw reported `host` separate from `display_host`.
 Message API `to_host` and persisted mesh payload host metadata use the raw
 observation; fleet directory labels and message/wait notices use presentation.
-Message-status details first resolve the raw destination through local delivery
-route bindings. Exact configured alias/dial-target keys on that route, or exact
-pinned aliases bound to the same node as that route, use the trusted local alias.
+For direct delivery (`via: None`), message-status details first resolve the raw
+destination through local delivery route bindings. Exact configured alias/dial-target
+keys on that route, or exact pinned aliases bound to the same node as that route,
+use the trusted local alias. Hub-carried delivery (`via: Some`) always uses
+claimed-name presentation: the recorded event carries no destination owner node
+proof, and a hub's route binding proves only the hop. A claimed destination cannot
+borrow that hub's alias, even when its raw name exactly matches the route.
 Empty keys, lookalikes, case variants and unrelated route claims never gain trust
 through the Unicode comparison keys. Unresolved destinations, including older
 events without a matching local binding, use escaped, badged presentation.
+When alias-collision protection hides a name and no owner identity is available,
+the label is `[unverified] unknown destination`, rather than a bare badge. This
+keeps the destination visible without rendering an unproven configured alias.
 The raw destination metadata remains unchanged.
 None of this rewrites cache keys, identity proofs, policy bindings or dial
 targets. Wire summaries remain observations, not authority to borrow aliases.
