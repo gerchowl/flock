@@ -4,15 +4,8 @@ use std::sync::{Arc, Once, OnceLock};
 
 type LookupResult = Result<Option<u32>, ()>;
 
-static COLLISION: OnceLock<crate::api::schema::AgentAccountDiagnostic> = OnceLock::new();
-
-/// Last confirmed collision, without starting or waiting for directory services.
-pub(crate) fn account_diagnostic() -> Option<crate::api::schema::AgentAccountDiagnostic> {
-    UidPolicy::default().report_cached_collision();
-    COLLISION.get().cloned()
-}
-
-/// Lazy, process-shared resolution. First use waits at most 100 ms for NSS.
+/// Lazy, server-owned resolution shared by its app and API listener.
+/// First use waits at most 100 ms for NSS.
 /// after that wait, pending calls return immediately without new workers.
 #[derive(Clone)]
 pub(crate) struct DedicatedUid(Arc<AccountLookup>);
@@ -72,6 +65,7 @@ impl From<LookupResult> for DedicatedUid {
 }
 
 /// Server-owned account configuration, independent of request claims.
+#[derive(Clone)]
 pub(crate) struct UidPolicy {
     /// Effective UID of the server at construction.
     pub operator: u32,
@@ -92,23 +86,30 @@ pub(crate) enum Principal {
 }
 impl Default for UidPolicy {
     fn default() -> Self {
-        static DEDICATED: OnceLock<DedicatedUid> = OnceLock::new();
         Self {
             operator: peer::effective_uid(),
-            dedicated: DEDICATED
-                .get_or_init(|| DedicatedUid::lazy(peer::dedicated_uid))
-                .clone(),
+            dedicated: DedicatedUid::lazy(peer::dedicated_uid),
         }
     }
 }
 impl UidPolicy {
+    /// This server's confirmed collision, without starting or waiting for NSS.
+    /// The immutable cached result retains the diagnostic until server restart.
+    pub(crate) fn account_diagnostic(&self) -> Option<crate::api::schema::AgentAccountDiagnostic> {
+        self.report_cached_collision();
+        (self.dedicated.0.result.get() == Some(&Ok(Some(self.operator)))).then_some(
+            crate::api::schema::AgentAccountDiagnostic::AgentAccountUidCollision {
+                uid: self.operator,
+            },
+        )
+    }
+
     /// Publish a completed collision without starting or waiting for NSS.
     fn report_cached_collision(&self) {
         if self.dedicated.0.result.get() == Some(&Ok(Some(self.operator))) {
             self.dedicated.0.collision_reported.call_once(|| {
                 tracing::warn!(code = "agent_account_uid_collision", uid = self.operator,
                     "flk-agent UID equals server UID: ADR-0036 section 1a misconfiguration; operator authority refused");
-                let _ = COLLISION.set(crate::api::schema::AgentAccountDiagnostic::AgentAccountUidCollision { uid: self.operator });
             });
         }
     }
