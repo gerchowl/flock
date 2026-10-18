@@ -72,7 +72,8 @@ impl Runtime {
     /// Successful admission emits an internal accepted-input fact through
     /// `Received::state_input`, arming S4 silence observation before started.
     /// Success acknowledges admission, not delivery or provider execution.
-    /// Cancellation errors also request process shutdown, not just pipe closure.
+    /// An unavailable acceptance observer requests process shutdown; ordinary
+    /// I/O cancellation preserves the independently observed exit outcome.
     /// `structured_turn_end_unknown` means loss concealed the boundary; await a
     /// subsequent result or explicitly stop, rather than retry as ordinary busy.
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
@@ -82,11 +83,8 @@ impl Runtime {
                 crate::api::error_code::ErrorCode::QueueModeUnsupported.as_str(),
             ));
         }
-        let result = self.transport.try_submit(user);
-        if result.is_err() && self.control.cancelled() {
-            self.stop.request();
-        }
-        result
+        self.transport
+            .try_submit_observed(user, || self.stop.request())
     }
     pub(super) fn input_handle(&self) -> &InputHandle {
         &self.transport
