@@ -1766,3 +1766,101 @@ fn custody_round1_replacement_owner_bypasses_long_backoff_immediately() {
         r.stop().await;
     });
 }
+
+#[test]
+fn custody_round2_repeated_expired_save_failure_retries_until_delivered() {
+    run(async {
+        use crate::api::error_code::ErrorCode;
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2544).await;
+        let d = mail(&r);
+        let now = crate::app::notifications::now_ms() as i64;
+        with_store(|s| {
+            let session = &r
+                .app
+                .state
+                .structured_agents
+                .get(&r.case.id)
+                .unwrap()
+                .0
+                .session_id;
+            s.accept_bound_delivery(&d, (&r.case.id, session), false, now)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let (ticket, ack) = r.app.admit_queue_custody(&d.envelope).unwrap();
+        r.until(|_| ticket.committed.try_recv().is_ok_and(|x| x.is_ok()))
+            .await;
+        let connection =
+            rusqlite::Connection::open(with_store(|s| Ok(s.path().to_owned())).unwrap()).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_delivery_save BEFORE UPDATE OF state ON envelopes
+            WHEN NEW.state='delivered' BEGIN SELECT RAISE(FAIL,'injected delivery save failure'); END;").unwrap();
+        let attempts = r.app.structured_sends.custody_attempts;
+        r.app
+            .retry_queue_custody(d.envelope.clone(), ErrorCode::InputWriteUnknown);
+        let pending = with_store(|s| {
+            s.collection_error(&d.envelope.key.origin_node, &d.envelope.correlation_id)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        with_store(|s| {
+            s.maintain(now + crate::mesh::store::DAY_MS)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let first_expired_attempt = std::time::Instant::now();
+        r.app
+            .finish_structured_messages(true, first_expired_attempt);
+        assert_eq!(
+            r.app.structured_sends.recovering.len(),
+            1,
+            "a second failed save after expiry must retain the proven key"
+        );
+        let deadline = r.app.structured_sends.retries[&d.envelope.key].at;
+        for n in 0..100 {
+            r.app.finish_structured_messages(
+                true,
+                first_expired_attempt + std::time::Duration::from_millis(n),
+            );
+            assert_eq!(
+                r.app.structured_sends.retries[&d.envelope.key].at, deadline,
+                "expired correction must respect backoff across repeated wakes"
+            );
+        }
+        connection
+            .execute_batch("DROP TRIGGER fail_delivery_save")
+            .unwrap();
+        r.app.finish_structured_messages(false, deadline);
+        let row = with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state, "delivered",
+            "a failed save must not erase positive proof's expiry protection"
+        );
+        assert!(row.envelope.body.is_empty());
+        let detail = with_store(|s| {
+            s.collection_error(&d.envelope.key.origin_node, &d.envelope.correlation_id)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            detail,
+            Some(format!(
+                "delivered_after_expiry:{}",
+                d.envelope.key.lifecycle_id()
+            ))
+        );
+        assert_eq!(
+            pending.as_deref(),
+            Some("input_write_unknown:commit_proven_settle_pending")
+        );
+        assert_eq!(
+            r.app.structured_sends.custody_attempts, attempts,
+            "proof recovery must not re-admit"
+        );
+        drop(ack);
+        r.until(|r| r.inputs().len() == 1).await;
+        r.stop().await;
+    });
+}

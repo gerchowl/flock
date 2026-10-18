@@ -32,6 +32,8 @@ pub(super) struct Retry {
     pub(super) at: Instant,
     /// Repeated failure wakes from one owner never bypass this floor.
     pub(super) wake_at: Instant,
+    /// A failed post-expiry custody settlement must honor its scheduled backoff.
+    pub(super) custody_correction: bool,
 }
 
 impl Retry {
@@ -67,6 +69,7 @@ impl Retry {
             attempts,
             at: now + delay,
             wake_at: now + Duration::from_secs(4),
+            custody_correction: false,
         }
     }
 }

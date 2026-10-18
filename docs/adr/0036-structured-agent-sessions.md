@@ -993,6 +993,19 @@ same queue (owner decision 5): there is no second input path.
   exactly once, with typed detail `delivered_after_expiry:<item_id>` (the proven
   MessageKey's lifecycle identity). A commit proof never changes an existing
   `Delivered` or `Refused` outcome.
+  If the delivery save fails again after expiry, a positive owner proof retains
+  the same key and retries settlement on the existing capped backoff, including
+  across wake notifications. Correction is bounded by the expired row's existing
+  `outcome_until` (seven days after expiry is persisted), never extended by a
+  retry or proof. At that deadline a retained row records typed detail
+  `input_write_unknown:correction_retention_elapsed`; after maintenance collects
+  the outcome, a retained status reference reports `outcome_retention_elapsed`.
+  Even before collection, proof cannot turn an out-of-window expiry into delivery.
+  **Restart limit:** active correction retains the already authenticated envelope
+  in memory. Startup's mailbox projection excludes payload-less `inbox_expired`
+  rows, so restart ends automatic post-expiry correction. It does not restore
+  deleted payload to revalidate a signature; the expired outcome remains until
+  ordinary retention deletion. Before expiry, startup recovery still loads inboxes.
   This corrects the expiry label only: deleted payload is not restored, released
   quota is not re-acquired, and the original deadlines stay unchanged. Replies
   use the existing payload-less path and the seven-day custody/reply deadline

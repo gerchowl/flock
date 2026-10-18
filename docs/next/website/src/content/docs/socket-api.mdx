@@ -329,7 +329,19 @@ protection until delivery is saved; expiry cannot erase that proof.
 If unknown expiry was already persisted, proof corrects only its status to
 `delivered`, once, with detail `delivered_after_expiry:<item_id>` identifying
 the committed lifecycle item. Proof never changes an existing delivered or
-refused outcome.
+refused outcome. If saving delivery fails again after expiry, positive proof keeps
+settlement retrying on the same capped backoff. Wake notifications cannot create
+a rapid retry loop. Correction ends at the expired row's existing `outcome_until`
+(seven days after expiry is persisted); neither retries nor proof extend it.
+A row still retained at that deadline records
+`input_write_unknown:correction_retention_elapsed`. After maintenance deletes the
+outcome, a retained status reference reports `outcome_retention_elapsed`.
+
+Automatic post-expiry correction has a restart limit: it uses the authenticated
+envelope retained in memory. Startup recovery omits payload-less expired rows,
+so a restart ends that correction path. It cannot restore deleted payload to
+revalidate the original signature. Ordinary inbox recovery before expiry remains
+available.
 Deleted payload stays deleted and released quota stays released. Reply recovery
 uses the existing payload-less route and the original admission's seven-day
 custody/reply deadline. Proof never extends deadlines or restores deleted reply

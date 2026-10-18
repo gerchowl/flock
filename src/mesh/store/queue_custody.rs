@@ -7,6 +7,7 @@ pub(super) const DELIVERED_AFTER_EXPIRY: &str = "delivered_after_expiry:";
 pub(super) const COMMITMENT_UNKNOWN_PREFIX: &str = "input_write_unknown:";
 pub(super) const COMMITMENT_UNKNOWN_AT_EXPIRY: &str =
     "input_write_unknown:commitment_unknown_at_expiry";
+const CORRECTION_RETENTION_ELAPSED: &str = "input_write_unknown:correction_retention_elapsed";
 
 impl<D: DiskSpace> Store<D> {
     // Only the sole journal owner's positive proof may call this path.
@@ -15,11 +16,11 @@ impl<D: DiskSpace> Store<D> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (state, error): (String, Option<String>) = tx
+        let (state, error, until): (String, Option<String>, Option<i64>) = tx
             .query_row(
-                "SELECT state,collect_error FROM envelopes WHERE origin=?1 AND id=?2",
+                "SELECT state,collect_error,outcome_until FROM envelopes WHERE origin=?1 AND id=?2",
                 params![key.origin_node, key.message_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?
             .ok_or(Error::NotFound)?;
@@ -29,8 +30,9 @@ impl<D: DiskSpace> Store<D> {
         ) {
             return Ok(());
         }
-        let late =
-            state == "inbox_expired" && error.as_deref() == Some(COMMITMENT_UNKNOWN_AT_EXPIRY);
+        let late = state == "inbox_expired"
+            && error.as_deref() == Some(COMMITMENT_UNKNOWN_AT_EXPIRY)
+            && until.is_some_and(|until| until > now);
         if state != "inbox" && !late {
             return Err(Error::InvalidState);
         }
@@ -60,8 +62,10 @@ impl<D: DiskSpace> Store<D> {
     /// Record a typed cause without settling possibly committed custody. `None`
     /// clears only this diagnostic when the owner can answer again. Returns the
     /// remaining native inbox TTL; unbound or settled rows return `None`.
-    /// Expired inboxes use the existing expiry outcome, retaining uncertainty
-    /// in its detail until a positive journal proof resolves that expiry label.
+    /// A failed proven settlement after unknown expiry instead returns its
+    /// remaining outcome retention, without extending that deadline. At its end
+    /// the retained expiry records `correction_retention_elapsed` and stops.
+    /// Expired payload is never restored for either retry or startup recovery.
     pub fn queue_commitment_unknown(
         &mut self,
         key: &MessageKey,
@@ -69,6 +73,39 @@ impl<D: DiskSpace> Store<D> {
         wall_ms: i64,
     ) -> Result<Option<u64>> {
         let now = self.writable(wall_ms)?;
+        if cause == Some(Unknown::SettlementPending) {
+            let until: Option<i64> = self
+                .connection
+                .query_row(
+                    "SELECT outcome_until FROM envelopes WHERE origin=?1 AND id=?2
+                 AND state='inbox_expired' AND collect_error=?3
+                 AND EXISTS(SELECT 1 FROM local_recipients r WHERE r.origin=?1 AND r.id=?2)",
+                    params![
+                        key.origin_node,
+                        key.message_id,
+                        COMMITMENT_UNKNOWN_AT_EXPIRY
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(until) = until {
+                if until > now {
+                    return Ok(Some((until - now) as u64));
+                }
+                self.connection.execute(
+                    "UPDATE envelopes SET collect_error=?4 WHERE origin=?1 AND id=?2
+                     AND state='inbox_expired' AND collect_error=?3 AND outcome_until<=?5",
+                    params![
+                        key.origin_node,
+                        key.message_id,
+                        COMMITMENT_UNKNOWN_AT_EXPIRY,
+                        CORRECTION_RETENTION_ELAPSED,
+                        now
+                    ],
+                )?;
+                return Ok(None);
+            }
+        }
         let deadline: Option<i64> = self
             .connection
             .query_row(
@@ -82,9 +119,11 @@ impl<D: DiskSpace> Store<D> {
             return Ok(None);
         };
         let detail = cause.map(|code| format!("{COMMITMENT_UNKNOWN_PREFIX}{}", code.as_str()));
+        // The runtime writer serializes Store calls. Keep the state predicate
+        // too, so this update only annotates the inbox selected above.
         self.connection.execute(
             "UPDATE envelopes SET collect_error=?3 WHERE origin=?1 AND id=?2
-             AND collect_error IS NOT ?3 AND (?3 IS NOT NULL OR
+             AND state='inbox' AND collect_error IS NOT ?3 AND (?3 IS NOT NULL OR
                (inbox_deadline>?5 AND substr(collect_error,1,length(?4))=?4))",
             params![
                 key.origin_node,
