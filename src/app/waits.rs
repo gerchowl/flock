@@ -319,6 +319,36 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn security2166_r2_owner_hint_wait_notice_uses_claim_presentation() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(&Default::default(), true, None, rx, Default::default());
+        app.state.peers.push(crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        let node = crate::mesh::identity::NodeIdentity::fixture([17; 32]).node_id();
+        let delegate = "11111111-1111-4111-8111-111111111111";
+        for name in [
+            "node-trusted.example",
+            "node-trusted.example\u{200b}",
+            "n\u{43e}de-trusted.example",
+            "node-unknown.example\u{202e}",
+        ] {
+            crate::mesh::runtime_store::with_store(|store| {
+                store
+                    .note_owner(delegate, &node, name, 1)
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+            let (code, notice) = app.delegate_subject_refusal(delegate).unwrap();
+            assert_eq!(code, "peer_incompatible");
+            assert!(notice.contains("unverified"), "{notice:?}");
+            assert!(!notice.contains("node-trusted.example"), "{notice:?}");
+            assert!(!notice.contains('\u{202e}'), "{notice:?}");
+        }
+    }
     use std::time::{Duration, Instant};
 
     use crate::api::agent_state::{Phase, Waiting, SETTLE_MS};

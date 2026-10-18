@@ -2470,6 +2470,20 @@ fn server_name_spans(
     mode: crate::config::ServerLabelConfig,
     style: Style,
 ) -> Vec<Span<'static>> {
+    if crate::peer_name::is_claim(host) {
+        let label = super::grammar::server_field_label(mode, icon_name, host);
+        // Band icon mode still names every row, including unverified claims.
+        let label = if mode == crate::config::ServerLabelConfig::Icon {
+            super::grammar::server_field_label(
+                crate::config::ServerLabelConfig::Both,
+                icon_name,
+                host,
+            )
+        } else {
+            label
+        };
+        return vec![Span::styled(label, style)];
+    }
     let mut spans = Vec::new();
     if mode == crate::config::ServerLabelConfig::Both
         || (mode == crate::config::ServerLabelConfig::Icon
@@ -2948,6 +2962,23 @@ pub(crate) fn format_age(secs: u64) -> String {
 
 /// Truncate a single-line span list to `width` columns with an ellipsis.
 fn clamp_line(line: Line<'_>, width: u16) -> Line<'_> {
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    if let Some(label) = crate::peer_name::fit(&text, width as usize) {
+        if label != text {
+            let style = line
+                .spans
+                .iter()
+                .find(|span| crate::peer_name::is_claim(&span.content))
+                .map(|span| span.style)
+                .unwrap_or_default();
+            return Line::from(Span::styled(label, style));
+        }
+        return line;
+    }
     let total: usize = line
         .spans
         .iter()
@@ -3285,7 +3316,8 @@ fn render_workspace_list(
         // Truncate on CHAR boundaries, not bytes: remote-only project leader
         // labels carry a `·` separator (and the origin rows from #66 are long),
         // so a byte slice could land mid-`·` and panic the whole render.
-        let label = if label.chars().count() > max_label {
+        let claimed = crate::peer_name::is_claim(&label);
+        let label = if !claimed && label.chars().count() > max_label {
             let kept: String = label.chars().take(max_label.saturating_sub(1)).collect();
             format!("{kept}…")
         } else {
@@ -3317,6 +3349,11 @@ fn render_workspace_list(
         }
         spans.push(Span::styled(label, label_style));
         let line = Line::from(spans);
+        let line = if claimed {
+            clamp_line(line, card.rect.width)
+        } else {
+            line
+        };
         frame.render_widget(
             Paragraph::new(line),
             Rect::new(card.rect.x, card.rect.y, card.rect.width, 1),
@@ -3666,9 +3703,21 @@ fn render_agent_detail(
             spans.push(Span::styled(status, Style::default().fg(p.red)));
             spans.push(Span::styled(" ", Style::default()));
         }
+        let claimed = crate::peer_name::is_claim(&detail.server);
+        let location = if claimed && location_budget == 0 {
+            server_field
+        } else {
+            location
+        };
         spans.push(Span::styled(location, location_style));
+        let line = Line::from(spans);
+        let line = if claimed {
+            clamp_line(line, body.width)
+        } else {
+            line
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(row_style),
+            Paragraph::new(line).style(row_style),
             Rect::new(body.x, row_y, body.width, 1),
         );
         row_y += 1;
@@ -3736,6 +3785,141 @@ mod tests {
     use crate::{detect::Agent, workspace::Workspace};
     use ratatui::{backend::TestBackend, Terminal};
 
+    macro_rules! claimed_alias_fixture {
+        ($test:ident, $claimed:expr) => {
+            #[test]
+            fn $test() {
+                let app = security2166_alias_fixture();
+                let shown = app.server_claim_name($claimed, Some("claimed-node"));
+                assert!(shown.contains("unverified"), "{shown:?}");
+                assert!(
+                    !shown.contains($claimed),
+                    "a confusable alias must not render: {shown:?}"
+                );
+            }
+        };
+    }
+    claimed_alias_fixture!(
+        security2166_r2_zwsp_collides,
+        "node-trusted.example\u{200b}"
+    );
+    claimed_alias_fixture!(security2166_r2_zwj_collides, "node-trusted.example\u{200d}");
+    claimed_alias_fixture!(
+        security2166_r2_word_joiner_collides,
+        "node-trusted.example\u{2060}"
+    );
+    claimed_alias_fixture!(security2166_r2_bom_collides, "node-trusted.example\u{feff}");
+    claimed_alias_fixture!(
+        security2166_r2_bidi_collides,
+        "node-trusted.example\u{202e}"
+    );
+    claimed_alias_fixture!(
+        security2166_r2_trailing_space_collides,
+        "node-trusted.example "
+    );
+    claimed_alias_fixture!(
+        security2166_r2_cyrillic_collides,
+        "n\u{43e}de-trusted.example"
+    );
+
+    #[test]
+    fn security2166_r2_claims_escape_all_invisible_scalars() {
+        let app = AppState::test_new();
+        for ch in [
+            '\u{200b}', '\u{200d}', '\u{2060}', '\u{feff}', '\u{202a}', '\u{202b}', '\u{202c}',
+            '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{9d}',
+            '\u{1b}', '\n', '\t', '\u{fe0f}',
+        ] {
+            let raw = format!("node-unknown.example{ch}");
+            let shown = app.server_claim_name(&raw, None);
+            assert!(!shown.contains(ch), "raw scalar {ch:?} in {shown:?}");
+            assert!(
+                shown.contains('\\'),
+                "the scalar must remain visible as an escape: {shown:?}"
+            );
+            assert!(shown.contains("unverified"), "{shown:?}");
+        }
+    }
+
+    #[test]
+    fn security2166_r2_non_interior_whitespace_is_visible() {
+        let app = AppState::test_new();
+        for name in [" leading", "trailing ", "two  spaces", "non\u{a0}breaking"] {
+            let shown = app.server_claim_name(name, None);
+            assert!(shown.contains("\\u{"), "{shown:?}");
+            assert!(shown.contains("unverified"));
+        }
+    }
+
+    #[test]
+    fn security2166_r2_empty_claim_keeps_the_marker() {
+        let app = AppState::test_new();
+        for node in [None, Some("claimed-node")] {
+            assert!(app.server_claim_name("", node).contains("unverified"));
+        }
+    }
+
+    #[test]
+    fn security2166_r2_unpinned_configured_host_keeps_its_local_name() {
+        let mut app = AppState::test_new();
+        let config = crate::config::PeerConfig {
+            name: "node-legacy.example".into(),
+            ..Default::default()
+        };
+        let mut peer = crate::peers::PeerSummaryState::new(&config);
+        peer.host = Some("claimed-host.example".into());
+        app.peers.push(config);
+        app.peer_summaries.push(peer);
+        assert_eq!(
+            app.server_peer_name(&app.peer_summaries[0]),
+            "node-legacy.example"
+        );
+        assert_eq!(
+            app.server_peer_host(&app.peer_summaries[0]),
+            "node-legacy.example"
+        );
+    }
+
+    #[test]
+    fn security2166_r2_narrow_rows_reserve_an_unverified_badge() {
+        let app = security2166_alias_fixture();
+        let name = app.server_claim_name("node-unknown.example", Some("claimed-node"));
+        for width in [1, 2, 5, 12, 16, 30] {
+            let shown = line_text(&clamp_line(Line::from(name.clone()), width));
+            assert!(
+                shown.contains("[unverified]") || shown.starts_with('?'),
+                "width {width}: {shown:?}"
+            );
+            let shown = super::super::grammar::agent_location_label(
+                &name,
+                None,
+                Some("project"),
+                "main",
+                width as usize,
+            );
+            assert!(
+                shown.contains("[unverified]") || shown.starts_with('?'),
+                "width {width}: {shown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn security2166_r2_icon_modes_do_not_remove_the_badge() {
+        let name = AppState::test_new().server_claim_name("node-unknown.example", None);
+        for mode in [
+            crate::config::ServerLabelConfig::Name,
+            crate::config::ServerLabelConfig::Both,
+            crate::config::ServerLabelConfig::Icon,
+        ] {
+            let member =
+                super::super::grammar::member_label_moded(mode, Some("toad"), &name, "main");
+            let field = super::super::grammar::server_field_label(mode, Some("toad"), &name);
+            assert!(member.contains("[unverified]"), "{member:?}");
+            assert!(field.contains("[unverified]"), "{field:?}");
+        }
+    }
+
     fn security2166_alias_fixture() -> AppState {
         let mut app = AppState::test_new();
         let alias = "node-trusted.example";
@@ -3779,19 +3963,19 @@ mod tests {
         for node in [None, Some("claimed-node".to_string())] {
             app.fleet_snapshot.as_mut().unwrap().peers[0].node_id = node;
             let peer = &app.fleet_snapshot.as_ref().unwrap().peers[0];
-            assert!(app.server_peer_name(peer).starts_with("unverified"));
+            assert!(app.server_peer_name(peer).starts_with("[unverified]"));
             assert!(app
                 .server_claim_name("NODE-TRUSTED.EXAMPLE", peer.node_id.as_deref())
-                .starts_with("unverified"));
+                .starts_with("[unverified]"));
         }
         app.server_nodes
             .insert("node-inbound.example".into(), "inbound-node".into());
         assert!(app
             .server_claim_name("node-inbound.example", None)
-            .starts_with("unverified"));
+            .starts_with("[unverified]"));
         assert_eq!(
             app.server_claim_name("node-unknown.example", None),
-            "node-unknown.example"
+            "[unverified] node-unknown.example"
         );
         let local = crate::peers::PeerSummaryState::new(&app.peers[0]);
         app.peer_summaries.push(local);
@@ -4330,7 +4514,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!text.contains("node-home.example"));
-        assert!(text.contains("unverified node-hom"));
+        assert!(text.contains("[unverified] node-hom"));
         let snapshot = app.fleet_snapshot.as_ref().unwrap();
         let home = home_server_rows(
             snapshot,
@@ -6058,7 +6242,7 @@ mod tests {
                 0,
                 true
             ),
-            "kiln:fix/pty"
+            "[unverified] kiln:fix/pty"
         );
     }
 
@@ -6483,7 +6667,7 @@ mod tests {
         let config_peer = crate::app::state::RemotePeerRef::Config { peer_idx: 0 };
         assert_eq!(
             remote_entry_label(&app, &config_peer, 0, false),
-            "gerchowl/dotfiles · atlas:main"
+            "gerchowl/dotfiles · [unverified] atlas:main"
         );
     }
 
@@ -6609,7 +6793,7 @@ mod tests {
         // Snapshot rows label like config-peer rows: carried host + branch.
         assert_eq!(
             remote_entry_label(&app, &RemotePeerRef::Snapshot { entry_idx: 0 }, 0, true),
-            "kiln:fix/pty"
+            "[unverified] kiln:fix/pty"
         );
 
         // No snapshot, no config peers: nothing remote folds in.
@@ -6929,6 +7113,10 @@ mod tests {
         app.selected = 0;
         app.mode = crate::app::Mode::Terminal;
         app.peer_summaries = vec![peer_with_workspaces("kiln", vec![])];
+        app.peers.push(crate::config::PeerConfig {
+            name: "kiln".into(),
+            ..Default::default()
+        });
         app.server_filter = Some(crate::app::state::ServerFilter::Peer {
             ssh_target: "kiln".into(),
         });

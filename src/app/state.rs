@@ -2883,35 +2883,17 @@ impl AppState {
             })
     }
 
-    /// Display a claimed name without letting an unproven row impersonate a
-    /// configured alias or a locally pinned name (ADR-0026, origin policy).
-    /// This is presentation only: routing and observation keys stay unchanged.
+    /// Render a claimed name through the shared escaped, badged presentation
+    /// and UTS #39 alias-skeleton policy (ADR-0026, origin policy).
     pub(crate) fn server_claim_name(&self, name: &str, node: Option<&str>) -> String {
-        let collides = self
-            .peers
-            .iter()
-            .any(|peer| peer.name.eq_ignore_ascii_case(name))
-            || self
-                .server_nodes
-                .keys()
-                .any(|alias| alias.eq_ignore_ascii_case(name));
-        let short = || {
-            node.map(|id| {
-                id.chars()
-                    .take(8)
-                    .flat_map(char::escape_default)
-                    .collect::<String>()
-            })
-            .filter(|id| !id.is_empty())
-        };
-        if collides {
-            return short().map_or_else(|| "unverified".into(), |id| format!("unverified {id}"));
-        }
-        if name.is_empty() {
-            short().unwrap_or_else(|| "unverified".into())
-        } else {
-            name.to_string()
-        }
+        crate::peer_name::claimed(
+            name,
+            node,
+            self.peers
+                .iter()
+                .map(|peer| peer.name.as_str())
+                .chain(self.server_nodes.keys().map(String::as_str)),
+        )
     }
 
     /// Prefer a proven binding or the locally configured source name. All
@@ -2941,6 +2923,11 @@ impl AppState {
     /// Directory host text is presentation, separate from the owner node and
     /// next-hop route. Apply the same alias protection to reported hostnames.
     pub(crate) fn server_peer_host(&self, peer: &crate::peers::PeerSummaryState) -> String {
+        if self.peer_summaries.iter().any(|p| std::ptr::eq(p, peer))
+            && self.peers.iter().any(|config| config.name == peer.peer)
+        {
+            return self.server_peer_name(peer);
+        }
         let host = peer.host.as_deref().unwrap_or(&peer.peer);
         if let Some(node) = self.server_peer_node(peer) {
             return self.server_node_name(node).unwrap_or(host).to_string();

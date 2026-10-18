@@ -75,6 +75,10 @@ toml_edit = "0.25.15"
 
 # Wipe node-key seeds and serialized private-key buffers after use.
 zeroize = { version = "1.9", features = ["serde"] }
+# Escape claimed peer names and compare their Unicode confusable skeletons.
+unicode-security = "0.1.2"
+caseless = "0.2.2"
+unicode-general-category = "1.1.0"
 
 [dev-dependencies]
 # Await fixture FIFO reports and bound scripted CLI subprocess lifetimes.

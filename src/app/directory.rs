@@ -22,7 +22,8 @@ pub(crate) struct AgentLocation {
     pub(crate) agent_id: String,
     pub(crate) node: Option<String>,
     pub(crate) live: bool,
-    /// Short host name of the server the agent lives on.
+    /// Viewer-safe display label, including a badge for unverified claims.
+    /// Never use this presentation text as a routing or identity key.
     pub(crate) host: String,
     /// Public pane id **on that host**. Meaningless anywhere else.
     pub(crate) pane_id: String,
@@ -56,6 +57,8 @@ pub(crate) struct AgentLocation {
 /// every caller matches on would make every one of them carry display fields
 /// it has no use for.
 struct FleetAgentEntry {
+    /// Keep observations out of the presentation layer when persisting owners.
+    owner_name: String,
     location: AgentLocation,
     agent: Option<String>,
     status: crate::api::schema::AgentStatus,
@@ -102,11 +105,15 @@ impl App {
                 None
             }
         };
+        let host = route.clone().unwrap_or_else(|| {
+            self.state
+                .server_claim_name(&owner.name, Some(&owner.node_id))
+        });
         Some(AgentLocation {
             agent_id: agent_id.into(),
             node: Some(owner.node_id),
             live: false,
-            host: route.clone().unwrap_or(owner.name),
+            host,
             pane_id: String::new(),
             local: false,
             direct: route.is_some(),
@@ -138,7 +145,7 @@ impl App {
                         .note_owner(
                             &location.agent_id,
                             node,
-                            &location.host,
+                            &entry.owner_name,
                             std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -215,6 +222,7 @@ impl App {
             for ws in &peer.workspaces {
                 for agent in &ws.agents {
                     entries.push(FleetAgentEntry {
+                        owner_name: peer.host.clone().unwrap_or_else(|| peer.peer.clone()),
                         location: AgentLocation {
                             node: peer.node_id.clone(),
                             live,
@@ -241,6 +249,7 @@ impl App {
             for ws in &peer.workspaces {
                 for agent in &ws.agents {
                     entries.push(FleetAgentEntry {
+                        owner_name: peer.host.clone().unwrap_or_else(|| peer.peer.clone()),
                         location: AgentLocation {
                             node: peer.node_id.clone(),
                             live,
@@ -365,6 +374,37 @@ mod tests {
         assert_eq!(location.route.as_deref(), Some("node-hub.example"));
     }
 
+    #[test]
+    fn security2166_r2_owner_observations_are_not_persisted_as_rendered_labels() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        app.state.peers.push(crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        let agent = "11111111-1111-4111-8111-111111111111";
+        let mut peer = peer_with_agent("node-trusted.example", "node-trusted.example", agent);
+        peer.node_id = Some(crate::mesh::identity::NodeIdentity::fixture([18; 32]).node_id());
+        app.state.relayed_fleet_cache.insert(
+            "claim".into(),
+            crate::peers::RelayedEntry {
+                peer,
+                via: Some("node-hub.example".into()),
+                hub_pushed: true,
+            },
+        );
+        let display = app.locate_agent(agent).unwrap().host;
+        app.note_mesh_owners();
+        let owner =
+            crate::mesh::runtime_store::read(|store| store.owner(agent).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(owner.name, "node-trusted.example");
+        app.state.relayed_fleet_cache.clear();
+        assert_eq!(app.locate_agent(agent).unwrap().host, display);
+    }
+
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
@@ -434,7 +474,7 @@ mod tests {
             .locate_agent("agent_kiln-dev_1")
             .expect("remote agent resolves");
         assert!(!found.local);
-        assert_eq!(found.host, "kiln-dev");
+        assert_eq!(found.host, "[unverified] kiln-dev");
         assert_eq!(found.pane_id, "w1:p1");
     }
 
@@ -448,7 +488,7 @@ mod tests {
         app.state.peer_summaries = vec![peer_with_agent("kiln", "bastion", "agent_bastion_1")];
 
         let found = app.locate_agent("agent_bastion_1").expect("resolves");
-        assert_eq!(found.host, "bastion", "where the agent is");
+        assert_eq!(found.host, "[unverified] bastion", "where the agent is");
         assert_eq!(
             found.route.as_deref(),
             Some("kiln"),
@@ -548,7 +588,7 @@ mod tests {
             !remote.local,
             "a peer's agent is not addressable by pane id"
         );
-        assert_eq!(remote.host, "bastion", "where it is");
+        assert_eq!(remote.host, "[unverified] bastion", "where it is");
         assert_eq!(
             remote.route.as_deref(),
             Some("kiln"),

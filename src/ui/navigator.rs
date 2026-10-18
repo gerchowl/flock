@@ -195,6 +195,11 @@ fn render_row(app: &AppState, frame: &mut Frame, rect: Rect, row: &NavigatorRow,
         .saturating_sub(meta_width)
         .saturating_sub(left_fixed.chars().count() as u16)
         .saturating_sub(3) as usize;
+    if left_budget == 0 && crate::peer_name::is_claim(&row.label) {
+        let title = truncate_text(&row.label, rect.width as usize);
+        frame.render_widget(Paragraph::new(title).style(text_style), rect);
+        return;
+    }
     let title = truncate_text(&row.label, left_budget);
 
     let spans = vec![
@@ -500,6 +505,9 @@ fn render_footer(app: &AppState, frame: &mut Frame, area: Rect) {
 }
 
 fn truncate_text(text: &str, max_width: usize) -> String {
+    if let Some(label) = crate::peer_name::fit(text, max_width) {
+        return label;
+    }
     let len = text.chars().count();
     if len <= max_width {
         return text.to_string();
@@ -517,6 +525,18 @@ fn truncate_text(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod trust_tests {
     use super::*;
+
+    #[test]
+    fn security2166_r2_navigator_truncation_keeps_the_badge() {
+        let name = AppState::test_new().server_claim_name("node-unknown.example", None);
+        for width in [1, 2, 5, 12, 16] {
+            let title = truncate_text(&format!("project · {name}:main"), width);
+            assert!(
+                title.contains("[unverified]") || title.starts_with('?'),
+                "{title:?}"
+            );
+        }
+    }
 
     #[test]
     fn security2166_navigator_detail_cannot_claim_a_configured_alias() {

@@ -207,17 +207,40 @@ name.
 ### Peer names in presentation
 
 Configured names and locally pinned/enrolled bindings are authoritative;
-reported node IDs and carried snapshot names are claims. Every name-bearing
-UI surface uses the same presentation rule: an unverified claim matching a
-configured alias or local pin name (ASCII case-insensitively) renders as
-`unverified` plus its escaped short node ID, or just `unverified` without an
-ID. It never renders that claimed alias. The locally configured source may
-still display its own configured name while offline or awaiting enrollment.
-The rule applies to servers, spaces, agents, navigator rows and details,
-filter headers, checkout notices and switch labels, and the fleet directory
-host labels used by CLI output and message/wait notices. It changes no cache key,
-identity proof, policy binding or dial target. Wire summaries retain their
-observations; they cannot establish a trusted alias by presenting it.
+reported node IDs and carried snapshot names are claims. One shared
+claimed-name presentation function owns comparison and escaping. Alias
+comparison removes format, bidi, control, default-ignorable and whitespace
+scalars, applies full Unicode casefolding, then the UTS #39 confusable skeleton
+to both the claim and the configured/pinned aliases. The maintained
+[`unicode-security`](https://docs.rs/unicode-security/0.1.2/unicode_security/)
+0.1.2 implementation supplies the skeleton and default-ignorable properties;
+`caseless` 0.2.2 supplies full casefolding and `unicode-general-category` 1.1.0
+supplies format categories. These dependencies pass the existing cargo-deny
+license and advisory policy without exceptions. No local confusables table is
+used. Skeletons are comparison keys, never display text or routing keys.
+
+On collision the claimed alias is hidden behind its escaped short node ID;
+otherwise the name is escaped. Every claim carries `[unverified]`, including
+empty names and short-ID fallbacks. Format/bidi/control/default-ignorable
+scalars and whitespace render as visible Unicode escapes; only a single
+interior ASCII space between visible non-whitespace scalars remains literal.
+Literal backslashes are escaped too. Truncation reserves the badge and cuts
+the remaining name/context by terminal cells. Below twelve cells the compact
+badge is `?`; with zero cells no name or badge can render. Icon modes cannot
+replace the badge. Narrow rows may drop ornaments or project context to retain
+this trust cue.
+
+The rule applies to servers (including carried Origin), spaces, agents,
+navigator rows and details, filter headers, checkout and switch notices, and
+fleet-directory/CLI and message/wait host labels. Locally configured rows keep
+their configured name even before a pin exists. A carried Home observation is
+still an unproven claim even when its asserted node ID matches a local pin;
+its Home badge remains as a deliberate UX trade-off. Only proof from that
+observation's source permits a trusted name. Stored owner hints from earlier
+versions pass the same function on read. New owner records preserve the raw
+observation separately from display, preventing repeated badge/escape growth.
+None of this rewrites cache keys, identity proofs, policy bindings or dial
+targets. Wire summaries remain observations, not authority to borrow aliases.
 
 An unproven row with a node ID has the badge `unverified`; an ID-less legacy
 row has `legacy/unverified`. Neither badge grants identity or routing trust.

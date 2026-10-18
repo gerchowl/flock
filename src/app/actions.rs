@@ -5805,7 +5805,10 @@ mod tests {
             })
             .expect("fleet-wide navigator should surface the peer workspace");
         // Same self-contained grammar the sidebar shows: `owner/repo · host:branch`.
-        assert_eq!(remote.label, "gerchowl/flock \u{00b7} atlas:main");
+        assert_eq!(
+            remote.label,
+            "gerchowl/flock \u{00b7} [unverified] atlas:main"
+        );
         assert_eq!(remote.status, AgentState::Working);
     }
 
