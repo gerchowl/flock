@@ -1,7 +1,7 @@
 //! Client bearer verification and revocation-serialized admission (ADR-0036 §5a).
 use super::VerifiedToken;
 use crate::app::LocalOperator;
-use crate::platform::client_token_lock::PendingLock;
+use crate::platform::client_token_lock::{LockFile, PendingLock};
 use crate::platform::client_tokens::{Entry, Namespace};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -176,11 +176,11 @@ impl TokenStore {
         };
         Ok(file)
     }
-    fn lock(&self) -> Result<File, TokenError> {
+    fn lock(&self) -> Result<LockFile, TokenError> {
         if priority::pending(&self.0)? {
             return Err(TokenError::Busy);
         }
-        let file = self.lock_file()?;
+        let file = LockFile::new(self.lock_file()?);
         file.try_lock().map_err(|e| match e {
             TryLockError::WouldBlock => TokenError::Busy,
             TryLockError::Error(e) => e.into(),

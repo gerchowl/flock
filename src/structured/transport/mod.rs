@@ -74,6 +74,8 @@ struct ControlPlane {
 pub struct StreamLocation {
     /// Existing flock data root (not the harness profile).
     pub data_dir: PathBuf,
+    /// Storage threshold captured from `[sessions]` at launch.
+    pub storage: super::blobs::StorageConfig,
     /// Agent identifier, containing only ASCII letters, digits, '-' or '_'.
     pub agent: String,
     /// Session identifier with the same restrictions; `queue` is reserved (any case).
@@ -113,10 +115,12 @@ pub struct StreamRecord {
     pub raw: String,
 }
 
-/// A persisted record paired with S1's infallible adapter interpretation.
+/// A live event paired with its envelope and explicit persistence status.
 #[derive(Debug)]
 pub struct Received {
-    /// Durable envelope; written before this notification is offered.
+    /// False for live-only partial deltas; their seq must not advance a cursor.
+    pub persisted: bool,
+    /// Durable envelope, or a live-only delta with the preceding durable seq.
     pub record: StreamRecord,
     /// Interpretation using the observed harness version.
     pub event: SessionEvent,
@@ -505,6 +509,16 @@ impl InputHandle {
     /// Loss with no identifiable event type yields `structured_turn_end_unknown`
     /// until a real result confirms the boundary; never retry it as ordinary busy.
     pub(super) fn try_submit(&self, user: &Value) -> io::Result<()> {
+        self.try_submit_observed(user, || {})
+    }
+
+    /// Offer input and request supervisor shutdown only if its acceptance fact
+    /// cannot reach the pump. Existing I/O cancellation does not imply stop intent.
+    pub(super) fn try_submit_observed(
+        &self,
+        user: &Value,
+        observer_unavailable: impl FnOnce(),
+    ) -> io::Result<()> {
         if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -555,7 +569,11 @@ impl InputHandle {
             self.busy.store(false, Ordering::Release);
             return Err(io::Error::other(err.to_string()));
         }
+        // The busy gate admits one input per turn, and the pump drains facts
+        // before each stdout line and poll. The bounded queue cannot fill while
+        // that pump is connected, so failure means its observer disconnected.
         if self.accepted.try_send(Accepted { at, at_ms }).is_err() {
+            observer_unavailable();
             self.cancel.store(true, Ordering::Release);
             self.busy.store(false, Ordering::Release);
             return Err(io::Error::new(
@@ -754,9 +772,19 @@ fn pump(
     cancel: &AtomicBool,
     controls: &ControlPlane,
 ) -> io::Result<()> {
+    let blobs = super::blobs::BlobStore::open(&location.data_dir).map_err(io::Error::other)?;
+    let threshold = location.storage.blob_min_bytes;
     let (mut file, mut seq) = open_stream(location, cancel)?;
     let mut recorder = control::Recorder::new(
-        &mut file, &mut seq, version, &tx, busy, uncertain, cancel, controls,
+        &mut file,
+        &mut seq,
+        version,
+        &tx,
+        busy,
+        uncertain,
+        cancel,
+        controls,
+        (&blobs, threshold),
     );
     let result = (|| {
         let mut line = Vec::new();
@@ -849,9 +877,10 @@ fn emit(
     uncertain: &AtomicBool,
     cancel: &AtomicBool,
     synthetic: bool,
+    storage: (&super::blobs::BlobStore, usize),
 ) -> io::Result<()> {
     let received = persist(
-        file, seq, line, count, version, busy, uncertain, synthetic, None, None,
+        file, seq, line, count, version, busy, uncertain, synthetic, None, None, storage,
     )?;
     publish(received, tx, cancel)
 }
@@ -867,6 +896,7 @@ fn persist(
     synthetic: bool,
     grant_request_id: Option<&str>,
     permission_request_seq: Option<u64>,
+    storage: (&super::blobs::BlobStore, usize),
 ) -> io::Result<Received> {
     let origin = if synthetic || count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err()
     {
@@ -905,10 +935,21 @@ fn persist(
         }
         _ => (false, None),
     };
-    *seq = seq
-        .checked_add(1)
-        .ok_or_else(|| io::Error::other("session sequence exhausted"))?;
-    let record = StreamRecord {
+    let stored_raw = if kind.as_deref() == Some("stream_event") {
+        None
+    } else {
+        storage
+            .0
+            .project(&raw, storage.1)
+            .map_err(io::Error::other)?
+    };
+    let persisted = stored_raw.is_some();
+    if persisted {
+        *seq = seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("session sequence exhausted"))?;
+    }
+    let mut record = StreamRecord {
         seq: *seq,
         received_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -920,10 +961,14 @@ fn persist(
         permission_request_seq,
         raw,
     };
-    let mut encoded = serde_json::to_vec(&record)?;
-    encoded.push(b'\n');
-    file.write_all(&encoded)?;
-    file.sync_data()?;
+    if let Some(raw) = stored_raw {
+        let live_raw = std::mem::replace(&mut record.raw, raw);
+        let mut encoded = serde_json::to_vec(&record)?;
+        encoded.push(b'\n');
+        file.write_all(&encoded)?;
+        file.sync_data()?;
+        record.raw = live_raw;
+    }
     if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {
         uncertain.store(false, Ordering::Release);
         busy.store(false, Ordering::Release);
@@ -935,6 +980,7 @@ fn persist(
         uncertain.store(true, Ordering::Release);
     }
     Ok(Received {
+        persisted,
         record,
         event,
         accepted: None,
