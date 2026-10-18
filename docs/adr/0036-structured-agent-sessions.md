@@ -1171,6 +1171,20 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   is visible through `ps` for the opener's lifetime. Single use, the 60-second
   TTL and fragment-only transport bound this known exposure; process logging
   masks the code. This exception does not permit long-lived tokens in argv.
+  Log-only argv scrubbing also masks userinfo in malformed URL tokens: raw
+  `/`, `#` or quotes before the final `@` must not expose a password prefix.
+  Without escaping, userinfo and path text containing `@` are ambiguous; the
+  conservative rule can hide preceding host/path text in logs. Quoted URL
+  wrappers are retained when the URL tail has no such ambiguity.
+  Query/fragment names containing a full credential label (shared with the
+  report scrubber), or `code`, `key` or `signature`, have their values masked
+  even when the label is mid-name, such as `api_key_v2` or `token_type`.
+  This intentionally treats those names as sensitive; the short `sig` alias
+  matches only the complete name, preserving ordinary `design` parameters.
+  Credential-header labels allow horizontal whitespace before `:` but require
+  whitespace or end-of-string after it, preserving non-header refspecs and
+  terminal targets such as `deploy-token:main` and `mysession:0`.
+  These rules shape diagnostic logs only; executed argv is never rewritten.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location
   (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.
