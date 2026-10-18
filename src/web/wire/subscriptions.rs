@@ -102,10 +102,7 @@ impl Subscriptions {
                     .await
                 {
                     Some(Ok(())) => {
-                        if stream
-                            .strip_prefix("agent/")
-                            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
-                        {
+                        if stream.starts_with("agent/") {
                             replay(&owner, &data, &fence, &hints, &id, &stream, after).await
                         } else {
                             Err(Some(SubfailCode::UnknownStream))
@@ -169,7 +166,9 @@ async fn replay(
     let source = owner
         .lookup(stream[6..].into())
         .await
-        .map_err(|_| None)?
+        .map_err(|error| {
+            (error.kind() == io::ErrorKind::InvalidInput).then_some(SubfailCode::InvalidAgent)
+        })?
         .ok_or(SubfailCode::UnknownStream)?;
     let wake = source.waker();
     let mut cut = {

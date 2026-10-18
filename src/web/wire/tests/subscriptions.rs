@@ -593,3 +593,31 @@ fn new_generation_selects_its_source_before_using_an_old_resume_hint() {
         case.server.finish().await;
     });
 }
+
+#[test]
+fn invalid_stored_subject_is_distinct_from_unknown_stream() {
+    runtime(async {
+        let mut case = Case::new(vec![]).await;
+        case.registry
+            .register(Record {
+                runtime: StructuredRuntime::Structured,
+                agent_id: "reserved".into(),
+                session_id: "queue".into(),
+                name: None,
+                harness: "claude".into(),
+                cwd: case.server._root.path().to_owned(),
+                model: None,
+            })
+            .unwrap();
+        let mut socket = case.open().await;
+        for stream in ["agent/../escaped", "agent/reserved"] {
+            socket
+                .send(json!({"t":"sub","sub_id":stream,"stream":stream}))
+                .await;
+            assert_eq!(case.frame(&mut socket).await["code"], "invalid_agent");
+        }
+        case.sub(&mut socket, "sibling", None).await;
+        assert_eq!(case.frame(&mut socket).await["t"], "synced");
+        case.server.finish().await;
+    });
+}
