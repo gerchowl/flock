@@ -1,6 +1,6 @@
 pub(crate) mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -152,6 +152,7 @@ where
 
 /// Preserve the formatter's field order while expanding sealed input metadata.
 /// This avoids changing serde_json's map representation for the whole binary.
+/// Duplicate names reject formatting before a JSON record is written (ADR-0039).
 struct InputJsonFields(Vec<(String, serde_json::Value)>);
 
 impl<'de> serde::Deserialize<'de> for InputJsonFields {
@@ -167,7 +168,11 @@ impl<'de> serde::Deserialize<'de> for InputJsonFields {
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut fields = Vec::new();
-                while let Some(field) = map.next_entry()? {
+                let mut names = HashSet::new();
+                while let Some(field) = map.next_entry::<String, serde_json::Value>()? {
+                    if !names.insert(field.0.clone()) {
+                        return Err(serde::de::Error::custom("duplicate input JSON field"));
+                    }
                     fields.push(field);
                 }
                 Ok(InputJsonFields(fields))
@@ -180,6 +185,12 @@ impl<'de> serde::Deserialize<'de> for InputJsonFields {
 impl serde::Serialize for InputJsonFields {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
+        let mut names = HashSet::new();
+        for (key, _) in &self.0 {
+            if !names.insert(key) {
+                return Err(serde::ser::Error::custom("duplicate input JSON field"));
+            }
+        }
         let mut map = serializer.serialize_map(Some(self.0.len()))?;
         for (key, value) in &self.0 {
             map.serialize_entry(key, value)?;
@@ -5980,6 +5991,74 @@ mod tests {
     }
 
     #[test]
+    fn input_json_fields_reject_duplicate_names_on_read() {
+        assert!(
+            serde_json::from_str::<InputJsonFields>(r#"{"input_len":1,"input_len":2}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn input_json_fields_reject_envelope_metadata_collisions_on_write() {
+        let mut envelope: InputJsonFields = serde_json::from_str(r#"{"input_len":2}"#).unwrap();
+        let metadata: InputJsonFields = serde_json::from_str(r#"{"input_len":1}"#).unwrap();
+        envelope.0.extend(metadata.0);
+        assert!(serde_json::to_string(&envelope).is_err());
+    }
+
+    #[test]
+    fn input_json_format_returns_format_error_on_field_collision() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct ObserveError(Arc<AtomicBool>);
+        impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for ObserveError
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+            N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+        {
+            fn format_event(
+                &self,
+                ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+                writer: tracing_subscriber::fmt::format::Writer<'_>,
+                event: &tracing::Event<'_>,
+            ) -> std::fmt::Result {
+                let result = tracing_subscriber::fmt::FormatEvent::format_event(
+                    &InputJsonFormat::default(),
+                    ctx,
+                    writer,
+                    event,
+                );
+                self.0.store(result.is_err(), Ordering::Relaxed);
+                result
+            }
+        }
+        let dir = crate::test_support::TempDir::socket();
+        let path = dir.path().join("collision.log");
+        let failed = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(Mutex::new(File::create(&path).unwrap()))
+            // Observe formatter output separately from the subscriber's error diagnostic.
+            .log_internal_errors(false)
+            .event_format(ObserveError(failed.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                event = "fixture.collision",
+                input_len = 2,
+                input_metadata = r#"{"input_len":1,"input_class":"unknown"}"#,
+                "duplicate metadata fixture"
+            );
+        });
+        assert!(
+            failed.load(Ordering::Relaxed),
+            "collision must return a format error"
+        );
+        assert!(
+            fs::read(path).unwrap().is_empty(),
+            "no partial JSON record may escape"
+        );
+    }
+
+    #[test]
     fn non_input_diagnostics_survive_report_redaction() {
         let out = capture_input_json(|| {
             structured_worker_shutdown_failed(&crate::structured::workers::ShutdownError(vec![(
@@ -5991,14 +6070,16 @@ mod tests {
             self_compact_completed("pane-example", 13);
             client_clipboard_image_staged(1, 14, "image-example.png");
             handoff_recorded("file-example", "png", 15);
-            let _ = crate::raw_input::parse_raw_input_bytes_sync(b"s");
+            let _ = crate::raw_input::parse_raw_input_bytes_sync(b"s\x1b[A\x1b[15~");
         });
         let records = crate::report::redact::extract(
             &out,
             "fixture.log",
             &crate::report::redact::Scrubber::new(None, None),
         );
-        assert_eq!(records.len(), 7);
+        assert!(out.contains("\"named_key\":\"up\""));
+        assert!(out.contains("\"function_key\":5"));
+        assert_eq!(records.len(), 9);
         assert!(records[0]
             .fields
             .contains(&("failure_code".into(), "session_busy".into())));
@@ -6013,17 +6094,13 @@ mod tests {
         for record in records {
             for (name, _) in record.fields {
                 assert!(![
-                    "bytes",
-                    "code",
                     "input_len",
                     "input_class",
                     "key_class",
+                    "named_key",
+                    "function_key",
                     "modifiers",
-                    "raw_bytes",
-                    "parsed",
-                    "key",
-                    "sequence",
-                    "encoded"
+                    "input_metadata",
                 ]
                 .contains(&name.as_str()));
             }
