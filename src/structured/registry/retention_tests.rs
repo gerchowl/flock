@@ -239,3 +239,17 @@ fn retained_explicit_purge_respects_age_kind_missing_stamps_and_live_workers() {
     assert_eq!(projection.update.state.lifecycle, Lifecycle::Live);
     assert_eq!(store.records().len(), 1);
 }
+
+#[test]
+fn retained_purge_reclassifies_the_last_forward_copy_before_automatic_pruning() {
+    let raw = forward();
+    let mut store = registry(json!([raw, raw]));
+    store.prepare_retained_save(100, false);
+    let mut stamps = store.retained_stamps();
+    stamps[1]["first_seen_ms"] = json!(200);
+    store.restore_retained_stamps(&stamps);
+    assert_eq!(store.purge_retained(true, Some(50), 200), 1);
+    assert_eq!(store.retained_records()[0].kind, RetainedKind::Forward);
+    store.prepare_retained_save(u64::MAX, true);
+    assert_eq!(serde_json::to_value(&store).unwrap(), json!([raw]));
+}

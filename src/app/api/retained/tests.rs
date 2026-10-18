@@ -43,7 +43,7 @@ fn request(app: &mut App, method: Method) -> Value {
 async fn retained_api_requires_operator_even_for_list_and_refuses_all_without_yes() {
     let mut app = operator();
     app.state.structured_agents =
-        serde_json::from_value(json!([{"invalid":true}, {"runtime":"future-runtime"}])).unwrap();
+        serde_json::from_value(json!([true, {"runtime":"future-runtime"}])).unwrap();
     for uid in [Some(42), Some(99), None] {
         app.current_api_peer_uid = Some(uid);
         for method in [
@@ -81,7 +81,7 @@ async fn retained_api_requires_operator_even_for_list_and_refuses_all_without_ye
 async fn retained_doctor_hints_at_forward_or_more_than_half_dead_cap_only() {
     let mut app = operator();
     for (dead, forward, hint) in [(0, 0, false), (128, 0, false), (129, 0, true), (0, 1, true)] {
-        let mut records: Vec<_> = (0..dead).map(|i| json!({"invalid":i})).collect();
+        let mut records: Vec<_> = (0..dead).map(|i| json!(i)).collect();
         records.extend((0..forward).map(|_| json!({"harness":"future-harness"})));
         app.state.structured_agents = serde_json::from_value(json!(records)).unwrap();
         let response = request(&mut app, list());
@@ -145,7 +145,7 @@ async fn retained_purge_persists_before_mutation_and_refuses_failed_commit() {
     std::env::set_var(keys[2], root.path().join("config"));
     let mut app = operator();
     app.no_session = false;
-    let raw = json!([{"invalid":true},{"runtime":"future-runtime"}]);
+    let raw = json!([true,{"runtime":"future-runtime"}]);
     app.state.structured_agents = serde_json::from_value(raw.clone()).unwrap();
     let dir = crate::session::data_dir();
     assert!(dir.starts_with(root.path()));
@@ -169,6 +169,31 @@ async fn retained_purge_persists_before_mutation_and_refuses_failed_commit() {
     app.state.structured_agents = serde_json::from_value(raw.clone()).unwrap();
     let response = request(&mut app, purge(Selection::All, true));
     assert_eq!(response["error"]["code"], "internal_error", "{response}");
+    assert_eq!(
+        serde_json::to_value(&app.state.structured_agents).unwrap(),
+        raw
+    );
+}
+
+#[tokio::test]
+async fn retained_agent_token_without_operator_evidence_is_refused() {
+    let mut app = operator();
+    app.current_api_peer_uid = None;
+    let raw = json!([true, {"runtime":"future-runtime"}]);
+    app.state.structured_agents = serde_json::from_value(raw.clone()).unwrap();
+    for method in [list(), purge(Selection::All, true)] {
+        let mut raw_request = serde_json::to_value(Request {
+            id: "agent-token".into(),
+            method,
+        })
+        .unwrap();
+        raw_request["token"] = json!("fixture-agent-token");
+        let request = serde_json::from_value(raw_request).unwrap();
+        let response: Value =
+            serde_json::from_str(&app.handle_api_request_after_internal_events_drained(request))
+                .unwrap();
+        assert_eq!(response["error"]["code"], "operator_only");
+    }
     assert_eq!(
         serde_json::to_value(&app.state.structured_agents).unwrap(),
         raw

@@ -137,6 +137,7 @@ impl Registry {
 
     /// Explicit operator selection; missing timestamps never satisfy an age filter.
     /// This changes only inactive records, preserving active workers and observations.
+    /// Reclassify remaining copies so removing an earlier duplicate cannot orphan DEAD data.
     pub fn purge_retained(&mut self, all: bool, older_than_ms: Option<u64>, now_ms: u64) -> usize {
         let before = self.retained.len();
         self.retained.retain(|slot, entry| {
@@ -151,6 +152,18 @@ impl Registry {
             }
             !selected
         });
+        let mut seen = BTreeSet::new();
+        for (slot, raw) in self.preserved.iter().enumerate() {
+            let Some(raw) = raw else { continue };
+            let duplicate = !seen.insert(digest(raw));
+            if let Some(entry) = self.retained.get_mut(&slot) {
+                entry.kind = if !raw.is_object() || duplicate {
+                    RetainedKind::Dead
+                } else {
+                    RetainedKind::Forward
+                };
+            }
+        }
         before - self.retained.len()
     }
 

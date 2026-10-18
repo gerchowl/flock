@@ -57,8 +57,9 @@ impl App {
             };
             let all = selection == Selection::All;
             let mut candidate = self.state.structured_agents.snapshot();
-            removed = candidate.purge_retained(all, older_than_ms, now);
+            candidate.purge_retained(all, older_than_ms, now);
             candidate.prepare_retained_save(now, true);
+            removed = self.state.structured_agents.retained_count() - candidate.retained_count();
             if !self.no_session {
                 let snapshot = self.capture_session_snapshot(&candidate, Some(now));
                 if let Err(error) = crate::persist::save_metadata(&snapshot) {

@@ -16,13 +16,7 @@ pub(super) fn run(args: &[String], doctor: bool) -> std::io::Result<i32> {
         );
         return Ok(exit::SUCCESS);
     }
-    let method = if doctor && args.is_empty() {
-        Some(Method::SessionRetainedList(EmptyParams {}))
-    } else if doctor {
-        None
-    } else {
-        parse(args)
-    };
+    let method = select(args, doctor);
     let Some(method) = method else {
         return Ok(output::failure(
             ErrorCode::InvalidParams,
@@ -45,6 +39,14 @@ pub(super) fn run(args: &[String], doctor: bool) -> std::io::Result<i32> {
             .ok_or_else(|| std::io::Error::other("unexpected retained response"))?
     );
     Ok(exit::SUCCESS)
+}
+fn select(args: &[String], doctor: bool) -> Option<Method> {
+    if doctor {
+        return args
+            .is_empty()
+            .then_some(Method::SessionRetainedList(EmptyParams {}));
+    }
+    parse(args)
 }
 fn parse(args: &[String]) -> Option<Method> {
     if args == ["list"] {

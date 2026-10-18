@@ -141,12 +141,53 @@ refuses automatic retention maintenance with a warning, preserving the data.
 FORWARD records have neither an automatic age limit nor an automatic count cap.
 A retained-only session, including opaque metadata, remains persistable.
 
-The operator list/purge commands and doctor reporting are tracked in #1853's
-second PR and are not available in this policy/persistence slice.
+### Inspect and purge (operator only)
+
+Use the running session's API socket:
+
+```sh
+flk session retained list
+flk session retained list --json
+flk doctor
+flk doctor --json
+flk session retained purge --dead
+flk session retained purge --dead --older-than 24h
+flk session retained purge --all --yes --older-than 720h
+```
+
+List reports each retained record's kind, current serialized array slot and
+`first_seen_ms` (null/unstamped until capture/save), plus counts per kind. It
+omits opaque payloads; back up `session.json` and inspect its corresponding slots
+before deciding to destroy FORWARD data. Slots are not stable record identifiers.
+Doctor uses the same live counts and hints the purge command when any FORWARD
+record exists or DEAD exceeds 128. It does not inspect an offline session file.
+
+Both list and purge require the operator principal, established by kernel UID
+and lease ancestry. Agent credentials/tokens cannot grant this authority; refusal
+is typed `operator_only` (CLI exit 13). A separate operator shell with the session
+socket can perform maintenance. A compatible running server is required.
+
+Choose exactly one of `--dead` or `--all`. The latter destroys rollback-compatible
+FORWARD data and requires an explicit `--yes` even through the API. Back up and
+check which binary understands these records first. `--older-than` accepts `ms`,
+`s`, `m`, `h` and combinations such as `1h30m`; it selects strictly older stamped
+records. Missing stamps never match an age filter. A backward clock does not
+make a record older. All purges also apply normal save-time DEAD bounds, and the
+reported removed count includes that maintenance. Active records and worker
+observations remain intact. If an age filter removes an earlier copy, a remaining
+last unusable object becomes FORWARD before automatic maintenance.
+
+Purge replaces the snapshot atomically before changing live retained state.
+A save failure before replacement returns a typed error and leaves live records
+unchanged. Directory-sync failure after replacement retains the logged durability
+warning policy described above. Pane-history files remain untouched. A server
+started with `--no-session` only changes its in-memory records. Neither `--all`
+nor `--yes` bypasses an unknown collection shape; follow the repair guide below.
 
 ### Repair an unknown collection shape
 
-A non-array `structured_agents` collection is preserved inactive. Admission
+A non-array `structured_agents` collection is preserved inactive. List/purge return
+typed `retained_collection_shape`; admission
 fails closed with typed `UnsupportedCollectionShape`, directing you here. Other
 PTY workspaces still load; saves preserve the opaque collection.
 
