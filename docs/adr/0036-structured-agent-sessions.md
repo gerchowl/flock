@@ -774,11 +774,12 @@ same queue (owner decision 5): there is no second input path.
   anchor?: { item_id | correlation_id | question_id | fork_point },
   priority: normal | urgent,          ordering only: which waiting item goes first
   delivery: at_idle | steer | interrupt,   timing only: when the item is written
-  state: queued | held | stashed | delivered | done | cancelled | dropped,
+  state: queued | held | stashed | delivered | done | cancelled | dropped | failed,
   (queued → delivered → done | cancelled; queued → held | stashed | dropped;
-   held | stashed → queued; delivered → held when the process dies without a result)
+   held | stashed → queued; queued → failed with a typed refusal;
+   delivered → held when the process dies without a result)
   stash?: name,                       which stash a stashed item is in
-  edit_lease?: { client, until_ms },  an open editor; the item is skipped while it holds
+  edit_lease?: { client, until_ms },  human producers only; skipped while it holds
   batch_id?: uuid,                    the message the item was written in
   relevant_now?: { p, band },         the last relevance check (below)
   body, attachments: [blob refs] }
@@ -835,6 +836,17 @@ same queue (owner decision 5): there is no second input path.
   that every item in it records; a one-item batch uses the `item_id` as its
   uuid, as before. `command_lifecycle` for that uuid moves all its items
   together. Up to `[queue] max_batch` (default 8) items go in one batch.
+
+  **Command exception (architect decision for #1802, 2026-10-17).** A harness
+  slash-command item is sent **verbatim**, as the sole text block of its own
+  isolated turn, without a producer label and never batched with another item.
+  The label would break command parsing. Attribution remains in the queue item
+  and its audit/lifecycle records. Only an operator may create command items:
+  the operator composer or `flk agent send` authenticated as operator/token
+  principal. Text from agents, MCP or relayed peers that starts with `/` remains
+  ordinary input, wrapped in the normal producer-labelled template, and cannot
+  become a harness command. Neither a slash prefix nor a claimed producer in
+  request JSON grants operator authority.
 - **Relatedness joins (owner decision 5).** After rules 1 to 4, when
   System One is configured (§2a's `[systemone]` client), the server asks
   it, in one call, one `noul` per candidate among the next
@@ -910,13 +922,116 @@ same queue (owner decision 5): there is no second input path.
     flk never uses it for a take-back.
 - **Acknowledgement (E3).** `command_lifecycle` drives the item state, so
   "delivered" means the harness started it, not that bytes were written.
+- **Pending turns (architect revised decision, #1896 review).** Only a real
+  result consumed by the queue owner or runtime exit/error ends its reservation.
+  Harness cancellation keeps the items cancelled while waiting for the result;
+  operator take-back (§3 above) is a separate operation, not implemented by this
+  worker slice. Indeterminate loss retains the S3a writer guard. Status reports
+  the batch ID, original reservation time and an explicit cause: `awaiting_result`,
+  `turn_end_unknown` or `cancelled_awaiting_result`. A refused uncertain offer
+  writes no stdin and restores its original queued items instead of holding them
+  as `input_write_failed`. A real result or runtime exit/restart recovers the
+  pending state; restart holds unresolved items `session_unconfirmed`, never
+  automatically resending them. No queue timeout is inferred from pending age.
+  Stall observation belongs to the session state/supervision policy.
 - **Ported producers.** `msg.send` / `msg.reply` delivery to a structured
   agent becomes a queue item instead of the inbox nudge and knock order
   (ADR-0026, which superseded the delivery contracts of ADR-0008, ADR-0018
   and ADR-0019; custody and the authenticated origin stay as ADR-0026
-  defines them). A delegate's structured result and receipt become a
+  defines them). Relayed sends and replies use a typed
+  `node_asserted { sender, origin }` producer: "sender as asserted by node origin".
+  Display metadata `from_host` uses the authoritative node-id/name mapping,
+  preferring the configured alias to the authenticated inbound name, as legacy
+  custody does. It is absent for an unmapped origin; the existing node-asserted
+  header retains the claimed sender and signing node id as explicit attribution,
+  never a bare node id posing as a host. A recovery-time name lookup failure is
+  logged with its registered code and leaves the host absent; it cannot revoke
+  proven delivery. Name presentation grants no local sender authority.
+  The origin is the verified signing node, independent of the forwarding hop;
+  its sender assertion is attribution only, as strong as that node's sender
+  policy. It may have been a permitted caller claim on the originating node.
+  Signature, origin policy and reply capability checks precede admission and
+  are rechecked during recovery. Relays always enter as nonce-framed Messages,
+  never Commands or `Principal::Operator`; they gain no local authority or
+  locally attested sender quota. Remote blocking accounting retains the
+  existing unattested bucket.
+  Existing custody fields carry this proof, with no retroactive attestation
+  marker (architect decision on #1958). A delegate's structured result and receipt become a
   `delegate_result` item for its parent. The Stop-hook recap and nudge
   become server work on `result` (§3a).
+- **Queue custody completion (#2160, #2186, #2164).** The journal owner's
+  committed fold is authoritative: a committed `MessageKey` cannot later be
+  refused as never committed. The custody lookup shares that fold, without a
+  separate growing key index. Auxiliary tracking is bounded by in-flight
+  admissions. Each lookup is O(retained journal items), with no file I/O on the
+  server loop. The journal still retains its item history. The shared snapshot
+  refreshes on admission completion and publication; between an append and that
+  refresh, the owner and snapshot may briefly retain two item vectors. A definite
+  absence requires a complete, readable fold with no pending admission.
+  Production never emits queue removals; future garbage collection must preserve
+  commitment proof before removing items.
+  Missing owners/runtimes, read-only or future-format journals and uncertain
+  writes cannot prove absence. Admission persists `admission_pending` before
+  dispatching to the owner, so expiry before acknowledgement retains uncertainty.
+  Even a permanent recovery error then keeps the
+  same key recovering until its existing inbox TTL (24 hours), never a fresh
+  send or a terminal refusal. Jittered backoff is 4–5 seconds, then 48–60 seconds,
+  then capped at 240–300 seconds, clipped to the remaining TTL. Owner/capacity
+  wakes can shorten a long backoff, but consecutive attempts against the same
+  owner generation remain at least four seconds apart. A new owner generation
+  can resume immediately on its wake; a failure's own notification cannot
+  create a retry loop.
+  Status stays `queued` with typed detail `input_write_unknown:<cause>`:
+  `owner_unavailable`, `admission_pending`, `write_uncertain`,
+  `commit_proven_settle_pending`, `journal_opaque`,
+  `queue_journal_newer` or `queue_journal_corrupt`. These describe unresolved
+  proof or settlement, independently of the error that triggered recovery.
+  Positive proof whose delivery save fails records `commit_proven_settle_pending`
+  until settlement is durable. Expiry retains the correction path in this case
+  too, so a transient store failure cannot erase proven commitment. A reply is
+  not journal commitment proof: `queued` and the unknown detail may coexist
+  with a reply until the owner answers, custody settles, or its TTL expires.
+  At TTL expiry the existing expiry/tombstone path records
+  `input_write_unknown:commitment_unknown_at_expiry` for the existing outcome
+  window. Expiry ends admission recovery without proving that nothing committed;
+  positive proof can still retain settlement recovery as bounded below.
+  Positive proof before expiry is persisted settles `Delivered` directly, even
+  if the inbox deadline passed between commit and settlement. After persisted
+  expiry, only an expiry carrying unknown commitment can change to `Delivered`,
+  exactly once, with typed detail `delivered_after_expiry:<item_id>` (the proven
+  MessageKey's lifecycle identity). A commit proof never changes an existing
+  `Delivered` or `Refused` outcome.
+  If the delivery save fails again after expiry, a positive owner proof retains
+  the same key and retries settlement on the existing capped backoff, including
+  across wake notifications. Correction is bounded by the expired row's existing
+  `outcome_until` (seven days after expiry is persisted), never extended by a
+  retry or proof. At that deadline a retained row records typed detail
+  `input_write_unknown:correction_retention_elapsed`; after maintenance collects
+  the outcome, a retained status reference reports `outcome_retention_elapsed`.
+  Even before collection, proof cannot turn an out-of-window expiry into delivery.
+  The retention decision uses a read-only deadline check. If persisting its final
+  diagnostic fails, recovery still stops and logs the save error and typed
+  `outcome_retention_elapsed` reason; the status deadline remains observable.
+  **Restart limit:** active correction retains the already authenticated envelope
+  in memory. Startup's mailbox projection excludes payload-less `inbox_expired`
+  rows, so restart ends automatic post-expiry correction. It does not restore
+  deleted payload to revalidate a signature; the expired outcome remains until
+  ordinary retention deletion. Before expiry, startup recovery still loads inboxes.
+  Payload-less `Delivered`/`Read` rows are omitted from mailbox rehydration while
+  their terminal status is preserved; intentional collection is not corruption.
+  This corrects the expiry label only: deleted payload is not restored, released
+  quota is not re-acquired, and the original deadlines stay unchanged. Replies
+  use the existing payload-less path and the seven-day custody/reply deadline
+  from original admission; neither proof nor settlement extends that window.
+  Deleted payload cannot be signature-verified again or recover original pane
+  metadata, so local replies requiring that material remain unavailable. Remote
+  return bindings retain their existing deadline and validation requirements.
+  No new store
+  outcome or wire kind is introduced.
+  Attested sends reuse the process's validated node identity without reading its
+  key file per send. Pre-upgrade unsigned custody rows are not retroactively
+  attested: their replies retain the terminal route during the existing inbox
+  window (up to 24 hours), rather than acquiring structured sender authority.
 - **Storage.** The queue persists as `queue.jsonl` beside the agent's
   session streams (§4).
 
@@ -929,9 +1044,33 @@ live. The misses came from an external, client-side supervisor that polled
 `agent_status` every few minutes and missed short idle windows between
 back-to-back turns. For a structured agent there is no polling at all:
 
+- **Input framing (architect decision, #1885 review).** Every non-command
+  item uses a single header line `From <producer> (item <item_id>):` with
+  reply metadata and `Attachments (blob refs): <JSON refs>` on that line.
+  Producer/attachment values are JSON-encoded so embedded newlines remain
+  escaped, including U+2028, U+2029 and U+0085. Attachment strings must be
+  content-addressed `blob:<sha256>` refs: exactly 64 lowercase hex digits
+  after `blob:`. Reply `question_id` must be a canonical lowercase hyphenated
+  UUID. The next line is `<<<flk-item <nonce>`, followed
+  by the literal body and a final line `flk-item <nonce>>>>`. Here `<nonce>`
+  denotes 128 random bits encoded as 32 lowercase hex digits. Generate a
+  fresh nonce per rendered item and regenerate if its hex string occurs
+  anywhere in the body. Sender text, including fake labels, attachment lines
+  or delimiters, remains inside that item's block. Attachments and reply
+  metadata never enter the body block. The operator-only native command
+  exception in §3 remains verbatim and isolated. Admission and replacement
+  validate anchors and refs, refusing `invalid_request` before writing.
+  Rendering validates again: an invalid head becomes durably `failed`
+  with its typed refusal, allowing subsequent items through. A valid prefix
+  is delivered before a later malformed item is failed.
 - **Trigger.** The turn end is the `result` event (E1). An armed self-compact
   (`flock_self_compact`, `flk pane arm-self-compact`) queues a `command`
-  item with body `/compact`, `delivery: at_idle`, `priority: urgent`. By
+  item with body `/compact`, `delivery: at_idle`, `priority: urgent`. The §3
+  command exception applies to direct command items: operator authorization
+  is required, the body is sent verbatim alone, and attribution stays in
+  queue/audit records. The agent-initiated self-compact authorization path
+  belongs to S5c (#1879); this admission slice does not implement or grant it.
+  An agent's recap or supervisor text cannot manufacture that authority. By
   §3, `at_idle` means it is never written into a running turn, and `urgent`
   means it is the first item written after that `result`, ahead of any
   `normal` `at_idle` item. Background shells, held waits and subagents do not matter, because
@@ -949,6 +1088,31 @@ back-to-back turns. For a structured agent there is no polling at all:
   did for a `pty` agent.
 
 ### 4. Storage
+
+Owner amendment (#1820): each queue identity header declares a journal format
+version. Missing stamps mean version 1. Append/checkpoint require a journal
+version no greater than the writer's supported version, and checkpoint writes
+the writer's own version before any new-format append. Bump for every new kind,
+top-level field or enum name. Newer journals load read-only with persistence
+leniency (ADR-0028 §3a), preserving raw bytes without repair or rewriting.
+Every mutation returns typed `queue_journal_newer { found, supported }`;
+queue status exposes the refusal, which requires a compatible writer and must
+never be retried in a loop. Opaque checkpoint passthrough is forbidden because
+an older writer cannot preserve unknown records' interleaving semantics.
+Owner clarification (#1820): unknown kinds/fields/enum names follow lenient
+recovery, with raw bytes preserved and unknown semantics never delivered.
+Malformed known records in supported formats load read-only as
+`queue_journal_corrupt { seq, offset, reason }`: stop folding, refuse every
+mutation/checkpoint and preserve the whole file. Operator recovery is outside
+this slice. A crash-torn final line keeps the existing truncation/sync path;
+it is not corruption. Neither read-only mode permits tail repair.
+Owner clarification (#1922): an invalid header format version is known-record
+corruption and uses the same typed read-only refusal. Unknown data in v1 prevent
+its mandatory upgrade, so it opens read-only with `queue_journal_corrupt` and
+reason `unknown_data_prevents_checkpoint`. Same-version unknown data permit
+known writes only until a checkpoint is required; a refused checkpoint latches
+that typed read-only reason before any further writes, bounding journal growth.
+The fsync-temp, rename, fsync-directory rule below is unchanged.
 
 - **Per-agent session stream.** Every stdout line of a structured agent is
   appended, with a per-stream `seq` and a receive timestamp, to
@@ -1000,6 +1164,18 @@ back-to-back turns. For a structured agent there is no polling at all:
   `{stream, stream_seq}` so a reader can jump from the global order into the
   per-agent stream. The global log is the only place where two agents'
   events are ordered against each other.
+- **Queue lifecycle facts (owner decision #1956).** Exactly one persisted
+  global kind, `queue_item_state`, follows a committed queue state transition.
+  Its fields are `agent`, `item_id`, optional `batch_id`, the existing typed
+  `producer`, typed `from` and `to`, `stream: "queue/<agent>"` and the original
+  committed `stream_seq`. The state vocabulary is §3's `queued`, `held`,
+  `stashed`, `delivered`, `done`, `cancelled`, `dropped`, plus `Unknown` for
+  lenient reading. Unknown kinds and facts with unknown states are skipped;
+  their global sequence remains spent. Adds, edits, reorders and checkpoints
+  do not emit this fact. Crash recovery's `delivered → held` does emit it.
+  Snapshot sequence allocation never changes a captured fact's transition
+  sequence. This kind stays local, under existing global retention/rotation;
+  it adds no mesh relay, per-transition kinds, checkpoint or question facts.
 - **Blobs by hash.** A tool result, attachment or thinking block over
   `[sessions] blob_min_bytes` (default 2 KiB) is stored once under
   `<data dir>/blobs/<sha256>` and the stored line keeps `{blob: sha256,
