@@ -11,8 +11,12 @@ const REPLY_MARGIN: Duration = Duration::from_secs(1);
 pub(crate) const SUBMIT_CAP: Duration =
     crate::app::guarded_submit::SUBMIT_WAIT_BOUND.saturating_add(REPLY_MARGIN.saturating_mul(2));
 
+fn guarded(method: &Method) -> bool {
+    matches!(method, Method::PaneSubmit(_)) || matches!(method, Method::AgentSend(p) if p.submit)
+}
+
 pub(super) fn cap(method: &Method) -> Duration {
-    if matches!(method, Method::PaneSubmit(_)) {
+    if guarded(method) {
         SUBMIT_CAP
     } else {
         CAP
@@ -29,7 +33,7 @@ pub(super) fn requires(method: &Method) -> bool {
             | Method::PaneWriteKeys(_)
             | Method::PaneWriteInput(_)
             | Method::PaneSubmit(_)
-    ) || matches!(method, Method::AgentSend(p) if !p.submit)
+    ) || matches!(method, Method::AgentSend(_))
 }
 
 fn refusal(request: &Request, code: ErrorCode, message: &str) -> Value {
@@ -52,7 +56,7 @@ fn bind(request: &Request, remaining: Duration) -> Result<Request, Value> {
             "caller budget cannot accommodate the write deadline and reply margin",
         )
     };
-    if matches!(bound.method, Method::PaneSubmit(_)) {
+    if guarded(&bound.method) {
         if remaining <= crate::app::guarded_submit::SUBMIT_WAIT_BOUND + REPLY_MARGIN {
             return Err(invalid());
         }
@@ -75,7 +79,13 @@ fn bind(request: &Request, remaining: Duration) -> Result<Request, Value> {
         Some(value) => value
             .as_u64()
             .filter(|ms| (1..=30000).contains(ms))
-            .ok_or_else(invalid)?,
+            .ok_or_else(|| {
+                refusal(
+                    request,
+                    ErrorCode::InvalidParams,
+                    "write_timeout_ms must be an integer in 1..=30000",
+                )
+            })?,
     };
     let available = remaining
         .as_millis()
@@ -88,7 +98,7 @@ fn bind(request: &Request, remaining: Duration) -> Result<Request, Value> {
     Ok(bound)
 }
 
-/// One fresh capability observation followed only by contract-bound method tags.
+/// One fresh protocol/capability observation within the original caller budget.
 /// A socket pathname cache cannot bind a write across a server replacement.
 pub(super) fn call(
     client: &ApiClient,
@@ -96,9 +106,6 @@ pub(super) fn call(
     cap: Duration,
     deadline: Option<Instant>,
 ) -> Result<Value, ApiClientError> {
-    if let Some(refusal) = crate::api::compatibility::refuse_skew(client, request) {
-        return Ok(refusal);
-    }
     let end = deadline.map_or(Instant::now() + cap, |end| end.min(Instant::now() + cap));
     let left = || end.saturating_duration_since(Instant::now());
     let mut request = request.clone();
@@ -110,13 +117,20 @@ pub(super) fn call(
             "caller budget exhausted before input dispatch",
         ));
     }
-    let ping = client.request_value_with_timeout(
-        &Request {
-            id: "api:input-write-capability".into(),
-            method: Method::Ping(PingParams::default()),
-        },
-        left(),
-    )?;
+    let ping = client
+        .exchange_until(
+            &Request {
+                id: "api:input-write-capability".into(),
+                method: Method::Ping(PingParams::default()),
+            },
+            end,
+        )
+        .map_err(Attempt::into_error)?;
+    // The fresh ping binds both protocol and capability to this server. Interpret
+    // skew first, preserving exit 78 before considering capability refusal.
+    if let Some(refusal) = crate::api::compatibility::refuse_skew(client, &request) {
+        return Ok(refusal);
+    }
     if ping
         .pointer("/result/capabilities/pane_input_write_ack")
         .and_then(Value::as_bool)
@@ -130,17 +144,19 @@ pub(super) fn call(
     }
     // Both verbs use the server's terminal-target resolver, including shells.
     // agent.get is narrower: it would incorrectly reject a shell placement.
-    let agent_target = if let Method::AgentSend(params) = &request.method {
-        let target = params.target.clone();
-        request.method = Method::PaneWriteText(PaneSendTextParams {
-            pane_id: target.clone(),
-            text: params.text.clone(),
-            raw: params.raw,
-            write_timeout_ms: params.write_timeout_ms.clone(),
-        });
-        Some(target)
-    } else {
-        None
+    // Guarded agent.send keeps its verb so the server restores the operator draft.
+    let agent_target = match &request.method {
+        Method::AgentSend(params) if !params.submit => {
+            let target = params.target.clone();
+            request.method = Method::PaneWriteText(PaneSendTextParams {
+                pane_id: target.clone(),
+                text: params.text.clone(),
+                raw: params.raw,
+                write_timeout_ms: params.write_timeout_ms.clone(),
+            });
+            Some(target)
+        }
+        _ => None,
     };
     let bound = match bind(&request, left()) {
         Ok(bound) => bound,
@@ -153,6 +169,9 @@ pub(super) fn call(
             if let Some(target) =
                 agent_target.filter(|_| response["error"]["code"] == "pane_not_found")
             {
+                if let Some(data) = response["error"]["data"].as_object_mut() {
+                    data.remove("expected");
+                }
                 response["error"]["code"] = json!(ErrorCode::AgentNotFound.as_str());
                 response["error"]["message"] = json!(format!("agent target {target} not found"));
             }
@@ -167,23 +186,26 @@ pub(super) fn call(
             }
         }
         Err(Attempt::BeforeSend(error)) => Err(error),
-        Err(Attempt::AfterSend(ApiClientError::Json(_))) => Ok(unknown(&request, "invalid_reply")),
+        Err(Attempt::AfterSend(
+            ApiClientError::Json(_) | ApiClientError::ReplyLineTooLarge { .. },
+        )) => Ok(unknown(&request, "invalid_reply")),
         Err(Attempt::AfterSend(_)) => Ok(unknown(&request, "transport_lost")),
     }
 }
 
 fn final_result(method: &Method, result: &ResponseResult) -> bool {
+    if guarded(method) {
+        return matches!(result, ResponseResult::GuardedSubmit { .. });
+    }
     matches!(
         (method, result),
-        (Method::PaneSubmit(_), ResponseResult::GuardedSubmit { .. })
-            | (
-                Method::PaneWriteText(_),
-                ResponseResult::Paste { .. } | ResponseResult::Ok {}
-            )
-            | (
-                Method::PaneWriteInput(_) | Method::PaneWriteKeys(_),
-                ResponseResult::Ok {}
-            )
+        (
+            Method::PaneWriteText(_),
+            ResponseResult::Paste { .. } | ResponseResult::Ok {}
+        ) | (
+            Method::PaneWriteInput(_) | Method::PaneWriteKeys(_),
+            ResponseResult::Ok {}
+        )
     )
 }
 
@@ -205,6 +227,7 @@ pub(super) fn normalize(method: &Method, response: &mut Value) -> bool {
         Method::PaneWriteKeys(_) => "pane.write_keys",
         Method::PaneWriteInput(_) => "pane.write_input",
         Method::PaneSubmit(_) => "pane.submit",
+        Method::AgentSend(p) if p.submit => "agent.send",
         _ => return false,
     };
     let error = &response["error"];

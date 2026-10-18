@@ -392,6 +392,10 @@ pub enum ApiClientError {
     Json(serde_json::Error),
     ErrorResponse(ErrorResponse),
     EmptyResponse,
+    /// A bounded API reply exceeded its payload limit, excluding the newline.
+    ReplyLineTooLarge {
+        limit: usize,
+    },
     UnexpectedResult(String),
 }
 
@@ -402,6 +406,7 @@ impl fmt::Display for ApiClientError {
             Self::Json(err) => write!(f, "{err}"),
             Self::ErrorResponse(response) => write!(f, "{}", response.error.message),
             Self::EmptyResponse => write!(f, "empty api response"),
+            Self::ReplyLineTooLarge { limit } => write!(f, "api reply line exceeds {limit} bytes"),
             Self::UnexpectedResult(result) => write!(f, "unexpected api result: {result}"),
         }
     }
@@ -439,7 +444,12 @@ fn read_json_line<T: DeserializeOwned>(
     serde_json::from_str(&line).map_err(ApiClientError::Json)
 }
 
+/// Maximum bounded reply payload: 8 MiB, excluding the terminating newline.
+/// Legacy unbounded requests and streaming subscriptions retain their own readers.
+const MAX_REPLY_LINE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Poll each partial read against one absolute cap without post-write setsockopt.
+/// Refuse payloads larger than [`MAX_REPLY_LINE_BYTES`] before growing the buffer.
 /// Peer close is readable: queued reply bytes must survive it. The clock seam
 /// lets tests drive expiry without sleeps or input replay.
 fn read_json_line_until(
@@ -473,7 +483,13 @@ fn read_json_line_until(
         }
         let chunk = &chunk[..read];
         let end = chunk.iter().position(|byte| *byte == b'\n');
-        line.extend_from_slice(&chunk[..end.map_or(chunk.len(), |index| index + 1)]);
+        let payload = end.unwrap_or(chunk.len());
+        if payload > MAX_REPLY_LINE_BYTES - line.len() {
+            return Err(ApiClientError::ReplyLineTooLarge {
+                limit: MAX_REPLY_LINE_BYTES,
+            });
+        }
+        line.extend_from_slice(&chunk[..payload]);
         if end.is_some() {
             break;
         }
@@ -553,7 +569,7 @@ mod tests {
         let oversized = read_payload(LIMIT + 1);
         assert!(oversized.is_err(), "oversized JSON reply must be refused");
         let error = oversized.unwrap_err();
-        assert!(format!("{error:?}").starts_with("ReplyLineTooLarge"));
+        assert!(matches!(&error, ApiClientError::ReplyLineTooLarge { limit } if *limit == LIMIT));
         assert_eq!(
             error.to_string(),
             format!("api reply line exceeds {LIMIT} bytes")
@@ -633,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn s4_fragmented_reply_cannot_renew_the_absolute_cap() {
+    fn fragmented_reply_cannot_renew_the_absolute_cap() {
         let (stream, mut producer) = UnixStream::pair().unwrap();
         producer.write_all(b"{").unwrap();
         let start = Instant::now();

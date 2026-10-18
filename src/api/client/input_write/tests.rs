@@ -385,3 +385,21 @@ fn gated_exhausted_budget_does_not_connect_for_a_version_probe() {
     assert_eq!(response["error"]["code"], "invalid_params");
     assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
 }
+
+#[test]
+fn guarded_agent_requires_capability_and_normalizes_an_unknown_method() {
+    for capable in [false, true] {
+        let mut script = vec![("ping", Some(ping(capable)))];
+        if capable {
+            script.push((
+                "agent.send",
+                Some(json!({"error":{
+                "code":"unknown_method","message":"agent.send is unavailable"}})),
+            ));
+        }
+        let peer = ScriptedApi::new(script);
+        let response = peer.client().request_value(&guarded_agent()).unwrap();
+        assert_eq!(response["error"]["code"], "server_version_gap");
+        assert_eq!(peer.finish().len(), if capable { 2 } else { 1 });
+    }
+}

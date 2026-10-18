@@ -356,9 +356,14 @@ falling back to a legacy send. Older wire clients can keep using `pane.send_*`.
 Raw CLI/MCP writes use a bounded 10-second response cap, select at most
 8000 ms for the write, and reduce it further to leave a strict 1000 ms reply
 margin (plus 2000 ms observation for paste). Explicit write timeouts are upper
-bounds within that effective caller budget.
+bounds within that effective caller budget. Values outside integer `1..=30000`
+are reported as range errors, separately from insufficient caller budget.
+A single fresh ping supplies both protocol and capability. An exhausted caller
+budget refuses before that probe; protocol skew is diagnosed before an absent
+capability, retaining exit 78 and the live-handoff guidance.
 
-Guarded `pane.submit` uses a separate, server-derived 11470 ms client cap:
+Guarded `pane.submit` and `agent.send` with `submit: true` use the same
+server-derived 11470 ms client cap:
 9470 ms for all configured server waits, 1000 ms for capability admission and
 1000 ms for the final reply. The conservative server sum includes draft clear
 and two restoration steps (3 × 1000 ms), paste completion and both Enter
@@ -377,6 +382,12 @@ inspect the pane before another action. MCP preserves the same evidence and
 retry classification. Delegate start/send retain the workspace, round and cursor
 on unknown or partially applied writes, including when `--keep-on-failure` was
 not requested; startup recovery never replays these uncertain writes.
+Bounded API replies have an 8 MiB payload limit, excluding the newline. An
+oversized reply returns the typed client error `ReplyLineTooLarge` without retry.
+If input was already dispatched, it becomes `input_write_unknown` with reason
+`invalid_reply`; inspect the pane before acting again. This limit applies to
+bounded request/reply calls, not the separate legacy unbounded or streaming readers.
+
 This contract does not introduce cross-host pane-input
 forwarding or change mesh VERSION 5.
 

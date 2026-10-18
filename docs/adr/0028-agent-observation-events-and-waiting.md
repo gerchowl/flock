@@ -1386,12 +1386,12 @@ Invalid values are refused before admission. The CLI's bounded response wait mus
 server deadline and its cancellation reply; propose a `1000` ms reply margin.
 Require `write_timeout_ms` to be strictly below the effective caller cap minus
 that reply margin, accounting also for a shorter remaining caller deadline and
-transport/forwarding time. The implementation must fix the in-tree delegate
-caller (`src/cli/delegate.rs::cap_for`): `PaneSendInput` and `PaneSubmit` share
-a 10 s socket cap, equal to the proposed default raw-write deadline. The fixed
-delegate uses `PaneWriteInput` (`pane.write_input`) for raw brief input; its
-`PaneSubmit` route retains guarded submission and reserves reply time within
-that same effective caller cap. Without reserving reply time,
+transport/forwarding time. The in-tree delegate previously shared a 10 s
+socket cap between `PaneSendInput` and `PaneSubmit`, equal to the proposed
+default raw-write deadline. The fixed delegate uses `PaneWriteInput`
+(`pane.write_input`) for raw brief input; its `PaneSubmit` route derives its
+cap from the complete guarded server bound and reserves reply time within
+that bounded caller cap. Without reserving reply time,
 a valid cancellation or completion reply can be lost and become unknown. Keep
 the caller cap bounded and explicitly select a shorter write budget (for
 example 8000 ms within a 10000 ms cap and 1000 ms reply margin), reducing it
@@ -1404,6 +1404,22 @@ and writing requests together, alongside existing actor admission limits;
 preserve any existing payload-size restrictions.
 Admission at either limit returns zero-byte cancellation before retaining input.
 Approve these deadline, reply-margin and admission limits before implementation.
+
+The shared client applies the guarded caller cap to both `pane.submit` and
+`agent.send` with `submit: true`; the latter retains its draft-restoration
+semantics. Their default cap is `SUBMIT_WAIT_BOUND` plus two 1000 ms margins
+(admission and reply). One fresh ping supplies protocol and completed-write
+capability together. Exhausted budgets refuse before the probe; protocol skew
+is interpreted before capability refusal, preserving exit 78 and handoff guidance.
+Explicit raw-write timeout values outside integer `1..=30000` are range errors,
+distinct from a valid request that cannot fit its remaining caller budget.
+
+The bounded client reply reader admits at most 8 MiB of payload, excluding its
+newline, and returns typed `ApiClientError::ReplyLineTooLarge` beyond that bound.
+It does not retry that refusal. After input dispatch, an oversized or malformed
+reply is still `input_write_unknown` with reason `invalid_reply`, never evidence
+that nothing was typed. Legacy unbounded requests and streaming subscriptions
+use separate readers and are outside this bounded-reader limit.
 
 #### Typed results and retry policy
 

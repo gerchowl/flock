@@ -508,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn s4_mcp_propagates_actual_client_unknown_effect() {
+    fn mcp_propagates_actual_client_unknown_effect() {
         let peer = crate::test_support::ScriptedApi::new(vec![
             (
                 "ping",

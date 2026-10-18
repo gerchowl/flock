@@ -29,7 +29,7 @@ async fn peer(listener: UnixListener, response: Value) {
         let request: Value = serde_json::from_str(&line).expect("JSON request");
         assert_eq!(request["method"], method, "unexpected peer stage");
         let mut reply = if method == "ping" {
-            json!({"result":{"type":"pong","version":"fixture","protocol":support::PROTOCOL_VERSION}})
+            json!({"result":{"type":"pong","version":"fixture","protocol":support::PROTOCOL_VERSION,"capabilities":{"pane_input_write_ack":true,"live_handoff":false}}})
         } else {
             assert_eq!(request["params"]["target"], "w1:p1");
             assert_eq!(request["params"]["text"], "failure prompt");
@@ -60,7 +60,7 @@ async fn guarded_submit_cli_reports_exit_8_and_9_with_scripted_evidence() {
         let socket = dir.path().join("s");
         let listener = UnixListener::bind(&socket).expect("isolated peer socket");
         let response = json!({"id":"cli:agent:send","result":{
-            "type":"agent_send", "pane_id":"w1:p1", "outcome":outcome, "reason":reason,
+            "type":"guarded_submit", "pane_id":"w1:p1", "outcome":outcome, "reason":reason, "retried":retried,
             "attempt":{
                 "attempt_id":format!("scripted-{code}"), "pane":"w1:p1", "correlation_ids":[],
                 "wake":false, "state":outcome, "reason":reason, "queued_at_ms":1,

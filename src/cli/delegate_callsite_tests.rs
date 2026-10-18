@@ -854,7 +854,8 @@ fn keep_on_failure_is_a_start_flag() {
 }
 
 #[test]
-fn s4_delegate_write_budget_fits_the_actual_cap_and_preserves_unknown_effect() {
+fn delegate_write_budget_fits_the_actual_cap_and_preserves_unknown_effect() {
+    let _environment = SubmitTestEnv::capture();
     let peer = crate::test_support::ScriptedApi::new(vec![
         (
             "ping",
@@ -1002,7 +1003,7 @@ fn delegate_budget_probe_restores_the_callers_socket_setting() {
     let directory = crate::test_support::TempDir::socket();
     let prior = directory.path().join("caller.sock");
     std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &prior);
-    s4_delegate_write_budget_fits_the_actual_cap_and_preserves_unknown_effect();
+    delegate_write_budget_fits_the_actual_cap_and_preserves_unknown_effect();
     assert_eq!(
         std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR),
         Some(prior.into_os_string())
