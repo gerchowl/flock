@@ -2671,6 +2671,11 @@ fn stored_permission_pair_replays_as_known_events() {
             example,
             "producer/fixture drift"
         );
+        assert_eq!(
+            record.raw,
+            serde_json::to_string(&example).unwrap(),
+            "wire byte drift"
+        );
         let event = SessionEvent::parse(&record.raw, "fixture");
         assert!(
             !matches!(event, SessionEvent::Unknown { .. }),
@@ -2683,5 +2688,21 @@ fn stored_permission_pair_replays_as_known_events() {
             serde_json::to_value(known).unwrap(),
             serde_json::from_str::<Value>(&record.raw).unwrap()
         );
+        let received = Received {
+            record,
+            event,
+            persisted: true,
+            accepted: None,
+        };
+        if example["state"] == "closed" {
+            assert!(matches!(
+                received.state_input(),
+                Some(crate::structured::state::Input::ControlAnswered(
+                    "typed-request"
+                ))
+            ));
+        } else {
+            assert!(received.state_input().is_none());
+        }
     }
 }

@@ -272,7 +272,7 @@ macro_rules! events {
         );)*
         }
 
-        /// One Claude stdout event, with lossless JSON fallback for new shapes.
+        /// One structured stream event, including host permission audits, with lossless fallback.
         ///
         /// A known discriminator with incompatible fields also becomes Unknown.
         /// Heterogeneous API messages, SSE bodies and SDK metadata stay JSON;
@@ -386,7 +386,7 @@ macro_rules! events {
         }
 
         impl SessionEvent {
-            /// Parse one stdout line using the observed Claude version.
+            /// Parse a stream payload using the observed Claude version.
             ///
             /// Unknown pairs, incompatible payloads and non-JSON diagnostics all
             /// become Unknown. There is no versionless serde Deserialize path.

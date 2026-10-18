@@ -30,6 +30,15 @@ function assertNever(value: never): never {
 // narrowing back to the containing envelope.
 function narrow(event: KnownSessionEvent): void {
   switch (event.type) {
+    case "flk_permission_request":
+      if (event.state === "open") {
+        event.request.tool_name satisfies string;
+      } else {
+        event.state satisfies "closed";
+        // @ts-expect-error Closed records never carry a tool request.
+        event.request;
+      }
+      break;
     case "assistant":
       event satisfies Assistant;
       // @ts-expect-error An assistant has no typed control response payload.
