@@ -945,7 +945,12 @@ back-to-back turns. For a structured agent there is no polling at all:
   `<data dir>/blobs/<sha256>` and the stored line keeps `{blob: sha256,
   size, preview}` in its place. Partial deltas (`stream_event`) are relayed
   live and not persisted; the complete `assistant` event that follows carries
-  the same content.
+  the same content. A corrupt object is repaired by a verified put. Publication
+  is serialized across stores/processes using an advisory directory lock and the
+  current object is reverified under that lock before rename. Only the writer
+  replacing corrupt bytes emits `structured.blob.repaired`, after directory
+  fsync, with hash and size, never content. Direct filesystem mutations outside
+  this lock are not coordinated.
 - **Rehydrate.** The native transcript Claude writes under the profile is a
   disposable working copy. A byte prefix of it (E11) is the only thing flk
   ever writes back, under a new session uuid, and only for a fork behind a

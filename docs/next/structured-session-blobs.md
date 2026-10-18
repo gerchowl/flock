@@ -24,6 +24,10 @@ file. If an existing object's bytes fail hash verification, the next put of the
 same content replaces it with the verified, synced temp file by atomic rename,
 then syncs the directory. Only after that sync does the typed logging helper emit
 `structured.blob.repaired` with `blob` (SHA-256) and `size` (bytes), never content.
+Publication uses an advisory lock on the pinned directory and rechecks the current
+object under that lock before rename. Racing puts emit one repair event: only the
+writer that actually replaces corrupt bytes reports it. Direct filesystem writes
+that do not take the lock are outside this coordination.
 The transport continues streaming after a successful repair. A read still returns
 Corrupt for damaged content; unsafe entries and read/write/sync failures remain
 explicit errors. A crash before rename leaves the old entry and an owned temp

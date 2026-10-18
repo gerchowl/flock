@@ -62,6 +62,28 @@ impl Directory {
         }
         Ok(file)
     }
+    /// Serialize publication across independently opened stores and processes.
+    /// Reopen the pinned directory: duplicated descriptors would share a lock.
+    /// Closing the returned descriptor releases the advisory lock, including on crash.
+    pub(crate) fn publication_lock(&self) -> io::Result<File> {
+        let component = c".";
+        // SAFETY: the directory owns its fd and the component is terminated.
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful openat transfers this new descriptor to File.
+        let file = unsafe { File::from_raw_fd(fd) };
+        validate(&file.metadata()?, true)?;
+        file.lock()?;
+        Ok(file)
+    }
     pub(crate) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         let (from, to) = (Self::name(from)?, Self::name(to)?);
         // SAFETY: both names are terminated and resolve relative to the owned fd.

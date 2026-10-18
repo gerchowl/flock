@@ -307,7 +307,16 @@ fn unsafe_namespace_and_file_permissions_fail_without_repair() {
 }
 
 std::thread_local! {
+    static REPAIR_RACE: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
     static CRASH_BEFORE_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn corrupt_observed() {
+    REPAIR_RACE.with(|barrier| {
+        if let Some(barrier) = barrier.borrow().as_ref() {
+            barrier.wait();
+        }
+    });
 }
 
 pub(super) fn before_publish() {
@@ -334,9 +343,12 @@ impl Write for RepairLog {
 #[test]
 fn corrupt_blob_is_repaired_by_put_and_records_one_structured_repair() {
     let (root, store) = setup();
-    let reference = store.put(&b"abc"[..], 3).unwrap();
-    fs::write(root.path().join("blobs").join(ABC), b"bad").unwrap();
-    assert!(matches!(store.get(ABC), Err(BlobError::Corrupt)));
+    let payload =
+        b"distinctive-blob-repair-leak-probe-6f418ec9-content-must-never-reach-a-log-record";
+    let reference = store.put(&payload[..], payload.len() as u64).unwrap();
+    let hash = &reference.blob;
+    fs::write(root.path().join("blobs").join(hash), b"bad").unwrap();
+    assert!(matches!(store.get(hash), Err(BlobError::Corrupt)));
     let capture = RepairLog::default();
     let writer = capture.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -346,11 +358,17 @@ fn corrupt_blob_is_repaired_by_put_and_records_one_structured_repair() {
         .with_writer(move || writer.clone())
         .finish();
     tracing::subscriber::with_default(subscriber, || {
-        assert_eq!(store.put(&b"abc"[..], 3).unwrap(), reference);
-        assert_eq!(store.put(&b"abc"[..], 3).unwrap(), reference);
+        assert_eq!(
+            store.put(&payload[..], payload.len() as u64).unwrap(),
+            reference
+        );
+        assert_eq!(
+            store.put(&payload[..], payload.len() as u64).unwrap(),
+            reference
+        );
     });
-    assert_eq!(store.get(ABC).unwrap(), b"abc");
-    assert_eq!(names(&root), [ABC]);
+    assert_eq!(store.get(hash).unwrap(), payload);
+    assert_eq!(names(&root), [hash.as_str()]);
     let bytes = capture.0.lock().unwrap().clone();
     let events: Vec<Value> = String::from_utf8(bytes)
         .unwrap()
@@ -363,9 +381,12 @@ fn corrupt_blob_is_repaired_by_put_and_records_one_structured_repair() {
         "only the repaired put emits a repair event"
     );
     assert_eq!(events[0]["fields"]["event"], "structured.blob.repaired");
-    assert_eq!(events[0]["fields"]["blob"], ABC);
-    assert_eq!(events[0]["fields"]["size"], 3);
-    assert!(!events[0].to_string().contains("abc"));
+    assert_eq!(events[0]["fields"]["blob"], *hash);
+    assert_eq!(events[0]["fields"]["size"], payload.len() as u64);
+    assert!(!events[0]
+        .to_string()
+        .contains(std::str::from_utf8(payload).unwrap()));
+    assert!(!events[0].to_string().contains(&reference.preview));
 }
 
 #[tokio::test]
@@ -423,4 +444,61 @@ async fn corrupt_blob_repair_crash_before_rename_preserves_old_and_synced_temp()
     assert_eq!(store.get(ABC).unwrap(), b"abc");
     // Crash leftovers are not live writers' files and are left for the sweep (#1824).
     assert_eq!(names(&root), entries);
+}
+
+#[test]
+fn racing_corrupt_observers_emit_only_one_repair_event() {
+    let (root, store) = setup();
+    store.put(&b"abc"[..], 3).unwrap();
+    fs::write(root.path().join("blobs").join(ABC), b"bad").unwrap();
+    let capture = RepairLog::default();
+    let barrier = Arc::new(Barrier::new(2));
+    let (tx, rx) = mpsc::channel();
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            // Independent stores exercise filesystem coordination, not an instance mutex.
+            let store = BlobStore::open(root.path()).unwrap();
+            let (barrier, tx, writer) = (barrier.clone(), tx.clone(), capture.clone());
+            std::thread::spawn(move || {
+                REPAIR_RACE.with(|slot| *slot.borrow_mut() = Some(barrier));
+                let subscriber = tracing_subscriber::fmt()
+                    .json()
+                    .without_time()
+                    .with_max_level(tracing::Level::WARN)
+                    .with_writer(move || writer.clone())
+                    .finish();
+                let result =
+                    tracing::subscriber::with_default(subscriber, || store.put(&b"abc"[..], 3));
+                tx.send(result).unwrap();
+            })
+        })
+        .collect();
+    drop(tx);
+    // Bound the rendezvous too: a missing observer or a silent worker must fail.
+    for _ in 0..2 {
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("repair worker must complete")
+                .unwrap()
+                .blob,
+            ABC
+        );
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(store.get(ABC).unwrap(), b"abc");
+    assert_eq!(names(&root), [ABC]);
+    let bytes = capture.0.lock().unwrap().clone();
+    let events: Vec<Value> = String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "only the writer replacing corrupt bytes reports repair"
+    );
+    assert_eq!(events[0]["fields"]["event"], "structured.blob.repaired");
 }

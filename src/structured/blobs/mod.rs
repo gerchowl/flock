@@ -127,9 +127,12 @@ impl BlobStore {
     /// Hash precisely the bytes read and written, atomically publishing only a
     /// complete, synced object. Cap failures clean up the private temporary file.
     /// An existing corrupt object is repaired with the verified new bytes and a
-    /// structured repair event after the directory sync. Unsafe entries and I/O
+    /// structured repair event after the directory sync. Publication is locked across
+    /// stores/processes and rechecks the current bytes before rename, so racing
+    /// observers do not report the same repair twice. Non-cooperating filesystem
+    /// mutations are outside this advisory lock. Unsafe entries and I/O
     /// failures still fail explicitly; reads continue to report corruption.
-    /// Concurrent identical puts may replace an identical inode, never partial data.
+    /// Concurrent puts deduplicate against the current object, never partial data.
     pub fn put(&self, mut reader: impl Read, max_bytes: u64) -> Result<BlobRef, BlobError> {
         let mut entropy = [0; 16];
         getrandom::fill(&mut entropy).map_err(io::Error::other)?;
@@ -167,10 +170,23 @@ impl BlobStore {
             };
             match self.get(&reference.blob) {
                 Ok(_) => self.0.sync()?,
-                Err(BlobError::Missing) => self.publish(&name, &reference.blob)?,
-                Err(BlobError::Corrupt) => {
-                    self.publish(&name, &reference.blob)?;
-                    crate::logging::structured_blob_repaired(&reference);
+                Err(error @ (BlobError::Missing | BlobError::Corrupt)) => {
+                    #[cfg(test)]
+                    if matches!(error, BlobError::Corrupt) {
+                        tests::corrupt_observed();
+                    }
+                    let _ = error;
+                    let _publication = self.0.publication_lock()?;
+                    // Recheck under the lock: another writer may already have repaired it.
+                    match self.get(&reference.blob) {
+                        Ok(_) => self.0.sync()?,
+                        Err(BlobError::Missing) => self.publish(&name, &reference.blob)?,
+                        Err(BlobError::Corrupt) => {
+                            self.publish(&name, &reference.blob)?;
+                            crate::logging::structured_blob_repaired(&reference);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Err(error) => return Err(error),
             }
