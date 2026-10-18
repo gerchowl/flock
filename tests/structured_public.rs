@@ -116,3 +116,32 @@ async fn public_cli_refuses_a_legacy_or_malformed_structured_capability() {
 #[allow(dead_code)] // Numeric registry shared with this bin-only integration test.
 #[path = "../src/cli/exit/constants.rs"]
 mod exit;
+
+/// Real headless reload must change subsequent admission, never existing leases.
+#[test]
+#[allow(clippy::disallowed_methods)] // Owns the bounded isolated server/probe tree.
+fn isolated_public_structured_policy_live_reload() {
+    let output = std::process::Command::new("python3")
+        .args([
+            "-I",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/probes/structured_public.py"
+            ),
+            "--flk",
+            env!("CARGO_BIN_EXE_flk"),
+            "--scenario",
+            "reload",
+        ])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("fixture PATH"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("bounded isolated reload probe");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

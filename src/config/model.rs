@@ -464,6 +464,9 @@ pub enum ConfigReloadStatus {
 pub struct ConfigReloadReport {
     pub status: ConfigReloadStatus,
     pub diagnostics: Vec<String>,
+    /// Changed or invalid sections, without any configuration values.
+    #[serde(default)]
+    pub sections: Vec<super::reload::SectionReload>,
 }
 
 /// Validate `[ui]` sidebar bound configuration.

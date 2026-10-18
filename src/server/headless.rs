@@ -3029,6 +3029,7 @@ impl HeadlessServer {
                 result: api::schema::ResponseResult::ConfigReload {
                     status: report.status,
                     diagnostics: report.diagnostics,
+                    sections: report.sections,
                 },
             })
             .unwrap_or_else(|err| {

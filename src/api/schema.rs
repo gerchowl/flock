@@ -3565,6 +3565,9 @@ pub enum ResponseResult {
     ConfigReload {
         status: crate::config::ConfigReloadStatus,
         diagnostics: Vec<String>,
+        /// Changed/invalid sections; absent on older peers.
+        #[serde(default)]
+        sections: Vec<crate::config::reload::SectionReload>,
     },
     /// #175 phase 4: reply for `checks.list`.
     ChecksList {

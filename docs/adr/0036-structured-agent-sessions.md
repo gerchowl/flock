@@ -3038,8 +3038,16 @@ integration binary. It owns a separate server and HOME, fake Claude and real
 scoped MCP child, readiness pipes and finite failure ceilings. No live server,
 profile, model, sleeps or retry loops participate.
 
-The current live-reload whitelist does not apply `[structured]` or `[fleet]`
-changes (#2043); use a fresh server after changing launch/admission policy.
-`[sessions]` live-reload semantics remain tracked by #1975. The dogfood isolates
-its policy cases in fresh servers rather than assuming a successful reload
-report changed these startup values.
+**Live admission policy (#2043, ADR-0002).** Valid `[structured]` and `[fleet]`
+changes apply on reload for admissions after that reload: run identity, profile,
+token-file selection, spawn opt-in and all fleet limits. Already admitted
+sessions, including pending launches, retain their snapshots. Lowering a limit
+below the running count refuses new starts until the count drops; it never
+evicts or retroactively re-authorizes existing sessions. Invalid sections keep
+their running policy and report `invalid` individually. Every changed section
+reports `applied` or `restart_required`; unclassified Config fields fail the
+classification gate. Socket account policy remains startup-owned. `[sessions]`
+also reports `restart_required` (#1975), without changing existing workers.
+The `--scenario reload` dogfood drives the production headless reload path,
+observes new profiles and immediate narrowing, and proves existing leases remain
+bound. Its default policy scenarios continue to use independent fresh servers.

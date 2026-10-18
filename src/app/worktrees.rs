@@ -2131,6 +2131,7 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
             crate::app::AppRuntimeConfig {
+                startup_reload_policy: Default::default(),
                 structured_mcp: None,
                 uid_policy: Default::default(),
                 merge_gate: crate::worktree::MergeGateContext {

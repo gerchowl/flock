@@ -472,18 +472,24 @@ fn load_live_config_from_table(
     if let Some(value) = table.get("onboarding") {
         match value.clone().try_into::<Option<bool>>() {
             Ok(onboarding) => config.onboarding = onboarding,
-            Err(err) => diagnostics.push(format!(
-                "invalid onboarding setting: {err}; keeping current onboarding state"
-            )),
+            Err(err) => {
+                invalid_sections.push("onboarding".into());
+                diagnostics.push(format!(
+                    "invalid onboarding setting: {err}; keeping current onboarding state"
+                ));
+            }
         }
     }
 
     if let Some(value) = table.get("name") {
         match value.clone().try_into::<String>() {
             Ok(name) => config.name = name,
-            Err(err) => diagnostics.push(format!(
-                "invalid name setting: {err}; keeping current node name"
-            )),
+            Err(err) => {
+                invalid_sections.push("name".into());
+                diagnostics.push(format!(
+                    "invalid name setting: {err}; keeping current node name"
+                ));
+            }
         }
     }
 
@@ -496,6 +502,7 @@ fn load_live_config_from_table(
         match value.clone().try_into::<String>() {
             Ok(icon) => config.icon = Some(icon),
             Err(err) => {
+                invalid_sections.push("icon".into());
                 diagnostics.push(format!("invalid icon setting: {err}; keeping current icon"))
             }
         }
@@ -508,9 +515,12 @@ fn load_live_config_from_table(
     if let Some(value) = table.get("thermal_command") {
         match value.clone().try_into::<String>() {
             Ok(command) => config.thermal_command = Some(command),
-            Err(err) => diagnostics.push(format!(
-                "invalid thermal_command setting: {err}; keeping current thermal command"
-            )),
+            Err(err) => {
+                invalid_sections.push("thermal_command".into());
+                diagnostics.push(format!(
+                    "invalid thermal_command setting: {err}; keeping current thermal command"
+                ));
+            }
         }
     }
 
@@ -520,9 +530,12 @@ fn load_live_config_from_table(
     if let Some(value) = table.get("gpu_command") {
         match value.clone().try_into::<String>() {
             Ok(command) => config.gpu_command = Some(command),
-            Err(err) => diagnostics.push(format!(
-                "invalid gpu_command setting: {err}; keeping current gpu command"
-            )),
+            Err(err) => {
+                invalid_sections.push("gpu_command".into());
+                diagnostics.push(format!(
+                    "invalid gpu_command setting: {err}; keeping current gpu command"
+                ));
+            }
         }
     }
 

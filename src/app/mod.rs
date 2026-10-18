@@ -171,6 +171,8 @@ pub(crate) const RECOVERY_PARK_LIMIT: Duration = Duration::from_secs(5);
 /// preserve normal command lookup through the server's PATH.
 #[derive(Default)]
 pub(crate) struct AppRuntimeConfig {
+    /// Immutable baseline for sections whose consumers require process restart.
+    pub(crate) startup_reload_policy: Config,
     /// Owning listener endpoint, never supplied by an API caller.
     pub(crate) structured_mcp: Option<crate::structured::launch::SessionMcp>,
     /// Command used by every app merge-evidence query, including workers.
@@ -562,6 +564,7 @@ impl App {
         event_hub: crate::api::EventHub,
         mut runtime_config: AppRuntimeConfig,
     ) -> Self {
+        runtime_config.startup_reload_policy = config.clone();
         // Absence is explicit policy, never an inference from a pending lookup.
         if config.security.agent_account == crate::config::model::AgentAccount::None {
             runtime_config.uid_policy.dedicated = Ok(None).into();
@@ -1898,6 +1901,7 @@ impl App {
                 crate::config::ConfigReloadReport {
                     status: crate::config::ConfigReloadStatus::Failed,
                     diagnostics,
+                    sections: Vec::new(),
                 }
             }
         };
@@ -1913,6 +1917,38 @@ impl App {
         notify_success: bool,
     ) -> crate::config::ConfigReloadReport {
         let mut diagnostics = load_diagnostics.to_vec();
+        let mut sections = match crate::config::reload::plan(
+            &self.state.config,
+            &self.runtime_config.startup_reload_policy,
+            config,
+            invalid_sections,
+        ) {
+            Ok(sections) => sections,
+            Err(error) => {
+                let diagnostics = vec![error.into()];
+                self.state.toast = None;
+                self.state.config_diagnostic =
+                    crate::config::config_diagnostic_summary(&diagnostics);
+                self.config_diagnostic_deadline = None;
+                return crate::config::ConfigReloadReport {
+                    status: crate::config::ConfigReloadStatus::Failed,
+                    diagnostics,
+                    sections: Vec::new(),
+                };
+            }
+        };
+        let mut rejected_sections = invalid_sections.to_vec();
+        for section in &sections {
+            if section.status == crate::config::reload::SectionStatus::RestartRequired
+                && section.section != "security"
+            {
+                diagnostics.push(format!(
+                    "{} changed: restart required to apply this section",
+                    section.section
+                ));
+            }
+        }
+
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
@@ -1928,8 +1964,12 @@ impl App {
         // re-populate `state.config` per valid section so accessors reflect
         // the reloaded values. Invalid sections keep the previous config —
         // consistent with the "keep-current-on-error" contract everywhere.
-        if !invalid_section("keys") {
-            self.state.config.keys = config.keys.clone();
+        // Launch and admission consume these snapshots only for new sessions.
+        if !invalid_section("structured") {
+            self.state.config.structured = config.structured.clone();
+        }
+        if !invalid_section("fleet") {
+            self.state.config.fleet = config.fleet;
         }
         if !invalid_section("experimental") {
             self.state.config.experimental = config.experimental.clone();
@@ -1944,6 +1984,7 @@ impl App {
             self.state.config.worktrees = config.worktrees.clone();
         }
         if !invalid_section("events") {
+            self.state.config.events = config.events.clone();
             self.event_hub
                 .set_read_max_wait_ms(config.events.read_max_wait_ms);
         }
@@ -1957,41 +1998,58 @@ impl App {
             self.state.config.channels = config.channels.clone();
             crate::channels::issue_tokens(&config.channels, &short_host_name());
         }
-        // Sections without an explicit invalidation gate always follow the
-        // incoming config.
-        self.state.config.name = config.name.clone();
-        self.state.config.onboarding = config.onboarding;
-        self.state.config.session = config.session.clone();
-        self.state.config.update = config.update;
-        self.state.config.remote = config.remote.clone();
-        self.state.config.slots = config.slots.clone();
-        self.state.config.peers = config.peers.clone();
+        // Valid sections retain their existing live consumers.
+        if !invalid_section("name") {
+            self.state.config.name = config.name.clone();
+        }
+        if !invalid_section("onboarding") {
+            self.state.config.onboarding = config.onboarding;
+        }
+        if !invalid_section("session") {
+            self.state.config.session = config.session.clone();
+        }
+        if !invalid_section("update") {
+            self.state.config.update = config.update;
+        }
+        if !invalid_section("remote") {
+            self.state.config.remote = config.remote.clone();
+        }
+        if !invalid_section("slots") {
+            self.state.config.slots = config.slots.clone();
+        }
+        if !invalid_section("peers") {
+            self.state.config.peers = config.peers.clone();
+        }
         // #96: publish the live-reloaded gossip cadence to the poll-tick thread
         // so `flk server reload-config` re-arms the loop without a restart.
         // Diagnostics ride along via collect_diagnostics; consumers clamp via
         // `poll_interval()` so an invalid `0` still produces a live cadence.
-        diagnostics.extend(config.gossip.diagnostics());
-        self.state.config.gossip = config.gossip;
-        self.gossip_poll_interval_secs.store(
-            config.gossip.poll_interval().as_secs().max(1),
-            Ordering::Relaxed,
-        );
+        if !invalid_section("gossip") {
+            diagnostics.extend(config.gossip.diagnostics());
+            self.state.config.gossip = config.gossip;
+            self.gossip_poll_interval_secs.store(
+                config.gossip.poll_interval().as_secs().max(1),
+                Ordering::Relaxed,
+            );
+        }
         // Drop tracker entries for peers no longer configured; surviving peers
         // keep their in-flight lock (matches the overlap guard's intent).
         self.peer_poll_tracker
-            .retain_only(config.peers.iter().map(|p| p.name.as_str()));
+            .retain_only(self.state.config.peers.iter().map(|p| p.name.as_str()));
         // Same intent one layer down: a held ssh connection outlives a reload,
         // but not one whose peer is gone or whose ssh target moved.
-        crate::peer_stream::retain_configured(&config.peers);
+        crate::peer_stream::retain_configured(&self.state.config.peers);
 
         if !invalid_section("keys") {
             match config.live_keybinds() {
                 Ok(live) => {
+                    self.state.config.keys = config.keys.clone();
                     self.state.prefix_code = live.prefix.0;
                     self.state.prefix_mods = live.prefix.1;
                     self.state.keybinds = live.keybinds;
                 }
                 Err(keybind_diagnostics) => {
+                    rejected_sections.push("keys".into());
                     diagnostics.extend(
                         keybind_diagnostics
                             .into_iter()
@@ -2012,6 +2070,7 @@ impl App {
             )
             .is_none()
             {
+                rejected_sections.push("ui".into());
                 diagnostics.push(format!(
                     "ui.sidebar_min_width ({}) is greater than sidebar_max_width ({}); keeping previous [ui] settings",
                     config.ui.sidebar_min_width, config.ui.sidebar_max_width,
@@ -2041,7 +2100,7 @@ impl App {
                 self.state.agent_aliases = config.ui.agent_aliases.clone();
                 self.state.adopt_external_worktrees = config.worktrees.adopt_external;
                 self.state.branch_pivot_message = config.worktrees.branch_pivot_message.clone();
-                if self.state.peers != config.peers {
+                if !invalid_section("peers") && self.state.peers != config.peers {
                     // Keep polled data for peers that survive the reload.
                     self.state.peer_summaries = config
                         .peers
@@ -2126,7 +2185,12 @@ impl App {
                 .unwrap_or_else(|| "catppuccin".to_string());
         }
 
-        let status = if diagnostics.is_empty() {
+        let status = if diagnostics.is_empty()
+            && rejected_sections.is_empty()
+            && sections
+                .iter()
+                .all(|section| section.status == crate::config::reload::SectionStatus::Applied)
+        {
             crate::config::ConfigReloadStatus::Applied
         } else {
             crate::config::ConfigReloadStatus::Partial
@@ -2158,9 +2222,15 @@ impl App {
             }
         }
 
+        for section in &mut sections {
+            if rejected_sections.contains(&section.section) {
+                section.status = crate::config::reload::SectionStatus::Invalid;
+            }
+        }
         crate::config::ConfigReloadReport {
             status,
             diagnostics,
+            sections,
         }
     }
 }
@@ -2352,6 +2422,9 @@ impl App {
         self.handle_mouse(mouse);
     }
 }
+
+#[cfg(test)]
+mod reload_policy_tests;
 
 #[cfg(test)]
 mod tests {

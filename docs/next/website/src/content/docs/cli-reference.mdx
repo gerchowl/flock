@@ -1093,7 +1093,10 @@ session authority. It does not invent `background: none`: until background
 facts are known, presentation status need not be `done`. Observe turn and
 lifecycle facts separately.
 
-Launch settings and fleet limits currently take effect at server startup.
-Restart after editing `[structured]` or `[fleet]`; live reload does not apply
-those sections yet (#2043). The analogous `[sessions]` reload limitation is
-tracked by #1975. The isolated dogfood uses a fresh server for each policy.
+Valid `[structured]` and `[fleet]` changes apply through `server reload-config`
+to new admissions (#2043). Existing and pending sessions keep their admitted
+policy, including profile and run identity. Narrowing limits refuses new starts
+until the count falls below the limit; it never evicts existing sessions.
+Invalid sections retain the running policy and report `invalid` per section.
+`[security]` and `[sessions]` still report `restart_required`; the storage-policy
+follow-up is tracked by #1975. No reload changes the active socket UID policy.

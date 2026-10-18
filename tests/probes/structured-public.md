@@ -27,8 +27,11 @@ MCP spawn must still observe the original parent's fanout/capacity accounting.
 The operator stops the owned sessions and server. A success prints a JSON receipt.
 
 Each policy scenario starts a fresh server with its own loaded config.
-Live reload does not apply `[structured]`/`[fleet]` yet (#2043); the `[sessions]`
-case is tracked by #1975.
+The separate reload scenario exercises changes within one running server:
+`--scenario reload` verifies structured opt-in/profile, fleet opt-in and all
+three limits, invalid-section retention, and no eviction below a lowered limit.
+Existing sessions retain their admitted profile while a new child uses the new
+profile. The `[sessions]` restart-required boundary is tracked by #1975.
 The probe observes a session-sourced idle turn, persisted result and Offline
 after stop; a result does not invent missing background evidence.
 

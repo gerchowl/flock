@@ -35,6 +35,7 @@ assert Path(server["env"]["FLOCK_SOCKET_PATH"]).is_absolute()
 assert Path(server["command"]).is_absolute()
 assert server["args"] == ["mcp", "serve", "--structured"]
 profile = Path(os.environ["CLAUDE_CONFIG_DIR"])
+(root / f"admitted-profile-{session}").write_text(str(profile))
 (profile / "sessions").mkdir(exist_ok=True, mode=0o700)
 (profile / "sessions" / f"{os.getpid()}.json").write_text("{}")
 print(json.dumps({"type": "system", "subtype": "hook_started", "hook_id": "fixture", "hook_name": "fixture", "hook_event": "SessionStart"}), flush=True)

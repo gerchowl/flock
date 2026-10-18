@@ -1531,6 +1531,7 @@ impl App {
                     result: ResponseResult::ConfigReload {
                         status: report.status,
                         diagnostics: report.diagnostics,
+                        sections: report.sections,
                     },
                 }
             }

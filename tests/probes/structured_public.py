@@ -43,11 +43,11 @@ def run(binary, scenario):
         # Explicit, owned short endpoint; no inherited FLOCK variable survives.
         env["FLOCK_SOCKET_PATH"] = str(root / "a")
         env["FLOCK_CLIENT_SOCKET_PATH"] = str(root / "c")
-        def configure(operator=True, enabled=True, capacity=1, depth=2, fanout=2):
+        def configure(operator=True, enabled=True, capacity=1, depth=2, fanout=2, profile="dogfood"):
             config = f'''onboarding = false
 [structured]
 run_as = '{"operator" if operator else "flk-agent"}'
-profile = 'dogfood'
+profile = '{profile}'
 token_file = {json.dumps(str(token))}
 [security]
 agent_account = 'none'
@@ -61,7 +61,7 @@ max_spawn_fanout = {fanout}
                 directory = root / "x" / app
                 directory.mkdir(parents=True, exist_ok=True)
                 (directory / "config.toml").write_text(config)
-        configure(operator=scenario != "default", enabled=scenario != "disabled",
+        configure(operator=scenario not in ("default", "reload"), enabled=scenario != "disabled",
                   capacity=1 if scenario == "capacity" else 8,
                   depth=0 if scenario == "depth" else 2,
                   fanout=1 if scenario == "fanout" else 2)
@@ -101,12 +101,17 @@ max_spawn_fanout = {fanout}
                 assert block, output.decode(errors="replace")
                 output += block
             start = ["agent", "start", "dogfood-parent", "--runtime", "structured", "--model", "dogfood-parent", "--cwd", str(root / "project"), "--", "claude"]
-            if scenario == "default":
+            if scenario in ("default", "reload"):
                 refused = cli(*start, code=1)
                 assert refused["error"]["code"] == "structured_needs_agent_user", refused
-                cli("server", "stop")
-                assert server.wait(timeout=15) == 0
-                return {"scenario":scenario,"status":"passed"}
+                if scenario == "default":
+                    cli("server", "stop")
+                    assert server.wait(timeout=15) == 0
+                    return {"scenario":scenario,"status":"passed"}
+                configure(operator=True, enabled=False, capacity=8, profile="reloaded-profile")
+                reload_result = cli("server", "reload-config")["result"]
+                assert reload_result["status"] == "applied", reload_result
+                assert {s["section"]:s["status"] for s in reload_result["sections"]} == {"structured":"applied", "fleet":"applied"}
             created = cli(*start)["result"]["agent"]
             assert created["runtime"] == "structured" and "pane_id" not in created
             parent_id = created["agent_id"]
@@ -138,6 +143,35 @@ max_spawn_fanout = {fanout}
             args = {"runtime":"structured", "agent":"claude", "prompt":"dogfood-task",
                     "model":"dogfood-child", "name":"dogfood-child",
                     "location":{"kind":"worktree_path","path":str(root / "project")}}
+            if scenario == "reload":
+                def expect_refusal(arguments, expected):
+                    response = tool("flock_agent_start", arguments)
+                    assert response.get("error", {}).get("data", {}).get("refusal") == expected, response
+                parent_profile = (root / f"admitted-profile-{created['session_id']}").read_text()
+                assert Path(parent_profile).name == "reloaded-profile", parent_profile
+                expect_refusal(args, "agent_spawn_disabled")
+                # Invalid sections retain the just-adopted policy independently.
+                for app in ("flock", "flock-dev"):
+                    path = root / "x" / app / "config.toml"
+                    invalid = path.read_text().replace("run_as = 'operator'", "run_as = 'invalid'")
+                    path.write_text(invalid.replace("agent_spawn_enabled = false", "agent_spawn_enabled = 'invalid'"))
+                invalid = cli("server", "reload-config")["result"]
+                assert invalid["status"] == "partial", invalid
+                assert {s["section"]:s["status"] for s in invalid["sections"]} == {"structured":"invalid", "fleet":"invalid"}
+                expect_refusal(args, "agent_spawn_disabled")
+                for limits, refusal in [
+                    ({"capacity":8, "depth":0, "fanout":2}, "at_lineage_depth"),
+                    ({"capacity":8, "depth":2, "fanout":0}, "at_fanout_limit"),
+                    ({"capacity":0, "depth":2, "fanout":2}, "at_agent_capacity"),
+                    ({"capacity":1, "depth":2, "fanout":2}, None),
+                ]:
+                    configure(profile="second-profile", **limits)
+                    changed = cli("server", "reload-config")["result"]
+                    assert changed["status"] == "applied", changed
+                    assert next(s["status"] for s in changed["sections"] if s["section"] == "fleet") == "applied"
+                    if refusal:
+                        expect_refusal(args, refusal)
+                assert (root / f"admitted-profile-{created['session_id']}").read_text() == parent_profile
             raw = tool("agent.start", args)
             assert raw["error"]["data"]["refusal"] == "not_exposed_via_mcp", raw
             if scenario in ("disabled", "depth"):
@@ -164,8 +198,28 @@ max_spawn_fanout = {fanout}
             assert child["runtime"] == "structured" and "pane_id" not in child
             assert select.select([turn_ready], [], [], 10)[0], "opening turn was not consumed"
             assert os.read(turn_ready, 1) == b"T"
+            if scenario == "reload":
+                child_profile = (root / f"admitted-profile-{child['session_id']}").read_text()
+                assert Path(child_profile).name == "second-profile", child_profile
+                configure(capacity=0, profile="second-profile")
+                narrowed = cli("server", "reload-config")["result"]
+                assert narrowed["status"] == "applied", narrowed
+                for target in (parent_id, child_id):
+                    assert cli("agent", "get", target)["result"]["agent"]["lease_state"] == "bound"
+                expect_refusal(dict(args, name="narrowed-child"), "at_agent_capacity")
+                configure(capacity=1, profile="second-profile")
+                assert cli("server", "reload-config")["result"]["status"] == "applied"
+                configure(operator=False, capacity=1, profile="second-profile")
+                assert cli("server", "reload-config")["result"]["status"] == "applied"
+                refused = cli("agent", "start", "opt-out-child", "--runtime", "structured",
+                              "--cwd", str(root / "project"), "--", "claude", code=1)
+                assert refused["error"]["code"] == "structured_needs_agent_user", refused
+                for target in (parent_id, child_id):
+                    assert tool("flock_agent_get", {"target":target})["agent"]["lease_state"] == "bound"
+                configure(capacity=1, profile="second-profile")
+                assert cli("server", "reload-config")["result"]["status"] == "applied"
             extra = dict(args, name="extra-child")
-            expected = "at_agent_capacity" if scenario == "capacity" else "at_fanout_limit"
+            expected = "at_agent_capacity" if scenario in ("capacity", "reload") else "at_fanout_limit"
             assert tool("flock_agent_start", extra)["error"]["data"]["refusal"] == expected
             observe(child_id, "turn_idle")
             assert any("dogfood-complete" in path.read_text() for path in (root / "x").rglob("*.jsonl")), "turn result must be durably observed"
@@ -224,8 +278,11 @@ max_spawn_fanout = {fanout}
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--flk", required=True)
-    binary = str(Path(parser.parse_args().flk).resolve())
-    proofs = [run(binary, scenario) for scenario in ("default", "disabled", "depth", "capacity", "fanout")]
+    parser.add_argument("--scenario", choices=("default", "disabled", "depth", "capacity", "fanout", "reload"))
+    arguments = parser.parse_args()
+    binary = str(Path(arguments.flk).resolve())
+    scenarios = (arguments.scenario,) if arguments.scenario else ("default", "disabled", "depth", "capacity", "fanout")
+    proofs = [run(binary, scenario) for scenario in scenarios]
     assert all(proof["status"] == "passed" for proof in proofs)
     print(json.dumps({"status":"passed", "scenarios":proofs, "real_mcp":True,
                       "framed_opening_turn":True,"spawn_policy_lineage_capacity_fanout":True}))
