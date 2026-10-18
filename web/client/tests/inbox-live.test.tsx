@@ -5,11 +5,12 @@
  * Scripted fake server, virtual time, no sleeps.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { render } from "solid-js/web";
 
 import type { AgentState } from "../src/gen/AgentState";
 import type { ServerFrame } from "../src/gen/ServerFrame";
-import { SUMMARY_MAX } from "../src/views/turns";
+import { SUMMARY_MAX, TITLE_MAX } from "../src/views/turns";
 import { emptyLayout } from "../src/layout/model";
 import type { Mode } from "../src/layout/phone";
 import { createWireFleet } from "../src/wire/fleet";
@@ -31,7 +32,8 @@ const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAl
 type App = { h: Harness; root: HTMLElement; fleet: (id: string, waiting: string[]) => void; event: (agent: string, id: string, tool?: string, input?: object, requestSeq?: number, tsMs?: number) => void;
   close: (agent: string, id: string) => void;
   raw: (agent: string, ev: object) => void;
-  gap: (agent: string) => void; synced: (agent: string) => void };
+  gap: (agent: string) => void;
+  reset: (agent: string) => void; synced: (agent: string) => void };
 
 function mountInbox(mode: Mode = "desktop"): App {
   const h = new Harness();
@@ -65,6 +67,7 @@ function mountInbox(mode: Mode = "desktop"): App {
     close: (agent, id) =>
       send({ t: "ev", sub_id: agentSub(agent), stream: `agent/${agent}`, seq: ++agentSeq, ts_ms: 0, ev: { type: "flk_permission_request", state: "closed", request_id: id, decision: "allow_once", message: null, principal: "p", source: "token" } as never }),
     raw: (agent, ev) => send({ t: "ev", sub_id: agentSub(agent), stream: `agent/${agent}`, seq: ++agentSeq, ts_ms: 0, ev: ev as never }),
+    reset: (agent) => send({ t: "subfail", sub_id: agentSub(agent), code: "cursor_ahead", message: "ahead" }),
     gap: (agent) => {
       send({ t: "gap", sub_id: agentSub(agent), from: agentSeq + 1, to: agentSeq + 2 });
       agentSeq += 2;
@@ -233,6 +236,67 @@ describe("live permission inbox", () => {
     expect(cards(root)[0]).toContain("(no summary for Mystery)");
     const detail = root.querySelectorAll('[data-testid="inbox-card"] .card__detail')[1]?.textContent ?? "";
     expect(detail).toBe(`${"x".repeat(SUMMARY_MAX - 1)}…`);
+  });
+
+  test("session_ended, the reason #2236 decided, closes a request", () => {
+    const { root, fleet, event, raw } = mountInbox();
+    fleet("atlas", ["r1"]);
+    event("atlas", "r1");
+    raw("atlas", { type: "flk_permission_request", state: "closed", request_id: "r1", reason: "session_ended" });
+    expect(cards(root)).toEqual([]);
+  });
+
+  test("the stale style is its own rule, so no other card text is styled stale", () => {
+    const css = readFileSync(new URL("../src/workbench/workbench.css", import.meta.url), "utf8");
+    const rule = /([^{}]*)\.card__stale([^{}]*)\{/.exec(css);
+    expect(rule?.[1]?.trim()).toBe("");
+    expect(rule?.[2]?.trim()).toBe("");
+    expect(/\.card__meta\s*,\s*\.card__stale|\.card__stale\s*,/.test(css)).toBe(false);
+  });
+
+  test("synced and reset both clear stale, and the next entry clears it when no synced comes", () => {
+    const { root, fleet, event, gap, synced, reset } = mountInbox();
+    fleet("atlas", ["r1"]);
+    event("atlas", "r1");
+    gap("atlas");
+    synced("atlas");
+    expect($$(root, "inbox-stale")).toHaveLength(0);
+    gap("atlas");
+    expect($$(root, "inbox-stale")).toHaveLength(1);
+    reset("atlas");
+    expect($$(root, "inbox-stale")).toHaveLength(0);
+    // After the first synced the transport passes on no other, so the replay's entry is the signal.
+    event("atlas", "r1");
+    gap("atlas");
+    expect($$(root, "inbox-stale")).toHaveLength(1);
+    event("atlas", "r1");
+    expect($$(root, "inbox-stale")).toHaveLength(0);
+  });
+
+  test("a notice for an unlisted id's bad record expires on the next synced or reset", () => {
+    const { root, fleet, raw, synced, reset } = mountInbox();
+    fleet("atlas", ["r1"]);
+    raw("atlas", { type: "flk_permission_request", state: "open", request_id: "auto-1" });
+    expect(cards(root)).toHaveLength(2);
+    synced("atlas");
+    expect(cards(root)).toHaveLength(1);
+    raw("atlas", { type: "flk_permission_request", state: "open" });
+    expect(cards(root)).toHaveLength(2);
+    reset("atlas");
+    expect(cards(root)).toHaveLength(1);
+  });
+
+  test("a code point is never split at the summary bound, and a long or non-string title is bounded", () => {
+    const { root, fleet, event, raw } = mountInbox();
+    fleet("atlas", ["r1", "r2"]);
+    event("atlas", "r1", "Bash", { command: `${"x".repeat(SUMMARY_MAX - 2)}😀${"y".repeat(10)}` }, 1, 1);
+    expect(root.querySelectorAll('[data-testid="inbox-card"] .card__detail')[0]?.textContent).toBe(`${"x".repeat(SUMMARY_MAX - 2)}😀…`);
+    raw("atlas", { type: "flk_permission_request", state: "open", request_id: "r2", request_seq: 2, request: { subtype: "can_use_tool", tool_name: "Edit", display_name: 42, input: {}, tool_use_id: "t" } });
+    expect(root.querySelectorAll('[data-testid="inbox-card"] .card__title')[0]?.textContent).toBe("Edit");
+    raw("atlas", { type: "flk_permission_request", state: "open", request_id: "r2", request_seq: 2, request: { subtype: "can_use_tool", tool_name: "Edit", display_name: "T".repeat(TITLE_MAX * 2), input: {}, tool_use_id: "t" } });
+    expect(root.querySelectorAll('[data-testid="inbox-card"] .card__title')[0]?.textContent).toBe(`${"T".repeat(TITLE_MAX - 1)}…`);
+    event("atlas", "r2", "M".repeat(500), { n: 1 }, 3, 3);
+    expect((root.querySelectorAll('[data-testid="inbox-card"] .card__detail')[1]?.textContent ?? "").length).toBeLessThanOrEqual(TITLE_MAX);
   });
 
   test("a history gap marks the agent's cards stale until its next entry", () => {

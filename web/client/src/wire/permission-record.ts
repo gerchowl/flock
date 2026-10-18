@@ -23,7 +23,7 @@ export type OpenPermissionRecord = {
 /** The operator's decision on a closed record (`agent.decide`'s vocabulary). */
 export type PermissionDecision = "allow_once" | "allow_always" | "deny";
 /** Why a host fact closed a request without a decision. */
-export type CloseReason = "ended" | "cancelled" | "result" | "interrupted";
+export type CloseReason = "ended" | "cancelled" | "result" | "interrupted" | "session_ended";
 
 /** The same request, closed: by a decision with its principal and source, or by a typed reason. */
 export type ClosedPermissionRecord = {
@@ -45,7 +45,7 @@ export type PermissionRecord = OpenPermissionRecord | ClosedPermissionRecord;
 export type InvalidPermissionRecord = { readonly state: "invalid"; readonly request_id: string | null; readonly problem: string };
 
 const DECISIONS: readonly string[] = ["allow_once", "allow_always", "deny"] satisfies readonly PermissionDecision[];
-const REASONS: readonly string[] = ["ended", "cancelled", "result", "interrupted"] satisfies readonly CloseReason[];
+const REASONS: readonly string[] = ["ended", "cancelled", "result", "interrupted", "session_ended"] satisfies readonly CloseReason[];
 
 const isObject = (value: unknown): value is { readonly [key: string]: unknown } => typeof value === "object" && value !== null && !Array.isArray(value);
 

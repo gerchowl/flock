@@ -74,6 +74,14 @@ export function commandOf(input: JsonValue | undefined): string {
 
 /** The longest input summary a card shows, in characters; longer ones end in an ellipsis. */
 export const SUMMARY_MAX = 200;
+/** The longest card title or placeholder, in characters. */
+export const TITLE_MAX = 80;
+
+/** `text` cut to at most `max` code points (never inside a surrogate pair), ending in an ellipsis when cut. */
+export function boundText(text: string, max: number): string {
+  const points = [...text];
+  return points.length > max ? `${points.slice(0, max - 1).join("")}…` : text;
+}
 
 /**
  * What a permission card shows for a tool's input: the well-known key's value
@@ -82,8 +90,7 @@ export const SUMMARY_MAX = 200;
  */
 export function inputSummary(tool: string, input: JsonValue | undefined): string {
   const known = knownInput(input);
-  if (known === null) return `(no summary for ${tool})`;
-  return known.length > SUMMARY_MAX ? `${known.slice(0, SUMMARY_MAX - 1)}…` : known;
+  return known === null ? boundText(`(no summary for ${tool})`, TITLE_MAX) : boundText(known, SUMMARY_MAX);
 }
 
 /** Groups `entries` into turns and pairs tool calls with their results. */

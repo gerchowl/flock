@@ -21,8 +21,11 @@
  * closed record with its `request_id`, or the id dropping out of
  * `waiting_on_human`. A closed id does not come back as pending while the
  * fleet still lists it; a closed record for an unknown id is ignored. A
- * history `gap` marks that agent's cards stale until its next entry or
- * `synced`.
+ * history `gap` marks that agent's cards stale until its next entry, `synced`
+ * or `reset`. The next entry is the signal the transport guarantees: the wire
+ * transport passes on only the first `synced` of a stream, so a gap after a
+ * re-subscribe gets none, but the replay's entries follow the gap. A notice
+ * for a record no listed id owns expires on the next `synced` or `reset`.
  *
  * One subscription per agent with listed ids, opened when its first id is
  * listed and closed when its list empties. The focused transcript tile's own
@@ -40,7 +43,7 @@ import { createSignal, type Accessor } from "solid-js";
 
 import type { AgentRow } from "../fleet";
 import type { Subscription, Transport } from "../transport";
-import { inputSummary } from "../views/turns";
+import { TITLE_MAX, boundText, inputSummary } from "../views/turns";
 import { permissionRecord, type OpenPermissionRecord } from "../wire/permission-record";
 import type { InboxCard } from "./inbox";
 
@@ -105,7 +108,7 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
     const common = { tsMs: found?.tsMs ?? Number.POSITIVE_INFINITY, listedAt: tracked.listedAt, seq: found?.seq ?? Number.POSITIVE_INFINITY, index };
     if (found !== undefined && bad === undefined) {
       const { request, request_seq: requestSeq } = found.record;
-      return { ...common, card: { ...base(agent, tracked, id), title: request.display_name ?? request.tool_name, detail: inputSummary(request.tool_name, request.input), requestSeq } };
+      return { ...common, card: { ...base(agent, tracked, id), title: boundText(typeof request.display_name === "string" ? request.display_name : request.tool_name, TITLE_MAX), detail: inputSummary(request.tool_name, request.input), requestSeq } };
     }
     const pending =
       bad !== undefined
@@ -153,6 +156,11 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
     setCards([...keyed, ...notices].map((entry) => entry.card));
   };
 
+  /** Drops the notices for records no listed id owns: they live until the next `reset` or `synced`. */
+  const expireNotices = (tracked: Tracked): void => {
+    for (const [key, bad] of tracked.invalid) if (bad.id === null || !tracked.ids.includes(bad.id)) tracked.invalid.delete(key);
+  };
+
   const open = (agent: string, tracked: Tracked): void => {
     tracked.subscription = transport.subscribe(`agent/${agent}`, null, {
       entry: (entry) => {
@@ -180,6 +188,7 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
       synced: () => {
         tracked.synced = true;
         tracked.stale = false;
+        expireNotices(tracked);
         publish();
       },
       failed: (failure) => {
