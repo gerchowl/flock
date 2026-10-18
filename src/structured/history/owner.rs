@@ -72,7 +72,8 @@ impl Client {
             .await
             .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
     }
-    /// None means unknown subject. Overload is WouldBlock, owner loss BrokenPipe,
+    /// None means unknown subject or an unsafe/reserved stored namespace. Neither
+    /// is exposed as a readable stream. Overload is WouldBlock, owner loss BrokenPipe,
     /// stale recovery Interrupted; storage failures retain their original I/O kind.
     /// Recovery performs no filesystem work on the application owner or heartbeat executor.
     pub(crate) async fn lookup(&self, id: String) -> io::Result<Option<History>> {
