@@ -650,11 +650,34 @@ pub enum AgentAccount {
     None,
 }
 
+/// Default queue rewrite trigger: 8 MiB, independent of the per-record ceiling.
+pub const DEFAULT_QUEUE_REWRITE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Session storage policy. Worker enforcement is wired by the next #1803 slice.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SessionsConfig {
+    /// Replace eligible JSON blocks strictly larger than this many encoded bytes.
+    pub blob_min_bytes: usize,
+    /// Rewrite before the next append when committed bytes exceed this value.
+    /// Zero is invalid: checkpointing cannot be disabled for writable journals.
+    pub queue_rewrite_bytes: std::num::NonZeroU64,
+}
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            blob_min_bytes: crate::structured::blobs::StorageConfig::default().blob_min_bytes,
+            queue_rewrite_bytes: std::num::NonZeroU64::new(DEFAULT_QUEUE_REWRITE_BYTES)
+                .expect("nonzero queue rewrite default"),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
-    /// Structured persistence policy (ADR-0036 §4).
-    pub sessions: crate::structured::blobs::StorageConfig,
+    /// Per-session durable queue storage policy.
+    pub sessions: SessionsConfig,
     /// Local socket identity policy (ADR-0036 §1a).
     pub security: SecurityConfig,
     /// Structured Claude launch policy (ADR-0036 §1); activation is #1439.

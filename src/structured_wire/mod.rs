@@ -17,8 +17,8 @@ mod minimal;
 // Later wire slices consume these exact payload re-exports.
 #[cfg_attr(feature = "web", allow(unused_imports))]
 pub use minimal::{
-    AgentDecide, AgentDecideErrorCode, AgentDecideResult, FleetAgentRow, FleetDelta,
-    PermissionDecision,
+    AgentDecide, AgentDecideErrorCode, AgentDecideResult, AgentSendResult, FleetAgentRow,
+    FleetDelta, PermissionDecision,
 };
 #[cfg(test)]
 mod review_tests;
