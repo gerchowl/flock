@@ -75,7 +75,7 @@ pub(crate) struct UidPolicy {
     pub dedicated: DedicatedUid,
 }
 /// Local socket UID classification. Unknown is never operator authority.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Principal {
     /// Operator UID, subject to independent agent ancestry checks.
     Operator,
@@ -115,14 +115,15 @@ impl UidPolicy {
     }
 
     /// Constrain the caller role by UID; agent identity still requires ancestry.
-    /// Configured pending/failed lookups deny operator availability. Only explicit
-    /// account-policy `none` avoids that cost; a resolved UID collision fails closed.
+    /// Same-UID authority does not depend on directory-service availability.
+    /// A confirmed dedicated-account collision still fails closed (#1944).
     pub fn classify(&self, uid: Option<u32>) -> Principal {
-        let (Some(uid), Ok(dedicated)) = (uid, self.dedicated.get()) else {
+        let Some(uid) = uid else {
             return Principal::Unknown;
         };
+        let dedicated = self.dedicated.get();
         self.report_cached_collision();
-        if dedicated == Some(uid) {
+        if dedicated == Ok(Some(uid)) {
             Principal::Agent
         } else if uid == self.operator {
             Principal::Operator
@@ -133,8 +134,9 @@ impl UidPolicy {
 }
 
 impl UidPolicy {
-    /// ADR-0036 §1a: anonymous/unknown UIDs may read, but cannot bypass the
-    /// boundary through raw terminal sends or other state-changing methods.
+    /// ADR-0036 §1a: unattested callers have no target or agent-directory access.
+    /// Only the untargeted health/capability ping remains available. Retry safety
+    /// grants no authority; future methods fail closed until admission is decided.
     pub fn refusal(
         &self,
         uid: Option<u32>,
@@ -148,45 +150,24 @@ impl UidPolicy {
             Principal::Agent if attributed => return None,
             _ => (),
         }
-        // is_retry_safe promises reads/previews only. Inbox consumption and
-        // cursor/wait lifecycle are reads too, but intentionally not retried.
-        if method.is_retry_safe()
-            || matches!(
-                method,
-                ChannelHello(_)
-                    | WaitPark(_)
-                    | MsgRead(_)
-                    | MsgWaitReply(_)
-                    | EventsSubscribe(_)
-                    | EventsWait(_)
-                    | EventsRead(_)
-                    | WaitHold(_, _)
-                    | WaitRelease(_)
-                    | PaneWaitForOutput(_)
-                    | PaneStashShow(_)
-            )
-        {
+        if matches!(method, Ping(_)) {
             return None;
         }
+
         Some(
             if matches!(
                 method,
-                MsgSend(_)
-                    | MsgReply(_)
-                    | MsgWake(_)
-                    | AgentSend(_)
-                    | PaneSendText(_)
-                    | PaneWriteText(_)
-                    | PaneWriteKeys(_)
-                    | PaneWriteInput(_)
-                    | PaneSendInput(_)
-                    | PaneSendKeys(_)
-                    | PaneSubmit(_)
-                    | PaneStashRestore(_)
+                ServerStop(_)
+                    | ServerReloadConfig(_)
+                    | ServerLiveHandoff(_)
+                    | ClientTokenAdd(_)
+                    | ClientTokenRemove(_)
+                    | ClientTokenList(_)
+                    | ClientOpen(_)
             ) {
-                ErrorCode::MsgNotAllowed
-            } else {
                 ErrorCode::OperatorOnly
+            } else {
+                ErrorCode::NotAuthorized
             },
         )
     }
@@ -267,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_account_lookup_does_not_block_app_startup_or_grant_authority() {
+    fn blocked_account_lookup_keeps_same_uid_authority_without_blocking_startup() {
         exercise_blocked_lookup(crate::config::model::AgentAccount::FlkAgent);
     }
 
@@ -364,22 +345,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("classification must finish while NSS stays blocked");
         driver.join().unwrap();
-        assert_eq!(
-            roles[0],
-            if recognition {
-                Principal::Unknown
-            } else {
-                Principal::Operator
-            }
-        );
+        assert_eq!(roles[0], Principal::Operator);
         assert!(roles[1..].iter().all(|role| *role == Principal::Unknown));
-        if recognition {
-            assert_eq!(stop["error"]["code"], "operator_only");
-        } else {
-            assert!(stop.get("result").is_some(), "{stop}");
-        }
+        assert!(stop.get("result").is_some(), "{stop}");
         assert!(read.get("result").is_some(), "{read}");
-        assert_eq!(quit, !recognition);
+        assert!(quit);
         assert!(
             lookup_entered.try_recv().is_err(),
             "one worker despite repeated calls"
@@ -447,7 +417,14 @@ mod tests {
         let read = Method::WorkspaceList(EmptyParams {});
         let stop = Method::ServerStop(EmptyParams {});
         for uid in [Some(42), Some(99), None] {
-            assert_eq!(policy.refusal(uid, false, &read), None);
+            assert_eq!(
+                policy.refusal(uid, false, &read),
+                Some(ErrorCode::NotAuthorized)
+            );
+            assert_eq!(
+                policy.refusal(uid, false, &Method::Ping(PingParams::default())),
+                None
+            );
             assert_eq!(
                 policy.refusal(uid, false, &stop),
                 Some(ErrorCode::OperatorOnly)
@@ -473,7 +450,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(
                     policy.refusal(uid, false, &request.method),
-                    Some(ErrorCode::MsgNotAllowed),
+                    Some(ErrorCode::NotAuthorized),
                     "{method}"
                 );
             }
@@ -484,6 +461,24 @@ mod tests {
             policy.refusal(None, true, &stop),
             Some(ErrorCode::OperatorOnly)
         );
+    }
+
+    #[test]
+    fn same_uid_survives_failed_and_pending_account_lookup() {
+        use crate::api::schema::{EmptyParams, Method};
+        let pending = DedicatedUid::lazy(|| panic!("lookup already started"));
+        pending.0.started.call_once(|| ());
+        for lookup in [DedicatedUid::from(Err(())), pending] {
+            let policy = UidPolicy {
+                operator: 7,
+                dedicated: lookup,
+            };
+            assert_eq!(policy.classify(Some(7)), Principal::Operator);
+            assert_eq!(
+                policy.refusal(Some(7), false, &Method::AgentList(EmptyParams {})),
+                None
+            );
+        }
     }
 
     #[test]
@@ -507,7 +502,7 @@ mod tests {
                 dedicated: Err(()).into()
             }
             .classify(Some(7)),
-            Principal::Unknown
+            Principal::Operator
         );
         assert_eq!(
             UidPolicy {

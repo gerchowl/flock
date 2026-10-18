@@ -363,7 +363,7 @@ async fn queued_socket_requests_with_reused_birth_never_become_operator() {
         });
         let response: serde_json::Value =
             serde_json::from_str(&response.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
-        assert_eq!(response["error"]["code"], "operator_only", "{response}");
+        assert_eq!(response["error"]["code"], "not_authorized", "{response}");
     }
     assert!(app.current_api_peer_birth.is_none());
 }
@@ -404,7 +404,7 @@ async fn recovery_parked_requests_preserve_original_peer_birth() {
 }
 
 #[tokio::test]
-async fn unreadable_peer_birth_with_no_leases_preserves_operator_behavior() {
+async fn unreadable_peer_birth_with_no_leases_refuses_operator_authority() {
     let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(
         &Config::default(),
@@ -415,7 +415,7 @@ async fn unreadable_peer_birth_with_no_leases_preserves_operator_behavior() {
     );
     app.current_api_peer_pid = Some(std::process::id());
     app.current_api_peer_birth = Some(None);
-    assert!(app.caller_is_local_operator());
+    assert!(!app.caller_is_local_operator());
 }
 
 #[tokio::test]

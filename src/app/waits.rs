@@ -247,14 +247,27 @@ impl App {
         }
     }
 
-    /// A held `events.read` opens its blocking wait. A caller in no agent
-    /// pane records nothing.
+    /// A held `events.read` opens its blocking wait after UID classification.
+    /// Unattested callers are refused before pane resolution; a recognized
+    /// caller in no agent pane records nothing.
     pub(super) fn handle_wait_hold(
         &mut self,
         id: String,
         predicate: WaitPredicate,
         hold_ms: u64,
+        admission: Option<&crate::api::schema::WaitAdmission>,
     ) -> String {
+        let authority = self
+            .runtime_config
+            .uid_policy
+            .classify(self.current_api_peer_uid.flatten());
+        if authority == crate::structured::identity::Principal::Unknown {
+            return encode_error(
+                id,
+                crate::api::error_code::ErrorCode::NotAuthorized.as_str(),
+                "socket caller lacks authority for this operation",
+            );
+        }
         let wait_id = match self.spawn_caller() {
             SpawnCaller::Agent {
                 agent_id, pane_id, ..
@@ -268,6 +281,17 @@ impl App {
                 .map(|(wait_id, _)| wait_id),
             SpawnCaller::Operator { .. } | SpawnCaller::Structured { .. } => None,
         };
+        if let (Some(wait_id), Some(admission)) = (wait_id.as_ref(), admission) {
+            if let Some(grant) =
+                crate::api::schema::WaitReleaseAuthority::admitted(wait_id.clone(), authority)
+            {
+                if let Err(grant) = admission.set(grant) {
+                    // The reader already left, or this cell already owns another hold.
+                    // Only the rejected grant's exact hold is closed.
+                    self.handle_wait_release(id.clone(), grant.release_id());
+                }
+            }
+        }
         encode_success(id, ResponseResult::WaitHeld { wait_id })
     }
 
@@ -353,6 +377,11 @@ mod tests {
         terminal.launch_argv = Some(vec!["claude".into()]);
         let agent_id = terminal.agent_id.to_string();
         crate::test_support::attest_pane_caller(&mut app, pane_id);
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: 7,
+            dedicated: Ok(Some(42)).into(),
+        };
+        app.current_api_peer_uid = Some(Some(7));
         let screen = concat!(
             "\u{25cf} Started the wait in the background.\n\n",
             "\u{273b} Crunched for 4s \u{b7} done 4:32 PM \u{b7} 1 shell still running\n",
@@ -420,6 +449,35 @@ mod tests {
             kinds: Vec::new(),
             subjects: Vec::new(),
             after: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unattested_hold_creates_no_wait_or_expiry_event() {
+        for uid in [None, Some(None), Some(Some(99))] {
+            let (mut app, agent_id) = settled_claude_with_a_background_shell();
+            app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+                operator: 7,
+                dedicated: Ok(Some(42)).into(),
+            };
+            app.current_api_peer_uid = uid;
+            let admission = std::sync::Arc::default();
+            let response = call(
+                &mut app,
+                Method::WaitHoldAdmitted(any_events(), 1_000, std::sync::Arc::clone(&admission)),
+            );
+            let opened = app.waits.next_deadline().is_some();
+            app.tick_waits(Instant::now() + Duration::from_secs(3_600));
+            let expired = app
+                .event_hub
+                .events_after(0)
+                .iter()
+                .any(|(_, event)| event.event == EventKind::WaitExpired);
+            assert_eq!((opened, expired), (false, false), "uid={uid:?}");
+            assert_eq!(app.waits.waiting(&agent_id), Waiting::None);
+            assert!(admission.get().is_none());
+            assert_eq!(response["error"]["code"], "not_authorized");
+            assert!(response["error"].get("data").is_none());
         }
     }
 
@@ -720,7 +778,8 @@ mod tests {
     #[tokio::test]
     async fn a_caller_outside_an_agent_pane_cannot_park_and_holds_nothing() {
         let (mut app, _) = settled_claude_with_a_background_shell();
-        app.current_api_peer_pid = None;
+        // This owned test process is outside the fixture's child pane.
+        app.current_api_peer_pid = Some(std::process::id());
         assert_eq!(
             call(&mut app, park(60_000))["error"]["code"],
             "no_caller_pane"
