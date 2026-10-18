@@ -248,8 +248,9 @@ retains the terminal reply path and grants no structured routing authority.
 No custody schema, identity material, mesh version, or event kind changes.
 
 Unverifiable recovery records and unknown native identities remain raw in
-custody and never enter a legacy mailbox or queue. The existing refusal event
-exposes the typed failure; correcting that evidence requires operator action.
+custody and never enter a legacy mailbox or queue. For unsettled records the
+existing refusal event exposes the typed failure; settled outcomes stay unchanged.
+Correcting unverifiable evidence requires operator action.
 Fresh terminal-bound messages are sealed only when their sender matches the
 authenticated caller, so legitimate replies can prove a structured sender while
 unsigned legacy sender claims remain on the terminal path.

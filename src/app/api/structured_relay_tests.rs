@@ -981,3 +981,39 @@ fn custody_completion_owner_refusal_and_duplicate_keep_the_typed_outcome() {
         r.stop().await;
     });
 }
+
+#[test]
+fn custody_completion_settled_unknown_recipient_does_not_emit_a_refusal() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2511).await;
+        let d = mail(&r);
+        let rx = request(&mut r, d.clone());
+        assert!(answer(&mut r, &rx).await["result"]["item_id"].is_string());
+        r.stop().await;
+        r.app
+            .state
+            .structured_agents
+            .remove(&r.case.id, r.case.generation)
+            .unwrap();
+        let cursor = r.hub.events_after(0).last().map_or(0, |(seq, _)| *seq);
+        r.app.restore_mesh_mail().unwrap();
+        assert!(
+            !r.hub.events_after(cursor).iter().any(|(_, event)| matches!(
+                &event.data,
+                crate::api::schema::EventData::MessageDelivered {
+                    delivered: false,
+                    ..
+                }
+            ))
+        );
+        assert_eq!(
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state,
+            "delivered"
+        );
+        assert!(r.app.structured_sends.recovering.is_empty());
+    });
+}

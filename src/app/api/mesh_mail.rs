@@ -685,11 +685,13 @@ impl App {
                         self.retry_queue_custody(record.envelope, code);
                     } else {
                         crate::logging::mesh_custody_failed("structured-restore", code.as_str());
-                        self.publish_queue_refusal(&record.envelope, code);
+                        if !record.settled {
+                            self.publish_queue_refusal(&record.envelope, code);
+                        }
                     }
                     continue;
                 }
-                if !record.read {
+                if !record.settled {
                     self.structured_sends.recovering.push(record.envelope);
                 } else {
                     self.mailboxes.record_delivered(&record.message);
@@ -704,7 +706,7 @@ impl App {
             if record.message.to_pane.is_empty() {
                 continue;
             }
-            if record.read {
+            if record.settled {
                 self.mailboxes.record_delivered(&record.message);
             } else {
                 self.mailboxes.enqueue(record.message);
@@ -1253,7 +1255,7 @@ mod tests {
 pub(crate) struct RecoveredMessage {
     message: PendingMessage,
     target: String,
-    read: bool,
+    settled: bool,
     envelope: Envelope,
     binding: Option<(String, String)>,
 }
@@ -1381,7 +1383,7 @@ pub(crate) fn load_mesh_mail(
         loaded.push(RecoveredMessage {
             message: data.message,
             target,
-            read: matches!(record.state.as_str(), "read" | "delivered"),
+            settled: matches!(record.state.as_str(), "read" | "delivered"),
             binding: with_store(|s| {
                 s.recipient_binding(&record.envelope.key)
                     .map_err(|e| e.to_string())

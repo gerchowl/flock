@@ -5217,4 +5217,10 @@ fn custody_completion_transport_refusal_cannot_revoke_own_inbox() {
         Err(Error::InvalidState)
     ));
     assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "inbox");
+    store.settle_queue_admission(&mail.key, None, 2).unwrap();
+    let admitted = store.get(&mail.key).unwrap().unwrap();
+    assert_eq!(admitted.state, "delivered");
+    assert_eq!(admitted.envelope.body, mail.body);
+    store.finish(&mail.key, Outcome::Read, 3).unwrap();
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "read");
 }
