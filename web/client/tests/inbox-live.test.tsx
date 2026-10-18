@@ -188,6 +188,17 @@ describe("live permission inbox", () => {
     expect(detail).toBe(`${"x".repeat(SUMMARY_MAX - 1)}…`);
   });
 
+  test("a closed record with both a decision and a reason or error_code closes the card without a notice", () => {
+    const { root, fleet, event, raw } = mountInbox();
+    fleet("atlas", ["r1", "r2"]);
+    event("atlas", "r1");
+    event("atlas", "r2");
+    const answered = { type: "flk_permission_request", state: "closed", request_seq: 7, decision: "deny", message: null, principal: "p", source: "token" };
+    raw("atlas", { ...answered, request_id: "r1", reason: "permission_request_limit", error_code: "permission_request_limit" });
+    raw("atlas", { ...answered, request_id: "r2", reason: "permission_request_too_large" });
+    expect(cards(root)).toEqual([]);
+  });
+
   test("session_ended, the reason #2236 decided, closes a request", () => {
     const { root, fleet, event, raw } = mountInbox();
     fleet("atlas", ["r1"]);
