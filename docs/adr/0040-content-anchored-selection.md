@@ -42,8 +42,26 @@ also invalidate the generation. The latter calls `eraseHistory` in
 `Screen.resize`. `Terminal.resize` resizes an allocated alternate screen
 even while primary is active, so the tracker remembers its allocation
 across `?47l` and invalidates on resize until full reset removes it.
-This conservatively invalidates primary-screen anchors too once an alternate
-screen exists. Ordinary primary resize/reflow before alternate allocation
+XTRESTORE (`CSI ? Pm r`) also reaches `setMode` and `switchScreenMode`:
+restoring false for 1047 clears the departing alternate screen, and restoring
+true for 1049 clears the entered alternate screen. Every private restore
+naming 47, 1047 or 1049 therefore invalidates and conservatively marks
+alternate allocation possible, regardless of the saved value. Saved mode
+bits are not mirrored. Full reset clears both the saved modes and allocation;
+a subsequent restore marks possible allocation again, even when unsaved
+(false). Resizes conservatively invalidate primary-screen anchors too once
+alternate allocation is known or possible.
+
+Audit: `stream.zig` dispatches XTSAVE to `save_mode`, which only stores bits
+(`stream_terminal.zig:191`); XTRESTORE dispatches `restore_mode` through
+`modes.restore` and `setMode` (`stream_terminal.zig:192–194`). Only modes
+47, 1047 and 1049 call `switchScreenMode` in that setter
+(`stream_terminal.zig:490–492`); mode 1048 saves/restores the cursor only.
+DECRQM calls `requestMode` / `getReport` and sends a report without setting
+modes or switching screens (`stream_terminal.zig:423–426`). Native-terminal
+tests cover saved true and unsaved false for all three screen modes and
+confirm XTSAVE/DECRQM preserve content. Real-PTY tests cover both destructive
+restore paths, plus capture after reset/restore followed by resize. Ordinary primary resize/reflow before alternate allocation
 with scrollback remains supported.
 The other `erasePage` path trims blank trailing resize rows only after
 checking that no tracked pin occupies them; normal history pruning already

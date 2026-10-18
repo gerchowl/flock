@@ -249,11 +249,15 @@ impl SelectionEraseTracker {
         }
         let parameters = &self.parameters[..self.parameters_len];
         let display_erase = final_byte == b'J' && matches!(parameters, [2 | 3]);
-        let screen_mode = self.private && matches!(final_byte, b'h' | b'l');
-        let screen_clear = screen_mode && parameters.iter().any(|p| matches!(p, 1047 | 1049));
-        // Alternate screens remain allocated after returning to primary.
+        let screen_mode = self.private && matches!(final_byte, b'h' | b'l' | b'r');
+        let screen_clear = screen_mode
+            && parameters
+                .iter()
+                .any(|p| matches!(p, 1047 | 1049) || (final_byte == b'r' && *p == 47));
+        // XTRESTORE can switch/clear using either saved value. Avoid mirroring
+        // saved mode bits: conservatively remember possible alternate allocation.
         self.alternate_exists |= screen_mode
-            && final_byte == b'h'
+            && matches!(final_byte, b'h' | b'r')
             && parameters.iter().any(|p| matches!(p, 47 | 1047 | 1049));
         if display_erase || screen_clear {
             self.invalidate();
@@ -280,7 +284,7 @@ mod erase_tests {
         tracker.write(b"title [3J\x1b]0;[3J\x07\x1bP[2J\x1b\\\x1b[3;J\x1b[>3J\x1b[3\x18J\x1b[22J");
         assert_eq!(
             tracker.generation, 1,
-            "trailing empty parameter does not invalidate ED 3"
+            "ED 3 with a trailing separator must invalidate the selection"
         );
     }
 
@@ -363,6 +367,67 @@ mod parameter_tests {
                 terminal.selection_erases.generation - generation,
                 u64::from(matches!(mode, Some(2 | 3))),
                 "generation: {parameters:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod mode_restore_tests {
+    use super::*;
+
+    #[test]
+    fn xtrestore_screen_modes_invalidate_for_saved_true_and_unsaved_false() {
+        for mode in [47, 1047, 1049] {
+            for saved in [false, true] {
+                let mut terminal = Terminal::new(40, 6, 256 * 1024).unwrap();
+                if saved {
+                    terminal.write(format!("\x1b[?{mode}h\x1b[?{mode}s\x1b[?{mode}l").as_bytes());
+                }
+                let generation = terminal.selection_erases.generation;
+                terminal.write(format!("\x1b[?{mode}r").as_bytes());
+                assert_eq!(
+                    terminal.active_screen().unwrap(),
+                    if saved {
+                        ActiveScreen::Alternate
+                    } else {
+                        ActiveScreen::Primary
+                    }
+                );
+                assert_eq!(
+                    terminal.selection_erases.generation,
+                    generation + 1,
+                    "XTRESTORE mode {mode}, saved={saved}"
+                );
+                assert!(
+                    terminal.selection_erases.alternate_exists,
+                    "allocation must be conservative for either restored value"
+                );
+                terminal.write(b"\x1b[?47l");
+                let generation = terminal.selection_erases.generation;
+                terminal.resize(20, 3, 1, 1).unwrap();
+                assert_eq!(
+                    terminal.selection_erases.generation,
+                    generation + 1,
+                    "inactive allocation after restore mode {mode}, saved={saved}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn xtsave_and_decrqm_do_not_switch_or_clear_screens() {
+        for mode in [47, 1047, 1049] {
+            let mut terminal = Terminal::new(40, 6, 256 * 1024).unwrap();
+            terminal.write(b"selected");
+            let before = terminal.read_text_viewport((0, 0), (39, 5), false).unwrap();
+            terminal.write(format!("\x1b[?{mode}s\x1b[?{mode}$p").as_bytes());
+            assert_eq!(terminal.active_screen().unwrap(), ActiveScreen::Primary);
+            assert_eq!(terminal.selection_erases.generation, 0);
+            assert!(!terminal.selection_erases.alternate_exists);
+            assert_eq!(
+                terminal.read_text_viewport((0, 0), (39, 5), false).unwrap(),
+                before
             );
         }
     }

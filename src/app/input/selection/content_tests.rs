@@ -60,6 +60,21 @@ while IFS= read -r command; do
             printf '\033[?47h'
             printf 'BACK_ALT\r\n'
             ;;
+        alt1047)
+            printf '\033[?1047h\033[HSELECTA\r\nSELECTB\r\nDONE_alt1047\r\n'
+            ;;
+        restore1047)
+            printf '\033[?1047r\033[?47h\033[HOTHER_A\r\nOTHER_B\r\nDONE_restore7\r\n'
+            ;;
+        save1049)
+            printf '\033[?1049h\033[?1049s\033[HSELECTA\r\nSELECTB\r\nDONE_saved49\r\n'
+            ;;
+        restore1049)
+            printf '\033[?1049r\033[HOTHER_A\r\nOTHER_B\r\nDONE_restore9\r\n'
+            ;;
+        reset_restore)
+            printf '\033c\033[?1049rSELECTA\r\nSELECTB\r\nDONE_reset\r\n'
+            ;;
         erase2)
             printf '\033[2J'
             printf 'DONE_erase2\r\n'
@@ -342,4 +357,51 @@ async fn real_read_inactive_alternate_resize_refuses_copy() {
         .expect("visible inactive alternate resize refusal");
     assert_eq!(toast.kind, ToastKind::NeedsAttention);
     assert_eq!(toast.title, "Cannot copy selection");
+}
+
+fn assert_restored_selection_refused(fixture: &mut Fixture) {
+    fixture.copy();
+    assert_eq!(
+        fixture.state.request_clipboard_write.as_deref(),
+        Some(b"previous clipboard".as_slice())
+    );
+    let toast = fixture
+        .state
+        .toast
+        .as_ref()
+        .expect("visible XTRESTORE refusal");
+    assert_eq!(toast.kind, ToastKind::NeedsAttention);
+    assert_eq!(toast.title, "Cannot copy selection");
+}
+
+#[tokio::test]
+async fn real_read_xtrestore_unsaved_1047_refuses_replacement_rows() {
+    let mut fixture = Fixture::new().await;
+    fixture.write_and_wait("alt1047", "DONE_alt1047").await;
+    fixture.select();
+    fixture.state.request_clipboard_write = Some(b"previous clipboard".to_vec());
+    fixture.write_and_wait("restore1047", "DONE_restore7").await;
+    assert_restored_selection_refused(&mut fixture);
+}
+
+#[tokio::test]
+async fn real_read_xtrestore_saved_true_1049_refuses_replacement_rows() {
+    let mut fixture = Fixture::new().await;
+    fixture.write_and_wait("save1049", "DONE_saved49").await;
+    fixture.select();
+    fixture.state.request_clipboard_write = Some(b"previous clipboard".to_vec());
+    fixture.write_and_wait("restore1049", "DONE_restore9").await;
+    assert_restored_selection_refused(&mut fixture);
+}
+
+#[tokio::test]
+async fn real_read_xtrestore_after_reset_keeps_resize_invalidation() {
+    let mut fixture = Fixture::new().await;
+    fixture.write_and_wait("reset_restore", "DONE_reset").await;
+    // Full reset clears saved modes. Even an unsaved restore conservatively
+    // marks alternate allocation; capture afterward to isolate resize tracking.
+    fixture.select();
+    fixture.state.request_clipboard_write = Some(b"previous clipboard".to_vec());
+    fixture.runtime().resize(8, 6, 0, 0);
+    assert_restored_selection_refused(&mut fixture);
 }
