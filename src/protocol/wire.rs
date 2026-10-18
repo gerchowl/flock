@@ -1109,6 +1109,32 @@ mod tests {
     // ---- Round-trip: ClientMessage ----
 
     #[test]
+    fn security_agent_name_binary_wire_keeps_layout_but_drops_bad_names() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let raw = FleetAgent {
+                agent_id: "agent-fixture".into(),
+                pane_id: "pane-fixture".into(),
+                agent: Some(name),
+                status: crate::api::schema::AgentStatus::Idle,
+            };
+            let bytes = bincode::serde::encode_to_vec(&raw, bincode::config::standard()).unwrap();
+            let (decoded, _): (FleetAgent, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            let summary: crate::api::schema::PeerAgentSummary = decoded.into();
+            if summary.agent.is_some() {
+                failures.push(case);
+            }
+            assert_eq!(summary.agent_id, "agent-fixture");
+        }
+        assert!(
+            failures.is_empty(),
+            "retained wire name cases: {failures:?}"
+        );
+        assert_eq!(crate::mesh::hello::VERSION, 5);
+    }
+
+    #[test]
     fn client_hello_roundtrip() {
         let msg = ClientMessage::Hello {
             version: PROTOCOL_VERSION,

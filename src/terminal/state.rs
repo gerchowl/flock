@@ -3783,6 +3783,40 @@ mod tests {
     }
 
     #[test]
+    fn security_agent_name_setter_rejects_without_mutating() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut terminal = test_terminal();
+            terminal.set_agent_name("safe".into());
+            terminal.set_agent_name(name);
+            if terminal.agent_name.as_deref() != Some("safe") {
+                failures.push(case);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "accepted hostile name cases: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn security_agent_name_legacy_display_is_bounded_and_escaped() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut terminal = test_terminal();
+            // Fault injection: simulate a broken ingress without invoking the setter.
+            terminal.agent_name = Some(name.clone());
+            if terminal.display_agent_label().as_deref() == Some(name.as_str()) {
+                failures.push(case);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "rendered hostile name cases: {failures:?}"
+        );
+    }
+
+    #[test]
     fn respawn_cleanup_resets_restored_agent_status() {
         let mut terminal = test_terminal();
         terminal.respawn_shell_on_exit = true;

@@ -1040,6 +1040,18 @@ mod tests {
     use super::PushDebounce;
 
     #[test]
+    fn security_agent_name_relay_refuses_before_forwarding() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let request = serde_json::json!({"id":"name-relay","method":"agent.rename","params":{"target":"agent-fixture","name":name}}).to_string();
+            if relay_refusal(&request).map(|(_, code, _)| code) != Some("invalid_agent_name") {
+                failures.push(case);
+            }
+        }
+        assert!(failures.is_empty(), "forwarded hostile names: {failures:?}");
+    }
+
+    #[test]
     fn wake_subscription_retry_is_bounded_and_logs_once_per_outage() {
         let mut retry = super::WakeRetry::default();
         for (index, seconds) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {

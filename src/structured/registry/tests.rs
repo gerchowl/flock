@@ -365,3 +365,24 @@ fn fresh_launch_resets_observations_and_fences_the_previous_generation() {
         Err(RegistryError::StaleGeneration)
     ));
 }
+
+#[test]
+fn security_agent_name_structured_registry_rejects_and_retains_inactive() {
+    let mut failures = Vec::new();
+    for (case, name) in crate::test_support::hostile_agent_names() {
+        let mut bad = record("agent-name-security");
+        bad.name = Some(name);
+        let raw = serde_json::json!([bad]);
+        let mut registry = Registry::default();
+        let refused = registry.register(bad).is_err();
+        let restored: Registry = serde_json::from_value(raw.clone()).unwrap();
+        if !refused || !restored.is_empty() {
+            failures.push(case);
+        }
+        assert_eq!(serde_json::to_value(restored).unwrap(), raw);
+    }
+    assert!(
+        failures.is_empty(),
+        "accepted structured name cases: {failures:?}"
+    );
+}

@@ -1650,6 +1650,40 @@ mod tests {
         .expect("exit observer thread")
     }
 
+    #[tokio::test]
+    async fn security_agent_name_api_boundaries_refuse_before_side_effects() {
+        let mut failures = Vec::new();
+        for method in ["agent.rename", "agent.start", "agent.spawn"] {
+            for (case, name) in crate::test_support::hostile_agent_names() {
+                let mut app = test_app();
+                app.state.workspaces = vec![crate::workspace::Workspace::test_new("name-security")];
+                app.state.ensure_test_terminals();
+                let terminal = app.state.terminals.values_mut().next().unwrap();
+                terminal.set_agent_name("safe".into());
+                let target = terminal.id.to_string();
+                let params = match method {
+                    "agent.rename" => serde_json::json!({"target":target,"name":name}),
+                    "agent.start" => serde_json::json!({"name":name,"argv":[]}),
+                    "agent.spawn" => {
+                        serde_json::json!({"name":name,"agent":"codex","prompt":"fixture task","location":{"kind":"workspace_id","workspace_id":"workspace-fixture"}})
+                    }
+                    _ => unreachable!(),
+                };
+                let request = serde_json::from_value(
+                    serde_json::json!({"id":"security-name","method":method,"params":params}),
+                )
+                .unwrap();
+                let response = app.handle_api_request(request);
+                let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+                if value["error"]["code"] != "invalid_agent_name" {
+                    failures.push((method, case));
+                }
+                assert_eq!(app.state.terminals.len(), 1);
+            }
+        }
+        assert!(failures.is_empty(), "unrefused name cases: {failures:?}");
+    }
+
     fn test_app() -> crate::app::App {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         crate::app::App::new(
