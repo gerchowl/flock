@@ -370,3 +370,109 @@ async fn cold_queue_one_io_slot_bounds_recovery_admission() {
     assert_eq!(refused, Some(ErrorCode::SessionBusy));
     drop(slot);
 }
+
+#[tokio::test]
+async fn cold_queue_through_cursor_resumes_into_the_next_live_generation() {
+    let (mut registry, mut workers, notify, _) = owner();
+    let (case, launch, factory) = Case::prepare(&mut registry, 948, "idle", vec![]);
+    seed(&case);
+    let recovery = workers
+        .recover_queue(
+            &registry,
+            case.fixture.root.path().into(),
+            &case.id,
+            case.generation,
+            policy(),
+        )
+        .unwrap();
+    loaded(recovery)
+        .await
+        .install(&mut workers, &registry)
+        .unwrap();
+    let mut recovered = workers
+        .queue_source(&registry, &case.id, case.generation)
+        .unwrap()
+        .subscribe(None)
+        .unwrap();
+    let snapshot = pages(&mut recovered);
+    let through = match snapshot.last() {
+        Some(Page::Synced(n)) => *n,
+        other => panic!("missing recovered barrier: {other:?}"),
+    };
+    assert_eq!(through, 2);
+    let generation = workers.start(&mut registry, launch, factory).unwrap();
+    let mut live = None;
+    let mut initial_published = false;
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        assert!(
+            workers.report(&case.id, generation).is_none(),
+            "producer ended before initial publication"
+        );
+        while workers
+            .queue_update(&registry, &case.id, generation)
+            .is_some()
+        {
+            initial_published = true;
+        }
+        live = workers.queue_source(&registry, &case.id, generation).ok();
+        initial_published && live.is_some()
+    })
+    .await;
+    let mut reader = live.unwrap().subscribe(Some(through)).unwrap();
+    let wake = reader.waker();
+    let mut synced = false;
+    wait(&wake, || loop {
+        match reader.page() {
+            Page::Synced(n) if n == through => {
+                synced = true;
+                return true;
+            }
+            Page::Record(record) => panic!("duplicated recovered record: {record:?}"),
+            Page::Gap(gap) => panic!("unexpected gap at recovered through: {gap:?}"),
+            Page::Pending => return false,
+            Page::Refused(code) => panic!("live source refused: {code:?}"),
+            Page::End => panic!("live source ended before sync"),
+            _ => (),
+        }
+    })
+    .await;
+    workers
+        .enqueue(
+            &registry,
+            &case.id,
+            generation,
+            crate::structured::workers::queue::Request {
+                item: crate::structured::queue::tests::item("00000000-0000-4000-8000-000000000002"),
+                principal: crate::structured::queue::admission::Principal::Operator,
+                gate: crate::structured::queue::admission::Gate::Hold,
+            },
+        )
+        .unwrap();
+    wait(&wake, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        while workers
+            .queue_update(&registry, &case.id, generation)
+            .is_some()
+        {}
+        loop {
+            match reader.page() {
+                Page::Record(record) if record["seq"] == 3 => return true,
+                Page::Pending => return false,
+                Page::Refused(code) | Page::Status(_, Some(code)) => {
+                    panic!("live continuation refused: {code:?}")
+                }
+                Page::End | Page::Lagged(_) => panic!("live continuation closed before append"),
+                _ => (),
+            }
+        }
+    })
+    .await;
+    workers.stop(&case.id, generation);
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&case.id, generation).is_some()
+    })
+    .await;
+    assert!(synced);
+}
