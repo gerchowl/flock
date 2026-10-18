@@ -1028,6 +1028,8 @@ fn do_handshake(
 enum ClientLoopEvent {
     /// Raw input bytes from stdin.
     StdinInput(Vec<u8>),
+    /// Terminal geometry is unavailable, so detach without resizing any panes.
+    Detach,
     /// Terminal resize detected.
     Resize(u16, u16, u32, u32),
     /// Server message received. Carries the slot key of the reader that read
@@ -1689,8 +1691,11 @@ fn run_attach_attempt(
     // Read the terminal geometry before the handshake, while still outside
     // raw mode. Re-read on every attempt so a resize that happens during a
     // handoff window is honored.
-    let (cols, rows, cell_width_px, cell_height_px) =
-        current_terminal_geometry(kitty_graphics_enabled);
+    let Some((cols, rows, cell_width_px, cell_height_px)) =
+        current_terminal_geometry(kitty_graphics_enabled)
+    else {
+        return Ok(());
+    };
 
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = do_handshake(
@@ -2102,8 +2107,13 @@ async fn run_client_loop(
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     attach_t0: Instant,
 ) -> Result<(), ClientError> {
-    let (_, _, initial_cell_width, initial_cell_height) =
-        current_terminal_geometry(kitty_graphics_enabled);
+    let Some((_, _, initial_cell_width, initial_cell_height)) =
+        current_terminal_geometry(kitty_graphics_enabled)
+    else {
+        // Closing this connection detaches the observer if its terminal vanished
+        // between the handshake and starting the event loop.
+        return Ok(());
+    };
     // `ui.file_drop` gate (#79): whether a dropped local file is ferried to the
     // server. Read once per attach leg (cheap; file-drops are rare).
     let file_drop_mode = crate::config::Config::load().config.ui.file_drop;
@@ -2272,6 +2282,7 @@ async fn run_client_loop(
         }
 
         match event {
+            ClientLoopEvent::Detach => break,
             ClientLoopEvent::StdinInput(data) => {
                 // Cancellable switch popup (#93): Esc is intercepted ONLY while
                 // a switch is pending. A chunk equal to exactly `[0x1b]` is the
@@ -4265,23 +4276,23 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // Resize polling
 // ---------------------------------------------------------------------------
 
-fn current_terminal_geometry(kitty_graphics_enabled: bool) -> (u16, u16, u32, u32) {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+fn current_terminal_geometry(kitty_graphics_enabled: bool) -> Option<(u16, u16, u32, u32)> {
+    let (cols, rows) = crossterm::terminal::size().ok()?;
     if !kitty_graphics_enabled {
-        return (cols, rows, 0, 0);
+        return Some((cols, rows, 0, 0));
     }
     let Ok(size) = crossterm::terminal::window_size() else {
-        return (cols, rows, 8, 16);
+        return Some((cols, rows, 8, 16));
     };
     if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
-        return (cols, rows, 8, 16);
+        return Some((cols, rows, 8, 16));
     }
-    (
+    Some((
         cols,
         rows,
         (size.width as u32 / size.columns as u32).max(1),
         (size.height as u32 / size.rows as u32).max(1),
-    )
+    ))
 }
 
 /// Polls the terminal size and sends resize events when it changes.
@@ -4292,8 +4303,30 @@ fn resize_poll_loop(
     kitty_graphics_enabled: bool,
     should_quit: &Arc<AtomicBool>,
 ) {
-    let (_, _, initial_cell_width, initial_cell_height) =
-        current_terminal_geometry(kitty_graphics_enabled);
+    resize_poll_loop_with(
+        resize_tx,
+        initial_cols,
+        initial_rows,
+        should_quit,
+        || current_terminal_geometry(kitty_graphics_enabled),
+        || std::thread::sleep(Duration::from_millis(100)),
+    );
+}
+
+/// Poll geometry with supplied observations and cadence. Geometry loss takes the
+/// same detach path as a clean client exit, without inventing a replacement size.
+fn resize_poll_loop_with(
+    resize_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    initial_cols: u16,
+    initial_rows: u16,
+    should_quit: &Arc<AtomicBool>,
+    mut geometry: impl FnMut() -> Option<(u16, u16, u32, u32)>,
+    mut wait: impl FnMut(),
+) {
+    let Some((_, _, initial_cell_width, initial_cell_height)) = geometry() else {
+        let _ = resize_tx.blocking_send(ClientLoopEvent::Detach);
+        return;
+    };
     let mut last_size = (
         initial_cols,
         initial_rows,
@@ -4301,8 +4334,11 @@ fn resize_poll_loop(
         initial_cell_height,
     );
     while !should_quit.load(Ordering::Acquire) {
-        std::thread::sleep(Duration::from_millis(100));
-        let new_size = current_terminal_geometry(kitty_graphics_enabled);
+        wait();
+        let Some(new_size) = geometry() else {
+            let _ = resize_tx.blocking_send(ClientLoopEvent::Detach);
+            return;
+        };
         if new_size != last_size {
             last_size = new_size;
             if resize_tx
@@ -4338,6 +4374,10 @@ fn init_logging() {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "geometry_tests.rs"]
+mod geometry_tests;
 
 #[cfg(test)]
 mod tests {
