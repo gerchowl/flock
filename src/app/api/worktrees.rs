@@ -77,8 +77,8 @@ struct KillTarget {
     /// The open workspace holding it, when one does — it is closed with the
     /// checkout.
     workspace_idx: Option<usize>,
-    /// The MAIN checkout root: where `git worktree remove` and `git branch -D`
-    /// run.
+    /// A repository query directory, which can be a linked checkout. Branch
+    /// deletion resolves its common directory before removing the checkout.
     repo_root: PathBuf,
     /// The linked checkout being removed.
     checkout: PathBuf,
@@ -97,6 +97,15 @@ enum KillRepositoryError {
 }
 
 fn kill_repository(path: &Path) -> Result<KillRepository, KillRepositoryError> {
+    kill_repository_facts(path, false)
+}
+
+// Only an owned membership's common-directory identity permits an admin path.
+// Explicit caller proofs still require a real checkout or bare root.
+fn kill_repository_facts(
+    path: &Path,
+    owned_common: bool,
+) -> Result<KillRepository, KillRepositoryError> {
     use KillRepositoryError::{InvalidProof, Unreachable};
     // A query failure at an unmarked directory is an invalid proof. An existing
     // Git marker, or an access error inspecting it, requires repository recovery.
@@ -131,12 +140,17 @@ fn kill_repository(path: &Path) -> Result<KillRepository, KillRepositoryError> {
         return Err(Unreachable);
     };
     let bare = bare.parse::<bool>().map_err(|_| Unreachable)?;
-    if !bare && *inside != "true" {
-        return Err(InvalidProof);
-    }
     let git = Path::new(git).canonicalize().map_err(|_| Unreachable)?;
     let common = Path::new(common).canonicalize().map_err(|_| Unreachable)?;
-    let root = if bare {
+    let admin = !bare && *inside != "true";
+    if admin
+        && !(owned_common
+            && git == common
+            && crate::worktree::canonical_or_original(path) == common)
+    {
+        return Err(InvalidProof);
+    }
+    let root = if bare || admin {
         git.clone()
     } else {
         PathBuf::from(query(&["--show-toplevel"])?.trim())
@@ -1016,6 +1030,23 @@ impl App {
             );
         }
 
+        // Capture a surviving repository directory before removal, including
+        // when the only open workspace is the linked checkout being removed.
+        let branch_repo = if would_delete_branch {
+            match kill_repository_facts(&target.repo_root, true) {
+                Ok(identity) => Some(identity.common),
+                Err(_) => {
+                    return ApiFailure::from(crate::worktree::CheckoutUnreachable {
+                        path: target.checkout.clone(),
+                        repo: Some(target.repo_root.clone()),
+                        possible_unmounted_mount_point: None,
+                    })
+                    .encode(id)
+                }
+            }
+        } else {
+            None
+        };
         let workspace_id = match target.workspace_idx {
             // Through the workspace whenever one holds this checkout, so the
             // workspace is closed with it. Removing the directory behind
@@ -1072,9 +1103,9 @@ impl App {
 
         let mut branch_deleted = false;
         let mut branch_delete_error = None;
-        if would_delete_branch {
+        if let Some(repo) = branch_repo {
             if let Some(branch) = verdict.branch.as_deref() {
-                match crate::worktree::delete_local_branch(&target.repo_root, branch) {
+                match crate::worktree::delete_local_branch(&repo, branch) {
                     Ok(()) => branch_deleted = true,
                     Err(err) => branch_delete_error = Some(err),
                 }
@@ -1200,28 +1231,35 @@ impl App {
                 let preferred =
                     crate::workspace::git_space_metadata(&canonical).map(|space| space.key);
                 let target_identity = kill_repository(&canonical).ok();
-                let mut owned = std::collections::BTreeSet::new();
+                let mut owned = std::collections::BTreeMap::new();
                 if let Some(repo) = &params.repo {
-                    owned.insert(crate::worktree::canonical_or_original(&absolute_user_path(
-                        "repo", repo,
-                    )?));
+                    owned.insert(
+                        crate::worktree::canonical_or_original(&absolute_user_path("repo", repo)?),
+                        None,
+                    );
                 } else {
                     for ws in &self.state.workspaces {
-                        let repo = ws
+                        let repository = ws
                             .worktree_space_here()
-                            .map(|space| space.repo_root.clone())
-                            .or_else(|| ws.git_space().map(|space| space.repo_root.clone()))
+                            .map(|space| (space.repo_root.clone(), space.key.clone()))
+                            .or_else(|| {
+                                ws.git_space()
+                                    .map(|space| (space.repo_root.clone(), space.key.clone()))
+                            })
                             .or_else(|| {
                                 crate::workspace::git_space_metadata(&ws.identity_cwd)
-                                    .map(|space| space.repo_root)
+                                    .map(|space| (space.repo_root, space.key))
                             });
-                        if let Some(repo) = repo {
-                            owned.insert(crate::worktree::canonical_or_original(&repo));
+                        if let Some((repo, key)) = repository {
+                            owned.insert(
+                                crate::worktree::canonical_or_original(&repo),
+                                Some(crate::worktree::canonical_or_original(Path::new(&key))),
+                            );
                         }
                     }
                 }
                 let mut owned: Vec<_> = owned.into_iter().collect();
-                owned.sort_by_key(|repo| {
+                owned.sort_by_key(|(repo, _)| {
                     crate::workspace::git_space_metadata(repo).map_or((true, true), |space| {
                         (
                             Some(&space.key) != preferred.as_ref(),
@@ -1231,8 +1269,11 @@ impl App {
                 });
                 let mut nearest: Option<PathBuf> = None;
                 let mut probe_failure = None;
-                for repo in owned {
-                    let identity = match kill_repository(&repo) {
+                for (repo, expected_common) in owned {
+                    let identity = match kill_repository_facts(
+                        &repo,
+                        expected_common.as_deref() == Some(repo.as_path()),
+                    ) {
                         Ok(identity) => identity,
                         Err(KillRepositoryError::InvalidProof) if params.repo.is_some() => {
                             return Err(invalid_repository_proof(&repo));
@@ -1248,6 +1289,12 @@ impl App {
                             continue;
                         }
                     };
+                    if expected_common
+                        .as_ref()
+                        .is_some_and(|common| common != &identity.common)
+                    {
+                        continue;
+                    }
                     if params.repo.is_some() && (identity.root != repo || identity.linked) {
                         return Err(invalid_repository_proof(&repo));
                     }
@@ -5880,6 +5927,139 @@ mod tests {
         assert!(!checkout.exists());
         assert!(app.state.workspaces.iter().all(|ws| ws.id != id));
         assert!(repo.join(".git").is_file());
+    }
+
+    fn assert_adopted_workspace_kill(repo: &Path, parent_open: bool) {
+        let repo = repo.canonicalize().unwrap();
+        let checkout = unreachable_fixture_path("adopted-proof-linked");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree/adopted-proof",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let mut app = app_with_parent(&repo);
+        app.state.workspaces[0].cached_git_space = crate::workspace::git_space_metadata(&repo);
+        if !parent_open {
+            app.state.workspaces.clear();
+        }
+        let mut ws = Workspace::test_new("adopted-proof");
+        ws.identity_cwd = checkout.clone();
+        ws.cached_git_space = crate::workspace::git_space_metadata(&checkout);
+        let id = ws.id.clone();
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        assert!(app.state.adopt_external_worktrees());
+        let membership = app
+            .state
+            .workspaces
+            .last()
+            .unwrap()
+            .worktree_space_here()
+            .unwrap();
+        assert_eq!(membership.checkout_path, checkout);
+        if parent_open {
+            assert_eq!(
+                membership.repo_root, repo,
+                "adoption must retain the known real main checkout"
+            );
+            let parent = app.state.workspaces[0].worktree_space_here().unwrap();
+            assert_eq!(parent.repo_root, repo);
+            assert_eq!(parent.checkout_path, repo);
+        }
+        let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
+            id: "adopted-path-kill".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                path: Some(checkout.to_string_lossy().into_owned()),
+                force: true,
+                keep_branch: true,
+                keep_processes: true,
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+        assert_eq!(response["result"]["removed"], true, "{response}");
+        assert!(!checkout.exists());
+        assert!(app.state.workspaces.iter().all(|ws| ws.id != id));
+        assert!(repo.join(".git").is_file());
+    }
+
+    fn adopted_separate_fixture(parent_open: bool) {
+        let repo = create_committed_repo("adopted-separate");
+        let admin = unreachable_fixture_path("adopted-separate-admin");
+        run_git(
+            &repo,
+            &["init", "--separate-git-dir", admin.to_str().unwrap()],
+        );
+        assert_adopted_workspace_kill(&repo, parent_open);
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(admin).unwrap();
+    }
+
+    fn adopted_submodule_fixture(parent_open: bool) {
+        let (source, repo, checkout) = crate::test_support::create_submodule_worktree(
+            "adopted-submodule",
+            "worktree/adopted-outer",
+        );
+        assert_adopted_workspace_kill(&repo.join("sub"), parent_open);
+        std::fs::remove_dir_all(checkout).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(source).unwrap();
+    }
+
+    #[test]
+    fn adopted_separate_git_dir_retains_known_main_and_closes_workspace() {
+        adopted_separate_fixture(true);
+    }
+
+    #[test]
+    fn adopted_separate_git_dir_with_only_common_identity_closes_workspace() {
+        adopted_separate_fixture(false);
+    }
+
+    #[test]
+    fn adopted_submodule_retains_known_main_and_closes_workspace() {
+        adopted_submodule_fixture(true);
+    }
+
+    #[test]
+    fn adopted_submodule_with_only_common_identity_closes_workspace() {
+        adopted_submodule_fixture(false);
+    }
+
+    #[test]
+    fn kill_from_linked_workspace_without_membership_deletes_branch() {
+        let (repo, checkout, mut app) = exact_root_fixture("linked-owner-branch");
+        let mut ws = Workspace::test_new("linked-owner");
+        ws.identity_cwd = checkout.clone();
+        ws.cached_git_space = crate::workspace::git_space_metadata(&checkout);
+        app.state.workspaces = vec![ws];
+        app.state.adopt_external_worktrees = false;
+        app.state.ensure_test_terminals();
+        let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
+            id: "linked-owner-kill".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                path: Some(checkout.to_string_lossy().into_owned()),
+                force: true,
+                keep_processes: true,
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+        assert_eq!(response["result"]["removed"], true, "{response}");
+        assert_eq!(response["result"]["branch_deleted"], true, "{response}");
+        assert!(
+            response["result"]["branch_delete_error"].is_null(),
+            "{response}"
+        );
+        assert!(!branch_exists(&repo, "worktree/exact-root"));
+        assert!(!checkout.exists());
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

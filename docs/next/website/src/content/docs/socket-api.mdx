@@ -401,7 +401,11 @@ proof to the real root. An existing repository that cannot be queried returns
 `worktree_repository_unreachable` (exit 10, retry `after_human`): restore access
 and retry. Main checkouts are never kill targets or enclosing hints. The first
 porcelain row is excluded too: in separate-git-dir and submodule layouts it can
-name an admin directory rather than the real main checkout.
+name an admin directory rather than the real main checkout. Open workspace
+membership uses canonical Git common-directory identity, including adopted
+workspaces whose main checkout is not open. Adoption retains a known real main
+checkout; branch deletion runs from the surviving common directory rather than
+from the removed linked checkout.
 Subdirectories,
 plain directories and checkouts of unowned repositories refuse
 `worktree_path_not_root` (exit 10, retry `after_human`), even with `--force`.
