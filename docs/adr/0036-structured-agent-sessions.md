@@ -1031,6 +1031,18 @@ The fsync-temp, rename, fsync-directory rule below is unchanged.
   `{stream, stream_seq}` so a reader can jump from the global order into the
   per-agent stream. The global log is the only place where two agents'
   events are ordered against each other.
+- **Queue lifecycle facts (owner decision #1956).** Exactly one persisted
+  global kind, `queue_item_state`, follows a committed queue state transition.
+  Its fields are `agent`, `item_id`, optional `batch_id`, the existing typed
+  `producer`, typed `from` and `to`, `stream: "queue/<agent>"` and the original
+  committed `stream_seq`. The state vocabulary is §3's `queued`, `held`,
+  `stashed`, `delivered`, `done`, `cancelled`, `dropped`, plus `Unknown` for
+  lenient reading. Unknown kinds and facts with unknown states are skipped;
+  their global sequence remains spent. Adds, edits, reorders and checkpoints
+  do not emit this fact. Crash recovery's `delivered → held` does emit it.
+  Snapshot sequence allocation never changes a captured fact's transition
+  sequence. This kind stays local, under existing global retention/rotation;
+  it adds no mesh relay, per-transition kinds, checkpoint or question facts.
 - **Blobs by hash.** A tool result, attachment or thinking block over
   `[sessions] blob_min_bytes` (default 2 KiB) is stored once under
   `<data dir>/blobs/<sha256>` and the stored line keeps `{blob: sha256,

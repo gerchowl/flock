@@ -320,12 +320,13 @@ impl Publisher {
         &mut self,
         snapshot: impl FnOnce() -> Result<Cut, Failure>,
         status: Option<Pending>,
-    ) {
+    ) -> bool {
         let Ok(Capture(after, live)) = self.1.try_recv() else {
-            return;
+            return false;
         };
         capture_locked(&self.0 .1, Capture(after, live), snapshot, status);
         self.0 .2.notify_waiters();
+        true
     }
     pub fn finish(
         &mut self,

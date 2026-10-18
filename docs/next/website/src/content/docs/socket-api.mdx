@@ -1004,3 +1004,19 @@ Remove these settings and callers:
 - The `forward_limit` and `peer_not_configured` routing refusals: known owners route through the mesh or queue while offline; unknown owners without a stored hint are refused as unknown.
 
 Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown keys with file and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
+
+
+### Queue item lifecycle facts
+
+`queue_item_state` is a durable, local event emitted after an existing queue
+item changes state. It carries `agent`, `item_id`, optional `batch_id`, the typed
+`producer`, `from`, `to`, `stream` (`queue/<agent>`) and `stream_seq`. The last
+field identifies the original committed queue transition; the event log's `seq`
+is a separate cursor and orders facts across agents.
+
+Known states are `queued`, `held`, `stashed`, `delivered`, `done`, `cancelled` and
+`dropped`. A reader skips a fact with an unknown state, just as an older reader
+skips an unknown event kind, while preserving the global cursor high-water.
+Adding, editing, reordering or checkpointing items does not emit lifecycle
+facts. Recovery from `delivered` to `held` does. These facts use the existing
+event-log retention and rotation and are not relayed over the mesh.

@@ -32,6 +32,7 @@ pub(in crate::structured::workers) fn journal(root: &SessionConfigDir, n: u32) -
 }
 fn update(cut: Cut) -> Update {
     Update {
+        facts: Vec::new(),
         admitted: None,
         offer: Ok(Offer::NoEligibleItems),
         pending: None,
@@ -376,6 +377,7 @@ fn queue_provider_byte_bound_and_uncertain_durability_close_explicitly() {
     p.capture(|| j.subscription().map_err(Into::into), None);
     pages(&mut failure);
     p.publish(&Update {
+        facts: Vec::new(),
         admitted: None,
         offer: Err(Failure {
             code: ErrorCode::InputWriteUnknown,
@@ -733,4 +735,73 @@ fn queue_provider_high_water_never_rewinds_on_a_stale_status_cut() {
             "rewound retained high-water"
         );
     }
+}
+
+#[test]
+fn queue_global_terminal_facts_keep_order_if_newer_cut_finds_capacity() {
+    use crate::api::queue_event::{QueueItemState, QueueState};
+    let root = root();
+    let (mut service, client) = Service::open(
+        root.path(),
+        "publication-fixture",
+        std::num::NonZeroU64::new(u64::MAX).unwrap(),
+    )
+    .unwrap();
+    let make = |seq| {
+        let mut update = update(Cut {
+            gap: None,
+            records: vec![],
+            through: seq,
+        });
+        update.facts.push(QueueItemState {
+            agent: "publication-fixture".into(),
+            item_id: format!("item-{seq}"),
+            batch_id: None,
+            producer: crate::structured::queue::model::Producer::Human,
+            from: QueueState::Delivered,
+            to: QueueState::Held,
+            stream: "queue/publication-fixture".into(),
+            stream_seq: seq,
+        });
+        update
+    };
+    for seq in 1..=5 {
+        service.pending = Some(make(seq));
+        service.flush(true, &|| ());
+    }
+    let mut seqs = client
+        .update()
+        .unwrap()
+        .facts
+        .into_iter()
+        .map(|f| f.stream_seq)
+        .collect::<Vec<_>>();
+    service.pending = Some(make(6));
+    service.flush(true, &|| ());
+    while let Some(update) = client.update() {
+        seqs.extend(update.facts.into_iter().map(|f| f.stream_seq));
+    }
+    assert_eq!(seqs, [1, 2, 3, 4, 5, 6]);
+    assert!(!client.has_updates());
+}
+
+#[test]
+fn queue_global_empty_capture_wakes_app_once_without_a_new_completion() {
+    let root = root();
+    let (mut service, client) = Service::open(
+        root.path(),
+        "publication-fixture",
+        std::num::NonZeroU64::new(u64::MAX).unwrap(),
+    )
+    .unwrap();
+    let mut reader = client.source.subscribe(None).unwrap();
+    let wakes = std::cell::Cell::new(0);
+    let notify = || wakes.set(wakes.get() + 1);
+    service.capture(&notify);
+    assert_eq!(wakes.get(), 1);
+    assert!(pages(&mut reader)
+        .iter()
+        .any(|p| matches!(p, Page::Synced(0))));
+    service.capture(&notify);
+    assert_eq!(wakes.get(), 1, "idle owner must not generate a wake loop");
 }

@@ -60,7 +60,8 @@ pub struct Report {
     pub authority_retained: bool,
 }
 enum Message {
-    Ready(Runtime),
+    // Runtime owns transport and queue capabilities; keep control messages compact.
+    Ready(Box<Runtime>),
     End(Report),
 }
 struct Worker {
@@ -248,7 +249,7 @@ impl Workers {
                             if cancelled.requested() {
                                 runtime.stop();
                             }
-                            let _ = tx.try_send(Message::Ready(runtime));
+                            let _ = tx.try_send(Message::Ready(Box::new(runtime)));
                             notify.notify_one();
                             let _ = wake.try_send(());
                         },
@@ -340,6 +341,21 @@ impl Workers {
             .as_ref()?
             .queue_update()
     }
+    /// Drain the fixed notification capacity per owned generation, including a removed
+    /// registry row. Historical committed facts must outlive supervisor metadata.
+    /// Queue subscriptions remain fenced separately by queue_source.
+    pub(crate) fn queue_completions(&self, terminal: bool) -> Vec<(String, u64, queue::Update)> {
+        // After stop there can also be one peeked completion and one fact tail.
+        let budget = queue::COMPLETION_CAPACITY + if terminal { 2 } else { 0 };
+        self.entries
+            .iter()
+            .flat_map(|(id, worker)| {
+                (0..budget)
+                    .map_while(|_| worker.runtime.as_ref()?.queue_update())
+                    .map(|update| (id.clone(), worker.generation, update))
+            })
+            .collect()
+    }
     /// Latch cancellation without blocking on preparation, process or I/O cleanup.
     pub fn stop(&self, id: &str, generation: u64) -> bool {
         let Some(worker) = self.entries.get(id).filter(|w| w.generation == generation) else {
@@ -381,7 +397,7 @@ impl Workers {
                         if worker.stop.requested() {
                             runtime.stop();
                         }
-                        worker.runtime = Some(runtime);
+                        worker.runtime = Some(*runtime);
                         changed |= worker.reduce(
                             registry,
                             id,
@@ -481,12 +497,16 @@ impl Workers {
                 changed = true;
             }
         }
-        // Removed records need no completed handle; uncertain ownership must survive.
+        // Keep committed completions after metadata removal; uncertain ownership survives.
         self.entries.retain(|id, worker| {
             worker.join_finished();
             worker.thread.is_some()
                 || !worker.finished
                 || registry.get(id).is_some()
+                || worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(Runtime::retired_queue_facts)
                 || worker
                     .report
                     .as_ref()

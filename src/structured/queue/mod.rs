@@ -6,9 +6,10 @@
 //! A failed write/sync/rename poisons the handle: reopen under the lease to learn
 //! which bytes committed. No success or in-memory change precedes durability.
 //! Optional configured checkpoint policy is available through open_with_policy.
-//! Production worker/event-loop wiring belongs to #1955 under #1803.
+//! The worker exposes committed cuts and transitions through one completion owner.
 #![deny(missing_docs)]
 pub(crate) mod admission;
+mod facts;
 pub mod model;
 mod policy;
 pub use policy::RewritePolicy;
@@ -57,6 +58,7 @@ pub struct Journal {
     directory: File,
     file: File,
     items: Vec<Item>,
+    facts: Vec<crate::api::queue_event::QueueItemState>,
     records: Vec<Value>,
     seq: u64,
     checkpoint: Option<(u64, u64)>,
@@ -171,6 +173,7 @@ impl Journal {
             directory: File::open(dir)?,
             file,
             items: Vec::new(),
+            facts: Vec::new(),
             records: Vec::new(),
             seq: 0,
             checkpoint: None,
@@ -293,6 +296,12 @@ impl Journal {
             this.file.write_all(&bytes)?;
             this.file.sync_data()
         })?;
+        self.facts.extend(facts::transitions(
+            &self.agent,
+            &self.items,
+            &items,
+            record.seq,
+        ));
         self.items = items;
         track_opaque(
             &record.change,

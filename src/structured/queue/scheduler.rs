@@ -115,6 +115,11 @@ impl Scheduler {
     pub fn enqueue(&mut self, item: Item, principal: Principal, gate: Gate) -> Result<(), Failure> {
         self.admission.enqueue(item, principal, gate)
     }
+    pub(in crate::structured) fn take_facts(
+        &mut self,
+    ) -> Vec<crate::api::queue_event::QueueItemState> {
+        self.admission.take_facts()
+    }
     /// Committed state and owned replay cuts for serialized publication.
     pub fn journal(&self) -> &Journal {
         self.admission.journal()

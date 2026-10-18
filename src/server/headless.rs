@@ -1153,11 +1153,7 @@ impl HeadlessServer {
     /// S3a-3 deliberately stops structured sessions before transferring ownership.
     /// Full single-writer session handoff belongs to S7-rest.
     fn stop_structured_before_handoff(&mut self) -> Vec<String> {
-        if let Err(error) = self
-            .app
-            .structured_workers
-            .shutdown(&mut self.app.state.structured_agents)
-        {
+        if let Err(error) = self.app.shutdown_structured_workers() {
             crate::logging::structured_worker_shutdown_failed(&error);
         }
         self.app.state.structured_agents.handoff_unknown()

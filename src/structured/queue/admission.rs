@@ -87,6 +87,9 @@ impl Admission {
         }
         Ok(Self { journal, max_batch })
     }
+    pub(super) fn take_facts(&mut self) -> Vec<crate::api::queue_event::QueueItemState> {
+        self.journal.take_facts()
+    }
     /// Immutable committed state/replay for the worker's serialized publisher.
     pub fn journal(&self) -> &Journal {
         &self.journal

@@ -48,6 +48,7 @@ pub(crate) mod notifications;
 pub(crate) mod owners;
 mod peer_checkout;
 pub(crate) mod questions;
+pub(crate) mod queue_events;
 mod runtime;
 mod session;
 pub mod state;
@@ -370,6 +371,7 @@ pub struct App {
         HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     pub(crate) input_writes: input_writes::InputWrites,
     pub(crate) structured_workers: crate::structured::workers::Workers,
+    queue_events: queue_events::QueueEvents,
     pub render_notify: Arc<Notify>,
     pub render_dirty: Arc<AtomicBool>,
     pub(crate) full_redraw_pending: bool,
@@ -1123,6 +1125,7 @@ impl App {
             last_terminal_size: terminal::size().ok(),
             input_writes: input_writes::InputWrites::default(),
             structured_workers: crate::structured::workers::Workers::new(render_notify.clone()),
+            queue_events: queue_events::QueueEvents::default(),
             render_notify,
             render_dirty,
             full_redraw_pending: false,
