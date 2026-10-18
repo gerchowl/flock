@@ -137,10 +137,10 @@ mod tests {
     }
 
     #[test]
-    fn security2200_display_dedupe_uses_the_admitted_ssh_host_not_the_display_label() {
+    fn security2200_display_dedupe_uses_configured_name_and_admitted_ssh_host() {
         let mut state = crate::app::state::AppState::test_new();
         let mut plain = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
-            name: "Direct display".into(),
+            name: "node-a.invalid".into(),
             ssh: "operator@node-a.invalid:22".into(),
             ..Default::default()
         });

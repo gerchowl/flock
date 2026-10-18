@@ -143,6 +143,14 @@ impl Config {
         self.node_host_warning_with_os(crate::app::os_node_name)
     }
 
+    /// Emit the own-node warning once at server startup, after logging is ready.
+    /// Config readers and status clients only receive the diagnostic as data.
+    pub(crate) fn log_node_host_warning(&self) {
+        if let Some(warning) = self.node_host_warning() {
+            crate::logging::node_host_invalid(&warning);
+        }
+    }
+
     fn node_host_warning_with_os(
         &self,
         os_name: impl FnOnce() -> String,

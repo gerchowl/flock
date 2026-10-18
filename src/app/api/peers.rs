@@ -193,7 +193,10 @@ impl App {
                 // absorbed, and never stored as a second home row either.
                 fleet = snapshot.without_origin_claims(fleet);
                 if let Some(row) = hub_self {
-                    if snapshot.origin.eq_ignore_ascii_case(&hub) {
+                    if hub_key.as_deref().is_some_and(|key| {
+                        crate::peers::row_host_key(Some(&snapshot.origin), "").as_deref()
+                            == Some(key)
+                    }) {
                         snapshot.absorb_hub_self(row);
                     } else {
                         fleet.push(row);

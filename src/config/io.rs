@@ -103,7 +103,6 @@ impl Config {
             }
         };
         if let Some(warning) = loaded.config.node_host_warning() {
-            crate::logging::node_host_invalid(&warning);
             loaded.diagnostics.push(warning.to_string());
         }
         loaded
@@ -775,6 +774,13 @@ fn validate_peers(
             diagnostics.push("invalid [[peers]] entry: missing name; entry ignored".to_string());
             return false;
         }
+        if crate::peers::row_host_key(Some(&peer.name), "").is_none() {
+            diagnostics.push(format!(
+                "{}: invalid [[peers]].name: use ASCII LDH labels (1-63 bytes each, 253 total) or a canonical IPv6 literal; entry ignored",
+                crate::api::error_code::ErrorCode::InvalidParams.as_str(),
+            ));
+            return false;
+        }
         if !seen.insert(peer.name.clone()) {
             diagnostics.push(format!(
                 "duplicate [[peers]] name \"{}\"; later entry ignored",
@@ -1073,9 +1079,31 @@ mod tests {
             assert!(diagnostic.contains("restart"));
             assert!(!diagnostic.contains(raw));
         });
-        assert!(logs.contains("config.node_host_invalid"));
-        assert!(logs.contains("invalid_node_host"));
+        assert!(!logs.contains("config.node_host_invalid"));
         assert!(!logs.contains(raw));
+        let config = Config {
+            name: raw.into(),
+            ..Default::default()
+        };
+        let startup = crate::logging::capture_logs(|| config.log_node_host_warning());
+        assert_eq!(startup.matches("config.node_host_invalid").count(), 1);
+        assert!(startup.contains("invalid_node_host"));
+        assert!(!startup.contains(raw));
+    }
+
+    #[test]
+    fn security2200_config_refuses_invalid_peer_names_but_keeps_ssh_aliases() {
+        let loaded = load_live_config_from_str(
+            "[[peers]]\nname = \"atlas.\"\nssh = \"atlas_ts\"\n[[peers]]\nname = \"atlas\"\nssh = \"atlas_ts\"\n",
+        ).unwrap();
+        assert_eq!(loaded.config.peers.len(), 1);
+        assert_eq!(loaded.config.peers[0].name, "atlas");
+        assert_eq!(loaded.config.peers[0].ssh_target(), "atlas_ts");
+        assert_eq!(loaded.diagnostics.len(), 1);
+        assert!(loaded.diagnostics[0].contains("invalid_params"));
+        assert!(loaded.diagnostics[0].contains("[[peers]].name"));
+        assert!(loaded.diagnostics[0].contains("LDH"));
+        assert!(!loaded.diagnostics[0].contains("atlas."));
     }
 
     #[test]

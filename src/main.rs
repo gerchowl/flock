@@ -780,9 +780,7 @@ fn run() -> io::Result<()> {
     // This is the pre-mission single-process behavior.
 
     init_logging();
-    if let Some(warning) = loaded_config.config.node_host_warning() {
-        logging::node_host_invalid(&warning);
-    }
+    loaded_config.config.log_node_host_warning();
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub =

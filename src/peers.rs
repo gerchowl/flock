@@ -323,6 +323,11 @@ impl PeerDialHealth {
 
 impl PeerSummaryState {
     pub fn new(config: &PeerConfig) -> Self {
+        // Configured names, not SSH aliases, identify first-hand rows even
+        // before the first successful poll. Report an invalid name at admission.
+        if row_host_key(Some(&config.name), "").is_none() {
+            crate::logging::peer_summary_identifier_dropped("host");
+        }
         Self {
             node_id: None,
             peer: config.name.clone(),
@@ -561,11 +566,11 @@ impl FleetSnapshotState {
         &self,
         rows: Vec<crate::api::schema::RelayedFleetPeer>,
     ) -> Vec<crate::api::schema::RelayedFleetPeer> {
-        let origin_key = self.origin.to_ascii_lowercase();
+        let origin_key = row_host_key(Some(&self.origin), "");
         rows.into_iter()
             .filter(
                 |row| match row_host_key(row.host.as_deref(), &row.ssh_target) {
-                    Some(key) => key != origin_key,
+                    Some(key) => origin_key.as_deref() != Some(key.as_str()),
                     None => {
                         crate::logging::peer_summary_identifier_dropped("host");
                         false
@@ -776,12 +781,15 @@ fn merge_relayed_rows(
         return;
     }
     let self_host = crate::app::short_host_name();
-    let self_host_lower = self_host.to_ascii_lowercase();
+    let self_key = row_host_key(Some(&self_host), "");
     for entry in entries {
         let Some(entry) = entry.received() else {
             continue;
         };
-        if entry.origin.eq_ignore_ascii_case(&self_host) {
+        if self_key
+            .as_deref()
+            .is_some_and(|key| row_host_key(Some(&entry.origin), "").as_deref() == Some(key))
+        {
             continue;
         }
         let Some(host_key) = row_host_key(entry.host.as_deref(), &entry.ssh_target) else {
@@ -789,7 +797,7 @@ fn merge_relayed_rows(
         };
         // Admission rejects unsafe host identities before presentation cleaning.
         // Key only after admission; a host identity is preserved exactly.
-        if host_key == self_host_lower {
+        if self_key.as_deref() == Some(host_key.as_str()) {
             // Never store an entry about ourselves as a relayed row — the self
             // row lives on the origin_summary path.
             continue;

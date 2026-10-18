@@ -210,10 +210,27 @@ and instructs the operator to set `name` and restart. It appears in startup
 configuration diagnostics, `flk config check`, and human-readable `flk status`;
 `flk status --json` exposes `{code, message, recovery}` as `node_host_warning`
 when present. Logs emit `config.node_host_invalid` with the typed code, rule and
-recovery, without the rejected name.
+recovery, without the rejected name. The server emits it once after logging is
+initialized; config reads and status clients return diagnostics without emitting
+that startup event.
+
+Configured peer rows use their configured `[[peers]].name` as identity, including
+before a successful poll, through the same strict key function. The SSH alias
+is only a route, so an underscore alias does not invalidate a valid configured
+name. Invalid configured names are refused with a typed configuration diagnostic.
+All other displayed rows require an admitted reported or parsed host key.
+Invalid rows never render, including carried rows whose route was disabled at
+admission. Admission records the typed refusal once; rendering does not log it.
+
+The reserved `<home>` (`HOME_SWITCH_TARGET`) is a carried origin-summary control
+route, not a hostname or SSH destination. It is exempt from fallback SSH-host
+validation when the reported host is absent, and from SSH route validation.
+Any nonempty reported host must still pass the strict rule. The sentinel never
+creates a hostname key or authorizes rendering a keyless row.
 
 An invalid raw host refuses a direct JSON summary, drops a relayed row, or
-disables a carried binary route. Invalid `via` refuses the batch. A content-free
+disables a carried binary route and excludes that row from display. Invalid
+`via` refuses the batch. A content-free
 `peer.summary.identifier_dropped` warning carries `invalid_params` and the fixed
 field name only. Generic deserialization remains data-only. The mesh layout and
 VERSION remain unchanged.

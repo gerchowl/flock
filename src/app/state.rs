@@ -2790,7 +2790,8 @@ impl AppState {
 
     /// Federated peers feeding BOTH the servers band and the spaces list's
     /// remote rows — ONE consolidated dedup (#101 gossip v3 part 4). Key:
-    /// lowercased reported host (fallback: ssh_target). Tie-break tier:
+    /// configured name for a ConfigPeer, otherwise the validated reported host
+    /// or parsed SSH host. Invalid identities never render. Tie-break tier:
     /// locally-polled ConfigPeer (top) → relayed cache (freshest wins by
     /// `origin_last_ok_secs`) → carried snapshot entry → origin summary. On
     /// same-source ties the entry with the smaller `origin_last_ok_secs`
@@ -2814,10 +2815,14 @@ impl AppState {
 
         for (rank, entry_ref, peer) in self.remote_row_candidates() {
             let freshness = row_freshness(peer);
-            let Some(host_key) = row_host_key(peer) else {
-                // A configured alias or disabled legacy row can remain visible
-                // without claiming a hostname derived from its display label.
-                ordered.push((entry_ref, peer, rank, freshness));
+            let host_key = if matches!(&entry_ref, RemotePeerRef::Config { .. }) {
+                crate::peers::row_host_key(Some(&peer.peer), "")
+            } else {
+                row_host_key(peer)
+            };
+            let Some(host_key) = host_key else {
+                // Admission has already recorded the typed refusal. Rendering
+                // never invents a key or repeats that diagnostic each frame.
                 continue;
             };
             if let Some(&idx) = host_to_idx.get(&host_key) {
@@ -2916,7 +2921,7 @@ impl AppState {
         let origin_key = self
             .fleet_snapshot
             .as_ref()
-            .map(|snapshot| snapshot.origin.to_ascii_lowercase());
+            .and_then(|snapshot| crate::peers::row_host_key(Some(&snapshot.origin), ""));
         let mut relayed: Vec<_> = self
             .relayed_fleet_cache
             .iter()
@@ -3013,7 +3018,7 @@ const REMOTE_ROW_RANK_SNAPSHOT: u8 = 2;
 const REMOTE_ROW_RANK_ORIGIN: u8 = 3;
 
 /// Use the same admitted hostname identity as relay and carried-fleet keys.
-/// Unknown identities may be displayed but cannot claim or merge a host row.
+/// Unknown identities have no display key and never render as remote rows.
 pub(crate) fn row_host_key(peer: &crate::peers::PeerSummaryState) -> Option<String> {
     crate::peers::row_host_key(peer.host.as_deref(), &peer.ssh_target)
 }
@@ -3911,6 +3916,90 @@ mod tests {
             "locally polled data outranks a relayed reading: {:?}",
             rows[0].0
         );
+    }
+
+    #[test]
+    fn security2200_trailing_dot_carried_row_is_refused_before_display() {
+        let mut state = AppState::test_new();
+        let plain = crate::peers::peer_to_wire(&crate::peers::PeerSummaryState::new(
+            &crate::config::PeerConfig {
+                name: "node-a.invalid".into(),
+                ..Default::default()
+            },
+        ));
+        let mut bad = plain.clone();
+        bad.host = Some("node-a.invalid.".into()); // guardrails-ok(fixture): deliberately invalid trailing-dot host.
+        let logs = crate::logging::capture_logs(|| {
+            state.fleet_snapshot = Some(crate::peers::FleetSnapshotState::from_wire(
+                crate::protocol::FleetSnapshot {
+                    origin: "home.invalid".into(),
+                    peers: vec![plain, bad],
+                    origin_summary: None,
+                },
+            ));
+        });
+        assert_eq!(logs.matches("peer.summary.identifier_dropped").count(), 1);
+        assert!(logs.contains("invalid_params"));
+        let render_logs = crate::logging::capture_logs(|| {
+            assert_eq!(state.remote_peers().len(), 1);
+            assert_eq!(state.remote_peers().len(), 1);
+        });
+        assert!(
+            render_logs.is_empty(),
+            "rendering must not repeat admission logs"
+        );
+    }
+
+    fn unreachable_config_peer_with_relay(ssh: &str) -> AppState {
+        let mut state = AppState::test_new();
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "atlas".into(),
+            ssh: ssh.into(),
+            ..Default::default()
+        });
+        peer.error = Some("unreachable".into());
+        state.peer_summaries.push(peer);
+        state.relayed_fleet_cache.insert(
+            "atlas".into(),
+            relayed("atlas", 5, std::time::Instant::now()),
+        );
+        state
+    }
+
+    #[test]
+    fn security2200_unreachable_config_peer_dedupes_by_configured_name() {
+        let state = unreachable_config_peer_with_relay("atlas-ts");
+        let rows = state.remote_peers();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].0, RemotePeerRef::Config { .. }));
+    }
+
+    #[test]
+    fn security2200_underscore_ssh_alias_does_not_change_configured_identity() {
+        let state = unreachable_config_peer_with_relay("atlas_ts");
+        let rows = state.remote_peers();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].0, RemotePeerRef::Config { .. }));
+    }
+
+    #[test]
+    fn security2200_invalid_configured_peer_name_is_refused_once() {
+        let mut state = AppState::test_new();
+        let logs = crate::logging::capture_logs(|| {
+            state
+                .peer_summaries
+                .push(crate::peers::PeerSummaryState::new(
+                    &crate::config::PeerConfig {
+                        name: "atlas.".into(),
+                        ssh: "atlas_ts".into(),
+                        ..Default::default()
+                    },
+                ));
+            assert!(state.remote_peers().is_empty());
+            assert!(state.remote_peers().is_empty());
+        });
+        assert_eq!(logs.matches("peer.summary.identifier_dropped").count(), 1);
+        assert!(logs.contains("invalid_params"));
     }
 
     /// The relay cache was insert-only, so a departed host kept its row for
