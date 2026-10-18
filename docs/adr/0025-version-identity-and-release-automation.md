@@ -193,6 +193,8 @@ This differs from local verification against the manifest, whose
 `checksum_mismatch` remains retry class `never`. Both refusals remove the
 temporary upload. Private install-script statuses 30 (transfer mismatch) and 31
 (missing tool) map to the registered errors and never escape as CLI exits.
+These statuses are not collision-free: the remote login shell runs first and can exit with any status, and Perl `die` in shasum can return errno (Linux EROFS is 30).
+Local upload I/O errors take precedence over remote status decoding, preserving their original type rather than reporting transfer corruption.
 Ordinary shell/tool failures, including statuses 2, 126 and 127, remain generic
 install failures with their stderr tail. Registered I/O error codes survive the
 launcher boundary without interpreting stderr text.

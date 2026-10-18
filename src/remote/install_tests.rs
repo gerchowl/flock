@@ -153,7 +153,9 @@ fn dash_shell_errors_preserve_the_real_failure_instead_of_requesting_hash_tools(
             .find(|path| path.is_file())
     });
     let Some(dash) = dash else {
-        // The generic status contract is still checked on systems without dash.
+        let notice =
+            "SKIPPED dash script coverage: dash not found on PATH; generic status checks still run";
+        eprintln!("{notice}"); // guardrails-ok(debug-leftovers): explicit coverage notice required by #2106
         generic_shell_failures_keep_stderr_and_never_become_checksum_refusals();
         return;
     };
@@ -205,4 +207,68 @@ fn dash_shell_errors_preserve_the_real_failure_instead_of_requesting_hash_tools(
             b"old binary"
         );
     }
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // An owned shell drains the fixture upload and reports the resulting mismatch.
+fn local_read_failure_keeps_its_type_before_remote_transfer_mismatch() {
+    #[derive(Debug)]
+    struct ReadFailure;
+    impl std::fmt::Display for ReadFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("fixture source became unreadable")
+        }
+    }
+    impl std::error::Error for ReadFailure {}
+    struct FailingReader(bool);
+    impl io::Read for FailingReader {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if self.0 {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, ReadFailure));
+            }
+            self.0 = true;
+            bytes[..7].copy_from_slice(b"partial");
+            Ok(7)
+        }
+    }
+    let root = crate::test_support::TempDir::socket();
+    let upload = root.path().join("upload");
+    let child = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\"; exit 30", "upload-fixture"])
+        .arg(&upload)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let error = finish_remote_upload(child, &mut FailingReader(false)).unwrap_err();
+    assert_eq!(fs::read(&upload).unwrap(), b"partial");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<ReadFailure>()
+        .is_some());
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // Run the dash fixture with an empty PATH to verify its explicit coverage notice.
+fn missing_dash_reports_the_skipped_script_coverage() {
+    let root = crate::test_support::TempDir::socket();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "remote::install_tests::dash_shell_errors_preserve_the_real_failure_instead_of_requesting_hash_tools",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("PATH", root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("SKIPPED dash script coverage: dash not found on PATH"),
+        "{stderr}"
+    );
 }

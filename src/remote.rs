@@ -1625,7 +1625,7 @@ fn install_remote_flock(
     let expected = crate::checksum::file_sha256(&mut source)?;
     let script = remote_install_script(remote_flock, &expected);
 
-    let mut child = TracedCommand::new("ssh", "remote")
+    let child = TracedCommand::new("ssh", "remote")
         .args(control_plane_jump_args(target)?)
         .arg("-T")
         .arg("-C")
@@ -1639,22 +1639,31 @@ fn install_remote_flock(
         .spawn_traced()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh install: {err}")))?;
 
+    if let Err(error) = finish_remote_upload(child, &mut source) {
+        crate::logging::remote_install_failed(target, &remote_flock.shell_path, &error.to_string());
+        return Err(error);
+    }
+    crate::logging::remote_install_completed(target, &remote_flock.shell_path);
+    Ok(())
+}
+
+/// Reap the upload process and preserve the originating transfer failure.
+fn finish_remote_upload(
+    mut child: std::process::Child,
+    source: &mut impl io::Read,
+) -> io::Result<()> {
     let copy_result = if let Some(mut stdin) = child.stdin.take() {
-        io::copy(&mut source, &mut stdin).map(|_| ())
+        io::copy(source, &mut stdin).map(|_| ())
     } else {
         Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "ssh install stdin missing",
         ))
     };
-    let output = child.wait_with_output()?;
-    if let Err(error) = remote_install_result(output.status, &output.stderr) {
-        crate::logging::remote_install_failed(target, &remote_flock.shell_path, &error.to_string());
-        return Err(error);
-    }
+    let output = child.wait_with_output();
     copy_result?;
-    crate::logging::remote_install_completed(target, &remote_flock.shell_path);
-    Ok(())
+    let output = output?;
+    remote_install_result(output.status, &output.stderr)
 }
 
 /// Stage and verify a received upload before atomically replacing the binary.
