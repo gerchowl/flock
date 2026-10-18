@@ -1,0 +1,1 @@
+- Git refresh now counts typed command and worker failures, avoids caching failed probes, bounds reftable git calls, and reports stalled owned rounds without starting overlapping workers.

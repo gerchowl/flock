@@ -4898,8 +4898,8 @@ pub struct PollerHealthSummary {
     pub pr: PollerHealth,
     /// The periodic git working-tree refresh that keeps sidebar branch /
     /// dirty / ahead-behind numbers accurate (#295). `None` from a peer on
-    /// the previous release; `Some` here always, because the refresher runs
-    /// as long as any workspace exists.
+    /// the previous release. A closed viewer gate or absent/ineligible
+    /// workspaces reports `idle` with its reason; it does not stamp success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_refresh: Option<PollerHealth>,
     /// The `[checks]` runner tick — the scheduler that dispatches script /
@@ -4918,6 +4918,38 @@ pub struct PollerHealthSummary {
     pub peer_poll: Option<PollerHealth>,
 }
 
+/// Why a poller is intentionally inactive or awaiting its next refresh.
+/// Codes contain no paths or host identifiers. Future peer values decode as
+/// `Unknown`; the optional field is ignored by older JSON readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollerReason {
+    /// No rendering app client is attached; the viewer-only gate is closed.
+    NoViewer,
+    /// No workspace exists to refresh.
+    NoWorkspaces,
+    /// Workspaces exist but none supplies a nonempty working directory.
+    NoEligibleWorkspaces,
+    /// No failure is known, but fresh results have not arrived yet.
+    AwaitingRefresh,
+    /// A newer peer supplied an unrecognized reason.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One repository's failed refresh, independent of the worker's health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRepositoryHealth {
+    /// ASCII-escaped checkout basename only, never an absolute filesystem path.
+    pub repo: String,
+    /// Workspace identities disambiguate repositories sharing a basename.
+    pub workspace_ids: Vec<String>,
+    /// Failed probes since this repository's last successful completion.
+    pub consecutive_failures: u32,
+    /// Closed git-refresh error code, never command output or a path.
+    pub last_error: String,
+}
+
 /// One poller's health.
 ///
 /// Carries the raw facts AND a computed verdict on purpose: a watchdog wants
@@ -4926,8 +4958,14 @@ pub struct PollerHealthSummary {
 /// colour a badge. Making either reconstruct the other guarantees they disagree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollerHealth {
-    /// `ok` | `degraded` | `broken`.
+    /// Failed git repositories. Empty/absent for healthy repositories and other pollers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repositories: Vec<GitRepositoryHealth>,
+    /// `ok` | `idle` | `degraded` | `broken`; unknown future values remain readable.
     pub status: String,
+    /// Typed inactivity or pending-refresh reason; absent for other pollers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PollerReason>,
     /// Seconds since the last SUCCESSFUL round. `None` = never succeeded,
     /// which is not the same as "0 seconds ago" and must not render as fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4942,6 +4980,7 @@ pub struct PollerHealth {
     /// Rounds skipped because the previous one had not finished. Sustained
     /// growth means the cadence is shorter than the work.
     pub skipped_rounds: u64,
+    /// Round error, or the first listed repository error for a partial git round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }

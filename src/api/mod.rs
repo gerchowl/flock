@@ -101,3 +101,6 @@ pub(crate) fn effect_exit_code(result: &serde_json::Value) -> Option<i32> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod poller_compat_tests;

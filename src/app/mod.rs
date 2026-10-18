@@ -12,6 +12,7 @@ pub(crate) mod agent_restart;
 mod agent_resume;
 mod agents;
 mod api;
+pub(crate) mod git_repository_health;
 pub(crate) use api::mesh_mail::RecoveredMessage;
 pub(crate) use api::mesh_routes::Completion as MeshRoutesCompletion;
 pub(crate) use api::responses::encode_error_with_data;
@@ -301,10 +302,16 @@ pub struct App {
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
+    /// A timed-out worker retains ownership until its completion arrives.
+    pub(crate) git_refresh_timed_out: bool,
+    /// Last dispatch gate; summaries read it without probing the filesystem.
+    pub(crate) git_refresh_idle: Option<crate::api::schema::PollerReason>,
     /// An issue-guard fetch is running off-loop (#302).
     pub(crate) issue_guard_fetch_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
+    pub(crate) git_repository_failures:
+        HashMap<std::path::PathBuf, (git_repository_health::RepositoryFailure, u32)>,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) next_resize_poll: Instant,
@@ -1012,9 +1019,12 @@ impl App {
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             git_refresh_in_flight: false,
+            git_refresh_timed_out: false,
+            git_refresh_idle: None,
             issue_guard_fetch_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_status_cache: HashMap::new(),
+            git_repository_failures: HashMap::new(),
             last_sidebar_divider_click: None,
             last_pane_click: None,
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
@@ -2661,12 +2671,17 @@ mod tests {
     }
 
     #[test]
-    fn git_refresh_deadline_is_suppressed_while_in_flight() {
+    fn git_refresh_deadline_watches_the_owned_round() {
         let mut app = test_app();
         app.state.workspaces.push(Workspace::test_new("one"));
         app.git_refresh_in_flight = true;
+        let start = Instant::now();
+        app.git_refresh_health.mark_started(start);
 
-        assert_eq!(app.git_refresh_deadline(), None);
+        assert_eq!(
+            app.git_refresh_deadline(),
+            Some(start + Duration::from_secs(crate::health::GIT_REFRESH_MAX_ROUND_SECS))
+        );
     }
 
     #[test]
@@ -2677,6 +2692,8 @@ mod tests {
         app.last_git_remote_status_refresh = previous_refresh;
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            failures: Vec::new(),
+            error: None,
             results: Vec::new(),
             cache_updates: Vec::new(),
         });
@@ -2694,6 +2711,8 @@ mod tests {
         let resolved_identity_cwd = app.state.workspaces[0].resolved_identity_cwd().unwrap();
 
         app.handle_internal_event(AppEvent::GitStatusRefreshed {
+            failures: Vec::new(),
+            error: None,
             results: vec![crate::workspace::WorkspaceGitStatus {
                 workspace_id,
                 resolved_identity_cwd,

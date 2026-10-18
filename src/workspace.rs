@@ -174,6 +174,8 @@ pub struct Workspace {
     pub identity_cwd: PathBuf,
     /// Cached current git branch for the workspace repo.
     pub(crate) cached_git_branch: Option<String>,
+    /// Last known git facts await a successful refresh after a repository failure.
+    pub(crate) git_status_stale: bool,
     /// Cached ahead/behind counts for the workspace repo's current branch upstream.
     pub(crate) cached_git_ahead_behind: Option<(usize, usize)>,
     /// GitHub PR state for the current branch (background gh poller).
@@ -351,6 +353,7 @@ impl Workspace {
                 custom_name: None,
                 identity_cwd: initial_cwd.clone(),
                 cached_git_branch: git_branch(&initial_cwd),
+                git_status_stale: false,
                 cached_git_ahead_behind: None,
                 pr_state: None,
                 cached_git_space: None,
@@ -825,6 +828,7 @@ impl Workspace {
             custom_name: label,
             identity_cwd: identity_cwd.clone(),
             cached_git_branch: git_branch(&identity_cwd),
+            git_status_stale: false,
             cached_git_ahead_behind: None,
             pr_state: None,
             cached_git_space: git_space_metadata(&identity_cwd),
@@ -1153,11 +1157,16 @@ impl Workspace {
         self.git_identity_resolved = true;
     }
 
-    pub fn git_status_snapshot_for_cwd_with_cache(
+    /// Read a snapshot within the owned round deadline, preserving typed probe failures.
+    pub(crate) fn git_status_snapshot_for_cwd_with_cache(
         resolved_identity_cwd: &std::path::Path,
         cached: Option<&GitStatusCacheEntry>,
-    ) -> (WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>) {
-        self::git::git_status_snapshot_for_cwd(resolved_identity_cwd, cached)
+        deadline: std::time::Instant,
+    ) -> Result<
+        (WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>),
+        crate::health::GitRefreshErrorKind,
+    > {
+        self::git::git_status_snapshot_for_cwd(resolved_identity_cwd, cached, deadline)
     }
 
     pub fn find_tab_index_for_pane(&self, pane_id: PaneId) -> Option<usize> {
@@ -1277,6 +1286,7 @@ impl Workspace {
             custom_name: Some(name.to_string()),
             identity_cwd: identity_cwd.clone(),
             cached_git_branch: git_branch(&identity_cwd),
+            git_status_stale: false,
             cached_git_ahead_behind: None,
             pr_state: None,
             cached_git_space: None,

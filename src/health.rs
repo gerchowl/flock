@@ -554,27 +554,45 @@ impl PollerStatus {
 
 /// Why a git-status refresh round failed.
 ///
-/// The refresh worker sends its result back through `AppEvent::
-/// GitStatusRefreshed`. A worker panic (or a send on a closed channel during
-/// shutdown) never delivers that event, and the reap turns that silent stall
-/// into a stamped `Timeout`. There is deliberately no free-text variant.
+/// Closed codes only: command deadlines, process I/O, nonzero exits, malformed
+/// output, worker panics, spawn failures, or a round stalled in filesystem I/O.
+/// No command output, paths, panic payloads or other free text reach summaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitRefreshErrorKind {
+    /// A git subprocess or the aggregate round exhausted its deadline.
     Timeout,
+    /// The owned round has not completed within its sixty-second bound.
+    Stalled,
+    /// Spawning, reading or waiting for a git subprocess failed.
+    GitIo,
+    /// Git exited unsuccessfully (excluding documented absent optional refs).
+    GitExit,
+    /// Git returned malformed UTF-8, counts or a required ref identity.
+    GitOutput,
+    /// The refresh worker unwound before returning its result.
+    WorkerPanic,
+    /// The operating system refused to start the refresh worker.
+    WorkerSpawn,
 }
 
 impl GitRefreshErrorKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Timeout => "timeout",
+            Self::Stalled => "round_stalled",
+            Self::GitIo => "git_io",
+            Self::GitExit => "git_exit",
+            Self::GitOutput => "git_output",
+            Self::WorkerPanic => "worker_panic",
+            Self::WorkerSpawn => "worker_spawn",
         }
     }
 }
 
 /// Longest a git-status refresh round can legitimately be in flight. Git
 /// operations against a slow filesystem (or an SMB-mounted checkout) can take
-/// several seconds; anything past this ceiling is a worker that never
-/// delivered its `GitStatusRefreshed` event.
+/// several seconds. Past this ceiling the watchdog records a stalled round
+/// and retains ownership until completion, rather than reaping its worker.
 pub(crate) const GIT_REFRESH_MAX_ROUND_SECS: u64 = 60;
 
 /// Why the checks runner tick did not stamp success.
