@@ -24,6 +24,8 @@
 # are allowed because the servers band sorts on them, which is the behaviour
 # several of these tests exist to pin.
 atlas = "a fleet hub in sidebar ordering tests"
+"atlas-ts" = "an SSH alias distinct from the configured peer name in identity tests"
+atlas_ts = "an underscore SSH alias with a separate valid configured peer name"
 bastion = "a spoke that reports a different hostname than it is configured as"
 hopper = "the client/home host"
 kiln = "a peer"

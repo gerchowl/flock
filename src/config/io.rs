@@ -776,7 +776,7 @@ fn validate_peers(
         }
         if crate::peers::row_host_key(Some(&peer.name), "").is_none() {
             diagnostics.push(format!(
-                "{}: invalid [[peers]].name: use ASCII LDH labels (1-63 bytes each, 253 total) or a canonical IPv6 literal; entry ignored",
+                "{}: invalid [[peers]].name: use ASCII LDH labels (1-63 bytes each, 253 total) or a canonical IPv6 literal; entry ignored (no polling or routing); rename [[peers]].name, for example name = \"node-a.invalid\"",
                 crate::api::error_code::ErrorCode::InvalidParams.as_str(),
             ));
             return false;

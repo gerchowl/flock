@@ -2790,8 +2790,10 @@ impl AppState {
 
     /// Federated peers feeding BOTH the servers band and the spaces list's
     /// remote rows — ONE consolidated dedup (#101 gossip v3 part 4). Key:
-    /// configured name for a ConfigPeer, otherwise the validated reported host
-    /// or parsed SSH host. Invalid identities never render. Tie-break tier:
+    /// configured name plus admitted reported host after a successful poll for
+    /// a ConfigPeer, otherwise the validated reported or parsed SSH host.
+    /// Both config keys point to one row. Invalid identities never become keys.
+    /// Tie-break tier:
     /// locally-polled ConfigPeer (top) → relayed cache (freshest wins by
     /// `origin_last_ok_secs`) → carried snapshot entry → origin summary. On
     /// same-source ties the entry with the smaller `origin_last_ok_secs`
@@ -2815,12 +2817,26 @@ impl AppState {
 
         for (rank, entry_ref, peer) in self.remote_row_candidates() {
             let freshness = row_freshness(peer);
-            let host_key = if matches!(&entry_ref, RemotePeerRef::Config { .. }) {
-                crate::peers::row_host_key(Some(&peer.peer), "")
-            } else {
-                row_host_key(peer)
-            };
-            let Some(host_key) = host_key else {
+            if matches!(&entry_ref, RemotePeerRef::Config { .. }) {
+                // Config rows come first. Both admitted identities point to
+                // that one row; an SSH alias never supplies a host identity.
+                let keys = [
+                    crate::peers::row_host_key(Some(&peer.peer), ""),
+                    peer.last_ok
+                        .and(peer.host.as_deref())
+                        .and_then(|host| crate::peers::row_host_key(Some(host), "")),
+                ];
+                if keys.iter().all(Option::is_none) {
+                    continue;
+                }
+                let idx = ordered.len();
+                for key in keys.into_iter().flatten() {
+                    host_to_idx.entry(key).or_insert(idx);
+                }
+                ordered.push((entry_ref, peer, rank, freshness));
+                continue;
+            }
+            let Some(host_key) = row_host_key(peer) else {
                 // Admission has already recorded the typed refusal. Rendering
                 // never invents a key or repeats that diagnostic each frame.
                 continue;
@@ -3980,26 +3996,6 @@ mod tests {
         let rows = state.remote_peers();
         assert_eq!(rows.len(), 1);
         assert!(matches!(rows[0].0, RemotePeerRef::Config { .. }));
-    }
-
-    #[test]
-    fn security2200_invalid_configured_peer_name_is_refused_once() {
-        let mut state = AppState::test_new();
-        let logs = crate::logging::capture_logs(|| {
-            state
-                .peer_summaries
-                .push(crate::peers::PeerSummaryState::new(
-                    &crate::config::PeerConfig {
-                        name: "atlas.".into(),
-                        ssh: "atlas_ts".into(),
-                        ..Default::default()
-                    },
-                ));
-            assert!(state.remote_peers().is_empty());
-            assert!(state.remote_peers().is_empty());
-        });
-        assert_eq!(logs.matches("peer.summary.identifier_dropped").count(), 1);
-        assert!(logs.contains("invalid_params"));
     }
 
     /// The relay cache was insert-only, so a departed host kept its row for

@@ -525,11 +525,15 @@ original SSH destination stays unchanged. Trailing-dot, underscore and malformed
 fallbacks are refused before keying. A bare IPv6 destination is an address;
 use brackets when specifying a port. Host keys do not resolve DNS aliases.
 
-Configured peer rows use `[[peers]].name` as their identity, including before the
-first successful poll, with the same strict validation. Their `ssh` alias is a
-route, so a valid name works with an underscore alias. An invalid configured
-name produces a typed diagnostic and is refused, rather than becoming a keyless
-row. Other remote rows require an admitted reported or parsed host key too.
+Before the first successful poll, a configured peer has its strict
+`[[peers]].name` identity key. Afterward, its key set also includes the strict
+admitted reported host. Relay and carried rows matching either member collapse
+into the config peer's one row. Invalid members supply no key; SSH aliases never
+supply identity. A valid name therefore works with an underscore SSH alias.
+Entries with invalid configured names are ignored entirely: no polling or
+routing. The typed config-load diagnostic asks you to rename the name, for
+example `name = "Node A"` to `name = "node-a.invalid"`; the SSH alias can stay
+unchanged. Other remote rows also require an admitted reported or parsed key.
 
 A node with an invalid configured or OS name gets its own `invalid_node_host`
 warning at startup and in `flk config check` and `flk status`, including the rule

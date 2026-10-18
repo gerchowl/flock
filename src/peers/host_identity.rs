@@ -140,11 +140,12 @@ mod tests {
     fn security2200_display_dedupe_uses_configured_name_and_admitted_ssh_host() {
         let mut state = crate::app::state::AppState::test_new();
         let mut plain = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
-            name: "node-a.invalid".into(),
+            name: "configured-node.invalid".into(),
             ssh: "operator@node-a.invalid:22".into(),
             ..Default::default()
         });
         plain.host = Some("node-a.invalid".into());
+        plain.last_ok = Some(std::time::Instant::now());
         state.peer_summaries.push(plain);
         let relayed = serde_json::from_value(serde_json::json!({
             "name":"Other display", "ssh_target":"operator@NODE-A.invalid:2222",
@@ -157,6 +158,11 @@ mod tests {
             "hub.invalid",
         );
         assert_eq!(state.relayed_fleet_cache.len(), 1);
-        assert_eq!(state.remote_peers().len(), 1);
+        let rows = state.remote_peers();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            rows[0].0,
+            crate::app::state::RemotePeerRef::Config { .. }
+        ));
     }
 }

@@ -1977,6 +1977,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn security2200_successful_poll_aliases_configured_and_reported_identity() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = crate::config::Config {
+            peers: vec![crate::config::PeerConfig {
+                name: "atlas".into(),
+                ssh: "atlas-ts".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let rows: [crate::api::schema::RelayedFleetPeer; 2] =
+            ["atlas", "atlas-mbp.invalid"].map(|host| {
+                serde_json::from_value(serde_json::json!({
+                    "name": "Relayed display", "ssh_target": format!("operator@{host}"),
+                    "host": host, "origin": "hub.invalid"
+                }))
+                .unwrap()
+            });
+        app.handle_internal_event(AppEvent::PeerSummaryFetched(
+            crate::peers::PeerSummaryFetch {
+                peer: "atlas".into(),
+                stream_error: None,
+                result: Ok(crate::peers::PeerSummaryPayload {
+                    node_id: None,
+                    outbound_pending: false,
+                    host: "atlas-mbp.invalid".into(),
+                    version: None,
+                    protocol: None,
+                    icon: None,
+                    system: None,
+                    workspaces: Vec::new(),
+                    latency_ms: 1,
+                    relayed_fleet: rows.into(),
+                }),
+            },
+        ));
+        assert!(app.state.peer_summaries[0].last_ok.is_some());
+        let carried = crate::peers::peer_to_wire(&app.state.peer_summaries[0]);
+        app.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState::from_wire(
+            crate::protocol::FleetSnapshot {
+                origin: "home.invalid".into(),
+                peers: vec![carried],
+                origin_summary: None,
+            },
+        ));
+        let visible = app.state.remote_peers();
+        assert_eq!(visible.len(), 1);
+        assert!(matches!(
+            visible[0].0,
+            crate::app::state::RemotePeerRef::Config { .. }
+        ));
+        assert_eq!(visible[0].1.peer, "atlas");
+    }
+
+    #[tokio::test]
     async fn peer_summary_fetch_merges_into_state() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = crate::config::Config::default();

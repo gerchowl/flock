@@ -214,10 +214,15 @@ recovery, without the rejected name. The server emits it once after logging is
 initialized; config reads and status clients return diagnostics without emitting
 that startup event.
 
-Configured peer rows use their configured `[[peers]].name` as identity, including
-before a successful poll, through the same strict key function. The SSH alias
-is only a route, so an underscore alias does not invalidate a valid configured
-name. Invalid configured names are refused with a typed configuration diagnostic.
+Configured peer rows start with their strict `[[peers]].name` key. After the
+first successful poll, their identity set also includes the strict admitted
+reported-host key. A relayed or carried row matching either member collapses
+into the config peer's one row. Invalid members are absent, never raw-text
+fallbacks. The SSH alias supplies no identity, so an underscore alias works with
+a valid configured name. Invalid configured names cause the entire entry to be
+ignored: no polling or routing. The typed config-load diagnostic asks the
+operator to rename `[[peers]].name`, for example from `Node A` to
+`node-a.invalid`; the SSH alias can stay unchanged.
 All other displayed rows require an admitted reported or parsed host key.
 Invalid rows never render, including carried rows whose route was disabled at
 admission. Admission records the typed refusal once; rendering does not log it.

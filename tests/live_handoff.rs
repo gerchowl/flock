@@ -1656,6 +1656,39 @@ fn security2200_status_and_config_check_explain_an_invalid_own_node_name() {
 }
 
 #[test]
+fn security2200_config_load_explains_ignored_peer_names_and_rename_recovery() {
+    let directory = SocketDir::reserve("np2200");
+    let base = directory.path();
+    let config = base.join("config.toml");
+    let source = "name=\"operator.invalid\"\nonboarding=false\n[[peers]]\nname=\"Bad Peer\"\nssh=\"node_a.invalid\"\n";
+    fs::write(&config, source).unwrap();
+    let mut command = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"));
+    command
+        .args(["config", "check", "--json"])
+        .envs(support::environment::isolated_env(
+            &base.join("config"),
+            &base.join("runtime"),
+        ))
+        .env_remove("FLOCK_NAME")
+        .env_remove("FLOCK_HOST_NAME")
+        .env("FLOCK_CONFIG_PATH", &config);
+    let checked = command.output().unwrap();
+    assert_eq!(checked.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&checked.stdout).unwrap();
+    let diagnostics = json["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{json}");
+    let diagnostic = diagnostics[0].as_str().unwrap();
+    assert!(diagnostic.contains("invalid_params"));
+    assert!(diagnostic.contains("[[peers]].name"));
+    assert!(diagnostic.contains("entry ignored"));
+    assert!(diagnostic.contains("no polling or routing"));
+    assert!(diagnostic.contains("rename"));
+    assert!(diagnostic.contains(r#"name = "node-a.invalid""#));
+    assert!(!diagnostic.contains("Bad Peer"));
+    assert_eq!(fs::read_to_string(config).unwrap(), source);
+}
+
+#[test]
 fn config_check_json_and_cli_warnings_name_source_keys() {
     let directory = SocketDir::reserve("hlh");
     let base = directory.path().to_path_buf();

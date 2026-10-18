@@ -323,11 +323,6 @@ impl PeerDialHealth {
 
 impl PeerSummaryState {
     pub fn new(config: &PeerConfig) -> Self {
-        // Configured names, not SSH aliases, identify first-hand rows even
-        // before the first successful poll. Report an invalid name at admission.
-        if row_host_key(Some(&config.name), "").is_none() {
-            crate::logging::peer_summary_identifier_dropped("host");
-        }
         Self {
             node_id: None,
             peer: config.name.clone(),
