@@ -60,7 +60,6 @@ struct AdmissionFixture {
     app: App,
     server: Option<crate::api::ServerHandle>,
     socket: PathBuf,
-    _relative_root: Option<crate::structured::launch::SessionConfigDir>,
     fixture: Fixture,
     _env: Environment,
 }
@@ -89,14 +88,11 @@ impl AdmissionFixture {
         let mut path = vec![root.to_owned()];
         path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
         env.set("PATH", Some(std::env::join_paths(path).unwrap()));
-        let relative_root = relative.then(|| {
-            crate::structured::launch::SessionConfigDir::create(std::path::Path::new("."))
-                .expect("owned relative listener directory")
-        });
-        let socket = relative_root.as_ref().map_or_else(
-            || root.join("api.sock"),
-            |directory| PathBuf::from(directory.path().file_name().unwrap()).join("api.sock"),
-        );
+        let socket = if relative {
+            PathBuf::from("relative.sock")
+        } else {
+            root.join("api.sock")
+        };
         env.set("FLOCK_SOCKET_PATH", Some(socket.clone().into()));
         fs::create_dir_all(crate::config::config_dir()).unwrap();
         let cwd = root.join("project");
@@ -124,7 +120,15 @@ impl AdmissionFixture {
         let mut server = crate::api::server::start_server_with_capabilities(
             tx,
             hub.clone(),
-            None,
+            Some(crate::api::schema::ServerCapabilities {
+                structured_agents: true,
+                live_handoff: false,
+                pane_input_write_ack: false,
+                node_id: None,
+                clone_detection_warning: None,
+                agent_start_label: true,
+                agent_questions: true,
+            }),
             policy.clone(),
         )
         .expect("ordinary listener startup");
@@ -138,7 +142,6 @@ impl AdmissionFixture {
             app,
             server: Some(server),
             socket,
-            _relative_root: relative_root,
             fixture,
             _env: env,
         };
@@ -551,6 +554,31 @@ async fn socket_structured_start_refuses_unavailable_launcher_and_unsupported_se
 /// Provisioning uses the actual listener handle and normal mesh initialization.
 #[tokio::test]
 async fn startup_with_relative_socket_keeps_legacy_routes_available() {
+    if std::env::var_os("FLK_RELATIVE_FIXTURE_CHILD").is_none() {
+        let cwd = crate::test_support::TempDir::socket();
+        let mut command = crate::process::TracedCommand::new(
+            std::env::current_exe().unwrap(),
+            "relative-socket-fixture",
+        );
+        command.args(["--exact", "app::api::structured_start::tests::startup_with_relative_socket_keeps_legacy_routes_available", "--nocapture", "--test-threads=1"])
+            .env_clear().env("PATH", std::env::var_os("PATH").unwrap())
+            .env("FLK_RELATIVE_FIXTURE_CHILD", "1")
+            .current_dir(cwd.path()).process_group(0);
+        let output = command
+            .output_traced_with_timeout_and_limit(LIMIT, 1024 * 1024)
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "relative socket fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fs::read_dir(cwd.path()).unwrap().next().is_none(),
+            "fixture listener must clean up"
+        );
+        return;
+    }
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = AdmissionFixture::with_endpoint("s4-accepted-silent", 5000, true, false);
     assert!(!fixture.socket.is_absolute());
