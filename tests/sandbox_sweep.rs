@@ -6,6 +6,7 @@ mod support;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Stdio};
 use std::time::{Duration, Instant};
@@ -209,9 +210,41 @@ impl Drop for Probe {
     }
 }
 
+fn assert_recorded_file_identity(probe: &Probe) {
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            probe
+                .base
+                .join(format!(".server-{}.json", probe.record().pid)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let metadata = fs::metadata(&probe.record().binary).unwrap();
+    assert_eq!(
+        value["file_identity"],
+        serde_json::json!({
+            "device": metadata.dev(),
+            "inode": metadata.ino(),
+            "size": metadata.size(),
+            "modified_secs": metadata.mtime(),
+            "modified_nanos": metadata.mtime_nsec(),
+        }),
+        "durable identity must describe the file captured before spawn"
+    );
+}
+
+#[test]
+fn normal_launch_records_the_binary_file_identity_and_matches() {
+    let probe = Probe::start();
+    assert_recorded_file_identity(&probe);
+    assert!(probe.record().matches(&probe.base));
+}
+
 #[test]
 fn dead_owner_sweep_stops_the_real_recorded_server_and_removes_probe_copy() {
     let mut probe = Probe::start();
+    assert_recorded_file_identity(&probe);
     let exit = ExitWatch::new(probe.record().pid).unwrap();
     let binary = probe.record().binary.clone();
     probe.orphan();
@@ -340,16 +373,44 @@ fn server_argument_in_a_client_command_never_proves_server_identity() {
 }
 
 #[test]
-fn dead_owner_server_is_recovered_after_its_binary_is_replaced() {
+fn replaced_binary_retains_the_server_until_the_original_identity_is_restored() {
     let mut probe = Probe::start();
     let exit = ExitWatch::new(probe.record().pid).unwrap();
     probe.orphan();
     let old = probe.base.join("old-flk");
     fs::rename(&probe.record().binary, &old).unwrap();
     fs::copy(env!("CARGO_BIN_EXE_flk"), &probe.record().binary).unwrap();
-    fs::remove_file(old).unwrap();
+    assert!(
+        !probe.record().matches(&probe.base),
+        "a replacement at the same path must not authorize a signal"
+    );
     sandboxes::sweep(probe.root.as_ref().unwrap().path());
-    assert!(!probe.base.exists(), "rebuild stranded the recorded server");
+    assert!(probe.base.exists());
+    assert!(process_lifetime::pid_alive(probe.record().pid));
+    fs::rename(old, &probe.record().binary).unwrap();
+    assert!(probe.record().matches(&probe.base));
+    sandboxes::sweep(probe.root.as_ref().unwrap().path());
+    assert!(!probe.base.exists());
+    exit.wait(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn unlinked_binary_retains_the_server_until_the_file_is_restored() {
+    let mut probe = Probe::start();
+    let exit = ExitWatch::new(probe.record().pid).unwrap();
+    probe.orphan();
+    let saved = probe.base.join("saved-flk");
+    fs::rename(&probe.record().binary, &saved).unwrap();
+    assert!(
+        !probe.record().matches(&probe.base),
+        "a missing executable file must not authorize a signal"
+    );
+    sandboxes::sweep(probe.root.as_ref().unwrap().path());
+    assert!(probe.base.exists());
+    assert!(process_lifetime::pid_alive(probe.record().pid));
+    fs::rename(saved, &probe.record().binary).unwrap();
+    sandboxes::sweep(probe.root.as_ref().unwrap().path());
+    assert!(!probe.base.exists());
     exit.wait(Duration::from_secs(5)).unwrap();
 }
 
@@ -636,8 +697,9 @@ fn relative_argv_server_is_recorded_matched_and_swept() {
     assert_eq!(entries.len(), 1);
     let recorded: ServerRecord =
         serde_json::from_slice(&fs::read(entries[0].path()).unwrap()).unwrap();
-    let canonical: PathBuf =
+    let launch: serde_json::Value =
         serde_json::from_slice(&fs::read(probe.base.join(".launch-binary.json")).unwrap()).unwrap();
+    let canonical = PathBuf::from(launch["path"].as_str().unwrap());
     // Cleanup uses the captured launch fact even when the regression writes a
     // relative binary. Assertions inspect the unmodified durable record.
     probe.record = Some(ServerRecord {

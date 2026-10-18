@@ -51,11 +51,14 @@ that describe the bug — is the point of the format.
 
 Before starting a server, the auto-detect test suite sweeps the same sandbox
 namespace. Live owner PIDs are kept. For dead owners, durable `.server-*.json`
-records must prove the recorded native birth time, exact launch argv, and sandbox
-HOME and state directory. Both the birth time and the complete argv are required.
-They survive replacement of a rebuilt executable: neither canonicalizing the
-current binary nor matching Linux's deleted-executable marker authorizes a
-signal. A record whose PID belongs to a process outside that sandbox is refused,
+records must prove the recorded native birth time, exact launch argv, sandbox
+HOME and state directory, and the executable file identity captured before spawn.
+The file identity consists of device, inode, size and nanosecond modification
+time. These cheap metadata checks detect replacement, unlinking and ordinary
+edits without hashing a large test executable. They are not a cryptographic
+signature against deliberate metadata manipulation in these private fixtures.
+Neither a path nor Linux's deleted-executable marker authorizes a signal.
+A record whose PID belongs to a process outside that sandbox is refused,
 even if that process has the expected argv and birth time. Older or incomplete
 records without the required proof are retained and logged.
 
@@ -83,10 +86,17 @@ PID has been reassigned to a live process, are retained.
 
 The copied probe server is recorded by the wrapper; direct and detached
 auto-detect servers are recorded by shared test support. Before spawning, the
-auto-detect launcher resolves and atomically records its canonical binary path,
-then executes that path. PID recording reads that launch fact rather than using
-live `argv[0]` as the binary identity. Missing or unreadable launch facts are
-logged and remain unproven; a launch path alone never authorizes a signal.
+auto-detect launcher resolves and atomically records its canonical binary path
+and file identity, then executes that path. PID recording copies both facts into
+the durable server record rather than using live `argv[0]` as binary identity.
+The Python wrapper captures the same metadata before spawning its copied binary.
+Every match checks the current regular file against that immutable identity.
+Missing launch facts, missing file identity in older records, unavailable files
+and changed metadata are logged and remain unproven. A replaced or unlinked
+binary therefore retains its sandbox and server, even when argv and birth still
+match. Restore the original file at its recorded path to permit recovery, or
+inspect and stop the owned fixture manually. Rebuilding at the same path does
+not renew an existing server's proof.
 Rust tests in
 `tests/sandbox_sweep.rs` exercise the actual wrapper, replacement binaries,
 identity refusals, graceful termination and escalation with real owned processes.

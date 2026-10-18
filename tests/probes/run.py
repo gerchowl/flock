@@ -68,10 +68,14 @@ def main():
             config = base / "c" / app
             config.mkdir()
             (config / "config.toml").write_text("onboarding = false\n")
+        metadata = binary.stat()
+        seconds, nanos = divmod(metadata.st_mtime_ns, 1_000_000_000)
+        file_identity = dict(device=metadata.st_dev, inode=metadata.st_ino, size=metadata.st_size,
+                             modified_secs=seconds, modified_nanos=nanos)
         server = subprocess.Popen([str(binary), "server"], cwd=base, env=env,
                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         record = dict(pid=server.pid, binary=str(binary), home=env["HOME"], state=env["XDG_STATE_HOME"], start_time=process_birth(server.pid),
-                      argv=[str(binary), "server"])
+                      argv=[str(binary), "server"], file_identity=file_identity)
         pending = base / ".server.pending"
         with pending.open("w") as out:
             json.dump(record, out)
