@@ -1,5 +1,5 @@
-//! Authenticated local custody to the single queue owner (ADR-0036 §3/S5,
-//! ADR-0026). Signed native recipient fields fence recovery from legacy claims.
+//! Authenticated message custody to the single queue owner (ADR-0036 §3/S5,
+//! ADR-0026). Verified signatures and native bindings fence recovered custody.
 use super::mesh_mail::{envelope, payload, Payload};
 use super::responses::{encode_error, encode_error_with_data};
 use super::structured_queue::Staged;
@@ -18,19 +18,19 @@ use crate::{
     },
 };
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 /// Deferred response and custody settlement for the owner's admission outcome.
 pub(super) struct Ack {
     key: MessageKey,
     recovered: bool,
+    relay: bool,
     message: PendingMessage,
     request: Option<MessageKey>,
     warnings: Vec<String>,
 }
 impl Ack {
     pub(super) fn refusal(&self, id: String, code: ErrorCode) -> String {
-        // A replay may refer to an already committed admission. Its failure
+        // Relay custody or a replay may refer to a committed admission. Its failure
         // cannot revoke that original custody or promise the sender a refusal.
         let code = if self.recovered {
             ErrorCode::InputWriteUnknown
@@ -44,7 +44,7 @@ impl Ack {
             item_id: Some(item_id),
             message_key: Some(self.key.clone()),
             correlation_id: self.message.correlation_id.clone(),
-            state: "queued".into(),
+            state: if self.relay { "delivered" } else { "queued" }.into(),
             warnings: self.warnings.clone(),
             to_host: None,
             path: None,
@@ -52,21 +52,7 @@ impl Ack {
     }
 }
 fn lifecycle(key: &MessageKey) -> String {
-    let hash = Sha256::digest(format!("{}:{}", key.origin_node, key.message_id).as_bytes());
-    let mut b = [0; 16];
-    b.copy_from_slice(&hash[..16]);
-    // RFC 9562 UUIDv8: the complete custody key supplies the custom digest.
-    b[6] = (b[6] & 15) | 128;
-    b[8] = (b[8] & 63) | 128;
-    let s: String = b.iter().map(|v| format!("{v:02x}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &s[..8],
-        &s[8..12],
-        &s[12..16],
-        &s[16..20],
-        &s[20..]
-    )
+    key.lifecycle_id()
 }
 fn stored<T>(
     op: impl FnOnce(&mut crate::mesh::store::Store) -> crate::mesh::store::Result<T>,
@@ -171,7 +157,7 @@ impl App {
             crate::mesh::sign::seal(&mut signed, &identity);
             let admission =
                 stored(|s| s.accept_local(&signed, CUSTODY_TTL_MS, &target, &session, now as i64))
-                    .and_then(|_| self.admit_local_custody(&signed));
+                    .and_then(|_| self.admit_queue_custody(&signed));
             let (ticket, mut ack) = match admission {
                 Ok(admitted) => admitted,
                 Err(code) => return Ok(admission_error(id.clone(), code, &signed.key)),
@@ -184,13 +170,12 @@ impl App {
             encode_error(id, code.as_str(), "local structured message refused")
         })
     }
-    pub(super) fn verified_local_custody(
+    pub(super) fn verified_queue_custody(
         &self,
         signed: &Envelope,
     ) -> Result<(u64, Payload), ErrorCode> {
         let origin = self.node_id.as_deref().ok_or(ErrorCode::IdentityUnknown)?;
-        if signed.key.origin_node != origin
-            || signed.return_binding.recipient_node != origin
+        if signed.return_binding.recipient_node != origin
             || crate::mesh::sign::verify(signed).is_err()
         {
             return Err(ErrorCode::NotAuthorized);
@@ -200,22 +185,38 @@ impl App {
             .structured_agents
             .get(&signed.target_agent)
             .ok_or(ErrorCode::AgentNotFound)?;
-        if record.session_id != signed.target_session {
+        let remote = signed.key.origin_node != origin;
+        if remote {
+            if let Some(request) = &signed.request_key {
+                self.verified_mesh_answer(request, signed)
+                    .map_err(|_| ErrorCode::NotAuthorized)?;
+            }
+            let name = stored(|s| s.origin_name(&signed.key.origin_node))?;
+            if !self.state.config.msg.accepts_origin(name.as_deref()) {
+                return Err(ErrorCode::MsgNotAllowed);
+            }
+            if stored(|s| s.recipient_binding(&signed.key))?
+                != Some((record.agent_id.clone(), record.session_id.clone()))
+            {
+                return Err(ErrorCode::NotAuthorized);
+            }
+        } else if record.session_id != signed.target_session {
             return Err(ErrorCode::NotAuthorized);
         }
         let data = payload(signed).map_err(|_| ErrorCode::InvalidEnvelope)?;
         if data.message.from_agent.as_deref().unwrap_or_default() != signed.sender
             || data.message.correlation_id != signed.correlation_id
+            || data.message.in_reply_to != signed.in_reply_to
         {
             return Err(ErrorCode::InvalidEnvelope);
         }
         Ok((generation, data))
     }
-    fn admit_local_custody(
+    pub(super) fn admit_queue_custody(
         &mut self,
         signed: &Envelope,
     ) -> Result<(super::structured_queue::Ticket, Ack), ErrorCode> {
-        let (generation, mut data) = self.verified_local_custody(signed)?;
+        let (generation, mut data) = self.verified_queue_custody(signed)?;
         // Recovery snapshots can predate an owner's terminal refusal.
         let current = stored(|s| s.get(&signed.key))?.ok_or(ErrorCode::MessageNotFound)?;
         if current.state != "inbox" {
@@ -224,7 +225,18 @@ impl App {
         self.structured_workers
             .runtime(&signed.target_agent, generation)
             .ok_or(ErrorCode::QueueSourceCold)?;
-        let principal = if signed.sender.is_empty() {
+        let remote = signed.key.origin_node != self.node_id.as_deref().unwrap_or_default();
+        if remote {
+            data.message.from_pane = None;
+            data.message.from_host = Some(signed.key.origin_node.clone());
+            data.message.to_pane = signed.target_agent.clone();
+        }
+        let principal = if remote {
+            Principal::Origin(Producer::NodeAsserted {
+                sender: signed.sender.clone(),
+                origin: signed.key.origin_node.clone(),
+            })
+        } else if signed.sender.is_empty() {
             Principal::Operator
         } else {
             Principal::Origin(Producer::Agent(signed.sender.clone()))
@@ -253,9 +265,14 @@ impl App {
             ticket,
             Ack {
                 key: signed.key.clone(),
-                recovered: false,
+                recovered: remote,
+                relay: remote,
                 message: data.message,
-                request: signed.request_key.clone(),
+                request: if remote {
+                    None
+                } else {
+                    signed.request_key.clone()
+                },
                 warnings: vec![],
             },
         ))
@@ -267,10 +284,14 @@ impl App {
             self.mailboxes.record_delivered(&ack.message);
             if ack.message.intent == crate::api::schema::MsgIntent::Blocking {
                 self.mailboxes.record_blocking(
-                    &super::messages::blocking_budget_key(
-                        ack.message.from_agent.as_deref(),
-                        ack.message.from_pane.as_deref(),
-                    ),
+                    &if ack.relay {
+                        super::messages::blocking_budget_key(None, None)
+                    } else {
+                        super::messages::blocking_budget_key(
+                            ack.message.from_agent.as_deref(),
+                            ack.message.from_pane.as_deref(),
+                        )
+                    },
                     ack.message.enqueued_at_ms,
                 );
             }
@@ -306,7 +327,7 @@ impl App {
             return;
         }
         for signed in std::mem::take(&mut self.structured_sends.recovering) {
-            match self.admit_local_custody(&signed) {
+            match self.admit_queue_custody(&signed) {
                 Ok((ticket, mut ack)) => {
                     ack.recovered = true;
                     let (tx, _rx) = std::sync::mpsc::channel();

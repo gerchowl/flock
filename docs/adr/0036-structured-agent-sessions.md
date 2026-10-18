@@ -933,7 +933,18 @@ same queue (owner decision 5): there is no second input path.
   agent becomes a queue item instead of the inbox nudge and knock order
   (ADR-0026, which superseded the delivery contracts of ADR-0008, ADR-0018
   and ADR-0019; custody and the authenticated origin stay as ADR-0026
-  defines them). A delegate's structured result and receipt become a
+  defines them). Relayed sends and replies use a typed
+  `node_asserted { sender, origin }` producer: "sender as asserted by node origin".
+  The origin is the verified signing node, independent of the forwarding hop;
+  its sender assertion is attribution only, as strong as that node's sender
+  policy. It may have been a permitted caller claim on the originating node.
+  Signature, origin policy and reply capability checks precede admission and
+  are rechecked during recovery. Relays always enter as nonce-framed Messages,
+  never Commands or `Principal::Operator`; they gain no local authority or
+  locally attested sender quota. Remote blocking accounting retains the
+  existing unattested bucket.
+  Existing custody fields carry this proof, with no retroactive attestation
+  marker (architect decision on #1958). A delegate's structured result and receipt become a
   `delegate_result` item for its parent. The Stop-hook recap and nudge
   become server work on `result` (§3a).
 - **Storage.** The queue persists as `queue.jsonl` beside the agent's
