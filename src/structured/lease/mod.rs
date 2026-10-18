@@ -73,6 +73,24 @@ pub struct Lease {
     generation: Generation,
 }
 impl SessionLeases {
+    /// Hold both census views behind a bounded fixture-owned barrier.
+    #[cfg(test)]
+    pub(crate) fn test_hold_census(
+        &self,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let leases = self.clone();
+        let (ready, seen) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _live = leases.0.lock();
+            let _published = leases.1.lock();
+            ready.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+        });
+        seen.recv_timeout(Duration::from_secs(10)).unwrap();
+        (release, holder)
+    }
+
     /// Inspect a single record non-blockingly, without exposing PIDs or credentials.
     pub(crate) fn state(&self, agent: &str, session: &str) -> LeaseState {
         let Some(entries) = self.0.try_lock() else {

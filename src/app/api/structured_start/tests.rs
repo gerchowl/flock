@@ -27,11 +27,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{BufRead, BufReader, Write},
-    os::{
-        fd::AsRawFd,
-        unix::net::{UnixListener, UnixStream},
-    },
-    sync::{atomic::AtomicBool, Arc},
+    os::unix::net::UnixStream,
     time::Instant,
 };
 const LIMIT: Duration = Duration::from_secs(10);
@@ -62,12 +58,17 @@ impl Drop for Environment {
 }
 struct AdmissionFixture {
     app: App,
-    listener: UnixListener,
+    server: Option<crate::api::ServerHandle>,
+    socket: PathBuf,
+    _relative_root: Option<crate::structured::launch::SessionConfigDir>,
     fixture: Fixture,
     _env: Environment,
 }
 impl AdmissionFixture {
     fn new(mode: &str, stall_ms: u64) -> Self {
+        Self::with_endpoint(mode, stall_ms, false, false)
+    }
+    fn with_endpoint(mode: &str, stall_ms: u64, relative: bool, unavailable: bool) -> Self {
         let fixture = Fixture::for_socket();
         let root = fixture.root.path();
         let mut env = Environment(vec![]);
@@ -88,7 +89,15 @@ impl AdmissionFixture {
         let mut path = vec![root.to_owned()];
         path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
         env.set("PATH", Some(std::env::join_paths(path).unwrap()));
-        env.set("FLOCK_SOCKET_PATH", Some(root.join("api.sock").into()));
+        let relative_root = relative.then(|| {
+            crate::structured::launch::SessionConfigDir::create(std::path::Path::new("."))
+                .expect("owned relative listener directory")
+        });
+        let socket = relative_root.as_ref().map_or_else(
+            || root.join("api.sock"),
+            |directory| PathBuf::from(directory.path().file_name().unwrap()).join("api.sock"),
+        );
+        env.set("FLOCK_SOCKET_PATH", Some(socket.clone().into()));
         fs::create_dir_all(crate::config::config_dir()).unwrap();
         let cwd = root.join("project");
         fs::create_dir(&cwd).unwrap();
@@ -106,51 +115,40 @@ impl AdmissionFixture {
             "assert sys.argv[1:4] == ['-p', '--input-format', 'stream-json']\nassert '--restricted' in sys.argv and '--strict-mcp-config' in sys.argv\nimport uuid\nuuid.UUID(sys.argv[sys.argv.index('--session-id') + 1])");
         fixture.file("claude", script.as_bytes(), 0o700);
         let config: crate::config::Config = toml::from_str(&format!("[sessions]\nstall_ms = {stall_ms}\nblob_min_bytes = 64\n[structured]\nrun_as = 'operator'\nprofile = 'fixture'\ntoken_file = {:?}\n",root.join("token").to_str().unwrap())).unwrap();
-        let listener = UnixListener::bind(root.join("api.sock")).unwrap();
-        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(&config, true, None, rx, Default::default());
-        app.runtime_config.uid_policy.dedicated = Ok(None).into();
-        app.runtime_config.structured_mcp = Some(fixture.mcp());
-        Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = crate::api::EventHub::default();
+        let policy = crate::structured::identity::UidPolicy {
+            dedicated: Ok(None).into(),
+            ..Default::default()
+        };
+        let mut server = crate::api::server::start_server_with_capabilities(
+            tx,
+            hub.clone(),
+            None,
+            policy.clone(),
+        )
+        .expect("ordinary listener startup");
+        if unavailable {
+            server.mcp_executable = || Err(io::Error::other("private resolver detail canary"));
+        }
+        let mut app = App::new(&config, true, None, rx, hub);
+        app.runtime_config.uid_policy = policy;
+        let initialized = app.initialize_mesh_mail(Some(&server));
+        let fixture = Self {
             app,
-            listener,
+            server: Some(server),
+            socket,
+            _relative_root: relative_root,
             fixture,
             _env: env,
-        }
+        };
+        assert!(
+            initialized.is_ok(),
+            "structured endpoint must not block startup: {initialized:?}"
+        );
+        fixture
     }
     async fn client<T: Send + 'static>(&mut self, call: impl FnOnce() -> T + Send + 'static) -> T {
-        let listener = self.listener.try_clone().unwrap();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        self.app.api_rx = rx;
-        let socket = std::thread::spawn(move || {
-            let mut fd = libc::pollfd {
-                fd: listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: initialized pollfd borrowing the owned short listener.
-            assert_eq!(
-                unsafe { libc::poll(&mut fd, 1, 10_000) },
-                1,
-                "client never connected"
-            );
-            let (stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(LIMIT)).unwrap();
-            let policy = crate::structured::identity::UidPolicy {
-                dedicated: Ok(None).into(),
-                ..Default::default()
-            };
-            crate::api::server::handle_connection(
-                stream,
-                &tx,
-                &Default::default(),
-                &Arc::new(AtomicBool::new(true)),
-                None,
-                &Default::default(),
-                &policy,
-            )
-            .unwrap();
-        });
         let (done, result) = tokio::sync::oneshot::channel();
         let client = std::thread::spawn(move || {
             let _ = done.send(call());
@@ -162,11 +160,10 @@ impl AdmissionFixture {
         self.app.handle_api_request_message(request);
         let result = tokio::time::timeout(LIMIT, result).await.unwrap().unwrap();
         client.join().unwrap();
-        socket.join().unwrap();
         result
     }
     async fn request(&mut self, method: Method) -> Value {
-        let socket = self.fixture.root.path().join("api.sock");
+        let socket = self.socket.clone();
         self.client(move || {
             let mut stream = UnixStream::connect(socket).unwrap();
             stream.set_read_timeout(Some(LIMIT)).unwrap();
@@ -250,6 +247,7 @@ impl Drop for AdmissionFixture {
             .structured_workers
             .shutdown(&mut self.app.state.structured_agents)
             .expect("fixture workers must join");
+        self.server.take().unwrap().finish_for_test();
     }
 }
 
@@ -469,6 +467,23 @@ async fn cli_socket_launch_persists_configured_blob_reference() {
     let reference: crate::structured::blobs::BlobRef =
         serde_json::from_value(stored["message"]["content"][0].clone())
             .expect("production caller must pass loaded storage policy");
+    let registration: Value = serde_json::from_slice(
+        &fs::read(fixture.fixture.root.path().join("observed-mcp.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        registration["mcpServers"]["flock"]["command"],
+        std::env::current_exe()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        registration["mcpServers"]["flock"]["env"]["FLOCK_SOCKET_PATH"],
+        fixture.socket.to_string_lossy().as_ref()
+    );
     let store = crate::structured::blobs::BlobStore::open(&crate::session::data_dir()).unwrap();
     assert_eq!(store.get(&reference.blob).unwrap(), bytes);
 }
@@ -531,4 +546,63 @@ async fn socket_structured_start_refuses_unavailable_launcher_and_unsupported_se
         serde_json::from_value(json!({"name":"fixture-pty", "argv":["claude"]})).unwrap();
     assert_eq!(pty.runtime, crate::api::schema::AgentRuntime::Pty);
     assert!(serde_json::to_value(pty).unwrap().get("runtime").is_none());
+}
+
+/// Provisioning uses the actual listener handle and normal mesh initialization.
+#[tokio::test]
+async fn startup_with_relative_socket_keeps_legacy_routes_available() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::with_endpoint("s4-accepted-silent", 5000, true, false);
+    assert!(!fixture.socket.is_absolute());
+    assert!(fixture.app.runtime_config.structured_mcp.is_some());
+    let response = fixture
+        .request(Method::AgentList(crate::api::schema::EmptyParams {}))
+        .await;
+    assert_eq!(response["result"]["agents"], json!([]));
+}
+
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Failure is local to structured admission, with fixed and typed diagnostics.
+#[tokio::test]
+async fn startup_with_unresolvable_endpoint_warns_and_only_structured_start_refuses() {
+    let _guard = crate::config::test_config_env_guard();
+    let capture = LogCapture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    let mut fixture = tracing::subscriber::with_default(subscriber, || {
+        AdmissionFixture::with_endpoint("s4-accepted-silent", 5000, false, true)
+    });
+    assert!(fixture.app.runtime_config.structured_mcp.is_none());
+    let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        output.contains("structured.mcp.endpoint_unavailable"),
+        "{output}"
+    );
+    assert!(output.contains("server_unavailable"), "{output}");
+    assert!(!output.contains("private resolver detail canary"));
+    let response = fixture
+        .request(Method::AgentList(crate::api::schema::EmptyParams {}))
+        .await;
+    assert_eq!(response["result"]["agents"], json!([]));
+    let params: AgentStartParams = serde_json::from_value(json!({"name":"fixture-launch", "runtime":"structured", "argv":["claude"], "cwd":fixture.fixture.root.path().join("project")})).unwrap();
+    let response = fixture.request(Method::AgentStart(params)).await;
+    assert_eq!(response["error"]["code"], "server_unavailable");
+    assert!(fixture.app.state.structured_agents.records().is_empty());
+    assert!(!fixture.fixture.root.path().join("version.pid").exists());
 }

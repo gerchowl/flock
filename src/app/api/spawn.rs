@@ -711,6 +711,30 @@ mod tests {
         )
     }
 
+    /// PTY attribution stays intact when both structured census copies are busy.
+    #[tokio::test]
+    async fn pty_admit_spawn_maps_registry_contention_to_retryable_session_busy() {
+        let mut app = app_with_one_pane();
+        let (pane_id, agent_id) = caller_pane_is_an_agent(&mut app);
+        let caller = super::SpawnCaller::Agent {
+            ws_idx: 0,
+            pane_id,
+            agent_id,
+        };
+        let (release, holder) = app.session_leases.test_hold_census();
+        let result = app.admit_spawn(crate::spawn::SpawnVerb::Fork, &caller, None);
+        let released = release.send(());
+        holder.join().unwrap();
+        released.unwrap();
+        let refusal = result.expect_err("census contention must refuse without waiting");
+        assert_eq!(refusal, crate::spawn::SpawnRefusal::RegistryBusy);
+        assert_eq!(refusal.code(), "session_busy");
+        assert!(refusal.retryable());
+        let data = super::refusal_data(&refusal);
+        assert_eq!(data["refusal"], "session_busy");
+        assert_eq!(data["retryable"], true);
+    }
+
     /// Off by default. Exposing a spawn verb to agents is the same
     /// "don't autopilot until the operator opts in" surface `[checks.reap]`
     /// models, and it ships the same way.

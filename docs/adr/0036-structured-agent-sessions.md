@@ -2934,13 +2934,14 @@ operator tooling is a follow-up owned by the architect.
 
 ### Amendment: Atomic structured admission (#1843 part 2a)
 
-The Workers owner is the single admission authority for structured launches.
-It checks limits and reserves a pending slot keyed by agent id in one owner
+The Workers owner is the single admission authority for structured launches. It
+checks limits and reserves a pending slot keyed by agent id in one owner
 operation before starting a producer. Counts combine live leases with pending
 slots, deduplicated by agent id. Agent-started launches count toward capacity
-and parent fanout; the attested operator exemption is unchanged. Admission reads the published lease copy nonblockingly, falling back to the live
-copy. If both copies are busy, `session_busy` is a typed retryable refusal.
-Neither path waits on the App thread or changes caller identity.
+and parent fanout; the attested operator exemption is unchanged. Admission reads
+the published lease copy nonblockingly, falling back to the live copy. If both
+copies are busy, `session_busy` is a typed retryable refusal. Neither path waits
+on the App thread or changes caller identity.
 
 A pending slot ends on lease acquisition or launch failure, never on elapsed
 time alone. Pending metadata grants neither caller identity nor signaling
@@ -2953,9 +2954,15 @@ and server start remain gated until part 3 completes narrowed MCP admission.
 The local `agent.start` contract adds the closed selector `runtime` (`pty` by
 absence, `structured` by explicit request) and the optional structured `model`.
 The CLI and socket share App admission and the Workers owner's atomic pending
-reservation. The listener supplies the immutable MCP endpoint. The caller
-cannot supply a binary, MCP endpoint, credential or harness flags: the only
-accepted structured argv is `claude`. `cwd` must resolve to an existing absolute
+reservation. The listener supplies the immutable MCP endpoint. Relative listener
+paths are resolved to absolute paths during endpoint provisioning. Endpoint
+resolution is optional at server startup: failure emits a typed
+`server_unavailable` warning without private resolution details, and a
+structured start refuses with that code before registering metadata or reserving
+capacity. Endpoint recovery takes effect on the next listener initialization.
+Ordinary server startup and PTY routes remain available. The caller cannot
+supply a binary, MCP endpoint, credential or harness flags: the only accepted
+structured argv is `claude`. `cwd` must resolve to an existing absolute
 directory. A resumed identity keeps its native session, cwd and model; launch
 overrides on resume are refused. Structured launches create no pane placement.
 Pane-only placement, focus, dry-run and readiness options are refused rather
