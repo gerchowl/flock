@@ -860,7 +860,7 @@ Replies need no addressing: `flock_msg_reply` carries the incoming `correlation_
 
 Each hop verifies the origin signature and evaluates `[msg] allow_from` against that origin's configured name, never the forwarding hub. An origin without a configured name matches only `"*"`. Forwarders persist custody before acknowledging and delete their body copy after transfer. The origin retains its copy until final receipt or expiry. Requests carry a visited-node list and a hop budget of eight; loops and exhausted budgets retain upstream custody until routing changes. Fleet pause freezes custody and its TTL. Multi-hop answers and receipts are separate mesh work.
 
-The tool table is closed and intentionally read-mostly. Mutating verbs (`pane.close`, `worktree.remove`/`create`, `agent.rename`/`focus`, raw pane `send_*`, `server.*`, `notification.*`, `integration.*`) are not exposed and refuse with JSON-RPC code `-32000` and `data.refusal = "not_exposed_via_mcp"`. Modelled flock refusals (`unsupported_for_agent`, `no_agent_session`, `transcript_not_found`, …) propagate through the same code with the flock error code in `data.refusal`.
+The tool table is closed and intentionally read-mostly. Mutating verbs (`pane.close`, `worktree.remove`/`create`, `agent.rename`/`focus`, `agent.start`, raw pane `send_*`, `server.*`, `notification.*`, `integration.*`) are not exposed and refuse with JSON-RPC code `-32000` and `data.refusal = "not_exposed_via_mcp"`. Modelled flock refusals (`unsupported_for_agent`, `no_agent_session`, `transcript_not_found`, …) propagate through the same code with the flock error code in `data.refusal`.
 
 Exposed tools:
 
