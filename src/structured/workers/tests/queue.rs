@@ -814,10 +814,12 @@ async fn worker_queue_cold_subscription_is_typed_and_generation_fenced() {
         .unwrap();
     drop(journal);
     let before = fs::read(path(&case)).unwrap();
-    assert!(matches!(
-        workers.queue_source(&registry, &case.id, case.generation),
-        Err(ErrorCode::QueueModeUnsupported)
-    ));
+    let refusal = workers
+        .queue_source(&registry, &case.id, case.generation)
+        .err()
+        .unwrap();
+    assert_eq!(refusal.as_str(), "queue_source_cold");
+    assert_eq!(refusal.retry(), crate::cli::exit::Retry::Later);
     assert!(matches!(
         workers.queue_source(&registry, &case.id, case.generation + 1),
         Err(ErrorCode::AgentNotFound)

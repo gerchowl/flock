@@ -310,7 +310,7 @@ impl Workers {
             .queue_enqueue(request)
     }
     /// Warm or recovered generation source; this never performs filesystem work.
-    /// Until a cold recovery is installed, absence is queue_mode_unsupported.
+    /// Until recovery installs a source, return retryable queue_source_cold.
     pub(crate) fn queue_source(
         &self,
         registry: &Registry,
@@ -328,7 +328,7 @@ impl Workers {
                     .filter(|(g, _)| *g == generation)
                     .map(|(_, source)| source.clone())
             })
-            .ok_or(ErrorCode::QueueModeUnsupported)
+            .ok_or(ErrorCode::QueueSourceCold)
     }
     /// Install only a matching namespace/epoch with no live or unconfirmed owner.
     pub(crate) fn install_queue_source(

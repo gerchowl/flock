@@ -149,8 +149,8 @@ impl Service {
         }
         true
     }
-    /// Whether this operation failed at the stdin boundary.
-    pub fn tick(&mut self, input: &InputHandle, stopped: bool, notify: &impl Fn()) -> bool {
+    /// Service replay requests independently of completion backpressure.
+    pub fn capture(&mut self) {
         let blocked = &mut self.blocked;
         let scheduler = &mut self.scheduler;
         self.publisher.capture(
@@ -166,6 +166,10 @@ impl Service {
             },
             self.status.clone(),
         );
+    }
+    /// Whether this operation failed at the stdin boundary.
+    pub fn tick(&mut self, input: &InputHandle, stopped: bool, notify: &impl Fn()) -> bool {
+        self.capture();
         let mut changed = self.initial;
         if let Ok(state) = self.states.try_recv() {
             if state.through >= self.required {
