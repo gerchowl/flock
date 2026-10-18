@@ -1546,3 +1546,42 @@ fn queue_global_facts_never_publish_failed_write_or_sync() {
         drop(peer);
     }
 }
+
+#[test]
+fn custody_completion_real_v2_upgrades_on_first_write_and_v2_refuses_v3() {
+    let root = Root::new();
+    let mut bytes =
+        encode(&json!({"kind":"queue_identity","agent_id":"fixture-agent","format_version":2}))
+            .unwrap();
+    bytes.extend(
+        encode(&Record {
+            seq: 1,
+            change: upsert("v2-item", 0),
+        })
+        .unwrap(),
+    );
+    drop(root.open());
+    fs::write(root.path(), &bytes).unwrap();
+    let mut current = root.open();
+    assert_eq!(current.format_version(), 2);
+    assert_eq!(current.items().len(), 1);
+    current.append(upsert("v3-item", 1)).unwrap();
+    assert_eq!(current.format_version(), 3);
+    drop(current);
+    let bytes = fs::read(root.path()).unwrap();
+    let mut old = Journal::open_inner(&root.0, "fixture-agent", None, true, 2).unwrap();
+    assert_eq!(
+        old.read_only(),
+        Some(ReadOnly::Newer(QueueJournalNewer {
+            found: 3,
+            supported: 2
+        }))
+    );
+    assert!(old
+        .append(upsert("old-item", 2))
+        .unwrap_err()
+        .to_string()
+        .contains("queue_journal_newer"));
+    assert!(old.checkpoint().is_err());
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}

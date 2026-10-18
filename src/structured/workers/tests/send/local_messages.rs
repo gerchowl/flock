@@ -139,7 +139,10 @@ fn local_message_socket_attribution_ack_and_lifecycle_share_one_owner() {
             before == fs::read(identity_path).unwrap(),
             "existing identity material changed"
         );
-        assert_eq!(stored.state, "inbox", "admission is not a read");
+        assert_eq!(
+            stored.state, "delivered",
+            "admission is durable delivery, not a read"
+        );
         assert!(String::from_utf8(disk(&r)).unwrap().contains(&item_id));
         r.until(|r| inputs(r).len() == 1).await;
         let input = inputs(&r).remove(0);
@@ -337,8 +340,8 @@ fn local_message_custody_cut_replays_idempotently_and_preserves_metadata() {
             r.app.structured_sends = Default::default();
             r.app.restore_mesh_mail().unwrap();
             assert!(
-                r.app.mailboxes.reply_meta("crash-cut").is_none(),
-                "cold owner cannot acknowledge custody"
+                r.app.mailboxes.reply_meta("crash-cut").is_some(),
+                "settled custody restores metadata without another owner admission"
             );
         })
         .await;

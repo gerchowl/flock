@@ -33,6 +33,24 @@ impl App {
             )
             .map_err(|e| e.to_string())
         })?;
+        let state = with_store(|s| s.get(&e.key).map_err(|e| e.to_string()))?
+            .ok_or("message_not_found")?
+            .state;
+        match state.as_str() {
+            "delivered" | "read" => return Ok((accepted, true)),
+            "expired" | "inbox_expired" => return Err("message_expired".into()),
+            "recipient_gone" => return Err("recipient_gone".into()),
+            "refused" => {
+                let status = with_store(|s| {
+                    s.status_key(&e.key, now_ms() as i64, None)
+                        .map_err(|e| e.to_string())
+                })?;
+                return Err(status
+                    .and_then(|s| s.detail)
+                    .unwrap_or_else(|| "msg_not_allowed".into()));
+            }
+            _ => (),
+        }
         match self.admit_queue_custody(e) {
             Ok((ticket, ack)) => {
                 if let Some(id) = response_id {
@@ -44,14 +62,7 @@ impl App {
                 }
             }
             Err(code) => {
-                if !self
-                    .structured_sends
-                    .recovering
-                    .iter()
-                    .any(|m| m.key == e.key)
-                {
-                    self.structured_sends.recovering.push(e.clone());
-                }
+                let code = self.retry_queue_custody(e.clone(), code);
                 if response_id.is_some() {
                     return Err(code.as_str().into());
                 }

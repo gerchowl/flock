@@ -503,8 +503,18 @@ impl App {
             delivery_attempts: 0,
             intent,
         };
+        let attested = key.as_ref().and_then(|key| {
+            crate::mesh::hello::with_store(|s| s.get(key).map_err(|e| e.to_string()))
+                .ok()
+                .flatten()
+                .filter(|r| {
+                    self.node_id.as_deref() == Some(r.envelope.key.origin_node.as_str())
+                        && crate::mesh::sign::verify(&r.envelope).is_ok()
+                })
+                .map(|r| r.envelope.sender)
+        });
         if local {
-            if let Some(target) = from_agent.as_ref() {
+            if let Some(target) = attested.as_ref().filter(|s| !s.is_empty()) {
                 match self.structured_send_target(target) {
                     Ok(Some((target, _))) => {
                         return self.local_structured_message(

@@ -22,6 +22,7 @@ use serde_json::json;
 /// Deferred response and custody settlement for the owner's admission outcome.
 pub(super) struct Ack {
     key: MessageKey,
+    signed: Envelope,
     recovered: bool,
     relay: bool,
     message: PendingMessage,
@@ -30,9 +31,8 @@ pub(super) struct Ack {
 }
 impl Ack {
     pub(super) fn refusal(&self, id: String, code: ErrorCode) -> String {
-        // Relay custody or a replay may refer to a committed admission. Its failure
-        // cannot revoke that original custody or promise the sender a refusal.
-        let code = if self.recovered {
+        // A recovered transient outcome keeps its stable key for in-process retry.
+        let code = if self.recovered && transient(code) {
             ErrorCode::InputWriteUnknown
         } else {
             code
@@ -51,6 +51,15 @@ impl Ack {
         }
     }
 }
+fn transient(code: ErrorCode) -> bool {
+    matches!(
+        code.retry(),
+        crate::cli::exit::Retry::Later
+            | crate::cli::exit::Retry::Yes
+            | crate::cli::exit::Retry::Maybe
+            | crate::cli::exit::Retry::AfterInspecting
+    )
+}
 fn lifecycle(key: &MessageKey) -> String {
     key.lifecycle_id()
 }
@@ -65,7 +74,9 @@ fn stored<T>(
 /// uncertain instead: preserve the key so a caller can inspect both stores.
 fn admission_error(id: String, mut code: ErrorCode, key: &MessageKey) -> String {
     if code != ErrorCode::InputWriteUnknown {
-        match stored(|s| s.refuse(key, code.as_str(), super::messages::now_ms() as i64)) {
+        match stored(|s| {
+            s.settle_queue_admission(key, Some(code.as_str()), super::messages::now_ms() as i64)
+        }) {
             Ok(()) | Err(ErrorCode::MessageNotFound) => (),
             Err(failure) => {
                 crate::logging::mesh_custody_failed("structured-refuse", failure.as_str());
@@ -146,7 +157,7 @@ impl App {
                 }
                 if original.envelope.return_binding.request != *key
                     || original.envelope.return_binding.recipient_node != origin
-                    || !matches!(original.state.as_str(), "inbox" | "read")
+                    || !matches!(original.state.as_str(), "inbox" | "read" | "delivered")
                 {
                     return Err(ErrorCode::ReplyUnavailable);
                 }
@@ -198,10 +209,10 @@ impl App {
             if stored(|s| s.recipient_binding(&signed.key))?
                 != Some((record.agent_id.clone(), record.session_id.clone()))
             {
-                return Err(ErrorCode::NotAuthorized);
+                return Err(ErrorCode::RecipientGone);
             }
         } else if record.session_id != signed.target_session {
-            return Err(ErrorCode::NotAuthorized);
+            return Err(ErrorCode::RecipientGone);
         }
         let data = payload(signed).map_err(|_| ErrorCode::InvalidEnvelope)?;
         if data.message.from_agent.as_deref().unwrap_or_default() != signed.sender
@@ -219,8 +230,13 @@ impl App {
         let (generation, mut data) = self.verified_queue_custody(signed)?;
         // Recovery snapshots can predate an owner's terminal refusal.
         let current = stored(|s| s.get(&signed.key))?.ok_or(ErrorCode::MessageNotFound)?;
-        if current.state != "inbox" {
-            return Err(ErrorCode::MessageNotFound);
+        match current.state.as_str() {
+            "inbox" => (),
+            "expired" | "inbox_expired" => return Err(ErrorCode::MessageExpired),
+            "recipient_gone" => return Err(ErrorCode::RecipientGone),
+            "refused" => return Err(ErrorCode::MsgNotAllowed),
+            "delivered" | "read" => return Err(ErrorCode::MessageNotFound),
+            _ => return Err(ErrorCode::MessageNotFound),
         }
         self.structured_workers
             .runtime(&signed.target_agent, generation)
@@ -265,6 +281,7 @@ impl App {
             ticket,
             Ack {
                 key: signed.key.clone(),
+                signed: signed.clone(),
                 recovered: remote,
                 relay: remote,
                 message: data.message,
@@ -280,8 +297,43 @@ impl App {
     /// Recovery waits for an owner/capacity wake, never writes a journal itself.
     /// Unknown origin is retained in custody and refused, never re-attributed.
     pub(crate) fn finish_structured_messages(&mut self, changed: bool) {
+        for (ack, code) in std::mem::take(&mut self.structured_sends.failed) {
+            match stored(|s| s.get(&ack.key)) {
+                Ok(Some(record)) if ack.recovered && record.state == "inbox" => {
+                    self.retry_queue_custody(record.envelope, code);
+                }
+                Ok(Some(record))
+                    if matches!(record.state.as_str(), "refused" | "recipient_gone") =>
+                {
+                    self.structured_sends.retries.remove(&ack.key);
+                    self.publish_queue_refusal(&record.envelope, code)
+                }
+                Err(_) if ack.recovered => {
+                    self.retry_queue_custody(ack.signed, code);
+                }
+                _ => (),
+            }
+        }
         for ack in std::mem::take(&mut self.structured_sends.acknowledged) {
+            let current = stored(|s| s.get(&ack.key));
+            let settled =
+                matches!(&current, Ok(Some(r)) if matches!(r.state.as_str(), "delivered" | "read"));
+            let settlement = if settled {
+                Ok(())
+            } else {
+                stored(|s| {
+                    s.settle_queue_admission(&ack.key, None, super::messages::now_ms() as i64)
+                })
+            };
+            if let Err(code) = settlement {
+                self.retry_queue_custody(ack.signed, code);
+                continue;
+            }
+            self.structured_sends.retries.remove(&ack.key);
             self.mailboxes.record_delivered(&ack.message);
+            if settled {
+                continue;
+            }
             if ack.message.intent == crate::api::schema::MsgIntent::Blocking {
                 self.mailboxes.record_blocking(
                     &if ack.relay {
@@ -323,10 +375,19 @@ impl App {
                 }
             }
         }
-        if !changed {
-            return;
-        }
+        let now = std::time::Instant::now();
         for signed in std::mem::take(&mut self.structured_sends.recovering) {
+            if self.fleet_pause.paused
+                || (!changed
+                    && self
+                        .structured_sends
+                        .retries
+                        .get(&signed.key)
+                        .is_some_and(|r| now < r.at))
+            {
+                self.structured_sends.recovering.push(signed);
+                continue;
+            }
             match self.admit_queue_custody(&signed) {
                 Ok((ticket, mut ack)) => {
                     ack.recovered = true;
@@ -334,13 +395,68 @@ impl App {
                     self.structured_sends
                         .park(Staged(String::new(), ticket, Some(ack)), tx);
                 }
-                Err(ErrorCode::SessionBusy | ErrorCode::QueueSourceCold) => {
-                    self.structured_sends.recovering.push(signed)
-                }
                 Err(code) => {
-                    crate::logging::mesh_custody_failed("structured-restore", code.as_str())
+                    self.retry_queue_custody(signed, code);
                 }
             }
         }
+    }
+    /// Retry the same authenticated envelope using the existing bounded backoff.
+    /// Permanent refusals use the ordinary status event, never a log-only outcome.
+    pub(super) fn retry_queue_custody(&mut self, signed: Envelope, code: ErrorCode) -> ErrorCode {
+        if stored(|s| s.get(&signed.key))
+            .is_ok_and(|r| r.is_none_or(|r| !matches!(r.state.as_str(), "inbox")))
+        {
+            self.structured_sends.retries.remove(&signed.key);
+            return code;
+        }
+        if !transient(code)
+            && stored(|s| {
+                s.settle_queue_admission(
+                    &signed.key,
+                    Some(code.as_str()),
+                    super::messages::now_ms() as i64,
+                )
+            })
+            .is_ok()
+        {
+            self.publish_queue_refusal(&signed, code);
+            self.structured_sends.retries.remove(&signed.key);
+            return code;
+        }
+        let retry = super::mesh_routes::Retry::failed(
+            self.structured_sends.retries.get(&signed.key),
+            0,
+            0,
+            std::time::Instant::now(),
+        );
+        self.structured_sends
+            .retries
+            .insert(signed.key.clone(), retry);
+        if !self
+            .structured_sends
+            .recovering
+            .iter()
+            .any(|e| e.key == signed.key)
+        {
+            self.structured_sends.recovering.push(signed);
+        }
+        if transient(code) {
+            code
+        } else {
+            ErrorCode::InputWriteUnknown
+        }
+    }
+    pub(super) fn publish_queue_refusal(&mut self, signed: &Envelope, code: ErrorCode) {
+        self.emit_event(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::MessageDelivered,
+            data: crate::api::schema::EventData::MessageDelivered {
+                correlation_id: signed.correlation_id.clone(),
+                delivered: false,
+                outcome: format!("refused: {}", code.as_str()),
+                delivery_attempts: 0,
+                latency_ms: 0,
+            },
+        });
     }
 }

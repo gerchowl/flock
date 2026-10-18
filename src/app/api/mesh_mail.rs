@@ -124,6 +124,7 @@ impl App {
         if self.fleet_pause.paused {
             return Err("fleet_paused".into());
         }
+        let attested = self.attested_sender_agent();
         let origin = self
             .node_id
             .as_deref()
@@ -144,6 +145,15 @@ impl App {
             .ok_or("missing recipient")?;
         envelope.target_agent = agent.clone();
         envelope.target_session = session.clone();
+        if attested.is_some() && attested.as_deref() == message.from_agent.as_deref() {
+            let identity =
+                crate::mesh::identity::NodeIdentity::existing().map_err(|e| e.to_string())?;
+            if identity.node_id() != origin {
+                return Err("identity_unknown".into());
+            }
+            crate::mesh::sign::seal(&mut envelope, &identity);
+        }
+
         with_store(|store| {
             store
                 .accept_local(&envelope, CUSTODY_TTL_MS, &agent, &session, now_ms() as i64)
@@ -160,7 +170,13 @@ impl App {
             Ok((accepted, delivered)) => encode_success(
                 id,
                 ResponseResult::MsgQueued {
-                    item_id: None,
+                    item_id: (delivered
+                        && self
+                            .state
+                            .structured_agents
+                            .get(&delivery.envelope.target_agent)
+                            .is_some())
+                    .then(|| delivery.envelope.key.lifecycle_id()),
                     message_key: Some(delivery.envelope.key),
                     correlation_id: delivery.envelope.correlation_id,
                     state: if !delivered {
@@ -177,8 +193,11 @@ impl App {
                 },
             ),
             Err(reason) => {
-                if let Some(code @ (ErrorCode::QueueSourceCold | ErrorCode::SessionBusy)) =
-                    ErrorCode::from_code(&reason)
+                if let Some(
+                    code @ (ErrorCode::QueueSourceCold
+                    | ErrorCode::SessionBusy
+                    | ErrorCode::InputWriteUnknown),
+                ) = ErrorCode::from_code(&reason)
                 {
                     return super::responses::encode_error_with_data(
                         id,
@@ -189,6 +208,15 @@ impl App {
                 }
                 let code = if reason == "origin_mismatch" {
                     "origin_mismatch"
+                } else if self
+                    .state
+                    .structured_agents
+                    .get(&delivery.envelope.target_agent)
+                    .is_some()
+                    && ErrorCode::from_code(&reason).is_some()
+                {
+                    ErrorCode::from_code(&reason)
+                        .map_or("mesh_delivery_refused", |code| code.as_str())
                 } else if reason == super::mesh_replies::UNAVAILABLE {
                     "reply_unavailable"
                 } else {
@@ -635,6 +663,8 @@ impl App {
                 .any(|t| t.agent_id.to_string() == record.target);
             // Legacy public-pane records without a native session remain legacy.
             // Placement-free targets and bound native identities require the fence.
+            // Legacy pane targets with no native binding or session retain the
+            // legacy projection, even if their target_agent resembles a native id.
             let native_shape = crate::terminal::AgentId::is_well_formed(&record.message.to_pane)
                 || (crate::terminal::AgentId::is_well_formed(&record.target)
                     && (record
@@ -645,7 +675,18 @@ impl App {
                     && !known_terminal);
             if self.state.structured_agents.get(&record.target).is_some() || native_shape {
                 if let Err(code) = self.verified_queue_custody(&record.envelope) {
-                    crate::logging::mesh_custody_failed("structured-restore", code.as_str());
+                    if matches!(code, ErrorCode::MsgNotAllowed | ErrorCode::RecipientGone)
+                        || matches!(
+                            code.retry(),
+                            crate::cli::exit::Retry::Later
+                                | crate::cli::exit::Retry::AfterInspecting
+                        )
+                    {
+                        self.retry_queue_custody(record.envelope, code);
+                    } else {
+                        crate::logging::mesh_custody_failed("structured-restore", code.as_str());
+                        self.publish_queue_refusal(&record.envelope, code);
+                    }
                     continue;
                 }
                 if !record.read {
@@ -1340,7 +1381,7 @@ pub(crate) fn load_mesh_mail(
         loaded.push(RecoveredMessage {
             message: data.message,
             target,
-            read: record.state == "read",
+            read: matches!(record.state.as_str(), "read" | "delivered"),
             binding: with_store(|s| {
                 s.recipient_binding(&record.envelope.key)
                     .map_err(|e| e.to_string())

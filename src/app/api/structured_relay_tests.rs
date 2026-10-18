@@ -614,3 +614,370 @@ fn relay_queue_cold_custody_returns_typed_keys_then_owner_wake_delivers_once() {
         r.stop().await;
     });
 }
+
+#[test]
+fn custody_completion_settles_and_restart_does_not_admit_again() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2501).await;
+        let d = mail(&r);
+        let rx = request(&mut r, d.clone());
+        assert!(answer(&mut r, &rx).await["result"]["item_id"].is_string());
+        r.until(|_| {
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state
+                != "inbox"
+        })
+        .await;
+        assert_eq!(
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state,
+            "delivered"
+        );
+        r.until(|r| !r.inputs().is_empty()).await;
+        r.stop().await;
+        r.restart(|r| {
+            r.app.mailboxes = Default::default();
+            r.app.structured_sends = Default::default();
+        })
+        .await;
+        r.app.restore_mesh_mail().unwrap();
+        assert!(r.app.structured_sends.recovering.is_empty());
+        assert!(r
+            .app
+            .mailboxes
+            .reply_meta(&d.envelope.correlation_id)
+            .is_some());
+        assert_eq!(r.inputs().len(), 1);
+        r.stop().await;
+    });
+}
+#[test]
+fn custody_completion_permanent_recovery_refusal_is_terminal_and_visible() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2502).await;
+        let d = mail(&r);
+        let record = &r.app.state.structured_agents.get(&r.case.id).unwrap().0;
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (&record.agent_id, &record.session_id),
+                false,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        r.app.state.config.msg.allow_from = vec!["different.example".into()];
+        r.app.structured_sends.recovering.push(d.envelope.clone());
+        r.app.finish_structured_messages(true);
+        assert_eq!(
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state,
+            "refused"
+        );
+        assert!(r.hub.events_after(0).iter().any(|(_,event)| matches!(&event.data,crate::api::schema::EventData::MessageDelivered { correlation_id,delivered:false,.. } if correlation_id==&d.envelope.correlation_id)));
+        r.stop().await;
+    });
+}
+#[test]
+fn custody_completion_terminal_duplicate_is_not_retryable() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2503).await;
+        let d = mail(&r);
+        let record = &r.app.state.structured_agents.get(&r.case.id).unwrap().0;
+        let now = crate::app::notifications::now_ms() as i64;
+        with_store(|s| {
+            s.accept_bound_delivery(&d, (&record.agent_id, &record.session_id), false, now)
+                .map_err(|e| e.to_string())?;
+            s.finish(
+                &d.envelope.key,
+                crate::mesh::store::Outcome::InboxExpired,
+                now + CUSTODY_TTL_MS,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let rx = request(&mut r, d);
+        let response = answer(&mut r, &rx).await;
+        assert_eq!(response["error"]["code"], "message_expired", "{response}");
+        r.stop().await;
+    });
+}
+
+#[test]
+fn custody_completion_unknown_retries_in_process_with_the_same_key() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2504).await;
+        let d = mail(&r);
+        let rx = request(&mut r, d.clone());
+        r.app.structured_sends.complete(
+            r.case.id.clone(),
+            r.case.generation,
+            d.envelope.key.lifecycle_id(),
+            Err(crate::structured::queue::admission::Failure {
+                code: crate::api::error_code::ErrorCode::InputWriteUnknown,
+                source: None,
+            }),
+        );
+        let response = answer(&mut r, &rx).await;
+        assert_eq!(response["error"]["code"], "input_write_unknown");
+        assert_eq!(
+            response["error"]["data"]["message_key"],
+            json!(d.envelope.key)
+        );
+        for retry in r.app.structured_sends.retries.values_mut() {
+            retry.at = std::time::Instant::now();
+        }
+        r.app.finish_structured_messages(false);
+        r.until(|_| {
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state
+                == "delivered"
+        })
+        .await;
+        r.until(|r| !r.inputs().is_empty()).await;
+        assert_eq!(r.inputs().len(), 1);
+        r.stop().await;
+    });
+}
+#[test]
+fn custody_completion_crash_before_settle_recovers_idempotently() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2505).await;
+        let d = mail(&r);
+        let record = &r.app.state.structured_agents.get(&r.case.id).unwrap().0;
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (&record.agent_id, &record.session_id),
+                false,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let (ticket, _ack) = r.app.admit_queue_custody(&d.envelope).unwrap();
+        r.until(|_| {
+            ticket
+                .committed
+                .try_recv()
+                .is_ok_and(|result| result.is_ok())
+        })
+        .await;
+        r.until(|r| !r.inputs().is_empty()).await;
+        assert_eq!(
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state,
+            "inbox"
+        );
+        r.stop().await;
+        r.restart(|r| {
+            r.app.mailboxes = Default::default();
+            r.app.structured_sends = Default::default();
+        })
+        .await;
+        r.app.restore_mesh_mail().unwrap();
+        r.until(|_| {
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state
+                == "delivered"
+        })
+        .await;
+        assert_eq!(r.inputs().len(), 1);
+        r.stop().await;
+    });
+}
+#[test]
+fn custody_completion_session_replacement_is_recipient_gone() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2506).await;
+        let d = mail(&r);
+        let mut record = r
+            .app
+            .state
+            .structured_agents
+            .get(&r.case.id)
+            .unwrap()
+            .0
+            .clone();
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (&record.agent_id, &record.session_id),
+                false,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        r.stop().await;
+        r.app
+            .state
+            .structured_agents
+            .remove(&r.case.id, r.case.generation)
+            .unwrap();
+        record.session_id = "replacement-session".into();
+        r.app.state.structured_agents.register(record).unwrap();
+        assert_eq!(
+            r.app.verified_queue_custody(&d.envelope).err(),
+            Some(crate::api::error_code::ErrorCode::RecipientGone)
+        );
+        r.app.structured_sends.recovering.push(d.envelope.clone());
+        r.app.finish_structured_messages(true);
+        assert_eq!(
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state,
+            "recipient_gone"
+        );
+        assert!(r.app.structured_sends.recovering.is_empty());
+    });
+}
+#[test]
+fn custody_completion_legacy_sender_claim_never_routes_to_a_queue() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2507).await;
+        let data: Value = serde_json::from_slice(&mail(&r).envelope.body).unwrap();
+        let mut message: crate::app::mailboxes::PendingMessage =
+            serde_json::from_value(data["message"].clone()).unwrap();
+        message.correlation_id = "legacy-claim".into();
+        message.from_agent = Some(r.case.id.clone());
+        message.from_host = None;
+        r.app.mailboxes.record_delivered(&message);
+        let (tx, rx) = mpsc::channel();
+        let pid = std::process::id();
+        r.app
+            .handle_api_request_message(crate::api::ApiRequestMessage {
+                request: Request {
+                    id: "legacy-reply".into(),
+                    method: Method::MsgReply(
+                        serde_json::from_value(
+                            json!({"correlation_id":"legacy-claim","body":"reply","intent":"fyi"}),
+                        )
+                        .unwrap(),
+                    ),
+                },
+                respond_to: tx,
+                peer_pid: Some(pid),
+                peer_birth: crate::platform::process_start_time(pid),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
+            });
+        let response = answer(&mut r, &rx).await;
+        assert!(response["result"]["item_id"].is_null(), "{response}");
+        assert!(r.app.structured_sends.staged.is_none());
+        assert!(r.app.structured_sends.recovering.is_empty());
+        assert!(r.inputs().is_empty());
+        r.stop().await;
+    });
+}
+
+#[test]
+fn custody_completion_settled_duplicate_needs_no_live_owner() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2508).await;
+        let d = mail(&r);
+        let rx = request(&mut r, d.clone());
+        assert!(answer(&mut r, &rx).await["result"]["item_id"].is_string());
+        r.stop().await;
+        let rx = request(&mut r, d.clone());
+        let response: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            response["result"]["item_id"],
+            d.envelope.key.lifecycle_id(),
+            "{response}"
+        );
+        assert!(r.app.structured_sends.recovering.is_empty());
+    });
+}
+#[test]
+fn custody_completion_backoff_does_not_hot_poll_idle_recovery() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2509).await;
+        let d = mail(&r);
+        let record = &r.app.state.structured_agents.get(&r.case.id).unwrap().0;
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (&record.agent_id, &record.session_id),
+                false,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        r.app.retry_queue_custody(
+            d.envelope.clone(),
+            crate::api::error_code::ErrorCode::InputWriteUnknown,
+        );
+        let at = r.app.structured_sends.retries[&d.envelope.key].at;
+        r.app.finish_structured_messages(false);
+        assert_eq!(r.app.structured_sends.recovering.len(), 1);
+        assert_eq!(r.app.structured_sends.retries[&d.envelope.key].at, at);
+        assert!(r.inputs().is_empty());
+        r.stop().await;
+    });
+}
+
+#[test]
+fn custody_completion_owner_refusal_and_duplicate_keep_the_typed_outcome() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2510).await;
+        let d = mail(&r);
+        let item = crate::structured::queue::tests::item(&d.envelope.key.lifecycle_id());
+        let ticket = r
+            .app
+            .structured_enqueue(
+                r.case.id.clone(),
+                r.case.generation,
+                item,
+                crate::structured::queue::admission::Principal::Operator,
+            )
+            .unwrap();
+        r.until(|_| ticket.committed.try_recv().is_ok_and(|r| r.is_ok()))
+            .await;
+        let rx = request(&mut r, d.clone());
+        let response = answer(&mut r, &rx).await;
+        assert_eq!(
+            response["error"]["code"], "queue_item_conflict",
+            "{response}"
+        );
+        assert_eq!(
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state,
+            "refused"
+        );
+        let rx = request(&mut r, d);
+        let duplicate = answer(&mut r, &rx).await;
+        assert_eq!(
+            duplicate["error"]["code"], "queue_item_conflict",
+            "{duplicate}"
+        );
+        assert!(r.app.structured_sends.recovering.is_empty());
+        r.stop().await;
+    });
+}

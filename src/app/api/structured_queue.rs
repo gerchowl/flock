@@ -67,6 +67,8 @@ pub(crate) struct Sends {
     parked: Vec<Parked>,
     pub(super) acknowledged: Vec<super::structured_messages::Ack>,
     pub(super) recovering: Vec<crate::mesh::store::Envelope>,
+    pub(super) retries: HashMap<crate::mesh::key::MessageKey, super::mesh_routes::Retry>,
+    pub(super) failed: Vec<(super::structured_messages::Ack, ErrorCode)>,
     pub staged: Option<Staged>,
 }
 impl Sends {
@@ -109,6 +111,7 @@ impl Sends {
             }
         });
         let acknowledged = &mut self.acknowledged;
+        let failed = &mut self.failed;
         self.parked.retain_mut(|(id, receipt, reply, ack)| {
             let result = match receipt.try_recv() {
                 Ok(result) => result,
@@ -129,7 +132,11 @@ impl Sends {
                     encode_success(id.clone(), response)
                 }
                 Err(code) => match ack.take() {
-                    Some(ack) => ack.refusal(id.clone(), code),
+                    Some(ack) => {
+                        let response = ack.refusal(id.clone(), code);
+                        failed.push((ack, code));
+                        response
+                    }
                     None => encode_error(
                         id.clone(),
                         code.as_str(),

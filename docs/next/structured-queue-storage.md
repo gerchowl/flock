@@ -221,3 +221,35 @@ The ADR-0036 §4 owner decisions in #1820 and #1922 separate three cases:
 Persistence remains fsync of the temporary file, rename, then fsync of the
 directory. Disk operations are blocking worker operations and must never run
 on the server event loop or during render.
+
+### Message custody completion (ADR-0036 §3/S5)
+
+A successful queue-owner commit transfers the existing native-bound custody
+record from `inbox` to `delivered`. This means durable queue admission, not a
+recipient read. Its signed payload and reply binding remain available under
+existing outcome retention. Reopen restores reply metadata without admitting
+again or spending the sender's blocking budget again. A crash between queue
+commit and custody settlement replays the same MessageKey-derived lifecycle ID,
+which the single queue owner admits idempotently.
+
+Recovered transient failures, including `input_write_unknown`, retain the same
+custody key and retry in the running process using the existing bounded,
+jittered retry policy (up to five minutes). Owner progress can wake a waiting
+admission sooner. Fleet pause suspends admission. Permanent refusals settle the
+existing `refused` or `recipient_gone` outcome and emit `message_delivered` with
+`delivered: false`; ordinary `msg.status` exposes the refusal and its detail.
+Refused duplicates retain the recorded refusal code (legacy rows without a
+reason use `msg_not_allowed`). Expired and refused duplicates return a terminal code instead of restarting
+admission. A changed native session returns `recipient_gone`.
+
+A local reply enters a structured queue only when its original sender comes
+from a verified, locally signed envelope. Claimed legacy `from_agent` metadata
+retains the terminal reply path and grants no structured routing authority.
+No custody schema, identity material, mesh version, or event kind changes.
+
+Unverifiable recovery records and unknown native identities remain raw in
+custody and never enter a legacy mailbox or queue. The existing refusal event
+exposes the typed failure; correcting that evidence requires operator action.
+Fresh terminal-bound messages are sealed only when their sender matches the
+authenticated caller, so legitimate replies can prove a structured sender while
+unsigned legacy sender claims remain on the terminal path.
