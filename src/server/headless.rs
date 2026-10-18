@@ -1304,6 +1304,7 @@ impl HeadlessServer {
             return Err(HandoffError::Undrained(undrained));
         }
 
+        self.app.prepare_retained_save();
         let snapshot = crate::persist::capture(
             &self.app.state.structured_agents,
             &self.app.state.workspaces,

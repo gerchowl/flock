@@ -432,7 +432,36 @@ Unknown pane runtime tags also survive restore/save and disable automatic agent
 resume for that pane only; its hibernation request and shell placement survive,
 and other panes retain normal resume behavior. A registry-only session remains
 persistable even when it contains only inactive raw entries and no terminal
-workspaces; #1853 tracks the lifetime of retained-only records. Both the temporary
+workspaces.
+
+**Retained-record lifetime (owner decision, #1853).** Inactive records with an
+unknown nonempty runtime or harness tag are **FORWARD** data: a newer flk may
+understand them, so a rollback never auto-prunes them, regardless of age/count.
+Supported-tag records that are invalid or shadowed duplicates are **DEAD**.
+On save, prune DEAD records strictly older than `RETAINED_DEAD_MAX_AGE` (30 days)
+and then enforce `RETAINED_DEAD_MAX` (256), oldest first. Equal timestamps use
+original array order. The injected clock determines age; a backward clock never
+ages a record early. Missing stamps receive the next save's time, not an invented
+historical age. A failed wall clock or an unknown sidecar collection format logs
+a warning and refuses automatic retention maintenance, preserving data.
+
+`first_seen_ms` is Unix milliseconds in the additive `structured_retention`
+sidecar field, never a property inserted into preserved record JSON. Each entry
+binds a timestamp to the serialized slot and a SHA-256 digest of the record's
+JSON representation. Mismatched or invalid sidecar entries are logged and kept
+raw; matching entries preserve extra fields. Recognized stamps precede opaque
+entries so stale duplicates cannot replace the active timestamp. Cold restore,
+compaction, subsequent saves and live handoff carry these stamps. Older binaries
+may drop this new sidecar on save; missing stamps then restart conservatively on
+the next new-binary save. Retention timestamps never supply runtime observations,
+lease evidence or authority.
+
+A non-array `structured_agents` collection remains raw and inactive and refuses
+admission with typed `RegistryError::UnsupportedCollectionShape`, naming the
+session-state repair guide. Never discard the whole session because of a bad
+entry. The operator list/purge commands and doctor counts/hints are the separate
+second PR of #1853; they are not enabled by this policy/persistence slice.
+Both the temporary
 snapshot file before rename and its parent directory after rename are fsynced.
 A directory sync failure after successful replacement is logged as a durability
 warning and the save reports success because the new file is already installed.

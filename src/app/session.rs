@@ -30,12 +30,26 @@ impl App {
         result
     }
 
+    /// Run save-time maintenance at the runtime boundary, keeping registry/capture pure.
+    pub(crate) fn prepare_retained_save(&mut self) {
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(elapsed) => self
+                .state
+                .structured_agents
+                .prepare_retained_save(elapsed.as_millis().min(u64::MAX as u128) as u64),
+            Err(error) => {
+                tracing::warn!("retained maintenance refused: invalid wall clock: {error}")
+            }
+        }
+    }
+
     pub(crate) fn save_session_now(&mut self) {
         if self.no_session {
             self.session_save_deadline = None;
             return;
         }
 
+        self.prepare_retained_save();
         if self.state.workspaces.is_empty() && self.state.structured_agents.is_empty() {
             crate::persist::clear();
         } else {
@@ -273,6 +287,75 @@ mod tests {
             let saved: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             assert_eq!(saved["structured_agents"], raw);
+        }
+    }
+
+    #[test]
+    fn retained_real_session_save_prunes_dead_and_keeps_forward() {
+        let _guard = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        let _env = SavedEnv(vec![
+            (
+                crate::config::CONFIG_PATH_ENV_VAR,
+                std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR),
+            ),
+            ("XDG_STATE_HOME", std::env::var_os("XDG_STATE_HOME")),
+            ("XDG_CONFIG_HOME", std::env::var_os("XDG_CONFIG_HOME")),
+        ]);
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+        std::fs::create_dir_all(crate::config::config_dir()).unwrap();
+        assert!(crate::session::data_dir().starts_with(root.path()));
+        let path = crate::session::data_dir().join("session.json");
+        let mut entries: Vec<_> = (0..300).map(|i| serde_json::json!({"invalid":i})).collect();
+        entries.push(serde_json::json!({"runtime":"future-runtime","opaque":[1,2]}));
+        let raw = serde_json::Value::Array(entries);
+        {
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "workspaces":[],"active":null,"selected":0,"structured_agents":raw,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut app = App::new(
+                &crate::config::Config::default(),
+                false,
+                None,
+                rx,
+                crate::api::EventHub::default(),
+            );
+            assert!(app.state.workspaces.is_empty());
+            assert!(app.state.structured_agents.records().is_empty());
+            assert_eq!(app.state.structured_agents.retained_count(), 301);
+            app.save_session_now();
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved["structured_agents"].as_array().unwrap().len(), 257);
+            assert_eq!(saved["structured_agents"][0]["invalid"], 44);
+            assert_eq!(saved["structured_agents"][256], raw[300]);
+            let loaded = crate::persist::load().unwrap();
+            assert!(loaded
+                .structured_agents
+                .retained_records()
+                .iter()
+                .all(|r| r.first_seen_ms.is_some()));
+            let stamps = loaded.structured_agents.retained_stamps();
+            assert_eq!(app.state.structured_agents.retained_stamps(), stamps);
+            app.save_session_now();
+            assert_eq!(
+                crate::persist::load()
+                    .unwrap()
+                    .structured_agents
+                    .retained_stamps(),
+                stamps
+            );
         }
     }
 }

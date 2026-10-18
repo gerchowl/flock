@@ -1166,6 +1166,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let snapshot = SessionSnapshot {
             structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1261,6 +1262,7 @@ mod tests {
     ) -> SessionSnapshot {
         SessionSnapshot {
             structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1646,6 +1648,7 @@ mod tests {
         };
         let snapshot = SessionSnapshot {
             structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {

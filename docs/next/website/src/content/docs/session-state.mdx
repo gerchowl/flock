@@ -110,3 +110,47 @@ During a handoff the old server briefly holds two descriptors per pane. On macOS
 | Server restart | No | Yes | Only with pane screen history | Only with native agent session restore |
 | Update without `--handoff` | Compatible servers keep running; restart-required servers may need stop/restart | Yes after restart | Only with pane screen history | Only with native agent session restore |
 | Update with `--handoff` | Best effort for supported running servers | Yes | Yes, from the live terminal if handoff succeeds | Yes, because the process keeps running if handoff succeeds |
+
+
+## Retained structured records
+
+Structured records that this binary cannot activate remain separate from live
+agents (ADR-0036 and ADR-0028 §3a). Unknown nonempty runtime or harness tags are
+**FORWARD** records and are never automatically pruned: downgrading flk must not
+destroy a newer binary's data. Invalid supported-format records and shadowed
+duplicates are **DEAD** records.
+
+Every save stamps newly retained records with `first_seen_ms` in Unix
+milliseconds. The stamp lives in the separate `structured_retention` snapshot
+field; preserved record JSON is unchanged. The sidecar binds each stamp to an
+array slot and a SHA-256 digest. Valid stamps and extra metadata survive cold
+restore, removal/compaction, repeated saves and live handoff. Invalid or newer
+metadata entries remain raw and are logged without their payloads. Older builds
+may discard the sidecar; a missing stamp gets a new conservative first-seen time
+at the next save.
+
+Saves remove DEAD records strictly older than 30 days
+(`RETAINED_DEAD_MAX_AGE`), then keep at most 256 (`RETAINED_DEAD_MAX`), pruning the
+oldest first. Equal timestamps use original record order. A backward clock does
+not age records early. A failed clock or an unknown sidecar collection format
+refuses automatic retention maintenance with a warning, preserving the data.
+FORWARD records have neither an automatic age limit nor an automatic count cap.
+A retained-only session, including opaque metadata, remains persistable.
+
+The operator list/purge commands and doctor reporting are tracked in #1853's
+second PR and are not available in this policy/persistence slice.
+
+### Repair an unknown collection shape
+
+A non-array `structured_agents` collection is preserved inactive. Admission
+fails closed with typed `UnsupportedCollectionShape`, directing you here. Other
+PTY workspaces still load; saves preserve the opaque collection.
+
+Back up `session.json` before making repairs. Inspect the backup with a binary
+that understands its format, preferably the version that wrote it. Never change
+or delete a running server's session file: it owns the in-memory copy and can
+overwrite an external edit. During an operator-controlled offline repair, restore
+a valid array from the backup or a compatible binary; preserve every record you
+do not understand. Do not replace an unknown collection with an empty array just
+to make admission succeed. Likewise preserve an unfamiliar `structured_retention`
+format until a compatible binary can interpret it.
