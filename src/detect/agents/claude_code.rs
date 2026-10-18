@@ -232,6 +232,9 @@ fn has_claude_blocked_prompt(content: &str, lower_content: &str) -> bool {
 /// it would own the last rule, so the region after the last rule is the live
 /// dialog there.
 pub(in crate::detect) fn has_folder_trust_dialog(content: &str) -> bool {
+    if has_folder_trust_with_permissions_dialog(content) {
+        return true;
+    }
     let after_rule = Some(flat_words(content_after_last_horizontal_rule(content)))
         .filter(|flat| flat.ends_with("enter to confirm esc to cancel"));
     trust_dialog_box(content)
@@ -243,6 +246,23 @@ pub(in crate::detect) fn has_folder_trust_dialog(content: &str) -> bool {
                 .iter()
                 .any(|(question, accept)| flat.contains(question) && flat.contains(accept))
         })
+}
+
+/// The live folder-trust variant that also pre-approves configured tools (#1116).
+/// The title, numeric notice, both choices and final confirm footer form one gate.
+pub(in crate::detect) fn has_folder_trust_with_permissions_dialog(content: &str) -> bool {
+    let region = trust_dialog_box(content)
+        .unwrap_or_else(|| content_after_last_horizontal_rule(content).to_string());
+    let flat = flat_words(&region);
+    let notice = flat
+        .split_once("this folder pre approves ")
+        .and_then(|(_, rest)| rest.split_once(" tool permissions"))
+        .is_some_and(|(count, _)| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()));
+    notice
+        && flat.contains("accessing workspace")
+        && flat.contains("no exit")
+        && flat.contains("yes i trust this folder")
+        && flat.ends_with("enter to confirm esc to cancel")
 }
 
 /// Claude's login method picker, or its question whether to use an API key
@@ -978,6 +998,23 @@ fn transcript_control_tail(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_trust_fixture_is_a_strong_human_trust_block() {
+        let screen = include_str!(
+            "../../../tests/fixtures/attention-1023/claude-trust-with-permissions.txt"
+        );
+        for screen in [
+            screen.to_string(),
+            screen
+                .replace("17 tool", "301 tool")
+                .replace("devkit-3c4e4016", "another-checkout"),
+        ] {
+            assert_eq!(detect_structural(&screen), Some(AgentState::Blocked));
+            assert!(has_visible_blocker(&screen));
+            assert_eq!(needs_human(&screen), HumanReason::Trust);
+        }
+    }
 
     /// Captured from a throwaway Claude in an isolated flk (#1022): the
     /// footer counts the `run_in_background` shells after the turn, across a

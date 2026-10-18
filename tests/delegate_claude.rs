@@ -1330,3 +1330,98 @@ fn keep_on_failure_keeps_a_start_whose_readiness_timed_out() {
     assert_eq!(reaped.status.code(), Some(0), "{}", stderr(&reaped));
     assert_eq!(workspaces(&server).len(), before, "reap removes it");
 }
+
+#[test]
+fn permission_trust_start_keeps_the_named_block_for_status_and_wait() {
+    let server = start_server();
+    operator_workspace(&server);
+    let repo = committed_repo(&server);
+    let b = brief(&server, "permissions.md", "Do not approve permissions.\n");
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "start",
+            "permissions",
+            "--harness",
+            "claude",
+            "--brief",
+            &b,
+            "--worktree",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--branch",
+            "fixture/permissions",
+            "--ready-timeout",
+            "20000",
+            "--json",
+        ],
+    );
+    let pane = delegate_pane(&server, "permissions");
+    fs::write(
+        server.base.join("screen"),
+        include_str!("fixtures/attention-1023/claude-trust-with-permissions.txt"),
+    )
+    .unwrap();
+    let deadline = Instant::now() + WITHIN;
+    let captured = loop {
+        let out = cli(
+            &server,
+            &[
+                "pane", "read", &pane, "--source", "recent", "--format", "text",
+            ],
+        );
+        let screen = String::from_utf8_lossy(&out.stdout).into_owned();
+        if screen.contains("pre-approves 17 tool permissions") {
+            break screen;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "delegate exited before painting: {screen}"
+        );
+        assert!(Instant::now() < deadline, "fixture did not paint: {screen}");
+        thread::yield_now();
+    };
+    let status = exited_within(&mut child, WITHIN);
+    let out = finish(child);
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(6),
+        "{}\ncaptured recent pane:\n{captured}",
+        stderr(&out)
+    );
+    let start = stdout_json(&out);
+    assert_eq!(start["outcome"], "agent_blocked");
+    assert_eq!(
+        start["startup_dialog"],
+        "claude_folder_trust_with_permissions"
+    );
+    assert_eq!(start["round"], 0);
+    assert!(Path::new(start["worktree"].as_str().unwrap()).exists());
+    assert_eq!(agent_get(&server, "permissions").unwrap()["pane_id"], pane);
+    let status = cli(&server, &["delegate", "status", "permissions", "--json"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    assert_eq!(
+        stdout_json(&status)["startup_dialog"],
+        "claude_folder_trust_with_permissions"
+    );
+    let waited = cli(
+        &server,
+        &[
+            "delegate",
+            "wait",
+            "permissions",
+            "--settle",
+            SETTLE,
+            "--timeout",
+            "5000",
+            "--json",
+        ],
+    );
+    assert_eq!(waited.status.code(), Some(6), "{}", stderr(&waited));
+    assert_eq!(
+        stdout_json(&waited)["startup_dialog"],
+        "claude_folder_trust_with_permissions"
+    );
+    assert!(typed(&server).is_empty(), "security dialog received input");
+}
