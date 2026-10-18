@@ -32,8 +32,14 @@ fn install_case(tool: Option<&str>, payload: &str, refusal: Option<ErrorCode>) {
         fs::set_permissions(bin.join(tool), fs::Permissions::from_mode(0o755)).unwrap();
     }
     // Drain the real upload, then deliver a controlled stream to the real install script.
-    let ssh = format!("#!/bin/sh\nfor command in \"$@\"; do :; done\ncat >/dev/null\nprintf '%s' {} | HOME={} PATH={} /bin/sh -c \"$command\"\n",
-        shell_quote(payload), shell_quote(home.to_str().unwrap()), shell_quote(bin.to_str().unwrap()));
+    let upload = shell_quote(root.path().join("upload").to_str().unwrap());
+    let sender = if payload == "complete binary" {
+        format!("cat {upload}")
+    } else {
+        format!("printf '%s' {}", shell_quote(payload))
+    };
+    let ssh = format!("#!/bin/sh\nfor command in \"$@\"; do :; done\ncat > {upload}\n{sender} | HOME={} PATH={} /bin/sh -c \"$command\"\n",
+        shell_quote(home.to_str().unwrap()), shell_quote(bin.to_str().unwrap()));
     fs::write(bin.join("ssh"), ssh).unwrap();
     fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
     let prior = std::env::var_os("PATH");
@@ -59,6 +65,7 @@ fn install_case(tool: Option<&str>, payload: &str, refusal: Option<ErrorCode>) {
             "refused input replaced the installed binary"
         );
         let error = result.unwrap_err();
+        assert_eq!(crate::cli::io_error_exit(&error), code.exit());
         assert_eq!(
             error.get_ref().unwrap().downcast_ref::<ErrorCode>(),
             Some(&code)
@@ -79,9 +86,13 @@ fn remote_install_rejects_truncated_stream_and_keeps_existing_binary() {
     install_case(
         Some("sha256sum"),
         "partial",
-        Some(ErrorCode::ChecksumMismatch),
+        Some(ErrorCode::RemoteChecksumMismatch),
     );
-    install_case(Some("shasum"), "partial", Some(ErrorCode::ChecksumMismatch));
+    install_case(
+        Some("shasum"),
+        "partial",
+        Some(ErrorCode::RemoteChecksumMismatch),
+    );
 }
 
 #[test]
@@ -97,4 +108,101 @@ fn remote_install_requires_a_checksum_tool_and_keeps_existing_binary() {
 fn remote_install_accepts_both_portable_checksum_commands() {
     install_case(Some("sha256sum"), "complete binary", None);
     install_case(Some("shasum"), "complete binary", None);
+}
+
+#[test]
+fn generic_shell_failures_keep_stderr_and_never_become_checksum_refusals() {
+    use std::os::unix::process::ExitStatusExt;
+    for status in [2, 126, 127] {
+        let error = remote_install_result(
+            std::process::ExitStatus::from_raw(status << 8),
+            b"Permission denied: fixture install path",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Permission denied"));
+        assert!(error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<ErrorCode>()
+            .is_none());
+        assert_eq!(crate::cli::io_error_exit(&error), crate::cli::exit::FAILURE);
+    }
+}
+
+#[test]
+fn checksum_refusals_have_distinct_retry_classes_and_registered_exits() {
+    use crate::cli::exit::{self, Retry};
+    for (code, retry) in [
+        (ErrorCode::RemoteChecksumMismatch, Retry::Yes),
+        (ErrorCode::ChecksumMismatch, Retry::Never),
+        (ErrorCode::ChecksumToolMissing, Retry::AfterHuman),
+    ] {
+        assert_eq!(code.retry(), retry);
+        assert_eq!(code.exit(), exit::REFUSED);
+        let error = io::Error::other(code);
+        assert_eq!(crate::cli::io_error_exit(&error), exit::REFUSED);
+    }
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // The fixture runs the generated script under dash when that shell is installed.
+fn dash_shell_errors_preserve_the_real_failure_instead_of_requesting_hash_tools() {
+    let dash = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|path| path.join("dash"))
+            .find(|path| path.is_file())
+    });
+    let Some(dash) = dash else {
+        // The generic status contract is still checked on systems without dash.
+        generic_shell_failures_keep_stderr_and_never_become_checksum_refusals();
+        return;
+    };
+    let root = crate::test_support::TempDir::socket();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    symlink(crate::test_support::program_path("rm"), bin.join("rm")).unwrap();
+    fs::write(bin.join("mkdir"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(bin.join("mkdir"), fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(crate::test_support::program_path("cat"), bin.join("cat")).unwrap();
+    fs::write(
+        bin.join("sha256sum"),
+        "#!/bin/sh\nprintf 'Permission denied: checksum fixture\\n' >&2\nexit 2\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("sha256sum"), fs::Permissions::from_mode(0o755)).unwrap();
+    let existing = root.path().join("existing");
+    fs::create_dir_all(existing.join(".local/bin")).unwrap();
+    fs::write(existing.join(".local/bin/flk"), b"old binary").unwrap();
+    let script = remote_install_script(
+        &RemoteFlock::for_platform(RemotePlatform::local()),
+        &"a".repeat(64),
+    );
+    for (program, home) in [
+        (script.as_str(), None),
+        (script.as_str(), Some(root.path())),
+        ("(", Some(root.path())),
+        (script.as_str(), Some(existing.as_path())),
+    ] {
+        let mut command = std::process::Command::new(&dash);
+        command
+            .args(["-eu", "-c", program])
+            .env_clear()
+            .env("PATH", &bin)
+            .stdin(Stdio::null());
+        if let Some(home) = home {
+            command.env("HOME", home);
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!output.stderr.is_empty());
+        let error = remote_install_result(output.status, &output.stderr).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(std::str::from_utf8(&output.stderr).unwrap().trim()));
+        assert_eq!(crate::cli::io_error_exit(&error), crate::cli::exit::FAILURE);
+        assert_eq!(
+            fs::read(existing.join(".local/bin/flk")).unwrap(),
+            b"old binary"
+        );
+    }
 }

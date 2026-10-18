@@ -19,6 +19,11 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+/// Private install-script signals, never returned directly as CLI statuses.
+/// Ordinary shell/tool errors (including 2, 126, 127) retain their stderr.
+const INSTALL_TRANSFER_MISMATCH: i32 = 30;
+const INSTALL_CHECKSUM_TOOL_MISSING: i32 = 31;
+
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1616,32 +1621,9 @@ fn install_remote_flock(
         &source_path.display().to_string(),
         &remote_flock.shell_path,
     );
-    let expected = crate::checksum::file_sha256(source_path)?;
     let mut source = File::open(source_path)?;
-    let script = format!(
-        r#"dest="$HOME/{install_suffix}"
-dir="${{dest%/*}}"
-mkdir -p "$dir"
-tmp="${{dest}}.tmp.$$"
-trap 'rm -f "$tmp"' 0
-cat > "$tmp"
-if command -v sha256sum >/dev/null 2>&1; then
-    actual=$(sha256sum "$tmp") || exit {mismatch_exit}
-elif command -v shasum >/dev/null 2>&1; then
-    actual=$(shasum -a 256 "$tmp") || exit {mismatch_exit}
-else
-    exit {missing_exit}
-fi
-actual=${{actual%% *}}
-[ "$actual" = {expected} ] || exit {mismatch_exit}
-chmod 755 "$tmp"
-mv "$tmp" "$dest"
-"#,
-        install_suffix = remote_flock.install_suffix,
-        expected = shell_quote(&expected),
-        mismatch_exit = crate::cli::exit::REFUSED,
-        missing_exit = crate::cli::exit::USAGE,
-    );
+    let expected = crate::checksum::file_sha256(&mut source)?;
+    let script = remote_install_script(remote_flock, &expected);
 
     let mut child = TracedCommand::new("ssh", "remote")
         .args(control_plane_jump_args(target)?)
@@ -1666,33 +1648,68 @@ mv "$tmp" "$dest"
         ))
     };
     let output = child.wait_with_output()?;
-    let status = output.status;
-    let refusal = match status.code() {
-        Some(crate::cli::exit::REFUSED) => {
-            Some((io::ErrorKind::InvalidData, ErrorCode::ChecksumMismatch))
-        }
-        Some(crate::cli::exit::USAGE) => {
-            Some((io::ErrorKind::NotFound, ErrorCode::ChecksumToolMissing))
-        }
-        _ => None,
-    };
-    if let Some((kind, code)) = refusal {
-        crate::logging::remote_install_failed(target, &remote_flock.shell_path, code.as_str());
-        return Err(io::Error::new(kind, code));
+    if let Err(error) = remote_install_result(output.status, &output.stderr) {
+        crate::logging::remote_install_failed(target, &remote_flock.shell_path, &error.to_string());
+        return Err(error);
     }
     copy_result?;
+    crate::logging::remote_install_completed(target, &remote_flock.shell_path);
+    Ok(())
+}
 
+/// Stage and verify a received upload before atomically replacing the binary.
+fn remote_install_script(remote_flock: &RemoteFlock, expected: &str) -> String {
+    format!(
+        r#"dest="$HOME/{install_suffix}"
+dir="${{dest%/*}}"
+mkdir -p "$dir"
+tmp="${{dest}}.tmp.$$"
+trap 'rm -f "$tmp"' 0
+cat > "$tmp"
+if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$tmp")
+elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$tmp")
+else
+    exit {missing_exit}
+fi
+actual=${{actual%% *}}
+[ "$actual" = {expected} ] || exit {mismatch_exit}
+chmod 755 "$tmp"
+mv "$tmp" "$dest"
+"#,
+        install_suffix = remote_flock.install_suffix,
+        expected = shell_quote(expected),
+        mismatch_exit = INSTALL_TRANSFER_MISMATCH,
+        missing_exit = INSTALL_CHECKSUM_TOOL_MISSING,
+    )
+}
+
+/// Decode only the two private signals; every other failure preserves stderr.
+fn remote_install_result(status: std::process::ExitStatus, stderr: &[u8]) -> io::Result<()> {
     if status.success() {
-        crate::logging::remote_install_completed(target, &remote_flock.shell_path);
-        Ok(())
-    } else {
-        let err = match crate::process::shape_stderr_tail(&output.stderr) {
-            Some(tail) => format!("remote install exited with {status}: {tail}"),
-            None => format!("remote install exited with {status}"),
-        };
-        crate::logging::remote_install_failed(target, &remote_flock.shell_path, &err);
-        Err(io::Error::other(err))
+        return Ok(());
     }
+    match status.code() {
+        Some(INSTALL_TRANSFER_MISMATCH) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                ErrorCode::RemoteChecksumMismatch,
+            ))
+        }
+        Some(INSTALL_CHECKSUM_TOOL_MISSING) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                ErrorCode::ChecksumToolMissing,
+            ))
+        }
+        _ => {}
+    }
+    let message = match crate::process::shape_stderr_tail(stderr) {
+        Some(tail) => format!("remote install exited with {status}: {tail}"),
+        None => format!("remote install exited with {status}"),
+    };
+    Err(io::Error::other(message))
 }
 
 /// SSH options applied to every non-interactive control-plane invocation

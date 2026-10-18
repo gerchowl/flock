@@ -178,14 +178,24 @@ shipped this metadata. Old published manifests are not rewritten. The local upda
 verification failure as registered `checksum_mismatch` and CLI exit 10
 (`REFUSED`, ADR-0029), rather than an unclassified failure.
 
-Remote installs also hash the local transfer source and verify the received
-temporary file before replacing the installed executable. This applies to
-release downloads and operator-supplied local binaries alike, and detects a
-truncated transfer independently of manifest authentication. The remote shell
-uses `sha256sum` or `shasum -a 256`; neither available is a registered
-`checksum_tool_missing` refusal. A mismatch is `checksum_mismatch`. Both keep
-the previous binary and remove the temporary upload. Shell exit statuses are
-mapped to registered errors without interpreting stderr text.
+Remote installs hash and rewind the same open handle that is streamed, so a
+source pathname replacement cannot change which bytes are sent. They verify
+the received temporary file before replacing the installed executable, for
+release downloads (including legacy manifests) and operator-supplied local
+binaries alike. This detects truncated transfers independently of manifest
+authentication. The remote shell uses `sha256sum` or `shasum -a 256`. If neither
+is available, `checksum_tool_missing` refuses with exit 10 and retry class
+`after_human`: install coreutils or Perl's shasum on the remote system.
+
+A transfer mismatch is `remote_checksum_mismatch`, exit 10, retry class `yes`:
+the existing remote binary is untouched, so a new transfer may be attempted.
+This differs from local verification against the manifest, whose
+`checksum_mismatch` remains retry class `never`. Both refusals remove the
+temporary upload. Private install-script statuses 30 (transfer mismatch) and 31
+(missing tool) map to the registered errors and never escape as CLI exits.
+Ordinary shell/tool failures, including statuses 2, 126 and 127, remain generic
+install failures with their stderr tail. Registered I/O error codes survive the
+launcher boundary without interpreting stderr text.
 
 ### 4. The bump is derived and checked; the number stays a human's
 
