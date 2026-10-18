@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub mod command;
 pub mod composer;
+pub mod duplicate_environment;
 pub mod fleet;
 pub mod json_api;
 pub mod paths;

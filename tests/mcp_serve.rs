@@ -840,6 +840,7 @@ fn structured_mcp_scrubs_exec_time_environment_before_ready() {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let secret = base64::engine::general_purpose::STANDARD.encode([43; 32]);
+    let duplicate = "second-copy-private-sentinel";
     let sentinel = "MCP_SCRUB_SENTINEL=exec-environment-reader-control";
     let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
     for (name, _) in
@@ -851,17 +852,21 @@ fn structured_mcp_scrubs_exec_time_environment_before_ready() {
         &base.join("c"),
         &base.join("r"),
     ));
+    command
+        .args(["mcp", "serve", "--structured"])
+        .env("FLOCK_SOCKET_PATH", base.join("a"))
+        .env("FLOCK_MCP_LEASE_CREDENTIAL", &secret)
+        .env("MCP_SCRUB_SENTINEL", "exec-environment-reader-control")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let mut child = ChildGuard(
-        command
-            .args(["mcp", "serve", "--structured"])
-            .env("FLOCK_SOCKET_PATH", base.join("a"))
-            .env("FLOCK_MCP_LEASE_CREDENTIAL", &secret)
-            .env("MCP_SCRUB_SENTINEL", "exec-environment-reader-control")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+        support::duplicate_environment::spawn(
+            command,
+            std::ffi::OsStr::new("FLOCK_MCP_LEASE_CREDENTIAL"),
+            std::ffi::OsStr::new(duplicate),
+        )
+        .unwrap(),
     );
     let output = child.0.stdout.take().unwrap();
     let (ready, received) = std::sync::mpsc::sync_channel(1);
@@ -902,6 +907,10 @@ fn structured_mcp_scrubs_exec_time_environment_before_ready() {
             .windows(secret.len())
             .any(|bytes| bytes == secret.as_bytes())),
         "credential remains in the child's exec-time environment"
+    );
+    assert!(
+        !environment.iter().any(|entry| entry.contains(duplicate)),
+        "a later duplicate credential remains in the child's exec-time environment"
     );
     drop(child);
     cleanup_test_base(&base);

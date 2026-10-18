@@ -185,22 +185,22 @@ fn startup_credential_buffers_are_zeroized_before_deallocation() {
 }
 
 #[test]
-fn credential_is_removed_before_any_endpoint_read_even_when_configuration_refuses() {
-    let removed = std::cell::Cell::new(false);
+fn credential_take_precedes_endpoint_lookup_on_configuration_refusal() {
+    let taken = std::cell::Cell::new(false);
     let result = capture_using(
         true,
         || {
-            removed.set(true);
+            taken.set(true);
             Ok(Some(zeroize::Zeroizing::new(b"invalid-secret".to_vec())))
         },
         || {
             assert!(
-                removed.get(),
-                "credential still present when startup proceeds"
+                taken.get(),
+                "credential take did not run before endpoint lookup"
             );
             None
         },
     );
     assert!(result.is_err());
-    assert!(removed.get());
+    assert!(taken.get());
 }
