@@ -30,7 +30,7 @@ pub const RETAINED_DEAD_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 6
 pub const RETAINED_DEAD_MAX: usize = 256;
 
 /// Retained data never supplies runtime or operator authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetainedKind {
     /// Any unusable object other than an exact duplicate; never auto-prune across versions.
@@ -39,7 +39,7 @@ pub enum RetainedKind {
     Dead,
 }
 /// Retained-record metadata, without exposing the preserved payload.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedInfo {
     /// Position in the serialized structured_agents array.
     pub slot: usize,
@@ -416,21 +416,23 @@ impl<'de> Deserialize<'de> for Registry {
         for (index, raw) in records.into_iter().enumerate() {
             let duplicate = !seen.insert(retention::digest(&raw));
             let dead = !raw.is_object() || duplicate;
-            let reason = if dead {
-                "non_object_or_exact_duplicate"
+            let reason = if !raw.is_object() {
+                "non_object".to_owned()
+            } else if duplicate {
+                "exact_duplicate".to_owned()
             } else {
                 match serde_json::from_value::<Record>(raw.clone()) {
                     Ok(record) => match registry.register_raw(record, raw.clone()) {
                         Ok(_) => continue,
-                        Err(RegistryError::Conflict) => "duplicate",
-                        Err(_) => "invalid_record",
+                        Err(error) => error.to_string(),
                     },
-                    Err(_) => "unsupported_shape",
+                    Err(_) => "unsupported_shape".to_owned(),
                 }
             };
             tracing::warn!(
                 index,
-                reason,
+                class = if dead { "DEAD" } else { "FORWARD" },
+                cause = reason.as_str(),
                 "structured record skipped; raw data retained inactive"
             );
             registry
