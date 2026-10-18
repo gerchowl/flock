@@ -7,6 +7,10 @@ under `<data dir>/blobs/<sha256>`. The persisted message replaces each block wit
 `stream_event` deltas remain live-only and do not consume durable sequence numbers.
 Consumers must check `Received.persisted` before advancing a durable cursor.
 
+Registry-worker admission supplies the `[sessions]` storage settings explicitly
+in `Launch.storage` (ADR-0036 §4). Each launch owns its policy snapshot; config
+changes affect subsequent launches.
+
 The shared content store stores bytes only, without content type or other metadata.
 `put(reader,max_bytes)` hashes exactly the bytes it writes and enforces a per-call
 cap independently of the persistence threshold. `get(hash)` verifies the digest
