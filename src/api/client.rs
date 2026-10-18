@@ -1,5 +1,7 @@
+use super::deadline::{self, DeadlineStream};
 use std::fmt;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(test)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -41,6 +43,7 @@ impl ConnectionTarget {
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     target: ConnectionTarget,
+    request_timeout: Duration,
 }
 
 impl ApiClient {
@@ -49,7 +52,10 @@ impl ApiClient {
     }
 
     pub fn for_target(target: ConnectionTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            request_timeout: deadline::REQUEST_TIMEOUT,
+        }
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -62,21 +68,14 @@ impl ApiClient {
     }
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
-        self.check_allocation_preview_protocol(request, None)?;
-        if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
-            return Ok(refusal);
-        }
-        let mut stream = self.connect()?;
-        write_request(&mut stream, request)?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response = read_json_line(&mut reader)?;
-        if matches!(request.method, Method::Ping(_)) {
-            super::compatibility::observe_ping(self, &response);
-        } else {
-            super::compatibility::normalize(self, &mut response);
-        }
-        Ok(response)
+        let timeout = deadline::request_timeout(request, self.request_timeout);
+        let end = Instant::now().checked_add(timeout).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "socket deadline exceeds monotonic clock range",
+            )
+        })?;
+        self.request_value_retrying(request, timeout, Some(end))
     }
 
     pub fn request_value_with_timeout(
@@ -85,7 +84,7 @@ impl ApiClient {
         timeout: Duration,
     ) -> Result<serde_json::Value, ApiClientError> {
         self.check_allocation_preview_protocol(request, Some(timeout))?;
-        if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
+        if let Some(refusal) = super::compatibility::refuse_skew(self, request)? {
             return Ok(refusal);
         }
         self.exchange_with_timeout(request, timeout)
@@ -113,9 +112,10 @@ impl ApiClient {
         deadline: Option<Instant>,
     ) -> Result<serde_json::Value, ApiClientError> {
         self.check_allocation_preview_protocol(request, Some(timeout))?;
-        if let Some(refusal) = super::compatibility::refuse_skew(self, request) {
+        if let Some(refusal) = super::compatibility::refuse_skew(self, request)? {
             return Ok(refusal);
         }
+        let started = Instant::now();
         let mut backoff = TRANSIENT_BACKOFF;
         let mut retries = 0;
         loop {
@@ -124,7 +124,7 @@ impl ApiClient {
                 Some(deadline) => {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
-                        return Err(ApiClientError::Io(io::ErrorKind::TimedOut.into()));
+                        return Err(DeadlineStream::timeout_at(&self.socket_path(), started).into());
                     }
                     left.min(timeout)
                 }
@@ -138,6 +138,10 @@ impl ApiClient {
                 && (failure.before_send() || request.method.is_retry_safe())
                 && deadline.is_none_or(|deadline| Instant::now() + backoff < deadline);
             if !retry {
+                if matches!(failure.error(), ApiClientError::Io(e) if e.kind() == io::ErrorKind::TimedOut)
+                {
+                    return Err(DeadlineStream::timeout_at(&self.socket_path(), started).into());
+                }
                 return Err(failure.into_error());
             }
             tracing::debug!(
@@ -159,14 +163,7 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, Attempt> {
-        let mut stream = self
-            .connect()
-            .map_err(|err| Attempt::BeforeSend(err.into()))?;
-        stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|err| Attempt::BeforeSend(err.into()))?;
-        stream
-            .set_read_timeout(Some(timeout))
+        let mut stream = DeadlineStream::connect(&self.socket_path(), timeout)
             .map_err(|err| Attempt::BeforeSend(err.into()))?;
         write_request(&mut stream, request).map_err(Attempt::AfterSend)?;
 
@@ -175,7 +172,7 @@ impl ApiClient {
         if matches!(request.method, Method::Ping(_)) {
             super::compatibility::observe_ping(self, &response);
         } else {
-            super::compatibility::normalize(self, &mut response);
+            super::compatibility::normalize(self, &mut response).map_err(Attempt::AfterSend)?;
         }
         Ok(response)
     }
@@ -200,15 +197,13 @@ impl ApiClient {
         request: &Request,
         read_timeout: Option<Duration>,
     ) -> Result<(serde_json::Value, EventStream), ApiClientError> {
-        let mut stream = self.connect()?;
+        let mut stream = DeadlineStream::connect(&self.socket_path(), self.request_timeout)?;
         write_request(&mut stream, request)?;
-        if let Some(timeout) = read_timeout {
-            stream.set_read_timeout(Some(timeout))?;
-        }
 
         let mut reader = BufReader::new(stream);
         let mut ack = read_json_line(&mut reader)?;
-        super::compatibility::normalize(self, &mut ack);
+        super::compatibility::normalize(self, &mut ack)?;
+        reader.get_mut().set_timeout(read_timeout)?;
         Ok((ack, EventStream { reader }))
     }
 
@@ -262,10 +257,6 @@ impl ApiClient {
         }
         Ok(())
     }
-
-    fn connect(&self) -> io::Result<UnixStream> {
-        UnixStream::connect(self.socket_path())
-    }
 }
 
 /// How one round trip failed, split at the point where the server could
@@ -309,7 +300,7 @@ impl Attempt {
 }
 
 pub struct EventStream {
-    reader: BufReader<UnixStream>,
+    reader: BufReader<DeadlineStream>,
 }
 
 impl EventStream {
@@ -322,7 +313,7 @@ impl EventStream {
     /// so a chatty pane could stretch a bounded wait indefinitely. Callers
     /// that loop re-arm this with whatever is left of their own deadline.
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        self.reader.get_ref().set_read_timeout(timeout)
+        self.reader.get_mut().set_timeout(timeout)
     }
 
     pub fn next_value(&mut self) -> Result<Option<serde_json::Value>, ApiClientError> {
@@ -372,7 +363,7 @@ impl From<serde_json::Error> for ApiClientError {
     }
 }
 
-fn write_request(stream: &mut UnixStream, request: &Request) -> Result<(), ApiClientError> {
+fn write_request(stream: &mut impl Write, request: &Request) -> Result<(), ApiClientError> {
     stream.write_all(serde_json::to_string(request)?.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -380,7 +371,7 @@ fn write_request(stream: &mut UnixStream, request: &Request) -> Result<(), ApiCl
 }
 
 fn read_json_line<T: DeserializeOwned>(
-    reader: &mut BufReader<UnixStream>,
+    reader: &mut BufReader<impl Read>,
 ) -> Result<T, ApiClientError> {
     let mut line = String::new();
     let read = reader.read_line(&mut line)?;
@@ -391,7 +382,7 @@ fn read_json_line<T: DeserializeOwned>(
 }
 
 fn read_optional_json_line<T: DeserializeOwned>(
-    reader: &mut BufReader<UnixStream>,
+    reader: &mut BufReader<impl Read>,
 ) -> Result<Option<T>, ApiClientError> {
     let mut line = String::new();
     let read = reader.read_line(&mut line)?;
@@ -649,7 +640,7 @@ mod tests {
             .request_value_retrying(&close, ATTEMPT, None)
             .unwrap_err();
         assert!(
-            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::WouldBlock),
+            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::TimedOut),
             "the timeout is reported as it happened: {error:?}"
         );
         let (listener, seen, _held) = server.join().unwrap();
@@ -667,7 +658,7 @@ mod tests {
             .request_value_retrying(&agent_get(), ATTEMPT, None)
             .unwrap_err();
         assert!(
-            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::WouldBlock),
+            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::TimedOut),
             "{error:?}"
         );
         let (listener, seen, _held) = server.join().unwrap();

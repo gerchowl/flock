@@ -85,17 +85,18 @@ fn cached(path: &Path) -> Option<Option<ServerVersion>> {
     })
 }
 
-fn probe(client: &ApiClient) -> Option<ServerVersion> {
-    let response = client
-        .request_value_with_timeout(
-            &Request {
-                id: "api:compatibility".into(),
-                method: Method::Ping(PingParams::default()),
-            },
-            Duration::from_millis(500),
-        )
-        .ok()?;
-    parse_ping(&response)
+pub(super) fn probe(
+    client: &ApiClient,
+) -> Result<Option<ServerVersion>, super::client::ApiClientError> {
+    let response = client.request_value_retrying(
+        &Request {
+            id: "api:compatibility".into(),
+            method: Method::Ping(PingParams::default()),
+        },
+        Duration::from_millis(500),
+        Some(std::time::Instant::now() + Duration::from_millis(500)),
+    )?;
+    Ok(parse_ping(&response))
 }
 
 fn parse_ping(response: &Value) -> Option<ServerVersion> {
@@ -111,9 +112,12 @@ pub fn is_capability_failure(reason: &str) -> bool {
         || reason.contains("method not found")
 }
 
-pub fn normalize(client: &ApiClient, response: &mut Value) {
+pub fn normalize(
+    client: &ApiClient,
+    response: &mut Value,
+) -> Result<(), super::client::ApiClientError> {
     let Some(error) = response.get("error") else {
-        return;
+        return Ok(());
     };
     if !matches!(
         error["code"].as_str(),
@@ -121,19 +125,20 @@ pub fn normalize(client: &ApiClient, response: &mut Value) {
     ) && error["code"].as_i64() != Some(-32601)
         && !is_capability_failure(error["message"].as_str().unwrap_or_default())
     {
-        return;
+        return Ok(());
     }
     let path = client.socket_path();
-    let server = server_version(client);
-    let Some(server) = server else { return };
+    let server = server_version_result(client)?;
+    let Some(server) = server else { return Ok(()) };
     if server.protocol >= crate::protocol::PROTOCOL_VERSION {
-        return;
+        return Ok(());
     }
     response["error"] = serde_json::json!({
         "code": ERROR_CODE,
         "message": server.message(),
     });
     record_failure(&path, &server);
+    Ok(())
 }
 
 fn record_failure(path: &Path, server: &ServerVersion) {
@@ -156,37 +161,48 @@ fn record_failure(path: &Path, server: &ServerVersion) {
 /// that asked for the gate is checked: `flk server` and `flk status` must keep
 /// reaching an older server, since handing it off is the fix, and a server
 /// whose version cannot be read is let through to fail as it would have.
-pub fn refuse_skew(client: &ApiClient, request: &Request) -> Option<Value> {
+pub fn refuse_skew(
+    client: &ApiClient,
+    request: &Request,
+) -> Result<Option<Value>, super::client::ApiClientError> {
     if !request.method.needs_current_protocol() {
-        return None;
+        return Ok(None);
     }
     let path = client.socket_path();
     let gated = INVOCATION.with_borrow(|state| state.gate && state.target.as_ref() == Some(&path));
     if !gated {
-        return None;
+        return Ok(None);
     }
-    let server = server_version(client)?;
+    let Some(server) = server_version_result(client)? else {
+        return Ok(None);
+    };
     if server.protocol >= crate::protocol::PROTOCOL_VERSION {
-        return None;
+        return Ok(None);
     }
     record_failure(&path, &server);
-    Some(serde_json::json!({
+    Ok(Some(serde_json::json!({
         "id": request.id,
         "error": {"code": ERROR_CODE, "message": server.message()},
-    }))
+    })))
 }
 
 pub fn server_version(client: &ApiClient) -> Option<ServerVersion> {
+    server_version_result(client).ok().flatten()
+}
+
+fn server_version_result(
+    client: &ApiClient,
+) -> Result<Option<ServerVersion>, super::client::ApiClientError> {
     let path = client.socket_path();
     if let Some(server) = cached(&path) {
-        return server;
+        return Ok(server);
     }
-    let server = probe(client);
+    let server = probe(client)?;
     INVOCATION.with_borrow_mut(|state| {
         if state.target.as_ref() == Some(&path) {
             state.probed = true;
             state.server = server.clone();
         }
     });
-    server
+    Ok(server)
 }

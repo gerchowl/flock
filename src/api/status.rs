@@ -33,20 +33,19 @@ pub fn read_runtime_status_at(
         method: Method::Ping(crate::api::schema::PingParams::default()),
     };
     let response = client
-        .request_value_with_timeout(&request, timeout)
+        .request_value_retrying(&request, timeout, Some(std::time::Instant::now() + timeout))
         .and_then(crate::api::client::parse_response_value);
     let response = match response {
         Ok(response) => response,
         Err(crate::api::client::ApiClientError::Io(err))
             if matches!(
                 err.kind(),
-                io::ErrorKind::ConnectionRefused
-                    | io::ErrorKind::NotFound
-                    | io::ErrorKind::TimedOut
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
             ) =>
         {
             return Ok(None);
         }
+        Err(crate::api::client::ApiClientError::Io(err)) => return Err(err),
         Err(err) => return Err(io::Error::other(err)),
     };
     match response.result {

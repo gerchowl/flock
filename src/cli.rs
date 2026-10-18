@@ -187,6 +187,14 @@ fn run(args: &[String]) -> std::io::Result<CommandOutcome> {
         }
     }
     match outcome {
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            let code = output::failure(
+                crate::api::error_code::ErrorCode::Timeout,
+                &error.to_string(),
+                exit::TIMEOUT,
+            );
+            Ok(CommandOutcome::Handled(code))
+        }
         // An io error ends the verb before it reported anything: under
         // machine output it is still an envelope on stdout, exit 1.
         Err(error) if output::json() && !output::envelope_pending() => {

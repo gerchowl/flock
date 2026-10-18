@@ -4,6 +4,7 @@
 //! modules don't scatter `#[cfg]` branches through product logic.
 
 pub(crate) mod peer;
+pub(crate) mod socket_deadline;
 pub(crate) mod structured;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

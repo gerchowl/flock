@@ -2,6 +2,7 @@ pub mod agent_state;
 pub mod client;
 pub mod client_tokens;
 pub(crate) mod compatibility;
+pub(crate) mod deadline;
 pub(crate) mod error_code;
 mod event_hub;
 mod events_read;
