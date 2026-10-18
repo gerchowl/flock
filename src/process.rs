@@ -612,7 +612,7 @@ fn redact_url_credentials(arg: &str) -> String {
     });
     let param = PARAM.get_or_init(|| {
         Regex::new(&format!(
-            r"(?i)([?#&](?:code|key|{})=)[^&#]*",
+            r"(?i)([?#&](?:\w*(?:code|key)|{})=)[^&#]*",
             crate::report::redact::SECRET_LABEL_PATTERN
         ))
         .expect("static secret URL parameter pattern")
@@ -959,6 +959,8 @@ mod tests {
             "api_key",
             "id_token",
             "REFRESH_TOKEN",
+            "authorization_code",
+            "signing_key",
         ] {
             for separator in ['?', '#', '&'] {
                 let prefix = if separator == '&' { "?view=diff" } else { "" };
