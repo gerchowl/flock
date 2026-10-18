@@ -757,7 +757,7 @@ fn explicit_revocation_ends_all_live_cuts_for_the_principal() {
             .unwrap()
             .session
             .clone();
-        case.server.core.revoke(&session);
+        case.server.core.shared.revoke(&session);
         assert!(matches!(
             socket.receive().await,
             Received::Close(AUTH_REVOKED_CLOSE)

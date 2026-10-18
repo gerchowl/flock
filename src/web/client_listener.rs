@@ -159,6 +159,10 @@ impl Listener {
     ) {
         self.core.service(registry, workers, root);
     }
+    /// Service authenticated commands on the application owner.
+    pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
+        self.core.service_commands(app);
+    }
     /// Start only inside the owning server loop, after handoff commit if importing.
     pub(crate) fn activate(&mut self) {
         if let Some((socket, router)) = self.prepared.take() {

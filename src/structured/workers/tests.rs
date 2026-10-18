@@ -23,7 +23,7 @@ pub(crate) fn event(kind: &str) -> Value {
 pub(crate) struct Case {
     pub fixture: Arc<Fixture>,
     pub id: String,
-    session: String,
+    pub(crate) session: String,
     pub generation: u64,
     leases: SessionLeases,
 }
@@ -1024,6 +1024,6 @@ mod queue;
 
 mod recovery;
 
-mod global;
+pub(crate) mod global;
 
 mod send;

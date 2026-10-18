@@ -204,8 +204,16 @@ with `self_message_forbidden`; names or IDs shared with a terminal are refused
 with `agent_target_ambiguous`. Only operator-origin
 slash commands are isolated, verbatim harness turns. Agent-origin slash text is
 ordinary nonce-framed message content. Cold/offline agents require an explicit
-launch; admission does not launch a second writer. The external S7-min send
-adapter is tracked in #1831 and does not add another admission path.
+launch; admission does not launch a second writer. The S7-min `/v1/ws` adapter
+uses this same admission service, returning its lifecycle `item_id` in the command
+ack. It accepts local structured targets only. `agent.decide` on that endpoint
+requires the open record's exact `request_id` and `request_seq`; the closed
+agent-stream record confirms the answer. Tokens are rechecked on every command:
+revocation sends `auth_revoked` before closing all token sockets with 4403, while
+a scope refusal leaves allowed reads connected. This first-send adapter has no
+durable command journal: `resume_only` returns `session_unconfirmed` without
+execution, and uncertain commands must be inspected rather than automatically
+resent.
 
 For terminal targets, `agent.send` accepts `{ "target": "worker", "text": "review the auth module", "submit": true }`. Without `submit`, `agent.send`, `pane.send_text` and `pane.send_input` (with `text`) refuse before typing into an agent pane whose composer holds a draft (`input_not_empty`) or that a flock injection holds (`injection_pending`); `"raw": true` types anyway (#1162). A shell pane is never refused. Omit `submit` (or set it to `false`) to paste text without submitting. Both `agent.send` and `pane.send_text` use bracketed paste when enabled and strip embedded paste delimiters; otherwise they send text bytes directly. Use `pane.send_keys` for control keys such as `Enter`, `C-c`, or `Esc`, because control bytes are pasted text when bracketed paste is enabled. With `submit: true`, the paste is followed by a 120 ms gap and a negotiated Enter key event. Submission retains its guarded write and harness-observation flow; a raw `write_timeout_ms` is rejected when `submit` is true. A closed or restarted execution is refused before Enter. This operator input method is intentionally absent from MCP; agents exchange messages through `flock_msg_send` instead. With `submit: true` and the [injection lock](./configuration.mdx#injection-lock) on, a one-row draft is moved aside and typed back. One flock could not put back is kept for `pane.stash_show` / `pane.stash_restore` (`{ "pane_id": "..." }`). Both answer `{ "type": "pane_stash", "pane_id", "drafts" }`: show lists the kept drafts, oldest first, and restore returns the one it typed.
 

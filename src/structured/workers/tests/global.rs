@@ -17,16 +17,16 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
 };
 
-pub(super) struct AppQueue {
-    pub(super) app: App,
-    pub(super) case: Case,
-    pub(super) notify: Arc<Notify>,
-    pub(super) driver: UnixStream,
-    pub(super) hub: EventHub,
-    pub(super) log: std::path::PathBuf,
+pub(crate) struct AppQueue {
+    pub(crate) app: App,
+    pub(crate) case: Case,
+    pub(crate) notify: Arc<Notify>,
+    pub(crate) driver: UnixStream,
+    pub(crate) hub: EventHub,
+    pub(crate) log: std::path::PathBuf,
 }
 impl AppQueue {
-    pub(super) async fn new(n: u32, seed: impl FnOnce(&Case) -> NonZeroU64) -> Self {
+    pub(crate) async fn new(n: u32, seed: impl FnOnce(&Case) -> NonZeroU64) -> Self {
         let (mut registry, workers, notify, _) = owner();
         let (mut case, mut launch, factory) = Case::prepare(&mut registry, n, "queue", vec![]);
         launch.queue_rewrite_bytes = seed(&case);
@@ -78,7 +78,7 @@ impl AppQueue {
             log,
         }
     }
-    pub(super) async fn until(&mut self, mut condition: impl FnMut(&Self) -> bool) {
+    pub(crate) async fn until(&mut self, mut condition: impl FnMut(&Self) -> bool) {
         let notify = self.notify.clone();
         wait(&notify, || {
             self.app.service_structured_workers(Instant::now());
@@ -93,7 +93,7 @@ impl AppQueue {
         })
         .await;
     }
-    pub(super) fn facts(&self) -> Vec<(u64, QueueItemState)> {
+    pub(crate) fn facts(&self) -> Vec<(u64, QueueItemState)> {
         self.hub
             .events_after(0)
             .into_iter()
@@ -103,10 +103,10 @@ impl AppQueue {
             })
             .collect()
     }
-    pub(super) fn control(&mut self, value: Value) {
+    pub(crate) fn control(&mut self, value: Value) {
         writeln!(self.driver, "{value}").unwrap();
     }
-    pub(super) async fn stop(&mut self) {
+    pub(crate) async fn stop(&mut self) {
         self.app
             .structured_workers
             .stop(&self.case.id, self.case.generation);
@@ -121,10 +121,10 @@ impl AppQueue {
         .await;
     }
 }
-pub(super) fn max_policy() -> NonZeroU64 {
+pub(crate) fn max_policy() -> NonZeroU64 {
     NonZeroU64::new(u64::MAX).unwrap()
 }
-pub(super) fn id(n: u32) -> String {
+pub(crate) fn id(n: u32) -> String {
     format!("00000000-0000-4000-8000-{n:012}")
 }
 
