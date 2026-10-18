@@ -15,6 +15,7 @@ mod api;
 pub(crate) use api::mesh_mail::RecoveredMessage;
 pub(crate) use api::mesh_routes::Completion as MeshRoutesCompletion;
 pub(crate) use api::responses::encode_error_with_data;
+pub(crate) use api::structured_queue::SendParams as StructuredSendParams;
 pub(crate) use api::LocalOperator;
 pub(crate) mod fleet_pause;
 pub(crate) mod guarded_submit;

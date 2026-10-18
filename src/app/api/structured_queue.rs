@@ -25,6 +25,18 @@ use std::{
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
 };
 
+/// Structured turns deliberately exclude terminal-only raw writes and deadlines.
+/// Authority is supplied separately by the authenticated dispatcher.
+pub(crate) struct SendParams {
+    /// Stable structured identity or unambiguous name.
+    pub target: String,
+    /// Model input, framed according to the authenticated origin.
+    pub text: String,
+    /// MVP requires an entire user turn.
+    pub submit: bool,
+    /// Canonical lifecycle UUID for idempotent retries.
+    pub item_id: Option<String>,
+}
 type Key = (String, u64, String);
 type ResultId = Result<crate::api::schema::AgentSendResult, ErrorCode>;
 /// Pending durable admission. Dropping a ticket never cancels a committed item.
@@ -45,6 +57,9 @@ pub(crate) struct Sends {
     pub staged: Option<Staged>,
 }
 impl Sends {
+    fn full(&self, operator: bool) -> bool {
+        self.waiting.len() + self.parked.len() >= if operator { 128 } else { 112 }
+    }
     pub(crate) fn complete(
         &mut self,
         agent: String,
@@ -105,8 +120,8 @@ impl Sends {
     }
 }
 impl App {
-    /// Structured identity is independent of terminal placement. Exact ids win;
-    /// names shared with a terminal are ambiguous. Terminal-only targets fall back.
+    /// Structured identity is independent of terminal placement. Exact ids and names
+    /// shared with a terminal are ambiguous. Terminal-only targets fall back.
     pub(crate) fn structured_send_target(
         &self,
         target: &str,
@@ -121,15 +136,13 @@ impl App {
         } else {
             target
         };
-        if let Some((record, _, generation)) = self.state.structured_agents.get(target) {
-            return Ok(Some((record.agent_id.clone(), generation)));
-        }
+
         let matches: Vec<_> = self
             .state
             .structured_agents
             .records()
             .into_iter()
-            .filter(|record| record.name.as_deref() == Some(target))
+            .filter(|record| record.agent_id == target || record.name.as_deref() == Some(target))
             .collect();
         if matches.is_empty() {
             return Ok(None);
@@ -152,22 +165,29 @@ impl App {
     /// authenticated dispatcher, never from JSON. No terminal or stdin is touched.
     /// `submit:false` is unsupported in the MVP and refused before queue work.
     /// Success means durable admission, not delivery. At most 128 outstanding
-    /// tickets and one in-flight request per item are accepted (`session_busy`).
+    /// tickets/replies and one in-flight request per item are accepted (`session_busy`).
+    /// Non-operator requests stop at 112, reserving 16 slots for the operator.
+    /// Exit before acknowledgement can report `input_write_unknown` after commit:
+    /// inspect the journal, then retry the same lifecycle ID, never a fresh ID.
     pub(crate) fn structured_send(
         &mut self,
-        params: AgentSendParams,
+        params: crate::app::StructuredSendParams,
         principal: &Principal<'_>,
     ) -> Result<Ticket, ErrorCode> {
         if !params.submit {
             return Err(ErrorCode::StructuredSubmitRequired);
         }
-        if params.raw || params.write_timeout_ms.is_some() {
-            return Err(ErrorCode::InvalidRequest);
-        }
         let origin = principal.queue_origin()?;
         let (agent, generation) = self
             .structured_send_target(&params.target)?
             .ok_or(ErrorCode::AgentNotFound)?;
+        if matches!(principal, Principal::Agent(id) | Principal::Lease(id) if *id == agent) {
+            return Err(ErrorCode::SelfMessageForbidden);
+        }
+        let operator = matches!(
+            origin,
+            crate::structured::queue::admission::Principal::Operator
+        );
         let item_id = match params.item_id {
             Some(id) => id,
             None => crate::structured::queue::admission::item_uuid().map_err(|error| error.code)?,
@@ -176,15 +196,10 @@ impl App {
             return Err(ErrorCode::InvalidRequest);
         }
         let key = (agent.clone(), generation, item_id.clone());
-        if self.structured_sends.waiting.len() + self.structured_sends.parked.len() >= 128
-            || self.structured_sends.waiting.contains_key(&key)
+        if self.structured_sends.full(operator) || self.structured_sends.waiting.contains_key(&key)
         {
             return Err(ErrorCode::SessionBusy);
         }
-        let operator = matches!(
-            origin,
-            crate::structured::queue::admission::Principal::Operator
-        );
         let item = Item {
             item_id: item_id.clone(),
             producer: Producer::Human,
@@ -224,9 +239,17 @@ impl App {
                 "structured sends require submit:true",
             );
         }
+        if params.raw || params.write_timeout_ms.is_some() {
+            return encode_error(
+                id,
+                ErrorCode::InvalidRequest.as_str(),
+                "terminal-only options",
+            );
+        }
+        let operator = self.caller_is_local_operator();
         let caller = self.spawn_caller();
         let principal = match &caller {
-            super::SpawnCaller::Operator { .. } => Principal::Operator,
+            super::SpawnCaller::Operator { .. } if operator => Principal::Operator,
             super::SpawnCaller::Agent { agent_id, .. }
             | super::SpawnCaller::Structured {
                 agent_id: Some(agent_id),
@@ -240,12 +263,82 @@ impl App {
                 )
             }
         };
-        match self.structured_send(params, &principal) {
+        match self.structured_send(
+            SendParams {
+                target: params.target,
+                text: params.text,
+                submit: params.submit,
+                item_id: params.item_id,
+            },
+            &principal,
+        ) {
             Ok(ticket) => {
                 self.structured_sends.staged = Some(Staged(id, ticket));
                 String::new()
             }
             Err(code) => encode_error(id, code.as_str(), "structured admission refused"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn send_admission_operator_reserve_survives_agent_saturation() {
+        let mut sends = Sends::default();
+        for n in 0..112 {
+            let (tx, _rx) = mpsc::channel();
+            sends
+                .waiting
+                .insert(("recipient".into(), 1, n.to_string()), tx);
+        }
+        assert!(sends.full(false));
+        assert!(!sends.full(true));
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state
+            .structured_agents
+            .register(crate::structured::registry::Record {
+                runtime: crate::structured::registry::StructuredRuntime::Structured,
+                agent_id: "recipient".into(),
+                name: None,
+                harness: "claude".into(),
+                session_id: "reserve-fixture".into(),
+                cwd: std::env::temp_dir(),
+                model: None,
+            })
+            .unwrap();
+        app.structured_sends = sends;
+        let request = || crate::app::StructuredSendParams {
+            target: "recipient".into(),
+            text: "turn".into(),
+            submit: true,
+            item_id: Some("00000000-0000-4000-8000-000000001299".into()),
+        };
+        assert!(matches!(
+            app.structured_send(request(), &Principal::Agent("sender.example")),
+            Err(ErrorCode::SessionBusy)
+        ));
+        // The reserved operator request passes capacity and reaches worker lookup.
+        assert!(matches!(
+            app.structured_send(request(), &Principal::Operator),
+            Err(ErrorCode::AgentNotFound)
+        ));
+        let mut sends = app.structured_sends;
+        for n in 112..128 {
+            let (tx, _rx) = mpsc::channel();
+            sends
+                .waiting
+                .insert(("recipient".into(), 1, n.to_string()), tx);
+        }
+        assert!(sends.full(false));
+        assert!(sends.full(true));
     }
 }
