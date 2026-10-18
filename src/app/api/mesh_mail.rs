@@ -1334,6 +1334,12 @@ pub(crate) fn load_mesh_mail(
     })?;
     let mut loaded = Vec::new();
     for record in records.into_iter().flatten() {
+        // Collected terminal payload is intentionally absent. Preserve its
+        // outcome instead of quarantining it as an invalid queued message.
+        if record.envelope.body.is_empty() && matches!(record.state.as_str(), "delivered" | "read")
+        {
+            continue;
+        }
         let mut data = match payload(&record.envelope) {
             Ok(data) => data,
             Err(_) => {

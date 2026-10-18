@@ -320,8 +320,9 @@ that diagnostic can remain alongside a reply. Backoff is 4–5 seconds, then
 may shorten long backoff, but attempts against the same owner generation remain
 at least four seconds apart. A new owner generation can resume immediately.
 At expiry, status is `expired` with detail
-`input_write_unknown:commitment_unknown_at_expiry`. This ends recovery without
-claiming the queue never committed the message.
+`input_write_unknown:commitment_unknown_at_expiry`. This ends admission recovery
+without claiming the queue never committed the message; positive proof can still
+retain settlement recovery within the outcome window below.
 
 A positive journal proof settles delivery despite an elapsed inbox deadline.
 If saving that settlement fails, `commit_proven_settle_pending` preserves expiry
@@ -336,12 +337,16 @@ a rapid retry loop. Correction ends at the expired row's existing `outcome_until
 A row still retained at that deadline records
 `input_write_unknown:correction_retention_elapsed`. After maintenance deletes the
 outcome, a retained status reference reports `outcome_retention_elapsed`.
+If saving the final diagnostic fails, a read-only deadline check still stops
+recovery, logs the failure and typed retention-end reason, and leaves the status
+deadline observable.
 
 Automatic post-expiry correction has a restart limit: it uses the authenticated
 envelope retained in memory. Startup recovery omits payload-less expired rows,
 so a restart ends that correction path. It cannot restore deleted payload to
 revalidate the original signature. Ordinary inbox recovery before expiry remains
-available.
+available. Payload-less delivered/read outcomes keep their terminal status and
+are omitted from mailbox rehydration.
 Deleted payload stays deleted and released quota stays released. Reply recovery
 uses the existing payload-less route and the original admission's seven-day
 custody/reply deadline. Proof never extends deadlines or restores deleted reply

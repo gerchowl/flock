@@ -10,6 +10,31 @@ pub(super) const COMMITMENT_UNKNOWN_AT_EXPIRY: &str =
 const CORRECTION_RETENTION_ELAPSED: &str = "input_write_unknown:correction_retention_elapsed";
 
 impl<D: DiskSpace> Store<D> {
+    /// Milliseconds left in an unknown-expiry correction, including zero.
+    /// Read the existing deadline without a SQLite write: a failed diagnostic
+    /// save must not prevent the caller from observing the end of retention.
+    pub fn queue_correction_remaining(
+        &self,
+        key: &MessageKey,
+        wall_ms: i64,
+    ) -> Result<Option<u64>> {
+        let now = self.clock()?.advance(wall_ms);
+        let until: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT outcome_until FROM envelopes WHERE origin=?1 AND id=?2
+             AND state='inbox_expired' AND collect_error=?3
+             AND EXISTS(SELECT 1 FROM local_recipients r WHERE r.origin=?1 AND r.id=?2)",
+                params![
+                    key.origin_node,
+                    key.message_id,
+                    COMMITMENT_UNKNOWN_AT_EXPIRY
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(until.map(|until| until.saturating_sub(now).max(0) as u64))
+    }
     // Only the sole journal owner's positive proof may call this path.
     pub(super) fn commit_queue_admission(&mut self, key: &MessageKey, wall_ms: i64) -> Result<()> {
         let now = self.writable(wall_ms)?;
@@ -72,26 +97,12 @@ impl<D: DiskSpace> Store<D> {
         cause: Option<Unknown>,
         wall_ms: i64,
     ) -> Result<Option<u64>> {
-        let now = self.writable(wall_ms)?;
         if cause == Some(Unknown::SettlementPending) {
-            let until: Option<i64> = self
-                .connection
-                .query_row(
-                    "SELECT outcome_until FROM envelopes WHERE origin=?1 AND id=?2
-                 AND state='inbox_expired' AND collect_error=?3
-                 AND EXISTS(SELECT 1 FROM local_recipients r WHERE r.origin=?1 AND r.id=?2)",
-                    params![
-                        key.origin_node,
-                        key.message_id,
-                        COMMITMENT_UNKNOWN_AT_EXPIRY
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(until) = until {
-                if until > now {
-                    return Ok(Some((until - now) as u64));
+            if let Some(remaining) = self.queue_correction_remaining(key, wall_ms)? {
+                if remaining > 0 {
+                    return Ok(Some(remaining));
                 }
+                let now = self.writable(wall_ms)?;
                 self.connection.execute(
                     "UPDATE envelopes SET collect_error=?4 WHERE origin=?1 AND id=?2
                      AND state='inbox_expired' AND collect_error=?3 AND outcome_until<=?5",
@@ -106,6 +117,7 @@ impl<D: DiskSpace> Store<D> {
                 return Ok(None);
             }
         }
+        let now = self.writable(wall_ms)?;
         let deadline: Option<i64> = self
             .connection
             .query_row(

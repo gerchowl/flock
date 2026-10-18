@@ -529,9 +529,28 @@ impl App {
             Ok(false) => None,
             Err(cause) => Some(cause),
         };
-        let remaining = match stored(|s| {
+        let correction_ended = expired
+            && committed == Ok(true)
+            && stored(|s| {
+                s.queue_correction_remaining(&signed.key, super::messages::now_ms() as i64)
+            }) == Ok(Some(0));
+        let remaining = stored(|s| {
             s.queue_commitment_unknown(&signed.key, cause, super::messages::now_ms() as i64)
-        }) {
+        });
+        // A definite retention deadline ends recovery even if recording that
+        // diagnostic fails. Log both the save error and the typed end reason.
+        let remaining = match remaining {
+            Err(failure) if correction_ended => {
+                crate::logging::mesh_custody_failed("structured-recovery", failure.as_str());
+                crate::logging::mesh_custody_failed(
+                    "structured-correction",
+                    "outcome_retention_elapsed",
+                );
+                Ok(None)
+            }
+            result => result,
+        };
+        let remaining = match remaining {
             Ok(Some(remaining)) => Some(remaining),
             Ok(None) => {
                 self.structured_sends.retries.remove(&signed.key);

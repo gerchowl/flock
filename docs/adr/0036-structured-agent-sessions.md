@@ -986,7 +986,8 @@ same queue (owner decision 5): there is no second input path.
   with a reply until the owner answers, custody settles, or its TTL expires.
   At TTL expiry the existing expiry/tombstone path records
   `input_write_unknown:commitment_unknown_at_expiry` for the existing outcome
-  window. Expiry ends recovery without proving that nothing committed.
+  window. Expiry ends admission recovery without proving that nothing committed;
+  positive proof can still retain settlement recovery as bounded below.
   Positive proof before expiry is persisted settles `Delivered` directly, even
   if the inbox deadline passed between commit and settlement. After persisted
   expiry, only an expiry carrying unknown commitment can change to `Delivered`,
@@ -1001,11 +1002,16 @@ same queue (owner decision 5): there is no second input path.
   `input_write_unknown:correction_retention_elapsed`; after maintenance collects
   the outcome, a retained status reference reports `outcome_retention_elapsed`.
   Even before collection, proof cannot turn an out-of-window expiry into delivery.
+  The retention decision uses a read-only deadline check. If persisting its final
+  diagnostic fails, recovery still stops and logs the save error and typed
+  `outcome_retention_elapsed` reason; the status deadline remains observable.
   **Restart limit:** active correction retains the already authenticated envelope
   in memory. Startup's mailbox projection excludes payload-less `inbox_expired`
   rows, so restart ends automatic post-expiry correction. It does not restore
   deleted payload to revalidate a signature; the expired outcome remains until
   ordinary retention deletion. Before expiry, startup recovery still loads inboxes.
+  Payload-less `Delivered`/`Read` rows are omitted from mailbox rehydration while
+  their terminal status is preserved; intentional collection is not corruption.
   This corrects the expiry label only: deleted payload is not restored, released
   quota is not re-acquired, and the original deadlines stay unchanged. Replies
   use the existing payload-less path and the seven-day custody/reply deadline
