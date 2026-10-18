@@ -1254,7 +1254,7 @@ async fn guarded_dispatch_requires_consuming_deferred_attempt() {
         panic!("expected submit event")
     };
     runtime(&app).test_stamp_operator_input_at(Instant::now());
-    app.advance_guarded_request(request_id, pane_id, attempt, respond_to);
+    app.advance_guarded_request(request_id, pane_id, *attempt, respond_to);
     assert!(!app.active_submissions.contains(&pane));
     let response: serde_json::Value = serde_json::from_str(&receiver.recv().unwrap()).unwrap();
     assert_eq!(response["result"]["outcome"], "unconfirmed");

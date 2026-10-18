@@ -383,6 +383,7 @@ pub(crate) fn run_controlled(
     }))
     .is_err();
     if publication_failed {
+        lease.revoke();
         stop.request();
         control.cancel();
     }
@@ -392,8 +393,12 @@ pub(crate) fn run_controlled(
         files,
         config,
         stop.clone(),
-        || control.close_stdin(),
         || {
+            lease.revoke();
+            control.close_stdin();
+        },
+        || {
+            lease.revoke();
             control.close_stdin();
             match io_rx.recv_timeout(IO_LIMIT) {
                 Ok(received) => facts = received,
@@ -451,6 +456,7 @@ fn startup_failed(
     io_confirmed: bool,
     lease: &mut super::lease::Lease,
 ) -> LaunchError {
+    lease.revoke();
     let stop = StopRequest::default();
     stop.request();
     // Missing child pipes precede all I/O workers. A partially started transport
