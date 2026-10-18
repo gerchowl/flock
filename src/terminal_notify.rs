@@ -82,14 +82,15 @@ fn build_osc99_notification(title: &str, body: Option<&str>) -> Vec<u8> {
 }
 
 pub(crate) fn sanitize_text(text: impl AsRef<str>) -> String {
-    text.as_ref()
+    let flattened: String = text
+        .as_ref()
         .chars()
-        .filter(|ch| *ch != '\u{1b}' && *ch != '\u{7}' && *ch != '\u{9c}')
         .map(|ch| match ch {
             '\n' | '\r' | '\t' => ' ',
             _ => ch,
         })
-        .collect()
+        .collect();
+    crate::terminal::agent_name::presentation(&flattened)
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +160,22 @@ pub(crate) fn wrap_tmux_passthrough(sequence: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security2090_notification_and_window_titles_strip_format_controls() {
+        for text in ["task\u{202e}tail", "task\u{9d}tail", "task\u{200b}tail"] {
+            assert_eq!(sanitize_text(text), "tasktail");
+            for bytes in [
+                build_osc9_notification(text, Some(text)),
+                build_osc99_notification(text, Some(text)),
+                set_window_title_sequence(text),
+            ] {
+                let shown = String::from_utf8(bytes).unwrap();
+                assert!(!shown.contains(text));
+                assert!(shown.contains("tasktail"));
+            }
+        }
+    }
 
     #[test]
     fn split_message_splits_title_and_body() {

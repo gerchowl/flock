@@ -113,6 +113,134 @@ GitHub user drive flock into acting on a public repo. The spawn carries a
 system-owned preamble the caller cannot displace, and refuses control-sequence
 bytes as `msg_send` already does.
 
+#### Agent identity text (#317)
+
+Agent names, hook-reported agent labels and manual pane labels are untrusted
+renderer input. Reject C0/C1 controls, ESC/CSI/OSC introducers, line breaks,
+Unicode line separators, and Unicode format characters (category Cf), except
+ZWJ (U+200D). Variation selectors U+FE00–FE0F remain allowed. Reject the entire
+Unicode tag block U+E0000–E007F and labels longer than 64 Unicode scalar values
+before trimming. This also prevents zero-width lookalikes from evading name
+uniqueness checks.
+
+`TerminalState::set_agent_name`, the manual-label setter and hook/metadata
+setters validate before mutation. Rename, creation, report-agent and metadata
+APIs return `invalid_agent_name` without echoing rejected text. The pane rename
+modal displays a refusal and preserves its input and previous label. Safe empty
+names retain the existing clear-name behavior; creation and agent reports
+require a nonempty name.
+
+Older mesh v5 peers and saved PTY sessions can carry invalid labels. Receivers
+drop the invalid identity field and warn with a typed code and fixed source,
+without its content. Restore drops any invalid manual pane label, independently
+of the agent name. Invalid structured records remain inactive with raw data
+retained (ADR-0028 §3a). Navigator, agent-panel, toast and desktop-notification
+labels escape unsafe text at the final display boundary. Overlong legacy
+labels display a truncated prefix with a visible `…` marker. Pane/agent JSON
+and GUI status events drop invalid agent labels rather than forwarding them.
+This does not change the wire layout or mesh version. The separate delegate
+filename restriction remains narrower than the general Unicode display rule.
+
+#### Presentation text (#2090)
+
+Titles and peer workspace/activity text are presentation, not identity. Strip
+characters forbidden by the identity policy above, preserving ZWJ and variation
+selectors, rather than refusing the record. Apply this at metadata admission and
+projection (including older/internal producers), peer JSON, binary fleet and
+relay receive boundaries, and notification output. Mesh v5 layout stays unchanged
+so older peers remain readable. The GUI and CLI receive sanitized strings, and
+the navigator sanitizes legacy text at its render boundary. Presentation text
+has no identity-length cap: retain full sanitized text for search, and truncate
+only when drawing into the available width. Metadata API titles retain their
+existing 80-scalar budget. Empty reported agent labels return
+`invalid_agent_name` with a nonempty-label message, separately from policy refusals.
+
+Peer receive admission includes project keys, because the sidebar derives its
+project-group label from that key before considering `project_label`. JSON
+workspace/agent admission and binary/relay conversion share a single admission
+method per record. Generic schema deserialization remains data-only, without
+peer warnings; the JSON summary parser, binary conversion and relay merger are
+the admission boundaries. Each peer presentation field retains at most 256 Unicode
+scalar values after sanitization: workspace, project key/label, branch, activity,
+peer display name, version, icon, error and origin display labels.
+The cap bounds render/search work after the existing frame-size check. Identity
+labels still use 64 scalars; thermal labels additionally retain their 16-byte cap.
+Unknown icon names resolve to a blank icon; dial reasons are classified tokens.
+Opaque workspace/pane/agent/node identifiers are not edited into new identities:
+valid printable ASCII tokens up to 256 bytes remain exact; malformed identifiers
+are cleared with a content-free `invalid_params` warning. Empty directory entries
+are omitted. Workspace ids already support the legacy id-less/name-focus path.
+SSH destination and ProxyJump grammar is checked with the same 256-byte bound:
+invalid relay rows are refused, and invalid carried routes are disabled rather
+than partially rewritten. The reserved home target remains supported. The mesh
+layout and VERSION remain unchanged.
+Reported hosts are hostname identities, not agent display names. Admit only
+ASCII LDH labels: letters, digits and internal hyphens, with an alphanumeric
+first and last byte, 1–63 bytes per label and at most 253 bytes overall.
+Dot-separated labels may not be empty; a trailing dot is refused. IDNA A-labels
+(`xn--bcher-kva`) are accepted as plain ASCII, without decoding or Unicode conversion.
+IPv4 text naturally meets this grammar. Canonical bare IPv6 literals are also
+admitted; bracketed or expanded noncanonical IPv6 reports are refused. Reject
+spaces, underscores, Unicode
+(including ZWJ, combining marks, variation selectors and confusables), controls
+and overlong values before keying or presentation cleaning. Never trim, strip,
+truncate or normalize a rejected identity into an admitted one. Valid spelling
+is retained apart from the existing ASCII case-insensitive cache lookup.
+
+The reported host comes from the node's configured `name` or its OS hostname;
+a node with an invalid identity must configure an LDH name to participate in
+peer summaries, then restart: the advertised hostname is cached for the session.
+SSH destinations are separate: `user@host`, ports, bracketed IPv6 and
+SSH aliases keep their existing destination/ProxyJump grammar and 256-byte bound.
+They are not admitted as opaque reported host identities. For an absent or
+empty host, one shared key function parses the SSH destination: remove the
+optional user and numeric port (1–65535), unbracket IPv6 and canonicalize its
+address, then apply the same host validator. Bare IPv6 means an address, not an
+address with a guessed port. DNS names are lowercased without DNS resolution;
+IPv4 and canonical IPv6 literals keep their complete address. Trailing dots,
+underscores, malformed authorities and every other invalid fallback are refused
+before either relay-cache or carried-fleet keying, with the same content-free
+`invalid_params` diagnostic. Routes retain their original spelling. Relay `via` edge names retain the shared
+forbidden-scalar predicate and 256-byte routing bound; they are not reported
+host fields. An empty `via` cannot route a row.
+
+Startup checks the effective configured or OS name without renaming it. A
+registered `invalid_node_host` warning (`after_human`) reports the LDH/IP rule
+and instructs the operator to set `name` and restart. It appears in startup
+configuration diagnostics, `flk config check`, and human-readable `flk status`;
+`flk status --json` exposes `{code, message, recovery}` as `node_host_warning`
+when present. Logs emit `config.node_host_invalid` with the typed code, rule and
+recovery, without the rejected name. The server emits it once after logging is
+initialized; config reads and status clients return diagnostics without emitting
+that startup event.
+
+Configured peer rows start with their strict `[[peers]].name` key. After the
+first successful poll, their identity set also includes the strict admitted
+reported-host key. A relayed or carried row matching either member collapses
+into the config peer's one row. Invalid members are absent, never raw-text
+fallbacks. The SSH alias supplies no identity, so an underscore alias works with
+a valid configured name. Invalid configured names cause the entire entry to be
+ignored: no polling or routing. The typed config-load diagnostic asks the
+operator to rename `[[peers]].name`, for example from `Node A` to
+`node-a.invalid`; the SSH alias can stay unchanged.
+All other displayed rows require an admitted reported or parsed host key.
+Invalid rows never render, including carried rows whose route was disabled at
+admission. Admission records the typed refusal once; rendering does not log it.
+
+The reserved `<home>` (`HOME_SWITCH_TARGET`) is a carried origin-summary control
+route, not a hostname or SSH destination. It is exempt from fallback SSH-host
+validation when the reported host is absent, and from SSH route validation.
+Any nonempty reported host must still pass the strict rule. The sentinel never
+creates a hostname key or authorizes rendering a keyless row.
+
+An invalid raw host refuses a direct JSON summary, drops a relayed row, or
+disables a carried binary route and excludes that row from display. Invalid
+`via` refuses the batch. A content-free
+`peer.summary.identifier_dropped` warning carries `invalid_params` and the fixed
+field name only. Generic deserialization remains data-only. The mesh layout and
+VERSION remain unchanged.
+
+
 ### 5. The ceiling is lineage-aware, not a single global counter
 
 A flat `max_concurrent_agents` is a footgun on its own: an adversarial or

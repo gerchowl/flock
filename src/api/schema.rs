@@ -5039,6 +5039,7 @@ impl ThermalReport {
     /// out-of-range rank or an unbounded string into our render pass.
     pub fn sanitized(mut self) -> Self {
         self.severity = self.severity.min(THERMAL_SEVERITY_MAX);
+        self.label = crate::peers::received::text(&self.label);
         if self.label.len() > THERMAL_LABEL_MAX_BYTES {
             let mut end = THERMAL_LABEL_MAX_BYTES;
             while end > 0 && !self.label.is_char_boundary(end) {
@@ -5057,6 +5058,7 @@ impl ThermalReport {
 
 /// One workspace in a federated peer's `peers.summary` response: just enough
 /// for the sidebar's project-folded remote rows and cross-server attention.
+/// Deserialization is data-only; peer ingress applies [`Self::received`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerWorkspaceSummary {
     /// Workspace id on the peer server (e.g. "ws_3"), used to focus it
@@ -5098,7 +5100,8 @@ pub struct PeerWorkspaceSummary {
 }
 
 /// One agent as the fleet sees it: its identity, and where that identity
-/// currently lives.
+/// currently lives. Deserialization is data-only; peer ingress applies
+/// [`Self::received`].
 ///
 /// The split is the point. `agent_id` is the NAME — stable across restarts,
 /// pane moves and workspace renames. Everything else is where it happens to be

@@ -22,7 +22,7 @@ pub(crate) mod hibernation;
 pub(crate) mod idle_wake;
 pub(crate) mod paste_confirm;
 pub(crate) mod self_compact;
-pub(crate) use api::peers::{configured_node_icon, short_host_name};
+pub(crate) use api::peers::{configured_node_icon, os_node_name, short_host_name};
 pub(crate) use api::workspaces::WorkspaceFocusOutcome;
 pub(crate) mod api_helpers;
 mod background_jobs;
@@ -4192,7 +4192,8 @@ sidebar_pane_gap = 99
             .terminals
             .get_mut(&attached_terminal_id)
             .unwrap()
-            .set_agent_name("reviewer".into());
+            .set_agent_name("reviewer".into())
+            .unwrap();
         app.state.active = Some(0);
         app.state.selected = 0;
 
@@ -4236,7 +4237,8 @@ sidebar_pane_gap = 99
             .terminals
             .get_mut(&first_terminal_id)
             .unwrap()
-            .set_agent_name("worker".into());
+            .set_agent_name("worker".into())
+            .unwrap();
         let second_terminal_id = app.state.workspaces[0]
             .pane_state(second)
             .unwrap()
@@ -4246,7 +4248,8 @@ sidebar_pane_gap = 99
             .terminals
             .get_mut(&second_terminal_id)
             .unwrap()
-            .set_agent_name("worker".into());
+            .set_agent_name("worker".into())
+            .unwrap();
         app.state.active = Some(0);
         app.state.selected = 0;
 

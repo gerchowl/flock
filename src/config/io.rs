@@ -79,7 +79,7 @@ impl Config {
     }
 
     fn finish_load(result: Result<LoadedConfig, Vec<String>>) -> LoadedConfig {
-        match result {
+        let mut loaded = match result {
             Ok(mut loaded) => {
                 // Field-level validation (keybinds, sound files, idle
                 // thresholds) belongs to the startup report; the live path
@@ -101,7 +101,11 @@ impl Config {
                     key_diagnostics: Vec::new(),
                 }
             }
+        };
+        if let Some(warning) = loaded.config.node_host_warning() {
+            loaded.diagnostics.push(warning.to_string());
         }
+        loaded
     }
 }
 
@@ -770,6 +774,13 @@ fn validate_peers(
             diagnostics.push("invalid [[peers]] entry: missing name; entry ignored".to_string());
             return false;
         }
+        if crate::peers::row_host_key(Some(&peer.name), "").is_none() {
+            diagnostics.push(format!(
+                "{}: invalid [[peers]].name: use ASCII LDH labels (1-63 bytes each, 253 total) or a canonical IPv6 literal; entry ignored (no polling or routing); rename [[peers]].name, for example name = \"node-a.invalid\"",
+                crate::api::error_code::ErrorCode::InvalidParams.as_str(),
+            ));
+            return false;
+        }
         if !seen.insert(peer.name.clone()) {
             diagnostics.push(format!(
                 "duplicate [[peers]] name \"{}\"; later entry ignored",
@@ -1044,6 +1055,73 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security2200_startup_warns_about_an_invalid_node_name_without_renaming() {
+        let raw = "node-a.invalid\u{200d}";
+        let logs = crate::logging::capture_logs(|| {
+            let loaded = Config::finish_load(Ok(LoadedConfig {
+                config: Config {
+                    name: raw.into(),
+                    ..Default::default()
+                },
+                diagnostics: Vec::new(),
+                invalid_sections: Vec::new(),
+                key_diagnostics: Vec::new(),
+            }));
+            assert_eq!(loaded.config.name, raw);
+            let diagnostic = loaded
+                .diagnostics
+                .iter()
+                .find(|text| text.contains("invalid_node_host"))
+                .expect("the node's operator must see the refusal before peer polls fail");
+            assert!(diagnostic.contains("LDH"));
+            assert!(diagnostic.contains("restart"));
+            assert!(!diagnostic.contains(raw));
+        });
+        assert!(!logs.contains("config.node_host_invalid"));
+        assert!(!logs.contains(raw));
+        let config = Config {
+            name: raw.into(),
+            ..Default::default()
+        };
+        let startup = crate::logging::capture_logs(|| config.log_node_host_warning());
+        assert_eq!(startup.matches("config.node_host_invalid").count(), 1);
+        assert!(startup.contains("invalid_node_host"));
+        assert!(!startup.contains(raw));
+    }
+
+    #[test]
+    fn security2200_config_refuses_invalid_peer_names_but_keeps_ssh_aliases() {
+        let loaded = load_live_config_from_str(
+            "[[peers]]\nname = \"atlas.\"\nssh = \"atlas_ts\"\n[[peers]]\nname = \"atlas\"\nssh = \"atlas_ts\"\n",
+        ).unwrap();
+        assert_eq!(loaded.config.peers.len(), 1);
+        assert_eq!(loaded.config.peers[0].name, "atlas");
+        assert_eq!(loaded.config.peers[0].ssh_target(), "atlas_ts");
+        assert_eq!(loaded.diagnostics.len(), 1);
+        assert!(loaded.diagnostics[0].contains("invalid_params"));
+        assert!(loaded.diagnostics[0].contains("[[peers]].name"));
+        assert!(loaded.diagnostics[0].contains("LDH"));
+        assert!(!loaded.diagnostics[0].contains("atlas."));
+    }
+
+    #[test]
+    fn security2200_os_name_warning_and_configured_override_use_the_same_rule() {
+        let mut config = Config::default();
+        let warning = config
+            .node_host_warning_with_os(|| "Bad OS Node".into())
+            .unwrap();
+        assert_eq!(warning.code, "invalid_node_host");
+        assert!(warning.message.contains("LDH"));
+        assert!(warning.recovery.contains("restart"));
+        assert!(config.name.is_empty());
+        config.name = "node-a.invalid".into();
+        assert!(config
+            .node_host_warning_with_os(|| panic!("configured name must bypass OS lookup"))
+            .is_none());
+        assert_eq!(config.name, "node-a.invalid");
+    }
 
     #[test]
     fn upsert_top_level_bool_replaces_existing_value() {

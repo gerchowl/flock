@@ -108,7 +108,7 @@ impl App {
         self.state
             .terminals
             .get(id)
-            .and_then(|t| t.agent_name.as_ref())
+            .and_then(|t| t.agent_name())
             .and_then(|name| config.restart_agents.get(name))
             .unwrap_or(&config.restart)
             .clone()

@@ -1055,7 +1055,10 @@ impl App {
                 data: crate::api::schema::EventData::PaneAgentDetected {
                     pane_id: pane_id.clone(),
                     workspace_id: workspace_id.clone(),
-                    agent: update.agent_label.clone(),
+                    agent: crate::terminal::agent_name::received(
+                        update.agent_label.clone(),
+                        "gui_event",
+                    ),
                 },
             });
         }
@@ -1090,7 +1093,10 @@ impl App {
                     pane_id,
                     workspace_id,
                     agent_status,
-                    agent: update.agent_label.clone(),
+                    agent: crate::terminal::agent_name::received(
+                        update.agent_label.clone(),
+                        "gui_event",
+                    ),
                     title: presentation.title,
                     display_agent: presentation.display_agent,
                     custom_status: presentation.custom_status,
@@ -1935,17 +1941,7 @@ const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
 fn sanitized_notification_text(value: &str, max_chars: usize) -> Option<String> {
     let mut sanitized = String::new();
     let mut previous_space = false;
-    for ch in value.chars() {
-        let replacement = if ch == '\n' || ch == '\r' || ch == '\t' {
-            Some(' ')
-        } else if ch.is_control() {
-            None
-        } else {
-            Some(ch)
-        };
-        let Some(ch) = replacement else {
-            continue;
-        };
+    for ch in crate::terminal_notify::sanitize_text(value).chars() {
         if ch.is_whitespace() {
             if previous_space {
                 continue;
@@ -1978,6 +1974,62 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git init failed for {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn security2200_successful_poll_aliases_configured_and_reported_identity() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = crate::config::Config {
+            peers: vec![crate::config::PeerConfig {
+                name: "atlas".into(),
+                ssh: "atlas-ts".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let rows: [crate::api::schema::RelayedFleetPeer; 2] =
+            ["atlas", "atlas-mbp.invalid"].map(|host| {
+                serde_json::from_value(serde_json::json!({
+                    "name": "Relayed display", "ssh_target": format!("operator@{host}"),
+                    "host": host, "origin": "hub.invalid"
+                }))
+                .unwrap()
+            });
+        app.handle_internal_event(AppEvent::PeerSummaryFetched(
+            crate::peers::PeerSummaryFetch {
+                peer: "atlas".into(),
+                stream_error: None,
+                result: Ok(crate::peers::PeerSummaryPayload {
+                    node_id: None,
+                    outbound_pending: false,
+                    host: "atlas-mbp.invalid".into(),
+                    version: None,
+                    protocol: None,
+                    icon: None,
+                    system: None,
+                    workspaces: Vec::new(),
+                    latency_ms: 1,
+                    relayed_fleet: rows.into(),
+                }),
+            },
+        ));
+        assert!(app.state.peer_summaries[0].last_ok.is_some());
+        let carried = crate::peers::peer_to_wire(&app.state.peer_summaries[0]);
+        app.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState::from_wire(
+            crate::protocol::FleetSnapshot {
+                origin: "home.invalid".into(),
+                peers: vec![carried],
+                origin_summary: None,
+            },
+        ));
+        let visible = app.state.remote_peers();
+        assert_eq!(visible.len(), 1);
+        assert!(matches!(
+            visible[0].0,
+            crate::app::state::RemotePeerRef::Config { .. }
+        ));
+        assert_eq!(visible[0].1.peer, "atlas");
     }
 
     #[tokio::test]
@@ -2353,7 +2405,7 @@ mod tests {
         terminal.detected_agent = Some(Agent::Claude);
         // Exactly what `flock_agent_start` does when the calling model supplies
         // one: `agent_name` outranks the detected harness in `pane_details`.
-        terminal.set_agent_name("researcher".into());
+        terminal.set_agent_name("researcher".into()).unwrap();
         terminal.state = AgentState::Working;
 
         let response = app.handle_peers_summary("req_peers".into());
@@ -2396,7 +2448,8 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_agent_name("researcher".into());
+            .set_agent_name("researcher".into())
+            .unwrap();
 
         let response = app.handle_peers_summary("req_peers".into());
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2997,7 +3050,7 @@ mod tests {
             .get_mut(&terminal_id)
             .expect("test terminal should exist");
         terminal.respawn_shell_on_exit = true;
-        terminal.set_agent_name("codex".into());
+        terminal.set_agent_name("codex".into()).unwrap();
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),
@@ -3018,7 +3071,7 @@ mod tests {
             .expect("terminal should survive respawn");
         assert!(!terminal.respawn_shell_on_exit);
         assert!(terminal.persisted_agent_session.is_none());
-        assert!(terminal.agent_name.is_none());
+        assert!(terminal.agent_name().is_none());
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();

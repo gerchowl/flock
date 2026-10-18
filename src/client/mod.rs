@@ -4050,6 +4050,10 @@ fn handle_notify_with_notifiers(
     mut show_terminal_notification: impl FnMut(&str, Option<&str>) -> io::Result<bool>,
     mut show_system_notification: impl FnMut(&str, Option<&str>) -> io::Result<bool>,
 ) {
+    let message = crate::terminal_notify::sanitize_text(message);
+    let message = message.as_str();
+    let body = body.map(crate::terminal_notify::sanitize_text);
+    let body = body.as_deref();
     match kind {
         NotifyKind::Sound => {
             let Some(sound) = sound_from_notify_message(message) else {
@@ -5452,6 +5456,27 @@ mod tests {
             emitted,
             Some(("pi finished".to_string(), Some("workspace 1".to_string())))
         );
+    }
+
+    #[test]
+    fn security2090_desktop_notification_receives_safe_title() {
+        for text in ["task\u{202e}tail", "task\u{9d}tail", "task\u{200b}tail"] {
+            let mut shown = false;
+            handle_notify_with_notifiers(
+                NotifyKind::SystemToast,
+                text,
+                Some(text),
+                &crate::config::SoundConfig::default(),
+                |_, _| panic!("wrong notification sink"),
+                |title, body| {
+                    assert_eq!(title, "tasktail");
+                    assert_eq!(body, Some("tasktail"));
+                    shown = true;
+                    Ok(true)
+                },
+            );
+            assert!(shown);
+        }
     }
 
     #[test]

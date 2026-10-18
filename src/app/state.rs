@@ -2790,7 +2790,10 @@ impl AppState {
 
     /// Federated peers feeding BOTH the servers band and the spaces list's
     /// remote rows — ONE consolidated dedup (#101 gossip v3 part 4). Key:
-    /// lowercased reported host (fallback: ssh_target). Tie-break tier:
+    /// configured name plus admitted reported host after a successful poll for
+    /// a ConfigPeer, otherwise the validated reported or parsed SSH host.
+    /// Both config keys point to one row. Invalid identities never become keys.
+    /// Tie-break tier:
     /// locally-polled ConfigPeer (top) → relayed cache (freshest wins by
     /// `origin_last_ok_secs`) → carried snapshot entry → origin summary. On
     /// same-source ties the entry with the smaller `origin_last_ok_secs`
@@ -2813,8 +2816,31 @@ impl AppState {
             std::collections::HashMap::new();
 
         for (rank, entry_ref, peer) in self.remote_row_candidates() {
-            let host_key = row_host_key(peer);
             let freshness = row_freshness(peer);
+            if matches!(&entry_ref, RemotePeerRef::Config { .. }) {
+                // Config rows come first. Both admitted identities point to
+                // that one row; an SSH alias never supplies a host identity.
+                let keys = [
+                    crate::peers::row_host_key(Some(&peer.peer), ""),
+                    peer.last_ok
+                        .and(peer.host.as_deref())
+                        .and_then(|host| crate::peers::row_host_key(Some(host), "")),
+                ];
+                if keys.iter().all(Option::is_none) {
+                    continue;
+                }
+                let idx = ordered.len();
+                for key in keys.into_iter().flatten() {
+                    host_to_idx.entry(key).or_insert(idx);
+                }
+                ordered.push((entry_ref, peer, rank, freshness));
+                continue;
+            }
+            let Some(host_key) = row_host_key(peer) else {
+                // Admission has already recorded the typed refusal. Rendering
+                // never invents a key or repeats that diagnostic each frame.
+                continue;
+            };
             if let Some(&idx) = host_to_idx.get(&host_key) {
                 let (_, _, cur_rank, cur_fresh) = ordered[idx];
                 // Lower rank number = higher tier (0 = ConfigPeer wins).
@@ -2911,7 +2937,7 @@ impl AppState {
         let origin_key = self
             .fleet_snapshot
             .as_ref()
-            .map(|snapshot| snapshot.origin.to_ascii_lowercase());
+            .and_then(|snapshot| crate::peers::row_host_key(Some(&snapshot.origin), ""));
         let mut relayed: Vec<_> = self
             .relayed_fleet_cache
             .iter()
@@ -3007,21 +3033,10 @@ const REMOTE_ROW_RANK_RELAYED: u8 = 1;
 const REMOTE_ROW_RANK_SNAPSHOT: u8 = 2;
 const REMOTE_ROW_RANK_ORIGIN: u8 = 3;
 
-/// Machine-independent host key: the peer's reported host (fallback: config
-/// name or ssh_target), lowercased. Used across surfaces so a host cannot
-/// dedupe under different keys on the band vs. the spaces list.
-pub(crate) fn row_host_key(peer: &crate::peers::PeerSummaryState) -> String {
-    let fallback = if peer.peer.is_empty() {
-        peer.ssh_target.as_str()
-    } else {
-        peer.peer.as_str()
-    };
-    let raw = peer
-        .host
-        .as_deref()
-        .filter(|host| !host.is_empty())
-        .unwrap_or(fallback);
-    raw.to_ascii_lowercase()
+/// Use the same admitted hostname identity as relay and carried-fleet keys.
+/// Unknown identities have no display key and never render as remote rows.
+pub(crate) fn row_host_key(peer: &crate::peers::PeerSummaryState) -> Option<String> {
+    crate::peers::row_host_key(peer.host.as_deref(), &peer.ssh_target)
 }
 
 /// Frozen origin freshness (#101 part 2): the origin's report age at capture
@@ -3149,6 +3164,16 @@ impl AppState {
     /// 4. **The label, verbatim** — for a row with no identifiable harness. A
     ///    name is still more use than a blank cell.
     pub fn agent_field_label(
+        &self,
+        mode: crate::config::AgentLabelConfig,
+        harness: Option<crate::detect::Agent>,
+        label: Option<&str>,
+    ) -> String {
+        crate::terminal::agent_name::display(&self.agent_field_label_raw(mode, harness, label))
+            .into_owned()
+    }
+
+    fn agent_field_label_raw(
         &self,
         mode: crate::config::AgentLabelConfig,
         harness: Option<crate::detect::Agent>,
@@ -3750,6 +3775,24 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn security_agent_name_panel_escapes_peer_labels_and_aliases() {
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut state = super::AppState::test_new();
+            let mode = crate::config::AgentLabelConfig::Name;
+            assert_ne!(
+                state.agent_field_label(mode, None, Some(&name)),
+                name,
+                "raw panel name: {case}"
+            );
+            state.agent_aliases.insert("fixture".into(), name.clone());
+            assert_ne!(
+                state.agent_field_label(mode, None, Some("fixture")),
+                name,
+                "raw alias: {case}"
+            );
+        }
+    }
 
     #[test]
     fn project_keys_reduce_to_github_slugs() {
@@ -3889,6 +3932,70 @@ mod tests {
             "locally polled data outranks a relayed reading: {:?}",
             rows[0].0
         );
+    }
+
+    #[test]
+    fn security2200_trailing_dot_carried_row_is_refused_before_display() {
+        let mut state = AppState::test_new();
+        let plain = crate::peers::peer_to_wire(&crate::peers::PeerSummaryState::new(
+            &crate::config::PeerConfig {
+                name: "node-a.invalid".into(),
+                ..Default::default()
+            },
+        ));
+        let mut bad = plain.clone();
+        bad.host = Some("node-a.invalid.".into()); // guardrails-ok(fixture): deliberately invalid trailing-dot host.
+        let logs = crate::logging::capture_logs(|| {
+            state.fleet_snapshot = Some(crate::peers::FleetSnapshotState::from_wire(
+                crate::protocol::FleetSnapshot {
+                    origin: "home.invalid".into(),
+                    peers: vec![plain, bad],
+                    origin_summary: None,
+                },
+            ));
+        });
+        assert_eq!(logs.matches("peer.summary.identifier_dropped").count(), 1);
+        assert!(logs.contains("invalid_params"));
+        let render_logs = crate::logging::capture_logs(|| {
+            assert_eq!(state.remote_peers().len(), 1);
+            assert_eq!(state.remote_peers().len(), 1);
+        });
+        assert!(
+            render_logs.is_empty(),
+            "rendering must not repeat admission logs"
+        );
+    }
+
+    fn unreachable_config_peer_with_relay(ssh: &str) -> AppState {
+        let mut state = AppState::test_new();
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "atlas".into(),
+            ssh: ssh.into(),
+            ..Default::default()
+        });
+        peer.error = Some("unreachable".into());
+        state.peer_summaries.push(peer);
+        state.relayed_fleet_cache.insert(
+            "atlas".into(),
+            relayed("atlas", 5, std::time::Instant::now()),
+        );
+        state
+    }
+
+    #[test]
+    fn security2200_unreachable_config_peer_dedupes_by_configured_name() {
+        let state = unreachable_config_peer_with_relay("atlas-ts");
+        let rows = state.remote_peers();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].0, RemotePeerRef::Config { .. }));
+    }
+
+    #[test]
+    fn security2200_underscore_ssh_alias_does_not_change_configured_identity() {
+        let state = unreachable_config_peer_with_relay("atlas_ts");
+        let rows = state.remote_peers();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].0, RemotePeerRef::Config { .. }));
     }
 
     /// The relay cache was insert-only, so a departed host kept its row for
