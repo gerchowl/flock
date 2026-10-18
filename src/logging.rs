@@ -50,6 +50,29 @@ pub(crate) fn structured_stream_repaired(bytes_dropped: u64) {
     );
 }
 
+/// Report a durable corrupt-blob replacement without exposing stored content.
+pub(crate) fn structured_blob_repaired(reference: &crate::structured::blobs::BlobRef) {
+    tracing::warn!(
+        event = "structured.blob.repaired",
+        blob = reference.blob.as_str(),
+        size = reference.size,
+        "repaired corrupt stored blob"
+    );
+}
+
+/// Report degraded repair coordination without logging OS error text or content.
+pub(crate) fn structured_blob_repair_lock_unavailable(
+    reference: &crate::structured::blobs::BlobRef,
+    kind: io::ErrorKind,
+) {
+    tracing::warn!(
+        event = "structured.blob.repair_lock_unavailable",
+        blob = reference.blob.as_str(),
+        error_kind = ?kind,
+        "repair lock unavailable; publishing without coordination"
+    );
+}
+
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),
