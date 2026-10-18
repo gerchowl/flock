@@ -1,6 +1,6 @@
 //! Descriptor-relative blob operations keep namespace replacements from redirecting I/O.
 use std::ffi::CString;
-use std::fs::{File, Metadata};
+use std::fs::{File, Metadata, TryLockError};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -62,10 +62,12 @@ impl Directory {
         }
         Ok(file)
     }
-    /// Serialize publication across independently opened stores and processes.
+    /// Try to coordinate a repair across independently opened stores/processes.
+    /// Contention returns WouldBlock; callers may publish without coordination
+    /// on unsupported filesystems. First writes do not need this lock.
     /// Reopen the pinned directory: duplicated descriptors would share a lock.
     /// Closing the returned descriptor releases the advisory lock, including on crash.
-    pub(crate) fn publication_lock(&self) -> io::Result<File> {
+    pub(crate) fn try_publication_lock(&self) -> io::Result<File> {
         let component = c".";
         // SAFETY: the directory owns its fd and the component is terminated.
         let fd = unsafe {
@@ -81,7 +83,10 @@ impl Directory {
         // SAFETY: successful openat transfers this new descriptor to File.
         let file = unsafe { File::from_raw_fd(fd) };
         validate(&file.metadata()?, true)?;
-        file.lock()?;
+        file.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
+            TryLockError::Error(error) => error,
+        })?;
         Ok(file)
     }
     pub(crate) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
@@ -162,5 +167,22 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         assert_eq!(bytes, b"owned elsewhere");
+    }
+    #[test]
+    fn contended_publication_lock_returns_without_waiting() {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let path = root.path().join("blobs");
+        let directory = Directory::open(&path).unwrap();
+        let _held = directory.try_publication_lock().unwrap();
+        let other = Directory::open(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(other.try_publication_lock());
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("publication lock must be nonblocking");
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        worker.join().unwrap();
     }
 }

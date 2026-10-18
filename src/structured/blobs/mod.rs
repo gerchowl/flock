@@ -5,8 +5,17 @@ use crate::platform::blobs::Directory;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// Best-effort repair coordination never makes an unbounded number of attempts,
+/// even if the supplied clock stops advancing. Content publication takes priority.
+const MAX_REPAIR_LOCK_ATTEMPTS: usize = 8;
+/// Stop retrying contention after this much supplied monotonic time. Individual
+/// filesystem operations retain their ordinary I/O failure behavior.
+const REPAIR_LOCK_WAIT: Duration = Duration::from_millis(20);
 
 /// Session persistence settings; the threshold is independent of each put's cap.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,14 +135,28 @@ impl BlobStore {
     }
     /// Hash precisely the bytes read and written, atomically publishing only a
     /// complete, synced object. Cap failures clean up the private temporary file.
-    /// An existing corrupt object is repaired with the verified new bytes and a
-    /// structured repair event after the directory sync. Publication is locked across
-    /// stores/processes and rechecks the current bytes before rename, so racing
-    /// observers do not report the same repair twice. Non-cooperating filesystem
-    /// mutations are outside this advisory lock. Unsafe entries and I/O
-    /// failures still fail explicitly; reads continue to report corruption.
-    /// Concurrent puts deduplicate against the current object, never partial data.
-    pub fn put(&self, mut reader: impl Read, max_bytes: u64) -> Result<BlobRef, BlobError> {
+    /// Only corrupt-object repair attempts advisory serialization and rechecks
+    /// the current bytes before rename. Missing objects publish without locking:
+    /// racing writers have identical verified bytes and emit no repair event.
+    /// Repair coordination tries at most eight nonblocking acquisitions within
+    /// 20 ms of supplied monotonic time. Lock errors or budget exhaustion warn
+    /// once with the error kind and fall back to unlocked publication; duplicate
+    /// repair diagnostics are then possible, but locking never loses content.
+    /// Non-cooperating filesystem mutations are outside this advisory lock.
+    /// Read/write/rename/sync failures remain explicit; reads report corruption.
+    pub fn put(&self, reader: impl Read, max_bytes: u64) -> Result<BlobRef, BlobError> {
+        self.put_with_repair_lock(reader, max_bytes, &mut Instant::now, &mut || {
+            self.0.try_publication_lock()
+        })
+    }
+    // Keep time and lock acquisition injectable for filesystem failure tests.
+    fn put_with_repair_lock(
+        &self,
+        mut reader: impl Read,
+        max_bytes: u64,
+        now: &mut impl FnMut() -> Instant,
+        lock: &mut impl FnMut() -> io::Result<File>,
+    ) -> Result<BlobRef, BlobError> {
         let mut entropy = [0; 16];
         getrandom::fill(&mut entropy).map_err(io::Error::other)?;
         let name = format!(".tmp-{:x}", u128::from_ne_bytes(entropy));
@@ -170,14 +193,21 @@ impl BlobStore {
             };
             match self.get(&reference.blob) {
                 Ok(_) => self.0.sync()?,
-                Err(error @ (BlobError::Missing | BlobError::Corrupt)) => {
+                Err(BlobError::Missing) => self.publish(&name, &reference.blob)?,
+                Err(BlobError::Corrupt) => {
                     #[cfg(test)]
-                    if matches!(error, BlobError::Corrupt) {
-                        tests::corrupt_observed();
-                    }
-                    let _ = error;
-                    let _publication = self.0.publication_lock()?;
-                    // Recheck under the lock: another writer may already have repaired it.
+                    tests::corrupt_observed();
+                    let _publication = match Self::repair_lock(now, lock) {
+                        Ok(guard) => Some(guard),
+                        Err(error) => {
+                            crate::logging::structured_blob_repair_lock_unavailable(
+                                &reference,
+                                error.kind(),
+                            );
+                            None
+                        }
+                    };
+                    // Recheck even on fallback: another writer may have repaired it.
                     match self.get(&reference.blob) {
                         Ok(_) => self.0.sync()?,
                         Err(BlobError::Missing) => self.publish(&name, &reference.blob)?,
@@ -199,6 +229,26 @@ impl BlobStore {
             Err(error) => return Err(BlobError::Io(error)),
         }
         result
+    }
+    /// A bounded, best-effort wait driven by the caller's monotonic clock.
+    /// Only contention retries; unsupported locking immediately falls back.
+    fn repair_lock(
+        now: &mut impl FnMut() -> Instant,
+        lock: &mut impl FnMut() -> io::Result<File>,
+    ) -> io::Result<File> {
+        let started = now();
+        for _ in 0..MAX_REPAIR_LOCK_ATTEMPTS {
+            match lock() {
+                Ok(guard) => return Ok(guard),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                Err(error) => return Err(error),
+            }
+            if now().saturating_duration_since(started) >= REPAIR_LOCK_WAIT {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        Err(io::ErrorKind::TimedOut.into())
     }
     fn publish(&self, temporary: &str, blob: &str) -> Result<(), BlobError> {
         #[cfg(test)]

@@ -454,11 +454,19 @@ fn racing_corrupt_observers_emit_only_one_repair_event() {
     let capture = RepairLog::default();
     let barrier = Arc::new(Barrier::new(2));
     let (tx, rx) = mpsc::channel();
+    let (published_tx, published_rx) = mpsc::channel();
+    let mut published_rx = Some(published_rx);
     let workers: Vec<_> = (0..2)
-        .map(|_| {
+        .map(|index| {
             // Independent stores exercise filesystem coordination, not an instance mutex.
             let store = BlobStore::open(root.path()).unwrap();
             let (barrier, tx, writer) = (barrier.clone(), tx.clone(), capture.clone());
+            let mut await_first = if index == 1 {
+                published_rx.take()
+            } else {
+                None
+            };
+            let published = (index == 0).then(|| published_tx.clone());
             std::thread::spawn(move || {
                 REPAIR_RACE.with(|slot| *slot.borrow_mut() = Some(barrier));
                 let subscriber = tracing_subscriber::fmt()
@@ -467,13 +475,33 @@ fn racing_corrupt_observers_emit_only_one_repair_event() {
                     .with_max_level(tracing::Level::WARN)
                     .with_writer(move || writer.clone())
                     .finish();
-                let result =
-                    tracing::subscriber::with_default(subscriber, || store.put(&b"abc"[..], 3));
+                let result = tracing::subscriber::with_default(subscriber, || {
+                    store.put_with_repair_lock(
+                        &b"abc"[..],
+                        3,
+                        &mut std::time::Instant::now,
+                        &mut || {
+                            // Both writers observed corruption at the barrier. Order acquisition
+                            // after publication so this assertion is independent of fsync speed
+                            // and the best-effort contention budget.
+                            if let Some(ready) = await_first.take() {
+                                ready.recv_timeout(Duration::from_secs(10)).expect(
+                                    "first repair must publish before the second acquisition",
+                                );
+                            }
+                            store.0.try_publication_lock()
+                        },
+                    )
+                });
+                if let Some(published) = published {
+                    published.send(()).unwrap();
+                }
                 tx.send(result).unwrap();
             })
         })
         .collect();
     drop(tx);
+    drop(published_tx);
     // Bound the rendezvous too: a missing observer or a silent worker must fail.
     for _ in 0..2 {
         assert_eq!(
@@ -501,4 +529,130 @@ fn racing_corrupt_observers_emit_only_one_repair_event() {
         "only the writer replacing corrupt bytes reports repair"
     );
     assert_eq!(events[0]["fields"]["event"], "structured.blob.repaired");
+}
+
+#[test]
+fn missing_put_never_attempts_the_repair_lock() {
+    let (_root, store) = setup();
+    let mut attempts = 0;
+    let now = std::time::Instant::now();
+    let result = store.put_with_repair_lock(&b"abc"[..], 3, &mut || now, &mut || {
+        attempts += 1;
+        Err(io::ErrorKind::Unsupported.into())
+    });
+    assert!(
+        result.is_ok(),
+        "first publication must not depend on locking: {result:?}"
+    );
+    assert_eq!(attempts, 0);
+    assert_eq!(store.get(ABC).unwrap(), b"abc");
+}
+
+#[test]
+fn corrupt_repair_survives_lock_error_and_warns_without_content() {
+    let (root, store) = setup();
+    store.put(&b"abc"[..], 3).unwrap();
+    fs::write(root.path().join("blobs").join(ABC), b"bad").unwrap();
+    let capture = RepairLog::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    let now = std::time::Instant::now();
+    let mut attempts = 0;
+    let result = tracing::subscriber::with_default(subscriber, || {
+        store.put_with_repair_lock(&b"abc"[..], 3, &mut || now, &mut || {
+            attempts += 1;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "fixture-private-lock-error-detail",
+            ))
+        })
+    });
+    assert!(
+        result.is_ok(),
+        "a lock error must not lose the repaired blob: {result:?}"
+    );
+    assert_eq!(attempts, 1);
+    assert_eq!(store.get(ABC).unwrap(), b"abc");
+    assert_eq!(names(&root), [ABC]);
+    let bytes = capture.0.lock().unwrap().clone();
+    let text = String::from_utf8(bytes).unwrap();
+    let events: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let warnings: Vec<_> = events
+        .iter()
+        .filter(|event| event["fields"]["event"] == "structured.blob.repair_lock_unavailable")
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["fields"]["error_kind"], "Unsupported");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["fields"]["event"] == "structured.blob.repaired")
+            .count(),
+        1
+    );
+    assert!(!text.contains("fixture-private-lock-error-detail"));
+}
+
+#[test]
+fn repair_lock_retry_budget_uses_supplied_time_and_bounds_a_frozen_clock() {
+    for advances in [true, false] {
+        let (root, store) = setup();
+        store.put(&b"abc"[..], 3).unwrap();
+        fs::write(root.path().join("blobs").join(ABC), b"bad").unwrap();
+        let capture = RepairLog::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let start = std::time::Instant::now();
+        let mut ticks = 0;
+        let mut attempts = 0;
+        let result = tracing::subscriber::with_default(subscriber, || {
+            store.put_with_repair_lock(
+                &b"abc"[..],
+                3,
+                &mut || {
+                    let now = start + Duration::from_secs(ticks);
+                    if advances {
+                        ticks += 1;
+                    }
+                    now
+                },
+                &mut || {
+                    attempts += 1;
+                    // Even a regressed loop fails explicitly instead of hanging the suite.
+                    assert!(attempts <= 8, "repair lock attempt budget exceeded");
+                    Err(io::ErrorKind::WouldBlock.into())
+                },
+            )
+        });
+        assert!(
+            result.is_ok(),
+            "content publication must survive contention: {result:?}"
+        );
+        assert_eq!(attempts, if advances { 1 } else { 8 });
+        assert_eq!(store.get(ABC).unwrap(), b"abc");
+        let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let events: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|event| event["fields"]["event"] == "structured.blob.repair_lock_unavailable")
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["fields"]["error_kind"], "TimedOut");
+    }
 }
