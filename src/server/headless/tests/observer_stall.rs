@@ -134,6 +134,7 @@ async fn stalled_observer_disconnect_preserves_live_pane_and_healthy_observer() 
                 .unwrap();
             let result = write_with_progress(
                 data,
+                Duration::from_secs(30),
                 || now.get(),
                 |bytes, _remaining| {
                     assert!(

@@ -1693,7 +1693,7 @@ pub(crate) fn client_conn_write_stalled(client_id: u64) {
         subsystem = "client_conn",
         outcome = "disconnected",
         client_id,
-        "observer disconnected after 30 seconds without socket write progress"
+        "observer disconnected after exhausting its socket write progress deadline"
     );
 }
 

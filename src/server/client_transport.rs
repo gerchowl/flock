@@ -36,6 +36,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Disconnect an observer after this long without bytes accepted by its socket.
 /// Idle connections with no pending output are unaffected, and every partial
 /// write restarts the monotonic deadline, even within a single large frame.
+/// Known limit: trickling readers can retain up to this much control-message
+/// backlog per frame. This is a no-progress limit, not a total delivery deadline.
 const OBSERVER_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum input payload size (bytes) for a single `ClientMessage::Input`.
@@ -325,13 +327,34 @@ pub(super) fn client_writer_loop(
     render_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
+    client_writer_loop_timed(
+        stream,
+        client_id,
+        control_rx,
+        render_rx,
+        server_event_tx,
+        OBSERVER_WRITE_STALL_TIMEOUT,
+        Instant::now,
+    );
+}
+
+/// Run the real socket writer with a supplied no-progress limit and clock.
+fn client_writer_loop_timed(
+    stream: UnixStream,
+    client_id: u64,
+    control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    render_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    server_event_tx: mpsc::Sender<ServerEvent>,
+    timeout: Duration,
+    now: fn() -> Instant,
+) {
     client_writer_loop_with(
         stream,
         client_id,
         control_rx,
         render_rx,
         server_event_tx,
-        |stream, data| write_framed_bytes(stream, data, client_id),
+        |stream, data| write_framed_bytes(stream, data, client_id, timeout, now),
     );
 }
 
@@ -408,6 +431,7 @@ pub(super) fn client_writer_loop_with(
 /// `now` and `write` are supplied so tests drive time at actual backpressure.
 pub(super) fn write_with_progress(
     data: &[u8],
+    timeout: Duration,
     mut now: impl FnMut() -> Instant,
     mut write: impl FnMut(&[u8], Duration) -> io::Result<usize>,
 ) -> io::Result<()> {
@@ -415,13 +439,13 @@ pub(super) fn write_with_progress(
     let mut last_progress = now();
     while offset < data.len() {
         let elapsed = now().saturating_duration_since(last_progress);
-        if elapsed >= OBSERVER_WRITE_STALL_TIMEOUT {
+        if elapsed >= timeout {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "observer write stalled",
             ));
         }
-        match write(&data[offset..], OBSERVER_WRITE_STALL_TIMEOUT - elapsed) {
+        match write(&data[offset..], timeout - elapsed) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(bytes) => {
                 offset += bytes;
@@ -440,8 +464,15 @@ pub(super) fn write_with_progress(
     Ok(())
 }
 
-fn write_framed_bytes(stream: &mut UnixStream, data: &[u8], client_id: u64) -> bool {
-    let result = write_with_progress(data, Instant::now, |bytes, remaining| {
+/// Use the same deadline for blocking syscall timeouts and progress accounting.
+fn write_framed_bytes(
+    stream: &mut UnixStream,
+    data: &[u8],
+    client_id: u64,
+    timeout: Duration,
+    now: impl FnMut() -> Instant,
+) -> bool {
+    let result = write_with_progress(data, timeout, now, |bytes, remaining| {
         // SO_SNDTIMEO bounds each blocking syscall by the remaining deadline.
         // Failure to arm it fails closed rather than leaving an unbounded write.
         stream.set_write_timeout(Some(remaining))?;
