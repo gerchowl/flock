@@ -411,3 +411,50 @@ fn guarded_agent_requires_capability_and_normalizes_an_unknown_method() {
         assert_eq!(peer.finish().len(), if capable { 2 } else { 1 });
     }
 }
+
+#[test]
+fn gated_old_protocol_without_write_capability_keeps_the_skew_refusal() {
+    let peer = ScriptedApi::new(vec![(
+        "ping",
+        Some(json!({"result":{
+        "version":"0.9.0","protocol":25}})),
+    )]);
+    let client = peer.client();
+    let _invocation = GatedInvocation::begin(&client);
+    let response = client.request_value(&raw("pane.send_input")).unwrap();
+    assert_eq!(response["error"]["code"], "server_version_gap");
+    assert_eq!(
+        crate::cli::error_code_exit(response["error"]["code"].as_str().unwrap(), false),
+        crate::cli::exit::PROTOCOL_GAP
+    );
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("server flk 0.9.0 (protocol 25) is incompatible"),
+        "{message}"
+    );
+    assert!(
+        message.contains("hand it off with 'flk server live-handoff'"),
+        "{message}"
+    );
+    assert_eq!(peer.finish().len(), 1);
+}
+
+#[test]
+fn agent_target_refusal_omits_data_when_only_the_pane_hint_remains() {
+    let peer = ScriptedApi::new(vec![
+        ("ping", Some(ping(true))),
+        (
+            "pane.write_text",
+            Some(json!({"error":{
+            "code":"pane_not_found","message":"missing pane",
+            "data":{"expected":[{"type":"pane","pane":"<pane>"}]}}})),
+        ),
+    ]);
+    let request: Request = serde_json::from_value(json!({"id":"agent","method":"agent.send",
+        "params":{"target":"missing","text":"hello","submit":false}}))
+    .unwrap();
+    let response = peer.client().request_value(&request).unwrap();
+    assert_eq!(response["error"]["code"], "agent_not_found");
+    assert!(response["error"].get("data").is_none(), "{response}");
+    assert_eq!(peer.finish().len(), 2);
+}
