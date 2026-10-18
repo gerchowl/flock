@@ -859,3 +859,5 @@ fn unknown_producer_tag_preserves_its_uninterpreted_payload() {
     assert_eq!(journal.replay(0).unwrap().records, [record]);
     assert!(journal.checkpoint().is_err());
 }
+
+mod admission;
