@@ -1410,15 +1410,69 @@ mod tests {
 
     #[test]
     fn compact_header_refspec_ambiguity_is_conservatively_masked() {
-        for argument in ["cookie:cookie", "authorization:main"] {
+        for argument in [
+            "cookie:cookie",
+            "authorization:main",
+            "-1HAuthorization:main",
+        ] {
             let label = argument.split_once(':').unwrap().0;
             assert_eq!(redact_arg(argument), format!("{label}: <redacted>"));
         }
         for argument in [
             "--sHAuthorization:main",
-            "-1HAuthorization:main",
             "-sHtoken:main",
             "refs/heads/private-token:refs/heads/x",
+        ] {
+            assert_eq!(redact_arg(argument), argument);
+        }
+    }
+
+    fn assert_nonletter_cluster_masked(prefix: &str, header: &str) {
+        let secret = ["fixture", "curl", "credential"].join("-");
+        let value = match header {
+            "Authorization" => format!("Bearer {secret}"),
+            "Cookie" => format!("sid={secret}"),
+            _ => secret.clone(),
+        };
+        let label = format!("{prefix}{header}:");
+        let logs = logged_fixture_args(&[format!("{label}{value}"), "ordinary".into()]);
+        assert!(!logs.contains(&secret), "{logs}");
+        assert!(logs.contains(&label), "{logs}");
+        assert!(logs.contains("<redacted> ordinary"), "{logs}");
+    }
+
+    #[test]
+    fn ipv4_glued_authorization_header_is_masked() {
+        assert_nonletter_cluster_masked("-4H", "Authorization");
+    }
+    #[test]
+    fn http10_silent_glued_cookie_header_is_masked() {
+        assert_nonletter_cluster_masked("-0sH", "Cookie");
+    }
+    #[test]
+    fn progress_glued_api_key_header_is_masked() {
+        assert_nonletter_cluster_masked("-#H", "X-Api-Key");
+    }
+    #[test]
+    fn next_glued_api_key_header_is_masked() {
+        assert_nonletter_cluster_masked("-:H", "X-Api-Key");
+    }
+    #[test]
+    fn next_cluster_masks_from_the_first_header_colon() {
+        let secret = ["fixture", "HAuthorization:", "tail"].concat();
+        assert_eq!(
+            redact_arg(&format!("-:HAuthorization:{secret}")),
+            "-:HAuthorization: <redacted>"
+        );
+    }
+    #[test]
+    fn lowercase_help_and_long_flags_are_not_header_clusters() {
+        for argument in [
+            "-4hAuthorization:main",
+            "-#hX-Api-Key:main",
+            "-:hAuthorization:main",
+            "--4HAuthorization:main",
+            "prefix#HAuthorization:main",
         ] {
             assert_eq!(redact_arg(argument), argument);
         }
