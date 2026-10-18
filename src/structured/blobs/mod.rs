@@ -14,13 +14,27 @@ use std::path::Path;
 pub struct StorageConfig {
     /// Replace eligible JSON blocks strictly larger than this many encoded bytes.
     pub blob_min_bytes: usize,
+    /// Silence observation policy in milliseconds, inclusive range 5000..=3600000.
+    #[serde(deserialize_with = "stall_ms")]
+    pub stall_ms: u64,
 }
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             blob_min_bytes: 2048,
+            stall_ms: 120_000,
         }
     }
+}
+fn stall_ms<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if !(5_000..=3_600_000).contains(&value) {
+        return Err(serde::de::Error::invalid_value(
+            serde::de::Unexpected::Unsigned(value),
+            &"sessions.stall_ms in 5000..=3600000 milliseconds",
+        ));
+    }
+    Ok(value)
 }
 /// Explicit failures, retained as the source when transport wraps them in io::Error.
 #[derive(Debug)]

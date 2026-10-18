@@ -271,7 +271,14 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   requests by `request_id`, and the agent stays `waiting_on_human` until
   every one of them is answered. Working is `system/status: requesting` or
   an open `message_start`. A stall is an accepted or started input with no stdout event for
-  `[sessions] stall_ms` while no control request and no tool call is open;
+  `[sessions] stall_ms` while no control request and no tool call is open.
+  This optional setting defaults to **120000 ms** (2 minutes), with an inclusive
+  range of **5000..=3600000 ms**. Out-of-range values, including zero, are config
+  validation errors; there is no disabled value or silent clamping. A stall is
+  an observation that leaves the phase unchanged, so false positives are cheap.
+  Provider retries and rate-limit backoff can produce tens of seconds of silence;
+  two minutes avoids reporting those as stalls while exposing a hung harness.
+  The production worker caller passes the loaded value, without another default;
   a long-running tool is not a stall (its `tool_use` is open). A stall is
   reported as `agent.session_stalled{since}` and leaves the phase as it is
   (ADR-0028 §1 derivation is unchanged); it is an observation, not a timeout
