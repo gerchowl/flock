@@ -196,9 +196,9 @@ impl Store {
     /// legacy snapshot-only lock (#1974). Legacy locks were always unmarked, even
     /// after publishing positions. That layout's only floor was `fleet.json`:
     /// if it is lost, no better floor can be recovered, preserving the old behavior.
-    /// The legacy layout never landed on `dev` and never shipped.
-    /// Before marking the lock, opening syncs the cursor's parent directory even when its value already
-    /// matches: a previous rename may have succeeded but its directory sync failed.
+    /// Before marking the lock, opening syncs the cursor's parent directory even
+    /// when its value already matches: a previous rename may have succeeded but
+    /// its directory sync failed.
     /// A directory-sync failure refuses opening and leaves the lock unmarked.
     /// `fleet.lock` carries the initialization marker: deleting it together with
     /// `fleet.cursor` while an older `fleet.json` survives reopens at that older

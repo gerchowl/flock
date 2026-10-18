@@ -41,9 +41,7 @@ An empty, unmarked lock with neither data record opens at zero. This includes an
 empty legacy lock from the snapshot-only layout (#1974). Legacy locks were always
 unmarked, even after positions had been published through `fleet.json`. That
 layout's only high-water floor was `fleet.json`; if it is lost, there is no better
-floor to recover. Opening at zero preserves the old behavior, rather than proving
-that nothing was ever reserved. The legacy layout never landed on `dev` and never
-shipped.
+floor to recover. Opening at zero preserves the old behavior.
 
 In the cursor-based layout, cursor durability precedes the initialization marker.
 If an unmarked lock already has a matching cursor, opening fsyncs the cursor's
