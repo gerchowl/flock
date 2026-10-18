@@ -161,6 +161,8 @@ pub(crate) fn run_notified(
 }
 
 /// Worker-owned cancellation exists before spawn, including deadline escalation.
+/// The tuple pairs the prepared profile with its pinned MCP endpoint while keeping
+/// this worker entry point within clippy's seven-argument limit (ADR-0036 §1/§1a).
 pub(crate) fn run_controlled(
     state: &Path,
     (profile, mcp): (LaunchProfile, SessionMcp),

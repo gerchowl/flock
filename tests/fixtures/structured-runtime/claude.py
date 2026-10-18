@@ -197,7 +197,6 @@ if mode in ("state-reducer", "worker-exit", "worker-exit-ok", "worker-stubborn")
         parent_gone()
     if mode.startswith("worker-exit"):
         sys.exit(0 if mode == "worker-exit-ok" else 7)
-
     sys.stdin.read()
     sys.exit(0)
 if mode == "lease-calls":
