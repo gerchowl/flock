@@ -1,9 +1,9 @@
 //! Real structured-client listener ownership (ADR-0036 §5/§5a).
+use super::listener_foundation::accept_next;
 use super::wire::timing::{Clock, SystemClock};
 use super::{client_exchange, gui, wire::Core};
 use crate::api::client_listener::{publish, Status};
 use crate::client_open::Codes;
-use crate::platform::client_listener::{accept_failure, AcceptFailure};
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -35,8 +35,6 @@ const HTTP_ADMISSION_DEADLINE: Duration = Duration::from_secs(5);
 const FUNNEL_DEADLINE: Duration = Duration::from_secs(5);
 /// Maximum status JSON bytes accepted from the public-funnel probe.
 const FUNNEL_STATUS_BYTES: usize = 65_536;
-/// Resource pressure pauses acceptance without spinning or stopping the server (Tokio convention).
-const ACCEPT_RESOURCE_BACKOFF: Duration = Duration::from_millis(100);
 /// Own every HTTP task; acceptance and its monotonic clock are injectable without test sleeps.
 async fn serve<A, F>(mut accept: A, router: Router, clock: Arc<dyn Clock>) -> io::Result<()>
 where
@@ -47,21 +45,7 @@ where
     let mut clients = JoinSet::new();
     loop {
         while clients.try_join_next().is_some() {}
-        let (socket, peer) = match accept().await {
-            Ok(connection) => connection,
-            Err(error) => {
-                let class = accept_failure(&error);
-                crate::logging::client_accept_failed(&error, class);
-                if class == AcceptFailure::Fatal {
-                    publish(Status::Failed);
-                    return Err(error);
-                }
-                if class == AcceptFailure::Resource {
-                    clock.until(clock.now() + ACCEPT_RESOURCE_BACKOFF).await;
-                }
-                continue;
-            }
-        };
+        let (socket, peer) = accept_next(&mut accept, clock.as_ref()).await?;
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             continue;
         };
@@ -192,8 +176,15 @@ fn check_funnel(port: u16) -> io::Result<()> {
     let output = crate::process::TracedCommand::new("tailscale", "client-wire")
         .args(["serve", "status", "--json"])
         .output_traced_with_timeout_and_limit(FUNNEL_DEADLINE, FUNNEL_STATUS_BYTES)?;
+    validate_funnel(output, port)
+}
+/// Validate successful probe output before any request can reach admission.
+fn validate_funnel(output: std::process::Output, port: u16) -> io::Result<()> {
     if !output.status.success() {
-        return Err(io::Error::other("tailscale status command failed"));
+        return Err(io::Error::other(format!(
+            "tailscale serve status failed: {}",
+            output.status
+        )));
     }
     let status: FunnelStatus = serde_json::from_slice(&output.stdout)
         .map_err(|_| io::Error::other("invalid tailscale status JSON"))?;

@@ -80,10 +80,10 @@ self plus the exact WebSocket URL for connections, and no objects, base URL,
 framing or form actions. There is no generated configuration script.
 
 Startup runs `tailscale serve status --json` off the async executor, bounded at
-five seconds and 64 KiB. Active public funnel, unsuccessful or malformed status,
+five seconds and 64 KiB. Any serve or funnel configuration targeting the bound port, unsuccessful or malformed status,
 and an unavailable probe refuse the configured listener and server startup;
-there is no silent fallback. Funnel configuration changes after startup are not
-monitored. The operator must keep public forwarding disabled.
+there is no silent fallback. Exit status is checked before parsing JSON. Forwarding changes after startup are not
+monitored. The operator must keep forwarding to this port disabled.
 
 Live handoff transfers the bound listening descriptor rather than rebinding its
 port after commit. The importer validates a listening socket and its configured
@@ -96,7 +96,8 @@ reconnect path. Failed imports preserve the exporter's listener. Received socket
 are close-on-exec so later children cannot retain the port. Process-local browser
 codes are not transferred; obtain a fresh URL after handoff or restart. A changed
 nonzero configured address requires a restart rather than adopting a mismatched
-listener. A listener failure ends the owning server loop; shutdown cancels owned
+listener. A fatal accept failure stops only the listener and publishes typed failed status;
+the server loop and its agents continue. Server shutdown cancels owned
 HTTP connection tasks, closes accepted I/O and checks core lease release before
 returning. HTTP/1 half-close handling and admission deadlines are configured on the
 owned connection driver.
@@ -104,3 +105,20 @@ owned connection driver.
 Completed exchange failures remain uniform 401 with no-store, including oversized bodies
 and internal store/worker errors. Only internal typed classes and I/O kinds enter
 server diagnostics; neither credentials, one-time codes nor raw errors do.
+
+## Listener recovery foundation (#1894)
+
+The separately reviewed foundation supplies the reusable accept policy. It treats peer resets,
+interrupted accepts and other per-connection errors as recoverable and logs them
+at debug level. Descriptor or buffer exhaustion emits a structured warning and
+waits `ACCEPT_RESOURCE_BACKOFF` (100 ms) on the supplied monotonic clock before
+accepting again. Only an invalid listener descriptor (`EBADF`, `EINVAL`,
+`ENOTSOCK`) ends that listener task and publishes the typed `failed` state once.
+It does not end the headless server loop or its agents. Ping carries the optional
+`client_listener` state (`listening` or `failed`), absent when disabled.
+
+Every SCM_RIGHTS descriptor is made close-on-exec at the receive boundary before
+import can spawn a child. The listener descriptor helper additionally verifies
+that a transferred socket is listening and retains exporter rollback ownership
+through duplication. The mounting change integrates those helpers into the listener lifecycle and
+the handoff manifest described above.

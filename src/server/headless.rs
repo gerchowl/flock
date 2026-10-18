@@ -5212,6 +5212,88 @@ mod tests {
         assert!(bytes.try_recv().is_err());
     }
 
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn fatal_client_accept_keeps_the_server_loop_and_shell_pty_alive() {
+        async fn request(
+            tx: &api::ApiRequestSender,
+            method: &str,
+            params: serde_json::Value,
+        ) -> serde_json::Value {
+            let (respond_to, response) = std::sync::mpsc::channel();
+            tx.send(api::ApiRequestMessage {
+                request: serde_json::from_value(
+                    serde_json::json!({"id":"listener-survival","method":method,"params":params}),
+                )
+                .unwrap(),
+                respond_to,
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
+            })
+            .unwrap();
+            let response = tokio::task::spawn_blocking(move || {
+                response
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("headless request producer disappeared or stayed silent")
+            })
+            .await
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert!(value.get("error").is_none(), "{value}");
+            value
+        }
+        let (data, failed) = crate::web::client_listener::tests::failed_listener().await;
+        let mut server = test_headless_server();
+        server.app.state.default_shell = "/bin/sh".into();
+        server.app.state.config.terminal.default_shell = "/bin/sh".into();
+        server.app.state.config.checks.enable = false;
+        server.app.next_auto_update_check = None;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        server.app.api_rx = rx;
+        server.client_wire = Some(failed);
+        let quit = server.should_quit.clone();
+        let exercise = async {
+            assert_eq!(
+                crate::api::client_listener::status(),
+                Some(crate::api::client_listener::Status::Failed)
+            );
+            let created = request(
+                &tx,
+                "workspace.create",
+                serde_json::json!({"cwd":data.path(),"focus":true}),
+            )
+            .await;
+            let pane = created["result"]["root_pane"]["pane_id"]
+                .as_str()
+                .expect("live shell pane");
+            request(&tx,"pane.write_input",serde_json::json!({"pane_id":pane,"text":"printf '%s%s\\n' listener- survived\n","raw":true})).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let read = request(
+                        &tx,
+                        "pane.read",
+                        serde_json::json!({"pane_id":pane,"source":"recent","format":"text"}),
+                    )
+                    .await;
+                    if read.to_string().contains("listener-survived") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("shell producer stayed silent after listener failure");
+            quit.store(true, Ordering::Release);
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(server.run(), exercise)
+        })
+        .await
+        .expect("headless loop did not finish after explicit owned shutdown");
+        result.unwrap();
+    }
+
     fn test_headless_server() -> HeadlessServer {
         let config = crate::config::Config::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

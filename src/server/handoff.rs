@@ -752,10 +752,7 @@ fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> 
         collected?;
         // Set every received PTY/listener descriptor before any importer child can be spawned.
         for fd in &out[before..] {
-            // SCM_RIGHTS transfers owned descriptors, but does not preserve FD_CLOEXEC.
-            if unsafe { libc::fcntl(*fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            crate::platform::received_fd::close_on_exec(*fd)?;
         }
         if byte[0] != FD_BATCH_TAG {
             return Err(io::Error::other(format!(

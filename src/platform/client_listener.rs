@@ -30,10 +30,7 @@ pub(crate) fn take(fds: &mut Vec<RawFd>) -> io::Result<TcpListener> {
         .ok_or_else(|| io::Error::other("missing structured listener descriptor"))?;
     // The authenticated SCM_RIGHTS receiver transferred exclusive ownership of this fd.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
-    // SCM_RIGHTS does not promise close-on-exec on both supported platforms.
-    if unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    crate::platform::received_fd::close_on_exec(listener.as_raw_fd())?;
     if !listening(listener.as_raw_fd())? {
         return Err(io::ErrorKind::InvalidInput.into());
     }

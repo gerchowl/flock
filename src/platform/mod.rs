@@ -6,6 +6,7 @@
 #[cfg(feature = "web")]
 pub(crate) mod client_listener;
 pub(crate) mod peer;
+pub(crate) mod received_fd;
 pub(crate) mod structured;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

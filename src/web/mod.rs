@@ -22,6 +22,7 @@
 pub(crate) mod client_exchange;
 pub(crate) mod client_listener;
 pub(crate) mod gui;
+pub(crate) mod listener_foundation;
 pub(crate) mod store_io;
 pub(crate) mod wire;
 

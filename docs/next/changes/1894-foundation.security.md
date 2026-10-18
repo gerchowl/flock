@@ -1,0 +1,1 @@
+- Prepare listener error recovery and typed health reporting, and prevent received handoff descriptors from leaking into child processes. The structured listener remains unmounted.

@@ -111,3 +111,71 @@ async fn fatal_accept_marks_only_the_listener_failed() {
     assert_eq!(crate::api::client_listener::status(), Some(Status::Failed));
     listener.shutdown().await.unwrap();
 }
+
+fn probe_output(value: &str, exit: i32) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(exit << 8),
+        stdout: value.as_bytes().to_vec(),
+        stderr: Vec::new(),
+    }
+}
+#[test]
+fn serve_and_funnel_targeting_the_bound_port_are_refused() {
+    for config in [
+        serde_json::json!({"Web":{"fixture.example:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:45678"}}}}}),
+        serde_json::json!({"AllowFunnel":{"fixture.example:45678":true}}),
+        serde_json::json!({"TCP":{"45678":{"HTTPS":true}}}),
+        serde_json::json!({"Foreground":{"123":{"Web":{"fixture.example:443":{"Handlers":{"/":{"Proxy":"45678"}}}}}}}),
+        serde_json::json!({"Services":{"svc:fixture":{"TCP":{"443":{"TCPForward":"127.0.0.1:45678"}}}}}),
+    ] {
+        let error = validate_funnel(probe_output(&config.to_string(), 0), 45678).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "tailscale serve/funnel may expose the client port"
+        );
+    }
+}
+#[test]
+fn unrelated_serve_ports_are_allowed_and_status_failures_are_precise() {
+    let config = r#"{"AllowFunnel":{"fixture.example:443":true},"Web":{"fixture.example:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:45679"}}}}}"#;
+    validate_funnel(probe_output(config, 0), 45678).unwrap();
+    let failed = validate_funnel(probe_output("invalid JSON", 7), 45678).unwrap_err();
+    assert!(failed
+        .to_string()
+        .contains("tailscale serve status failed:"));
+    assert!(!failed.to_string().contains("invalid tailscale status JSON"));
+    assert_eq!(
+        validate_funnel(probe_output("invalid JSON", 0), 45678)
+            .unwrap_err()
+            .to_string(),
+        "invalid tailscale status JSON"
+    );
+    for proxy in [
+        serde_json::Value::Null,
+        serde_json::json!(false),
+        serde_json::json!("http://["),
+    ] {
+        let config =
+            serde_json::json!({"Web":{"fixture.example:443":{"Handlers":{"/":{"Proxy":proxy}}}}});
+        assert_eq!(
+            validate_funnel(probe_output(&config.to_string(), 0), 45678)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+}
+#[test]
+fn serve_proxy_port_forms_match_the_bound_authority() {
+    for (target, port) in [
+        ("45678", 45678),
+        ("127.0.0.1:45678", 45678),
+        ("http://127.0.0.1:45678/path", 45678),
+        ("https://fixture.example", 443),
+        ("http://fixture.example", 80),
+    ] {
+        assert_eq!(target_port(target), Some(port));
+    }
+}
