@@ -574,6 +574,8 @@ pub fn take_switch_target(path: &std::path::Path) -> Option<RecordedSwitch> {
 pub enum ClientError {
     /// Could not connect to the server's client socket.
     ConnectionFailed(io::Error),
+    /// No usable startup terminal geometry was obtained within its budget.
+    TerminalGeometry(io::Error),
     /// Server rejected our handshake.
     HandshakeRejected { version: u32, error: String },
     /// Server shut down.
@@ -596,6 +598,7 @@ impl std::fmt::Display for ClientError {
                 write!(f, "\nIs flk server running? Start it with `flk server`.")?;
                 write!(f, "\nSocket path: {}", path.display())
             }
+            ClientError::TerminalGeometry(err) => write!(f, "terminal geometry: {err}"),
             ClientError::HandshakeRejected { version, error } => {
                 write!(f, "server rejected handshake (version {version}): {error}")
             }
@@ -644,7 +647,7 @@ impl std::fmt::Display for ClientError {
 impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ClientError::ConnectionFailed(err) => Some(err),
+            ClientError::ConnectionFailed(err) | ClientError::TerminalGeometry(err) => Some(err),
             ClientError::ConnectionLost(err) => Some(err),
             ClientError::Protocol(err) => Some(err),
             _ => None,
@@ -823,6 +826,11 @@ struct HeldRestoreGuard {
 impl HeldRestoreGuard {
     fn new() -> Self {
         Self { armed: true }
+    }
+
+    /// End a final leg and reclaim any remaining inherited terminal hold.
+    fn finish(self) {
+        drop(self);
     }
 
     /// Disarm: this leg is exiting by handing the held terminal to the next
@@ -1028,6 +1036,8 @@ fn do_handshake(
 enum ClientLoopEvent {
     /// Raw input bytes from stdin.
     StdinInput(Vec<u8>),
+    /// Terminal geometry is unavailable, so detach without resizing any panes.
+    Detach,
     /// Terminal resize detected.
     Resize(u16, u16, u32, u32),
     /// Server message received. Carries the slot key of the reader that read
@@ -1308,6 +1318,9 @@ impl HandoffRetry {
             AttachAttemptError::Handshake(ClientError::HandshakeRejected { version, .. }) => {
                 *version <= PROTOCOL_VERSION
             }
+            // Terminal geometry is local to this client; a server handoff
+            // cannot repair it, even while transport churn is retryable.
+            AttachAttemptError::Handshake(ClientError::TerminalGeometry(_)) => false,
             AttachAttemptError::Handshake(_) => true,
         }
     }
@@ -1671,6 +1684,7 @@ fn run_attach_attempt(
     attach_request: Option<&(String, bool)>,
     direct_attach: bool,
     kitty_graphics_enabled: bool,
+    mut geometry_probe: GeometryQuery,
     host_theme: Option<crate::terminal_theme::TerminalTheme>,
     pending_stdin: &mut Option<Vec<u8>>,
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
@@ -1683,14 +1697,23 @@ fn run_attach_attempt(
     hold_on_transport_loss: bool,
     signal: &AttachSignal,
 ) -> Result<(), AttachAttemptError> {
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
-
     // Read the terminal geometry before the handshake, while still outside
     // raw mode. Re-read on every attempt so a resize that happens during a
     // handoff window is honored.
-    let (cols, rows, cell_width_px, cell_height_px) =
-        current_terminal_geometry(kitty_graphics_enabled);
+    let Some((cols, rows, cell_width_px, cell_height_px)) = wait_for_initial_geometry(
+        should_quit,
+        || geometry_probe(kitty_graphics_enabled),
+        Instant::now,
+        std::thread::park_timeout,
+    )
+    .map_err(|err| AttachAttemptError::Handshake(ClientError::TerminalGeometry(err)))?
+    else {
+        return Ok(());
+    };
+
+    // Do not occupy a server handshake slot until this client has geometry.
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
 
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = do_handshake(
@@ -1755,8 +1778,8 @@ fn run_attach_attempt(
     let initial_input = pending_stdin.take();
     let result = rt.block_on(run_client_loop(
         stream,
-        cols,
-        rows,
+        (cols, rows, cell_width_px, cell_height_px),
+        geometry_probe,
         should_quit.clone(),
         sound_config.clone(),
         mouse_scroll_lines,
@@ -1770,9 +1793,18 @@ fn run_attach_attempt(
         attach_t0,
     ));
 
-    // A remote leg whose transport dropped keeps its last frame up while it
-    // redials (#436): decide before the guard's restore runs. Everything else
-    // restores the terminal before the caller prints anything.
+    finish_attach_session(_guard, result, hold_on_transport_loss, should_quit)
+}
+
+/// Complete a guarded session, including early tty-loss exits from loop startup.
+fn finish_attach_session(
+    guard: TerminalGuard,
+    result: Result<(), ClientError>,
+    hold_on_transport_loss: bool,
+    should_quit: &AtomicBool,
+) -> Result<(), AttachAttemptError> {
+    // Only transport loss holds raw mode for redial. A clean tty-loss exit
+    // restores modes through the same guard drop as every other final exit.
     if hold_on_transport_loss
         && matches!(result, Err(ClientError::ConnectionLost(_)))
         && !should_quit.load(Ordering::Acquire)
@@ -1780,8 +1812,7 @@ fn run_attach_attempt(
     {
         RECONNECT_HOLD.store(true, Ordering::Release);
     }
-    drop(_guard);
-
+    drop(guard);
     result.map_err(AttachAttemptError::Session)
 }
 
@@ -1962,6 +1993,7 @@ fn run_client_with_mode(
                 attach_request.as_ref(),
                 direct_attach,
                 kitty_graphics_enabled,
+                terminal_geometry_query(),
                 host_theme,
                 &mut pending_stdin,
                 stdin_rx,
@@ -2069,9 +2101,9 @@ fn run_client_with_mode(
         });
     }
 
-    // Clean leg exit: the terminal is already fully restored. Disarm so the
-    // guard does not second-guess it.
-    held_restore.into_handoff();
+    // A pre-handshake tty-loss exit has no new TerminalGuard. Reclaim any
+    // inherited raw-mode hold rather than handing it to a nonexistent next leg.
+    held_restore.finish();
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("client");
     Ok(())
@@ -2088,8 +2120,8 @@ fn run_client_with_mode(
 #[allow(clippy::too_many_arguments)]
 async fn run_client_loop(
     stream: UnixStream,
-    cols: u16,
-    rows: u16,
+    initial_geometry: TerminalGeometry,
+    mut geometry_probe: GeometryQuery,
     should_quit: Arc<AtomicBool>,
     sound_config: crate::config::SoundConfig,
     mouse_scroll_lines: usize,
@@ -2102,8 +2134,18 @@ async fn run_client_loop(
     stdin_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
     attach_t0: Instant,
 ) -> Result<(), ClientError> {
-    let (_, _, initial_cell_width, initial_cell_height) =
-        current_terminal_geometry(kitty_graphics_enabled);
+    let (cols, rows, _, _) = initial_geometry;
+    let Some((_, _, initial_cell_width, initial_cell_height)) = resolve_terminal_geometry(
+        Some(initial_geometry),
+        geometry_probe(kitty_graphics_enabled),
+        "loop_startup",
+    )
+    .map_err(ClientError::TerminalGeometry)?
+    else {
+        // Closing this connection detaches the observer if its terminal vanished
+        // between the handshake and starting the event loop.
+        return Ok(());
+    };
     // `ui.file_drop` gate (#79): whether a dropped local file is ferried to the
     // server. Read once per attach leg (cheap; file-drops are rare).
     let file_drop_mode = crate::config::Config::load().config.ui.file_drop;
@@ -2140,7 +2182,13 @@ async fn run_client_loop(
     let resize_quit = should_quit.clone();
     let resize_tx = event_tx.clone();
     std::thread::spawn(move || {
-        resize_poll_loop(resize_tx, cols, rows, kitty_graphics_enabled, &resize_quit);
+        resize_poll_loop(
+            resize_tx,
+            initial_geometry,
+            kitty_graphics_enabled,
+            &resize_quit,
+            geometry_probe,
+        );
     });
 
     let max_frame_size = if kitty_graphics_enabled {
@@ -2272,6 +2320,7 @@ async fn run_client_loop(
         }
 
         match event {
+            ClientLoopEvent::Detach => break,
             ClientLoopEvent::StdinInput(data) => {
                 // Cancellable switch popup (#93): Esc is intercepted ONLY while
                 // a switch is pending. A chunk equal to exactly `[0x1b]` is the
@@ -4265,44 +4314,214 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // Resize polling
 // ---------------------------------------------------------------------------
 
-fn current_terminal_geometry(kitty_graphics_enabled: bool) -> (u16, u16, u32, u32) {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    if !kitty_graphics_enabled {
-        return (cols, rows, 0, 0);
+type TerminalGeometry = (u16, u16, u32, u32);
+use crate::platform::terminal_geometry::GeometryError;
+
+/// Startup may precede the first PTY resize (for example in an exec session).
+/// Wait at most two monotonic seconds for nonzero cells; never invent geometry.
+const INITIAL_GEOMETRY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Share the established geometry polling cadence while waiting for startup.
+const GEOMETRY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+type GeometryQuery = Box<dyn FnMut(bool) -> Result<TerminalGeometry, GeometryError> + Send>;
+
+fn terminal_geometry_query() -> GeometryQuery {
+    let mut probe = crate::platform::terminal_geometry::GeometryProbe::default();
+    Box::new(move |kitty| {
+        let (cols, rows, width, height) = probe.query()?;
+        let (cell_width, cell_height) = if !kitty {
+            (0, 0)
+        } else if width == 0 || height == 0 {
+            (8, 16)
+        } else {
+            (
+                (u32::from(width) / u32::from(cols)).max(1),
+                (u32::from(height) / u32::from(rows)).max(1),
+            )
+        };
+        Ok((cols, rows, cell_width, cell_height))
+    })
+}
+
+/// A registered startup refusal is also visible in the human error message.
+#[derive(Debug)]
+struct GeometryStartupError(crate::api::error_code::ErrorCode, &'static str);
+impl std::fmt::Display for GeometryStartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.0, self.1)
     }
-    let Ok(size) = crossterm::terminal::window_size() else {
-        return (cols, rows, 8, 16);
+}
+impl std::error::Error for GeometryStartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+fn geometry_startup_error(no_tty: bool) -> io::Error {
+    use crate::api::error_code::ErrorCode;
+    let (kind, code, message) = if no_tty {
+        (
+            io::ErrorKind::NotConnected,
+            ErrorCode::TerminalUnavailable,
+            "no terminal is available; attach from a terminal",
+        )
+    } else {
+        (
+            io::ErrorKind::TimedOut,
+            ErrorCode::Timeout,
+            "terminal geometry did not become nonzero before the startup deadline",
+        )
     };
-    if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
-        return (cols, rows, 8, 16);
+    io::Error::new(kind, GeometryStartupError(code, message))
+}
+
+fn wait_for_initial_geometry(
+    should_quit: &AtomicBool,
+    mut geometry: impl FnMut() -> Result<TerminalGeometry, GeometryError>,
+    now: impl Fn() -> Instant,
+    mut wait: impl FnMut(Duration),
+) -> io::Result<Option<TerminalGeometry>> {
+    let deadline = now() + INITIAL_GEOMETRY_TIMEOUT;
+    let mut last_failure = None;
+    loop {
+        if should_quit.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let observed = geometry();
+        if should_quit.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match observed {
+            Ok(size) => return Ok(Some(size)),
+            Err(GeometryError::Gone(error)) => {
+                crate::logging::client_geometry_query_failed(
+                    "handshake",
+                    "tty_gone",
+                    "detached",
+                    &error,
+                );
+                return Ok(None);
+            }
+            Err(GeometryError::Unavailable(error)) => {
+                crate::logging::client_geometry_query_failed(
+                    "handshake",
+                    "no_tty",
+                    "startup_failed",
+                    &error,
+                );
+                return Err(geometry_startup_error(true));
+            }
+            Err(GeometryError::Transient(error)) => {
+                let key = (error.kind(), error.raw_os_error());
+                if last_failure != Some(key) {
+                    crate::logging::client_geometry_query_failed(
+                        "handshake",
+                        "transient_query_failure",
+                        "waiting_geometry",
+                        &error,
+                    );
+                    last_failure = Some(key);
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            let error = geometry_startup_error(false);
+            crate::logging::client_geometry_query_failed(
+                "handshake",
+                "geometry_deadline",
+                "startup_failed",
+                &error,
+            );
+            return Err(error);
+        }
+        wait(remaining.min(GEOMETRY_POLL_INTERVAL));
     }
-    (
-        cols,
-        rows,
-        (size.width as u32 / size.columns as u32).max(1),
-        (size.height as u32 / size.rows as u32).max(1),
-    )
+}
+
+/// Resolve an established-session observation without inventing geometry.
+/// Initial measurements instead use the bounded startup wait above.
+fn resolve_terminal_geometry(
+    previous: Option<TerminalGeometry>,
+    observed: Result<TerminalGeometry, GeometryError>,
+    stage: &'static str,
+) -> io::Result<Option<TerminalGeometry>> {
+    match observed {
+        Ok(geometry) => Ok(Some(geometry)),
+        Err(GeometryError::Gone(error)) => {
+            crate::logging::client_geometry_query_failed(stage, "tty_gone", "detached", &error);
+            Ok(None)
+        }
+        Err(GeometryError::Transient(error)) => {
+            crate::logging::client_geometry_query_failed(
+                stage,
+                "transient_query_failure",
+                if previous.is_some() {
+                    "geometry_retained"
+                } else {
+                    "startup_failed"
+                },
+                &error,
+            );
+            previous.map(Some).ok_or(error)
+        }
+        Err(GeometryError::Unavailable(_)) => Err(geometry_startup_error(true)),
+    }
 }
 
 /// Polls the terminal size and sends resize events when it changes.
 fn resize_poll_loop(
     resize_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
-    initial_cols: u16,
-    initial_rows: u16,
+    initial_geometry: TerminalGeometry,
     kitty_graphics_enabled: bool,
     should_quit: &Arc<AtomicBool>,
+    mut geometry_probe: GeometryQuery,
 ) {
-    let (_, _, initial_cell_width, initial_cell_height) =
-        current_terminal_geometry(kitty_graphics_enabled);
-    let mut last_size = (
-        initial_cols,
-        initial_rows,
-        initial_cell_width,
-        initial_cell_height,
+    resize_poll_loop_with(
+        resize_tx,
+        initial_geometry,
+        should_quit,
+        || geometry_probe(kitty_graphics_enabled),
+        || std::thread::sleep(GEOMETRY_POLL_INTERVAL),
     );
+}
+
+/// Poll geometry with supplied observations and cadence. Geometry loss takes the
+/// same detach path as a clean client exit, without inventing a replacement size.
+fn resize_poll_loop_with(
+    resize_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
+    initial_geometry: TerminalGeometry,
+    should_quit: &Arc<AtomicBool>,
+    mut geometry: impl FnMut() -> Result<TerminalGeometry, GeometryError>,
+    mut wait: impl FnMut(),
+) {
+    let mut last_size = initial_geometry;
+    let mut last_failure = None;
     while !should_quit.load(Ordering::Acquire) {
-        std::thread::sleep(Duration::from_millis(100));
-        let new_size = current_terminal_geometry(kitty_graphics_enabled);
+        let new_size = match geometry() {
+            Ok(size) => {
+                last_failure = None;
+                size
+            }
+            Err(GeometryError::Gone(error) | GeometryError::Unavailable(error)) => {
+                crate::logging::client_geometry_query_failed(
+                    "poll", "tty_gone", "detached", &error,
+                );
+                let _ = resize_tx.blocking_send(ClientLoopEvent::Detach);
+                return;
+            }
+            Err(GeometryError::Transient(error)) => {
+                let key = (error.kind(), error.raw_os_error());
+                if last_failure != Some(key) {
+                    crate::logging::client_geometry_query_failed(
+                        "poll",
+                        "transient_query_failure",
+                        "geometry_retained",
+                        &error,
+                    );
+                    last_failure = Some(key);
+                }
+                last_size
+            }
+        };
         if new_size != last_size {
             last_size = new_size;
             if resize_tx
@@ -4314,6 +4533,7 @@ fn resize_poll_loop(
                 break; // Main loop gone.
             }
         }
+        wait();
     }
 }
 
@@ -4338,6 +4558,10 @@ fn init_logging() {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "geometry_tests.rs"]
+mod geometry_tests;
 
 #[cfg(test)]
 mod tests {
