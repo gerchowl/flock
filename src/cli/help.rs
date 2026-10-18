@@ -116,7 +116,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "worktree",
         "kill",
-        "flk worktree kill (--workspace ID | --path PATH) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]",
+        "flk worktree kill (--workspace ID | --path PATH [--repo REPO]) [--dry-run] [--force] [--keep-branch] [--keep-procs] [--json]",
     ),
     (
         "worktree",
