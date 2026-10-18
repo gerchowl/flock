@@ -2,8 +2,14 @@
 //! Caller identity is trusted dispatcher context, never command JSON. Only an
 //! authenticated operator token may decide; socket UID and agent ancestry alone
 //! grant nothing. A new transport owns a new book, including on resume.
-//! At most [`MAX_OPEN`] concurrent requests and 1024 lifetime IDs are accepted. Invalid or
-//! repeated harness IDs stop the transport rather than risk miscorrelation.
+//! There is no lifetime request limit (ADR-0036 S6). Keep at most
+//! [`MAX_OPEN_PERMISSION_REQUESTS`] live/in-flight requests in full. Excess
+//! requests receive an audited `permission_request_limit` deny, not a session stop.
+//! Retain the last [`CLOSED_PERMISSION_REQUEST_WINDOW`] durably closed IDs in FIFO
+//! order. Late decisions for retained IDs return `permission_request_closed`;
+//! evicted or never-seen IDs return `permission_request_unknown` (both retry never).
+//! Invalid IDs, or duplicates still live or retained, stop the transport rather
+//! than risk miscorrelation. Eviction also ends duplicate-ID detection for that ID.
 //! The stream owner audits terminal closes before clearing runtime state.
 //! Audits and responses share the transport byte cap; an audit failure cancels
 //! delivery. Admission success reserves a decision, not its eventual delivery.
@@ -12,14 +18,20 @@
 //! [`MAX_GRANTS`] bounds distinct exact grants, including pending grants.
 pub mod auth;
 
-pub(super) const MAX_OPEN: usize = 16;
+/// Maximum live permission requests, including reserved answers awaiting their
+/// durable close and completed stdin write. The harness normally blocks per
+/// request; excess requests are denied individually without consuming a slot.
+pub const MAX_OPEN_PERMISSION_REQUESTS: usize = 16;
+/// Number of closed IDs retained in closure order, independently of live slots
+/// and session grants. Beyond this FIFO window, late decisions are unknown.
+pub const CLOSED_PERMISSION_REQUEST_WINDOW: usize = 1024;
 pub(super) const MAX_GRANTS: usize = 16;
 
 use super::claude::ToolRequest;
 use crate::api::error_code::ErrorCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Server-authenticated caller context; deliberately not deserializable.
 pub enum Principal<'a> {
@@ -61,7 +73,9 @@ pub enum Decision {
 pub struct AgentDecide {
     /// Agent whose live runtime receives this decision.
     pub agent: String,
-    /// Exact currently open harness request id.
+    /// Exact currently open harness request ID. Retained closed IDs return
+    /// `permission_request_closed`; evicted or never-seen IDs return
+    /// `permission_request_unknown`, as bounded by [`CLOSED_PERMISSION_REQUEST_WINDOW`].
     pub request_id: String,
     /// One of the three permission decisions.
     pub decision: Decision,
@@ -117,7 +131,8 @@ pub(super) struct Book {
     agent: String,
     active: bool,
     open: BTreeMap<String, Open>,
-    seen: BTreeSet<String>,
+    closed_ids: BTreeSet<String>,
+    closed_fifo: VecDeque<String>,
     grants: BTreeMap<String, Grant>,
 }
 pub(super) fn open_record(id: &str, request: &ToolRequest) -> Value {
@@ -130,7 +145,8 @@ impl Book {
             agent,
             active: true,
             open: BTreeMap::new(),
-            seen: BTreeSet::new(),
+            closed_ids: BTreeSet::new(),
+            closed_fifo: VecDeque::new(),
             grants: BTreeMap::new(),
         }
     }
@@ -148,6 +164,9 @@ impl Book {
     // failure is reported by that owner; shutdown cannot promise failed fsyncs.
     pub fn end(&mut self) {
         self.active = false;
+        for id in self.open.keys().cloned().collect::<Vec<_>>() {
+            self.remember_closed(&id);
+        }
         self.open.clear();
         self.grants.clear();
     }
@@ -155,11 +174,13 @@ impl Book {
         if !self.active
             || id.is_empty()
             || id.len() > 256
-            || self.seen.contains(id)
-            || self.open.len() >= MAX_OPEN
-            || self.seen.len() >= 1024
+            || self.open.contains_key(id)
+            || self.closed_ids.contains(id)
         {
             return Err(ErrorCode::InvalidRequest);
+        }
+        if self.open.len() >= MAX_OPEN_PERMISSION_REQUESTS {
+            return Err(ErrorCode::PermissionRequestLimit);
         }
         let audit = open_record(id, &request);
         self.open.insert(
@@ -171,7 +192,6 @@ impl Book {
                 grant: None,
             },
         );
-        self.seen.insert(id.into());
         Ok(audit)
     }
     pub fn automatic(&mut self, id: &str) -> Result<Option<Answer>, ErrorCode> {
@@ -199,7 +219,7 @@ impl Book {
     }
 
     fn missing(&self, id: &str) -> ErrorCode {
-        if self.seen.contains(id) {
+        if self.open.contains_key(id) || self.closed_ids.contains(id) {
             ErrorCode::PermissionRequestClosed
         } else {
             ErrorCode::PermissionRequestUnknown
@@ -325,17 +345,19 @@ impl Book {
         }
     }
     pub fn audited(&mut self, answer: &Answer) {
-        if let Some(open) = self
+        let Some(open) = self
             .open
             .get_mut(&answer.id)
             .filter(|r| r.stage == Stage::Auditing && self.active)
-        {
-            open.stage = Stage::Closed;
-            open.grant = None;
-            if let Some((key, grant)) = &answer.grant {
-                self.grants.insert(key.clone(), grant.clone());
-            }
+        else {
+            return;
+        };
+        open.stage = Stage::Closed;
+        open.grant = None;
+        if let Some((key, grant)) = &answer.grant {
+            self.grants.insert(key.clone(), grant.clone());
         }
+        self.remember_closed(&answer.id);
     }
     pub fn written(&mut self, answer: Answer) {
         self.open.remove(&answer.id);
@@ -377,6 +399,29 @@ impl Book {
     }
     pub fn closed(&mut self, id: &str) {
         self.open.remove(id);
+        self.remember_closed(id);
+    }
+    fn remember_closed(&mut self, id: &str) {
+        if self.closed_ids.insert(id.into()) {
+            self.closed_fifo.push_back(id.into());
+            if self.closed_fifo.len() > CLOSED_PERMISSION_REQUEST_WINDOW {
+                if let Some(evicted) = self.closed_fifo.pop_front() {
+                    self.closed_ids.remove(&evicted);
+                }
+            }
+        }
+    }
+    // Called only after observe rejected a valid, uncorrelated ID at capacity.
+    // No live slot or grant is reserved; the stream owner durably closes the ID.
+    pub fn capacity_refusal(&self, id: &str) -> Answer {
+        let code = ErrorCode::PermissionRequestLimit.as_str();
+        crate::logging::structured_permission_request_refused(&self.agent, id, code);
+        Answer {
+            id: id.into(),
+            response: json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{"behavior":"deny","message":code}}}),
+            audit: json!({"type":"flk_permission_request","state":"closed","request_id":id,"decision":"deny","message":code,"principal":"flk","source":"limit","reason":code,"error_code":code}),
+            grant: None,
+        }
     }
 }
 

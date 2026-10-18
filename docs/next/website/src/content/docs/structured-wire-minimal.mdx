@@ -50,3 +50,8 @@ Failures use `ok: false` and the existing `WireError` envelope without `result`.
 `permission_request_closed` and `not_authorized`, with retry class `never`.
 These names are contracts for S6 (#1429) to register before serving them; this
 slice adds no API error registrations or authorization behavior.
+
+Live structured runtimes retain the most recent 1024 closed permission-request
+IDs in FIFO closure order. A decision for one of those IDs returns
+`permission_request_closed`; an evicted or never-seen ID returns
+`permission_request_unknown`.

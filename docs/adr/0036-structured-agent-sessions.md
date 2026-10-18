@@ -1793,6 +1793,24 @@ P16 and P17 have no source in the stream today and are not promised;
   closing the request or sending a response. The operator may still allow
   once or deny that request. Token authorization still applies to manual
   decisions after a grant exists.
+- **Permission request bounds (S6, #1813).** There is no lifetime request-ID
+  cap. `MAX_OPEN_PERMISSION_REQUESTS = 16` keeps live requests in full, including
+  reserved/audited responses until stdin delivery completes. The harness normally
+  blocks per request. An excess valid new request is denied individually with
+  `permission_request_limit` (retry never), a structured warning and a durable
+  closed audit carrying that code. It consumes no live slot and does not end the
+  session or close other requests. The deny uses the existing bounded,
+  cancel-aware writer delivery: backpressure delays it, while disk failure,
+  cancellation or a disconnected writer remains an explicit I/O failure.
+  `CLOSED_PERMISSION_REQUEST_WINDOW = 1024` retains closed IDs in FIFO order of
+  durable closure, including capacity denials. A decide for a retained closed ID
+  gets `permission_request_closed`; an evicted or never-seen ID gets
+  `permission_request_unknown` (both retry never). Live/in-flight IDs remain
+  independently correlated even when older closed IDs are evicted. Invalid IDs
+  and duplicates still live or in the window retain the existing fail-closed
+  transport behavior; duplicate detection cannot extend beyond the retained
+  window. This bookkeeping never expires or changes session-only exact-match
+  `allow_always` grants, including their originating request-ID audit reference.
 - **Delivery and audit ordering.** A permission closes for attention only
   after its decision audit is durable, and user input remains gated until
   the control response is fully written. Admission success reserves a
@@ -1803,8 +1821,9 @@ P16 and P17 have no source in the stream today and are not promised;
   Harness cancellation closes its named request; top-level result and host
   interruption also produce reasoned closes. A cancelled reservation cannot
   deliver a stale answer. Disk errors are surfaced; failed persistence cannot
-  promise a durable close. Unknown and already accepted or closed request IDs are distinct `permission_request_unknown` and
-  `permission_request_closed` refusals, both retry never.
+  promise a durable close. Unknown IDs, including evicted closed IDs, yield
+  `permission_request_unknown`. An already accepted decision or an ID still in
+  the closed window yields `permission_request_closed`; both are retry never.
 
 ### 11. Harness neutrality
 

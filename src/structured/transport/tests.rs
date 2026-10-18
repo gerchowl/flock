@@ -2124,3 +2124,179 @@ fn session_grant_capacity_refuses_without_closing_or_sending() {
         .is_none());
     assert!(replay_open_permissions(&root).is_empty());
 }
+
+// These tests have one response outstanding, so a buffered read cannot consume
+// a later reply. Reject EOF, worker failure or a missing response within wait().
+fn single_permission_response(transport: &Transport, input: &mut File) -> Value {
+    private_fs::set_nonblocking(input).unwrap();
+    let mut bytes = Vec::new();
+    wait(transport, || {
+        let mut chunk = [0; 4096];
+        match input.read(&mut chunk) {
+            Ok(0) => panic!("stdin closed before permission response"),
+            Ok(n) => {
+                bytes.extend_from_slice(&chunk[..n]);
+                bytes.ends_with(b"\n").then(|| {
+                    serde_json::from_slice(&bytes).expect("one complete permission response")
+                })
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+            Err(error) => panic!("permission response read failed: {error}"),
+        }
+    })
+}
+
+#[test]
+fn permission_session_survives_two_thousand_prompt_close_cycles() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    for n in 0..2000 {
+        let id = format!("cycle-{n}");
+        permission(&mut output, &id);
+        assert_eq!(receive(&transport).record.origin, RecordOrigin::Claude);
+        let open: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+        assert_eq!(open["state"], "open");
+        call_decide(
+            &transport,
+            &owner(),
+            &decide(&id, permissions::Decision::Deny),
+        )
+        .unwrap();
+        let close: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+        assert_eq!(close["request_id"], id);
+        assert_eq!(close["state"], "closed");
+        let response = single_permission_response(&transport, &mut input);
+        assert_eq!(response["response"]["request_id"], id);
+        assert_eq!(response["response"]["response"]["behavior"], "deny");
+    }
+    assert!(matches!(
+        transport.try_completion(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        call_decide(
+            &transport,
+            &owner(),
+            &decide("cycle-1999", permissions::Decision::Deny)
+        ),
+        Err(ErrorCode::PermissionRequestClosed)
+    );
+    assert_eq!(
+        call_decide(
+            &transport,
+            &owner(),
+            &decide("cycle-0", permissions::Decision::Deny)
+        ),
+        Err(ErrorCode::PermissionRequestUnknown)
+    );
+    drop(output);
+    reader_done(&transport).unwrap();
+}
+
+#[test]
+fn open_permission_limit_denies_only_excess_requests_and_keeps_session_alive() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    for n in 0..16 {
+        permission(&mut output, &format!("open-{n}"));
+        receive(&transport);
+        receive(&transport);
+    }
+    for n in 0..3 {
+        let id = format!("excess-{n}");
+        permission(&mut output, &id);
+        assert_eq!(receive(&transport).record.origin, RecordOrigin::Claude);
+        let refused = receive(&transport);
+        let audit: Value = serde_json::from_str(&refused.record.raw).unwrap();
+        assert_eq!(audit["state"], "closed");
+        assert_eq!(audit["error_code"], "permission_request_limit");
+        assert_eq!(audit["decision"], "deny");
+        assert_eq!(audit["request_id"], id);
+        assert!(
+            matches!(refused.state_input(), Some(crate::structured::state::Input::ControlAnswered(value)) if value == id)
+        );
+        let response = single_permission_response(&transport, &mut input);
+        assert_eq!(response["response"]["request_id"], id);
+        assert_eq!(response["response"]["response"]["behavior"], "deny");
+        assert_eq!(
+            response["response"]["response"]["message"],
+            "permission_request_limit"
+        );
+        assert_eq!(
+            call_decide(
+                &transport,
+                &owner(),
+                &decide(&id, permissions::Decision::Deny)
+            ),
+            Err(ErrorCode::PermissionRequestClosed)
+        );
+        assert_eq!(transport.waiting_on_human().unwrap().len(), 16);
+    }
+    call_decide(
+        &transport,
+        &owner(),
+        &decide("open-0", permissions::Decision::AllowOnce),
+    )
+    .unwrap();
+    receive(&transport);
+    assert_eq!(
+        single_permission_response(&transport, &mut input)["response"]["response"]["behavior"],
+        "allow"
+    );
+    // The second response proves that the writer already released open-0.
+    call_decide(
+        &transport,
+        &owner(),
+        &decide("open-1", permissions::Decision::Deny),
+    )
+    .unwrap();
+    receive(&transport);
+    single_permission_response(&transport, &mut input);
+    assert_eq!(transport.waiting_on_human().unwrap().len(), 14);
+    permission(&mut output, "following-request");
+    receive(&transport);
+    let open: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+    assert_eq!(open["state"], "open");
+    assert_eq!(transport.waiting_on_human().unwrap().len(), 15);
+    assert!(matches!(
+        transport.try_completion(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn oversized_request_at_open_limit_is_denied_without_retiring_other_requests() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    for n in 0..permissions::MAX_OPEN_PERMISSION_REQUESTS {
+        permission(&mut output, &format!("open-{n}"));
+        receive(&transport);
+        receive(&transport);
+    }
+    let raw = serde_json::json!({"type":"control_request","request_id":"oversized-excess", "request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example","input":{"data":"x".repeat(MAX_LINE_BYTES)}}});
+    let producer = thread::spawn(move || {
+        writeln!(output, "{raw}").unwrap();
+        output
+    });
+    let summary = receive(&transport);
+    assert!(summary.record.raw.len() < MAX_LINE_BYTES);
+    let close: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+    assert_eq!(close["request_id"], "oversized-excess");
+    assert_eq!(
+        close["error_code"],
+        ErrorCode::PermissionRequestLimit.as_str()
+    );
+    assert_eq!(
+        single_permission_response(&transport, &mut input)["response"]["response"]["behavior"],
+        "deny"
+    );
+    assert_eq!(
+        transport.waiting_on_human().unwrap().len(),
+        permissions::MAX_OPEN_PERMISSION_REQUESTS
+    );
+    assert!(matches!(
+        transport.try_completion(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    let _output = producer.join().unwrap();
+}

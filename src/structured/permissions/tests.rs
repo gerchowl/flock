@@ -125,12 +125,12 @@ fn failed_admission_can_retry_and_requests_are_bounded() {
     assert!(b
         .prepare(&token(), &args("request-example", Decision::Deny))
         .is_ok());
-    for n in 1..16 {
+    for n in 1..MAX_OPEN_PERMISSION_REQUESTS {
         b.observe(&format!("request-{n}"), request()).unwrap();
     }
     assert_eq!(
         b.observe("overflow", request()).err(),
-        Some(ErrorCode::InvalidRequest)
+        Some(ErrorCode::PermissionRequestLimit)
     );
 }
 
@@ -258,4 +258,103 @@ fn exact_grants_preserve_numeric_representation_and_unicode() {
     }
     b.observe("exact", original).unwrap();
     assert!(b.automatic("exact").unwrap().is_some());
+}
+
+#[test]
+fn closed_request_window_distinguishes_recent_evicted_and_unknown_ids() {
+    let mut b = Book::new("fixture-agent".into());
+    for n in 0..CLOSED_PERMISSION_REQUEST_WINDOW {
+        let id = format!("request-{n}");
+        b.observe(&id, request()).unwrap();
+        b.closed(&id);
+    }
+    assert_eq!(
+        b.prepare(&token(), &args("request-0", Decision::Deny))
+            .err(),
+        Some(ErrorCode::PermissionRequestClosed)
+    );
+    b.observe("next-request", request()).unwrap();
+    b.closed("next-request");
+    for id in ["request-0", "never-seen"] {
+        assert_eq!(
+            b.prepare(&token(), &args(id, Decision::Deny)).err(),
+            Some(ErrorCode::PermissionRequestUnknown)
+        );
+    }
+    assert_eq!(
+        b.prepare(&token(), &args("request-1", Decision::Deny))
+            .err(),
+        Some(ErrorCode::PermissionRequestClosed)
+    );
+    assert_eq!(
+        b.prepare(&token(), &args("next-request", Decision::Deny))
+            .err(),
+        Some(ErrorCode::PermissionRequestClosed)
+    );
+}
+
+#[test]
+fn closed_id_eviction_keeps_live_requests_and_uses_closure_order() {
+    let mut b = Book::new("fixture-agent".into());
+    b.observe("live", request()).unwrap();
+    b.observe("first-opened", request()).unwrap();
+    b.observe("second-opened", request()).unwrap();
+    b.closed("second-opened");
+    b.closed("first-opened");
+    for n in 0..CLOSED_PERMISSION_REQUEST_WINDOW - 1 {
+        let id = format!("retired-{n}");
+        b.observe(&id, request()).unwrap();
+        b.closed(&id);
+    }
+    assert_eq!(
+        b.prepare(&token(), &args("second-opened", Decision::Deny))
+            .err(),
+        Some(ErrorCode::PermissionRequestUnknown)
+    );
+    assert_eq!(
+        b.prepare(&token(), &args("first-opened", Decision::Deny))
+            .err(),
+        Some(ErrorCode::PermissionRequestClosed)
+    );
+    assert_eq!(b.waiting(), ["live"]);
+    let answer = b
+        .prepare(&token(), &args("live", Decision::AllowOnce))
+        .unwrap();
+    assert_eq!(
+        answer.response["response"]["response"]["updatedInput"],
+        json!(request().input)
+    );
+    assert_eq!(b.closed_ids.len(), CLOSED_PERMISSION_REQUEST_WINDOW);
+    assert_eq!(b.closed_fifo.len(), CLOSED_PERMISSION_REQUEST_WINDOW);
+}
+
+#[test]
+fn session_grant_survives_eviction_of_its_originating_request_id() {
+    let mut b = Book::new("fixture-agent".into());
+    b.observe("grant-origin", request()).unwrap();
+    let answer = b
+        .prepare(&token(), &args("grant-origin", Decision::AllowAlways))
+        .unwrap();
+    assert!(b.begin_answer(&answer.id));
+    b.audited(&answer);
+    b.written(answer);
+    for n in 0..CLOSED_PERMISSION_REQUEST_WINDOW {
+        let id = format!("retired-{n}");
+        let mut other = request();
+        other.input.insert("n".into(), json!(n));
+        b.observe(&id, other).unwrap();
+        b.closed(&id);
+    }
+    assert_eq!(
+        b.prepare(&token(), &args("grant-origin", Decision::Deny))
+            .err(),
+        Some(ErrorCode::PermissionRequestUnknown)
+    );
+    b.observe("exact-followup", request()).unwrap();
+    let automatic = b.automatic("exact-followup").unwrap().unwrap();
+    assert_eq!(automatic.audit["grant_request_id"], "grant-origin");
+    assert_eq!(
+        automatic.response["response"]["response"]["behavior"],
+        "allow"
+    );
 }

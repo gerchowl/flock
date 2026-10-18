@@ -42,6 +42,7 @@ struct Control {
 enum Input {
     User(Vec<u8>),
     Decision(Control),
+    Refusal(Vec<u8>),
 }
 enum Command {
     Decide(Control),
@@ -225,7 +226,7 @@ impl Transport {
         }
         private_fs::set_nonblocking(&stdout)?;
         private_fs::set_nonblocking(&stdin)?;
-        let (input, input_rx) = mpsc::sync_channel(permissions::MAX_OPEN + 1);
+        let (input, input_rx) = mpsc::sync_channel(permissions::MAX_OPEN_PERMISSION_REQUESTS + 1);
         let (decisions, decision_rx) = mpsc::sync_channel(4);
         let permissions = Arc::new(parking_lot::Mutex::new(Book::new(location.agent.clone())));
         let plane = ControlPlane {
@@ -558,6 +559,7 @@ fn write_inputs(
                     }
                     Input::User(bytes) => (bytes, None),
                     Input::Decision(control) => (control.bytes, Some(control.answer)),
+                    Input::Refusal(bytes) => (bytes, None),
                 };
                 if let Some(check) = before_first_write.take() {
                     check()?;
@@ -850,11 +852,7 @@ fn persist(
     }
     Ok(Received { record, event })
 }
-fn publish(
-    mut received: Received,
-    tx: &mpsc::SyncSender<Received>,
-    cancel: &AtomicBool,
-) -> io::Result<()> {
+fn publish<T>(mut received: T, tx: &mpsc::SyncSender<T>, cancel: &AtomicBool) -> io::Result<()> {
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(cancelled());
