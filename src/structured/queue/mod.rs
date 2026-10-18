@@ -7,6 +7,7 @@
 //! which bytes committed. No success or in-memory change precedes durability.
 //! Threshold configuration and worker/event-loop wiring belong to #1803.
 #![deny(missing_docs)]
+pub(crate) mod admission;
 pub mod model;
 use crate::platform::structured as private_fs;
 pub use model::{Change, Item, Record};
@@ -333,7 +334,10 @@ impl Journal {
                 if Some(seq) != self.seq.checked_add(1) {
                     return Err(problem("non-dense queue sequence"));
                 }
-                if matches!(value["kind"].as_str(), Some("upsert" | "remove")) {
+                if matches!(
+                    value["kind"].as_str(),
+                    Some("upsert" | "remove" | "batch" | "fail")
+                ) {
                     let record = serde_json::from_value::<Record>(value.clone())?;
                     self.future |=
                         record.change.has_unknown() || serde_json::to_value(&record)? != value;
