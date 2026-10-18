@@ -190,3 +190,10 @@ pub fn server_version(client: &ApiClient) -> Option<ServerVersion> {
     });
     server
 }
+
+/// An absent or malformed capability never permits a structured selector.
+pub(crate) fn advertises_structured(pong: &Value) -> bool {
+    pong.pointer("/result/capabilities/structured_agents")
+        .and_then(Value::as_bool)
+        == Some(true)
+}

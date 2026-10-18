@@ -35,6 +35,8 @@ pub(crate) use admission::Admission;
 
 /// Internal launch policy, supplied by authenticated admission in #1843.
 pub struct Launch {
+    /// Validated, nonce-framed MCP opening turn; CLI starts remain idle.
+    pub opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
     /// Stable registered identity.
     pub agent_id: String,
     /// Current registry epoch; replaced atomically by a fresh launch epoch.
@@ -156,6 +158,7 @@ impl Workers {
         prepare: impl FnOnce(&Record) -> Result<LaunchProfile, LaunchError> + Send + 'static,
     ) -> Result<u64, ErrorCode> {
         let Launch {
+            opening_turn,
             agent_id,
             generation: current,
             leases,
@@ -262,12 +265,22 @@ impl Workers {
                     };
                     let event_notify = notify.clone();
                     let event_wake = wake.clone();
-                    runtime::run_controlled(
+                    let mut input_failed = false;
+                    let result = runtime::run_controlled(
                         &state,
                         (profile, mcp),
                         lease,
                         location,
                         |runtime| {
+                            if let Some(prompt) = &opening_turn {
+                                let user = serde_json::json!({"type":"user", "message":{
+                                    "role":"user", "content":prompt.as_argv_element()},
+                                    "parent_tool_use_id":null,"session_id":""});
+                                if runtime.try_submit(&user).is_err() {
+                                    input_failed = true;
+                                    runtime.stop();
+                                }
+                            }
                             if cancelled.requested() {
                                 runtime.stop();
                             }
@@ -281,7 +294,12 @@ impl Workers {
                         },
                         cancelled.clone(),
                     )
-                    .map_err(|error| (error.code(), error.to_string()))
+                    .map_err(|error| (error.code(), error.to_string()));
+                    if input_failed {
+                        Err((ErrorCode::AgentStartFailed, "opening turn refused".into()))
+                    } else {
+                        result
+                    }
                 }))
                 .unwrap_or_else(|_| {
                     Err((

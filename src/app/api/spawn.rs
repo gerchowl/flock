@@ -260,6 +260,51 @@ impl App {
             return encode_error(id, "internal_error", "resolved workspace has no cwd");
         };
 
+        if params.runtime == crate::api::schema::AgentRuntime::Structured {
+            if kind != AgentKind::Claude || params.focus || params.questions.is_some() {
+                return encode_error(
+                    id,
+                    "runtime_unsupported",
+                    "unsupported structured spawn options",
+                );
+            }
+            let start = crate::api::schema::AgentStartParams {
+                runtime: params.runtime,
+                model: params.model,
+                name: params
+                    .name
+                    .unwrap_or_else(crate::app::worktrees::generated_fork_run_id),
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                argv: vec!["claude".into()],
+                dry_run: false,
+                workspace_id: None,
+                tab_id: None,
+                split: None,
+                active: false,
+                here: false,
+                focus: false,
+                label: None,
+                questions: None,
+                unattended: false,
+            };
+            return match self.start_structured_request(
+                start,
+                &caller,
+                SpawnVerb::Spawn,
+                Some(prompt),
+            ) {
+                Ok(result) => encode_success(id, result),
+                Err(code) => encode_error(id, code.as_str(), "structured spawn refused"),
+            };
+        }
+        if params.model.is_some() {
+            return encode_error(
+                id,
+                "runtime_unsupported",
+                "--model requires structured runtime",
+            );
+        }
+
         // #359: the child is exec'd from argv with no shell in between, so the
         // agent profile the REQUESTER is on has to be carried explicitly or the
         // child silently starts against the default one — which may be a
@@ -659,6 +704,8 @@ mod tests {
         Request {
             id: "req".into(),
             method: Method::AgentSpawn(AgentSpawnParams {
+                runtime: crate::api::schema::AgentRuntime::Pty,
+                model: None,
                 agent: agent.into(),
                 prompt: prompt.into(),
                 location: SpawnLocation::WorktreePath {
@@ -794,6 +841,8 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: Method::AgentSpawn(AgentSpawnParams {
+                runtime: crate::api::schema::AgentRuntime::Pty,
+                model: None,
                 agent: "opencode".into(),
                 prompt: "review #42".into(),
                 location: SpawnLocation::WorkspaceId {

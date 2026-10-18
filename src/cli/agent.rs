@@ -270,11 +270,19 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         ready_timeout_ms,
         asked,
     } = flags;
-    // Keep the client gate closed too: older servers would ignore the selector
-    // and launch raw PTY argv. Part 3 must negotiate support before opening it.
-    if runtime == crate::api::schema::AgentRuntime::Structured && (wait_ready || !cfg!(test)) {
-        eprintln!("runtime_unsupported: structured start awaits final routing; pane readiness is unsupported");
-        return Ok(crate::cli::exit::USAGE);
+    if runtime == crate::api::schema::AgentRuntime::Structured {
+        if wait_ready {
+            eprintln!("runtime_unsupported: structured sessions have no pane readiness");
+            return Ok(crate::cli::exit::USAGE);
+        }
+        let pong = super::send_request(&Request {
+            id: "cli:ping:structured".into(),
+            method: Method::Ping(crate::api::schema::PingParams::default()),
+        })?;
+        if !crate::api::compatibility::advertises_structured(&pong) {
+            eprintln!("server_version_gap: structured admission requires a newer server");
+            return Ok(crate::cli::exit::PROTOCOL_GAP);
+        }
     }
     let asked = asked.gate(
         &format!("agent start {name}"),

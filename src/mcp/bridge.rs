@@ -166,6 +166,20 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
     };
 
     let method = (tool.build)(arguments.clone())?;
+    if matches!(&method, Method::AgentSpawn(p)
+        if p.runtime == crate::api::schema::AgentRuntime::Structured)
+    {
+        let pong = flock
+            .call(Method::Ping(crate::api::schema::PingParams::default()))
+            .map_err(McpError::transport)?;
+        if !crate::api::compatibility::advertises_structured(&pong) {
+            return Err(McpError::from_flock_error(
+                crate::api::compatibility::ERROR_CODE,
+                "structured admission requires a newer server",
+                crate::api::compatibility::EXIT_CODE,
+            ));
+        }
+    }
     // #1179 / #868: an older server would drop `questions` without a word and
     // start the child with no policy. An agent cannot read a stderr note, so
     // the call is refused before anything starts, and says why.

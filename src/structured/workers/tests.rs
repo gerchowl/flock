@@ -67,6 +67,7 @@ impl Case {
             .unwrap();
         let leases = SessionLeases::default();
         let launch = Launch {
+            opening_turn: None,
             agent_id: id.clone(),
             generation,
             leases: leases.clone(),

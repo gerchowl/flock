@@ -1,4 +1,4 @@
-//! Shared structured admission (ADR-0036 S3a-3). The public gate opens in part 3.
+//! Shared authenticated structured admission (ADR-0036 S3a-3).
 use super::{spawn::SpawnCaller, App};
 use crate::api::{
     agent_state::Lifecycle,
@@ -17,10 +17,15 @@ impl App {
         params: AgentStartParams,
         caller: &SpawnCaller,
     ) -> Result<ResponseResult, ErrorCode> {
-        // No production route opens before narrowed MCP admission in #1843 part 3.
-        if !cfg!(test) {
-            return Err(ErrorCode::RuntimeUnsupported);
-        }
+        self.start_structured_request(params, caller, crate::spawn::SpawnVerb::Fork, None)
+    }
+    pub(super) fn start_structured_request(
+        &mut self,
+        params: AgentStartParams,
+        caller: &SpawnCaller,
+        verb: crate::spawn::SpawnVerb,
+        opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
+    ) -> Result<ResponseResult, ErrorCode> {
         if params.dry_run
             || params.focus
             || params.active
@@ -53,7 +58,7 @@ impl App {
             .admit()
             .map_err(|e| e.code())?;
         let lineage = self
-            .admit_spawn(crate::spawn::SpawnVerb::Fork, caller, None)
+            .admit_spawn(verb, caller, None)
             .map_err(|e| ErrorCode::from_code(e.code()).unwrap_or(ErrorCode::InternalError))?;
         let mcp = self
             .runtime_config
@@ -109,6 +114,7 @@ impl App {
         let started = self.structured_workers.start(
             &mut self.state.structured_agents,
             Launch {
+                opening_turn,
                 agent_id: agent_id.clone(),
                 generation,
                 leases: self.session_leases.clone(),
@@ -120,7 +126,7 @@ impl App {
                     config: self.state.config.fleet,
                     pty: l.pty_census,
                     paused: self.fleet_pause.paused,
-                    verb: crate::spawn::SpawnVerb::Fork,
+                    verb,
                 }),
                 lineage: lineage.map(|l| (l.parent_agent_id, l.child_depth.saturating_sub(1))),
             },

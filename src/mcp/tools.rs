@@ -87,6 +87,12 @@ pub(super) fn table() -> &'static [Tool] {
             build: build_agent_get,
         },
         Tool {
+            name: "flock_agent_stop",
+            description: "Stop a structured session by id or unique name. Only the operator or that structured agent itself may stop it. PTY targets return runtime_unsupported (never retry, exit 2).",
+            input_schema: schema_target_only,
+            build: |args| Ok(Method::AgentStop(AgentTarget { target: required_string(&args, "target")? })),
+        },
+        Tool {
             name: "flock_agent_read",
             description: "Read recent output from an agent's pane — the \
                           terminal as drawn, hard-wrapped at the pane's \
@@ -502,6 +508,8 @@ fn schema_agent_start() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "runtime": {"type":"string", "enum":["pty","structured"], "default":"pty"},
+            "model": {"type":"string", "description":"Structured Claude model; omit for PTY."},
             "agent": {
                 "type": "string",
                 "enum": crate::spawn::AgentKind::supported(),
@@ -540,6 +548,9 @@ fn build_agent_start(args: Value) -> Result<Method, McpError> {
     let location: crate::api::schema::SpawnLocation = serde_json::from_value(location.clone())
         .map_err(|err| McpError::invalid_params(format!("invalid location: {err}")))?;
     Ok(Method::AgentSpawn(crate::api::schema::AgentSpawnParams {
+        runtime: serde_json::from_value(args.get("runtime").cloned().unwrap_or(json!("pty")))
+            .map_err(|_| McpError::invalid_params("runtime must be pty or structured"))?,
+        model: optional_string(&args, "model")?,
         agent,
         prompt,
         location,
