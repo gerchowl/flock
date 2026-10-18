@@ -102,7 +102,9 @@ impl Subscriptions {
                     .await
                 {
                     Some(Ok(())) => {
-                        if stream.starts_with("agent/") {
+                        if stream == "fleet" {
+                            super::fleet::replay(&shared.fleet, &data, &fence, &id, after).await
+                        } else if stream.starts_with("agent/") {
                             replay(&owner, &data, &fence, &hints, &id, &stream, after).await
                         } else {
                             Err(Some(SubfailCode::UnknownStream))
@@ -135,7 +137,7 @@ impl Subscriptions {
         true
     }
 }
-async fn deliver(
+pub(super) async fn deliver(
     data: &mpsc::Sender<Delivery>,
     live: &Arc<AtomicBool>,
     frame: ServerFrame,

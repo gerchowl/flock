@@ -1158,3 +1158,5 @@ fn subscriptions_are_accepted_on_the_actual_socket() {
 }
 
 mod subscriptions;
+
+mod fleet;

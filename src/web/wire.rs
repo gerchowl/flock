@@ -1,4 +1,5 @@
 //! Server-owned, opt-in structured transport; no PTY or model dispatch.
+mod fleet;
 mod output;
 mod subscriptions;
 pub(crate) mod timing;
@@ -59,6 +60,7 @@ struct Client {
     revoke: watch::Sender<bool>,
 }
 struct Shared {
+    fleet: fleet::Client,
     histories: crate::structured::history::owner::Client,
     store: Arc<TokenStore>,
     epoch: String,
@@ -110,11 +112,13 @@ impl Core {
     ) -> io::Result<Self> {
         let epoch = store.random::<16>().map_err(io::Error::other)?;
         let (stop, _) = watch::channel(false);
+        let fleet = fleet::Client::new(wake.clone(), stop.subscribe());
         let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
             owner,
             shared: Arc::new(Shared {
                 histories,
+                fleet,
                 store: Arc::new(store),
                 epoch,
                 clock,
@@ -134,6 +138,7 @@ impl Core {
         root: &std::path::Path,
     ) {
         self.owner.service(registry, workers, root);
+        self.shared.fleet.observe(registry, workers, root);
     }
     /// Mount only behind S2b-mount's loopback, Host/Origin and funnel guards.
     pub(crate) fn router(&self) -> Router {
@@ -153,10 +158,15 @@ impl Core {
     /// Cancel transport work and wait for every connection lease, including hello.
     pub(crate) async fn shutdown(&self) -> Result<(), tokio::time::error::Elapsed> {
         self.shared.stop.send_replace(true);
-        tokio::time::timeout(
-            SHUTDOWN_WAIT,
-            self.shared.slots.clone().acquire_many_owned(CONNECTIONS),
-        )
+        tokio::time::timeout(SHUTDOWN_WAIT, async {
+            let _ = self
+                .shared
+                .slots
+                .clone()
+                .acquire_many_owned(CONNECTIONS)
+                .await;
+            self.shared.fleet.closed().await;
+        })
         .await
         .map(|_| ())
     }

@@ -4,8 +4,9 @@ description: Generated fleet and permission-decision contracts for GUI clients.
 ---
 
 The S7-min types are generated from Rust into `web/client/src/gen/`. They define
-contracts for the GUI and server work in #1746; this types slice does not enable
-a WebSocket endpoint or execute commands.
+contracts for the GUI and server work in #1746. The opt-in S7 endpoint serves
+`fleet` subscriptions to read-scoped clients through its existing subscription
+identity, delivery and heartbeat machinery. This stream does not execute commands.
 
 `FleetAgentRow` contains `id`, `label`, `state`, optional `activity`, and required
 `waiting_on_human: string[]`. State is the shared S4 `AgentState` object: axes, derived phase and sources.
@@ -13,11 +14,14 @@ Its per-field `or_unknown` deserializers follow ADR-0028 §3a, so an unknown
 phase from a newer server becomes `unknown` while the other axes survive and
 the fleet delta remains usable. The waiting IDs identify permission requests on `agent/<id>`;
 there is no separate inbox stream in S7-min. Rows represent structured agents.
+The server omits optional `activity` until the structured producer in
+[#2243](https://github.com/gerchowl/flock/issues/2243) lands.
+`waiting_on_human` contains only open, non-automatic harness permission request IDs.
 
 The `fleet` stream carries the closed `FleetDelta` union inside `ev`:
 
 ```json
-{"type":"fleet.upsert","row":{"id":"example-agent","label":"Example","state":{"turn":"idle","background":"none","attention":{"needs_human":{"reason":"permission"}},"waiting":"none","lifecycle":"live","phase":"needs_human","source":{}},"activity":"Permission needed","waiting_on_human":["request-one"]}}
+{"type":"fleet.upsert","row":{"id":"example-agent","label":"Example","state":{"turn":"idle","background":"none","attention":{"needs_human":{"reason":"permission"}},"waiting":"none","lifecycle":"live","phase":"needs_human","source":{}},"waiting_on_human":["request-one"]}}
 {"type":"fleet.remove","id":"example-agent"}
 ```
 
@@ -33,7 +37,9 @@ a gap/snapshot and its own synced barrier. Every subscription uses a fresh
 ID on the connection, including recovery. After unsub, subfail or lagged, late frames
 for the retired ID are silently dropped; frames for never-opened IDs are protocol
 errors. Reusing a live or closed ID is refused with subfail code `sub_id_reused`. The `fleet-lite.jsonl` fixture pins
-bootstrap, live updates/removal and recovery.
+bootstrap, live updates/removal and recovery on the client.
+`tests/fixtures/structured-wire/fleet-server.jsonl` separately drives the real
+server owner and endpoint, including absent-row completion.
 
 ### Fleet-lite store recovery
 
@@ -53,9 +59,28 @@ the lock unmarked for a later retry.
 while an older `fleet.json` survives reopens at that older head. The operator
 must never delete the lock.
 
-The provider core persists a separate durable cursor before replacing the row
-snapshot. Subscription integration and the configured store location belong to
-S7-min slice 6b (#1832); the core currently has no product caller.
+The stream owner persists `<data dir>/fleet.cursor` before replacing
+`<data dir>/fleet.json`, under the existing exclusive `fleet.lock`.
+It refreshes registry/S4/S6 observations before serving a cut. Checkpoint
+allocation, publication to existing subscribers and registration of the new
+subscriber are serialized off the app and heartbeat executors. Concurrent
+mutations follow the immutable replay cut, after its single synced barrier.
+
+The live ring holds sixteen frames within the existing 64 KiB message limit,
+shared across cuts. Each socket retains the existing eight-active-subscription
+and 1024-lifetime-ID limits. A slow cut may lag even during initial replay;
+resubscribe under a fresh ID from the applied cursor. Oversized rows also yield
+lagged rather than truncated payloads; recovery cannot make an oversized row fit.
+Captured checkpoints retain memory proportional to the fleet row count per
+replay, under those cut limits. The latest coherent owner-turn materialization
+may replace an unprocessed one;
+use the agent journal for every intermediate event.
+
+An unavailable permission-book observation leaves stored rows intact and fails
+its readers instead of publishing an empty attention list. A later coherent
+observation can serve fresh readers. Storage failure stops the fleet owner,
+logs the I/O kind and closes its readers. Repair the durable records as below
+and restart the owner; no cursor is reset or write retried silently.
 
 For a store named `fleet.json`, preserve `fleet.cursor` and `fleet.lock` during
 recovery. A lost or corrupt snapshot opens with no rows at the cursor's preserved

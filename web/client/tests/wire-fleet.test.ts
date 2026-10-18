@@ -11,7 +11,7 @@ import { Harness, live, sentFrames, step } from "./wire/harness";
 
 type Seen = { readonly rows: readonly string[] } | { readonly failed: string };
 
-const row = (id: string, extra: object = {}): object => ({ id, label: id.toUpperCase(), state: "working", waiting_on_human: [], ...extra });
+const row = (id: string, extra: object = {}): object => ({ id, label: id.toUpperCase(), state: { turn: "working", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} }, waiting_on_human: [], ...extra });
 const upsert = (seq: number, value: object): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { type: "fleet.upsert", row: value } as never });
 const remove = (seq: number, id: string): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { type: "fleet.remove", id } });
 
@@ -45,7 +45,7 @@ describe("wire fleet", () => {
       { id: "atlas", label: "ATLAS", state: "working", activity: "editing", waitingOnHuman: ["r1"] },
       { id: "kite", label: "KITE", state: "working", activity: "", waitingOnHuman: [] },
     ]);
-    send(h, upsert(3, row("kite", { state: "needs_human" })));
+    send(h, upsert(3, row("kite", { state: { phase: "needs_human" } })));
     send(h, remove(4, "atlas"));
     expect(seen).toEqual([{ rows: ["atlas", "kite"] }, { rows: ["atlas", "kite"] }, { rows: ["kite"] }]);
     expect(last()[0]?.state).toBe("needs_human");
@@ -120,4 +120,18 @@ test("fleet sources on one connection never reuse a sub id, and a closed one's l
   send(h, upsert(1, row("stale")));
   expect(h.connection.state).toBe("Live");
   expect(seen).toEqual([["kite"]]);
+});
+
+test("generated S4 fleet state reaches presentation without discarding the row", () => {
+  const { h, last } = subscribed();
+  send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+  send(h, upsert(1, row("fixture-agent", { state: { turn: "working", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} } })));
+  expect(last().map((value) => [value.id, value.state])).toEqual([["fixture-agent", "working"]]);
+});
+
+test("a newer phase keeps the fleet row and renders unknown", () => {
+  const { h, last } = subscribed();
+  send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+  send(h, upsert(1, row("fixture-agent", { state: { turn: "working", phase: "future-phase", source: {} } })));
+  expect(last().map((value) => [value.id, value.state])).toEqual([["fixture-agent", "unknown"]]);
 });

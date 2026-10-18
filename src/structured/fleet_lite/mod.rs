@@ -10,8 +10,8 @@
 //! Lost/corrupt snapshots recover empty at that floor with a typed diagnostic.
 //! Missing/corrupt cursor evidence cannot silently authorize a reset to zero.
 #![deny(missing_docs)]
-// #1832 slice 6b adds the product caller after subscription machinery lands.
-#![allow(dead_code)]
+// The non-web binary has no stream consumer.
+#![cfg_attr(not(feature = "web"), allow(dead_code))]
 
 use super::registry::Record;
 use crate::api::agent_state::AgentState;
@@ -327,6 +327,11 @@ impl Store {
             writable: true,
             diagnostics,
         })
+    }
+
+    /// Durable allocation floor, including reserved checkpoint positions.
+    pub fn high_water(&self) -> u64 {
+        self.high_water
     }
 
     /// Recovery facts from opening, retained until this owner is dropped.

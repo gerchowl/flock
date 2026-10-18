@@ -5270,6 +5270,7 @@ mod tests {
                 )
                 .unwrap(),
                 respond_to,
+                scope: None,
                 peer_pid: Some(std::process::id()),
                 peer_birth: crate::platform::process_start_time(std::process::id()),
                 peer_uid: Some(crate::platform::peer::effective_uid()),
