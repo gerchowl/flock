@@ -1488,6 +1488,7 @@ mod tests {
     ) -> std::sync::mpsc::Receiver<String> {
         let (respond_to, response) = std::sync::mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: serde_json::from_value(
                 serde_json::json!({"id":"same", "method":method, "params":params}),
             )
