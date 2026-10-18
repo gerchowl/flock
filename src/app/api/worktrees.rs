@@ -1276,7 +1276,7 @@ impl App {
                     })
                 });
                 let mut nearest: Option<PathBuf> = None;
-                let mut probe_failure = None;
+                let mut probe_failures = Vec::new();
                 for (repo, expected_common) in owned {
                     let identity = match kill_repository_facts(
                         &repo,
@@ -1287,13 +1287,13 @@ impl App {
                             return Err(invalid_repository_proof(&repo));
                         }
                         Err(_) => {
-                            probe_failure.get_or_insert_with(|| {
-                                ApiFailure::from(crate::worktree::CheckoutUnreachable {
+                            probe_failures.push(ApiFailure::from(
+                                crate::worktree::CheckoutUnreachable {
                                     path: canonical.clone(),
                                     repo: Some(repo.clone()),
                                     possible_unmounted_mount_point: None,
-                                })
-                            });
+                                },
+                            ));
                             continue;
                         }
                     };
@@ -1301,7 +1301,7 @@ impl App {
                         .as_ref()
                         .is_some_and(|common| common != &identity.common)
                     {
-                        probe_failure.get_or_insert_with(|| ApiFailure {
+                        probe_failures.push(ApiFailure {
                             code: crate::api::error_code::ErrorCode::WorktreeRepositoryUnreachable.as_str(),
                             message: "Open workspace repository identity changed; reopen the workspace at its intended repository before retrying.".into(),
                             data: Some(serde_json::json!({
@@ -1330,13 +1330,13 @@ impl App {
                     let rows = match crate::worktree::list_existing_worktrees(&repo) {
                         Ok(rows) => rows,
                         Err(_) => {
-                            probe_failure.get_or_insert_with(|| {
-                                ApiFailure::from(crate::worktree::CheckoutUnreachable {
+                            probe_failures.push(ApiFailure::from(
+                                crate::worktree::CheckoutUnreachable {
                                     path: canonical.clone(),
                                     repo: Some(repo.clone()),
                                     possible_unmounted_mount_point: None,
-                                })
-                            });
+                                },
+                            ));
                             continue;
                         }
                     };
@@ -1391,18 +1391,26 @@ impl App {
                         }
                     }
                 }
+                let mut probe_failures = probe_failures.into_iter();
                 if nearest.is_none() {
-                    if let Some(failure) = probe_failure {
+                    if let Some(failure) = probe_failures.next() {
                         return Err(failure);
                     }
                 }
+                let diagnostics: Vec<_> = probe_failures
+                    .map(|failure| {
+                        serde_json::json!({"code":failure.code, "message":failure.message,
+                        "data":failure.data})
+                    })
+                    .collect();
                 // ADR-0029 §4: an explicit retarget is required; force cannot
                 // turn an enclosing registered checkout into the requested root.
                 Err(ApiFailure {
                     code: crate::api::error_code::ErrorCode::WorktreePathNotRoot.as_str(),
                     message: "path must be an exact registered linked-worktree root of an open workspace or explicitly named repository; retarget explicitly, provide repo, or open its owning repository".into(),
                     data: Some(serde_json::json!({"path":canonical,
-                        "nearest_enclosing_worktree":nearest})),
+                        "nearest_enclosing_worktree":nearest,
+                        "repository_probe_failures":diagnostics})),
                 })
             }
         }
@@ -6183,6 +6191,113 @@ mod tests {
         std::fs::remove_dir_all(other).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
     }
+    #[test]
+    fn kill_api_with_invalid_stored_repo_preserves_checkout_and_branch() {
+        let (repo, checkout, mut app) = exact_root_fixture("invalid-stored-repo-api");
+        let workspace_id = push_worktree_workspace(&mut app, &repo, &checkout);
+        let invalid = repo.join("plain-directory");
+        std::fs::create_dir(&invalid).unwrap();
+        let invalid = invalid.canonicalize().unwrap();
+        app.state.workspaces[1]
+            .worktree_space
+            .as_mut()
+            .unwrap()
+            .repo_root = invalid.clone();
+        let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
+            id: "invalid-stored-repo".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                workspace_id: Some(workspace_id.clone()),
+                keep_branch: false,
+                force: true,
+                keep_processes: true,
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+        assert_eq!(
+            response["error"]["code"], "worktree_repository_invalid_proof",
+            "{response}"
+        );
+        assert_eq!(
+            response["error"]["data"]["repo"],
+            serde_json::json!(invalid)
+        );
+        assert!(checkout.join(".git").is_file());
+        assert!(branch_exists(&repo, "worktree/exact-root"));
+        assert!(app.state.workspaces.iter().any(|ws| ws.id == workspace_id));
+        std::fs::remove_dir_all(checkout).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn enclosing_worktree_refusal_retains_changed_repository_identity_diagnostic() {
+        let (repo, checkout, mut app) = exact_root_fixture("nearest-with-stale-owner");
+        let other = create_committed_repo("stale-owner-with-nearest");
+        let old_key = crate::workspace::git_space_metadata(&other).unwrap().key;
+        let mut stale = Workspace::test_new("stale-owner");
+        stale.identity_cwd = other.clone();
+        stale.cached_git_space = crate::workspace::git_space_metadata(&other);
+        app.state.workspaces.push(stale);
+        std::fs::rename(other.join(".git"), other.join("saved-git")).unwrap();
+        let replacement = other.join("replacement-admin");
+        run_git(
+            &other,
+            &["init", "--separate-git-dir", replacement.to_str().unwrap()],
+        );
+        let sub = checkout.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
+            id: "nearest-stale-owner".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                path: Some(sub.to_string_lossy().into_owned()),
+                force: true,
+                keep_processes: true,
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+        assert_eq!(
+            response["error"]["code"], "worktree_path_not_root",
+            "{response}"
+        );
+        let data = &response["error"]["data"];
+        assert_eq!(
+            data["nearest_enclosing_worktree"],
+            serde_json::json!(checkout)
+        );
+        let failures = data["repository_probe_failures"]
+            .as_array()
+            .expect("probe diagnostics retained");
+        assert_eq!(failures.len(), 1, "{response}");
+        let failure = &failures[0];
+        assert_eq!(failure["code"], "worktree_repository_unreachable");
+        assert!(failure["message"]
+            .as_str()
+            .unwrap()
+            .contains("identity changed"));
+        assert_eq!(
+            failure["data"]["reason"],
+            "workspace_repository_identity_changed"
+        );
+        assert_eq!(
+            failure["data"]["expected_common_dir"],
+            serde_json::json!(old_key)
+        );
+        assert_eq!(
+            failure["data"]["observed_common_dir"],
+            serde_json::json!(replacement.canonicalize().unwrap())
+        );
+        assert!(failure["data"]["recovery"]
+            .as_str()
+            .unwrap()
+            .contains("Reopen"));
+        assert!(checkout.join(".git").is_file());
+        assert!(branch_exists(&repo, "worktree/exact-root"));
+        std::fs::remove_dir_all(checkout).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
     #[test]
     fn branch_deletion_invalid_stored_repo_requires_retargeting() {
         let (repo, checkout, _app) = exact_root_fixture("invalid-branch-repo");

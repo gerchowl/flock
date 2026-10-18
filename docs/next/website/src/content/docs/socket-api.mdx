@@ -421,7 +421,11 @@ plain directories and checkouts of unowned repositories refuse
 `worktree_path_not_root` (exit 10, retry `after_human`), even with `--force`.
 Its `error.data` carries `path` and `nearest_enclosing_worktree` (the closest
 enclosing registered root of an eligible repository, excluding its main checkout,
-or `null` if none is known).
+or `null` if none is known). When a known enclosing root supplies the hint,
+`repository_probe_failures` retains unrelated repository diagnostics as an array
+of `{code, message, data}` objects, including expected and observed common
+directories for changed workspace identities. The refusal remains
+`worktree_path_not_root`; a hint never grants permission to remove its root.
 Retarget explicitly to that root if intended, supply its repository as `repo`,
 or open a workspace in the owning repository before retrying. Alternatively,
 use raw `git worktree remove <path>` from the owning repository, accepting Git's
