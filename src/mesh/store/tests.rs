@@ -5547,3 +5547,65 @@ fn custody_followup_positive_proof_never_changes_terminal_delivery_or_refusal() 
         assert_eq!(usage(&store), quota);
     }
 }
+
+#[test]
+fn custody_round2_proven_correction_is_bounded_by_outcome_retention() {
+    use crate::structured::queue::custody::Unknown;
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store.set_local_node(&mail.key.origin_node);
+    store
+        .accept_local(&mail, CUSTODY_TTL_MS, "native", "session", 0)
+        .unwrap();
+    store
+        .queue_commitment_unknown(&mail.key, Some(Unknown::SettlementPending), 0)
+        .unwrap();
+    store.maintain(DAY_MS).unwrap();
+    assert!(
+        !store.mailbox_keys().unwrap().contains(&mail.key),
+        "startup cannot revalidate deleted payload; its restart limit must remain documented"
+    );
+    let until: i64 = store
+        .connection
+        .query_row(
+            "SELECT outcome_until FROM envelopes WHERE origin=?1 AND id=?2",
+            params![mail.key.origin_node, mail.key.message_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .queue_commitment_unknown(&mail.key, Some(Unknown::SettlementPending), DAY_MS)
+            .unwrap(),
+        Some((until - DAY_MS) as u64)
+    );
+    assert!(
+        matches!(
+            store.settle_queue_admission(&mail.key, None, until),
+            Err(Error::InvalidState)
+        ),
+        "proof must not extend the expired outcome's retention window"
+    );
+    assert_eq!(
+        store
+            .queue_commitment_unknown(&mail.key, Some(Unknown::SettlementPending), until)
+            .unwrap(),
+        None
+    );
+    let status = store
+        .status(&mail.key.origin_node, &mail.correlation_id, until)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, "outcome_retention_elapsed");
+    assert_eq!(
+        status.detail.as_deref(),
+        Some("input_write_unknown:correction_retention_elapsed")
+    );
+    assert_eq!(
+        store.get(&mail.key).unwrap().unwrap().state,
+        "inbox_expired"
+    );
+    store.maintain(until).unwrap();
+    assert!(store.get(&mail.key).unwrap().is_none());
+}

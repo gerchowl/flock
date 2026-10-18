@@ -986,13 +986,32 @@ same queue (owner decision 5): there is no second input path.
   with a reply until the owner answers, custody settles, or its TTL expires.
   At TTL expiry the existing expiry/tombstone path records
   `input_write_unknown:commitment_unknown_at_expiry` for the existing outcome
-  window. Expiry ends recovery without proving that nothing committed.
+  window. Expiry ends admission recovery without proving that nothing committed;
+  positive proof can still retain settlement recovery as bounded below.
   Positive proof before expiry is persisted settles `Delivered` directly, even
   if the inbox deadline passed between commit and settlement. After persisted
   expiry, only an expiry carrying unknown commitment can change to `Delivered`,
   exactly once, with typed detail `delivered_after_expiry:<item_id>` (the proven
   MessageKey's lifecycle identity). A commit proof never changes an existing
   `Delivered` or `Refused` outcome.
+  If the delivery save fails again after expiry, a positive owner proof retains
+  the same key and retries settlement on the existing capped backoff, including
+  across wake notifications. Correction is bounded by the expired row's existing
+  `outcome_until` (seven days after expiry is persisted), never extended by a
+  retry or proof. At that deadline a retained row records typed detail
+  `input_write_unknown:correction_retention_elapsed`; after maintenance collects
+  the outcome, a retained status reference reports `outcome_retention_elapsed`.
+  Even before collection, proof cannot turn an out-of-window expiry into delivery.
+  The retention decision uses a read-only deadline check. If persisting its final
+  diagnostic fails, recovery still stops and logs the save error and typed
+  `outcome_retention_elapsed` reason; the status deadline remains observable.
+  **Restart limit:** active correction retains the already authenticated envelope
+  in memory. Startup's mailbox projection excludes payload-less `inbox_expired`
+  rows, so restart ends automatic post-expiry correction. It does not restore
+  deleted payload to revalidate a signature; the expired outcome remains until
+  ordinary retention deletion. Before expiry, startup recovery still loads inboxes.
+  Payload-less `Delivered`/`Read` rows are omitted from mailbox rehydration while
+  their terminal status is preserved; intentional collection is not corruption.
   This corrects the expiry label only: deleted payload is not restored, released
   quota is not re-acquired, and the original deadlines stay unchanged. Replies
   use the existing payload-less path and the seven-day custody/reply deadline
@@ -1598,7 +1617,10 @@ that the existing implementation already enforces these rules.
 scopes on **every cmd**, before claiming an idempotency key, returning a cached
 ack or dispatching a verb; cached hello authorization is insufficient. Serialize
 this authorization/admission boundary with operator revocation, so a command
-cannot be newly admitted after revocation. On detection of a removed/replaced
+cannot be newly admitted after revocation. Each admission or management operation
+explicitly unlocks its owned file description at scope exit, including completion
+or cancellation of lock-helper transfers. An inherited pre-exec descriptor in a
+child cannot extend that critical section. On detection of a removed/replaced
 token, return an error ack for the triggering cmd with `code:"auth_revoked"`
 before closing **all sockets for that token with 4403**; clients enter NeedsToken.
 Order that ack before the close on the triggering socket, without waiting for

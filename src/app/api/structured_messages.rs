@@ -364,26 +364,27 @@ impl App {
             self.record_queue_delivery(ack, settled);
         }
         for signed in std::mem::take(&mut self.structured_sends.recovering) {
-            // Expiry cleanup and a final proof do not perform a new admission,
-            // so they must not wait behind the admission retry floor.
+            let retry = self.structured_sends.retries.get(&signed.key);
+            let retry_pending = retry.is_some_and(|r| {
+                let new_owner = self
+                    .custody_owner_generation(&signed)
+                    .is_some_and(|generation| r.superseded(1, generation, false));
+                now < r.at && (!changed || (!new_owner && now < r.wake_at))
+            });
+            let correcting = retry.is_some_and(|r| r.custody_correction);
+            // First expiry cleanup/proof bypasses admission backoff. A failed
+            // post-expiry settlement uses its own bounded retry deadline.
             if stored(|s| s.get(&signed.key))
                 .is_ok_and(|row| row.is_none_or(|row| row.state != "inbox"))
             {
+                if correcting && retry_pending {
+                    self.structured_sends.recovering.push(signed);
+                    continue;
+                }
                 self.retry_queue_custody_at(signed, ErrorCode::InputWriteUnknown, now);
                 continue;
             }
-            if self.fleet_pause.paused
-                || (self
-                    .structured_sends
-                    .retries
-                    .get(&signed.key)
-                    .is_some_and(|r| {
-                        let new_owner = self
-                            .custody_owner_generation(&signed)
-                            .is_some_and(|generation| r.superseded(1, generation, false));
-                        now < r.at && (!changed || (!new_owner && now < r.wake_at))
-                    }))
-            {
+            if self.fleet_pause.paused || retry_pending {
                 self.structured_sends.recovering.push(signed);
                 continue;
             }
@@ -472,7 +473,9 @@ impl App {
         code: ErrorCode,
         now: std::time::Instant,
     ) -> ErrorCode {
-        if stored(|s| s.get(&signed.key))
+        let current = stored(|s| s.get(&signed.key));
+        let expired = matches!(&current, Ok(Some(r)) if r.state == "inbox_expired");
+        if current
             .is_ok_and(|r| r.is_none_or(|r| !matches!(r.state.as_str(), "inbox" | "inbox_expired")))
         {
             self.structured_sends.retries.remove(&signed.key);
@@ -526,9 +529,28 @@ impl App {
             Ok(false) => None,
             Err(cause) => Some(cause),
         };
-        let remaining = match stored(|s| {
+        let correction_ended = expired
+            && committed == Ok(true)
+            && stored(|s| {
+                s.queue_correction_remaining(&signed.key, super::messages::now_ms() as i64)
+            }) == Ok(Some(0));
+        let remaining = stored(|s| {
             s.queue_commitment_unknown(&signed.key, cause, super::messages::now_ms() as i64)
-        }) {
+        });
+        // A definite retention deadline ends recovery even if recording that
+        // diagnostic fails. Log both the save error and the typed end reason.
+        let remaining = match remaining {
+            Err(failure) if correction_ended => {
+                crate::logging::mesh_custody_failed("structured-recovery", failure.as_str());
+                crate::logging::mesh_custody_failed(
+                    "structured-correction",
+                    "outcome_retention_elapsed",
+                );
+                Ok(None)
+            }
+            result => result,
+        };
+        let remaining = match remaining {
             Ok(Some(remaining)) => Some(remaining),
             Ok(None) => {
                 self.structured_sends.retries.remove(&signed.key);
@@ -551,6 +573,12 @@ impl App {
             owner.unwrap_or(0),
             now,
         );
+        retry.custody_correction = expired
+            || self
+                .structured_sends
+                .retries
+                .get(&signed.key)
+                .is_some_and(|r| r.custody_correction);
         if let Some(remaining) = remaining {
             retry.at = retry
                 .at
