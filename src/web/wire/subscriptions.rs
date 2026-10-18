@@ -207,21 +207,16 @@ pub(super) async fn replay(
         let frame = match item {
             Item::Record(record) => {
                 cursor = record.seq;
-                let ev = if record.known == Some(false) {
-                    Some(WireEvent::Unknown(UnknownEvent {
+                let ev = match (record.known, record.shape.as_ref()) {
+                    (Some(false), Some(shape)) => Some(WireEvent::Unknown(UnknownEvent {
                         r#type: UnknownTag::Unknown,
                         raw: record.raw.clone(),
-                        shape: record
-                            .shape
-                            .as_ref()
-                            .ok_or(SubfailCode::UnknownStream)?
-                            .0
-                            .clone(),
-                    }))
-                } else {
-                    serde_json::from_str(&record.raw)
+                        shape: shape.0.clone(),
+                    })),
+                    (Some(true), _) => serde_json::from_str(&record.raw)
                         .ok()
-                        .map(|event| WireEvent::Session(Box::new(event)))
+                        .map(|event| WireEvent::Session(Box::new(event))),
+                    _ => None,
                 };
                 match ev {
                     Some(ev) => ServerFrame::Ev {

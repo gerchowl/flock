@@ -692,6 +692,42 @@ fn invalid_known_payload_is_an_inline_gap_without_losing_siblings() {
     });
 }
 #[test]
+fn corrupt_wrapper_is_an_inline_gap_and_reconnect_advances_past_it() {
+    runtime(async {
+        for invalid_json in [false, true] {
+            let mut case = Case::new(vec![record(1), record(2), record(3)]).await;
+            case.stored.corrupt_wrapper(1, invalid_json);
+            let mut socket = case.open().await;
+            case.sub(&mut socket, "sibling", Some(2)).await;
+            assert_eq!(case.frame(&mut socket).await["seq"], 3);
+            assert_eq!(case.frame(&mut socket).await["t"], "synced");
+            case.sub(&mut socket, "bad", Some(1)).await;
+            assert_eq!(
+                case.frame(&mut socket).await,
+                json!({"t":"gap","sub_id":"bad","from":2,"to":2})
+            );
+            assert_eq!(case.frame(&mut socket).await["seq"], 3);
+            assert_eq!(case.frame(&mut socket).await["t"], "synced");
+            case.stored.append(record(4));
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let frame = case.frame(&mut socket).await;
+                assert_eq!(frame["seq"], 4);
+                ids.push(frame["sub_id"].as_str().unwrap().to_owned());
+            }
+            ids.sort();
+            assert_eq!(ids, ["bad", "sibling"]);
+            let mut reconnected = case.open().await;
+            case.sub(&mut reconnected, "resume", Some(2)).await;
+            assert_eq!(case.frame(&mut reconnected).await["seq"], 3);
+            assert_eq!(case.frame(&mut reconnected).await["seq"], 4);
+            assert_eq!(case.frame(&mut reconnected).await["t"], "synced");
+            case.server.finish().await;
+        }
+    });
+}
+
+#[test]
 fn page_capacity_wait_is_cancellable_and_does_not_close_siblings() {
     runtime(async {
         use super::super::subscriptions::{replay, IO};
@@ -732,6 +768,10 @@ fn page_capacity_wait_is_cancellable_and_does_not_close_siblings() {
         assert_eq!(case.frame(&mut socket).await["seq"], 2);
         assert_eq!(case.frame(&mut socket).await["t"], "synced");
         case.server.finish().await;
+        // Acquire all slots to await cancelled socket jobs without a scheduling race.
+        let returned = within(IO.acquire_many(32)).await.unwrap();
+        drop(returned);
+        assert_eq!(IO.available_permits(), 32);
     });
 }
 

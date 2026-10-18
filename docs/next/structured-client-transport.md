@@ -185,7 +185,15 @@ records and inline history gaps precede exactly one `synced` barrier; subsequent
 records are live. Legacy provenance gaps continue through later records. A known
 stored payload that no longer parses emits an inline history `gap` over its
 original sequence and continues to later records and the barrier. This records
-missing history without reconnect loops or closing sibling IDs. Unknown
+missing history without reconnect loops or closing sibling IDs. Complete lines
+with corrupt storage wrappers are consumed once. Their missing sequence range
+is an inline `gap`, bounded by the next valid wrapper or the already captured
+head; the byte checkpoint advances past the damaged lines. Resuming after that
+range continues with later records, and other subscriptions remain open. The
+reader never invents sequence numbers for unsequenced garbage between otherwise
+contiguous records. An owned cut can gap a corrupt final wrapper when its head
+was already captured; cold recovery still requires a valid tail to establish
+that head, and an unterminated line remains a truncation error. Unknown
 wrappers retain the original raw line and observed harness shape, and known
 payloads retain their projected blob references. Partial deltas are absent from
 durable history. A normal producer end drains already committed records.

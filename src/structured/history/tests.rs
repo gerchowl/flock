@@ -56,6 +56,37 @@ impl Fixture {
             source,
         }
     }
+    pub(crate) fn corrupt_wrapper(&mut self, index: usize, invalid_json: bool) {
+        let path = self
+            ._root
+            .path()
+            .join("sessions/fixture-agent/history.jsonl");
+        let mut bytes = std::fs::read(path).unwrap();
+        let start = if index == 0 {
+            0
+        } else {
+            bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'\n')
+                .nth(index - 1)
+                .unwrap()
+                .0
+                + 1
+        };
+        if invalid_json {
+            bytes[start] = b'!';
+        } else {
+            let at = bytes[start..]
+                .windows(5)
+                .position(|part| part == b"\"raw\"")
+                .unwrap();
+            bytes[start + at + 1] = b'x';
+        }
+        self.file.set_len(0).unwrap();
+        self.file.write_all(&bytes).unwrap();
+        self.file.sync_all().unwrap();
+    }
     pub(crate) fn append(&mut self, record: StreamRecord) {
         let bytes = serde_json::to_vec(&record).unwrap();
         self.file.write_all(&bytes).unwrap();
@@ -615,4 +646,84 @@ fn recovery_uses_the_same_captured_length_for_head_and_end() {
     let mut resumed = source.resume(1, &hint).unwrap();
     assert_eq!(seq(next(&mut resumed)), 2);
     assert!(matches!(next(&mut resumed), Item::Synced(2)));
+}
+
+#[test]
+fn corrupt_wrappers_gap_and_checkpoint_without_replaying_prior_loss() {
+    for invalid_json in [false, true] {
+        let mut fixture = Fixture::new(
+            (1..=4)
+                .map(|seq| record(seq, json!({"type":"assistant","message":{}})))
+                .collect(),
+        );
+        fixture.corrupt_wrapper(1, invalid_json);
+        let mut cut = fixture.source.subscribe(None).unwrap();
+        assert_eq!(seq(next(&mut cut)), 1);
+        assert!(matches!(
+            next(&mut cut),
+            Item::Gap {
+                from: 2,
+                to: 2,
+                reason: GapReason::CorruptWrapper
+            }
+        ));
+        let hint = cut.checkpoint().unwrap();
+        let mut resumed = fixture.source.resume(2, &hint).unwrap();
+        assert_eq!(seq(next(&mut resumed)), 3);
+        let mut scanned = fixture.source.subscribe(Some(2)).unwrap();
+        assert_eq!(seq(next(&mut scanned)), 3);
+        assert_eq!(seq(next(&mut scanned)), 4);
+        assert!(matches!(next(&mut scanned), Item::Synced(4)));
+        assert_eq!(seq(next(&mut cut)), 3);
+        assert_eq!(seq(next(&mut cut)), 4);
+        assert!(matches!(next(&mut cut), Item::Synced(4)));
+    }
+}
+
+#[test]
+fn corrupt_wrapper_at_captured_head_gaps_once_and_keeps_live_continuation() {
+    let mut fixture = Fixture::new(vec![record(1, json!({"type":"assistant","message":{}}))]);
+    fixture.corrupt_wrapper(0, true);
+    let mut cut = fixture.source.subscribe(None).unwrap();
+    fixture.append(record(2, json!({"type":"assistant","message":{}})));
+    assert!(matches!(
+        next(&mut cut),
+        Item::Gap {
+            from: 1,
+            to: 1,
+            reason: GapReason::CorruptWrapper
+        }
+    ));
+    let hint = cut.checkpoint().unwrap();
+    assert_eq!(hint.seq, 1);
+    assert!(matches!(next(&mut cut), Item::Synced(1)));
+    assert_eq!(seq(next(&mut cut)), 2);
+    let mut resumed = fixture.source.resume(1, &hint).unwrap();
+    assert_eq!(seq(next(&mut resumed)), 2);
+    assert!(matches!(next(&mut resumed), Item::Synced(2)));
+}
+
+#[test]
+fn corrupt_unsequenced_noise_does_not_consume_valid_sequences() {
+    let mut fixture = Fixture::new(vec![
+        record(1, json!({"type":"assistant","message":{}})),
+        record(2, json!({"type":"assistant","message":{}})),
+    ]);
+    let path = fixture
+        ._root
+        .path()
+        .join("sessions/fixture-agent/history.jsonl");
+    let records = std::fs::read(path).unwrap();
+    fixture.file.set_len(0).unwrap();
+    fixture.file.write_all(b"unsequenced garbage\n").unwrap();
+    fixture.file.write_all(&records).unwrap();
+    fixture.file.sync_all().unwrap();
+    fixture
+        .source
+        .initialize(&fixture.file, 2, fixture.file.metadata().unwrap().len())
+        .unwrap();
+    let mut cut = fixture.source.subscribe(None).unwrap();
+    assert_eq!(seq(next(&mut cut)), 1);
+    assert_eq!(seq(next(&mut cut)), 2);
+    assert!(matches!(next(&mut cut), Item::Synced(2)));
 }

@@ -22,7 +22,7 @@ pub const PAGE_BYTES: usize = 32 * 1024;
 /// Storage's bounded record limit, including envelope and newline.
 const RECORD_BYTES: usize = super::transport::RECORD_LIMIT as usize;
 
-/// Why a range cannot be reconstructed. Neither kind is an entity snapshot.
+/// Why a range cannot be reconstructed. These gaps carry no entity snapshot.
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GapReason {
@@ -30,6 +30,8 @@ pub enum GapReason {
     RetainedPrefix,
     /// Legacy record lacks original classification or sender shape.
     ProvenanceMissing,
+    /// One or more complete lines have an invalid storage wrapper.
+    CorruptWrapper,
 }
 /// One bounded replay/publication step. A barrier precedes every live record.
 #[derive(Debug)]
@@ -276,6 +278,8 @@ impl Registered {
         Cut {
             file: self.file,
             head: self.head,
+            end: self.end,
+            corrupt: false,
             cursor: self.cursor,
             offset: checkpoint.unwrap_or(0),
             checkpoint,
@@ -337,6 +341,8 @@ fn tail_head(file: &File, length: u64) -> io::Result<u64> {
 pub struct Cut {
     file: File,
     head: u64,
+    end: u64,
+    corrupt: bool,
     cursor: u64,
     offset: u64,
     checkpoint: Option<u64>,
@@ -351,8 +357,9 @@ pub struct Cut {
     live: Arc<Mutex<Live>>,
 }
 impl Cut {
-    /// Poll on an I/O worker. Errors are explicit; corrupt/truncated cuts never
-    /// become Current. No parser or current harness version participates.
+    /// Poll on an I/O worker. Complete corrupt wrappers become explicit gaps
+    /// anchored to original sequences. Truncated cuts remain errors.
+    /// No harness parser or current harness version participates.
     pub fn page(&mut self) -> io::Result<Item> {
         if self.closed {
             return Ok(Item::End);
@@ -375,10 +382,25 @@ impl Cut {
                     if read {
                         return Ok(Item::Progress);
                     }
+                    if self.offset == self.end {
+                        if self.corrupt && self.partial.is_empty() {
+                            let from = self.cursor + 1;
+                            self.cursor = self.head;
+                            self.checkpoint = Some(self.end);
+                            self.corrupt = false;
+                            return Ok(Item::Gap {
+                                from,
+                                to: self.head,
+                                reason: GapReason::CorruptWrapper,
+                            });
+                        }
+                        return Err(io::ErrorKind::UnexpectedEof.into());
+                    }
                     self.buffer.resize(PAGE_BYTES, 0);
+                    let limit = (self.end - self.offset).min(PAGE_BYTES as u64) as usize;
                     let n = crate::platform::structured::read_file_at(
                         &self.file,
-                        &mut self.buffer,
+                        &mut self.buffer[..limit],
                         self.offset,
                     )?;
                     if n == 0 {
@@ -403,10 +425,18 @@ impl Cut {
                 if self.partial.last() != Some(&b'\n') {
                     continue;
                 }
-                let record: StreamRecord = serde_json::from_slice(&self.partial)?;
+                let record = serde_json::from_slice::<StreamRecord>(&self.partial);
                 let end = self.offset - (self.buffer.len() - self.used) as u64;
                 let start = end - self.partial.len() as u64;
                 self.partial.clear();
+                let record = match record {
+                    Ok(record) => record,
+                    Err(_) => {
+                        self.corrupt = true;
+                        continue;
+                    }
+                };
+                let corrupt = std::mem::take(&mut self.corrupt);
                 if record.seq <= self.cursor {
                     if record.seq == self.cursor {
                         self.checkpoint = Some(end);
@@ -421,7 +451,11 @@ impl Cut {
                     let item = Item::Gap {
                         from: self.cursor + 1,
                         to: record.seq - 1,
-                        reason: GapReason::RetainedPrefix,
+                        reason: if corrupt {
+                            GapReason::CorruptWrapper
+                        } else {
+                            GapReason::RetainedPrefix
+                        },
                     };
                     self.cursor = record.seq - 1;
                     self.checkpoint = Some(start);
