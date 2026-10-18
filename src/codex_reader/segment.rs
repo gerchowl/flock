@@ -4,7 +4,7 @@
 use super::*;
 use crate::codex_binding::{Binding, Failure, Key, Ownership};
 use crate::codex_rollout::Observation;
-use std::{fs::File, path::Path};
+use std::fs::File;
 
 /// Verified pre-launch bytes, including any incomplete inherited record. This
 /// is history evidence, not a transferable writer/authority capability.
@@ -12,69 +12,52 @@ pub(crate) struct Snapshot {
     checkpoint: Checkpoint,
     thread: String,
 }
-impl Snapshot {
-    /// Capture after quiescing the prior writer and before launching/resuming.
-    /// The controller guarantees this ordering; the snapshot grants no writer identity.
-    /// The caller opens the known local path beneath its attributed home using
-    /// the binding's platform opener; this never discovers or follows remote paths.
-    pub fn capture(file: &mut File, path: &Path, limits: Limits) -> Result<Self, Error> {
-        let identity = rollout_identity(file, path).map_err(|_| Error::Attribution)?;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|_| Error::Attribution)?;
-        let mut bytes = Vec::new();
-        (&mut *file)
-            .take((limits.file_bytes as u64).saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|_| Error::Attribution)?;
-        if bytes.len() > limits.file_bytes {
-            return Err(Error::Record(Reason::CapacityExceeded));
-        }
-        let mut next = None;
-        let mut end = 0;
-        let mut thread = None;
-        for line in bytes.split_inclusive(|b| *b == b'\n') {
-            if line
-                .len()
-                .saturating_sub(usize::from(line.ends_with(b"\n")))
-                > limits.record_bytes
-            {
-                return Err(Error::Record(Reason::CapacityExceeded));
-            }
-            if !line.ends_with(b"\n") {
-                break;
-            }
-            let record: Value =
-                serde_json::from_slice(line).map_err(|_| Error::Record(Reason::MalformedRecord))?;
-            if thread.is_none() {
-                if record["type"] != "session_meta" {
-                    return Err(Error::Attribution);
-                }
-                thread = record["payload"]["id"]
-                    .as_str()
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned);
-                if thread.is_none() {
-                    return Err(Error::Attribution);
-                }
-                next = first_ordinal(&record).map_err(Error::Record)?;
-            }
-            verify_record(&record, &mut next).map_err(Error::Record)?;
-            end += line.len();
-        }
-        if rollout_identity(file, path).map_err(|_| Error::Attribution)? != identity {
+/// Incremental pre-launch capture. The caller keeps the old writer quiescent
+/// throughout capture and starts the next writer only after successful EOF.
+/// Cancellation drops this object; no background work or notification wait.
+pub(crate) struct Capture {
+    file: File,
+    path: std::path::PathBuf,
+    scan: Scan,
+    thread: Option<String>,
+    failed: bool,
+}
+impl Capture {
+    /// Open the known local file beneath the launch home with the binding's
+    /// platform opener. This operation never discovers or follows remote paths.
+    pub fn new(file: File, path: std::path::PathBuf, limits: Limits) -> Result<Self, Error> {
+        let scan = Scan::new(&file, &path, limits).map_err(Error::Record)?;
+        Ok(Self {
+            file,
+            path,
+            scan,
+            thread: None,
+            failed: false,
+        })
+    }
+    /// At most one work budget; None is progress, not a completed snapshot.
+    /// After an error or completed capture, this object cannot be reused.
+    pub fn step(&mut self, now: Instant) -> Result<Option<Snapshot>, Error> {
+        if self.failed {
             return Err(Error::Attribution);
         }
-        Ok(Self {
-            thread: thread.ok_or(Error::Attribution)?,
-            checkpoint: Checkpoint {
-                identity,
-                read_offset: bytes.len() as u64,
-                complete_offset: end as u64,
-                partial: bytes[end..].to_vec(),
-                digest: Sha256::digest(&bytes).into(),
-                next_ordinal: next,
-            },
-        })
+        let result = self
+            .scan
+            .step(&mut self.file, &self.path, now, |record, _, begin| {
+                if begin == 0 {
+                    self.thread = record["payload"]["id"].as_str().map(str::to_owned);
+                }
+            });
+        self.failed = result.is_err();
+        let update = result.map_err(Error::Record)?;
+        if update.eof_at.is_none() {
+            return Ok(None);
+        }
+        self.failed = true;
+        Ok(Some(Snapshot {
+            checkpoint: update.checkpoint,
+            thread: self.thread.take().ok_or(Error::Attribution)?,
+        }))
     }
 }
 
@@ -114,148 +97,201 @@ pub(crate) struct Segment {
     reader: Reader,
     reducer: Reducer,
 }
-impl Segment {
-    /// Verify attribution before committing binding trust. A failed candidate
-    /// rejects the pending claim; stale callbacks cannot reject a newer claim.
-    pub fn admit(
+/// A bounded admission transaction. Trust stays pending until verified EOF;
+/// dropping it cancels local work and the controller must reject/replace its claim.
+pub(crate) struct Admission {
+    key: Key,
+    reader: Option<Reader>,
+    reducer: Option<Reducer>,
+    mode: Mode,
+    minimum: u64,
+    delimiters: usize,
+    failure: Option<Error>,
+    compact: bool,
+}
+impl Admission {
+    /// Prepare local ownership/continuity constraints; no file-sized I/O here.
+    /// The current pending claim is rejected on failure, preserving launch trust.
+    pub fn begin(
         binding: &mut Binding,
         key: &Key,
         validated: Result<Validated, Failure>,
         mode: Mode,
         owners: &mut Ownership,
         limits: Limits,
-        now: Instant,
     ) -> Result<Self, Error> {
         if !binding.pending(key) {
             return Err(Error::Binding(Failure::Route));
         }
-        let prepared = Self::prepare(key, validated, mode, limits, now);
-        match prepared {
-            Ok(mut segment) => {
-                let file = binding
-                    .finish(key, Ok(segment.reader.validated), owners)
-                    .map_err(Error::Binding)?;
-                segment.reader.validated = file;
-                Ok(segment)
-            }
-            Err(error) => {
-                let reason = match error {
-                    Error::Binding(reason) => reason,
-                    _ => Failure::Metadata,
-                };
-                let _ = binding.finish(key, Err(reason), owners);
-                Err(error)
-            }
+        let result = Self::prepare(key, validated, mode, limits);
+        if let Err(error) = &result {
+            let reason = if let Error::Binding(reason) = error {
+                *reason
+            } else {
+                Failure::Metadata
+            };
+            let _ = binding.finish(key, Err(reason), owners);
         }
+        result
     }
     fn prepare(
         key: &Key,
         validated: Result<Validated, Failure>,
         mode: Mode,
         limits: Limits,
-        now: Instant,
     ) -> Result<Self, Error> {
         let validated = validated.map_err(Error::Binding)?;
         if validated.key() != key {
             return Err(Error::Binding(Failure::Route));
         }
-        let compact = matches!(&mode, Mode::Compact(_));
-        let read_error = |reason| {
-            if compact {
-                Error::Compaction
-            } else {
-                Error::Record(reason)
-            }
-        };
-        let mut reader = Reader::new(validated, limits).map_err(read_error)?;
-        let update = reader.poll(now).map_err(read_error)?;
-        let bytes = &update.bytes;
-        let mut from = 0;
-        let inherited = match mode {
+        let mut reader = Reader::new(validated, limits).map_err(Error::Record)?;
+        let mut reducer = None;
+        let mut minimum = 0;
+        let compact = matches!(mode, Mode::Compact(_));
+        let mode = match mode {
             Mode::Compact(Handoff(old)) => {
-                let old_key = old.reader.validated.key();
-                if old_key.owner != key.owner
-                    || old_key.launch != key.launch
-                    || old_key.thread != key.thread
+                let prior = old.reader.validated.key();
+                if prior.owner != key.owner
+                    || prior.launch != key.launch
+                    || prior.thread != key.thread
                     || old.reader.validated.writer != reader.validated.writer
-                    || !matches_prefix(&old.reader.cursor, &reader, bytes, false)
                 {
                     return Err(Error::Compaction);
                 }
-                from = old.reader.cursor.read_offset as usize;
-                Some(old.reducer)
+                seed(&mut reader, old.reader.scan.cursor, false).map_err(|_| Error::Compaction)?;
+                reducer = Some(old.reducer);
+                Mode::Fresh
             }
             Mode::Resume { snapshot, copied } => {
-                if snapshot.thread != key.thread
-                    || !matches_prefix(&snapshot.checkpoint, &reader, bytes, copied)
-                {
+                if snapshot.thread != key.thread {
                     return Err(Error::Attribution);
                 }
-                from = snapshot.checkpoint.read_offset as usize;
-                if !snapshot.checkpoint.partial.is_empty() {
-                    from += bytes[from..]
+                minimum = snapshot.checkpoint.read_offset;
+                seed(&mut reader, snapshot.checkpoint, copied)?;
+                Mode::Fresh
+            }
+            other => other,
+        };
+        Ok(Self {
+            key: key.clone(),
+            reader: Some(reader),
+            reducer,
+            mode,
+            minimum,
+            delimiters: 0,
+            failure: None,
+            compact,
+        })
+    }
+    /// One bounded scan. Only this still-pending capability can commit trust.
+    /// Stale callbacks cannot fail or finish a newer claim. Errors are terminal.
+    pub fn step(
+        &mut self,
+        binding: &mut Binding,
+        owners: &mut Ownership,
+        now: Instant,
+    ) -> Result<Option<Segment>, Error> {
+        if !binding.pending(&self.key) {
+            return Err(Error::Binding(Failure::Route));
+        }
+        let result = self.advance(now);
+        match result {
+            Ok(Some(mut segment)) => {
+                segment.reader.validated = binding
+                    .finish(&self.key, Ok(segment.reader.validated), owners)
+                    .map_err(Error::Binding)?;
+                Ok(Some(segment))
+            }
+            Err(error) => {
+                let reason = if let Error::Binding(reason) = error {
+                    reason
+                } else {
+                    Failure::Metadata
+                };
+                let _ = binding.finish(&self.key, Err(reason), owners);
+                Err(error)
+            }
+            pending => pending,
+        }
+    }
+    fn advance(&mut self, now: Instant) -> Result<Option<Segment>, Error> {
+        let reader = self.reader.as_mut().ok_or(Error::Attribution)?;
+        let compact = self.compact;
+        let limits = reader.scan.limits;
+        let update = reader
+            .records(now, |record, bytes, begin| {
+                if compact || self.failure.is_some() {
+                    return;
+                }
+                if begin == 0
+                    && matches!(self.mode, Mode::Fresh)
+                    && self.minimum == 0
+                    && ["forked_from_id", "history_base"]
                         .iter()
-                        .position(|b| *b == b'\n')
-                        .ok_or(Error::Attribution)?
-                        + 1;
-                }
-                None
-            }
-            Mode::Fork => {
-                let delimiters = records(bytes)?
-                    .into_iter()
-                    .filter(|(_, record)| {
-                        record["type"] == "event_msg"
-                            && record["payload"]["type"] == "thread_settings_applied"
-                            && record["payload"]["thread_id"].as_str() == Some(&key.thread)
-                    })
-                    .map(|(end, _)| end)
-                    .collect::<Vec<_>>();
-                if delimiters.len() != 1 {
-                    return Err(Error::Attribution);
-                }
-                from = delimiters[0];
-                None
-            }
-            Mode::Fresh => {
-                let first = records(bytes)?
-                    .into_iter()
-                    .next()
-                    .ok_or(Error::Attribution)?
-                    .1;
-                if first["payload"]
-                    .get("forked_from_id")
-                    .is_some_and(|v| !v.is_null())
-                    || first["payload"]
-                        .get("history_base")
-                        .is_some_and(|v| !v.is_null())
+                        .any(|k| record["payload"].get(k).is_some_and(|v| !v.is_null()))
                 {
-                    return Err(Error::Attribution);
+                    self.failure = Some(Error::Attribution);
                 }
-                None
-            }
-        };
-        let mut reducer = if let Some(reducer) = inherited {
-            reducer
-        } else {
-            let mut offset = from;
-            let start = records(&bytes[from..])?
-                .into_iter()
-                .find_map(|(end, record)| {
-                    let begin = offset;
-                    offset = from + end;
-                    (record["type"] == "event_msg"
-                        && matches!(
-                            record["payload"]["type"].as_str(),
-                            Some("task_started" | "turn_started")
-                        ))
-                    .then_some((begin, record))
-                })
-                .ok_or(Error::Attribution)?;
-            from = start.0;
-            limits.reducer(start.1.get("ordinal").and_then(Value::as_u64))
-        };
-        reducer.feed(&bytes[from..], now);
+                if record["type"] == "event_msg"
+                    && record["payload"]["type"] == "thread_settings_applied"
+                    && record["payload"]["thread_id"].as_str() == Some(&self.key.thread)
+                    && matches!(self.mode, Mode::Fork)
+                {
+                    self.delimiters += 1;
+                    if self.delimiters != 1 {
+                        self.failure = Some(Error::Attribution);
+                    }
+                }
+                if begin < self.minimum || (matches!(self.mode, Mode::Fork) && self.delimiters != 1)
+                {
+                    return;
+                }
+                if self.reducer.is_none()
+                    && record["type"] == "event_msg"
+                    && matches!(
+                        record["payload"]["type"].as_str(),
+                        Some("task_started" | "turn_started")
+                    )
+                {
+                    self.reducer =
+                        Some(limits.reducer(record.get("ordinal").and_then(Value::as_u64)));
+                }
+                if let Some(reducer) = &mut self.reducer {
+                    reducer.feed(bytes, now);
+                    reducer.feed(b"\n", now);
+                }
+            })
+            .map_err(|reason| {
+                if compact {
+                    Error::Compaction
+                } else {
+                    Error::Record(reason)
+                }
+            })?;
+        if let Some(error) = self.failure.take() {
+            return Err(error);
+        }
+        if compact {
+            self.reducer
+                .as_mut()
+                .ok_or(Error::Compaction)?
+                .feed(&update.bytes, now);
+        }
+        if let Some(reason) = self
+            .reducer
+            .as_ref()
+            .and_then(|r| r.observe(now).reason)
+            .filter(|r| *r != Reason::PartialRecord)
+        {
+            return Err(Error::Record(reason));
+        }
+        if update.eof_at.is_none() {
+            return Ok(None);
+        }
+        let mut reducer = self.reducer.take().ok_or(Error::Attribution)?;
+        if !compact {
+            reducer.feed(&update.checkpoint.partial, now);
+        }
         if let Some(reason) = reducer
             .observe(now)
             .reason
@@ -263,8 +299,21 @@ impl Segment {
         {
             return Err(Error::Record(reason));
         }
-        Ok(Self { reader, reducer })
+        Ok(Some(Segment {
+            reader: self.reader.take().ok_or(Error::Attribution)?,
+            reducer,
+        }))
     }
+}
+fn seed(reader: &mut Reader, mut checkpoint: Checkpoint, copied: bool) -> Result<(), Error> {
+    if !copied && checkpoint.identity != reader.scan.cursor.identity {
+        return Err(Error::Attribution);
+    }
+    checkpoint.identity = reader.scan.cursor.identity;
+    reader.scan.cursor = checkpoint;
+    Ok(())
+}
+impl Segment {
     /// Deliver only the current reader's verified suffix; source failure cannot
     /// leave a cached idle/working decision usable. Capability checks are #1857.
     pub fn poll(&mut self, now: Instant) -> Result<(), Error> {
@@ -280,9 +329,10 @@ impl Segment {
     pub fn observe(&self, now: Instant) -> Observation<'_> {
         self.reducer.observe(now)
     }
-    /// Capture before SessionStart revokes the prior binding generation.
+    /// Capture the owned verified cursor before SessionStart revokes its capability.
+    /// Admission rechecks its entire prefix and consumes subsequent appended bytes.
     pub fn handoff(
-        mut self,
+        self,
         binding: &Binding,
         owners: &Ownership,
         now: Instant,
@@ -290,7 +340,6 @@ impl Segment {
         if !binding.accepts(self.reader.validated.key(), owners) {
             return Err(Error::Compaction);
         }
-        self.poll(now).map_err(|_| Error::Compaction)?;
         if self
             .observe(now)
             .reason
@@ -301,27 +350,5 @@ impl Segment {
         Ok(Handoff(Box::new(self)))
     }
 }
-fn matches_prefix(checkpoint: &Checkpoint, reader: &Reader, bytes: &[u8], copied: bool) -> bool {
-    let end = checkpoint.read_offset as usize;
-    (copied || checkpoint.identity == reader.cursor.identity)
-        && bytes.len() >= end
-        && Sha256::digest(&bytes[..end])[..] == checkpoint.digest
-}
-// Complete records only: partial EOF is retained by Reader/Reducer, never used
-// as a segment delimiter or as evidence of a new writer's start.
-fn records(bytes: &[u8]) -> Result<Vec<(usize, Value)>, Error> {
-    let mut end = 0;
-    bytes
-        .split_inclusive(|b| *b == b'\n')
-        .filter(|line| line.ends_with(b"\n"))
-        .map(|line| {
-            end += line.len();
-            serde_json::from_slice(line)
-                .map(|record| (end, record))
-                .map_err(|_| Error::Record(Reason::MalformedRecord))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests;
