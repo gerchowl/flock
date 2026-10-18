@@ -8,14 +8,15 @@ pub(crate) trait Provider {
     type Error;
     /// Owned replay barrier followed by bounded live continuation.
     type Subscription: Subscription;
-    /// Nonblocking request. Buffer acceptance is not a completed replay cut.
+    /// Request a cut; buffer acceptance is not a completed replay barrier.
+    /// File-backed providers require the consumer’s I/O worker.
     fn subscribe(&self, after: Option<u64>) -> Result<Self::Subscription, Self::Error>;
 }
 /// One consumer's immutable replay and live cursor.
 pub(crate) trait Subscription {
     /// Stream-specific record, gap, barrier, pending, lagged or terminal outcome.
     type Page;
-    /// Bounded in-memory progress; filesystem work stays on the source owner.
+    /// Bounded progress. File-backed providers page on a consumer I/O worker.
     fn page(&mut self) -> Self::Page;
     /// Coalesced readiness hint. Enable before paging, then recheck after waking.
     fn waker(&self) -> std::sync::Arc<tokio::sync::Notify>;
