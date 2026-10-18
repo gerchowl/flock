@@ -93,15 +93,37 @@ pub enum RegistryError {
     GenerationExhausted,
 }
 
+/// Stable retained-record warning `cause` values (ADR-0028 §3a lenient load).
+/// These codes describe why an entry is inactive, independently of its
+/// DEAD/FORWARD class and human-readable detail. Keep their spelling stable.
+mod retained_causes {
+    /// `invalid_record`: a decoded record fails identity, name or harness validation.
+    pub(super) const INVALID_RECORD: &str = "invalid_record";
+    /// `unsupported_collection_shape`: structured_agents has a non-array layout.
+    pub(super) const UNSUPPORTED_COLLECTION_SHAPE: &str = "unsupported_collection_shape";
+    /// `conflict`: identity, name or session conflicts with an existing reservation.
+    pub(super) const CONFLICT: &str = "conflict";
+    /// `stale_generation`: no entry exists or its launch generation differs.
+    pub(super) const STALE_GENERATION: &str = "stale_generation";
+    /// `generation_exhausted`: another launch generation cannot be allocated safely.
+    pub(super) const GENERATION_EXHAUSTED: &str = "generation_exhausted";
+    /// `non_object`: the retained JSON element is not an object.
+    pub(super) const NON_OBJECT: &str = "non_object";
+    /// `exact_duplicate`: an object canonically equals an earlier array element.
+    pub(super) const EXACT_DUPLICATE: &str = "exact_duplicate";
+    /// `unsupported_shape`: an object cannot be decoded as a supported record.
+    pub(super) const UNSUPPORTED_SHAPE: &str = "unsupported_shape";
+}
+
 impl RegistryError {
     /// Stable diagnostic cause, independent of human-readable error wording.
     fn retained_cause(&self) -> &'static str {
         match self {
-            Self::InvalidRecord => "invalid_record",
-            Self::UnsupportedCollectionShape => "unsupported_collection_shape",
-            Self::Conflict => "conflict",
-            Self::StaleGeneration => "stale_generation",
-            Self::GenerationExhausted => "generation_exhausted",
+            Self::InvalidRecord => retained_causes::INVALID_RECORD,
+            Self::UnsupportedCollectionShape => retained_causes::UNSUPPORTED_COLLECTION_SHAPE,
+            Self::Conflict => retained_causes::CONFLICT,
+            Self::StaleGeneration => retained_causes::STALE_GENERATION,
+            Self::GenerationExhausted => retained_causes::GENERATION_EXHAUSTED,
         }
     }
 }
@@ -431,9 +453,9 @@ impl<'de> Deserialize<'de> for Registry {
             let dead = !raw.is_object() || duplicate;
             let mut detail = String::new();
             let cause = if !raw.is_object() {
-                "non_object"
+                retained_causes::NON_OBJECT
             } else if duplicate {
-                "exact_duplicate"
+                retained_causes::EXACT_DUPLICATE
             } else {
                 match serde_json::from_value::<Record>(raw.clone()) {
                     Ok(record) => match registry.register_raw(record, raw.clone()) {
@@ -443,7 +465,7 @@ impl<'de> Deserialize<'de> for Registry {
                             error.retained_cause()
                         }
                     },
-                    Err(_) => "unsupported_shape",
+                    Err(_) => retained_causes::UNSUPPORTED_SHAPE,
                 }
             };
             tracing::warn!(

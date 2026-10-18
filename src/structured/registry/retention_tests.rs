@@ -255,6 +255,26 @@ fn retained_purge_reclassifies_the_last_forward_copy_before_automatic_pruning() 
 }
 
 #[test]
+fn retained_cause_codes_cover_every_registry_error() {
+    let cases = [
+        (RegistryError::InvalidRecord, "invalid_record"),
+        (
+            RegistryError::UnsupportedCollectionShape,
+            "unsupported_collection_shape",
+        ),
+        (RegistryError::Conflict, "conflict"),
+        (RegistryError::StaleGeneration, "stale_generation"),
+        (RegistryError::GenerationExhausted, "generation_exhausted"),
+    ];
+    let actual: Vec<_> = cases
+        .iter()
+        .map(|(error, _)| error.retained_cause())
+        .collect();
+    let expected: Vec<_> = cases.iter().map(|(_, code)| *code).collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn retained_logs_separate_class_from_each_cause() {
     let original = serde_json::to_value(super::tests::record("agent_fixture_logs")).unwrap();
     let mut conflict = original.clone();
@@ -348,6 +368,7 @@ fn retained_swap_installs_saved_state_exactly_without_cold_live_entries() {
     assert_eq!(serde_json::to_value(&live).unwrap(), json!([forward()]));
 }
 
+#[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "retained snapshot must have the same live entries")]
 fn retained_swap_rejects_stale_entry_set() {
