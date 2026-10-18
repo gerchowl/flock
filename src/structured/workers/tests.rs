@@ -63,17 +63,20 @@ impl Case {
                 session_id: session.clone(),
                 cwd,
                 model: Some("fixture-worker-model".into()),
+                lineage: None,
             })
             .unwrap();
         let leases = SessionLeases::default();
         let launch = Launch {
+            opening_turn: None,
             agent_id: id.clone(),
             generation,
             leases: leases.clone(),
             state: fixture.root.path().to_owned(),
             mcp: fixture.mcp(),
+            storage: Default::default(),
             stall_after: STALL,
-            lineage: None,
+            admission: None,
         };
         let f = fixture.clone();
         let authority = leases.clone();
@@ -272,6 +275,19 @@ pub(crate) async fn wait(notify: &Arc<Notify>, mut condition: impl FnMut() -> bo
     })
     .await
     .expect("bounded worker condition never arrived");
+}
+/// Join the terminal producer before an immediate resume, without a scheduling race.
+pub(crate) async fn join_reported(workers: &mut Workers, id: &str, generation: u64) {
+    let worker = workers.entries.get_mut(id).unwrap();
+    assert_eq!(worker.generation, generation);
+    assert!(worker.report.is_some());
+    if let Some(thread) = worker.thread.take() {
+        tokio::time::timeout(LIMIT, tokio::task::spawn_blocking(move || thread.join()))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 }
 fn owner() -> (Registry, Workers, Arc<Notify>, Instant) {
     let notify = Arc::new(Notify::new());
@@ -623,7 +639,11 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
     let (mut registry, mut workers, notify, now) = owner();
     let (a, launch, _) = Case::prepare(&mut registry, 10, "state-reducer", vec![]);
     let (tx, messages) = mpsc::sync_channel(2);
-    drop(tx);
+    let producer = std::thread::spawn(move || drop(tx));
+    producer.join().unwrap();
+    workers
+        .pending
+        .insert(a.id.clone(), Some("fixture-parent".into()));
     workers.entries.insert(
         a.id.clone(),
         Worker {
@@ -643,6 +663,11 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
         workers.report(&a.id, a.generation).is_some()
     })
     .await;
+    assert!(
+        !workers.pending.contains_key(&a.id),
+        "disconnected launch must free its pending slot"
+    );
+    assert_eq!(workers.counts(&a.leases, "fixture-parent"), Ok((0, 0)));
     assert!(workers.entries[&a.id].thread.is_none());
     let report = workers.report(&a.id, a.generation).unwrap();
     assert!(report.authority_retained);
@@ -836,4 +861,306 @@ fn drop_after_failed_shutdown_does_not_wait_a_second_time() {
     worker.join().unwrap();
     dropper.join().unwrap();
     result.expect("Drop must not repeat the full teardown after its deadline");
+}
+
+#[test]
+fn restored_unknown_refuses_before_profile_preparation_and_preserves_epoch() {
+    let mut registry = Registry::default();
+    let mut workers = Workers::new(Arc::new(Notify::new()));
+    let (case, launch, _) = Case::prepare(&mut registry, 901, "state-reducer", vec![]);
+    registry.restore_handoff_unknown(std::slice::from_ref(&case.id));
+    let (_, projection, generation) = registry.get(&case.id).unwrap();
+    let before = format!("{:?}", projection.update);
+    let error = workers
+        .start(&mut registry, launch, |_| {
+            panic!("Unknown must refuse before preparation")
+        })
+        .unwrap_err();
+    assert_eq!(
+        error,
+        crate::api::error_code::ErrorCode::StructuredRecoveryRequired
+    );
+    let (_, after, epoch) = registry.get(&case.id).unwrap();
+    assert_eq!(epoch, generation);
+    assert_eq!(format!("{:?}", after.update), before);
+    assert!(workers.runtime(&case.id, epoch).is_none());
+    assert!(!case.leases.is_reserved(&case.session).unwrap());
+}
+
+fn record_lineage(registry: &mut Registry, launch: &mut Launch, parent: &str, depth: u32) {
+    let mut record = registry
+        .remove(&launch.agent_id, launch.generation)
+        .unwrap();
+    record.lineage = Some(super::super::registry::Lineage {
+        parent: Some(parent.into()),
+        depth,
+    });
+    launch.generation = registry.register(record).unwrap();
+}
+fn limited_launch(mut launch: Launch, leases: &SessionLeases) -> Launch {
+    launch.leases = leases.clone();
+    launch.admission = Some(Admission {
+        config: crate::spawn::FleetConfig {
+            max_concurrent_agents: 1,
+            ..Default::default()
+        },
+        pty: crate::spawn::SpawnCensus {
+            live_agent_started: 0,
+            parent_live_children: 0,
+            child_depth: 1,
+        },
+        paused: false,
+        verb: crate::spawn::SpawnVerb::Fork,
+    });
+    launch
+}
+
+/// A producer held before lease acquisition cannot leave an uncounted admission gap.
+#[tokio::test]
+async fn owner_pending_reservation_blocks_concurrent_start_and_failure_frees_it() {
+    let (mut registry, mut workers, notify, now) = owner();
+    let leases = SessionLeases::default();
+    let (first, mut launch, _) = Case::prepare(&mut registry, 120, "state-reducer", vec![]);
+    record_lineage(&mut registry, &mut launch, "fixture-parent", 1);
+    let (release, barrier) = mpsc::channel();
+    workers.before_reserve = Some(barrier);
+    let generation = workers
+        .start(&mut registry, limited_launch(launch, &leases), |_| {
+            Err(io::Error::other("fixture preparation failure").into())
+        })
+        .unwrap();
+    assert_eq!(workers.counts(&leases, "fixture-parent"), Ok((1, 1)));
+    assert!(!leases.is_reserved(&first.session).unwrap());
+    workers.poll(&mut registry, now + Duration::from_secs(3600), 1000);
+    assert_eq!(
+        workers.counts(&leases, "fixture-parent"),
+        Ok((1, 1)),
+        "a clock cannot release pending admission"
+    );
+    let (_, mut second, _) = Case::prepare(&mut registry, 121, "state-reducer", vec![]);
+    record_lineage(&mut registry, &mut second, "fixture-parent", 1);
+    let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = prepared.clone();
+    let refused = workers.start(&mut registry, limited_launch(second, &leases), move |_| {
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(io::Error::other("unadmitted preparation").into())
+    });
+    release.send(()).unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&first.id, generation).is_some()
+    })
+    .await;
+    let remaining = workers.counts(&leases, "fixture-parent");
+    let cleanup = workers.shutdown(&mut registry);
+    assert_eq!(refused, Err(ErrorCode::AtAgentCapacity));
+    assert!(!prepared.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        remaining,
+        Ok((0, 0)),
+        "failed preparation releases reservation"
+    );
+    cleanup.unwrap();
+    let (_, mut third, _) = Case::prepare(&mut registry, 122, "state-reducer", vec![]);
+    record_lineage(&mut registry, &mut third, "fixture-parent", 1);
+    workers
+        .start(&mut registry, limited_launch(third, &leases), |_| {
+            Err(io::Error::other("fixture preparation failure").into())
+        })
+        .unwrap();
+    workers.shutdown(&mut registry).unwrap();
+}
+
+#[test]
+fn owner_counts_deduplicate_pending_and_leased_identity() {
+    let (_, mut workers, _, _) = owner();
+    let leases = SessionLeases::default();
+    workers
+        .pending
+        .insert("fixture-child".into(), Some("fixture-parent".into()));
+    let lease = leases
+        .reserve(
+            "fixture-child",
+            "00000000-0000-4000-8000-000000000123",
+            Some(("fixture-parent", 0)),
+        )
+        .unwrap();
+    assert_eq!(workers.counts(&leases, "fixture-parent"), Ok((1, 1)));
+    drop(lease);
+    assert_eq!(workers.counts(&leases, "fixture-parent"), Ok((1, 1)));
+}
+
+#[tokio::test]
+async fn owner_failed_lease_acquisition_releases_pending_reservation() {
+    let (mut registry, mut workers, notify, _) = owner();
+    let leases = SessionLeases::default();
+    let (case, mut launch, _) = Case::prepare(&mut registry, 124, "state-reducer", vec![]);
+    record_lineage(&mut registry, &mut launch, "fixture-parent", 1);
+    let existing = leases
+        .reserve("other-fixture-agent", &case.session, None)
+        .unwrap();
+    let generation = workers
+        .start(&mut registry, limited_launch(launch, &leases), |_| {
+            panic!("a duplicate lease must never prepare a profile")
+        })
+        .unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&case.id, generation).is_some()
+    })
+    .await;
+    let pending = workers.pending.contains_key(&case.id);
+    drop(existing);
+    let _ = workers.shutdown(&mut registry);
+    assert!(!pending, "lease failure must release its owner reservation");
+}
+
+/// Lease acquisition transfers accounting before preparation completes.
+#[tokio::test]
+async fn owner_lease_acquisition_retires_pending_without_double_counting() {
+    let (mut registry, mut workers, notify, _) = owner();
+    let leases = SessionLeases::default();
+    let (case, mut launch, _) = Case::prepare(&mut registry, 125, "state-reducer", vec![]);
+    record_lineage(&mut registry, &mut launch, "fixture-parent", 1);
+    let (entered, seen) = mpsc::sync_channel(1);
+    let (release, barrier) = mpsc::sync_channel(1);
+    let generation = workers
+        .start(&mut registry, limited_launch(launch, &leases), move |_| {
+            entered.send(()).unwrap();
+            barrier
+                .recv_timeout(LIMIT)
+                .map_err(|_| io::Error::other("profile barrier failed"))?;
+            Err(io::Error::other("fixture preparation failure").into())
+        })
+        .unwrap();
+    seen.recv_timeout(LIMIT)
+        .expect("preparation must acquire its lease first");
+    let count_before = workers.counts(&leases, "fixture-parent");
+    workers.poll(&mut registry, Instant::now(), 1000);
+    let pending = workers.pending.contains_key(&case.id);
+    let count_after = workers.counts(&leases, "fixture-parent");
+    release.send(()).unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&case.id, generation).is_some()
+    })
+    .await;
+    workers.shutdown(&mut registry).unwrap();
+    assert!(
+        !pending,
+        "the lease replaces, rather than supplements, pending ownership"
+    );
+    assert_eq!(count_before, Ok((1, 1)));
+    assert_eq!(count_after, Ok((1, 1)));
+}
+
+#[tokio::test]
+async fn registry_worker_launch_uses_configured_blob_threshold() {
+    let (mut registry, mut workers, notify, now) = owner();
+    let config: crate::config::Config =
+        toml::from_str("[sessions]\nblob_min_bytes = 64\n").unwrap();
+    let block = json!({"type":"thinking", "thinking":"x".repeat(256)});
+    let bytes = serde_json::to_vec(&block).unwrap();
+    assert!(bytes.len() > config.sessions.blob_min_bytes);
+    assert!(bytes.len() < 2048);
+    let message = json!({"type":"assistant", "message":{"role":"assistant", "content":[block]}});
+    let (mut case, mut launch, factory) = Case::prepare(
+        &mut registry,
+        1919,
+        "worker-exit-ok",
+        vec![message, event("result")],
+    );
+    launch.storage = config.sessions;
+    case.generation = workers.start(&mut registry, launch, factory).unwrap();
+    case.ready(&mut registry, &mut workers, &notify, now).await;
+    case.submit(&workers);
+    wait(&notify, || {
+        workers.poll(&mut registry, now, 1000);
+        workers.report(&case.id, case.generation).is_some()
+    })
+    .await;
+    let report = workers.report(&case.id, case.generation).unwrap();
+    assert_eq!(report.result.as_ref().unwrap().outcome, Outcome::Exited);
+    assert!(!report.authority_retained);
+    assert!(workers.entries[&case.id].thread.is_none());
+    let stream = fs::read_to_string(
+        case.fixture
+            .root
+            .path()
+            .join("sessions")
+            .join(&case.id)
+            .join(format!("{}.jsonl", case.session)),
+    )
+    .unwrap();
+    let stored = stream
+        .lines()
+        .map(|line| {
+            let envelope: Value = serde_json::from_str(line).unwrap();
+            serde_json::from_str::<Value>(envelope["raw"].as_str().unwrap()).unwrap()
+        })
+        .find(|value| value["type"] == "assistant")
+        .expect("worker persisted assistant");
+    let reference: crate::structured::blobs::BlobRef =
+        serde_json::from_value(stored["message"]["content"][0].clone())
+            .expect("configured threshold must project this block");
+    let store = crate::structured::blobs::BlobStore::open(case.fixture.root.path()).unwrap();
+    assert_eq!(reference.size, bytes.len() as u64);
+    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), block);
+}
+
+/// A new lease generation must preserve ancestry even when the operator resumes.
+#[tokio::test]
+async fn operator_resume_preserves_original_lease_lineage() {
+    let (mut registry, mut workers, notify, now) = owner();
+    let (case, mut launch, _) = Case::prepare(&mut registry, 1734, "state-reducer", vec![]);
+    record_lineage(&mut registry, &mut launch, "original-parent", 3);
+    let template = Launch {
+        opening_turn: None,
+        agent_id: case.id.clone(),
+        generation: case.generation,
+        leases: case.leases.clone(),
+        state: case.fixture.root.path().to_owned(),
+        mcp: case.fixture.mcp(),
+        storage: Default::default(),
+        stall_after: STALL,
+        admission: None,
+    };
+    let generation = workers
+        .start(&mut registry, launch, |_| {
+            Err(io::Error::other("owned first-launch failure").into())
+        })
+        .unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, now, 1000);
+        workers.report(&case.id, generation).is_some()
+            && workers
+                .entries
+                .get(&case.id)
+                .unwrap()
+                .thread
+                .as_ref()
+                .is_none_or(JoinHandle::is_finished)
+    })
+    .await;
+    let mut resume = template;
+    resume.generation = generation;
+    let leases = case.leases.clone();
+    let (seen, observed) = mpsc::channel();
+    let generation = workers
+        .start(&mut registry, resume, move |_| {
+            seen.send(leases.admitted_identities().unwrap()).unwrap();
+            Err(io::Error::other("owned resumed-launch failure").into())
+        })
+        .unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, now, 1000);
+        workers.report(&case.id, generation).is_some()
+    })
+    .await;
+    let identities = observed.recv_timeout(LIMIT).unwrap();
+    assert_eq!(
+        identities.get(&case.id),
+        Some(&Some("original-parent".into()))
+    );
 }

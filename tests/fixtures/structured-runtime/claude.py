@@ -53,9 +53,11 @@ assert json.loads(settings.read_text()) == {"permissions": {"defaultMode": "defa
 registration = json.loads(mcp.read_text())
 assert set(registration["mcpServers"]) == {"flock"}, "missing session flock MCP"
 server = registration["mcpServers"]["flock"]
-assert server["type"] == "stdio" and server["args"] == ["mcp", "serve"]
+assert server["type"] == "stdio" and server["args"] == ["mcp", "serve", "--structured"]
 assert pathlib.Path(server["command"]).is_absolute(), "unpinned MCP executable"
-assert set(server["env"]) == {"FLOCK_SOCKET_PATH"}, "credential or identity in MCP env"
+assert set(server["env"]) == {"FLOCK_SOCKET_PATH", "FLOCK_MCP_LEASE_CREDENTIAL"}, "MCP env shape"
+assert "FLOCK_MCP_LEASE_CREDENTIAL" not in os.environ, "credential in Claude launch env"
+assert len(server["env"]["FLOCK_MCP_LEASE_CREDENTIAL"]) == 44, "lease credential shape"
 assert "fixture-token-not-a-credential" not in mcp.read_text(), "token in MCP JSON"
 (root / "observed-mcp.json").write_text(json.dumps(registration))
 assert stat.S_IMODE(settings.stat().st_mode) == 0o600
