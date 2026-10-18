@@ -30,7 +30,7 @@ pub const RETAINED_DEAD_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 6
 pub const RETAINED_DEAD_MAX: usize = 256;
 
 /// Retained data never supplies runtime or operator authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetainedKind {
     /// Any unusable object other than an exact duplicate; never auto-prune across versions.
@@ -39,7 +39,7 @@ pub enum RetainedKind {
     Dead,
 }
 /// Retained-record metadata, without exposing the preserved payload.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedInfo {
     /// Position in the serialized structured_agents array.
     pub slot: usize,
@@ -91,6 +91,41 @@ pub enum RegistryError {
     StaleGeneration,
     /// The generation counter cannot allocate another launch safely.
     GenerationExhausted,
+}
+
+/// Stable retained-record warning `cause` values (ADR-0028 §3a lenient load).
+/// These codes describe why an entry is inactive, independently of its
+/// DEAD/FORWARD class and human-readable detail. Keep their spelling stable.
+mod retained_causes {
+    /// `invalid_record`: a decoded record fails identity, name or harness validation.
+    pub(super) const INVALID_RECORD: &str = "invalid_record";
+    /// `unsupported_collection_shape`: structured_agents has a non-array layout.
+    pub(super) const UNSUPPORTED_COLLECTION_SHAPE: &str = "unsupported_collection_shape";
+    /// `conflict`: identity, name or session conflicts with an existing reservation.
+    pub(super) const CONFLICT: &str = "conflict";
+    /// `stale_generation`: no entry exists or its launch generation differs.
+    pub(super) const STALE_GENERATION: &str = "stale_generation";
+    /// `generation_exhausted`: another launch generation cannot be allocated safely.
+    pub(super) const GENERATION_EXHAUSTED: &str = "generation_exhausted";
+    /// `non_object`: the retained JSON element is not an object.
+    pub(super) const NON_OBJECT: &str = "non_object";
+    /// `exact_duplicate`: an object canonically equals an earlier array element.
+    pub(super) const EXACT_DUPLICATE: &str = "exact_duplicate";
+    /// `unsupported_shape`: an object cannot be decoded as a supported record.
+    pub(super) const UNSUPPORTED_SHAPE: &str = "unsupported_shape";
+}
+
+impl RegistryError {
+    /// Stable diagnostic cause, independent of human-readable error wording.
+    fn retained_cause(&self) -> &'static str {
+        match self {
+            Self::InvalidRecord => retained_causes::INVALID_RECORD,
+            Self::UnsupportedCollectionShape => retained_causes::UNSUPPORTED_COLLECTION_SHAPE,
+            Self::Conflict => retained_causes::CONFLICT,
+            Self::StaleGeneration => retained_causes::STALE_GENERATION,
+            Self::GenerationExhausted => retained_causes::GENERATION_EXHAUSTED,
+        }
+    }
 }
 
 impl std::fmt::Display for RegistryError {
@@ -416,21 +451,28 @@ impl<'de> Deserialize<'de> for Registry {
         for (index, raw) in records.into_iter().enumerate() {
             let duplicate = !seen.insert(retention::digest(&raw));
             let dead = !raw.is_object() || duplicate;
-            let reason = if dead {
-                "non_object_or_exact_duplicate"
+            let mut detail = String::new();
+            let cause = if !raw.is_object() {
+                retained_causes::NON_OBJECT
+            } else if duplicate {
+                retained_causes::EXACT_DUPLICATE
             } else {
                 match serde_json::from_value::<Record>(raw.clone()) {
                     Ok(record) => match registry.register_raw(record, raw.clone()) {
                         Ok(_) => continue,
-                        Err(RegistryError::Conflict) => "duplicate",
-                        Err(_) => "invalid_record",
+                        Err(error) => {
+                            detail = error.to_string();
+                            error.retained_cause()
+                        }
                     },
-                    Err(_) => "unsupported_shape",
+                    Err(_) => retained_causes::UNSUPPORTED_SHAPE,
                 }
             };
             tracing::warn!(
                 index,
-                reason,
+                class = if dead { "DEAD" } else { "FORWARD" },
+                cause,
+                detail = detail.as_str(),
                 "structured record skipped; raw data retained inactive"
             );
             registry

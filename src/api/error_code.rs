@@ -135,6 +135,7 @@ error_codes! {
         NoCallerPane = "no_caller_pane",
         NoCheckout = "no_checkout",
         NotAnEdge = "not_an_edge",
+        NotAuthorized = "not_authorized",
         NotFound = "not_found",
         NotFromAPane = "not_from_a_pane",
         NotGitWorktree = "not_git_worktree",
@@ -142,20 +143,19 @@ error_codes! {
         NotImplemented = "not_implemented",
         NotLinkedWorktree = "not_linked_worktree",
         OperatorOnly = "operator_only",
-        NotAuthorized = "not_authorized",
-        PermissionGrantLimit = "permission_grant_limit",
-        PermissionInputAlreadyHeld = "permission_input_already_held",
-        PermissionRequestTooLarge = "permission_request_too_large",
-        PermissionRequestUnknown = "permission_request_unknown",
-        PermissionRequestClosed = "permission_request_closed",
-        // Retained for compatibility with runtimes predating session grants.
-        PermissionDecisionUnsupported = "permission_decision_unsupported",
         OriginMismatch = "origin_mismatch",
         OwnerPolicyChanged = "owner_policy_changed",
         OwnerPolicyUnreadable = "owner_policy_unreadable",
         PaneGone = "pane_gone",
         PaneNotFound = "pane_not_found",
         Parked = "parked",
+        // Retained for compatibility with runtimes predating session grants.
+        PermissionDecisionUnsupported = "permission_decision_unsupported",
+        PermissionGrantLimit = "permission_grant_limit",
+        PermissionInputAlreadyHeld = "permission_input_already_held",
+        PermissionRequestClosed = "permission_request_closed",
+        PermissionRequestTooLarge = "permission_request_too_large",
+        PermissionRequestUnknown = "permission_request_unknown",
         PromptControlBytes = "prompt_control_bytes",
         PromptEmpty = "prompt_empty",
         PromptTooLong = "prompt_too_long",
@@ -166,6 +166,7 @@ error_codes! {
         ReplyUnavailable = "reply_unavailable",
         RestartDisabled = "restart_disabled",
         RestartUnsupported = "restart_unsupported",
+        RetainedCollectionShape = "retained_collection_shape",
         SelfCompactInstructionsUnsupported = "self_compact_instructions_unsupported",
         SelfCompactUnavailable = "self_compact_unavailable",
         SelfKillUnconfirmed = "self_kill_unconfirmed",
@@ -227,8 +228,6 @@ error_codes! {
     Yes:
         Timeout = "timeout";
     Later:
-        SessionBusy = "session_busy",
-        InputWriteCancelled = "input_write_cancelled",
         AgentNotReady = "agent_not_ready",
         AtAgentCapacity = "at_agent_capacity",
         AtFanoutLimit = "at_fanout_limit",
@@ -237,6 +236,7 @@ error_codes! {
         HandoffUndrained = "handoff_undrained",
         InjectionPending = "injection_pending",
         InputNotEmpty = "input_not_empty",
+        InputWriteCancelled = "input_write_cancelled",
         MailStoreFull = "mail_store_full",
         MailboxFull = "mailbox_full",
         MeshNotEnrolled = "mesh_not_enrolled",
@@ -247,28 +247,29 @@ error_codes! {
         RestartBusy = "restart_busy",
         RestartPending = "restart_pending",
         RestartRateLimited = "restart_rate_limited",
+        SessionBusy = "session_busy",
         SessionUnconfirmed = "session_unconfirmed",
         TooManyWaits = "too_many_waits",
         UnknownComposer = "unknown_composer",
         WorktreeMergeUnknown = "worktree_merge_unknown",
         WorktreeOpenPr = "worktree_open_pr";
     AfterInspecting:
-        InputWriteFailed = "input_write_failed",
-        InputWriteUnknown = "input_write_unknown",
         AgentExitedAtStart = "agent_exited_at_start",
         AgentExitedBeforeReady = "agent_exited_before_ready",
+        InputWriteFailed = "input_write_failed",
+        InputWriteUnknown = "input_write_unknown",
         NoResult = "no_result",
         SelfSubmitUnconfirmed = "self_submit_unconfirmed",
         SessionMismatch = "session_mismatch";
     AfterHuman:
-        StructuredWorkerPanicked = "structured_worker_panicked",
-        StructuredWorkerTimeout = "structured_worker_timeout",
-        StructuredWorkerCleanupFailed = "structured_worker_cleanup_failed",
         ClaudeFolderTrust = "claude_folder_trust",
         CodexFolderTrust = "codex_folder_trust",
         CodexHookReview = "codex_hook_review",
         StructuredHarnessVersionUnsupported = "structured_harness_version_unsupported",
-        StructuredNeedsAgentUser = "structured_needs_agent_user";
+        StructuredNeedsAgentUser = "structured_needs_agent_user",
+        StructuredWorkerCleanupFailed = "structured_worker_cleanup_failed",
+        StructuredWorkerPanicked = "structured_worker_panicked",
+        StructuredWorkerTimeout = "structured_worker_timeout";
     AfterHandoff:
         MailStoreSchemaTooNew = "mail_store_schema_too_new",
         MeshVersionMismatch = "mesh_version_mismatch",
@@ -279,6 +280,15 @@ error_codes! {
 #[cfg(test)]
 mod tests {
     use super::ErrorCode;
+
+    #[test]
+    fn retained_error_registry_lists_each_retry_class_alphabetically() {
+        for pair in ErrorCode::ALL.windows(2) {
+            if pair[0].retry() == pair[1].retry() {
+                assert!(pair[0].as_str() < pair[1].as_str(), "{pair:?}");
+            }
+        }
+    }
 
     #[test]
     fn parked_restart_requires_a_different_call_and_has_a_usage_exit() {
@@ -321,7 +331,7 @@ mod tests {
             })
             .collect();
         let expected: Vec<(&str, String)> = [
-            ("never", "agent_here_unavailable agent_name_taken agent_no_active_workspace agent_not_found agent_placement_conflict agent_placement_not_found agent_placement_required agent_profile_unresolved agent_spawn_disabled agent_target_ambiguous already_hibernated ambiguous_worktree_branch at_lineage_depth channel_not_owner channel_unauthorized check_not_found cursor_ahead dirty_worktree_requires_force goal_already_armed goal_caller_refused goal_not_armed goal_not_paused handoff_not_found handoff_too_large hibernate_unsupported hop_budget_exhausted identity_pin_conflict identity_unknown invalid_agent invalid_agent_argv invalid_agent_name invalid_custody_state invalid_envelope invalid_header_field invalid_key invalid_metadata_request invalid_params invalid_regex invalid_request invalid_session_name invalid_signature invalid_state_label lineage_not_found linked_worktree_source loop_detected mesh_collection_refused mesh_refused message_expired message_key_conflict message_not_found msg_not_allowed msg_target_ambiguous msg_target_not_found no_agent_session no_branch no_caller_pane no_checkout not_an_edge not_authorized not_found not_from_a_pane not_git_worktree not_hibernated not_implemented not_linked_worktree operator_only origin_mismatch owner_policy_changed owner_policy_unreadable pane_gone pane_not_found parked permission_decision_unsupported permission_grant_limit permission_input_already_held permission_request_closed permission_request_too_large permission_request_unknown prompt_control_bytes prompt_empty prompt_too_long questions_widening_refused recipient_gone relay_not_from_ssh relay_unattestable reply_unavailable restart_disabled restart_unsupported self_compact_instructions_unsupported self_compact_unavailable self_kill_unconfirmed self_message_forbidden sender_unresolved spawn_caller_unknown stash_empty structured_mcp_lease_required submodule_worktree_requires_force tab_not_found target_pane_not_found too_many_header_fields transcript_not_found unknown_agent_kind unsafe_text unsupported_for_agent unsupported_in_app_mode wait_deadline_too_long wait_predicate_invalid wait_predicate_unsupported workspace_not_found worktree_not_found"),
+            ("never", "agent_here_unavailable agent_name_taken agent_no_active_workspace agent_not_found agent_placement_conflict agent_placement_not_found agent_placement_required agent_profile_unresolved agent_spawn_disabled agent_target_ambiguous already_hibernated ambiguous_worktree_branch at_lineage_depth channel_not_owner channel_unauthorized check_not_found cursor_ahead dirty_worktree_requires_force goal_already_armed goal_caller_refused goal_not_armed goal_not_paused handoff_not_found handoff_too_large hibernate_unsupported hop_budget_exhausted identity_pin_conflict identity_unknown invalid_agent invalid_agent_argv invalid_agent_name invalid_custody_state invalid_envelope invalid_header_field invalid_key invalid_metadata_request invalid_params invalid_regex invalid_request invalid_session_name invalid_signature invalid_state_label lineage_not_found linked_worktree_source loop_detected mesh_collection_refused mesh_refused message_expired message_key_conflict message_not_found msg_not_allowed msg_target_ambiguous msg_target_not_found no_agent_session no_branch no_caller_pane no_checkout not_an_edge not_authorized not_found not_from_a_pane not_git_worktree not_hibernated not_implemented not_linked_worktree operator_only origin_mismatch owner_policy_changed owner_policy_unreadable pane_gone pane_not_found parked permission_decision_unsupported permission_grant_limit permission_input_already_held permission_request_closed permission_request_too_large permission_request_unknown prompt_control_bytes prompt_empty prompt_too_long questions_widening_refused recipient_gone relay_not_from_ssh relay_unattestable reply_unavailable restart_disabled restart_unsupported retained_collection_shape self_compact_instructions_unsupported self_compact_unavailable self_kill_unconfirmed self_message_forbidden sender_unresolved spawn_caller_unknown stash_empty structured_mcp_lease_required submodule_worktree_requires_force tab_not_found target_pane_not_found too_many_header_fields transcript_not_found unknown_agent_kind unsafe_text unsupported_for_agent unsupported_in_app_mode wait_deadline_too_long wait_predicate_invalid wait_predicate_unsupported workspace_not_found worktree_not_found"),
 
             ("maybe", "agent_fork_failed agent_start_failed checkout_prepare_failed delegate_unreachable digest_write_failed handoff_failed handoff_unreadable integration_install_failed integration_uninstall_failed internal_error mail_store_unavailable mesh_delivery_refused mesh_store_unavailable pane_move_failed pane_send_failed pane_split_failed pause_persist_failed serialization_error server_unavailable session_broken session_delete_failed session_stop_failed spawn_failed spawn_location_unresolved tab_close_failed tab_create_failed transcript_unreadable transport workspace_create_failed worktree_create_failed worktree_list_failed worktree_open_failed worktree_prune_failed worktree_remove_failed write_failed"),
             ("yes", "timeout"),

@@ -417,6 +417,65 @@ fn anchored_open_rejects_symlink_components_and_parent_traversal() {
 }
 
 #[test]
+fn open_descriptor_metadata_failure_is_distinct_from_path_failure() {
+    let f = Fixture::new();
+    let mut binding = Binding::new(owner("pane"));
+    let key = begin(&mut binding);
+    let launch = launch(&key, &f.home, f.writer);
+    let missing = f.home.join("sessions/missing.jsonl");
+    let outside = f.root.join("outside.jsonl");
+    std::fs::copy(&f.path, &outside).unwrap();
+    for path in [&missing, &outside] {
+        assert_eq!(
+            validate_with_link_count(
+                &key,
+                &launch,
+                Some(path),
+                &[f.writer],
+                &compatibility(),
+                4096,
+                |_| panic!("path refusal must happen before descriptor metadata query"),
+            )
+            .unwrap_err(),
+            Failure::Path
+        );
+    }
+    let queried = std::cell::Cell::new(false);
+    let result = validate_with_link_count(
+        &key,
+        &launch,
+        Some(&f.path),
+        &[f.writer],
+        &compatibility(),
+        4096,
+        |file| {
+            assert!(
+                file.metadata().unwrap().is_file(),
+                "query receives an opened regular file"
+            );
+            queried.set(true);
+            Err(std::io::Error::other(
+                "injected descriptor metadata failure",
+            ))
+        },
+    );
+    assert!(
+        queried.get(),
+        "the real validation path must reach the descriptor query"
+    );
+    assert_eq!(result.as_ref().unwrap_err(), &Failure::Metadata);
+    let mut owners = Ownership::default();
+    assert_eq!(
+        binding.finish(&key, result, &mut owners).unwrap_err(),
+        Failure::Metadata
+    );
+    assert_eq!(
+        binding.decision(&owners),
+        Decision::BindingValidationFailed(Failure::Metadata)
+    );
+}
+
+#[test]
 fn hard_linked_transcripts_inside_and_outside_launch_home_are_refused() {
     for outside_home in [false, true] {
         let f = Fixture::new();
