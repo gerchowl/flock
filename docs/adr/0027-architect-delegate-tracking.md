@@ -184,7 +184,12 @@ Readiness consumes the lock diagnosis in `agent.get`'s existing
 `blocked_reason`, without another screen RPC. A lock reason requires
 `agent_status: blocked`; the server caches the live diagnosis per terminal
 content revision and projects that status with its reason, even before the
-asynchronous detector publishes the transition. PTY writes, resize and mode
+asynchronous detector publishes the transition. `pane.get` / `pane.list` and
+agent reads use the same live status derivation. Internal lock evidence is
+`Locked`, `Unlocked`, or `Unavailable(reason)`. A poisoned terminal-core mutex
+or snapshot failure yields `Unknown`, with its typed reason logged once per
+terminal, and no lock reason. It never fails a list request or proves an unlock.
+PTY writes, resize and mode
 changes invalidate the cache; user viewport scrolling does not. Offline and
 hibernated lifecycle states still outrank a lock diagnosis. Other reasons retain their
 existing semantics: `resume_failed` can describe an offline identity. A plain

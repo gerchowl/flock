@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -104,10 +105,35 @@ pub(crate) struct ProcessBytesResult {
     pub terminal_responses: Vec<Bytes>,
 }
 
+/// Live lock evidence, including a failure to obtain a trustworthy snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexLockState {
+    Locked,
+    Unlocked,
+    Unavailable(DetectionUnavailable),
+}
+
+/// Internal detection failures project to Unknown, never an unlocked screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetectionUnavailable {
+    CorePoisoned,
+    Snapshot(crate::ghostty::Error),
+}
+
+impl DetectionUnavailable {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CorePoisoned => "core_poisoned",
+            Self::Snapshot(_) => "snapshot_failed",
+        }
+    }
+}
+
 pub(crate) struct GhosttyPaneTerminal {
     pub core: Mutex<GhosttyPaneCore>,
     key_encoder: Mutex<crate::ghostty::KeyEncoder>,
     pending_pty_responses: Arc<Mutex<Vec<Bytes>>>,
+    detection_unavailable_logged: AtomicBool,
 }
 
 pub(crate) struct GhosttyPaneCore {
@@ -193,7 +219,7 @@ impl PaneTerminal {
     }
 
     /// Reuse the lock diagnosis until content, geometry or terminal mode changes.
-    pub(crate) fn codex_conversation_locked(&self) -> bool {
+    pub(crate) fn codex_conversation_locked(&self) -> CodexLockState {
         self.ghostty.codex_conversation_locked()
     }
 
@@ -375,6 +401,7 @@ impl GhosttyPaneTerminal {
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
+            detection_unavailable_logged: AtomicBool::new(false),
         })
     }
 
@@ -1012,20 +1039,44 @@ impl GhosttyPaneTerminal {
             .unwrap_or_default()
     }
 
-    fn codex_conversation_locked(&self) -> bool {
+    fn codex_conversation_locked(&self) -> CodexLockState {
         let Ok(mut core) = self.core.lock() else {
-            return false;
+            return self.detection_unavailable(DetectionUnavailable::CorePoisoned);
         };
         let revision = core.terminal.detection_revision();
-        if let Some((cached_revision, locked)) = core.codex_lock_cache {
-            if revision == cached_revision {
-                return locked;
+        let locked = match core.codex_lock_cache {
+            Some((cached_revision, locked)) if revision == cached_revision => locked,
+            _ => {
+                let text = match ghostty_detection_text(&core) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        return self.detection_unavailable(DetectionUnavailable::Snapshot(error));
+                    }
+                };
+                let locked = crate::detect::codex_conversation_locked(&text);
+                core.codex_lock_cache = Some((revision, locked));
+                locked
             }
+        };
+        if locked {
+            CodexLockState::Locked
+        } else {
+            CodexLockState::Unlocked
         }
-        let locked = ghostty_detection_text(&core)
-            .is_ok_and(|text| crate::detect::codex_conversation_locked(&text));
-        core.codex_lock_cache = Some((revision, locked));
-        locked
+    }
+
+    fn detection_unavailable(&self, reason: DetectionUnavailable) -> CodexLockState {
+        if !self
+            .detection_unavailable_logged
+            .swap(true, Ordering::Relaxed)
+        {
+            error!(
+                event = "pane.detection.unavailable",
+                reason = reason.label(),
+                "Live lock detection unavailable"
+            );
+        }
+        CodexLockState::Unavailable(reason)
     }
 
     pub fn detection_text(&self) -> String {
@@ -2180,6 +2231,53 @@ mod tests {
     use super::*;
     use ratatui::{layout::Rect, style::Color};
     use tokio::sync::mpsc;
+
+    #[derive(Clone, Default)]
+    struct DetectionLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DetectionLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn codex_lock_poison_is_typed_and_logged_once() {
+        let (tx, _rx) = mpsc::channel(4);
+        let pane = GhosttyPaneTerminal::new(crate::ghostty::Terminal::new(80, 24, 0).unwrap(), tx)
+            .unwrap();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _core = pane.core.lock().unwrap();
+            panic!("fixture poisons terminal core");
+        }));
+        assert!(poisoned.is_err());
+        let capture = DetectionLog::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..3 {
+                assert_eq!(
+                    pane.codex_conversation_locked(),
+                    CodexLockState::Unavailable(DetectionUnavailable::CorePoisoned)
+                );
+            }
+        });
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("pane.detection.unavailable").count(),
+            1,
+            "{log}"
+        );
+        assert!(log.contains("core_poisoned"), "{log}");
+    }
 
     fn write_numbered_lines(terminal: &mut crate::ghostty::Terminal, count: usize) {
         for i in 0..count {

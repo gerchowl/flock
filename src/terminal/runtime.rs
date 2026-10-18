@@ -303,7 +303,7 @@ impl TerminalRuntime {
     }
 
     /// Lock diagnosis cached against the terminal content revision.
-    pub(crate) fn codex_conversation_locked(&self) -> bool {
+    pub(crate) fn codex_conversation_locked(&self) -> crate::pane::CodexLockState {
         self.0.codex_conversation_locked()
     }
 
@@ -524,6 +524,10 @@ impl TerminalRuntime {
 
 #[cfg(test)]
 impl TerminalRuntime {
+    pub(crate) fn test_poison_detection_core(&self) {
+        self.0.test_poison_detection_core();
+    }
+
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
         let (runtime, rx) = crate::pane::PaneRuntime::test_with_channel(cols, rows);
         (Self(runtime), rx)

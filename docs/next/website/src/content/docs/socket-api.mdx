@@ -1016,7 +1016,13 @@ blocked wait instead of naming the dialog through a separate screen request.
 `agent.get` and `agent.list` carry `blocked_reason: codex_conversation_locked`
 only with `agent_status: blocked`. The live lock diagnosis is cached per
 terminal content revision and projects blocked status with the reason even
-before the asynchronous detector publishes it. PTY writes, resize and mode
+before the asynchronous detector publishes it. `pane.get` and `pane.list` use
+the same status derivation, so they also report `agent_status: blocked` for a
+live lock. If the terminal-core mutex is poisoned or a snapshot fails, these
+reads report `agent_status: unknown` without a lock reason. The server logs the
+internal typed detection reason once per terminal; it does not refuse the
+request or interpret unavailable evidence as an unlocked screen.
+PTY writes, resize and mode
 changes invalidate the cache; user viewport scrolling does not. `resume_failed` remains an offline reason and
 does not require blocked status. A live lock footer truncated exactly after
 `r retry f fork` is accepted; subsequent composer or transcript text is not.

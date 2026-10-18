@@ -31,8 +31,8 @@ mod state;
 mod terminal;
 mod xtgettcap;
 
+pub(crate) use self::terminal::{CodexLockState, TerminalDirtyPatch, TerminalDirtyPatchOutcome};
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
-pub(crate) use self::terminal::{TerminalDirtyPatch, TerminalDirtyPatchOutcome};
 pub use self::{
     state::{CompletionPending, PaneState},
     terminal::{InputState, ScrollMetrics, TerminalCursorState},
@@ -2316,6 +2316,16 @@ impl PaneRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_poison_detection_core(&self) {
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _core = self.terminal.ghostty.core.lock().unwrap();
+            panic!("fixture poisons terminal core");
+        }));
+        assert!(failed.is_err());
+        assert!(self.terminal.ghostty.core.is_poisoned());
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_detection_text_reads() -> usize {
         DETECTION_TEXT_READS.with(Cell::get)
     }
@@ -2329,7 +2339,7 @@ impl PaneRuntime {
     }
 
     /// Lock diagnosis cached against the terminal content revision.
-    pub(crate) fn codex_conversation_locked(&self) -> bool {
+    pub(crate) fn codex_conversation_locked(&self) -> CodexLockState {
         let locked = self.terminal.codex_conversation_locked();
         self.observe_codex_lock(|| locked);
         locked
@@ -2337,16 +2347,16 @@ impl PaneRuntime {
 
     pub fn detection_text(&self) -> String {
         let text = self.terminal.detection_text();
-        self.observe_codex_lock(|| crate::detect::codex_conversation_locked(&text));
+        self.observe_codex_lock(|| self.terminal.codex_conversation_locked());
         text
     }
 
-    fn observe_codex_lock(&self, locked: impl FnOnce() -> bool) {
+    fn observe_codex_lock(&self, locked: impl FnOnce() -> CodexLockState) {
         let mut pending = self.codex_lock_pending.borrow_mut();
         if let Some(write) = pending.as_ref() {
             // Retire an expired write before judging an unlocked repaint.
             let _ = write.receipt.progress();
-            if write.receipt.finished_at().is_some() && !locked() {
+            if write.receipt.finished_at().is_some() && locked() == CodexLockState::Unlocked {
                 pending.take();
             }
         }
@@ -2915,6 +2925,32 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn codex_lock_unavailable_does_not_prove_unlock() {
+        let (runtime, mut bytes) = PaneRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(
+            include_str!("../tests/fixtures/codex/conversation-locked.txt")
+                .replace('\n', "\r\n")
+                .as_bytes(),
+        );
+        let now = std::time::Instant::now();
+        runtime
+            .try_resolve_codex_lock_at(
+                Bytes::from_static(b"r"),
+                now + std::time::Duration::from_secs(10),
+                now,
+            )
+            .unwrap();
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"r");
+        runtime.test_poison_detection_core();
+        assert!(matches!(
+            runtime.codex_conversation_locked(),
+            CodexLockState::Unavailable(_)
+        ));
+        runtime.detection_text();
+        assert!(runtime.codex_lock_pending.borrow().is_some());
+    }
+
+    #[tokio::test]
     async fn codex_lock_flicker_does_not_release_pending_write() {
         let (runtime, mut bytes) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
         let locked =
@@ -2945,7 +2981,10 @@ mod tests {
         assert!(bytes.try_recv().is_err());
         first.retire(crate::pty::write_receipt::WriteFailure::Deadline);
         runtime.test_process_pty_bytes(b"\x1b[2J\x1b[H> unlocked");
-        assert!(!runtime.codex_conversation_locked());
+        assert_eq!(
+            runtime.codex_conversation_locked(),
+            CodexLockState::Unlocked
+        );
         assert!(runtime.codex_lock_pending.borrow().is_none());
     }
 
