@@ -402,7 +402,7 @@ async fn recovery_parked_requests_preserve_original_peer_birth() {
 }
 
 #[tokio::test]
-async fn unreadable_peer_birth_with_no_leases_preserves_operator_behavior() {
+async fn unreadable_peer_birth_with_no_leases_refuses_operator_authority() {
     let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(
         &Config::default(),
@@ -413,7 +413,7 @@ async fn unreadable_peer_birth_with_no_leases_preserves_operator_behavior() {
     );
     app.current_api_peer_pid = Some(std::process::id());
     app.current_api_peer_birth = Some(None);
-    assert!(app.caller_is_local_operator());
+    assert!(!app.caller_is_local_operator());
 }
 
 #[tokio::test]
