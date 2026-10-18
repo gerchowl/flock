@@ -1175,15 +1175,22 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   `/`, `#` or quotes before the final `@` must not expose a password prefix.
   Without escaping, userinfo and path text containing `@` are ambiguous; the
   conservative rule can hide preceding host/path text in logs. Quoted URL
-  wrappers are retained when the URL tail has no such ambiguity.
+  wrappers are retained when the URL tail has no such ambiguity. Whitespace
+  and angle brackets (`<`, `>`) terminate URL tokens: malformed userinfo with
+  these characters can leave a password prefix visible. This backstop cannot
+  replace keeping credentials in stdin or the environment.
   Query/fragment names containing a full credential label (shared with the
   report scrubber), or `code`, `key` or `signature`, have their values masked
   even when the label is mid-name, such as `api_key_v2` or `token_type`.
-  This intentionally treats those names as sensitive; the short `sig` alias
+  This intentionally also masks false positives such as `keyboard`, `monkey`,
+  `unicode` and `sessionid`; the short `sig` alias
   matches only the complete name, preserving ordinary `design` parameters.
-  Credential-header labels allow horizontal whitespace before `:` but require
-  whitespace or end-of-string after it, preserving non-header refspecs and
-  terminal targets such as `deploy-token:main` and `mysession:0`.
+  Recognized credential headers (including `Authorization`, `Cookie`,
+  `Proxy-Authorization`, `Set-Cookie` and the `X-` credential-header family)
+  allow horizontal whitespace before `:` and mask values even without space
+  after it. Other prefixed credential labels require whitespace or end-of-string
+  after `:`, preserving refspecs and terminal targets such as `deploy-token:main`
+  and `mysession:0`.
   These rules shape diagnostic logs only; executed argv is never rewritten.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location

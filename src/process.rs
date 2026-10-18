@@ -572,13 +572,19 @@ fn redact_arg(arg: &str) -> String {
     let arg = urls.as_str();
     static HEADER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let header = HEADER.get_or_init(|| {
+        // HTTP allows compact values for recognized credential headers. Generic
+        // prefixed labels need spacing to distinguish refspecs and pane targets.
+        let label = crate::report::redact::secret_label_pattern("");
         regex::Regex::new(&format!(
-            r"(?i)({}[ \t]*:)(?:\s|$)",
+            r"(?i)(?:^|[^\w-])(?:((?:{label}|proxy-authorization|set-cookie|x-[\w-]*{label})[ \t]*:)|({}[ \t]*:)(?:\s|$))",
             crate::report::redact::secret_label_pattern(r"[\w-]*")
         ))
         .expect("static secret header pattern")
     });
-    if let Some(found) = header.captures(arg).and_then(|captures| captures.get(1)) {
+    if let Some(found) = header
+        .captures(arg)
+        .and_then(|captures| captures.get(1).or_else(|| captures.get(2)))
+    {
         let rest = &arg[found.end()..];
         const AUTH_SCHEMES: [&str; 5] = ["bearer", "basic", "digest", "negotiate", "token"];
         let first = rest
@@ -601,6 +607,8 @@ fn redact_arg(arg: &str) -> String {
 /// Full secret labels match anywhere in parameter names; short `sig` stays exact
 /// so ordinary `design` is retained. Literal `@` in userinfo or a path is ambiguous:
 /// conservatively masking through the last one can hide preceding host/path text.
+/// Whitespace and angle brackets terminate URL tokens. Malformed userinfo with
+/// these characters can remain visible; secrets must travel through stdin or env.
 fn redact_url_credentials(arg: &str) -> String {
     use regex::Regex;
     use std::sync::OnceLock;
@@ -1243,6 +1251,60 @@ mod tests {
             String::from_utf8(output.stdout).unwrap(),
             arguments.join("\n") + "\n"
         );
+    }
+
+    #[test]
+    fn compact_recognized_headers_mask_values_without_colon_whitespace() {
+        let secret = ["fixture", "compact", "credential"].join("-");
+        for name in [
+            "Authorization",
+            "Proxy-Authorization",
+            "Cookie",
+            "Set-Cookie",
+            "X-Api-Key",
+            "X-Auth-Token",
+            "X-Credentials",
+            "X-Session",
+            "Api-Key",
+            "Token",
+        ] {
+            let value = if name.ends_with("Authorization") {
+                format!("Bearer {secret}")
+            } else if name.ends_with("Cookie") {
+                format!("sid={secret}")
+            } else {
+                secret.clone()
+            };
+            for prefix in ["", "http.extraheader="] {
+                let argument = format!("{prefix}{name}:{value}");
+                let logs = logged_fixture_args(&["-H".into(), argument, "ordinary".into()]);
+                assert!(!logs.contains(&secret), "{name}: {logs}");
+                assert!(logs.contains(&format!("{prefix}{name}:")), "{logs}");
+                assert!(logs.contains("<redacted> ordinary"), "{logs}");
+            }
+        }
+    }
+
+    #[test]
+    fn prefixed_credential_labels_without_header_spacing_stay_visible() {
+        for argument in [
+            "deploy-token:main",
+            "mysession:0",
+            "custom-cookie:main",
+            "customauthorization:main",
+            "prefix-X-Api-Key:main",
+        ] {
+            assert_eq!(redact_arg(argument), argument);
+        }
+    }
+
+    #[test]
+    fn malformed_userinfo_token_boundaries_are_a_documented_limit() {
+        let prefix = ["fixture", "boundary", "prefix"].join("-");
+        for boundary in ['<', '>', ' ', '\t', '\n'] {
+            let argument = format!("https://fixture-user:{prefix}{boundary}tail@example.com/repo");
+            assert_eq!(redact_arg(&argument), argument);
+        }
     }
 
     #[test]
