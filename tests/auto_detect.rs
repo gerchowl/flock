@@ -71,10 +71,11 @@ fn cleanup_spawned_flock(spawned: SpawnedFlock, base: PathBuf) {
     cleanup_test_base(&base);
 }
 
-fn wait_for_socket(path: &Path, timeout: Duration) {
+fn wait_for_socket(path: &Path, timeout: Duration, client: Option<u32>) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() && UnixStream::connect(path).is_ok() {
+            support::sandboxes::record_socket(path, client);
             return;
         }
         thread::sleep(Duration::from_millis(25));
@@ -112,6 +113,7 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
 /// schedule — see the `serial-pty` group and the retries in
 /// `.config/nextest.toml`.
 fn test_lock() -> MutexGuard<'static, ()> {
+    support::sandboxes::sweep_once();
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
@@ -119,6 +121,22 @@ fn test_lock() -> MutexGuard<'static, ()> {
 }
 
 fn spawn_server(
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
+    client_socket_path: &Path,
+) -> SpawnedFlock {
+    spawn_server_from(
+        Path::new(env!("CARGO_BIN_EXE_flk")),
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        client_socket_path,
+    )
+}
+
+fn spawn_server_from(
+    binary: &Path,
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
@@ -144,7 +162,8 @@ fn spawn_server(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
+    let binary = support::sandboxes::prepare_launch(binary, runtime_dir).unwrap();
+    let mut cmd = CommandBuilder::new(binary);
     cmd.arg("server");
     for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
         cmd.env(key, value);
@@ -157,6 +176,9 @@ fn spawn_server(
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
+    if let Some(pid) = child.process_id() {
+        support::sandboxes::record_spawn(pid, config_home, runtime_dir);
+    }
     drop(pair.slave);
 
     SpawnedFlock {
@@ -170,6 +192,22 @@ fn spawn_flock_auto(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
+    client_socket_path: &Path,
+) -> SpawnedFlock {
+    spawn_flock_auto_from(
+        Path::new(env!("CARGO_BIN_EXE_flk")),
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        client_socket_path,
+    )
+}
+
+fn spawn_flock_auto_from(
+    binary: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedFlock {
     fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
@@ -192,7 +230,8 @@ fn spawn_flock_auto(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
+    let binary = support::sandboxes::prepare_launch(binary, runtime_dir).unwrap();
+    let mut cmd = CommandBuilder::new(binary);
     // No subcommand, no --no-session → auto-detect launch
     for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
         cmd.env(key, value);
@@ -310,12 +349,17 @@ fn run_cli(socket_path: &Path, args: &[&str]) -> std::process::Output {
 }
 
 fn process_exists(pid: u32) -> bool {
-    let result = unsafe { libc::kill(pid as i32, 0) };
-    if result == 0 {
-        true
-    } else {
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
+    support::process_lifetime::pid_alive(pid)
+}
+
+fn assert_durable_server_record(base: &Path, pid: u32) {
+    let record: support::sandboxes::ServerRecord = serde_json::from_slice(
+        &fs::read(base.join(format!(".server-{pid}.json"))).expect("durable server identity"),
+    )
+    .unwrap();
+    assert_eq!(record.pid, pid);
+    assert!(record.start_time.is_some());
+    assert!(record.matches(base));
 }
 
 fn read_json_line(stream: UnixStream) -> Value {
@@ -371,7 +415,11 @@ fn auto_detect_daemon_is_reaped_by_the_runtime_dir_sweep() {
     let flock = spawn_flock_auto(&config_home, &runtime_dir, &api_socket, &client_socket);
     let client_pid = flock.child.process_id().expect("client should have PID");
 
-    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &api_socket,
+        Duration::from_secs(10),
+        flock.child.process_id(),
+    );
 
     // Finding the daemon is itself the capability under test: on macOS the
     // sweep used to enumerate nothing, so nothing here could ever have reaped
@@ -402,6 +450,13 @@ fn auto_detect_daemon_is_reaped_by_the_runtime_dir_sweep() {
          test proves nothing"
     );
 
+    for pid in &daemon_pids {
+        assert_durable_server_record(&base, *pid);
+    }
+    assert!(
+        !base.join(format!(".server-{client_pid}.json")).exists(),
+        "attached client must not be recorded as a daemon"
+    );
     cleanup_spawned_flock(flock, base);
 
     // `terminate_pid` escalates SIGTERM to SIGKILL and then waits, but a
@@ -450,8 +505,16 @@ fn auto_detect_no_server_spawns_server_and_attaches() {
     let flock = spawn_flock_auto(&config_home, &runtime_dir, &api_socket, &client_socket);
 
     // Wait for both sockets to appear (server was spawned).
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &api_socket,
+        Duration::from_secs(10),
+        flock.child.process_id(),
+    );
+    wait_for_socket(
+        &client_socket,
+        Duration::from_secs(10),
+        flock.child.process_id(),
+    );
 
     // Verify the API socket responds to ping (server is running).
     let response = ping_socket(&api_socket);
@@ -487,10 +550,18 @@ fn auto_detect_server_running_attaches_directly() {
 
     // Start a server explicitly.
     let server = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    assert!(base
+        .join(format!(
+            ".server-{}.json",
+            server.child.process_id().unwrap()
+        ))
+        .is_file());
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
+    wait_for_socket(&client_socket, Duration::from_secs(10), None);
 
     let server_pid = server.child.process_id().expect("server should have PID");
+
+    assert_durable_server_record(&base, server_pid);
 
     // Verify server is running.
     assert!(process_exists(server_pid), "server should be running");
@@ -541,8 +612,16 @@ fn auto_detect_socket_path_consistency() {
     let flock = spawn_flock_auto(&config_home, &runtime_dir, &api_socket, &client_socket);
 
     // Wait for both sockets to appear at the custom paths.
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &api_socket,
+        Duration::from_secs(10),
+        flock.child.process_id(),
+    );
+    wait_for_socket(
+        &client_socket,
+        Duration::from_secs(10),
+        flock.child.process_id(),
+    );
 
     // Verify sockets exist at the specified paths.
     assert!(
@@ -584,7 +663,7 @@ fn no_session_flag_runs_monolithically() {
     let flock = spawn_flock_no_session(&config_home, &runtime_dir, &api_socket);
 
     // Wait for the API socket (monolithic mode creates it).
-    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
 
     // Verify the API socket exists and responds.
     let response = ping_socket(&api_socket);
@@ -657,8 +736,8 @@ fn cli_subcommands_work_through_server() {
 
     // Start a server.
     let server = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
+    wait_for_socket(&client_socket, Duration::from_secs(10), None);
 
     // Test `flock workspace list` through the server's API socket.
     let output = run_cli(&api_socket, &["workspace", "list"]);
@@ -703,8 +782,16 @@ fn auto_detect_server_persists_and_reattaches() {
 
     // Run `flock` — auto-detect spawns server + attaches client.
     let mut client1 = spawn_flock_auto(&config_home, &runtime_dir, &api_socket, &client_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(
+        &api_socket,
+        Duration::from_secs(10),
+        client1.child.process_id(),
+    );
+    wait_for_socket(
+        &client_socket,
+        Duration::from_secs(10),
+        client1.child.process_id(),
+    );
 
     // Verify API responds.
     let response = ping_socket(&api_socket);
@@ -792,7 +879,10 @@ fn auto_detect_default_socket_path_from_config_dir() {
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
+    let binary =
+        support::sandboxes::prepare_launch(Path::new(env!("CARGO_BIN_EXE_flk")), &runtime_dir)
+            .unwrap();
+    let mut cmd = CommandBuilder::new(binary);
     cmd.arg("server");
     for (key, value) in support::environment::isolated_env(&config_home, &runtime_dir) {
         cmd.env(key, value);
@@ -806,6 +896,9 @@ fn auto_detect_default_socket_path_from_config_dir() {
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
+    if let Some(pid) = child.process_id() {
+        support::sandboxes::record_spawn(pid, &config_home, &runtime_dir);
+    }
     drop(pair.slave);
     let server = SpawnedFlock {
         _master: pair.master,
@@ -813,8 +906,8 @@ fn auto_detect_default_socket_path_from_config_dir() {
     };
 
     // Wait for sockets to appear at the default config-dir paths.
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
+    wait_for_socket(&client_socket, Duration::from_secs(10), None);
 
     // Verify both sockets exist.
     assert!(api_socket.exists(), "API socket should exist in config dir");
@@ -843,8 +936,8 @@ fn auto_detect_writes_client_and_server_logs_to_separate_files() {
     let client_socket = runtime_dir.join("flock-client.sock");
 
     let spawned = spawn_flock_auto(&config_home, &runtime_dir, &api_socket, &client_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
+    wait_for_socket(&client_socket, Duration::from_secs(10), None);
 
     let app_dir_name = support::paths::app_dir_name();
     let log_dir = config_home.join(app_dir_name);
@@ -893,7 +986,7 @@ fn no_session_writes_startup_logs_to_monolith_file() {
     let api_socket = runtime_dir.join("flock.sock");
 
     let spawned = spawn_flock_no_session(&config_home, &runtime_dir, &api_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
 
     let app_dir_name = support::paths::app_dir_name();
     let log_dir = config_home.join(app_dir_name);
@@ -924,8 +1017,8 @@ fn auto_detect_respects_nested_guard_before_auto_attach() {
     let client_socket = runtime_dir.join("flock-client.sock");
 
     let server = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
-    wait_for_socket(&api_socket, Duration::from_secs(10));
-    wait_for_socket(&client_socket, Duration::from_secs(10));
+    wait_for_socket(&api_socket, Duration::from_secs(10), None);
+    wait_for_socket(&client_socket, Duration::from_secs(10), None);
 
     let baseline = read_json_line({
         let mut stream = UnixStream::connect(&api_socket).unwrap();
@@ -979,4 +1072,86 @@ fn auto_detect_respects_nested_guard_before_auto_attach() {
     );
 
     cleanup_spawned_flock(server, base);
+}
+
+#[test]
+fn direct_server_alias_records_canonical_launch_identity() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let alias = base.join("flk");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_flk"), &alias).unwrap();
+    let runtime = base.join("runtime");
+    let api = runtime.join("flock.sock");
+    let server = spawn_server_from(
+        &alias,
+        &base.join("config"),
+        &runtime,
+        &api,
+        &runtime.join("client.sock"),
+    );
+    wait_for_socket(&api, Duration::from_secs(10), None);
+    let pid = server.child.process_id().unwrap();
+    let record: support::sandboxes::ServerRecord =
+        serde_json::from_slice(&fs::read(base.join(format!(".server-{pid}.json"))).unwrap())
+            .unwrap();
+    assert_eq!(record.binary, alias.canonicalize().unwrap());
+    assert_durable_server_record(&base, pid);
+    cleanup_spawned_flock(server, base);
+}
+
+#[test]
+fn detached_daemon_alias_has_a_durable_exact_argv_record() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let alias = base.join("flk");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_flk"), &alias).unwrap();
+    let runtime = base.join("runtime");
+    let api = runtime.join("flock.sock");
+    let client = spawn_flock_auto_from(
+        &alias,
+        &base.join("config"),
+        &runtime,
+        &api,
+        &runtime.join("client.sock"),
+    );
+    wait_for_socket(&api, Duration::from_secs(10), client.child.process_id());
+    let records: Vec<_> = fs::read_dir(&base)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".server-") && name.ends_with(".json")
+        })
+        .collect();
+    assert_eq!(records.len(), 1, "exactly the detached server is recorded");
+    let record: support::sandboxes::ServerRecord =
+        serde_json::from_slice(&fs::read(records[0].path()).unwrap()).unwrap();
+    assert_ne!(Some(record.pid), client.child.process_id());
+    assert_eq!(record.binary, alias.canonicalize().unwrap());
+    assert_eq!(
+        record.argv,
+        vec![
+            record.binary.to_string_lossy().into_owned(),
+            "server".into()
+        ]
+    );
+    assert_eq!(
+        record.argv,
+        support::process_table::process_info(record.pid)
+            .unwrap()
+            .argv
+    );
+    assert_durable_server_record(&base, record.pid);
+    let mut mismatched = record.clone();
+    // Keep the record internally consistent so only the live argv rejects it.
+    mismatched.binary = base.canonicalize().unwrap().join("other/flk");
+    mismatched.argv[0] = mismatched.binary.to_string_lossy().into_owned();
+    assert!(
+        !mismatched.matches(&base),
+        "exact argv must remain required"
+    );
+    cleanup_spawned_flock(client, base);
 }
