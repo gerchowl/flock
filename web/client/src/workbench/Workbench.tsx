@@ -20,6 +20,7 @@ import { isPhone, type Mode } from "../layout/phone";
 import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
 import type { InboxCard } from "./inbox";
+import { Composer, createComposerState, type Sender } from "./Composer";
 import { Palette } from "./Palette";
 import { AgentRowButton, AgentTitle, InboxCards, Waits } from "./parts";
 import { PhoneWorkbench } from "./Phone";
@@ -31,6 +32,8 @@ export type WorkbenchProps = {
   readonly fleet: FleetSource;
   readonly transport: Transport;
   readonly inbox: readonly InboxCard[];
+  /** Sends `agent.send` through the outbox; `null` in fixture mode. */
+  readonly sender: Sender | null;
   /** The saved layout, and where to save changes. */
   readonly layout: Layout;
   readonly saveLayout: (layout: Layout) => void;
@@ -54,6 +57,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   window.addEventListener("resize", onResize);
   onCleanup(() => window.removeEventListener("resize", onResize));
   const phone = createMemo(() => isPhone(props.mode ?? "auto", width()));
+  const composer = createComposerState();
   const [rows, setRows] = createSignal<readonly AgentRow[]>([]);
   const [fleetNote, setFleetNote] = createSignal<string | null>("Loading the agent list…");
   onCleanup(
@@ -120,8 +124,15 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
                 </span>
               </header>
               <div class="focus__body">
-                <Transcript transport={props.transport} stream={`agent/${agent}`} source={props.source} />
+                <Transcript
+                  transport={props.transport}
+                  stream={`agent/${agent}`}
+                  source={props.source}
+                  onEntry={(seq, text) => composer.observe(agent, seq, text)}
+                  onCurrent={(current) => composer.current(agent, current)}
+                />
               </div>
+              <Composer agent={agent} row={focusedRow()} sender={props.sender} state={composer} />
             </>
           )}
         </Show>
@@ -145,6 +156,8 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         transport={props.transport}
         source={props.source}
         inbox={props.inbox}
+        sender={props.sender}
+        composer={composer}
       />
     </Show>
   );

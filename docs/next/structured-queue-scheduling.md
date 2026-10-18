@@ -94,3 +94,7 @@ publication is #1956, without new queue deadlines or public endpoints here.
 
 The worker machinery in #1955 is not production enforcement by itself. The
 production launch path is #1843; #1928 remains open until that path exists.
+
+The internal [queue publication provider](structured-queue-publication.md) exposes
+committed cuts without competing for the Runtime receiver. Cold recovery and
+global facts remain follow-up parts of #1956.
