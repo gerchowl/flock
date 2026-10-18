@@ -754,9 +754,10 @@ pub fn relayed_entry_from_wire(
 /// that host wins", and that drift is the defect the directory exists to stop.
 ///
 /// Legacy loop prevention uses the origin field and reported host. Known
-/// node copies are consolidated and local copies omitted by ID in AppState.
-/// Freshest-wins across sources,
-/// on the LIVE age (origin's reading plus dwell here), so a source that has
+/// proven node copies are consolidated in AppState. Claims are cached per
+/// supplying edge, so an unproven claim cannot overwrite another source.
+/// Freshest-wins within each source on the LIVE age (origin's reading plus
+/// dwell here), so a source that has
 /// gone quiet cannot keep winning against one still polling. #392: a row whose
 /// ssh_target or proxy_jump this host refuses to dial is dropped and logged,
 /// and the rest still merges.

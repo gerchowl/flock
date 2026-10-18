@@ -4075,7 +4075,7 @@ mod tests {
             std::time::Instant::now(),
             60,
         );
-        assert_eq!(spans_text(&home.name), "node-home.example");
+        assert_eq!(spans_text(&home.name), "  node-home.example");
         app.fleet_snapshot
             .as_mut()
             .unwrap()
@@ -6425,9 +6425,8 @@ mod tests {
                 Some("fix/pty"),
             )
         };
-        // Defensive hub-meets-snapshot case: "kiln" is both a live-polled
-        // config peer and a carried snapshot entry (same ssh target). The
-        // polled entry wins; the snapshot-only "atlas" still folds in after.
+        // Matching targets and self-reported IDs are not identity proof.
+        // Keep the independently configured and carried readings separate.
         app.peer_summaries = vec![peer_with_workspaces("kiln", vec![flock_row()])];
         app.fleet_snapshot = Some(snapshot_with_peers(
             "hopper",
@@ -6455,10 +6454,8 @@ mod tests {
                 WorkspaceListEntry::Workspace { .. } | WorkspaceListEntry::Header { .. } => None,
             })
             .collect();
-        // #102 merged stream: `gerchowl/dotfiles` sorts before
-        // `gerchowl/flock`, so atlas's dotfiles row lands FIRST — but the
-        // dedup contract still holds: the duplicated kiln renders once,
-        // from the polled config entry.
+        // Project ordering is unchanged, but claims cannot displace the
+        // configured source in the merged stream.
         assert_eq!(
             remote_peers,
             vec![

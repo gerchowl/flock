@@ -483,7 +483,12 @@ fn protocol_32_client_refuses_protocol_31_server_with_handoff_recovery() {
         json!({"result":{"type":"pong","version":"3.1.0","protocol":31}})
     }
     let (socket, _server) = scripted_server("snapshot-skew", old_server);
-    let output = flk(&socket, &["agent", "send", "w1", "fixture", "--json"]);
+    let output = flk(
+        &socket,
+        &[
+            "--format", "json", "agent", "send", "--submit", "w1", "fixture",
+        ],
+    );
     let value = envelope(&output, 78);
     assert_eq!(value["error"]["code"], "server_version_gap");
     assert_eq!(value["error"]["retry"], "after_handoff");
