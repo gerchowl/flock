@@ -270,7 +270,7 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   tracks open control
   requests by `request_id`, and the agent stays `waiting_on_human` until
   every one of them is answered. Working is `system/status: requesting` or
-  an open `message_start`. A stall is a started input with no stdout event for
+  an open `message_start`. A stall is an accepted or started input with no stdout event for
   `[sessions] stall_ms` while no control request and no tool call is open;
   a long-running tool is not a stall (its `tool_use` is open). A stall is
   reported as `agent.session_stalled{since}` and leaves the phase as it is
@@ -499,6 +499,23 @@ remain #1380. Public structured start stays unreachable until #1843 and #1734
 have landed. The default remains the agent user (#1177); the owner-approved
 MVP exception permits explicit operator-mode opt-in only. #1843 supplies the
 public admission wiring and isolated manual dogfood runbook for that exception.
+
+Accepted-input silence (#1903): successful transport admission of a user
+stdin envelope supplies `Input::Accepted { at, at_ms }` through
+`Received::state_input`, using monotonic and Unix clocks captured at admission.
+It arms the same caller stall policy before any started/requesting/message_start
+observation, without inventing a working turn. Later stdout resets the silence
+anchor normally; started evidence establishes working, and top-level result or
+exit retires the pending interval. Control requests and open tools suppress
+stall reporting exactly as for started turns. The transport serializes its host
+`flk_input_accepted` stream record before later stdout observations, even for a
+fast response. This is an internal stream fact, not an EventHub event kind or
+mesh frame. Its monotonic stamp belongs only to the current launch and cannot
+be reconstructed on replay; a raw host record without that stamp is skipped.
+Admission is not proof of a successful pipe write or provider turn. A cancelled
+admission requests process shutdown as well as pipe cancellation. Transport
+failure remains an explicit worker failure, and output backpressure delays
+notification rather than dropping it. No queue/scheduler feed is needed.
 
 The caller supplies monotonic observation time and its configured `stall_ms`;
 the reducer never starts a timer, polls a process or kills/retries a turn.
