@@ -100,8 +100,12 @@ pub(crate) async fn failed_listener() -> (crate::test_support::TempDir, Listener
         data,
         Listener {
             health,
-            socket,
-            core,
+            socket: Arc::new(Mutex::new(Some(socket))),
+            core: Arc::new(core),
+            clock: Arc::new(SystemClock),
+            probe: Arc::new(check_funnel),
+            reload: Arc::new(Notify::new()),
+            codes: Codes::default(),
             prepared: None,
             task: Some(task),
         },
@@ -254,10 +258,34 @@ async fn alternate_loopback_address_has_typed_exact_binding_refusal() {
     .await;
 }
 #[tokio::test]
-async fn inherited_listener_without_bind_has_typed_refusal() {
+async fn inherited_listener_without_bind_is_closed_and_reports_disabled() {
+    use crate::platform::client_listener::{assert_fd_closed_in_child, isolated_fd_child};
+    use std::os::fd::AsRawFd;
+    if !isolated_fd_child("web::client_listener::tests::inherited_listener_without_bind_is_closed_and_reports_disabled") { return; }
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
-    assert_preparation_refusal(None, Some(socket), InvalidListener::Unconfigured).await;
+    let fd = socket.as_raw_fd();
+    let health = Health::default();
+    health.publish(Status::Listening);
+    let codes = Codes::default();
+    codes.set_endpoint(socket.local_addr().unwrap()).unwrap();
+    let root = crate::test_support::TempDir::socket();
+    let result = Listener::prepare_using(
+        None,
+        codes.clone(),
+        root.path().into(),
+        Some(socket),
+        health.clone(),
+        Arc::new(SystemClock),
+        Arc::new(|_| panic!("disabled listener must never probe")),
+    )
+    .await
+    .unwrap();
+    assert_fd_closed_in_child(fd);
+    assert!(result.is_none());
+    assert_eq!(health.status(), Some(Status::Disabled));
+    assert_eq!(codes.bound_endpoint(), None);
 }
+
 #[tokio::test]
 async fn inherited_listener_port_mismatch_has_typed_refusal() {
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -289,7 +317,7 @@ fn server_failure_wins_over_listener_shutdown_failure_and_logs_secondary_kind() 
     });
     assert!(logs.contains("client.listener.shutdown_failed"));
     assert!(logs.contains("OutOfMemory"));
-    assert!(logs.contains(&libc::ENOMEM.to_string()));
+    assert!(logs.contains(&format!("errno=Some({})", libc::ENOMEM)));
     assert_eq!(
         finish_shutdown(Ok(()), Err(io::Error::from_raw_os_error(libc::ENOMEM)))
             .unwrap_err()

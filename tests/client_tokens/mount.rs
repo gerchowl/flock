@@ -593,3 +593,105 @@ fn real_server_stalled_http_body_expires_but_upgraded_socket_stays_usable() {
     assert_eq!(kind, 8);
     assert_eq!(u16::from_be_bytes(close[..2].try_into().unwrap()), 1008);
 }
+
+#[test]
+fn real_handoff_with_removed_bind_keeps_server_and_panes_but_disables_listener() {
+    let server = Server::start();
+    assert_eq!(
+        server.api("ping", json!({}))["result"]["client_listener"],
+        "listening"
+    );
+    let workspace = server.api("workspace.create", json!({"cwd":server.root,"focus":true}));
+    let pane = workspace["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap();
+    let config = server
+        .config
+        .join(support::paths::app_dir_name())
+        .join("config.toml");
+    fs::write(
+        config,
+        "onboarding = false\n[security]\nagent_account = 'none'\n",
+    )
+    .unwrap();
+    let handoff = server.api("server.live_handoff", json!({}));
+    assert!(handoff.get("result").is_some(), "{handoff}");
+    server.owner.wait_exited(Duration::from_secs(10)).unwrap();
+    let ping = server.api("ping", json!({}));
+    assert_eq!(ping["result"]["client_listener"], "disabled");
+    assert!(server
+        .api("pane.get", json!({"pane_id":pane}))
+        .get("result")
+        .is_some());
+    assert!(server.api("client.open", json!({})).get("error").is_some());
+    assert_shell_still_runs(&server, pane);
+    // Kernel descriptor closure is checked in the isolated preparation test.
+}
+
+#[test]
+fn real_config_reload_stops_only_exposed_listener_and_preserves_agent_pty() {
+    let server = Server::start();
+    let endpoint = endpoint(&server);
+    let token = bearer(&endpoint);
+    let mut wire = WebSocket::open(&endpoint);
+    assert_eq!(wire.hello(&token).0, 1);
+    let workspace = server.api("workspace.create", json!({"cwd":server.root,"focus":true}));
+    let pane = workspace["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap();
+    let config = json!({"Web":{"fixture.example:443":{"Handlers":{"/":{"Proxy":format!("http://{}",endpoint.address)}}}}});
+    fs::write(
+        server.root.join("tools/tailscale"),
+        format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", config),
+    )
+    .unwrap();
+    let reload = server.api("server.reload_config", json!({}));
+    assert!(reload.get("result").is_some(), "{reload}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let ping = server.api("ping", json!({}));
+        match ping["result"]["client_listener"].as_str().unwrap() {
+            "exposed_by_serve" => break,
+            "listening" => assert!(
+                std::time::Instant::now() < deadline,
+                "reload never rechecked forwarding"
+            ),
+            other => panic!("unexpected listener state {other}"),
+        }
+    }
+    let (opcode, bytes) = wire.receive();
+    assert_eq!(opcode, 8);
+    assert_eq!(u16::from_be_bytes(bytes[..2].try_into().unwrap()), 1001);
+    assert!(server
+        .api("pane.get", json!({"pane_id":pane}))
+        .get("result")
+        .is_some());
+    assert!(server
+        .api("workspace.list", json!({}))
+        .get("result")
+        .is_some());
+    assert_shell_still_runs(&server, pane);
+}
+
+fn assert_shell_still_runs(server: &Server, pane: &str) {
+    let written = server.api(
+        "pane.write_input",
+        json!({"pane_id":pane,"text":"printf '%s%s\\n' guard- survived\n","raw":true}),
+    );
+    assert!(written.get("result").is_some(), "{written}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let read = server.api(
+            "pane.read",
+            json!({"pane_id":pane,"source":"recent","format":"text"}),
+        );
+        assert!(read.get("result").is_some(), "shell read failed: {read}");
+        if read.to_string().contains("guard-survived") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shell producer stayed alive and silent after listener transition: {read}"
+        );
+    }
+}

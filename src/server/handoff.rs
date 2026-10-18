@@ -1236,10 +1236,20 @@ mod tests {
                     .map(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) }),
             );
         });
+        let protected: Vec<_> = received
+            .iter()
+            .map(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) })
+            .collect();
         close_fds(&received);
         close_fds(&writes);
         assert_all_write_ends_closed(&reads);
         result.unwrap();
+        assert!(
+            protected
+                .iter()
+                .all(|flags| *flags >= 0 && flags & libc::FD_CLOEXEC != 0),
+            "every received fd must be CLOEXEC after the fallback on Darwin too"
+        );
         assert_eq!(
             observed.len(),
             1,

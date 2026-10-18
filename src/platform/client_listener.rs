@@ -57,9 +57,9 @@ pub(crate) enum InvalidListener {
     NotListening,
     /// The bound socket would permit exposure beyond IPv4 loopback.
     NonLoopback,
-    /// Import supplied a listener after the configured binding was removed.
+    /// Serve or funnel configuration targets the client listener.
     #[cfg(feature = "web")]
-    Unconfigured,
+    ExposedByServe,
     /// The imported listener does not match the configured address or nonzero port.
     #[cfg(feature = "web")]
     BindMismatch {
@@ -82,8 +82,8 @@ impl std::fmt::Display for InvalidListener {
                 "structured listener address is outside its allowed IPv4 loopback binding",
             ),
             #[cfg(feature = "web")]
-            Self::Unconfigured => {
-                f.write_str("received structured listener without a configured bind")
+            Self::ExposedByServe => {
+                f.write_str("tailscale serve/funnel may expose the client port")
             }
             #[cfg(feature = "web")]
             Self::BindMismatch { expected, actual } => write!(
@@ -196,6 +196,38 @@ fn listening(fd: RawFd) -> io::Result<bool> {
     Ok(accept != 0)
 }
 
+/// Run descriptor-number checks in a single-test child with no concurrent fd allocators.
+#[cfg(test)]
+pub(crate) fn isolated_fd_child(name: &str) -> bool {
+    if std::env::var("FLOCK_FD_CLOSURE_CHILD").ok().as_deref() == Some(name) {
+        return true;
+    }
+    let mut command =
+        crate::process::TracedCommand::new(std::env::current_exe().unwrap(), "fd-closure-test");
+    command.args(["--exact", name, "--nocapture", "--test-threads=1"]);
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
+        command.env_remove(key);
+    }
+    command.env("FLOCK_FD_CLOSURE_CHILD", name);
+    let output = command
+        .output_traced_with_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+/// The isolated child runs one synchronous operation: no other thread can recycle this number.
+#[cfg(test)]
+pub(crate) fn assert_fd_closed_in_child(fd: RawFd) {
+    assert!(std::env::var_os("FLOCK_FD_CLOSURE_CHILD").is_some());
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,14 +261,13 @@ mod tests {
     }
     #[test]
     fn duplicated_listener_has_owned_close_on_drop_semantics() {
+        if !isolated_fd_child("platform::client_listener::tests::duplicated_listener_has_owned_close_on_drop_semantics") { return; }
         let original = TcpListener::bind("127.0.0.1:0").unwrap();
         let owned: OwnedFd = duplicate(&original).unwrap();
-        let address = original.local_addr().unwrap();
+        let fd = owned.as_raw_fd();
         drop(owned);
+        assert_fd_closed_in_child(fd);
         assert!(original.local_addr().is_ok());
-        drop(original);
-        // A leaked duplicate retains the port, regardless of descriptor-number reuse.
-        let _rebound = TcpListener::bind(address).expect("duplicate retained the listening port");
     }
     #[test]
     fn missing_or_non_listening_descriptor_is_refused() {
@@ -285,25 +316,20 @@ mod family_tests {
             Some(&InvalidListener::Family)
         );
         assert!(fds.is_empty());
+        assert_fd_closed_in_child(fd);
     }
     #[test]
     fn listening_unix_socket_is_refused_with_owned_descriptor_cleanup() {
+        if !isolated_fd_child("platform::client_listener::family_tests::listening_unix_socket_is_refused_with_owned_descriptor_cleanup") { return; }
         let root = crate::test_support::TempDir::socket();
         let socket = std::os::unix::net::UnixListener::bind(root.path().join("l.sock")).unwrap();
         refused(socket.into_raw_fd());
-        assert_eq!(
-            std::os::unix::net::UnixStream::connect(root.path().join("l.sock"))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::ConnectionRefused
-        );
     }
     #[test]
     fn listening_ipv6_socket_is_refused_with_owned_descriptor_cleanup() {
+        if !isolated_fd_child("platform::client_listener::family_tests::listening_ipv6_socket_is_refused_with_owned_descriptor_cleanup") { return; }
         let socket = TcpListener::bind("[::1]:0").unwrap();
-        let address = socket.local_addr().unwrap();
         refused(socket.into_raw_fd());
-        let _rebound = TcpListener::bind(address).expect("refused IPv6 listener retained its port");
     }
 }
 
@@ -313,8 +339,8 @@ mod loopback_tests {
     use std::os::fd::IntoRawFd;
     #[test]
     fn received_wildcard_listener_is_refused_and_closed() {
+        if !isolated_fd_child("platform::client_listener::loopback_tests::received_wildcard_listener_is_refused_and_closed") { return; }
         let listener = TcpListener::bind("0.0.0.0:0").unwrap();
-        let address = listener.local_addr().unwrap();
         let fd = listener.into_raw_fd();
         let mut fds = vec![fd];
         let error = take(&mut fds).unwrap_err();
@@ -326,8 +352,7 @@ mod loopback_tests {
             Some(&InvalidListener::NonLoopback)
         );
         assert!(fds.is_empty());
-        let _rebound =
-            TcpListener::bind(address).expect("refused wildcard listener retained its port");
+        assert_fd_closed_in_child(fd);
     }
     #[test]
     fn loopback_exposure_boundary_is_the_entire_ipv4_loopback_block() {

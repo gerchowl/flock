@@ -289,7 +289,7 @@ async fn connection(
     let mut heartbeat = Heartbeat::new(shared.clock.now());
     let code = loop {
         tokio::select! { biased;
-            _ = stop.changed() => return,
+            _ = stop.changed() => break GOING_AWAY_CLOSE,
             _ = revoked.changed() => break AUTH_REVOKED_CLOSE,
             _ = &mut writer => return,
             _ = shared.clock.until(heartbeat.expires()) => break GOING_AWAY_CLOSE,

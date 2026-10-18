@@ -1020,7 +1020,11 @@ it across configuration reloads. Host/Origin must match that address. Startup
 accepts only the exact IPv4 loopback address `127.0.0.1`. Startup and handoff
 import refuse any serve or funnel configuration targeting the bound port,
 including tailnet-only serve, and an unavailable, unsuccessful or malformed
-bounded forwarding probe. Forwarding changes after startup are not monitored
-(#1972).
+bounded forwarding probe. The listener checks again on config reload and every
+60 seconds. A new exposure stops only the listener and its connections and
+reports `client_listener: exposed_by_serve` in ping; server work and PTYs continue.
+Probe failures stop only the listener with `failed`. Removing the bind allows
+handoff but disables the inherited listener (`disabled`) instead of refusing
+the whole handoff (#1972).
 The handshake-only transport currently advertises no command capabilities;
 subscription and command routing follow in the remaining structured-client slices.

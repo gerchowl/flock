@@ -35,6 +35,12 @@ impl Codes {
         self.0.lock().map_err(|_| TokenError::Busy)?.endpoint = Some(bind);
         Ok(())
     }
+    /// Withdraw a listener endpoint when its owner closes the socket.
+    #[cfg(feature = "web")]
+    pub(crate) fn clear_endpoint(&self) -> Result<(), TokenError> {
+        self.0.lock().map_err(|_| TokenError::Busy)?.endpoint = None;
+        Ok(())
+    }
     /// Retain at most 128 live handoffs, with a hard 60-second lifetime.
     pub(crate) fn mint(&self, code: String, token: Bearer, now: Instant) -> Result<(), TokenError> {
         let code: [u8; 32] = Sha256::digest(code.as_bytes()).into();

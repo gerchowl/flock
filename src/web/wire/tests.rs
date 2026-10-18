@@ -49,7 +49,7 @@ impl TestClock {
             .filter(|&&d| d == self.0.base + Duration::from_millis(ms))
             .count()
     }
-    async fn deadline_count(&self, ms: u64, count: usize) {
+    pub(crate) async fn deadline_count(&self, ms: u64, count: usize) {
         let mut signal = self.0.signal.subscribe();
         within(async {
             loop {

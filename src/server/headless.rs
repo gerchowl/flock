@@ -675,7 +675,7 @@ impl HeadlessServer {
         if let Some(wire) = &self.client_wire {
             self.app
                 .client_codes
-                .set_endpoint(wire.socket.local_addr()?)
+                .set_endpoint(wire.local_addr()?)
                 .map_err(io::Error::other)?;
         }
         Ok(())
@@ -1416,7 +1416,12 @@ impl HeadlessServer {
         }
         #[cfg(feature = "web")]
         {
-            manifest.client_listener = self.client_wire.is_some();
+            manifest.client_listener = self
+                .client_wire
+                .as_ref()
+                .map(|wire| wire.has_socket())
+                .transpose()?
+                .unwrap_or(false);
             if manifest.client_listener {
                 manifest.version = crate::server::handoff::CLIENT_LISTENER_HANDOFF_VERSION;
             }
@@ -1446,7 +1451,9 @@ impl HeadlessServer {
             #[cfg(feature = "web")]
             if let Some(wire) = &self.client_wire {
                 use std::os::fd::IntoRawFd;
-                fds.push(crate::platform::client_listener::duplicate(&wire.socket)?.into_raw_fd());
+                if manifest.client_listener {
+                    fds.push(wire.duplicate()?.into_raw_fd());
+                }
             }
             Ok::<(), io::Error>(())
         })();
@@ -1641,6 +1648,10 @@ impl HeadlessServer {
         apply_keybindings(&mut self.app, &server_keybindings);
         let report = self.app.apply_config_from_disk(notify_success);
         self.app.take_config_reloaded_from_disk();
+        #[cfg(feature = "web")]
+        if let Some(wire) = &self.client_wire {
+            wire.recheck();
+        }
         self.server_keybindings = app_keybindings(&self.app);
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(&report.diagnostics);

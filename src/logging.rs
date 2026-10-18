@@ -66,6 +66,15 @@ pub(crate) fn client_exchange_failed(
     tracing::warn!(event = "client.exchange.internal_failure", subsystem = "structured_client", reason, io_kind = ?io_kind, "browser credential exchange unavailable");
 }
 
+/// Report a forwarding exposure or failed safety check without raw command output.
+#[cfg(feature = "web")]
+pub(crate) fn client_listener_probe_failed(
+    status: crate::api::client_listener::Status,
+    error: &io::Error,
+) {
+    tracing::warn!(event = "client.listener.probe_failed", subsystem = "structured_client", status = ?status, kind = ?error.kind(), "client listener stopped by forwarding guard");
+}
+
 /// Report secondary listener cleanup errors without replacing the primary server failure.
 #[cfg(feature = "web")]
 pub(crate) fn client_listener_shutdown_failed(error: &std::io::Error) {

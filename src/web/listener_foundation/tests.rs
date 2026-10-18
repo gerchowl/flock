@@ -121,7 +121,12 @@ fn listener_status_is_typed_and_optional_in_ping() {
             ..
         }
     ));
-    for status in [Status::Listening, Status::Failed] {
+    for status in [
+        Status::Listening,
+        Status::Failed,
+        Status::Disabled,
+        Status::ExposedByServe,
+    ] {
         let value = serde_json::to_value(pong(Some(status))).unwrap();
         assert_eq!(
             value["client_listener"],

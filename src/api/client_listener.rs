@@ -1,11 +1,15 @@
 //! Per-server structured listener status, observable without contacting that listener.
 use std::sync::{Arc, Mutex, PoisonError};
-/// A configured listener's confirmed state; absence means disabled or unavailable on older servers.
+/// Confirmed listener state; older or non-web servers may omit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Listening,
     Failed,
+    /// Configuration disabled this server's listener.
+    Disabled,
+    /// A serve or funnel exposure stopped the listener.
+    ExposedByServe,
 }
 /// Shared only by one API server and its listener owner; independent servers never share state.
 #[derive(Clone, Debug, Default)]

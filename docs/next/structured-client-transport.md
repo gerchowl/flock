@@ -76,9 +76,9 @@ The mounted listener accepts exactly `127.0.0.1`. Other addresses, including
 other members of IPv4's loopback block, receive a typed `NonLoopback` refusal
 before the forwarding probe or router construction. The lower-level descriptor
 adopter independently rejects sockets outside `127.0.0.0/8` (#1960).
-An inherited socket without a configured bind receives `Unconfigured`; an
-address or nonzero-port mismatch receives `BindMismatch`. Descriptor adoption
-closes a refused socket through its sole owner (#1972).
+If the configured bind was removed, the importer accepts the server handoff,
+closes the inherited listener through its sole owner, and reports `disabled`.
+An address or nonzero-port mismatch still receives `BindMismatch` (#1972).
 
 The listener requires numeric Host and same-origin Origin matching its actual
 bound IPv4 authority (normalizing HTTP's default port only). API routes require
@@ -91,8 +91,14 @@ Startup runs `tailscale serve status --json` off the async executor, bounded at
 five seconds and 64 KiB. Any serve or funnel configuration targeting the bound
 port, unsuccessful or malformed status, and an unavailable probe refuse the
 configured listener and server startup; there is no silent fallback. Exit status
-is checked before parsing JSON. Forwarding changes after startup are not
-monitored. The operator must keep forwarding to this port disabled.
+is checked before parsing JSON. The running listener rechecks on config reload
+and every 60 seconds, using a monotonic supplied clock. Reload requests during
+an in-flight check retain a subsequent check; concurrent bursts coalesce.
+An exposure stops only the listener and its connections, reports
+`exposed_by_serve`, and emits a warning. A failed safety probe also stops only
+the listener, reporting `failed`; raw probe output is never logged. Server
+work and agent PTYs continue. Clearing forwarding does not automatically
+restart a stopped listener; a fresh server or handoff can activate it safely.
 
 Live handoff transfers the bound listening descriptor rather than rebinding its
 port after commit. The importer validates a listening socket and its configured
@@ -104,8 +110,9 @@ reset; ownership acknowledgement precedes that exit and clients use §5a's norma
 reconnect path. Failed imports preserve the exporter's listener. Received sockets
 are close-on-exec so later children cannot retain the port. Process-local browser
 codes are not transferred; obtain a fresh URL after handoff or restart. A changed
-nonzero configured address requires a restart rather than adopting a mismatched
-listener. A fatal accept failure stops only the listener and publishes typed
+nonzero configured address refuses import rather than adopting a mismatched
+listener. Removing the bind instead disables the inherited listener without
+refusing the server handoff. A fatal accept failure stops only the listener and publishes typed
 failed status;
 the server loop and its agents continue. Server shutdown cancels owned
 HTTP connection tasks, closes accepted I/O and checks core lease release before
@@ -129,7 +136,8 @@ wait `ACCEPT_RESOURCE_BACKOFF` (100 ms) on the supplied monotonic clock before
 accepting again. Only an invalid listener descriptor (`EBADF`, `EINVAL`,
 `ENOTSOCK`) ends that listener task and publishes the typed `failed` state once.
 It does not end the headless server loop or its agents. Ping carries the optional
-`client_listener` state (`listening` or `failed`), absent when disabled.
+`client_listener` state (`listening`, `failed`, `disabled`, or
+`exposed_by_serve`); older or non-web servers may omit it.
 This state belongs to the logical server and is injected into its API socket
 and listener owner. Handoff rollback retains it when replacing the API socket;
 independent server instances never share a process static.

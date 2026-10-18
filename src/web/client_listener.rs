@@ -21,11 +21,11 @@ use std::{
     io,
     net::{Ipv4Addr, SocketAddr, TcpListener},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
-    sync::Semaphore,
+    sync::{Notify, Semaphore},
     task::{JoinHandle, JoinSet},
 };
 /// Concurrent HTTP connections before upgrade; upgraded sockets have the core's cap.
@@ -36,6 +36,30 @@ const HTTP_ADMISSION_DEADLINE: Duration = Duration::from_secs(5);
 const FUNNEL_DEADLINE: Duration = Duration::from_secs(5);
 /// Maximum status JSON bytes accepted from the public-funnel probe.
 const FUNNEL_STATUS_BYTES: usize = 65_536;
+/// Fixed cadence for periodic exposure checks; reload checks never postpone it.
+const EXPOSURE_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// Bounded blocking forwarding probe; injected probes never execute an external command.
+type Probe = Arc<dyn Fn(u16) -> io::Result<()> + Send + Sync>;
+async fn probe(probe: Probe, port: u16) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || probe(port))
+        .await
+        .map_err(io::Error::other)?
+}
+async fn monitor(
+    clock: Arc<dyn Clock>,
+    probe_fn: Probe,
+    reload: Arc<Notify>,
+    port: u16,
+) -> io::Result<()> {
+    let mut deadline = clock.now() + EXPOSURE_RECHECK_INTERVAL;
+    loop {
+        tokio::select! {
+            _ = clock.until(deadline) => { deadline += EXPOSURE_RECHECK_INTERVAL; },
+            _ = reload.notified() => {}
+        }
+        probe(probe_fn.clone(), port).await?;
+    }
+}
 /// Own every HTTP task; acceptance and its monotonic clock are injectable without test sleeps.
 async fn serve<A, F>(
     mut accept: A,
@@ -75,9 +99,13 @@ where
 }
 /// Prepared before handoff ready; only run activates acceptance, after commit.
 pub(crate) struct Listener {
-    pub(crate) socket: TcpListener,
+    socket: Arc<Mutex<Option<TcpListener>>>,
     pub(crate) health: Health,
-    core: Core,
+    core: Arc<Core>,
+    clock: Arc<dyn Clock>,
+    probe: Probe,
+    reload: Arc<Notify>,
+    codes: Codes,
     prepared: Option<(tokio::net::TcpListener, Router)>,
     task: Option<JoinHandle<io::Result<()>>>,
 }
@@ -86,6 +114,10 @@ impl Drop for Listener {
         if let Some(task) = &self.task {
             task.abort();
         }
+        self.socket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 impl Listener {
@@ -97,15 +129,32 @@ impl Listener {
         inherited: Option<TcpListener>,
         health: Health,
     ) -> io::Result<Option<Self>> {
+        Self::prepare_using(
+            bind,
+            codes,
+            data,
+            inherited,
+            health,
+            Arc::new(SystemClock),
+            Arc::new(check_funnel),
+        )
+        .await
+    }
+    /// Prepare with an owned clock and probe, including the startup check.
+    async fn prepare_using(
+        bind: Option<SocketAddr>,
+        codes: Codes,
+        data: PathBuf,
+        inherited: Option<TcpListener>,
+        health: Health,
+        clock: Arc<dyn Clock>,
+        probe_fn: Probe,
+    ) -> io::Result<Option<Self>> {
         let Some(bind) = bind else {
-            return if inherited.is_none() {
-                Ok(None)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    InvalidListener::Unconfigured,
-                ))
-            };
+            drop(inherited);
+            health.publish(Status::Disabled);
+            codes.clear_endpoint().map_err(io::Error::other)?;
+            return Ok(None);
         };
         crate::platform::client_listener::require_loopback(bind)?;
         if bind.ip() != Ipv4Addr::LOCALHOST {
@@ -129,33 +178,90 @@ impl Listener {
                 },
             ));
         }
-        tokio::task::spawn_blocking(move || check_funnel(actual.port()))
-            .await
-            .map_err(io::Error::other)??;
+        if let Err(error) = probe(probe_fn.clone(), actual.port()).await {
+            publish_probe_failure(&health, &error);
+            return Err(error);
+        }
         socket.set_nonblocking(true)?;
         let acceptor = tokio::net::TcpListener::from_std(socket.try_clone()?)?;
-        let core = Core::new(data.clone()).await?;
+        let core = Arc::new(Core::new(data.clone()).await?);
         let csp = HeaderValue::from_str(&format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://{actual}/v1/ws; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")).map_err(io::Error::other)?;
         let router = core
             .router()
-            .merge(client_exchange::router(codes, data, actual).map_err(io::Error::other)?)
+            .merge(client_exchange::router(codes.clone(), data, actual).map_err(io::Error::other)?)
             .merge(gui::router(actual)?)
             .layer(middleware::from_fn_with_state((actual, csp), guard));
         Ok(Some(Self {
             health,
-            socket,
+            socket: Arc::new(Mutex::new(Some(socket))),
             core,
+            clock,
+            probe: probe_fn,
+            reload: Arc::new(Notify::new()),
+            codes,
             prepared: Some((acceptor, router)),
             task: None,
         }))
+    }
+    /// Address and descriptor access share ownership with the exposure supervisor.
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket
+            .lock()
+            .map_err(|_| io::Error::other("listener ownership poisoned"))?
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?
+            .local_addr()
+    }
+    /// Observe owned descriptor presence without hiding an address-query failure.
+    pub(crate) fn has_socket(&self) -> io::Result<bool> {
+        Ok(self
+            .socket
+            .lock()
+            .map_err(|_| io::Error::other("listener ownership poisoned"))?
+            .is_some())
+    }
+    /// Duplicate only while this owner still has a live bound socket.
+    pub(crate) fn duplicate(&self) -> io::Result<std::os::fd::OwnedFd> {
+        crate::platform::client_listener::duplicate(
+            self.socket
+                .lock()
+                .map_err(|_| io::Error::other("listener ownership poisoned"))?
+                .as_ref()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?,
+        )
+    }
+    /// A pending reload is retained even during an in-flight probe; bursts coalesce.
+    pub(crate) fn recheck(&self) {
+        self.reload.notify_one();
     }
     /// Start only inside the owning server loop, after handoff commit if importing.
     pub(crate) fn activate(&mut self) {
         if let Some((socket, router)) = self.prepared.take() {
             self.health.publish(Status::Listening);
             let health = self.health.clone();
+            let clock = self.clock.clone();
+            let reload = self.reload.clone();
+            let probe_fn = self.probe.clone();
+            let owned = self.socket.clone();
+            let core = self.core.clone();
+            let codes = self.codes.clone();
             self.task = Some(tokio::spawn(async move {
-                serve(|| socket.accept(), router, Arc::new(SystemClock), health).await
+                let port = socket.local_addr()?.port();
+                let result = tokio::select! {
+                    result = serve(|| socket.accept(), router, clock.clone(), health.clone()) => result,
+                    result = monitor(clock, probe_fn, reload, port) => {
+                        if let Err(error) = &result { publish_probe_failure(&health, error); }
+                        result
+                    }
+                };
+                drop(socket);
+                owned
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let cleared = codes.clear_endpoint().map_err(io::Error::other);
+                let shutdown = core.shutdown().await.map_err(io::Error::other);
+                finish_shutdown(finish_shutdown(result, cleared), shutdown)
             }));
         }
     }
@@ -220,7 +326,7 @@ fn validate_funnel(output: std::process::Output, port: u16) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "tailscale serve/funnel may expose the client port",
+            InvalidListener::ExposedByServe,
         ));
     }
     Ok(())
@@ -258,6 +364,21 @@ fn targets_port(value: &serde_json::Value, port: u16) -> bool {
     }
 }
 
+/// Publish typed probe failure without exposing probe output or credentials.
+fn publish_probe_failure(health: &Health, error: &io::Error) {
+    let status = if error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<InvalidListener>())
+        == Some(&InvalidListener::ExposedByServe)
+    {
+        Status::ExposedByServe
+    } else {
+        Status::Failed
+    };
+    health.publish(status);
+    crate::logging::client_listener_probe_failed(status, error);
+}
+
 /// Preserve the event-loop failure when listener cleanup also fails.
 pub(crate) fn finish_shutdown(primary: io::Result<()>, shutdown: io::Result<()>) -> io::Result<()> {
     if let Err(error) = shutdown {
@@ -271,3 +392,6 @@ pub(crate) fn finish_shutdown(primary: io::Result<()>, shutdown: io::Result<()>)
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod recheck_tests;
