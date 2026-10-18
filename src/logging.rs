@@ -75,6 +75,12 @@ pub(crate) fn client_listener_probe_failed(
     tracing::warn!(event = "client.listener.probe_failed", subsystem = "structured_client", status = ?status, kind = ?error.kind(), "client listener stopped by forwarding guard");
 }
 
+/// Report address lookup failure separately from forwarding probes, without raw diagnostics.
+#[cfg(feature = "web")]
+pub(crate) fn client_listener_address_failed(error: &io::Error) {
+    tracing::warn!(event = "client.listener.address_failed", subsystem = "structured_client", kind = ?error.kind(), errno = ?error.raw_os_error(), "client listener address lookup failed");
+}
+
 /// Report secondary listener cleanup errors without replacing the primary server failure.
 #[cfg(feature = "web")]
 pub(crate) fn client_listener_shutdown_failed(error: &std::io::Error) {

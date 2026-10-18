@@ -148,6 +148,14 @@ This state belongs to the logical server and is injected into its API socket
 and listener owner. Handoff rollback retains it when replacing the API socket;
 independent server instances never share a process static.
 
+Listener diagnostics use `client.listener.accept` for classified accept errors,
+`client.listener.probe_failed` for forwarding-guard failures, and
+`client.listener.shutdown_failed` for secondary cleanup errors. Address lookup
+failure during activation emits `client.listener.address_failed` with its I/O
+kind and errno, and publishes `failed` directly without a transient `listening`
+state. It is distinct from a forwarding probe failure: no recheck probe ran.
+These events do not include raw error text, probe output or credentials.
+
 On Linux, `MSG_CMSG_CLOEXEC` makes every SCM_RIGHTS descriptor close-on-exec
 atomically at receipt. Darwin has no equivalent receive flag: the immediate
 fcntl leaves a residual receive-to-fcntl window against concurrent fork/exec.

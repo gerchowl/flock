@@ -5382,7 +5382,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(!stopped.client_listener);
-        assert_eq!(stopped.version, crate::server::handoff::HANDOFF_VERSION);
+        assert_eq!(stopped.version, manifest().version);
         server.client_wire.take().unwrap().shutdown().await.unwrap();
     }
 

@@ -236,7 +236,14 @@ impl Listener {
         address: impl FnOnce(&tokio::net::TcpListener) -> io::Result<SocketAddr> + Send + 'static,
     ) {
         if let Some((socket, router)) = self.prepared.take() {
-            self.health.publish(Status::Listening);
+            let address = address(&socket);
+            match &address {
+                Ok(_) => self.health.publish(Status::Listening),
+                Err(error) => {
+                    self.health.publish(Status::Failed);
+                    crate::logging::client_listener_address_failed(error);
+                }
+            }
             let health = self.health.clone();
             let clock = self.clock.clone();
             let reload = self.reload.clone();
@@ -245,11 +252,8 @@ impl Listener {
             let core = self.core.clone();
             let codes = self.codes.clone();
             self.task = Some(tokio::spawn(async move {
-                let result = match address(&socket) {
-                    Err(error) => {
-                        publish_probe_failure(&health, &error);
-                        Err(error)
-                    }
+                let result = match address {
+                    Err(error) => Err(error),
                     Ok(address) => tokio::select! {
                     result = serve(|| socket.accept(), router, clock.clone(), health.clone()) => result,
                     result = monitor(clock, probe_fn, reload, address.port()) => {
