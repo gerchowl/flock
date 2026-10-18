@@ -14,8 +14,8 @@ use serde_json::Value;
 pub(crate) mod fixture;
 mod minimal;
 pub use minimal::{
-    AgentDecide, AgentDecideErrorCode, AgentDecideResult, FleetAgentRow, FleetDelta,
-    PermissionDecision,
+    AgentDecide, AgentDecideErrorCode, AgentDecideResult, AgentSendResult, FleetAgentRow,
+    FleetDelta, PermissionDecision,
 };
 #[cfg(test)]
 mod review_tests;

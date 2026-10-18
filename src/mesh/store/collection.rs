@@ -16,8 +16,15 @@ pub(super) fn record_answer(
     }
     if !crate::app::mailboxes::is_deferral(&answer.correlation_id) {
         tx.execute(
-            "UPDATE envelopes SET collect_done=1,collect_error=NULL WHERE origin=?1 AND id=?2",
-            params![request.origin_node, request.message_id],
+            // A conversation answer is not the journal owner's commitment proof.
+            "UPDATE envelopes SET collect_done=1,collect_error=CASE
+             WHEN state IN ('inbox','inbox_expired') AND substr(collect_error,1,length(?3))=?3
+             THEN collect_error ELSE NULL END WHERE origin=?1 AND id=?2",
+            params![
+                request.origin_node,
+                request.message_id,
+                COMMITMENT_UNKNOWN_PREFIX
+            ],
         )?;
     }
     if ack {

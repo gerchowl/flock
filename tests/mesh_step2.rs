@@ -1932,6 +1932,45 @@ fn store_fault_keeps_panes_and_unknown_refusals_stay_queued() {
 }
 
 #[test]
+fn custody_completion_peer_message_not_found_retains_custody() {
+    let c = Conversation::new(DIRECT);
+    let origin = c.fleet.node("nodea");
+    cut(&c.fleet, "nodea", "nodeb");
+    let path = c.fleet.base.join("bin/ssh");
+    let source = fs::read_to_string(&path).unwrap();
+    assert!(source.contains("\"code\": \"held_by_test\""));
+    fs::write(
+        path,
+        source.replace(
+            "\"code\": \"held_by_test\"",
+            "\"code\": \"message_not_found\"",
+        ),
+    )
+    .unwrap();
+    let capture = c.fleet.base.join("capture-delivery-nodea-nodeb");
+    fs::write(&capture, "").unwrap();
+    assert_eq!(c.send()["state"], "queued");
+    reconnect(&c.fleet, "nodea", "nodeb");
+    due(origin);
+    fleet::wait_until("lookup-miss response processed", DEADLINE, || {
+        let captured = fs::read(&capture).ok()?;
+        serde_json::from_slice::<Value>(&captured).ok()?;
+        let status = api(origin, "msg.status", json!({"correlation_id":"question"}));
+        (status["state"] == "refused" || scalar(origin,
+            "SELECT count(*) FROM envelopes WHERE state='custody' AND retry_at>0 AND lease_until<=retry_at") > 0)
+            .then_some(())
+    });
+    assert_eq!(
+        api(origin, "msg.status", json!({"correlation_id":"question"}))["state"],
+        "queued"
+    );
+    fs::remove_file(capture).unwrap();
+    due(origin);
+    c.read_question();
+    once(c.fleet.node("nodeb"), "question");
+}
+
+#[test]
 fn corrupt_row_at_each_hop_does_not_block_healthy_mail_or_strand_leases() {
     let mut c = Conversation::to(fleet::CHAIN_ABC, "nodec");
     for name in ["nodea", "nodeb", "nodec"] {
