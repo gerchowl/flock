@@ -101,6 +101,12 @@ impl Server {
         Self::with_clock(|clock| Arc::new(clock)).await
     }
     async fn with_clock(wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>) -> Self {
+        Self::with_clock_and_shutdown_wait(wrap, SHUTDOWN_WAIT).await
+    }
+    async fn with_clock_and_shutdown_wait(
+        wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>,
+        shutdown_wait: Duration,
+    ) -> Self {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let dir = root.path().join("client-tokens");
@@ -117,8 +123,12 @@ impl Server {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         let clock = TestClock::new();
-        let core =
-            Core::with_clock(TokenStore::open(root.path()).unwrap(), wrap(clock.clone())).unwrap();
+        let core = Core::with_shutdown_wait(
+            TokenStore::open(root.path()).unwrap(),
+            wrap(clock.clone()),
+            shutdown_wait,
+        )
+        .unwrap();
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind = socket.local_addr().unwrap();
         let router = core.router();
@@ -999,7 +1009,8 @@ async fn shutdown_is_idempotent_and_shares_concurrent_completion() {
 
 #[tokio::test]
 async fn timed_out_shutdown_is_not_cached_and_can_be_retried() {
-    let server = Server::new().await;
+    let server =
+        Server::with_clock_and_shutdown_wait(|clock| Arc::new(clock), Duration::ZERO).await;
     let lease = server
         .core
         .shared
@@ -1007,17 +1018,13 @@ async fn timed_out_shutdown_is_not_cached_and_can_be_retried() {
         .clone()
         .try_acquire_owned()
         .unwrap();
-    assert!(server.core.shutdown().await.is_err());
-    {
-        let retry = server.core.shutdown();
-        tokio::pin!(retry);
-        assert!(
-            futures_util::poll!(&mut retry).is_pending(),
-            "retry must still wait for the held connection lease"
-        );
-        drop(lease);
-        within(&mut retry).await.unwrap();
-        within(server.core.shutdown()).await.unwrap();
-    }
+    assert!(within(server.core.shutdown()).await.is_err());
+    assert!(
+        within(server.core.shutdown()).await.is_err(),
+        "a timed-out drain must not be cached as success while a lease is still held"
+    );
+    drop(lease);
+    within(server.core.shutdown()).await.unwrap();
+    within(server.core.shutdown()).await.unwrap();
     server.finish().await;
 }

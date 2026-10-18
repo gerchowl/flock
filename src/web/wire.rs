@@ -40,7 +40,7 @@ const PRIORITY_CAPACITY: usize = 4;
 const DATA_CAPACITY: usize = 8;
 /// Maximum buffered WebSocket output bytes.
 const WRITE_BUFFER_BYTES: usize = MAX_MESSAGE * 2;
-/// Failure ceiling for releasing all socket leases during shutdown.
+/// Production ceiling for draining socket leases during shutdown: five seconds.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 /// First-admission retention advertised in welcome, in milliseconds.
 const IDEMPOTENCY_WINDOW_MS: u64 = 86_400_000;
@@ -86,6 +86,8 @@ impl Drop for Lease {
 pub(crate) struct Core {
     shared: Arc<Shared>,
     shutdown_complete: tokio::sync::OnceCell<()>,
+    /// Lease-drain ceiling supplied at construction for deterministic tests.
+    shutdown_wait: Duration,
 }
 impl Drop for Core {
     fn drop(&mut self) {
@@ -94,6 +96,7 @@ impl Drop for Core {
 }
 impl Core {
     /// New server epoch, independent of durable stream cursors or command identities.
+    /// Production shutdown retains the five-second lease-drain ceiling.
     pub(crate) async fn new(data: PathBuf) -> io::Result<Self> {
         let store = super::store_io::shared()
             .run(move || TokenStore::open(&data))
@@ -104,10 +107,20 @@ impl Core {
     }
     /// Embed with a supplied monotonic clock; deadlines never use wall-clock time.
     pub(crate) fn with_clock(store: TokenStore, clock: Arc<dyn Clock>) -> io::Result<Self> {
+        Self::with_shutdown_wait(store, clock, SHUTDOWN_WAIT)
+    }
+    /// Construct with a supplied lease-drain ceiling; production uses five seconds.
+    /// Zero permits deterministic timeout tests; available leases complete immediately.
+    fn with_shutdown_wait(
+        store: TokenStore,
+        clock: Arc<dyn Clock>,
+        shutdown_wait: Duration,
+    ) -> io::Result<Self> {
         let epoch = store.random::<16>().map_err(io::Error::other)?;
         let (stop, _) = watch::channel(false);
         Ok(Self {
             shutdown_complete: tokio::sync::OnceCell::new(),
+            shutdown_wait,
             shared: Arc::new(Shared {
                 store: Arc::new(store),
                 epoch,
@@ -138,12 +151,13 @@ impl Core {
     /// Cancel transport work and wait for every connection lease, including hello.
     /// Concurrent and repeated calls share one successful completion. A timed-out
     /// or cancelled caller can retry draining without declaring shutdown complete.
+    /// The construction-supplied timeout defaults to five seconds in production.
     pub(crate) async fn shutdown(&self) -> Result<(), tokio::time::error::Elapsed> {
         self.shutdown_complete
             .get_or_try_init(|| async {
                 self.shared.stop.send_replace(true);
                 tokio::time::timeout(
-                    SHUTDOWN_WAIT,
+                    self.shutdown_wait,
                     self.shared.slots.clone().acquire_many_owned(CONNECTIONS),
                 )
                 .await

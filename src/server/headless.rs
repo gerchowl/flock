@@ -5366,6 +5366,7 @@ mod tests {
             .export_client_listener(&mut captured)
             .unwrap()
             .unwrap();
+        // Address failure shares task cleanup with a probe-driven exposure stop.
         crate::web::client_listener::tests::fail_activation(server.client_wire.as_mut().unwrap())
             .await;
         assert!(captured.client_listener);

@@ -345,7 +345,8 @@ pub(crate) async fn prepared_listener() -> (crate::test_support::TempDir, Listen
     (root, listener)
 }
 
-/// Drive the real activation cleanup without an external forwarding probe.
+/// Exercise address-failure cleanup without an external forwarding probe.
+/// This shares the listener task cleanup with a probe-driven exposure stop.
 pub(crate) async fn fail_activation(listener: &mut Listener) {
     listener.activate_with_addr(|_| Err(io::Error::from_raw_os_error(libc::EIO)));
     let error = bounded(listener.task.take().unwrap())
