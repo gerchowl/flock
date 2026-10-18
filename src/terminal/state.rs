@@ -223,6 +223,9 @@ pub struct TerminalState {
     pub resume_failed: bool,
     /// Latest accepted Codex report, still requiring local binding validation.
     pub codex_session_start: Option<crate::agent_resume::CodexSessionStart>,
+    /// Unknown persisted pane runtime tag, retained across rollback saves.
+    /// It grants no agent resume authority.
+    pub(crate) persisted_runtime_tag: Option<serde_json::Value>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     /// True when `persisted_agent_session` was established by a hook report
     /// from the process running in this pane, rather than restored from a
@@ -375,6 +378,7 @@ impl TerminalState {
             hook_authority: None,
             agent_metadata: HashMap::new(),
             codex_session_start: None,
+            persisted_runtime_tag: None,
             persisted_agent_session: None,
             resume_failed: false,
             session_ref_hook_confirmed: false,
