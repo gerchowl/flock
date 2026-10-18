@@ -11,7 +11,7 @@
 //! authority and Unknown lifecycle, requiring explicit recovery rather than restart.
 #![deny(missing_docs)]
 use super::{
-    launch::{LaunchError, LaunchProfile},
+    launch::{LaunchError, LaunchProfile, SessionMcp},
     lease::SessionLeases,
     registry::{Record, Registry},
     runtime::{self, Exit, Runtime},
@@ -41,6 +41,8 @@ pub struct Launch {
     pub leases: SessionLeases,
     /// Durable stream/supervision directory.
     pub state: PathBuf,
+    /// Pinned flock executable and owning server socket for this session.
+    pub mcp: SessionMcp,
     /// Caller-supplied sessions stall policy, with no guessed default.
     pub stall_after: Duration,
     /// Optional authenticated delegation lineage.
@@ -145,6 +147,7 @@ impl Workers {
             generation: current,
             leases,
             state,
+            mcp,
             stall_after,
             lineage,
         } = launch;
@@ -213,7 +216,7 @@ impl Workers {
                     let event_wake = wake.clone();
                     runtime::run_controlled(
                         &state,
-                        profile,
+                        (profile, mcp),
                         lease,
                         location,
                         |runtime| {
