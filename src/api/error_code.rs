@@ -261,6 +261,7 @@ error_codes! {
         SelfSubmitUnconfirmed = "self_submit_unconfirmed",
         SessionMismatch = "session_mismatch";
     AfterHuman:
+        InvalidNodeHost = "invalid_node_host",
         StructuredWorkerPanicked = "structured_worker_panicked",
         StructuredWorkerTimeout = "structured_worker_timeout",
         StructuredWorkerCleanupFailed = "structured_worker_cleanup_failed",

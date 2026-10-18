@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+mod host_identity;
 pub(crate) mod received;
+pub(crate) use host_identity::{node_host_warning, row_host_key, NodeHostWarning};
 
 use crate::api::schema::PeerWorkspaceSummary;
 use crate::config::PeerConfig;
@@ -561,7 +563,15 @@ impl FleetSnapshotState {
     ) -> Vec<crate::api::schema::RelayedFleetPeer> {
         let origin_key = self.origin.to_ascii_lowercase();
         rows.into_iter()
-            .filter(|row| wire_row_identity(row) != origin_key)
+            .filter(
+                |row| match row_host_key(row.host.as_deref(), &row.ssh_target) {
+                    Some(key) => key != origin_key,
+                    None => {
+                        crate::logging::peer_summary_identifier_dropped("host");
+                        false
+                    }
+                },
+            )
             .collect()
     }
 
@@ -596,18 +606,6 @@ impl FleetSnapshotState {
         reading.proxy_jump = None;
         self.origin_summary = Some(reading);
     }
-}
-
-/// The identity a relayed row is stored under: its reported host, else its ssh
-/// target, lowercased. Exactly the relay cache key, so a row cannot match one
-/// machine here and be stored as another there. Unlike [`normalized_host_key`]
-/// nothing is stripped, because identity must not fold `a.lan` into `a.tailnet`.
-pub fn wire_row_identity(row: &crate::api::schema::RelayedFleetPeer) -> String {
-    row.host
-        .as_deref()
-        .filter(|host| !host.is_empty())
-        .unwrap_or(&row.ssh_target)
-        .to_ascii_lowercase()
 }
 
 /// A host identity every viewer derives the same way (#422): lowercased, any
@@ -786,7 +784,9 @@ fn merge_relayed_rows(
         if entry.origin.eq_ignore_ascii_case(&self_host) {
             continue;
         }
-        let host_key = wire_row_identity(&entry);
+        let Some(host_key) = row_host_key(entry.host.as_deref(), &entry.ssh_target) else {
+            continue;
+        };
         // Admission rejects unsafe host identities before presentation cleaning.
         // Key only after admission; a host identity is preserved exactly.
         if host_key == self_host_lower {
@@ -1710,6 +1710,66 @@ mod tests {
         }
     }
 
+    fn assert_fallback_identity(target: &str, accepted: bool) {
+        let mut plain = wire_peer("node-a.invalid", None);
+        plain.host = Some("node-a.invalid".into());
+        let mut fallback = plain.clone();
+        fallback.host = Some(String::new());
+        fallback.ssh_target = target.into();
+        fallback.age_secs = Some(0);
+        let mut cache = HashMap::new();
+        super::merge_relayed_fleet(&mut cache, vec![plain], "hub.invalid");
+        let logs = crate::logging::capture_logs(|| {
+            super::merge_relayed_fleet(&mut cache, vec![fallback], "hub.invalid");
+        });
+        assert_eq!(
+            cache.len(),
+            1,
+            "fallback created another identity: {target}"
+        );
+        assert_eq!(
+            cache["node-a.invalid"].peer.ssh_target,
+            if accepted { target } else { "node-a.invalid" }
+        );
+        if !accepted {
+            assert!(logs.contains("peer.summary.identifier_dropped"));
+            assert!(logs.contains("invalid_params"));
+            assert!(!logs.contains(target));
+        }
+    }
+
+    #[test]
+    fn security2200_fallback_rejects_trailing_dot() {
+        assert_fallback_identity("node-a.invalid.", false);
+    }
+
+    #[test]
+    fn security2200_fallback_rejects_underscore() {
+        assert_fallback_identity("node_a.invalid", false);
+    }
+
+    #[test]
+    fn security2200_fallback_rejects_uppercase_trailing_dot() {
+        assert_fallback_identity("NODE-A.invalid.", false);
+    }
+
+    #[test]
+    fn security2200_fallback_user_and_port_share_the_reported_host_key() {
+        assert_fallback_identity("operator@NODE-A.invalid:2222", true);
+    }
+
+    #[test]
+    fn security2200_reported_host_case_collapses_to_one_row() {
+        let mut cache = HashMap::new();
+        for host in ["Node-A.invalid", "node-a.invalid"] {
+            let mut row = wire_peer("node-a.invalid", None);
+            row.host = Some(host.into());
+            super::merge_relayed_fleet(&mut cache, vec![row], "hub.invalid");
+        }
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key("node-a.invalid"));
+    }
+
     fn assert_strict_host_refused(raw: String) {
         let response = serde_json::json!({"id":"fixture", "result":{"host":raw}}).to_string();
         let mut hostile = wire_peer("node-a.invalid", None);
@@ -1822,7 +1882,7 @@ mod tests {
             "operator@node-a.invalid",
             "node-a.invalid:22",
             "[2001:db8::1]",
-            "2001:db8::1",
+            "2001:0DB8:0:0:0:0:0:1",
         ] {
             assert_strict_host_refused(raw.into());
         }
@@ -1844,6 +1904,7 @@ mod tests {
             "0",
             "192.0.2.1",
             "xn--bcher-kva.invalid",
+            "2001:db8::1",
             &max_host,
         ] {
             let response = serde_json::json!({"id":"fixture", "result":{"host":host}}).to_string();

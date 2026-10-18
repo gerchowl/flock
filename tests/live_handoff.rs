@@ -1616,6 +1616,46 @@ fn removed_config_keys_warn_on_cold_start_and_live_reload() {
 }
 
 #[test]
+fn security2200_status_and_config_check_explain_an_invalid_own_node_name() {
+    let directory = SocketDir::reserve("n2200");
+    let base = directory.path();
+    let env = support::environment::isolated_env(&base.join("config"), &base.join("runtime"));
+    let config = base.join("config.toml");
+    let source = "onboarding=false\nname=\"Bad Node\"\n";
+    fs::write(&config, source).unwrap();
+    let run = |args: &[&str]| {
+        let mut command = support::environment::Command::new(env!("CARGO_BIN_EXE_flk"));
+        command
+            .args(args)
+            .env_remove("FLOCK_NAME")
+            .env_remove("FLOCK_HOST_NAME")
+            .envs(env.iter().cloned())
+            .env("FLOCK_CONFIG_PATH", &config);
+        support::environment::assert_command_isolated(&command);
+        command.output().unwrap()
+    };
+    let status = run(&["status", "--json"]);
+    assert!(status.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let warning = &json["node_host_warning"];
+    assert_eq!(warning["code"], "invalid_node_host", "{json}");
+    assert!(warning["message"].as_str().unwrap().contains("LDH"));
+    assert!(warning["recovery"].as_str().unwrap().contains("restart"));
+    let status = run(&["status"]);
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("invalid_node_host"));
+    let checked = run(&["config", "check", "--json"]);
+    assert_eq!(checked.status.code(), Some(1));
+    let json: serde_json::Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert!(json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item.as_str().unwrap().contains("invalid_node_host")));
+    assert_eq!(fs::read_to_string(config).unwrap(), source);
+}
+
+#[test]
 fn config_check_json_and_cli_warnings_name_source_keys() {
     let directory = SocketDir::reserve("hlh");
     let base = directory.path().to_path_buf();

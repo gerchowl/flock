@@ -3675,6 +3675,18 @@ pub(crate) fn client_system_notification_failed(err: &str) {
 // disables a keybinding or falls back to defaults, and that's a user-visible
 // regression they'd want to notice in the log tail.
 
+/// Warn the local operator about a name peers will refuse. All fields come
+/// from the typed fixed-text diagnostic, never from the rejected node name.
+pub(crate) fn node_host_invalid(warning: &crate::peers::NodeHostWarning) {
+    tracing::warn!(
+        event = "config.node_host_invalid",
+        code = warning.code,
+        rule = warning.message,
+        recovery = warning.recovery,
+        "invalid advertised node identity"
+    );
+}
+
 pub(crate) fn config_diagnostic(diagnostic: &str) {
     tracing::warn!(
         event = "config.diagnostic",

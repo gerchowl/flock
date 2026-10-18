@@ -173,10 +173,16 @@ impl App {
         // itself.
         //
         let hub_key = hub.to_ascii_lowercase();
-        let hub_self = params
-            .hub_self
-            .map(|row| *row)
-            .filter(|row| crate::peers::wire_row_identity(row) == hub_key);
+        let hub_self =
+            params.hub_self.map(|row| *row).filter(|row| {
+                match crate::peers::row_host_key(row.host.as_deref(), &row.ssh_target) {
+                    Some(key) => key == hub_key,
+                    None => {
+                        crate::logging::peer_summary_identifier_dropped("host");
+                        false
+                    }
+                }
+            });
         match self.state.fleet_snapshot.as_mut() {
             Some(snapshot) => {
                 // The home row is the one the operator trusts, so exactly one
@@ -431,17 +437,6 @@ fn focus_target(target: Option<&PeerWorkspaceSummary>) -> Option<String> {
         .filter(|id| !id.trim().is_empty())
 }
 
-/// Host key a fleet entry dedupes under: the host it reports about itself,
-/// falling back to its ssh target, lowercased. Mirrors the receiving end's
-/// `row_host_key`, so emit-side and render-side collapse the same rows.
-fn wire_host_key(peer: &crate::protocol::FleetPeer) -> String {
-    peer.host
-        .as_deref()
-        .filter(|host| !host.is_empty())
-        .unwrap_or(&peer.ssh_target)
-        .to_ascii_lowercase()
-}
-
 /// Union two fleet peer lists into the one a leg carries.
 ///
 /// Entries about the hop target (it becomes the self row over there) and about
@@ -468,7 +463,10 @@ fn merge_fleet_peers(
     let mut merged: Vec<crate::protocol::FleetPeer> = Vec::new();
     let mut by_host: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for peer in first.into_iter().chain(rest) {
-        let key = wire_host_key(&peer);
+        let Some(key) = crate::peers::row_host_key(peer.host.as_deref(), &peer.ssh_target) else {
+            crate::logging::peer_summary_identifier_dropped("host");
+            continue;
+        };
         if key == exclude_lower
             || key == origin_lower
             || peer.ssh_target.eq_ignore_ascii_case(exclude_ssh_target)
@@ -713,7 +711,7 @@ impl App {
             .as_ref()?
             .peers
             .iter()
-            .find(|entry| crate::app::state::row_host_key(entry) == host_key)?;
+            .find(|entry| crate::app::state::row_host_key(entry).as_deref() == Some(host_key))?;
         let ssh_target = carried.ssh_target.clone();
         let proxy_jump = carried.proxy_jump.clone();
         let target = ws_idx.and_then(|ws_idx| pushed.workspaces.get(ws_idx));
@@ -870,9 +868,12 @@ fn compute_short_host_name() -> String {
     //
     // Read once (short_host_name caches), so a changed name takes effect on
     // restart, matching how the OS host name is treated as fixed per-process.
-    if let Some(name) = configured_node_name() {
-        return name;
-    }
+    configured_node_name().unwrap_or_else(os_node_name)
+}
+
+/// OS fallback used both by advertised identity and startup diagnostics.
+/// This does not load configuration, so config validation cannot recurse.
+pub(crate) fn os_node_name() -> String {
     #[cfg(target_os = "macos")]
     if let Some(name) = macos_local_host_name() {
         return name;
@@ -1116,6 +1117,35 @@ mod tests {
             ingested_at: None,
             proxy_jump: None,
             icon: None,
+        }
+    }
+
+    #[test]
+    fn security2200_carried_fleet_fallback_uses_the_same_host_identity() {
+        for (target, accepted) in [
+            ("node-a.invalid.", false),
+            ("node_a.invalid", false),
+            ("NODE-A.invalid.", false),
+            ("operator@NODE-A.invalid:2222", true),
+        ] {
+            let mut plain = summary("node-a.invalid", "node-a.invalid");
+            plain.origin_last_ok_secs = Some(10);
+            let plain = crate::peers::peer_to_wire(&plain);
+            let mut fallback = plain.clone();
+            fallback.host = Some(String::new());
+            fallback.ssh_target = target.into();
+            fallback.origin_last_ok_secs = Some(0);
+            let rows = super::merge_fleet_peers(
+                vec![plain],
+                vec![fallback],
+                "other.invalid",
+                "origin.invalid",
+            );
+            assert_eq!(rows.len(), 1, "{target}");
+            assert_eq!(
+                rows[0].ssh_target,
+                if accepted { target } else { "node-a.invalid" }
+            );
         }
     }
 

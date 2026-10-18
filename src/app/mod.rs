@@ -22,7 +22,7 @@ pub(crate) mod hibernation;
 pub(crate) mod idle_wake;
 pub(crate) mod paste_confirm;
 pub(crate) mod self_compact;
-pub(crate) use api::peers::{configured_node_icon, short_host_name};
+pub(crate) use api::peers::{configured_node_icon, os_node_name, short_host_name};
 pub(crate) use api::workspaces::WorkspaceFocusOutcome;
 pub(crate) mod api_helpers;
 mod background_jobs;

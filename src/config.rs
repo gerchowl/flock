@@ -138,6 +138,23 @@ impl Config {
         self.validated_keybinds().3
     }
 
+    /// Advisory for the effective advertised node name; never rewrites config.
+    pub(crate) fn node_host_warning(&self) -> Option<crate::peers::NodeHostWarning> {
+        self.node_host_warning_with_os(crate::app::os_node_name)
+    }
+
+    fn node_host_warning_with_os(
+        &self,
+        os_name: impl FnOnce() -> String,
+    ) -> Option<crate::peers::NodeHostWarning> {
+        let configured = self.name.trim();
+        if configured.is_empty() {
+            crate::peers::node_host_warning(&os_name())
+        } else {
+            crate::peers::node_host_warning(configured)
+        }
+    }
+
     pub fn collect_diagnostics(&self) -> Vec<String> {
         let (prefix_diag, _, keybind_diags, _) = self.validated_keybinds();
         let account_warning = (self.security.agent_account == model::AgentAccount::None

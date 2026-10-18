@@ -20,17 +20,15 @@ pub(crate) fn text(value: &str) -> String {
 /// Admit a reported hostname without rewriting it (ADR-0014 §4). A-labels
 /// remain ASCII; SSH destinations and relay edge names have separate grammars.
 fn host(value: &str) -> bool {
-    let valid = !value.is_empty()
-        && value.len() <= 253
-        && value.split('.').all(|label| {
-            let bytes = label.as_bytes();
-            bytes.len() <= 63
-                && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-                && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-                && bytes
-                    .iter()
-                    .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
-        });
+    let valid = super::host_identity::canonical_host(value).is_some();
+    if !valid {
+        crate::logging::peer_summary_identifier_dropped("host");
+    }
+    valid
+}
+
+fn row_host_valid(host: Option<&str>, target: &str) -> bool {
+    let valid = super::row_host_key(host, target).is_some();
     if !valid {
         crate::logging::peer_summary_identifier_dropped("host");
     }
@@ -135,11 +133,13 @@ impl super::PeerSummaryPayload {
 impl super::PeerSummaryState {
     /// Admit a materialized fleet row. Invalid SSH routes are disabled, never edited.
     pub(super) fn received(mut self) -> Self {
-        let invalid_host = self
-            .host
-            .as_deref()
-            .filter(|host| !host.is_empty())
-            .is_some_and(|value| !host(value));
+        let invalid_host = if self.host.as_deref().is_some_and(|host| !host.is_empty()) {
+            !host(self.host.as_deref().unwrap_or_default())
+        } else if self.ssh_target == crate::protocol::HOME_SWITCH_TARGET {
+            false
+        } else {
+            !row_host_valid(None, &self.ssh_target)
+        };
         if invalid_host {
             self.host = None;
             self.ssh_target.clear();
@@ -198,12 +198,7 @@ impl crate::api::schema::RelayedFleetPeer {
     /// Refuse unsafe host identities before cleaning any presentation text.
     /// SSH destinations remain untouched here and are checked before admission.
     pub(crate) fn received(mut self) -> Option<Self> {
-        if self
-            .host
-            .as_deref()
-            .filter(|host| !host.is_empty())
-            .is_some_and(|value| !host(value))
-        {
+        if !row_host_valid(self.host.as_deref(), &self.ssh_target) {
             return None;
         }
         self.name = text(&self.name);

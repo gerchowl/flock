@@ -2813,8 +2813,13 @@ impl AppState {
             std::collections::HashMap::new();
 
         for (rank, entry_ref, peer) in self.remote_row_candidates() {
-            let host_key = row_host_key(peer);
             let freshness = row_freshness(peer);
+            let Some(host_key) = row_host_key(peer) else {
+                // A configured alias or disabled legacy row can remain visible
+                // without claiming a hostname derived from its display label.
+                ordered.push((entry_ref, peer, rank, freshness));
+                continue;
+            };
             if let Some(&idx) = host_to_idx.get(&host_key) {
                 let (_, _, cur_rank, cur_fresh) = ordered[idx];
                 // Lower rank number = higher tier (0 = ConfigPeer wins).
@@ -3007,21 +3012,10 @@ const REMOTE_ROW_RANK_RELAYED: u8 = 1;
 const REMOTE_ROW_RANK_SNAPSHOT: u8 = 2;
 const REMOTE_ROW_RANK_ORIGIN: u8 = 3;
 
-/// Machine-independent host key: the peer's reported host (fallback: config
-/// name or ssh_target), lowercased. Used across surfaces so a host cannot
-/// dedupe under different keys on the band vs. the spaces list.
-pub(crate) fn row_host_key(peer: &crate::peers::PeerSummaryState) -> String {
-    let fallback = if peer.peer.is_empty() {
-        peer.ssh_target.as_str()
-    } else {
-        peer.peer.as_str()
-    };
-    let raw = peer
-        .host
-        .as_deref()
-        .filter(|host| !host.is_empty())
-        .unwrap_or(fallback);
-    raw.to_ascii_lowercase()
+/// Use the same admitted hostname identity as relay and carried-fleet keys.
+/// Unknown identities may be displayed but cannot claim or merge a host row.
+pub(crate) fn row_host_key(peer: &crate::peers::PeerSummaryState) -> Option<String> {
+    crate::peers::row_host_key(peer.host.as_deref(), &peer.ssh_target)
 }
 
 /// Frozen origin freshness (#101 part 2): the origin's report age at capture

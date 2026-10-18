@@ -179,22 +179,38 @@ ASCII LDH labels: letters, digits and internal hyphens, with an alphanumeric
 first and last byte, 1–63 bytes per label and at most 253 bytes overall.
 Dot-separated labels may not be empty; a trailing dot is refused. IDNA A-labels
 (`xn--bcher-kva`) are accepted as plain ASCII, without decoding or Unicode conversion.
-IPv4 text naturally meets this grammar. Reject spaces, underscores, Unicode
+IPv4 text naturally meets this grammar. Canonical bare IPv6 literals are also
+admitted; bracketed or expanded noncanonical IPv6 reports are refused. Reject
+spaces, underscores, Unicode
 (including ZWJ, combining marks, variation selectors and confusables), controls
 and overlong values before keying or presentation cleaning. Never trim, strip,
 truncate or normalize a rejected identity into an admitted one. Valid spelling
 is retained apart from the existing ASCII case-insensitive cache lookup.
 
 The reported host comes from the node's configured `name` or its OS hostname;
-a node with a non-LDH name must configure an LDH name to participate in peer
-summaries, then restart: the advertised hostname is cached for the session.
+a node with an invalid identity must configure an LDH name to participate in
+peer summaries, then restart: the advertised hostname is cached for the session.
 SSH destinations are separate: `user@host`, ports, bracketed IPv6 and
 SSH aliases keep their existing destination/ProxyJump grammar and 256-byte bound.
-They are not admitted as reported host identities. An absent or empty reported
-host means no reported identity and retains the legacy SSH-destination fallback,
-whose route grammar is still checked. Relay `via` edge names retain the shared
+They are not admitted as opaque reported host identities. For an absent or
+empty host, one shared key function parses the SSH destination: remove the
+optional user and numeric port (1–65535), unbracket IPv6 and canonicalize its
+address, then apply the same host validator. Bare IPv6 means an address, not an
+address with a guessed port. DNS names are lowercased without DNS resolution;
+IPv4 and canonical IPv6 literals keep their complete address. Trailing dots,
+underscores, malformed authorities and every other invalid fallback are refused
+before either relay-cache or carried-fleet keying, with the same content-free
+`invalid_params` diagnostic. Routes retain their original spelling. Relay `via` edge names retain the shared
 forbidden-scalar predicate and 256-byte routing bound; they are not reported
 host fields. An empty `via` cannot route a row.
+
+Startup checks the effective configured or OS name without renaming it. A
+registered `invalid_node_host` warning (`after_human`) reports the LDH/IP rule
+and instructs the operator to set `name` and restart. It appears in startup
+configuration diagnostics, `flk config check`, and human-readable `flk status`;
+`flk status --json` exposes `{code, message, recovery}` as `node_host_warning`
+when present. Logs emit `config.node_host_invalid` with the typed code, rule and
+recovery, without the rejected name.
 
 An invalid raw host refuses a direct JSON summary, drops a relayed row, or
 disables a carried binary route. Invalid `via` refuses the batch. A content-free

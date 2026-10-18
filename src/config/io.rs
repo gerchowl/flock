@@ -79,7 +79,7 @@ impl Config {
     }
 
     fn finish_load(result: Result<LoadedConfig, Vec<String>>) -> LoadedConfig {
-        match result {
+        let mut loaded = match result {
             Ok(mut loaded) => {
                 // Field-level validation (keybinds, sound files, idle
                 // thresholds) belongs to the startup report; the live path
@@ -101,7 +101,12 @@ impl Config {
                     key_diagnostics: Vec::new(),
                 }
             }
+        };
+        if let Some(warning) = loaded.config.node_host_warning() {
+            crate::logging::node_host_invalid(&warning);
+            loaded.diagnostics.push(warning.to_string());
         }
+        loaded
     }
 }
 
@@ -1044,6 +1049,51 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security2200_startup_warns_about_an_invalid_node_name_without_renaming() {
+        let raw = "node-a.invalid\u{200d}";
+        let logs = crate::logging::capture_logs(|| {
+            let loaded = Config::finish_load(Ok(LoadedConfig {
+                config: Config {
+                    name: raw.into(),
+                    ..Default::default()
+                },
+                diagnostics: Vec::new(),
+                invalid_sections: Vec::new(),
+                key_diagnostics: Vec::new(),
+            }));
+            assert_eq!(loaded.config.name, raw);
+            let diagnostic = loaded
+                .diagnostics
+                .iter()
+                .find(|text| text.contains("invalid_node_host"))
+                .expect("the node's operator must see the refusal before peer polls fail");
+            assert!(diagnostic.contains("LDH"));
+            assert!(diagnostic.contains("restart"));
+            assert!(!diagnostic.contains(raw));
+        });
+        assert!(logs.contains("config.node_host_invalid"));
+        assert!(logs.contains("invalid_node_host"));
+        assert!(!logs.contains(raw));
+    }
+
+    #[test]
+    fn security2200_os_name_warning_and_configured_override_use_the_same_rule() {
+        let mut config = Config::default();
+        let warning = config
+            .node_host_warning_with_os(|| "Bad OS Node".into())
+            .unwrap();
+        assert_eq!(warning.code, "invalid_node_host");
+        assert!(warning.message.contains("LDH"));
+        assert!(warning.recovery.contains("restart"));
+        assert!(config.name.is_empty());
+        config.name = "node-a.invalid".into();
+        assert!(config
+            .node_host_warning_with_os(|| panic!("configured name must bypass OS lookup"))
+            .is_none());
+        assert_eq!(config.name, "node-a.invalid");
+    }
 
     #[test]
     fn upsert_top_level_bool_replaces_existing_value() {

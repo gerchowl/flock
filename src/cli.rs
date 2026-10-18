@@ -545,6 +545,12 @@ fn config_check_outcome() -> ConfigCheckOutcome {
             // bindings are actually resolved — and those are the warnings this
             // command mostly exists to catch.
             diagnostics.extend(loaded.config.collect_diagnostics());
+            diagnostics.extend(
+                loaded
+                    .config
+                    .node_host_warning()
+                    .map(|warning| warning.to_string()),
+            );
 
             if diagnostics.is_empty() {
                 ConfigCheckOutcome::Clean

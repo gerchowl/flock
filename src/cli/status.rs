@@ -104,6 +104,7 @@ pub(crate) enum ServerRuntimeStatus {
 
 fn print_full_status(json: bool) -> std::io::Result<i32> {
     let config_warnings = crate::config::removed_config_warnings();
+    let node_host_warning = crate::config::Config::load().config.node_host_warning();
     let server = read_server_runtime_status()?;
     let installed = read_installed_status(&server);
     let (peers, enrollment_warning) = if matches!(server, ServerRuntimeStatus::Running { .. }) {
@@ -115,6 +116,7 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
     if json {
         print_json(&FullStatusJson {
             config_warnings: config_warnings.clone(),
+            node_host_warning: node_host_warning.clone(),
             client: client_status_json(),
             server: server_status_json(&server),
             update: update_status_json(&server),
@@ -125,6 +127,9 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
         return Ok(0);
     }
 
+    if let Some(warning) = node_host_warning {
+        println!("node identity warning: {warning}");
+    }
     for warning in config_warnings {
         println!("config warning: {warning}");
     }
@@ -327,6 +332,8 @@ fn restart_needed_label(server: &ServerRuntimeStatus) -> &'static str {
 
 #[derive(Serialize)]
 struct FullStatusJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_host_warning: Option<crate::peers::NodeHostWarning>,
     config_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enrollment_warning: Option<String>,
