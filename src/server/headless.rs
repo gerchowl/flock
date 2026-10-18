@@ -1212,6 +1212,26 @@ impl HeadlessServer {
         self.app.state.structured_agents.handoff_unknown()
     }
 
+    /// Capture the descriptor and manifest flag from one ownership snapshot.
+    /// A later listener stop cannot revoke this handoff's owned descriptor.
+    #[cfg(feature = "web")]
+    fn export_client_listener(
+        &self,
+        manifest: &mut crate::server::handoff::HandoffManifest,
+    ) -> io::Result<Option<std::os::fd::OwnedFd>> {
+        let descriptor = self
+            .client_wire
+            .as_ref()
+            .map(|wire| wire.export_descriptor())
+            .transpose()?
+            .flatten();
+        if descriptor.is_some() {
+            manifest.client_listener = true;
+            manifest.version = crate::server::handoff::CLIENT_LISTENER_HANDOFF_VERSION;
+        }
+        Ok(descriptor)
+    }
+
     #[cfg(unix)]
     fn perform_live_handoff(
         &mut self,
@@ -1415,23 +1435,13 @@ impl HeadlessServer {
             manifest.store_generation = store_generation.saturating_add(1);
         }
         #[cfg(feature = "web")]
-        let client_descriptor = match self
-            .client_wire
-            .as_ref()
-            .map(|wire| wire.export_descriptor())
-            .transpose()
-        {
-            Ok(descriptor) => descriptor.flatten(),
+        let client_descriptor = match self.export_client_listener(&mut manifest) {
+            Ok(descriptor) => descriptor,
             Err(error) => {
                 self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
                 return Err(error.into());
             }
         };
-        #[cfg(feature = "web")]
-        if client_descriptor.is_some() {
-            manifest.client_listener = true;
-            manifest.version = crate::server::handoff::CLIENT_LISTENER_HANDOFF_VERSION;
-        }
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
             &socket_path,
@@ -5334,6 +5344,46 @@ mod tests {
         .await
         .expect("headless loop did not finish after explicit owned shutdown");
         result.unwrap();
+    }
+
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn handoff_export_keeps_descriptor_snapshot_when_listener_stops() {
+        use std::os::fd::IntoRawFd;
+        fn manifest() -> crate::server::handoff::HandoffManifest {
+            let snapshot = serde_json::from_value(serde_json::json!({
+                "workspaces":[], "active":null, "selected":0,
+            }))
+            .unwrap();
+            crate::server::handoff::manifest_for(snapshot, Vec::new(), None, None)
+        }
+        let (_root, listener) = crate::web::client_listener::tests::prepared_listener().await;
+        let mut server = test_headless_server();
+        let address = listener.local_addr().unwrap();
+        server.client_wire = Some(listener);
+        let mut captured = manifest();
+        let descriptor = server
+            .export_client_listener(&mut captured)
+            .unwrap()
+            .unwrap();
+        crate::web::client_listener::tests::fail_activation(server.client_wire.as_mut().unwrap())
+            .await;
+        assert!(captured.client_listener);
+        assert_eq!(
+            captured.version,
+            crate::server::handoff::CLIENT_LISTENER_HANDOFF_VERSION
+        );
+        let transferred =
+            crate::platform::client_listener::take(&mut vec![descriptor.into_raw_fd()]).unwrap();
+        assert_eq!(transferred.local_addr().unwrap(), address);
+        let mut stopped = manifest();
+        assert!(server
+            .export_client_listener(&mut stopped)
+            .unwrap()
+            .is_none());
+        assert!(!stopped.client_listener);
+        assert_eq!(stopped.version, crate::server::handoff::HANDOFF_VERSION);
+        server.client_wire.take().unwrap().shutdown().await.unwrap();
     }
 
     fn test_headless_server() -> HeadlessServer {

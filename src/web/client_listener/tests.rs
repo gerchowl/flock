@@ -326,3 +326,32 @@ fn server_failure_wins_over_listener_shutdown_failure_and_logs_secondary_kind() 
     );
     assert!(finish_shutdown(Ok(()), Ok(())).is_ok());
 }
+
+/// Isolated prepared listener for the headless handoff-export boundary test.
+pub(crate) async fn prepared_listener() -> (crate::test_support::TempDir, Listener) {
+    let root = crate::test_support::TempDir::socket();
+    let listener = Listener::prepare_using(
+        Some("127.0.0.1:0".parse().unwrap()),
+        Codes::default(),
+        root.path().into(),
+        None,
+        Health::default(),
+        Arc::new(SystemClock),
+        Arc::new(|_| Ok(())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    (root, listener)
+}
+
+/// Drive the real activation cleanup without an external forwarding probe.
+pub(crate) async fn fail_activation(listener: &mut Listener) {
+    listener.activate_with_addr(|_| Err(io::Error::from_raw_os_error(libc::EIO)));
+    let error = bounded(listener.task.take().unwrap())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    assert!(listener.export_descriptor().unwrap().is_none());
+}

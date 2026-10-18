@@ -187,3 +187,36 @@ async fn activation_address_failure_clears_endpoint_socket_and_health() {
     assert!(fixture.listener.export_descriptor().unwrap().is_none());
     fixture.listener.shutdown().await.unwrap();
 }
+
+#[test]
+fn activation_address_failure_never_publishes_listening_and_has_its_own_event() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let logs = crate::logging::capture_logs(|| {
+        runtime.block_on(async {
+            let mut fixture = Fixture::new().await;
+            let health = fixture.listener.health.clone();
+            let sequence = Arc::new(Mutex::new(Vec::new()));
+            let observed = sequence.clone();
+            fixture.listener.activate_with_addr(move |_| {
+                observed.lock().unwrap().push(health.status());
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            });
+            let error = bounded(fixture.listener.task.take().unwrap())
+                .await
+                .unwrap()
+                .unwrap_err();
+            sequence
+                .lock()
+                .unwrap()
+                .push(fixture.listener.health.status());
+            assert_eq!(*sequence.lock().unwrap(), vec![None, Some(Status::Failed)]);
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            fixture.listener.shutdown().await.unwrap();
+        })
+    });
+    assert!(logs.contains("client.listener.address_failed"), "{logs}");
+    assert!(!logs.contains("client.listener.probe_failed"), "{logs}");
+}

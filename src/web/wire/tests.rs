@@ -996,3 +996,30 @@ async fn shutdown_is_idempotent_and_shares_concurrent_completion() {
     );
     server.finish().await;
 }
+
+#[tokio::test]
+async fn timed_out_shutdown_is_not_cached_and_can_be_retried() {
+    let server = Server::new().await;
+    let lease = server
+        .core
+        .shared
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .unwrap();
+    assert!(server.core.shutdown().await.is_err());
+    assert!(server.core.shutdown_complete.get().is_none());
+    {
+        let retry = server.core.shutdown();
+        tokio::pin!(retry);
+        assert!(
+            futures_util::poll!(&mut retry).is_pending(),
+            "retry must still wait for the held connection lease"
+        );
+        drop(lease);
+        within(&mut retry).await.unwrap();
+        assert!(server.core.shutdown_complete.get().is_some());
+        within(server.core.shutdown()).await.unwrap();
+    }
+    server.finish().await;
+}
