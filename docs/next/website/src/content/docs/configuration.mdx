@@ -471,9 +471,10 @@ place. The local setting is read at attach and refreshed by the existing client
 config reload request. Re-enabling immediately republishes the last title received
 from the active server, even if that title has not changed. Pane programs' own
 OSC 0/2 titles are consumed by the server's terminal emulator and are not
-forwarded to the host through render frames. If a title is unexpectedly absent, check both configs
-and terminal passthrough support. If disabling it on the server appears to have
-no effect, check that you edited the attached server's config and reloaded it.
+forwarded to the host through render frames. If a title is unexpectedly absent,
+check both configs and terminal passthrough support. If disabling it on the
+server appears to have no effect, check that you edited the attached server's
+config and reloaded it.
 
 Inside tmux, the title only reaches the outer terminal if tmux is allowed to
 pass the sequence through:

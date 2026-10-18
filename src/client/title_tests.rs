@@ -90,17 +90,32 @@ fn output_for(mode: &str) -> Vec<u8> {
     }
     let status = child.wait().unwrap();
     reading.join().unwrap();
-    let output = result.expect("title worker must finish within its bounded ceiling");
+    let mut output = result.expect("title worker must finish within its bounded ceiling");
     assert!(
         status.success(),
         "{status:?}: {}",
         String::from_utf8_lossy(&output)
     );
+    if reenable {
+        let echo = b"continue\r\n";
+        let positions: Vec<_> = output
+            .windows(echo.len())
+            .enumerate()
+            .filter_map(|(index, bytes)| (bytes == echo).then_some(index))
+            .collect();
+        assert_eq!(
+            positions.len(),
+            1,
+            "fixture acknowledgment echo: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        output.drain(positions[0]..positions[0] + echo.len());
+    }
     output
 }
 
 fn config_text(enabled: bool) -> String {
-    format!("[title]\nenabled = {enabled}\n[slots]\nenabled = false\n")
+    format!("[title]\nenabled = {enabled}\n[slots]\nenabled = false\n[ui]\nfile_drop = \"never\"\n[keys]\nprefix = \"ctrl+a\"\n")
 }
 
 #[test]
@@ -177,12 +192,18 @@ fn title_output_worker() {
     let mode = std::env::var("FLOCK_TEST_TITLE_MODE").unwrap();
     let local_config = crate::config::Config::load().config;
     HOST_WINDOW_TITLE_ALLOWED.store(local_config.title.enabled, Ordering::Release);
-    if mode == "snapshot" {
+    if mode == "snapshot" || mode.ends_with("_snapshot") {
         std::fs::write(
             std::env::var(crate::config::CONFIG_PATH_ENV_VAR).unwrap(),
-            config_text(true),
+            config_text(true)
+                .replace("never", "auto")
+                .replace("ctrl+a", "ctrl+b"),
         )
         .unwrap();
+    }
+    if mode.ends_with("_snapshot") {
+        assert_dial_snapshot(&mode, local_config);
+        return;
     }
     if mode == "reload" {
         HOST_WINDOW_TITLE_ALLOWED.store(true, Ordering::Release);
@@ -192,6 +213,11 @@ fn title_output_worker() {
     } else {
         let (client, mut server) = UnixStream::pair().unwrap();
         let server_mode = mode.clone();
+        let snapshot_input = (mode == "snapshot").then(|| {
+            let path = std::env::var(crate::config::CONFIG_PATH_ENV_VAR).unwrap();
+            format!("\x1b[200~{path}\x1b[201~").into_bytes()
+        });
+        let expected_input = snapshot_input.clone();
         let serving = std::thread::spawn(move || {
             if server_mode != "reenable_empty" {
                 protocol::write_message(
@@ -227,6 +253,17 @@ fn title_output_worker() {
                         .unwrap();
                 }
             }
+            if let Some(expected) = expected_input {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let input: protocol::ClientMessage =
+                    protocol::read_message(&mut server, protocol::MAX_FRAME_SIZE).unwrap();
+                assert!(
+                    matches!(input, protocol::ClientMessage::Input { data } if data == expected),
+                    "the loaded file_drop=never snapshot must send the paste as input"
+                );
+            }
             protocol::write_message(
                 &mut server,
                 &ServerMessage::ServerShutdown {
@@ -236,7 +273,10 @@ fn title_output_worker() {
             .unwrap();
         });
         let quit = Arc::new(AtomicBool::new(false));
-        let (_stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel(1);
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel(1);
+        if let Some(input) = snapshot_input {
+            stdin_tx.try_send(input).unwrap();
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -271,4 +311,120 @@ fn title_output_worker() {
     }
     restore_host_window_title();
     restore_host_window_title();
+}
+
+#[test]
+fn warm_dial_uses_the_attach_snapshot_after_the_config_file_changes() {
+    output_for("warm_snapshot");
+}
+
+#[test]
+fn switch_dial_uses_the_attach_snapshot_after_the_config_file_changes() {
+    output_for("switch_snapshot");
+}
+
+#[test]
+fn prewarm_bridge_dial_passes_the_attach_snapshot_to_the_switch_dialer() {
+    output_for("bridge_snapshot");
+}
+
+fn assert_dial_snapshot(mode: &str, config: crate::config::Config) {
+    use super::slots::SlotTarget;
+    use super::{spawn_switch_dial, spawn_warm_bridge_dial, spawn_warm_dial, ClientLoopEvent};
+    use crate::protocol::{ClientKeybindings, ClientMessage, MAX_FRAME_SIZE, PROTOCOL_VERSION};
+    use std::os::unix::net::UnixListener;
+    let path = std::path::PathBuf::from(std::env::var(crate::config::CONFIG_PATH_ENV_VAR).unwrap())
+        .with_file_name("s");
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // Exec-isolated worker: these values cannot affect another test or live server.
+    std::env::set_var(
+        crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
+        &path,
+    );
+    std::env::set_var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR, "local");
+    let expected = config.local_keybindings_profile_toml().unwrap();
+    let changed = crate::config::Config::load()
+        .config
+        .local_keybindings_profile_toml()
+        .unwrap();
+    assert_ne!(
+        expected, changed,
+        "fixture config must change after the snapshot"
+    );
+    let (sent, mut received) = tokio::sync::mpsc::channel(1);
+    match mode {
+        "warm_snapshot" => spawn_warm_dial(
+            1,
+            SlotTarget::Home,
+            path,
+            (80, 24, 0, 0),
+            RenderEncoding::TerminalAnsi,
+            config,
+            sent,
+        ),
+        "switch_snapshot" => spawn_switch_dial(
+            1,
+            SlotTarget::Home,
+            (80, 24, 0, 0),
+            RenderEncoding::TerminalAnsi,
+            config,
+            None,
+            None,
+            sent,
+        ),
+        "bridge_snapshot" => spawn_warm_bridge_dial(
+            1,
+            SlotTarget::Home,
+            (80, 24, 0, 0),
+            RenderEncoding::TerminalAnsi,
+            config,
+            sent,
+        ),
+        _ => panic!("unknown dial fixture: {mode}"),
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut peer = rt
+        .block_on(async {
+            let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("dial must reach the private fixture listener")
+                .unwrap()
+                .0
+        })
+        .into_std()
+        .unwrap();
+    peer.set_nonblocking(false).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let hello: ClientMessage = protocol::read_message(&mut peer, MAX_FRAME_SIZE).unwrap();
+    protocol::write_message(
+        &mut peer,
+        &ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+            encoding: RenderEncoding::TerminalAnsi,
+            error: None,
+        },
+    )
+    .unwrap();
+    let event = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .expect("dial must report completion")
+            .expect("dial event channel must remain open")
+    });
+    assert!(
+        matches!(event, ClientLoopEvent::SlotWarmed { .. }),
+        "dial must complete successfully"
+    );
+    match hello {
+        ClientMessage::Hello {
+            keybindings: ClientKeybindings::Local { keys_toml },
+            ..
+        } => assert_eq!(keys_toml, expected, "dial reloaded the changed config"),
+        _ => panic!("dial must send the local keybindings from its snapshot"),
+    }
 }

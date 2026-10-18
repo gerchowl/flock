@@ -926,20 +926,15 @@ fn carried_fleet_snapshot() -> Option<protocol::FleetSnapshot> {
     }
 }
 
-fn requested_keybindings(local_config: Option<&crate::config::Config>) -> ClientKeybindings {
+/// Every Hello uses the attach snapshot, including background slot dials.
+/// Requiring it here prevents a handshake from reloading the config file.
+fn requested_keybindings(local_config: &crate::config::Config) -> ClientKeybindings {
     match std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR)
         .ok()
         .as_deref()
     {
         Some("local") => local_config
-            .map_or_else(
-                || {
-                    crate::config::Config::load()
-                        .config
-                        .local_keybindings_profile_toml()
-                },
-                |config| config.local_keybindings_profile_toml(),
-            )
+            .local_keybindings_profile_toml()
             .map(|keys_toml| ClientKeybindings::Local { keys_toml })
             .unwrap_or(ClientKeybindings::Server),
         _ => ClientKeybindings::Server,
@@ -977,7 +972,7 @@ fn do_handshake(
     // (the origin carries no snapshot), so without this a switch to a spoke
     // hands it `fleet: None` and the spoke loses its servers band/home row.
     fleet_override: Option<&protocol::FleetSnapshot>,
-    local_config: Option<&crate::config::Config>,
+    local_config: &crate::config::Config,
 ) -> Result<RenderEncoding, ClientError> {
     let handshake_t0 = Instant::now();
     stream
@@ -1724,7 +1719,7 @@ fn run_attach_attempt(
         attach_request.is_some(),
         host_theme,
         None, // initial attach: the launcher-carried snapshot (env) is correct
-        Some(local_config),
+        local_config,
     )
     .map_err(AttachAttemptError::Handshake)?;
 
@@ -2640,6 +2635,7 @@ async fn run_client_loop(
                                         target.clone(),
                                         geometry,
                                         negotiated_encoding,
+                                        local_config.clone(),
                                         fleet.clone(),
                                         proxy_jump.clone(),
                                         event_tx.clone(),
@@ -3051,6 +3047,7 @@ async fn run_client_loop(
                                             socket_path,
                                             geometry,
                                             negotiated_encoding,
+                                            local_config.clone(),
                                             event_tx.clone(),
                                         );
                                     }
@@ -3071,6 +3068,7 @@ async fn run_client_loop(
                                             target.clone(),
                                             geometry,
                                             negotiated_encoding,
+                                            local_config.clone(),
                                             event_tx.clone(),
                                         );
                                     }
@@ -3696,6 +3694,7 @@ fn spawn_warm_dial(
     socket_path: std::path::PathBuf,
     geometry: (u16, u16, u32, u32),
     requested_encoding: RenderEncoding,
+    local_config: crate::config::Config,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     std::thread::spawn(move || {
@@ -3720,7 +3719,7 @@ fn spawn_warm_dial(
                 false,
                 None,
                 None,
-                None,
+                &local_config,
             )?;
             Ok(stream)
         })();
@@ -3757,6 +3756,7 @@ fn spawn_warm_bridge_dial(
     target: slots::SlotTarget,
     geometry: (u16, u16, u32, u32),
     requested_encoding: RenderEncoding,
+    local_config: crate::config::Config,
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
 ) {
     spawn_switch_dial(
@@ -3764,6 +3764,7 @@ fn spawn_warm_bridge_dial(
         target,
         geometry,
         requested_encoding,
+        local_config,
         None,
         None,
         event_tx,
@@ -3783,6 +3784,7 @@ fn spawn_switch_dial(
     target: slots::SlotTarget,
     geometry: (u16, u16, u32, u32),
     requested_encoding: RenderEncoding,
+    local_config: crate::config::Config,
     // The hub's snapshot from the SwitchServer message -- carried into the
     // spoke's handshake so it renders the servers band / home row (#102).
     fleet: Option<protocol::FleetSnapshot>,
@@ -3826,7 +3828,7 @@ fn spawn_switch_dial(
                                 false,
                                 None,
                                 fleet.as_ref(),
-                                None,
+                                &local_config,
                             )
                         })?;
                         return Ok((stream, None));
@@ -3877,7 +3879,7 @@ fn spawn_switch_dial(
                                     false,
                                     None,
                                     fleet.as_ref(),
-                                    None,
+                                    &local_config,
                                 )
                             })?;
                             Ok((stream, Some(bridge)))
@@ -4942,6 +4944,7 @@ mod tests {
             slots::SlotTarget::Home,
             (90, 30, 8, 16),
             RenderEncoding::SemanticFrame,
+            crate::config::Config::default(),
             Some(hub.clone()),
             None,
             event_tx,
