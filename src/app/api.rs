@@ -32,6 +32,7 @@ pub(crate) mod peers;
 pub(super) mod responses;
 mod revert;
 mod spawn;
+pub(crate) mod structured_messages;
 pub(crate) mod structured_queue;
 mod tabs;
 pub(crate) mod workspaces;

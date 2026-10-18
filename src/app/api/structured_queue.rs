@@ -12,7 +12,7 @@ use crate::{
     structured::{
         permissions::Principal,
         queue::{
-            admission::{Failure, Gate},
+            admission::{Failure, Gate, Principal as QueuePrincipal},
             model::{Delivery, Kind, Priority, Producer, State},
             Item,
         },
@@ -39,6 +39,13 @@ pub(crate) struct SendParams {
 }
 type Key = (String, u64, String);
 type ResultId = Result<crate::api::schema::AgentSendResult, ErrorCode>;
+// Admission response and optional post-commit custody settlement.
+type Parked = (
+    String,
+    Receiver<ResultId>,
+    Sender<String>,
+    Option<super::structured_messages::Ack>,
+);
 /// Pending durable admission. Dropping a ticket never cancels a committed item.
 /// No delivery deadline or automatic retry exists. Reuse `item_id` after inspecting
 /// an uncertain result; identical committed retries are idempotent.
@@ -48,12 +55,18 @@ pub(crate) struct Ticket {
     /// Completion from the journal owner, not bounded-channel acceptance.
     pub committed: Receiver<ResultId>,
 }
-pub(crate) struct Staged(String, Ticket);
+pub(crate) struct Staged(
+    pub(super) String,
+    pub(super) Ticket,
+    pub(super) Option<super::structured_messages::Ack>,
+);
 /// Bounded response routing attached to the existing sole completion consumer.
 #[derive(Default)]
 pub(crate) struct Sends {
     waiting: HashMap<Key, Sender<ResultId>>,
-    parked: Vec<(String, Receiver<ResultId>, Sender<String>)>,
+    parked: Vec<Parked>,
+    pub(super) acknowledged: Vec<super::structured_messages::Ack>,
+    pub(super) recovering: Vec<crate::mesh::store::Envelope>,
     pub staged: Option<Staged>,
 }
 impl Sends {
@@ -75,12 +88,12 @@ impl Sends {
             );
         }
     }
-    pub(crate) fn park(&mut self, Staged(id, ticket): Staged, reply: Sender<String>) {
+    pub(crate) fn park(&mut self, Staged(id, ticket, ack): Staged, reply: Sender<String>) {
         tracing::debug!(
             item_id = ticket.item_id.as_str(),
             "waiting for durable queue admission"
         );
-        self.parked.push((id, ticket.committed, reply));
+        self.parked.push((id, ticket.committed, reply, ack));
     }
     /// Fences unresolved acknowledgements when their original worker disappears.
     /// Such an admission may have committed: report unknown, never auto-resend.
@@ -95,19 +108,26 @@ impl Sends {
                 true
             }
         });
-        self.parked.retain(|(id, receipt, reply)| {
+        let acknowledged = &mut self.acknowledged;
+        self.parked.retain_mut(|(id, receipt, reply, ack)| {
             let result = match receipt.try_recv() {
                 Ok(result) => result,
                 Err(TryRecvError::Empty) => return true,
                 Err(TryRecvError::Disconnected) => Err(ErrorCode::InputWriteUnknown),
             };
             let response = match result {
-                Ok(result) => encode_success(
-                    id.clone(),
-                    ResponseResult::AgentQueued {
-                        item_id: result.item_id,
-                    },
-                ),
+                Ok(result) => {
+                    let response = if let Some(ack) = ack.take() {
+                        let response = ack.response(result.item_id);
+                        acknowledged.push(ack);
+                        response
+                    } else {
+                        ResponseResult::AgentQueued {
+                            item_id: result.item_id,
+                        }
+                    };
+                    encode_success(id.clone(), response)
+                }
                 Err(code) => encode_error(
                     id.clone(),
                     code.as_str(),
@@ -184,21 +204,13 @@ impl App {
         if matches!(principal, Principal::Agent(id) | Principal::Lease(id) if *id == agent) {
             return Err(ErrorCode::SelfMessageForbidden);
         }
-        let operator = matches!(
-            origin,
-            crate::structured::queue::admission::Principal::Operator
-        );
+        let operator = matches!(origin, QueuePrincipal::Operator);
         let item_id = match params.item_id {
             Some(id) => id,
             None => crate::structured::queue::admission::item_uuid().map_err(|error| error.code)?,
         };
         if !crate::structured::queue::admission::canonical_uuid(&item_id) {
             return Err(ErrorCode::InvalidRequest);
-        }
-        let key = (agent.clone(), generation, item_id.clone());
-        if self.structured_sends.full(operator) || self.structured_sends.waiting.contains_key(&key)
-        {
-            return Err(ErrorCode::SessionBusy);
         }
         let item = Item {
             item_id: item_id.clone(),
@@ -217,6 +229,23 @@ impl App {
             attachments: vec![],
             metadata: Default::default(),
         };
+        self.structured_enqueue(agent, generation, item, origin)
+    }
+    /// Single owner admission for authenticated adapters, including local custody.
+    pub(super) fn structured_enqueue(
+        &mut self,
+        agent: String,
+        generation: u64,
+        item: Item,
+        origin: QueuePrincipal,
+    ) -> Result<Ticket, ErrorCode> {
+        let operator = matches!(origin, QueuePrincipal::Operator);
+        let item_id = item.item_id.clone();
+        let key = (agent.clone(), generation, item_id.clone());
+        if self.structured_sends.full(operator) || self.structured_sends.waiting.contains_key(&key)
+        {
+            return Err(ErrorCode::SessionBusy);
+        }
         self.structured_workers.enqueue(
             &self.state.structured_agents,
             &agent,
@@ -273,7 +302,7 @@ impl App {
             &principal,
         ) {
             Ok(ticket) => {
-                self.structured_sends.staged = Some(Staged(id, ticket));
+                self.structured_sends.staged = Some(Staged(id, ticket, None));
                 String::new()
             }
             Err(code) => encode_error(id, code.as_str(), "structured admission refused"),

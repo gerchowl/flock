@@ -300,3 +300,5 @@ fn narrow(p: AgentSendParams) -> crate::app::StructuredSendParams {
         item_id: p.item_id,
     }
 }
+
+mod local_messages;

@@ -4,6 +4,9 @@ use std::io::{BufRead, BufReader, Write};
 // Exercise the real socket credential capture and application dispatcher. Account
 // policy classifies the real UID; it never changes accounts or requires privilege.
 async fn socket(r: &mut AppQueue, p: AgentSendParams) -> Value {
+    socket_method(r, Method::AgentSend(p)).await
+}
+pub(super) async fn socket_method(r: &mut AppQueue, method: Method) -> Value {
     let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
     client.set_read_timeout(Some(LIMIT)).unwrap();
     server.set_read_timeout(Some(LIMIT)).unwrap();
@@ -30,7 +33,7 @@ async fn socket(r: &mut AppQueue, p: AgentSendParams) -> Value {
             "{}",
             serde_json::to_string(&Request {
                 id: "security-send".into(),
-                method: Method::AgentSend(p),
+                method,
             })
             .unwrap()
         )

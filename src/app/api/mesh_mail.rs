@@ -156,6 +156,7 @@ impl App {
             Ok((accepted, delivered)) => encode_success(
                 id,
                 ResponseResult::MsgQueued {
+                    item_id: None,
                     message_key: Some(delivery.envelope.key),
                     correlation_id: delivery.envelope.correlation_id,
                     state: if !delivered {
@@ -471,6 +472,7 @@ impl App {
             let _ = respond_to.send(encode_success(
                 send.id,
                 ResponseResult::MsgQueued {
+                    item_id: None,
                     message_key: Some(delivery.envelope.key.clone()),
                     correlation_id: send.correlation_id,
                     state: state.into(),
@@ -586,6 +588,18 @@ impl App {
             {
                 continue;
             }
+            if self.state.structured_agents.get(&record.target).is_some() {
+                if let Err(code) = self.verified_local_custody(&record.envelope) {
+                    crate::logging::mesh_custody_failed("structured-restore", code.as_str());
+                    continue;
+                }
+                if !record.read {
+                    self.structured_sends.recovering.push(record.envelope);
+                } else {
+                    self.mailboxes.record_delivered(&record.message);
+                }
+                continue;
+            }
             if !record.target.is_empty() {
                 if let Some(location) = self.locate_agent(&record.target).filter(|l| l.local) {
                     record.message.to_pane = location.pane_id;
@@ -600,6 +614,7 @@ impl App {
                 self.mailboxes.enqueue(record.message);
             }
         }
+        self.finish_structured_messages(true);
         self.sync_blocking_mail();
     }
 
@@ -1143,6 +1158,7 @@ pub(crate) struct RecoveredMessage {
     message: PendingMessage,
     target: String,
     read: bool,
+    envelope: Envelope,
 }
 
 /// Load and decode on the recovery worker, projecting only on the app loop.
@@ -1262,13 +1278,14 @@ pub(crate) fn load_mesh_mail(
                 target.clone_from(agent);
             }
         }
-        data.message.message_key = Some(record.envelope.key);
+        data.message.message_key = Some(record.envelope.key.clone());
         data.message.enqueued_at_ms =
             now_ms().saturating_sub((record.mailbox_ttl_ms - record.remaining_ms).max(0) as u64);
         loaded.push(RecoveredMessage {
             message: data.message,
             target,
             read: record.state == "read",
+            envelope: record.envelope,
         });
     }
     Ok(loaded)

@@ -219,12 +219,14 @@ impl App {
             now,
             crate::app::notifications::now_ms(),
         );
-        self.queue_events.poll(
+        let published = self.queue_events.poll(
             &self.structured_workers,
             &self.state.structured_agents,
             &self.event_hub,
             &mut self.structured_sends,
-        ) || changed
+        );
+        self.finish_structured_messages(changed || published);
+        published || changed
     }
 
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {

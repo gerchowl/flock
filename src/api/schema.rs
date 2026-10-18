@@ -3330,6 +3330,9 @@ pub enum ResponseResult {
         delegates: Vec<DelegateRow>,
     },
     MsgQueued {
+        /// Durable structured queue identity; absent for legacy terminal mail.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_key: Option<crate::mesh::key::MessageKey>,
         correlation_id: String,
