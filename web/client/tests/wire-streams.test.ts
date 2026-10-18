@@ -383,3 +383,22 @@ describe("sub_id_reused (ADR-0036 §5a)", () => {
     expect(h.connection.streams().get("s1")?.state).toBe("Refused");
   });
 });
+
+
+test("lagged skipped_to is diagnostic and never becomes an applied cursor", () => {
+  for (const applied of [null, 2]) {
+    const h = new Harness();
+    live(h);
+    const seen: number[] = [];
+    h.connection.subscribe("agent/a", {
+      event: (seq) => seen.push(seq), gap: () => undefined, synced: () => undefined,
+      snapshot: () => undefined, reset: () => undefined, refused: () => undefined,
+    });
+    if (applied !== null) h.step(step({ step: "send", frame: { t: "ev", sub_id: "s1", stream: "agent/a", seq: applied, ts_ms: 0, ev: { type: "user", message: {} } } }));
+    h.step(step({ step: "send", frame: { t: "lagged", sub_id: "s1", skipped_to: 99 } }));
+    expect(h.connection.streams().get("s2")?.cursor).toBe(applied);
+    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s2", stream: "agent/a", ...(applied === null ? {} : { after: applied }) });
+    h.step(step({ step: "send", frame: { t: "ev", sub_id: "s2", stream: "agent/a", seq: 3, ts_ms: 0, ev: { type: "user", message: {} } } }));
+    expect(seen).toEqual(applied === null ? [3] : [2, 3]);
+  }
+});

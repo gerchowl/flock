@@ -3017,6 +3017,9 @@ pub enum ResponseResult {
         session_health: Option<crate::platform::SessionHealth>,
         #[serde(default)]
         api_listener: Option<ApiListenerHealth>,
+        /// Confirmed structured listener state; failure never stops the server or its PTYs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_listener: Option<super::client_listener::Status>,
         /// Missing on older servers; observing status never starts an NSS lookup.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_account_diagnostic: Option<AgentAccountDiagnostic>,
@@ -5711,6 +5714,7 @@ mod tests {
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
+                client_listener: None,
                 agent_account_diagnostic: None,
             },
         };

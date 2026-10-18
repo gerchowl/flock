@@ -498,7 +498,7 @@ pub fn validated_prompt_float_lines(lines: u16) -> u16 {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientConfig {
-    /// Explicit IPv4 loopback address with a nonzero port, e.g. `127.0.0.1:7682`.
+    /// IPv4 loopback address; port 0 selects an OS-assigned port reported by `client open`.
     pub bind: Option<std::net::SocketAddr>,
 }
 
@@ -653,6 +653,8 @@ pub enum AgentAccount {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    /// Structured persistence policy (ADR-0036 §4).
+    pub sessions: crate::structured::blobs::StorageConfig,
     /// Local socket identity policy (ADR-0036 §1a).
     pub security: SecurityConfig,
     /// Structured Claude launch policy (ADR-0036 §1); activation is #1439.

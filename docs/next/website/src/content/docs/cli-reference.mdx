@@ -1025,5 +1025,10 @@ server URL from its own location; no config script is served.
 The code expires after 60 seconds; it is exchanged once for a bearer and is never
 placed in the query or diagnostic logs. Set `[client] bind = "127.0.0.1:7682"`
 explicitly. This is separate from the terminal bridge's `[web]` settings and
-requires the `web` feature. The structured listener integration is tracked by
-#1828; the exchange router alone does not start a listener.
+requires the `web` feature. The headless server mounts the GUI, browser-code
+exchange and WebSocket core on this opt-in listener. Port `0` selects an
+OS-assigned port; `client open` reports the live address after binding and keeps
+it across configuration reloads. Host/Origin must match that address. Startup
+refuses active public funnel or an unavailable/invalid bounded funnel probe.
+The handshake-only transport currently advertises no command capabilities;
+subscription and command routing follow in the remaining structured-client slices.
