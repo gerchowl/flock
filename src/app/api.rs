@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod peer_uid_tests;
 #[cfg(test)]
+mod scoped_mcp_tests;
+#[cfg(test)]
 mod structured_lease_tests;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -32,6 +34,8 @@ pub(crate) mod peers;
 pub(super) mod responses;
 mod revert;
 mod spawn;
+mod structured_agents;
+mod structured_start;
 mod tabs;
 pub(crate) mod workspaces;
 mod worktrees;
@@ -210,7 +214,7 @@ impl App {
             respond_to,
         } = ev
         {
-            self.advance_guarded_request(request_id, pane_id, attempt, respond_to);
+            self.advance_guarded_request(request_id, pane_id, *attempt, respond_to);
             return;
         }
         if let AppEvent::ClipboardWrite { content } = ev {
@@ -1404,6 +1408,17 @@ impl App {
         request: &crate::api::schema::Request,
     ) -> Option<String> {
         use crate::api::{error_code::ErrorCode, schema::Method};
+        if self
+            .current_api_scope
+            .as_ref()
+            .is_some_and(|scope| scope.caller() == crate::structured::lease::Caller::Uncertain)
+        {
+            return Some(responses::encode_error(
+                request.id.clone(),
+                ErrorCode::NotAuthorized.as_str(),
+                "scoped caller authentication refused",
+            ));
+        }
         let uid = self.current_api_peer_uid?;
         let code = if matches!(
             request.method,
@@ -1464,6 +1479,7 @@ impl App {
             self.pending_recovery_park = Some((
                 request,
                 super::ApiCaller {
+                    scope: self.current_api_scope.clone(),
                     pid: self.current_api_peer_pid,
                     birth: self.current_api_peer_birth,
                     uid: self.current_api_peer_uid,
@@ -1515,6 +1531,7 @@ impl App {
                     result: ResponseResult::ConfigReload {
                         status: report.status,
                         diagnostics: report.diagnostics,
+                        sections: report.sections,
                     },
                 }
             }
@@ -1573,6 +1590,7 @@ impl App {
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
+            Method::AgentStop(target) => return self.handle_structured_stop(request.id, target),
             Method::AgentFocus(target) => return self.handle_agent_focus(request.id, target),
             Method::AgentRename(params) => return self.handle_agent_rename(request.id, params),
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),

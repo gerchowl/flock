@@ -4611,6 +4611,8 @@ mod tests {
         let spawn = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::AgentSpawn(crate::api::schema::AgentSpawnParams {
+                runtime: crate::api::schema::AgentRuntime::Pty,
+                model: None,
                 agent: "claude".into(),
                 prompt: "pick up the second half".into(),
                 location: crate::api::schema::SpawnLocation::WorktreePath {

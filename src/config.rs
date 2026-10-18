@@ -5,6 +5,7 @@ mod env;
 mod io;
 mod keybinds;
 pub(crate) mod model;
+pub(crate) mod reload;
 mod sound;
 mod spawn_env;
 mod theme;

@@ -143,8 +143,9 @@ impl PaneClickState {
 }
 
 /// Socket attribution preserved across recovery continuations.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ApiCaller {
+    scope: Option<crate::api::scoped::Scope>,
     pid: Option<u32>,
     birth: Option<Option<u64>>,
     uid: Option<Option<u32>>,
@@ -170,6 +171,10 @@ pub(crate) const RECOVERY_PARK_LIMIT: Duration = Duration::from_secs(5);
 /// preserve normal command lookup through the server's PATH.
 #[derive(Default)]
 pub(crate) struct AppRuntimeConfig {
+    /// Immutable baseline for sections whose consumers require process restart.
+    pub(crate) startup_reload_policy: Config,
+    /// Owning listener endpoint, never supplied by an API caller.
+    pub(crate) structured_mcp: Option<crate::structured::launch::SessionMcp>,
     /// Command used by every app merge-evidence query, including workers.
     pub(crate) merge_gate: crate::worktree::MergeGateContext,
     /// Account lookup captured once, independent of caller-controlled requests.
@@ -197,6 +202,8 @@ pub struct App {
     /// Peer PID of the API request currently being handled; lets pane
     /// reports resolve by process ancestry when env pane-ids are stale.
     pub(crate) current_api_peer_pid: Option<u32>,
+    /// Revocable scoped admission, preserved across queues and continuations.
+    pub(crate) current_api_scope: Option<crate::api::scoped::Scope>,
     /// Internal call, captured socket birth, or captured-but-unavailable birth.
     pub(crate) current_api_peer_birth: Option<Option<u64>>,
     /// Internal call, captured UID, or captured-but-unavailable UID.
@@ -557,6 +564,7 @@ impl App {
         event_hub: crate::api::EventHub,
         mut runtime_config: AppRuntimeConfig,
     ) -> Self {
+        runtime_config.startup_reload_policy = config.clone();
         // Absence is explicit policy, never an inference from a pending lookup.
         if config.security.agent_account == crate::config::model::AgentAccount::None {
             runtime_config.uid_policy.dedicated = Ok(None).into();
@@ -1004,6 +1012,7 @@ impl App {
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
             current_api_peer_pid: None,
+            current_api_scope: None,
             current_api_peer_birth: None,
             current_api_peer_uid: None,
             session_leases: Default::default(),
@@ -1290,11 +1299,13 @@ impl App {
         peer_pid: Option<u32>,
         peer_birth: Option<Option<u64>>,
         peer_uid: Option<Option<u32>>,
+        scope: Option<crate::api::scoped::Scope>,
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
         self.recovery_parked.push(ParkedApiRequest {
             request,
             caller: ApiCaller {
+                scope,
                 pid: peer_pid,
                 birth: peer_birth,
                 uid: peer_uid,
@@ -1327,7 +1338,9 @@ impl App {
             self.current_api_peer_birth,
             self.current_api_peer_uid,
         );
+        let scope = self.current_api_scope.take();
         for parked in std::mem::take(&mut self.recovery_parked) {
+            self.current_api_scope = parked.caller.scope;
             self.current_api_peer_pid = parked.caller.pid;
             self.current_api_peer_birth = parked.caller.birth;
             self.current_api_peer_uid = parked.caller.uid;
@@ -1339,6 +1352,7 @@ impl App {
             self.current_api_peer_birth,
             self.current_api_peer_uid,
         ) = caller;
+        self.current_api_scope = scope;
     }
 
     #[cfg(unix)]
@@ -1888,6 +1902,7 @@ impl App {
                 crate::config::ConfigReloadReport {
                     status: crate::config::ConfigReloadStatus::Failed,
                     diagnostics,
+                    sections: Vec::new(),
                 }
             }
         };
@@ -1903,6 +1918,38 @@ impl App {
         notify_success: bool,
     ) -> crate::config::ConfigReloadReport {
         let mut diagnostics = load_diagnostics.to_vec();
+        let mut sections = match crate::config::reload::plan(
+            &self.state.config,
+            &self.runtime_config.startup_reload_policy,
+            config,
+            invalid_sections,
+        ) {
+            Ok(sections) => sections,
+            Err(error) => {
+                let diagnostics = vec![error.into()];
+                self.state.toast = None;
+                self.state.config_diagnostic =
+                    crate::config::config_diagnostic_summary(&diagnostics);
+                self.config_diagnostic_deadline = None;
+                return crate::config::ConfigReloadReport {
+                    status: crate::config::ConfigReloadStatus::Failed,
+                    diagnostics,
+                    sections: Vec::new(),
+                };
+            }
+        };
+        let mut rejected_sections = invalid_sections.to_vec();
+        for section in &sections {
+            if section.status == crate::config::reload::SectionStatus::RestartRequired
+                && section.section != "security"
+            {
+                diagnostics.push(format!(
+                    "{} changed: restart required to apply this section",
+                    section.section
+                ));
+            }
+        }
+
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
@@ -1918,8 +1965,12 @@ impl App {
         // re-populate `state.config` per valid section so accessors reflect
         // the reloaded values. Invalid sections keep the previous config —
         // consistent with the "keep-current-on-error" contract everywhere.
-        if !invalid_section("keys") {
-            self.state.config.keys = config.keys.clone();
+        // Launch and admission consume these snapshots only for new sessions.
+        if !invalid_section("structured") {
+            self.state.config.structured = config.structured.clone();
+        }
+        if !invalid_section("fleet") {
+            self.state.config.fleet = config.fleet;
         }
         if !invalid_section("experimental") {
             self.state.config.experimental = config.experimental.clone();
@@ -1934,6 +1985,7 @@ impl App {
             self.state.config.worktrees = config.worktrees.clone();
         }
         if !invalid_section("events") {
+            self.state.config.events = config.events.clone();
             self.event_hub
                 .set_read_max_wait_ms(config.events.read_max_wait_ms);
         }
@@ -1947,41 +1999,56 @@ impl App {
             self.state.config.channels = config.channels.clone();
             crate::channels::issue_tokens(&config.channels, &short_host_name());
         }
-        // Sections without an explicit invalidation gate always follow the
-        // incoming config.
-        self.state.config.name = config.name.clone();
-        self.state.config.onboarding = config.onboarding;
-        self.state.config.session = config.session.clone();
-        self.state.config.update = config.update;
-        self.state.config.remote = config.remote.clone();
-        self.state.config.slots = config.slots.clone();
-        self.state.config.peers = config.peers.clone();
+        // The cached node name is startup-owned, matching its reload classification.
+        // Valid live sections retain their existing consumers.
+        if !invalid_section("onboarding") {
+            self.state.config.onboarding = config.onboarding;
+        }
+        if !invalid_section("session") {
+            self.state.config.session = config.session.clone();
+        }
+        if !invalid_section("update") {
+            self.state.config.update = config.update;
+        }
+        if !invalid_section("remote") {
+            self.state.config.remote = config.remote.clone();
+        }
+        if !invalid_section("slots") {
+            self.state.config.slots = config.slots.clone();
+        }
+        if !invalid_section("peers") {
+            self.state.config.peers = config.peers.clone();
+        }
         // #96: publish the live-reloaded gossip cadence to the poll-tick thread
         // so `flk server reload-config` re-arms the loop without a restart.
         // Diagnostics ride along via collect_diagnostics; consumers clamp via
         // `poll_interval()` so an invalid `0` still produces a live cadence.
-        diagnostics.extend(config.gossip.diagnostics());
-        self.state.config.gossip = config.gossip;
-        self.gossip_poll_interval_secs.store(
-            config.gossip.poll_interval().as_secs().max(1),
-            Ordering::Relaxed,
-        );
+        if !invalid_section("gossip") {
+            diagnostics.extend(config.gossip.diagnostics());
+            self.state.config.gossip = config.gossip;
+            self.gossip_poll_interval_secs.store(
+                config.gossip.poll_interval().as_secs().max(1),
+                Ordering::Relaxed,
+            );
+        }
         // Drop tracker entries for peers no longer configured; surviving peers
         // keep their in-flight lock (matches the overlap guard's intent).
         self.peer_poll_tracker
-            .retain_only(config.peers.iter().map(|p| p.name.as_str()));
+            .retain_only(self.state.config.peers.iter().map(|p| p.name.as_str()));
         // Same intent one layer down: a held ssh connection outlives a reload,
         // but not one whose peer is gone or whose ssh target moved.
-        crate::peer_stream::retain_configured(&config.peers);
+        crate::peer_stream::retain_configured(&self.state.config.peers);
 
         if !invalid_section("keys") {
             match config.live_keybinds() {
                 Ok(live) => {
+                    self.state.config.keys = config.keys.clone();
                     self.state.prefix_code = live.prefix.0;
                     self.state.prefix_mods = live.prefix.1;
                     self.state.keybinds = live.keybinds;
                 }
                 Err(keybind_diagnostics) => {
+                    rejected_sections.push("keys".into());
                     diagnostics.extend(
                         keybind_diagnostics
                             .into_iter()
@@ -2002,6 +2069,7 @@ impl App {
             )
             .is_none()
             {
+                rejected_sections.push("ui".into());
                 diagnostics.push(format!(
                     "ui.sidebar_min_width ({}) is greater than sidebar_max_width ({}); keeping previous [ui] settings",
                     config.ui.sidebar_min_width, config.ui.sidebar_max_width,
@@ -2031,7 +2099,7 @@ impl App {
                 self.state.agent_aliases = config.ui.agent_aliases.clone();
                 self.state.adopt_external_worktrees = config.worktrees.adopt_external;
                 self.state.branch_pivot_message = config.worktrees.branch_pivot_message.clone();
-                if self.state.peers != config.peers {
+                if !invalid_section("peers") && self.state.peers != config.peers {
                     // Keep polled data for peers that survive the reload.
                     self.state.peer_summaries = config
                         .peers
@@ -2116,7 +2184,12 @@ impl App {
                 .unwrap_or_else(|| "catppuccin".to_string());
         }
 
-        let status = if diagnostics.is_empty() {
+        let status = if diagnostics.is_empty()
+            && rejected_sections.is_empty()
+            && sections
+                .iter()
+                .all(|section| section.status == crate::config::reload::SectionStatus::Applied)
+        {
             crate::config::ConfigReloadStatus::Applied
         } else {
             crate::config::ConfigReloadStatus::Partial
@@ -2148,9 +2221,15 @@ impl App {
             }
         }
 
+        for section in &mut sections {
+            if rejected_sections.contains(&section.section) {
+                section.status = crate::config::reload::SectionStatus::Invalid;
+            }
+        }
         crate::config::ConfigReloadReport {
             status,
             diagnostics,
+            sections,
         }
     }
 }
@@ -2342,6 +2421,9 @@ impl App {
         self.handle_mouse(mouse);
     }
 }
+
+#[cfg(test)]
+mod reload_policy_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3690,6 +3772,35 @@ sidebar_pane_gap = 99
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// ADR-0002's live snapshot must agree with the startup-owned node label.
+    #[test]
+    fn reload_config_name_report_matches_the_running_name_until_restart() {
+        let _guard = config_env_guard();
+        let path = temp_config_path("reload-startup-name");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = test_app();
+        let original_name = app.state.config.name.clone();
+        std::fs::write(&path, "name='renamed.example.test'\nonboarding=false\n").unwrap();
+        for _ in 0..2 {
+            let report = app.reload_config();
+            assert_eq!(app.state.config.name, original_name);
+            assert_eq!(app.state.config.onboarding, Some(false));
+            assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+            assert_eq!(
+                report
+                    .sections
+                    .iter()
+                    .find(|section| section.section == "name")
+                    .unwrap()
+                    .status,
+                crate::config::reload::SectionStatus::RestartRequired
+            );
+        }
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     #[test]
     fn removed_key_on_live_reload_applies_other_settings() {
         let _guard = config_env_guard();
@@ -3698,16 +3809,22 @@ sidebar_pane_gap = 99
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
         let mut app = test_app();
         let workspace_count = app.state.workspaces.len();
+        let original_name = app.state.config.name.clone();
         for removed in [
             "[msg]\nuplink_timeout_secs=20",
             "[msg]\nuplink_heartbeat_secs=3",
             "[msg]\ndeferral_relay_concurrency=1",
             "[[peers]]\nname='nodea'\nsummary_command='false'",
         ] {
-            std::fs::write(&path, format!("name='changed'\n{removed}\n")).unwrap();
+            std::fs::write(
+                &path,
+                format!("name='changed'\nonboarding=false\n{removed}\n"),
+            )
+            .unwrap();
             let report = app.reload_config();
             assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
-            assert_eq!(app.state.config.name, "changed");
+            assert_eq!(app.state.config.name, original_name);
+            assert_eq!(app.state.config.onboarding, Some(false));
             assert_eq!(app.state.workspaces.len(), workspace_count);
             assert!(app
                 .state
@@ -4489,6 +4606,8 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_390".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -4665,6 +4784,8 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_390_explicit".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -4698,6 +4819,8 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_390_split".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -4723,6 +4846,8 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_398_active".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -4749,6 +4874,8 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_398_here".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -4844,6 +4971,8 @@ sidebar_pane_gap = 99
                 id: format!("req_agent_start_398_{index}"),
                 method: crate::api::schema::Method::AgentStart(
                     crate::api::schema::AgentStartParams {
+                        runtime: Default::default(),
+                        model: None,
                         label: None,
                         dry_run: false,
                         name: format!("worker-{index}"),
@@ -5313,6 +5442,8 @@ sidebar_pane_gap = 99
         };
 
         let base = || crate::api::schema::AgentStartParams {
+            runtime: Default::default(),
+            model: None,
             label: None,
             dry_run: false,
             name: "worker".into(),
@@ -5331,6 +5462,8 @@ sidebar_pane_gap = 99
         // `--active`: names the focused space, so there is something to split.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 dry_run: false,
                 active: true,
                 ..base()
@@ -5342,6 +5475,8 @@ sidebar_pane_gap = 99
         let response = attempt(&|app: &App| {
             let workspace_id = app.public_workspace_id(0);
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 dry_run: false,
                 workspace_id: Some(workspace_id),
                 ..base()
@@ -5353,6 +5488,8 @@ sidebar_pane_gap = 99
         let response = attempt(&|app: &App| {
             let tab_id = app.public_tab_id(0, 0).expect("a public tab id");
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 dry_run: false,
                 tab_id: Some(tab_id),
                 ..base()
@@ -5363,6 +5500,8 @@ sidebar_pane_gap = 99
         // `--cwd` naming an OPEN checkout: resolves to a space, so it splits it.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 dry_run: false,
                 cwd: Some(open_checkout.display().to_string()),
                 ..base()
@@ -5377,6 +5516,8 @@ sidebar_pane_gap = 99
         // `a_headless_start_naming_an_unopened_checkout_still_gets_a_space_of_its_own`.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 dry_run: false,
                 cwd: Some(unopened.display().to_string()),
                 ..base()
@@ -5410,6 +5551,8 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_398_precedence".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -5650,6 +5793,8 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_own_space".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -5709,6 +5854,8 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_focus".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),

@@ -965,6 +965,15 @@ impl App {
         err: TerminalTargetError,
     ) -> crate::api::schema::ErrorBody {
         match err {
+            TerminalTargetError::RuntimeUnsupported { target } => {
+                crate::api::schema::ErrorBody {
+                    data: None,
+                    code: crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str().into(),
+                    message: format!(
+                        "agent {target} has no PTY placement; this operation requires a pane"
+                    ),
+                }
+            }
             TerminalTargetError::NotFound { target } => crate::api::schema::ErrorBody {
                 data: None,
                 code: "agent_not_found".into(),
@@ -1374,7 +1383,7 @@ impl App {
         })
     }
 
-    fn agent_name_conflicts(
+    pub(super) fn agent_name_conflicts(
         &self,
         name: &str,
         except_terminal_id: &str,
@@ -1706,6 +1715,8 @@ mod tests {
         Request {
             id: "req_agent_start_cwd".into(),
             method: Method::AgentStart(AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -1729,6 +1740,8 @@ mod tests {
         Request {
             id: "req_agent_start_profile".into(),
             method: Method::AgentStart(AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
