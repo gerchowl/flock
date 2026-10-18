@@ -27,7 +27,16 @@ fn has_title_operation(output: &[u8]) -> bool {
 fn output_for(mode: &str) -> Vec<u8> {
     let root = crate::test_support::TempDir::socket();
     let config = root.path().join("config.toml");
-    std::fs::write(&config, config_text(mode == "allowed")).unwrap();
+    let initial = if mode.starts_with("slot_reload") {
+        reload_tests::config(if mode == "slot_reload_invalid" {
+            "ctrl+c"
+        } else {
+            "ctrl+a"
+        })
+    } else {
+        config_text(mode == "allowed")
+    };
+    std::fs::write(&config, initial).unwrap();
     let pair = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize {
             rows: 24,
@@ -190,8 +199,12 @@ fn attach_uses_the_loaded_snapshot_even_if_the_file_changes_before_the_loop() {
 #[ignore = "exec-isolated terminal writer fixture"]
 fn title_output_worker() {
     let mode = std::env::var("FLOCK_TEST_TITLE_MODE").unwrap();
-    let local_config = crate::config::Config::load().config;
+    let mut local_config = crate::config::Config::load().config;
     HOST_WINDOW_TITLE_ALLOWED.store(local_config.title.enabled, Ordering::Release);
+    if mode.starts_with("slot_reload") {
+        reload_tests::run(&mode, local_config);
+        return;
+    }
     if mode == "snapshot" || mode.ends_with("_snapshot") {
         std::fs::write(
             std::env::var(crate::config::CONFIG_PATH_ENV_VAR).unwrap(),
@@ -208,7 +221,12 @@ fn title_output_worker() {
     if mode == "reload" {
         HOST_WINDOW_TITLE_ALLOWED.store(true, Ordering::Release);
         HOST_WINDOW_TITLE_OWNED.store(true, Ordering::Release);
-        reload_local_client_config(&mut crate::config::SoundConfig::default(), &mut false, None);
+        reload_local_client_config(
+            &mut crate::config::SoundConfig::default(),
+            &mut false,
+            None,
+            &mut local_config,
+        );
         assert!(!HOST_WINDOW_TITLE_ALLOWED.load(Ordering::Acquire));
     } else {
         let (client, mut server) = UnixStream::pair().unwrap();
@@ -296,7 +314,7 @@ fn title_output_worker() {
             None,
             &mut stdin_rx,
             Instant::now(),
-            &local_config,
+            &mut local_config,
         ));
         quit.store(true, Ordering::Release);
         serving.join().unwrap();
@@ -428,3 +446,6 @@ fn assert_dial_snapshot(mode: &str, config: crate::config::Config) {
         _ => panic!("dial must send the local keybindings from its snapshot"),
     }
 }
+
+#[path = "title_tests/reload_tests.rs"]
+mod reload_tests;
