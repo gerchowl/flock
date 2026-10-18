@@ -147,7 +147,7 @@ impl BlobStore {
     /// Clock expiry warns with TimedOut; attempt exhaustion warns with WouldBlock.
     /// Other lock errors warn immediately. Each warns once and falls back to
     /// unlocked publication; duplicate diagnostics are then possible, but locking
-    /// never loses content. Contention stalls the stream pump for about 20 ms
+    /// never loses content. Contention stalls the stream pump for at most about 20 ms
     /// plus scheduling overshoot. Filesystem latency is separately unbounded.
     /// Non-cooperating filesystem mutations are outside this advisory lock.
     /// Read/write/rename/sync failures remain explicit; reads report corruption.
