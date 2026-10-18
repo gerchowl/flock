@@ -68,6 +68,10 @@ impl Runtime {
     /// Offer a bounded user envelope only while idle; WouldBlock never waits.
     /// Queue-owned workers refuse this raw entry with queue_mode_unsupported;
     /// producers must use generation-fenced queue admission instead.
+    /// Successful admission emits an internal accepted-input fact through
+    /// `Received::state_input`, arming S4 silence observation before started.
+    /// Success acknowledges admission, not delivery or provider execution.
+    /// Cancellation errors also request process shutdown, not just pipe closure.
     /// `structured_turn_end_unknown` means loss concealed the boundary; await a
     /// subsequent result or explicitly stop, rather than retry as ordinary busy.
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
@@ -77,7 +81,11 @@ impl Runtime {
                 crate::api::error_code::ErrorCode::QueueModeUnsupported.as_str(),
             ));
         }
-        self.transport.try_submit(user)
+        let result = self.transport.try_submit(user);
+        if result.is_err() && self.control.cancelled() {
+            self.stop.request();
+        }
+        result
     }
     pub(super) fn input_handle(&self) -> &InputHandle {
         &self.transport
@@ -538,7 +546,9 @@ fn collect(
             if !queue.flush(control.cancelled(), notify) {
                 return false;
             }
-            queue.tick(&input, stop.requested(), notify);
+            if queue.tick(&input, stop.requested(), notify) && control.cancelled() {
+                stop.request();
+            }
             queue.flush(control.cancelled(), notify)
         });
         if pending.is_none() && queue_ready {
@@ -552,8 +562,12 @@ fn collect(
                             .as_object()
                             .is_some_and(|object| object.contains_key("messaging_socket_path"))
                     });
-                    let uninspectable =
-                        received.record.origin == RecordOrigin::Flk && !init_inspected;
+                    let uninspectable = received.record.origin == RecordOrigin::Flk
+                        && !init_inspected
+                        && !matches!(
+                            received.state_input(),
+                            Some(super::state::Input::Accepted { .. })
+                        );
                     if init.is_some() && !forbidden {
                         init_inspected = true;
                     }
@@ -571,7 +585,9 @@ fn collect(
                         facts.delivery_cancelled = true;
                     }
                     if let Some(queue) = &mut queue {
-                        queue.event(&input, &received, stop.requested());
+                        if queue.event(&input, &received, stop.requested()) && control.cancelled() {
+                            stop.request();
+                        }
                     }
                     if !control.cancelled() {
                         pending = Some(received);
