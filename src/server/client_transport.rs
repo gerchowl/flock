@@ -36,9 +36,60 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 /// Disconnect an observer after this long without bytes accepted by its socket.
 /// Idle connections with no pending output are unaffected, and every partial
 /// write restarts the monotonic deadline, even within a single large frame.
-/// Known limit: trickling readers can retain up to this much control-message
-/// backlog per frame. This is a no-progress limit, not a total delivery deadline.
-const OBSERVER_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// A trickling reader can delay delivery indefinitely, but the control queue
+/// has a separate frame and byte bound. This is not a total delivery deadline.
+pub(super) const OBSERVER_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum queued control frames per observer, excluding the frame being written.
+const OBSERVER_CONTROL_CAPACITY: usize = 8;
+/// Maximum bytes in one queued control frame, including its wire length prefix.
+const OBSERVER_CONTROL_FRAME_BYTES: usize = MAX_GRAPHICS_FRAME_SIZE + 4;
+
+/// Nonblocking, bounded control delivery. Overflow disconnects only this observer.
+#[derive(Clone, Debug)]
+pub(super) struct ObserverControl {
+    sender: std::sync::mpsc::SyncSender<Vec<u8>>,
+    socket: Option<Arc<UnixStream>>,
+    client_id: u64,
+}
+
+impl ObserverControl {
+    /// Create the bounded queue and retain a socket for immediate overflow shutdown.
+    pub(super) fn channel(
+        socket: Option<UnixStream>,
+        client_id: u64,
+    ) -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(OBSERVER_CONTROL_CAPACITY);
+        (
+            Self {
+                sender,
+                socket: socket.map(Arc::new),
+                client_id,
+            },
+            receiver,
+        )
+    }
+
+    /// Queue a frame without blocking the server, or close an overloaded observer.
+    pub(super) fn send(&self, frame: Vec<u8>) -> Result<(), std::sync::mpsc::SendError<Vec<u8>>> {
+        let rejected = if frame.len() > OBSERVER_CONTROL_FRAME_BYTES {
+            frame
+        } else {
+            match self.sender.try_send(frame) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(frame)) => frame,
+                Err(std::sync::mpsc::TrySendError::Disconnected(frame)) => {
+                    return Err(std::sync::mpsc::SendError(frame))
+                }
+            }
+        };
+        crate::logging::client_conn_control_overflow(self.client_id);
+        if let Some(socket) = &self.socket {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        Err(std::sync::mpsc::SendError(rejected))
+    }
+}
 
 /// Maximum input payload size (bytes) for a single `ClientMessage::Input`.
 const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
@@ -47,7 +98,7 @@ const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 #[derive(Clone, Debug)]
 pub(crate) struct ClientWriter {
     /// Reliable control messages such as shutdown, notifications, and clipboard writes.
-    pub(crate) control: std::sync::mpsc::Sender<Vec<u8>>,
+    pub(super) control: ObserverControl,
     /// Droppable render messages. Capacity is one so slow clients cannot build lag.
     pub(crate) render: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
@@ -279,7 +330,7 @@ pub(crate) fn handle_client_handshake(
     stream.set_read_timeout(None)?;
 
     // Create separate channels for reliable control messages and droppable renders.
-    let (control_tx, control_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (control_tx, control_rx) = ObserverControl::channel(Some(stream.try_clone()?), client_id);
     let (render_tx, render_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
     let writer = ClientWriter {
         control: control_tx,
@@ -334,11 +385,10 @@ pub(super) fn client_writer_loop(
         render_rx,
         server_event_tx,
         OBSERVER_WRITE_STALL_TIMEOUT,
-        Instant::now,
     );
 }
 
-/// Run the real socket writer with a supplied no-progress limit and clock.
+/// Run the real socket writer with a supplied no-progress limit.
 fn client_writer_loop_timed(
     stream: UnixStream,
     client_id: u64,
@@ -346,7 +396,6 @@ fn client_writer_loop_timed(
     render_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     server_event_tx: mpsc::Sender<ServerEvent>,
     timeout: Duration,
-    now: fn() -> Instant,
 ) {
     client_writer_loop_with(
         stream,
@@ -354,7 +403,7 @@ fn client_writer_loop_timed(
         control_rx,
         render_rx,
         server_event_tx,
-        |stream, data| write_framed_bytes(stream, data, client_id, timeout, now),
+        |stream, data| write_framed_bytes(stream, data, client_id, timeout, Instant::now),
     );
 }
 

@@ -1,7 +1,7 @@
 use super::*;
 use crate::server::client_transport::{
     client_read_loop, client_writer_loop, client_writer_loop_with, finish_write,
-    write_with_progress,
+    write_with_progress, OBSERVER_WRITE_STALL_TIMEOUT,
 };
 use std::cell::Cell;
 use std::io::Write;
@@ -134,7 +134,7 @@ async fn stalled_observer_disconnect_preserves_live_pane_and_healthy_observer() 
                 .unwrap();
             let result = write_with_progress(
                 data,
-                Duration::from_secs(30),
+                OBSERVER_WRITE_STALL_TIMEOUT,
                 || now.get(),
                 |bytes, _remaining| {
                     assert!(
@@ -144,7 +144,7 @@ async fn stalled_observer_disconnect_preserves_live_pane_and_healthy_observer() 
                     match socket.write(bytes) {
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                             observed_backpressure = true;
-                            now.set(now.get() + Duration::from_secs(30));
+                            now.set(now.get() + OBSERVER_WRITE_STALL_TIMEOUT);
                             Err(err)
                         }
                         other => other,

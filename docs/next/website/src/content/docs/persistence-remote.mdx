@@ -31,6 +31,13 @@ flk server stop
 
 When Flock starts again after a full server stop, it restores the saved session shape. For what survives detach, server restart, screen history replay, native agent session restore, and live handoff, see [Session state and restore](/docs/session-state/).
 
+Control delivery is bounded to eight queued frames per observer, each at most
+32 MiB plus its four-byte length prefix, with one additional frame in flight.
+Exceeding either limit disconnects that observer and logs
+`client_conn.control_overflow`. Trickling readers can delay delivery indefinitely
+but cannot grow this backlog without bound. Render frames have a separate
+one-frame queue.
+
 A terminal observer with pending output is disconnected after 30 seconds without
 any bytes accepted by its socket. Queuing a render is not progress. Each partial
 socket write restarts this limit, so a slow reader that keeps making progress can

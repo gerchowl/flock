@@ -5321,7 +5321,8 @@ mod tests {
         std::sync::mpsc::Receiver<Vec<u8>>,
         std::sync::mpsc::Receiver<Vec<u8>>,
     ) {
-        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let (control_tx, control_rx) =
+            crate::server::client_transport::ObserverControl::channel(None, 0);
         let (render_tx, render_rx) = std::sync::mpsc::sync_channel(1);
         (
             ClientWriter {
