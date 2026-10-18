@@ -63,7 +63,9 @@ filesystem watcher or automatic command-time revocation route is added
 here; the command slice must recheck storage before dispatch as ADR-0036 requires.
 Closing the core cancels pending hellos and authenticated sockets. Explicit
 shutdown waits up to five seconds for connection leases and reports failure to
-release them; it never treats that ceiling as evidence of success.
+release them; it never treats that ceiling as evidence of success. Concurrent
+and repeated shutdown calls share a successful completion without sending
+another cancellation. A timed-out or cancelled caller may retry the drain.
 
 Transport tests use an isolated TCP adapter around the real router. Fixture
 vectors are selected by their machine-readable `covers` fields. This slice
@@ -101,7 +103,11 @@ work and agent PTYs continue. Clearing forwarding does not automatically
 restart a stopped listener; a fresh server or handoff can activate it safely.
 
 Live handoff transfers the bound listening descriptor rather than rebinding its
-port after commit. The importer validates a listening socket and its configured
+port after commit. Export snapshots the descriptor and its manifest flag under
+the exposure-stop ownership lock: if stopping wins, export records no listener;
+if export wins, its owned descriptor survives closure of the serving copy.
+An activation address-query failure clears the endpoint and socket and reports
+`failed`, just like other listener failures. The importer validates a listening socket and its configured
 address, constructs the guarded routers before ready, then accepts only after
 commit. Descriptor-extension version 2 makes an older importer refuse before
 commit, including handoffs with zero PTYs. Existing sockets reconnect when the

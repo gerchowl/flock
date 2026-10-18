@@ -212,23 +212,16 @@ impl Listener {
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?
             .local_addr()
     }
-    /// Observe owned descriptor presence without hiding an address-query failure.
-    pub(crate) fn has_socket(&self) -> io::Result<bool> {
-        Ok(self
-            .socket
+    /// Snapshot the transferable descriptor under the exposure-stop ownership lock.
+    /// A stopped listener exports as disabled; a captured descriptor stays owned
+    /// even if the supervisor subsequently closes its copy.
+    pub(crate) fn export_descriptor(&self) -> io::Result<Option<std::os::fd::OwnedFd>> {
+        self.socket
             .lock()
             .map_err(|_| io::Error::other("listener ownership poisoned"))?
-            .is_some())
-    }
-    /// Duplicate only while this owner still has a live bound socket.
-    pub(crate) fn duplicate(&self) -> io::Result<std::os::fd::OwnedFd> {
-        crate::platform::client_listener::duplicate(
-            self.socket
-                .lock()
-                .map_err(|_| io::Error::other("listener ownership poisoned"))?
-                .as_ref()
-                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?,
-        )
+            .as_ref()
+            .map(crate::platform::client_listener::duplicate)
+            .transpose()
     }
     /// A pending reload is retained even during an in-flight probe; bursts coalesce.
     pub(crate) fn recheck(&self) {
@@ -236,6 +229,12 @@ impl Listener {
     }
     /// Start only inside the owning server loop, after handoff commit if importing.
     pub(crate) fn activate(&mut self) {
+        self.activate_with_addr(tokio::net::TcpListener::local_addr);
+    }
+    fn activate_with_addr(
+        &mut self,
+        address: impl FnOnce(&tokio::net::TcpListener) -> io::Result<SocketAddr> + Send + 'static,
+    ) {
         if let Some((socket, router)) = self.prepared.take() {
             self.health.publish(Status::Listening);
             let health = self.health.clone();
@@ -246,13 +245,18 @@ impl Listener {
             let core = self.core.clone();
             let codes = self.codes.clone();
             self.task = Some(tokio::spawn(async move {
-                let port = socket.local_addr()?.port();
-                let result = tokio::select! {
+                let result = match address(&socket) {
+                    Err(error) => {
+                        publish_probe_failure(&health, &error);
+                        Err(error)
+                    }
+                    Ok(address) => tokio::select! {
                     result = serve(|| socket.accept(), router, clock.clone(), health.clone()) => result,
-                    result = monitor(clock, probe_fn, reload, port) => {
+                    result = monitor(clock, probe_fn, reload, address.port()) => {
                         if let Err(error) = &result { publish_probe_failure(&health, error); }
                         result
                     }
+                    },
                 };
                 drop(socket);
                 owned

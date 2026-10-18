@@ -979,3 +979,20 @@ fn per_principal_quota_preserves_siblings_and_global_sixteen_socket_limit() {
         server.finish().await;
     });
 }
+
+#[tokio::test]
+async fn shutdown_is_idempotent_and_shares_concurrent_completion() {
+    let server = Server::new().await;
+    let mut stop = server.core.shared.stop.subscribe();
+    let (first, second) =
+        within(async { tokio::join!(server.core.shutdown(), server.core.shutdown()) }).await;
+    first.unwrap();
+    second.unwrap();
+    assert!(*stop.borrow_and_update());
+    within(server.core.shutdown()).await.unwrap();
+    assert!(
+        !stop.has_changed().unwrap(),
+        "completed shutdown must not cancel again"
+    );
+    server.finish().await;
+}

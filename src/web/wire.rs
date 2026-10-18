@@ -85,6 +85,7 @@ impl Drop for Lease {
 /// Dropping the owner cancels every handshake and authenticated socket.
 pub(crate) struct Core {
     shared: Arc<Shared>,
+    shutdown_complete: tokio::sync::OnceCell<()>,
 }
 impl Drop for Core {
     fn drop(&mut self) {
@@ -106,6 +107,7 @@ impl Core {
         let epoch = store.random::<16>().map_err(io::Error::other)?;
         let (stop, _) = watch::channel(false);
         Ok(Self {
+            shutdown_complete: tokio::sync::OnceCell::new(),
             shared: Arc::new(Shared {
                 store: Arc::new(store),
                 epoch,
@@ -134,14 +136,21 @@ impl Core {
         }
     }
     /// Cancel transport work and wait for every connection lease, including hello.
+    /// Concurrent and repeated calls share one successful completion. A timed-out
+    /// or cancelled caller can retry draining without declaring shutdown complete.
     pub(crate) async fn shutdown(&self) -> Result<(), tokio::time::error::Elapsed> {
-        self.shared.stop.send_replace(true);
-        tokio::time::timeout(
-            SHUTDOWN_WAIT,
-            self.shared.slots.clone().acquire_many_owned(CONNECTIONS),
-        )
-        .await
-        .map(|_| ())
+        self.shutdown_complete
+            .get_or_try_init(|| async {
+                self.shared.stop.send_replace(true);
+                tokio::time::timeout(
+                    SHUTDOWN_WAIT,
+                    self.shared.slots.clone().acquire_many_owned(CONNECTIONS),
+                )
+                .await
+                .map(|_| ())
+            })
+            .await
+            .map(|_| ())
     }
 }
 async fn upgrade(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> Response {

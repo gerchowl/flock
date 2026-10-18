@@ -1415,16 +1415,22 @@ impl HeadlessServer {
             manifest.store_generation = store_generation.saturating_add(1);
         }
         #[cfg(feature = "web")]
+        let client_descriptor = match self
+            .client_wire
+            .as_ref()
+            .map(|wire| wire.export_descriptor())
+            .transpose()
         {
-            manifest.client_listener = self
-                .client_wire
-                .as_ref()
-                .map(|wire| wire.has_socket())
-                .transpose()?
-                .unwrap_or(false);
-            if manifest.client_listener {
-                manifest.version = crate::server::handoff::CLIENT_LISTENER_HANDOFF_VERSION;
+            Ok(descriptor) => descriptor.flatten(),
+            Err(error) => {
+                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                return Err(error.into());
             }
+        };
+        #[cfg(feature = "web")]
+        if client_descriptor.is_some() {
+            manifest.client_listener = true;
+            manifest.version = crate::server::handoff::CLIENT_LISTENER_HANDOFF_VERSION;
         }
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
@@ -1449,11 +1455,9 @@ impl HeadlessServer {
                 fds.push(runtime.duplicate_handoff_fd()?);
             }
             #[cfg(feature = "web")]
-            if let Some(wire) = &self.client_wire {
+            if let Some(descriptor) = client_descriptor {
                 use std::os::fd::IntoRawFd;
-                if manifest.client_listener {
-                    fds.push(wire.duplicate()?.into_raw_fd());
-                }
+                fds.push(descriptor.into_raw_fd());
             }
             Ok::<(), io::Error>(())
         })();

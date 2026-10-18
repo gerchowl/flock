@@ -73,10 +73,7 @@ impl Fixture {
             self.listener.local_addr().unwrap_err().kind(),
             io::ErrorKind::NotConnected
         );
-        assert_eq!(
-            self.listener.duplicate().unwrap_err().kind(),
-            io::ErrorKind::NotConnected
-        );
+        assert!(self.listener.export_descriptor().unwrap().is_none());
         assert_eq!(self.listener.codes.bound_endpoint(), None);
     }
 }
@@ -150,4 +147,43 @@ fn startup_exposure_refusal_and_health_share_a_typed_reason_and_warning() {
     assert_eq!(health.status(), Some(Status::ExposedByServe));
     assert!(logs.contains("status=ExposedByServe"));
     assert!(logs.contains("client.listener.probe_failed"));
+}
+
+#[tokio::test]
+async fn export_snapshot_survives_stop_and_stopped_export_is_disabled() {
+    let mut fixture = Fixture::new().await;
+    fixture.start().await;
+    let descriptor = fixture.listener.export_descriptor().unwrap().unwrap();
+    fixture.outcome.store(1, Ordering::SeqCst);
+    fixture.listener.recheck();
+    fixture.stopped(Status::ExposedByServe).await;
+    let transferred = crate::platform::client_listener::take(&mut vec![{
+        use std::os::fd::IntoRawFd;
+        descriptor.into_raw_fd()
+    }])
+    .unwrap();
+    assert!(transferred.local_addr().unwrap().ip().is_loopback());
+    assert!(fixture.listener.export_descriptor().unwrap().is_none());
+    fixture.listener.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn activation_address_failure_clears_endpoint_socket_and_health() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .listener
+        .codes
+        .set_endpoint(fixture.listener.local_addr().unwrap())
+        .unwrap();
+    fixture
+        .listener
+        .activate_with_addr(|_| Err(io::Error::from_raw_os_error(libc::EIO)));
+    let error = bounded(fixture.listener.task.take().unwrap())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    assert_eq!(fixture.listener.health.status(), Some(Status::Failed));
+    assert_eq!(fixture.listener.codes.bound_endpoint(), None);
+    assert!(fixture.listener.export_descriptor().unwrap().is_none());
+    fixture.listener.shutdown().await.unwrap();
 }
