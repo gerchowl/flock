@@ -53,7 +53,7 @@ pub struct WorktreeBranchDeleteResult {
 pub struct WorktreeRemoveResult {
     pub workspace_id: String,
     pub path: std::path::PathBuf,
-    pub result: Result<(), String>,
+    pub result: Result<(), crate::worktree::WorktreeRemoveFailure>,
     /// Processes whose cwd was inside the checkout when the removal started
     /// (#400). Captured up front because that is the last moment the kernel
     /// can answer the question; whichever of these outlive the teardown are

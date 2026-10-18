@@ -367,20 +367,23 @@ Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create
 
 ### Worktree removal recovery
 
-If the repository probe fails or its worktree administration directory cannot be
-read, removal refuses `worktree_repository_unreachable` (exit 10, retry
-`after_human`). Restore access to the repository and its Git administration
-metadata (mount, permissions or metadata repair), then retry; leave the checkout
-intact. The error names the repository requiring recovery.
+If the repository probe fails or access to its worktree administration metadata
+fails for a reason other than missing metadata, removal refuses
+`worktree_repository_unreachable` (exit 10, retry `after_human`). Restore access
+to the repository and its Git administration metadata (mount, permissions or
+metadata repair), then retry; leave the checkout intact. The error names the
+repository requiring recovery.
 
 A registered checkout directory that is present but has no valid `.git` link
 back to this repository's worktree admin entry is refused with
-`worktree_checkout_unreachable` (exit 10, retry `after_human`). `--force` cannot
-override it. The TUI kill dialog gives the same recovery: remount and retry, or,
-if the checkout is really gone, remove the directory yourself and retry. Flock
-never runs `git worktree prune` during removal or kill: pruning is repo-wide
-and can unlink other checkouts that are only temporarily absent. A completely
-absent directory still permits Git to remove that single registration.
+`worktree_checkout_unreachable` (exit 10, retry `after_human`). A missing admin
+entry or `worktrees/` directory also means the checkout is orphaned and uses
+this code and recovery text. `--force` cannot override it. The TUI kill dialog
+gives the same recovery: remount and retry, or, if the checkout is really gone,
+remove the directory yourself and retry. Flock never runs `git worktree prune`
+during removal or kill: pruning is repo-wide and can unlink other checkouts that
+are only temporarily absent. A completely absent directory still permits Git to
+remove that single registration.
 
 The refusal's `error.data` has `path` (the checkout path), `recovery` (the
 recovery text), and `possible_unmounted_mount_point` (`true` for the same device
