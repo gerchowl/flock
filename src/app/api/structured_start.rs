@@ -43,6 +43,13 @@ impl App {
         if params.argv != ["claude"] {
             return Err(ErrorCode::InvalidAgentArgv);
         }
+        // A legacy record needs explicit recovery, even when addressed by id.
+        if self.state.structured_agents.records().iter().any(|record| {
+            record.name.as_deref() == Some("self")
+                && (params.name == "self" || params.name == record.agent_id)
+        }) {
+            return Err(ErrorCode::StructuredLegacyNameReserved);
+        }
         if params.name == "self" {
             return Err(ErrorCode::InvalidAgentName);
         }

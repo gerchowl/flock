@@ -707,6 +707,16 @@ fn endpoint_warning_has_a_closed_path_free_reason() {
 /// admitted ancestry rather than taking the operator's root exemption.
 #[tokio::test]
 async fn app_operator_resume_preserves_record_and_lease_lineage() {
+    operator_resume_preserves_lineage(false).await;
+}
+
+/// The real session snapshot is the only lineage source in this fresh App.
+#[tokio::test]
+async fn cold_restore_operator_resume_preserves_lineage_and_enforces_fanout() {
+    operator_resume_preserves_lineage(true).await;
+}
+
+async fn operator_resume_preserves_lineage(cold: bool) {
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
     fixture.app.state.config.fleet.agent_spawn_enabled = true;
@@ -783,6 +793,61 @@ async fn app_operator_resume_preserves_record_and_lease_lineage() {
     for name in ["model.pid", "validated"] {
         fs::remove_file(fixture.fixture.root.path().join(name)).unwrap();
     }
+    if cold {
+        fixture.app.no_session = false;
+        fixture.app.save_session_now();
+        let snapshot = crate::persist::load().expect("saved structured registry");
+        assert_eq!(snapshot.structured_agents.records(), vec![record.clone()]);
+        let config = fixture.app.state.config.clone();
+        let policy = fixture.app.runtime_config.uid_policy.clone();
+        fixture
+            .app
+            .structured_workers
+            .shutdown(&mut fixture.app.state.structured_agents)
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = crate::api::EventHub::default();
+        let restored = App::new(&config, false, None, rx, hub.clone());
+        let old = std::mem::replace(&mut fixture.app, restored);
+        drop(old);
+        fixture.server.take().unwrap().finish_for_test();
+        let server = crate::api::server::start_server_with_capabilities(
+            tx,
+            hub,
+            Some(crate::api::schema::ServerCapabilities {
+                structured_agents: true,
+                live_handoff: false,
+                pane_input_write_ack: false,
+                node_id: None,
+                clone_detection_warning: None,
+                agent_start_label: true,
+                agent_questions: true,
+            }),
+            policy.clone(),
+        )
+        .unwrap();
+        fixture.app.runtime_config.uid_policy = policy;
+        fixture.app.initialize_mesh_mail(Some(&server)).unwrap();
+        fixture.server = Some(server);
+        assert_eq!(
+            fixture.app.state.structured_agents.records(),
+            vec![record.clone()]
+        );
+        assert!(fixture
+            .app
+            .structured_workers
+            .runtime(&id, generation)
+            .is_none());
+        assert!(fixture
+            .app
+            .session_leases
+            .admitted_identities()
+            .unwrap()
+            .is_empty());
+        // Operator resume is exempt even when current policy allows no children.
+        fixture.app.state.config.fleet.max_spawn_fanout = 0;
+    }
+    let notify = fixture.app.render_notify.clone();
     let resume = serde_json::from_value(
         json!({"name":"lineage-child", "runtime":"structured", "argv":["claude"]}),
     )
@@ -836,6 +901,28 @@ async fn app_operator_resume_preserves_record_and_lease_lineage() {
             .get(&id),
         Some(&Some("original-parent".into()))
     );
+    if cold {
+        fixture.app.state.config.fleet.max_spawn_fanout = 1;
+        let params = serde_json::from_value(json!({
+            "name":"next-child", "runtime":"structured", "argv":["claude"],
+            "cwd":fixture.fixture.root.path().join("project"), "model":"fixture-worker-model"
+        }))
+        .unwrap();
+        assert_eq!(
+            fixture
+                .app
+                .start_structured(
+                    params,
+                    &SpawnCaller::Structured {
+                        agent_id: Some("original-parent".into()),
+                        depth: 2,
+                    }
+                )
+                .unwrap_err(),
+            ErrorCode::AtFanoutLimit
+        );
+        assert_eq!(fixture.app.state.structured_agents.records().len(), 1);
+    }
 }
 
 #[tokio::test]
@@ -927,4 +1014,41 @@ async fn legacy_unknown_lineage_operator_resume_is_a_root() {
             .get("legacy-structured"),
         Some(&None)
     );
+}
+
+/// A pre-reservation record must explain how the operator can recover it.
+#[tokio::test]
+async fn legacy_self_record_has_typed_actionable_recovery_refusal() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    fixture.app.state.structured_agents = serde_json::from_value(json!([{
+        "runtime":"structured", "agent_id":"legacy-self", "name":"self",
+        "harness":"claude", "session_id":"00000000-0000-4000-8000-000000002075",
+        "cwd":fixture.fixture.root.path().join("project")
+    }]))
+    .unwrap();
+    for name in ["self", "legacy-self"] {
+        let params = serde_json::from_value(json!({
+            "name":name, "runtime":"structured", "argv":["claude"]
+        }))
+        .unwrap();
+        let refused = fixture.request(Method::AgentStart(params)).await;
+        assert_eq!(
+            refused["error"]["code"], "structured_legacy_name_reserved",
+            "{refused}"
+        );
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("self") && message.contains("rename or remove"),
+            "{message}"
+        );
+        assert_eq!(
+            ErrorCode::from_code(refused["error"]["code"].as_str().unwrap())
+                .unwrap()
+                .retry(),
+            crate::cli::exit::Retry::AfterHuman
+        );
+    }
+    assert_eq!(fixture.app.state.structured_agents.records().len(), 1);
+    assert!(!fixture.fixture.root.path().join("version.pid").exists());
 }

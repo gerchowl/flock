@@ -1023,6 +1023,10 @@ For structured targets the response type is `structured_agent_info`, containing
 record while cancellation and cleanup run asynchronously. It requires operator
 or structured-self authority. Offline stop is idempotent; Unknown ownership refuses
 with `structured_recovery_required` (retry `after_human`, CLI exit 1).
+A saved structured record named `self` refuses `agent.start`, by name or id,
+with `structured_legacy_name_reserved` (retry `after_human`, CLI exit 1). The
+operator must rename or remove the saved record before retrying; stop the server
+and back up the session snapshot before editing it.
 Pane-only operations return `runtime_unsupported` (retry `never`, CLI exit 2).
 These contracts do not enable public structured start; that remains gated until
 all #1843 routing and #1734 credential protection land. Mesh VERSION remains 5.

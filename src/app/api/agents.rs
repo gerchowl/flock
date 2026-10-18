@@ -226,7 +226,15 @@ impl App {
         if params.runtime == crate::api::schema::AgentRuntime::Structured {
             return match self.start_structured(params, &caller) {
                 Ok(result) => encode_success(id, result),
-                Err(code) => encode_error(id, code.as_str(), "structured start refused"),
+                Err(code) => encode_error(
+                    id,
+                    code.as_str(),
+                    if code == crate::api::error_code::ErrorCode::StructuredLegacyNameReserved {
+                        "legacy structured record uses reserved name 'self': rename or remove the saved record before retrying"
+                    } else {
+                        "structured start refused"
+                    },
+                ),
             };
         }
         if params.model.is_some() {

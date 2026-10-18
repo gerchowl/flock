@@ -323,6 +323,7 @@ The original parent and depth survive every resume and lease generation; resume
 never re-parents a conversation. Parent and child depth are persisted together
 in the structured record, using the session snapshot's atomic write protocol,
 and supply the pending reservation and lease after restart or handoff.
+Operator resume is exempt from admission, so it can exceed fanout by design.
 Migration limit (#2055): records written without lineage load as lineage unknown
 under ADR-0028 §3a and resume as roots, operator-only; no parent is invented.
 This rule is adjacent to the `may_stop` policy:
