@@ -600,6 +600,16 @@ fn redact_arg(arg: &str) -> String {
         (compact.is_match(name) || rest.is_empty() || rest.starts_with(char::is_whitespace))
             .then_some(found)
     }) {
+        let label = &arg[..found.end()];
+        // Ignore curl's leading -: switch, but never retain an earlier value
+        // inside a later label. Mask the whole argument when it is ambiguous.
+        let header_label = label.strip_prefix("-:").unwrap_or(label);
+        if header_label
+            .strip_suffix(':')
+            .is_some_and(|prefix| prefix.contains(':'))
+        {
+            return "<redacted>".to_owned();
+        }
         let rest = &arg[found.end()..];
         const AUTH_SCHEMES: [&str; 5] = ["bearer", "basic", "digest", "negotiate", "token"];
         let first = rest
@@ -607,7 +617,6 @@ fn redact_arg(arg: &str) -> String {
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        let label = &arg[..found.end()];
         return if AUTH_SCHEMES.contains(&first.as_str()) {
             format!("{label} {first} <redacted>")
         } else {
@@ -1447,18 +1456,22 @@ mod tests {
     fn ipv4_glued_authorization_header_is_masked() {
         assert_nonletter_cluster_masked("-4H", "Authorization");
     }
+
     #[test]
     fn http10_silent_glued_cookie_header_is_masked() {
         assert_nonletter_cluster_masked("-0sH", "Cookie");
     }
+
     #[test]
     fn progress_glued_api_key_header_is_masked() {
         assert_nonletter_cluster_masked("-#H", "X-Api-Key");
     }
+
     #[test]
     fn next_glued_api_key_header_is_masked() {
         assert_nonletter_cluster_masked("-:H", "X-Api-Key");
     }
+
     #[test]
     fn next_cluster_masks_from_the_first_header_colon() {
         let secret = ["fixture", "HAuthorization:", "tail"].concat();
@@ -1467,6 +1480,7 @@ mod tests {
             "-:HAuthorization: <redacted>"
         );
     }
+
     #[test]
     fn lowercase_help_and_long_flags_are_not_header_clusters() {
         for argument in [
@@ -1475,6 +1489,65 @@ mod tests {
             "-:hAuthorization:main",
             "--4HAuthorization:main",
             "prefix#HAuthorization:main",
+        ] {
+            assert_eq!(redact_arg(argument), argument);
+        }
+    }
+
+    fn assert_chained_header_value_is_not_logged(prefix: &str, suffix: &str) {
+        let secret = ["fixture", "Chain", "Value"].concat();
+        let argument = format!("{prefix}{secret}{suffix}");
+        let logs = logged_fixture_args(&[argument.clone(), "ordinary".into()]);
+        assert!(!logs.contains(&secret), "{logs}");
+        assert!(logs.contains("<redacted> ordinary"), "{logs}");
+        assert_eq!(redact_arg(&argument), "<redacted>");
+    }
+
+    #[test]
+    fn skipped_header_value_never_becomes_a_later_label() {
+        assert_chained_header_value_is_not_logged("-Htoken:", "-:HAuthorization:x");
+    }
+
+    #[test]
+    fn unknown_curl_header_value_never_becomes_a_later_label() {
+        assert_chained_header_value_is_not_logged("-Hfoo:", "-:HAuthorization:x");
+    }
+
+    #[test]
+    fn absorbed_cluster_value_never_becomes_a_later_label() {
+        assert_chained_header_value_is_not_logged("-:Hfoo:", ":HAuthorization:x");
+    }
+
+    #[test]
+    fn earlier_embedded_header_value_never_becomes_a_later_label() {
+        assert_chained_header_value_is_not_logged(
+            "http.extraheader=Unlisted:",
+            " Authorization:Bearer x",
+        );
+    }
+
+    #[test]
+    fn ambiguous_lazy_cluster_is_conservatively_masked() {
+        assert_eq!(redact_arg("-:Hfoo:HAuthorization:z"), "<redacted>");
+    }
+
+    #[test]
+    fn ipv4_private_token_header_is_directly_covered() {
+        assert_nonletter_cluster_masked("-4H", "PRIVATE-TOKEN");
+    }
+
+    #[test]
+    fn next_proxy_authorization_header_is_directly_covered() {
+        assert_nonletter_cluster_masked("-:H", "Proxy-Authorization");
+    }
+
+    #[test]
+    fn header_shaped_values_without_a_credential_header_keep_their_audit_trail() {
+        for argument in [
+            "-Htoken:main",
+            "session:0 token:main",
+            "refs/heads/token:refs/heads/main",
+            "+refs/heads/cookie:refs/main",
         ] {
             assert_eq!(redact_arg(argument), argument);
         }

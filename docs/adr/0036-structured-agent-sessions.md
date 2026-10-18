@@ -1218,6 +1218,13 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   Bare compact refspecs such as `cookie:cookie` and `authorization:main` are
   masked in logs because they are indistinguishable from compact credential
   headers, an acceptable loss of diagnostic detail to avoid exposing secrets.
+  Everything after the first header-shaped label is value, never part of a
+  later label. If a later credential-header match would retain text following
+  an earlier colon, mask the whole argument instead. Curl's leading `-:` switch
+  is not a header delimiter. This deliberately over-masks ambiguous chains such
+  as `-:Hfoo:HAuthorization:z`, including `z`, and may hide option labels in that
+  argument; the program and other arguments remain logged. Skipped matches never
+  promote earlier values into a retained label.
   These rules shape diagnostic logs only; executed argv is never rewritten.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location
