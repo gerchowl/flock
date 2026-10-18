@@ -126,7 +126,7 @@ fn actual_http_exchange_is_single_use_uniform_origin_guarded_and_secret_free() {
                 State((codes.clone(), root.path().into(), origin.clone())),
                 ConnectInfo("192.0.2.1:1234".parse().unwrap()),
                 headers,
-                axum::body::Bytes::new(),
+                Ok(axum::body::Bytes::new()),
             )
             .await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN);

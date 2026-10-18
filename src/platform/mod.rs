@@ -3,6 +3,8 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+#[cfg(feature = "web")]
+pub(crate) mod client_listener;
 pub(crate) mod peer;
 pub(crate) mod structured;
 

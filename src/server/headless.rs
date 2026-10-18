@@ -213,6 +213,9 @@ pub struct HeadlessServer {
     api_tx: Option<api::ApiRequestSender>,
     api_server: Option<api::ServerHandle>,
     client_listener: UnixListener,
+    /// Bound structured listener and acceptor lifetime, including handoff preparation.
+    #[cfg(feature = "web")]
+    client_wire: Option<crate::web::client_listener::Listener>,
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
@@ -599,6 +602,8 @@ impl HeadlessServer {
             api_tx,
             api_server,
             client_listener: listener,
+            #[cfg(feature = "web")]
+            client_wire: None,
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
@@ -633,6 +638,45 @@ impl HeadlessServer {
     /// - Handles scheduled tasks (resize poll, animation, session save, etc.)
     /// - Renders virtually and streams frames to clients
     pub async fn run(&mut self) -> io::Result<()> {
+        #[cfg(feature = "web")]
+        {
+            if self.client_wire.is_none() {
+                self.prepare_client_wire(None).await?;
+            }
+            if let Some(wire) = &mut self.client_wire {
+                wire.activate();
+            }
+        }
+        let result = self.run_loop().await;
+        #[cfg(feature = "web")]
+        if let Some(wire) = self.client_wire.take() {
+            wire.shutdown().await?;
+        }
+        result
+    }
+    /// Prepare while rollback is still possible; activation belongs to the run loop.
+    #[cfg(feature = "web")]
+    async fn prepare_client_wire(
+        &mut self,
+        inherited: Option<std::net::TcpListener>,
+    ) -> io::Result<()> {
+        self.client_wire = crate::web::client_listener::Listener::prepare(
+            self.app.state.config.client.bind,
+            self.app.client_codes.clone(),
+            crate::session::data_dir(),
+            inherited,
+        )
+        .await?;
+        if let Some(wire) = &self.client_wire {
+            self.app
+                .client_codes
+                .set_endpoint(wire.socket.local_addr()?)
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+    /// Own the event loop inside the structured listener's lifetime.
+    async fn run_loop(&mut self) -> io::Result<()> {
         crate::logging::startup("server");
 
         // Register SIGINT handler for graceful shutdown.
@@ -656,6 +700,16 @@ impl HeadlessServer {
         let mut needs_full_render = true;
 
         loop {
+            #[cfg(feature = "web")]
+            if self
+                .client_wire
+                .as_ref()
+                .is_some_and(crate::web::client_listener::Listener::failed)
+            {
+                return Err(io::Error::other(
+                    "structured client acceptor ended unexpectedly",
+                ));
+            }
             crate::render_prof::event("loop.tick");
             crate::render_prof::flush_if_due();
 
@@ -1355,6 +1409,13 @@ impl HeadlessServer {
         {
             manifest.store_generation = store_generation.saturating_add(1);
         }
+        #[cfg(feature = "web")]
+        {
+            manifest.client_listener = self.client_wire.is_some();
+            if manifest.client_listener {
+                manifest.version = crate::server::handoff::CLIENT_LISTENER_HANDOFF_VERSION;
+            }
+        }
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
             &socket_path,
@@ -1376,6 +1437,10 @@ impl HeadlessServer {
                     continue;
                 };
                 fds.push(runtime.duplicate_handoff_fd()?);
+            }
+            #[cfg(feature = "web")]
+            if let Some(wire) = &self.client_wire {
+                fds.push(crate::platform::client_listener::duplicate(&wire.socket)?);
             }
             Ok::<(), io::Error>(())
         })();
@@ -4193,6 +4258,8 @@ pub fn run_server() -> io::Result<()> {
             Err(err) => return Err(err),
         };
 
+        #[cfg(feature = "web")]
+        server.prepare_client_wire(None).await?;
         crate::logging::server_started(&api::socket_path(), &client_socket_path());
         print_ready_message(&api::socket_path(), &client_socket_path());
 
@@ -4211,6 +4278,19 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     init_logging();
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
+    #[cfg(feature = "web")]
+    let wire_listener = if received.manifest.client_listener {
+        Some(
+            crate::platform::client_listener::take(&mut received.fds).inspect_err(|err| {
+                let _ = crate::server::handoff::report_import_refusal(
+                    &mut received.stream,
+                    &err.to_string(),
+                );
+            })?,
+        )
+    } else {
+        None
+    };
     crate::server::handoff::log_import_result(received.manifest.panes.len());
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4279,6 +4359,11 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             Some(api_tx.clone()),
             Some(api_server),
         )?;
+        #[cfg(feature = "web")]
+        if let Err(err) = server.prepare_client_wire(wire_listener).await {
+            crate::server::handoff::report_import_refusal(&mut received.stream, &err.to_string())?;
+            return Err(err);
+        }
         // Late failure tests corrupt only their supplied sandbox identity after bootstrap.
         if cfg!(debug_assertions) {
             if let Some(path) = std::env::var_os("FLOCK_TEST_HANDOFF_CORRUPT_IDENTITY_PATH") {
@@ -4841,6 +4926,8 @@ mod tests {
             api_tx: None,
             api_server: None,
             client_listener: listener,
+            #[cfg(feature = "web")]
+            client_wire: None,
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
