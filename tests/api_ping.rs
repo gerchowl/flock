@@ -389,6 +389,10 @@ fn ping_over_socket_returns_version() {
     );
     assert_eq!(value["id"], "req_1");
     assert_eq!(value["result"]["type"], "pong");
+    assert_eq!(
+        value["result"]["capabilities"]["pane_input_write_ack"],
+        true
+    );
     assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
@@ -2772,7 +2776,13 @@ with log.open('w') as out:
         &socket_path,
         &["agent", "send", "--no-submit", pane, "cli!"],
     );
-    assert!(plain_cli.status.success());
+    assert!(
+        plain_cli.status.success(),
+        "status={:?} stdout={} stderr={}",
+        plain_cli.status.code(),
+        String::from_utf8_lossy(&plain_cli.stdout),
+        String::from_utf8_lossy(&plain_cli.stderr)
+    );
     let pane_cli = run_flk(&socket_path, &["pane", "send-text", pane, "pane!\ntext"]);
     assert!(pane_cli.status.success());
     for command in [

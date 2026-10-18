@@ -2915,7 +2915,7 @@ pub struct InputWriteDetails {
     /// Null for an unknown transport outcome; server receipts carry exact counts.
     pub bytes_written: Option<u64>,
     pub bytes_total: Option<u64>,
-    /// Deadline, writer_broken, owner_changed, pane_gone or admission_limit.
+    /// Deadline, writer_broken, owner_changed, pane_gone, admission_limit, transport_lost or invalid_reply.
     pub reason: String,
     /// True only once remainder retirement is complete, including a late full write.
     pub remainder_discarded: bool,

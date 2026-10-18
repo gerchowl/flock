@@ -80,7 +80,7 @@ fn run(
                 continue;
             }
             let response = if method == "ping" {
-                serde_json::json!({"id":request["id"],"result":{"type":"pong","version":version,"protocol":protocol}})
+                serde_json::json!({"id":request["id"],"result":{"type":"pong","version":version,"protocol":protocol,"capabilities":{"pane_input_write_ack":true,"live_handoff":false}}})
             } else if let Some(error) = &error {
                 serde_json::json!({"id":request["id"],"error":error})
             } else if method == "agent.get" && request["params"]["target"] == "new-fixture" {
@@ -89,6 +89,9 @@ fn run(
                 serde_json::json!({"id":request["id"],"result":{"agent":{
                     "terminal_id":"term_fixture", "pane_id":"w1:p1", "agent_status":"idle"
                 }}})
+            } else if method == "agent.send" && request["params"]["submit"] == true {
+                serde_json::json!({"id":request["id"],"result":{"type":"guarded_submit",
+                    "outcome":"accepted","reason":null,"retried":false}})
             } else {
                 serde_json::json!({"id":request["id"],"result":{"text":"fixture reply"}})
             };
