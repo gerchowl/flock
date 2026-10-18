@@ -39,6 +39,7 @@ fn send(r: &mut AppQueue, body: &str) -> Receiver<String> {
         .unwrap_or_else(std::process::id);
     r.app
         .handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "refusal-round".into(),
                 method: Method::MsgSend(params),

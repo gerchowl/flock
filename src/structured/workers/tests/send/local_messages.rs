@@ -49,6 +49,7 @@ fn request(r: &mut AppQueue, method: Method) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     r.app
         .handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "local-message".into(),
                 method,

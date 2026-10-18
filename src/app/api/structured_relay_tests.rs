@@ -93,6 +93,7 @@ fn request(r: &mut AppQueue, d: Deliver) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     r.app
         .handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "relay".into(),
                 method: Method::MeshDeliver(Box::new(d)),
@@ -516,6 +517,7 @@ fn relay_queue_reply_routes_by_verified_custody_origin_not_claimed_host() {
         let (tx, rx) = mpsc::channel();
         r.app
             .handle_api_request_message(crate::api::ApiRequestMessage {
+                scope: None,
                 request: Request {
                     id: "reply".into(),
                     method: Method::MsgReply(crate::api::schema::MsgReplyParams {
@@ -869,6 +871,7 @@ fn custody_completion_legacy_sender_claim_never_routes_to_a_queue() {
         let pid = std::process::id();
         r.app
             .handle_api_request_message(crate::api::ApiRequestMessage {
+                scope: None,
                 request: Request {
                     id: "legacy-reply".into(),
                     method: Method::MsgReply(
@@ -1057,6 +1060,7 @@ fn custody_completion_node_signature_without_local_binding_is_not_sender_attesta
         let pid = std::process::id();
         r.app
             .handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "unbound-reply".into(),
                 method: Method::MsgReply(
