@@ -67,17 +67,16 @@ impl<R: parking_lot::lock_api::RawMutex> Book<R> {
         if after.is_some_and(|n| n > self.retained.through) {
             return Err(ErrorCode::CursorAhead);
         }
-        register_live(
-            &live,
-            Packet(
-                self.retained.clone(),
-                self.status.clone(),
-                self.error,
-                true,
-                after.unwrap_or(0),
-            ),
-            self.ended,
-        );
+        let mut state = live.lock();
+        state.packets.push_back(Packet(
+            self.retained.clone(),
+            self.status.clone(),
+            self.error,
+            true,
+            after.unwrap_or(0),
+        ));
+        state.ended = self.ended;
+        drop(state);
         self.readers.retain(|r| r.strong_count() != 0);
         self.readers.push(Arc::downgrade(&live));
         Ok(())
@@ -149,17 +148,6 @@ impl<R: parking_lot::lock_api::RawMutex> Book<R> {
             true
         });
     }
-}
-// Generic locking lets the test unlock witness observe the actual registration
-// critical section without a production test hook.
-fn register_live<R: parking_lot::lock_api::RawMutex>(
-    live: &parking_lot::lock_api::Mutex<R, Live>,
-    packet: Packet,
-    ended: bool,
-) {
-    let mut live = live.lock();
-    live.packets.push_back(packet);
-    live.ended = ended;
 }
 struct Capture(Option<u64>, Arc<Mutex<Live>>);
 /// Retained generation source. Cold opening belongs exclusively on an I/O worker.
