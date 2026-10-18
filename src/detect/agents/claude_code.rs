@@ -232,6 +232,9 @@ fn has_claude_blocked_prompt(content: &str, lower_content: &str) -> bool {
 /// it would own the last rule, so the region after the last rule is the live
 /// dialog there.
 pub(in crate::detect) fn has_folder_trust_dialog(content: &str) -> bool {
+    if has_folder_trust_with_permissions_dialog(content) {
+        return true;
+    }
     let after_rule = Some(flat_words(content_after_last_horizontal_rule(content)))
         .filter(|flat| flat.ends_with("enter to confirm esc to cancel"));
     trust_dialog_box(content)
@@ -243,6 +246,28 @@ pub(in crate::detect) fn has_folder_trust_dialog(content: &str) -> bool {
                 .iter()
                 .any(|(question, accept)| flat.contains(question) && flat.contains(accept))
         })
+}
+
+/// The live folder-trust variant that also pre-approves configured tools (#1116).
+/// The numeric notice and known trust controls must share a live dialog region.
+/// A frame or final confirm footer bounds it, independently of the cancel label.
+pub(in crate::detect) fn has_folder_trust_with_permissions_dialog(content: &str) -> bool {
+    let framed = trust_dialog_box(content);
+    let region = framed
+        .as_deref()
+        .unwrap_or_else(|| content_after_last_horizontal_rule(content));
+    let flat = flat_words(region);
+    let notice = flat
+        .split_once("this folder pre approves ")
+        .and_then(|(_, rest)| rest.split_once(" tool permissions"))
+        .is_some_and(|(count, _)| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()));
+    let trust_controls = TRUST_DIALOGS
+        .iter()
+        .any(|(question, accept)| flat.contains(question) && flat.contains(accept))
+        || (flat.contains("accessing workspace") && flat.contains(TRUST_DIALOGS[0].1));
+    notice
+        && trust_controls
+        && (framed.is_some() || flat.ends_with("enter to confirm esc to cancel"))
 }
 
 /// Claude's login method picker, or its question whether to use an API key
@@ -979,6 +1004,23 @@ fn transcript_control_tail(line: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn permission_trust_fixture_is_a_strong_human_trust_block() {
+        let screen = include_str!(
+            "../../../tests/fixtures/attention-1023/claude-trust-with-permissions.txt"
+        );
+        for screen in [
+            screen.to_string(),
+            screen
+                .replace("17 tool", "301 tool")
+                .replace("fixture-project", "another-fixture-project"),
+        ] {
+            assert_eq!(detect_structural(&screen), Some(AgentState::Blocked));
+            assert!(has_visible_blocker(&screen));
+            assert_eq!(needs_human(&screen), HumanReason::Trust);
+        }
+    }
+
     /// Captured from a throwaway Claude in an isolated flk (#1022): the
     /// footer counts the `run_in_background` shells after the turn, across a
     /// later turn that started none, and drops the counter once they exit. A
@@ -1585,18 +1627,8 @@ mod tests {
     /// "No, exit", and the dialog is still the dialog.
     #[test]
     fn the_trust_dialog_with_gated_grants_is_still_blocked() {
-        let screen = concat!(
-            "\u{256d}\u{2500} Accessing workspace: \u{2500}\u{2500}\u{2500}\u{256e}\n",
-            "\u{2502} Quick safety check: Is this a project you created or one you trust?\n",
-            "\u{2502}\n",
-            "\u{2502} This folder pre-approves 3 tool permissions in\n",
-            " .claude/settings.json:\n",
-            "\u{2502}   Bash(npm run test)\n",
-            "\u{2502}\n",
-            "\u{276f} Yes, I trust this folder\n",
-            "\u{2502}   No, continue without these permissions\n",
-            "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}\n",
-        );
+        let screen =
+            include_str!("../../../tests/fixtures/attention-1023/claude-trust-gated-grants.txt");
         assert!(has_folder_trust_dialog(screen));
         assert_eq!(detect_structural(screen), Some(AgentState::Blocked));
     }
