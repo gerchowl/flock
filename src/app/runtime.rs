@@ -1893,24 +1893,19 @@ pub(crate) fn refresh_workspace_git_statuses_with_cache(
 }
 
 fn refresh_scheduled_git_statuses(
-    mut items: Vec<WorkspaceGitRefreshItem>,
+    items: Vec<WorkspaceGitRefreshItem>,
     cache: &HashMap<std::path::PathBuf, GitStatusCacheEntry>,
     deadline: Instant,
     schedule: &mut GitRefreshSchedule,
 ) -> WorkspaceGitRefreshOutput {
-    for item in &mut items {
-        if Instant::now() >= deadline {
-            continue;
-        }
-        item.cache_key = crate::workspace::git_status_cache_key(&item.resolved_identity_cwd)
-            .unwrap_or_else(|| item.resolved_identity_cwd.clone());
-    }
     let mut round = crate::workspace::git::GitRefreshRound::default();
-    refresh_git_jobs(
-        deduplicate_git_refresh_items(items, cache),
-        schedule,
+    refresh_scheduled_git_statuses_with(
+        items,
+        cache,
         deadline,
+        schedule,
         Instant::now,
+        |cwd| crate::workspace::git_status_cache_key(cwd).unwrap_or_else(|| cwd.to_path_buf()),
         |job, deadline| {
             Workspace::git_status_snapshot_for_cwd_with_cache(
                 &job.status_cwd,
@@ -1919,6 +1914,39 @@ fn refresh_scheduled_git_statuses(
                 &mut round,
             )
         },
+    )
+}
+
+fn refresh_scheduled_git_statuses_with(
+    mut items: Vec<WorkspaceGitRefreshItem>,
+    cache: &HashMap<std::path::PathBuf, GitStatusCacheEntry>,
+    deadline: Instant,
+    schedule: &mut GitRefreshSchedule,
+    mut now: impl FnMut() -> Instant,
+    mut key: impl FnMut(&std::path::Path) -> std::path::PathBuf,
+    probe: impl FnMut(
+        &WorkspaceGitRefreshJob,
+        Instant,
+    ) -> Result<
+        (
+            crate::workspace::WorkspaceGitStatusSnapshot,
+            Option<GitStatusCacheEntry>,
+        ),
+        GitRefreshErrorKind,
+    >,
+) -> WorkspaceGitRefreshOutput {
+    for item in &mut items {
+        if now() >= deadline {
+            continue;
+        }
+        item.cache_key = key(&item.resolved_identity_cwd);
+    }
+    refresh_git_jobs(
+        deduplicate_git_refresh_items(items, cache),
+        schedule,
+        deadline,
+        now,
+        probe,
     )
 }
 
@@ -2305,6 +2333,177 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn git2177_snapshot() -> (
+        crate::workspace::WorkspaceGitStatusSnapshot,
+        Option<GitStatusCacheEntry>,
+    ) {
+        (
+            crate::workspace::WorkspaceGitStatusSnapshot {
+                branch: Some("updated".into()),
+                ahead_behind: None,
+                space: None,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn git2177_identity_queue_survives_removal_insertion_and_reordering() {
+        let jobs = scheduling_fixture();
+        let mut fourth = jobs[0].clone();
+        fourth.cache_key = fourth.cache_key.with_file_name("fourth");
+        fourth.status_cwd = fourth.cache_key.clone();
+        let sets = [
+            jobs.clone(),
+            vec![jobs[2].clone(), jobs[1].clone(), fourth.clone()],
+            vec![fourth.clone(), jobs[2].clone(), jobs[1].clone()],
+            vec![jobs[1].clone(), fourth.clone(), jobs[2].clone()],
+        ];
+        let mut schedule = GitRefreshSchedule::default();
+        let mut served = Vec::new();
+        for set in sets {
+            let start = Instant::now();
+            let end = start + Duration::from_secs(1);
+            let clock = std::cell::Cell::new(start);
+            refresh_git_jobs(
+                set,
+                &mut schedule,
+                end,
+                || clock.get(),
+                |job, _| {
+                    served.push(job.cache_key.clone());
+                    clock.set(end);
+                    Ok(git2177_snapshot())
+                },
+            );
+        }
+        assert_eq!(
+            served,
+            vec![
+                jobs[0].cache_key.clone(),
+                jobs[1].cache_key.clone(),
+                jobs[2].cache_key.clone(),
+                fourth.cache_key
+            ]
+        );
+    }
+
+    fn git2177_lookup_items() -> (Vec<WorkspaceGitRefreshItem>, PathBuf, PathBuf) {
+        let a = Workspace::test_new("lookup-a").identity_cwd;
+        let b = Workspace::test_new("lookup-b").identity_cwd;
+        let items = [a.join("one"), a.join("two"), b.clone()]
+            .into_iter()
+            .enumerate()
+            .map(|(index, cwd)| WorkspaceGitRefreshItem {
+                workspace_id: format!("ws_{index}"),
+                resolved_identity_cwd: cwd.clone(),
+                cache_key: cwd,
+            })
+            .collect();
+        (items, a, b)
+    }
+
+    #[test]
+    fn git2177_expired_lookup_never_splits_a_known_repository_health_key() {
+        let (items, a, b) = git2177_lookup_items();
+        let mut schedule = GitRefreshSchedule::default();
+        let start = Instant::now();
+        let end = start + Duration::from_secs(1);
+        refresh_scheduled_git_statuses_with(
+            items.clone(),
+            &HashMap::new(),
+            end,
+            &mut schedule,
+            || start,
+            |cwd| {
+                if cwd.starts_with(&a) {
+                    a.clone()
+                } else {
+                    b.clone()
+                }
+            },
+            |_, _| Ok(git2177_snapshot()),
+        );
+        let clock = std::cell::Cell::new(start);
+        refresh_scheduled_git_statuses_with(
+            items,
+            &HashMap::new(),
+            end,
+            &mut schedule,
+            || clock.get(),
+            |cwd| {
+                clock.set(end);
+                if cwd.starts_with(&a) {
+                    a.clone()
+                } else {
+                    b.clone()
+                }
+            },
+            |_, _| panic!("expired discovery must not start a probe"),
+        );
+        assert_eq!(
+            schedule.missed.len(),
+            2,
+            "two repositories, never three raw cwd keys"
+        );
+        assert_eq!(
+            schedule.missed[&a].0.len(),
+            2,
+            "nested cwd targets share the checkout key"
+        );
+        assert!(schedule.missed.contains_key(&b));
+    }
+
+    #[test]
+    fn git2177_slow_lookup_cannot_block_a_different_repository_every_round() {
+        let (items, a, b) = git2177_lookup_items();
+        let mut schedule = GitRefreshSchedule::default();
+        let start = Instant::now();
+        let end = start + Duration::from_secs(1);
+        refresh_scheduled_git_statuses_with(
+            items.clone(),
+            &HashMap::new(),
+            end,
+            &mut schedule,
+            || start,
+            |cwd| {
+                if cwd.starts_with(&a) {
+                    a.clone()
+                } else {
+                    b.clone()
+                }
+            },
+            |_, _| Ok(git2177_snapshot()),
+        );
+        let mut served = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let clock = std::cell::Cell::new(start);
+            refresh_scheduled_git_statuses_with(
+                items.clone(),
+                &HashMap::new(),
+                end,
+                &mut schedule,
+                || clock.get(),
+                |cwd| {
+                    if cwd.starts_with(&a) {
+                        clock.set(end);
+                        a.clone()
+                    } else {
+                        b.clone()
+                    }
+                },
+                |job, _| {
+                    served.insert(job.cache_key.clone());
+                    Ok(git2177_snapshot())
+                },
+            );
+        }
+        assert!(
+            served.contains(&b),
+            "the neighbor starts within two repository turns despite a slow lookup"
+        );
     }
 
     #[test]

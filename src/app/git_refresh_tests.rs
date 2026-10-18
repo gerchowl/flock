@@ -559,3 +559,44 @@ async fn git2100_removed_or_moved_repository_has_no_starvation_diagnostic() {
     app.state.workspaces.clear();
     assert!(app.git_repository_health_rows().is_empty());
 }
+
+#[tokio::test]
+async fn git2177_real_failure_precedes_starvation_in_the_public_summary() {
+    let mut app = app();
+    app.state.app_client_attached = true;
+    app.state.workspaces[0].tabs.clear();
+    let ws = &app.state.workspaces[0];
+    let key = ws.identity_cwd.clone();
+    let targets = vec![WorkspaceGitRefreshTarget {
+        workspace_id: ws.id.clone(),
+        resolved_identity_cwd: ws.identity_cwd.clone(),
+    }];
+    app.git_repository_failures.insert(
+        key.clone(),
+        (
+            crate::app::git_repository_health::RepositoryFailure {
+                cache_key: key.clone(),
+                targets: targets.clone(),
+                error: GitRefreshErrorKind::GitExit,
+            },
+            2,
+        ),
+    );
+    app.git_refresh_schedule
+        .lock()
+        .missed
+        .insert(key, (targets, GIT_REFRESH_STARVED_ROUNDS));
+    let row = summary(&mut app);
+    assert_eq!(row["status"], "degraded");
+    assert!(
+        row["reason"].is_null(),
+        "a real typed failure outranks the starvation reason: {row}"
+    );
+    assert_eq!(row["last_error"], "git_exit");
+    assert_eq!(row["repositories"][0]["status"], "failed");
+    assert_eq!(
+        row["repositories"][0]["consecutive_not_started"],
+        GIT_REFRESH_STARVED_ROUNDS
+    );
+    assert_eq!(row["repositories"][0]["consecutive_failures"], 2);
+}
