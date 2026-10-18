@@ -1249,7 +1249,12 @@ retained prefix uses the same gap path with reason `retained_prefix`.
 The registry's runtime stream owner registers bounded continuation and captures
 its durable head under one publication lock. An owned file cut pages through that
 head before exactly one `synced`; subsequent publications cannot fall between
-registration and the barrier. Terminal permission audits use this same source,
+registration and the barrier. Capture and registration are one operation over
+the locked book; constructing the owned cut afterwards cannot open a hole.
+Replay retains unread page bytes. Runtime-only, source-fenced byte checkpoints
+let a consumer resume its applied cursor after lag without rescanning the prefix;
+they are neither new wire fields nor durable cursor authority. Lag terminates
+unfinished replay on its next page. Terminal permission audits use this same source,
 even when runtime notification delivery is cancelled. Partial deltas consume no
 durable cursor and do not enter this source. The S4 reader remains singular.
 

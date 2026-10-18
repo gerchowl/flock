@@ -53,7 +53,8 @@ on an I/O worker and install it with `Workers::install_retained`; changed epochs
 active producers, mismatched agent/session namespaces and an existing source
 refuse stale installation. The retained reader validates the private session
 namespace and permissions before opening it. Recovery
-reads at most a record-limit tail; the writer alone repairs torn tails.
+reads a geometrically grown tail starting at one page, never an eagerly
+allocated record-limit buffer; the writer alone repairs torn tails.
 
 `History::waker` supplies coalesced readiness/publication/end hints. Enable its
 notification future before checking readiness or paging, then recheck state after
@@ -67,17 +68,37 @@ then durable live continuation. It pins the file descriptor and uses positional
 reads, so replay cannot move the writer's append offset. Paging and cold recovery
 perform filesystem I/O and belong off the heartbeat loop.
 
-Each page reads at most 32 KiB and emits at most one record, gap or barrier. A
+Each page reads at most 32 KiB and emits at most one record, gap or barrier.
+Unread bytes stay buffered rather than being fetched again for each line;
+cursor-only scans skip all complete buffered records within that page budget.
+`Cut::read_bytes` accounts for bytes actually read, independently of cursors. A
 record is capped at 16 MiB. `Progress` schedules another replay page after
 yielding; it must not wait for a live-publication hint. `Pending` means no live
 record is available yet. Live
 continuation queues at most 16 records and 256 KiB of encoded envelopes. Overflow
-clears its queue and yields a terminal Lagged cut; resubscribe from the last
-applied cursor, never the skipped-to head. Consumer errors, corrupt/unterminated
-records and producer failure are explicit. Committed facts remain replayable
+clears its queue and yields a terminal Lagged cut on the next page, including
+during unfinished replay. A single encoded record over 256 KiB lags every
+subscriber, even one caught up before that publication. Resubscribe from the last
+applied cursor, never the skipped-to head.
+
+After applying a record or gap, retain `Cut::checkpoint` for that cursor and use
+`History::resume(after, hint)` after lag. The opaque hint identifies the pinned
+source and exact byte boundary, so resume reads only the suffix instead of
+rescanning a long prefix. No hint is issued for an unlocated cursor-only scan;
+there is no fabricated byte offset. A mismatched cursor, source or offset is refused.
+Hints cannot cross source recovery/restart; a cursor-only cold subscription
+scans with bounded pages. The consumer (#1830) owns its applied-cursor hint and
+must not use an emitted cursor before application. Prefix gaps retain the next
+record's start boundary; live records retain their fsynced end boundary.
+
+Consumer errors, corrupt/unterminated records and producer failure are explicit. Committed facts remain replayable
 before producer failure is reported. A normal producer end drains its queue.
 
-Publication follows file sync and precedes notification delivery. Permission
+Head capture and live registration share one mutable locked-book operation;
+an owned registration is already live before file-cut construction can begin.
+Publication follows file sync and precedes notification delivery. The projected
+record is placed in one Arc; without queued subscribers, live delivery unwraps
+it without cloning its raw payload. Permission
 open/closed audits therefore remain available even if cancellation drops an S4
 notification. S4 still owns the sole Runtime event receiver; replay never races
 it. Partial deltas remain live-only outside this durable source. WebSocket

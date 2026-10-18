@@ -56,7 +56,9 @@ impl Fixture {
         self.file.write_all(&bytes).unwrap();
         self.file.write_all(b"\n").unwrap();
         self.file.sync_all().unwrap();
-        self.source.publish(record, bytes.len() + 1).unwrap();
+        self.source
+            .publish(Arc::new(record), bytes.len() + 1)
+            .unwrap();
     }
 }
 fn next(cut: &mut Cut) -> Item {
@@ -239,7 +241,6 @@ fn record_and_byte_overflow_close_once_and_require_a_fresh_cut() {
                 json!({"text":if large {"x".repeat(LIVE_BYTES)} else {"x".into()}}),
             ))
         }
-        assert!(matches!(next(&mut cut), Item::Synced(0)));
         assert!(matches!(next(&mut cut),Item::Lagged(to) if to==count as u64));
         assert!(matches!(next(&mut cut), Item::End));
         assert!(cut.live.lock().queue.is_empty());
@@ -249,38 +250,34 @@ fn record_and_byte_overflow_close_once_and_require_a_fresh_cut() {
     }
 }
 #[test]
-fn atomic_registration_under_a_racing_publisher_never_loses_a_record() {
-    for _ in 0..32 {
+fn registration_is_live_before_cut_construction_without_a_publication_hole() {
+    for before in [true, false] {
         let mut fixture = Fixture::new(vec![]);
-        let source = fixture.source.clone();
-        let (go, start) = std::sync::mpsc::sync_channel(1);
-        let (done, ack) = std::sync::mpsc::sync_channel(1);
-        let producer = std::thread::spawn(move || {
-            start
-                .recv_timeout(Duration::from_secs(5))
-                .expect("subscriber must start race");
+        if before {
             fixture.append(record(1, json!({"type":"user","message":{}})));
-            done.send(fixture)
-                .unwrap_or_else(|_| panic!("subscriber disappeared"))
-        });
-        go.try_send(()).expect("racing publisher must remain live");
-        let mut cut = source.subscribe(None).unwrap();
-        let _fixture = ack
-            .recv_timeout(Duration::from_secs(5))
-            .expect("publication producer remains bounded");
-        producer.join().unwrap();
+        }
+        let registered = fixture.source.0.lock().register(None).unwrap();
+        // This is the deterministic split-lock window: a cut has not been built.
+        if !before {
+            fixture.append(record(1, json!({"type":"user","message":{}})));
+        }
+        let mut cut = registered.cut(fixture.source.0.clone(), None);
         let mut seen = Vec::new();
-        let mut barriers = 0;
+        let mut barriers = Vec::new();
         for _ in 0..3 {
             match cut.page().unwrap() {
                 Item::Record(record) => seen.push(record.seq),
-                Item::Synced(_) => barriers += 1,
-                Item::Pending | Item::Progress => {}
-                other => panic!("{other:?}"),
+                Item::Synced(head) => barriers.push(head),
+                Item::Pending | Item::Progress => (),
+                item => panic!("{item:?}"),
             }
         }
-        assert_eq!(seen, vec![1]);
-        assert_eq!(barriers, 1);
+        assert_eq!(
+            seen,
+            vec![1],
+            "publication between capture and construction cannot disappear"
+        );
+        assert_eq!(barriers, vec![u64::from(before)]);
     }
 }
 
@@ -403,4 +400,162 @@ async fn readiness_publication_and_end_notifications_are_only_hints() {
         .await
         .expect("producer end must wake continuation");
     assert!(matches!(cut.page().unwrap(), Item::End));
+}
+
+fn long_history(count: u64) -> Fixture {
+    Fixture::new(
+        (1..=count)
+            .map(|seq| {
+                record(
+                    seq,
+                    json!({"type":"user","message":{"content":"x".repeat(400)}}),
+                )
+            })
+            .collect(),
+    )
+}
+#[test]
+fn buffered_replay_reads_each_file_byte_once_instead_of_each_record_page() {
+    let fixture = long_history(2_000);
+    let length = fixture.file.metadata().unwrap().len();
+    let mut cut = fixture.source.subscribe(None).unwrap();
+    for expected in 1..=2_000 {
+        assert_eq!(seq(next(&mut cut)), expected);
+    }
+    assert!(matches!(next(&mut cut), Item::Synced(2_000)));
+    assert!(
+        cut.read_bytes() <= length + PAGE_BYTES as u64,
+        "read {} bytes for {length} bytes of JSONL",
+        cut.read_bytes()
+    );
+}
+#[test]
+fn cursor_only_resume_skips_buffered_prefix_records_in_one_page() {
+    let fixture = long_history(2_000);
+    let length = fixture.file.metadata().unwrap().len();
+    let mut cursor_only = fixture.source.subscribe(Some(1_999)).unwrap();
+    assert!(
+        cursor_only.checkpoint().is_none(),
+        "an unlocated cursor has no invented byte hint"
+    );
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        match cursor_only.page().unwrap() {
+            Item::Progress => assert!(
+                steps <= (length / PAGE_BYTES as u64) + 2,
+                "skipped records must share a page, not each return Progress"
+            ),
+            Item::Record(record) => {
+                assert_eq!(record.seq, 2_000);
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+#[test]
+fn lag_interrupts_replay_and_a_fenced_hint_resumes_without_reading_the_prefix() {
+    let mut fixture = long_history(5_000);
+    let mut cut = fixture.source.subscribe(None).unwrap();
+    for expected in 1..=4_000 {
+        assert_eq!(seq(next(&mut cut)), expected);
+    }
+    let hint = cut.checkpoint().unwrap();
+    let read = cut.read_bytes();
+    for seq in 5_001..=5_017 {
+        fixture.append(record(seq, json!({"type":"user","message":{}})));
+    }
+    assert!(
+        matches!(cut.page().unwrap(), Item::Lagged(5_017)),
+        "lag must win over unread replay"
+    );
+    assert_eq!(
+        cut.read_bytes(),
+        read,
+        "lagged cut must perform no more file reads"
+    );
+    let mut resumed = fixture.source.resume(4_000, &hint).unwrap();
+    assert_eq!(resumed.offset, hint.offset);
+    for expected in 4_001..=5_017 {
+        assert_eq!(seq(next(&mut resumed)), expected);
+    }
+    assert!(matches!(next(&mut resumed), Item::Synced(5_017)));
+    let suffix = fixture.file.metadata().unwrap().len() - hint.offset;
+    assert!(
+        resumed.read_bytes() <= suffix + PAGE_BYTES as u64,
+        "resume reread the prefix: {} bytes for {suffix} suffix bytes",
+        resumed.read_bytes()
+    );
+    assert!(fixture.source.resume(3_999, &hint).is_err());
+    let other = long_history(5_000);
+    assert!(other.source.resume(4_000, &hint).is_err());
+}
+#[test]
+fn gap_and_live_checkpoints_preserve_exact_record_boundaries() {
+    let mut fixture = Fixture::new(vec![record(5, json!({"type":"user","message":{}}))]);
+    let mut cut = fixture.source.subscribe(None).unwrap();
+    assert!(matches!(next(&mut cut), Item::Gap { from: 1, to: 4, .. }));
+    let mut resumed = fixture
+        .source
+        .resume(4, &cut.checkpoint().unwrap())
+        .unwrap();
+    assert_eq!(seq(next(&mut resumed)), 5);
+    assert!(matches!(next(&mut resumed), Item::Synced(5)));
+    fixture.append(record(6, json!({"type":"user","message":{}})));
+    assert_eq!(seq(next(&mut resumed)), 6);
+    let mut latest = fixture
+        .source
+        .resume(6, &resumed.checkpoint().unwrap())
+        .unwrap();
+    assert!(matches!(latest.page().unwrap(), Item::Synced(6)));
+    assert_eq!(latest.read_bytes(), 0);
+}
+#[test]
+fn cold_tail_allocation_tracks_the_final_record_instead_of_the_file_limit() {
+    let fixture = long_history(5_000);
+    let mut tail = Vec::new();
+    let length = fixture.file.metadata().unwrap().len();
+    assert_eq!(tail_head(&fixture.file, length, &mut tail).unwrap(), 5_000);
+    assert!(tail.len() <= PAGE_BYTES);
+    assert!(tail.capacity() <= PAGE_BYTES);
+    let fixture = Fixture::new(vec![record(
+        1,
+        json!({"type":"future","payload":"x".repeat(PAGE_BYTES*3)}),
+    )]);
+    assert_eq!(
+        tail_head(
+            &fixture.file,
+            fixture.file.metadata().unwrap().len(),
+            &mut tail
+        )
+        .unwrap(),
+        1
+    );
+    assert!(tail.len() <= PAGE_BYTES * 4);
+}
+
+#[test]
+fn one_oversized_publication_lags_a_caught_up_cut_without_copying_the_arc() {
+    let mut fixture = Fixture::new(vec![]);
+    let mut cut = fixture.source.subscribe(None).unwrap();
+    assert!(matches!(cut.page().unwrap(), Item::Synced(0)));
+    let record = Arc::new(record(
+        1,
+        json!({"type":"future","payload":"x".repeat(LIVE_BYTES)}),
+    ));
+    let bytes = serde_json::to_vec(&*record).unwrap();
+    fixture.file.write_all(&bytes).unwrap();
+    fixture.file.write_all(b"\n").unwrap();
+    fixture.file.sync_all().unwrap();
+    fixture
+        .source
+        .publish(record.clone(), bytes.len() + 1)
+        .unwrap();
+    assert_eq!(
+        Arc::strong_count(&record),
+        1,
+        "oversize lag must retain no payload copy"
+    );
+    assert!(matches!(cut.page().unwrap(), Item::Lagged(1)));
 }

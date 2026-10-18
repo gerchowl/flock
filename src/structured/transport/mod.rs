@@ -965,7 +965,9 @@ fn persist(
         encoded.push(b'\n');
         file.write_all(&encoded)?;
         file.sync_data()?;
-        storage.2.publish(record.clone(), encoded.len())?;
+        let stored = Arc::new(record);
+        storage.2.publish(stored.clone(), encoded.len())?;
+        record = Arc::unwrap_or_clone(stored);
         record.raw = live_raw;
     }
     if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {
