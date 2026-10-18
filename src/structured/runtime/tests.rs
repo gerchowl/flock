@@ -80,6 +80,13 @@ impl Fixture {
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("fixture mode");
         path
     }
+    pub(crate) fn mcp(&self) -> SessionMcp {
+        SessionMcp::new(
+            &self.root.path().join("claude"),
+            &self.root.path().join("api.sock"),
+        )
+        .expect("owned fixture endpoint")
+    }
     pub(crate) fn profile(&self, mode: &str, version: &str) -> LaunchProfile {
         self.profile_at(mode, version, SESSION)
     }
@@ -154,8 +161,9 @@ impl Fixture {
             .leases
             .reserve("fixture-agent", &location.session, None)
             .expect("lease");
+        let mcp = self.mcp();
         let worker = std::thread::spawn(move || {
-            let result = run(&state, profile, lease, location, |runtime| {
+            let result = run(&state, profile, lease, location, mcp, |runtime| {
                 let _ = ready_tx.send(runtime);
             });
             let _ = result_tx.send(result);
@@ -570,6 +578,7 @@ fn failed_model_spawn_removes_armed_files_and_preserves_profile() {
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
+        fixture.mcp(),
         |_| panic!("failed spawn published a runtime"),
     )
     .expect_err("removed executable cannot spawn");
@@ -829,6 +838,7 @@ fn publication_panic_shuts_down_owned_process_and_retains_uncertain_files() {
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
+        fixture.mcp(),
         |_| panic!("owned publication failure"),
     )
     .expect("worker result");
@@ -890,6 +900,7 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
                 agent: "fixture-agent".into(),
                 session: session.into(),
             },
+            fixture.mcp(),
             |_| panic!("mismatched identity must never publish"),
         )
         .expect_err("mismatch");
@@ -899,6 +910,25 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
         );
         assert!(fixture.leases.reserve(agent, session, None).is_ok());
     }
+}
+
+#[test]
+fn session_1441_fake_harness_receives_owned_flock_mcp_config() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("mcp-config", "2.1.296").expect("launch");
+    running.submit();
+    let exit = running.finish();
+    assert_eq!(
+        exit.status.expect("reaped status").code(),
+        Some(0),
+        "{exit:?}"
+    );
+    let config: Value = serde_json::from_slice(
+        &fs::read(fixture.root.path().join("observed-mcp.json")).expect("observed MCP"),
+    )
+    .unwrap();
+    assert_eq!(config["mcpServers"].as_object().unwrap().len(), 1);
+    assert!(!running.generated.exists());
 }
 
 #[test]
@@ -1165,12 +1195,14 @@ fn registry_launch_metadata_reaches_the_child_and_events_wake_the_owner() {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (result_tx, result_rx) = mpsc::sync_channel(1);
     let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+    let mcp = fixture.mcp();
     let worker = std::thread::spawn(move || {
         let result = run_notified(
             &state,
             profile,
             lease,
             location,
+            mcp,
             |runtime| {
                 ready_tx.try_send(runtime).ok();
             },
