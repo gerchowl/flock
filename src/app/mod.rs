@@ -176,6 +176,17 @@ pub(crate) struct AppRuntimeConfig {
     pub(crate) uid_policy: crate::structured::identity::UidPolicy,
 }
 
+impl AppRuntimeConfig {
+    /// Capture one server's launch-time identity policy before starting listeners.
+    pub(crate) fn for_config(config: &Config) -> Self {
+        let mut runtime = Self::default();
+        if config.security.agent_account == crate::config::model::AgentAccount::None {
+            runtime.uid_policy.dedicated = Ok(None).into();
+        }
+        runtime
+    }
+}
+
 pub struct App {
     pub(crate) runtime_config: AppRuntimeConfig,
     /// Shared, in-memory one-time browser handoffs, never persisted across restart.
@@ -358,6 +369,7 @@ pub struct App {
     pub(crate) suppressed_repeat_keys:
         HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     pub(crate) input_writes: input_writes::InputWrites,
+    pub(crate) structured_workers: crate::structured::workers::Workers,
     pub render_notify: Arc<Notify>,
     pub render_dirty: Arc<AtomicBool>,
     pub(crate) full_redraw_pending: bool,
@@ -531,7 +543,7 @@ impl App {
             config_diagnostic,
             api_rx,
             event_hub,
-            AppRuntimeConfig::default(),
+            AppRuntimeConfig::for_config(config),
         )
     }
 
@@ -1110,6 +1122,7 @@ impl App {
             input_rx: None,
             last_terminal_size: terminal::size().ok(),
             input_writes: input_writes::InputWrites::default(),
+            structured_workers: crate::structured::workers::Workers::new(render_notify.clone()),
             render_notify,
             render_dirty,
             full_redraw_pending: false,
@@ -1697,12 +1710,7 @@ impl App {
 
         self.input_writes
             .retire_all(crate::pty::write_receipt::WriteFailure::PaneGone);
-        // Save session on exit (skip in --no-session mode)
-        if !self.no_session {
-            self.save_session_now();
-        }
-
-        Ok(())
+        self.finish_session().map_err(io::Error::other)
     }
 
     fn sync_host_mouse_capture(&self, active: &mut bool) -> io::Result<()> {
@@ -2373,6 +2381,92 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn structured_worker_notifications_and_exact_deadlines_reach_the_scheduler() {
+        use crate::api::agent_state::{Lifecycle, Phase};
+        use crate::structured::workers::tests::{event, wait, Case};
+        let mut app = test_app();
+        let now = Instant::now();
+        let notify = app.render_notify.clone();
+        app.state.workspaces.clear();
+        app.state.config.checks.enable = false;
+        app.next_auto_update_check = None;
+        app.checks_heartbeat_deadline = None;
+        app.checks_next_deadline = None;
+        app.next_animation_tick = None;
+        app.session_save_deadline = None;
+        let (mut case, mut launch, factory) = Case::prepare(
+            &mut app.state.structured_agents,
+            11,
+            "state-reducer",
+            vec![event("command_lifecycle")],
+        );
+        // Choose an explicit fixture policy earlier than unrelated app deadlines.
+        launch.stall_after = Duration::from_millis(1);
+        case.generation = app
+            .structured_workers
+            .start(&mut app.state.structured_agents, launch, factory)
+            .unwrap();
+        wait(&notify, || {
+            app.handle_scheduled_tasks(now, false);
+            assert!(app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            app.state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle
+                == Lifecycle::Live
+        })
+        .await;
+        case.submit(&app.structured_workers);
+        wait(&notify, || {
+            app.handle_scheduled_tasks(now, false);
+            assert!(app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            app.state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .phase
+                == Phase::Working
+        })
+        .await;
+        app.checks_next_deadline = None;
+        app.checks_heartbeat_deadline = None;
+        let due = app
+            .structured_workers
+            .next_deadline(&app.state.structured_agents)
+            .unwrap();
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(now, false, false),
+            Some(due)
+        );
+        let now = due;
+        app.handle_scheduled_tasks(now, false);
+        let update = &app.state.structured_agents.get(&case.id).unwrap().1.update;
+        assert_eq!(update.state.phase, Phase::Working);
+        assert!(update.stalled_since_ms.is_some());
+        case.finish(
+            &mut app.state.structured_agents,
+            &mut app.structured_workers,
+            &notify,
+            now,
+            Some(crate::structured::runtime::Outcome::Stopped),
+        )
+        .await;
     }
 
     #[test]

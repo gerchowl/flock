@@ -270,7 +270,7 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   tracks open control
   requests by `request_id`, and the agent stays `waiting_on_human` until
   every one of them is answered. Working is `system/status: requesting` or
-  an open `message_start`. A stall is a started input with no stdout event for
+  an open `message_start`. A stall is an accepted or started input with no stdout event for
   `[sessions] stall_ms` while no control request and no tool call is open;
   a long-running tool is not a stall (its `tool_use` is open). A stall is
   reported as `agent.session_stalled{since}` and leaves the phase as it is
@@ -337,7 +337,8 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   resolved absent account does too. A dedicated UID equal to the server UID
   is a §1a misconfiguration, never operator authority. Report
   `agent_account_uid_collision` once in the log and retain the typed diagnostic
-  in server status until restart.
+  in server status until restart. Each server owns its account cache and
+  collision-reporting state; its app and API listener share the same policy.
 
   Explicit `agent_account = "none"` declares that no dedicated account is used.
   The server never starts the dedicated-account NSS lookup, and callers with
@@ -419,8 +420,11 @@ or harness records, invalid entries and duplicates are skipped with a warning,
 without rejecting any PTY workspace. The first supported id/name/session wins.
 Skipped entries remain raw and in order across saves, including additional
 fields, so rollback cannot erase newer records. Explicit removal also discards
-retained entries sharing the removed id, name or session, preventing a shadowed
-duplicate from becoming active after restart. Removal compacts retained slots.
+retained entries sharing the removed id or session, preventing a shadowed
+duplicate from becoming active after restart. Known-runtime shadows also match
+by name; a future-runtime record sharing only a name has a separate identity
+and survives removal (#1858). Explicit admission refuses any retained name.
+Removal compacts retained slots.
 Known records also retain their original extra fields. An unknown collection shape remains raw
 and inactive; new admission refuses until its shape is understood. Warnings
 contain an index and reason, never raw payloads. The registry exposes a retained
@@ -437,7 +441,52 @@ Handoff restores structured metadata offline; this slice owns no workers to
 transfer.
 
 #1842 owns runtime workers, actual lease ownership and observation scheduling.
-Its caller must mark session persistence dirty when durable metadata changes.
+The app owns `structured::workers::Workers` outside pure `AppState`. Each launch
+reserves its native session before running the admission-supplied, bounded
+profile factory on an owning thread, then binds the registered cwd/model.
+Preparation is cancellable at its boundaries; an in-progress factory must finish
+within its own bound. One blocked factory cannot block another agent or the app.
+A new launch advances the observation generation, without modifying durable
+metadata. Live/unconfirmed workers refuse replacement. Cold restore remains
+offline and never starts a worker automatically.
+
+Ready/completion share a bounded two-message channel. Runtime stream queues are
+bounded separately; an app pass drains at most four records per worker and
+rearms its existing event wake when it reaches that budget. Every stream record
+enters S4 only via `Received::state_input`, so durable permission-book closes
+clear attention without waiting for a result (#1846/#1849). Lifecycle and due
+observations are explicit host facts. Both TUI and headless schedulers service
+owner wakes and include S4's exact next observation boundary. No periodic
+structured-agent timer, kill-on-silence policy or EventHub emission is added.
+
+Ordinary stop latches cancellation without waiting; polling joins only finished threads. A terminal report
+becomes visible only after queued stream facts drain. Confirmed cleanup closes
+open requests and sets Offline; unconfirmed ownership instead retains authority
+and Unknown lifecycle, refuses restart, and requires explicit recovery. Reports
+retain actual exit status/outcome or typed preparation/worker failure; results
+remain turn facts rather than process-success evidence. Finished threads are joined
+before replacement or pruning. Shutdown and the pre-handoff step attempt to stop
+all workers, drain durable permission closes, release confirmed leases, and join
+within the stated bound. Handoff deliberately stops structured sessions in this
+slice (full single-writer transfer is S7-rest). Records remain Offline and resume
+only through an explicit start using their stored session id, never automatically.
+A shared 10-second graceful deadline is followed by identity-checked child-tree
+KILL and a bounded 10-second cleanup/join interval. Deadline overruns report
+`structured_worker_timeout`; unconfirmed cleanup reports
+`structured_worker_cleanup_failed`. Worker diagnostics never veto handoff: kill,
+report the typed codes and proceed once the real handoff preconditions hold.
+An additive, optional handoff-manifest list carries uncertain agent identities,
+restored as Unknown without lease or process authority; confirmed cleanup stays
+Offline. Cold disk restore still defaults to Offline. Unknown identities never
+grant permission to signal. An unjoined worker remains owned and fenced, and
+later owner polls can finish joining it. Worker panics report the distinct
+`structured_worker_panicked` failure. These diagnostics require human inspection
+before retrying an uncertain session. Shutdown runs once per worker set and caches its typed result.
+Both TUI and headless quit always save the session before returning a shutdown
+error. Drop runs bounded teardown only if it has not already been attempted;
+after success or failure it joins only finished threads, without another wait.
+A newly admitted worker resets that cached result. The caller must mark session persistence
+dirty when durable metadata changes.
 #1843 owns the public `StructuredAgentInfo`, additive `structured_agents` list,
 get/status/stop routes and `runtime_unsupported` refusals. Existing PTY
 `AgentInfo` placement fields remain mandatory and unchanged; structured records
@@ -446,6 +495,23 @@ remain #1380. Public structured start stays unreachable until #1843 and #1734
 have landed. The default remains the agent user (#1177); the owner-approved
 MVP exception permits explicit operator-mode opt-in only. #1843 supplies the
 public admission wiring and isolated manual dogfood runbook for that exception.
+
+Accepted-input silence (#1903): successful transport admission of a user
+stdin envelope supplies `Input::Accepted { at, at_ms }` through
+`Received::state_input`, using monotonic and Unix clocks captured at admission.
+It arms the same caller stall policy before any started/requesting/message_start
+observation, without inventing a working turn. Later stdout resets the silence
+anchor normally; started evidence establishes working, and top-level result or
+exit retires the pending interval. Control requests and open tools suppress
+stall reporting exactly as for started turns. The transport serializes its host
+`flk_input_accepted` stream record before later stdout observations, even for a
+fast response. This is an internal stream fact, not an EventHub event kind or
+mesh frame. Its monotonic stamp belongs only to the current launch and cannot
+be reconstructed on replay; a raw host record without that stamp is skipped.
+Admission is not proof of a successful pipe write or provider turn. A cancelled
+admission requests process shutdown as well as pipe cancellation. Transport
+failure remains an explicit worker failure, and output backpressure delays
+notification rather than dropping it. No queue/scheduler feed is needed.
 
 The caller supplies monotonic observation time and its configured `stall_ms`;
 the reducer never starts a timer, polls a process or kills/retries a turn.

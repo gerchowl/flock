@@ -47,6 +47,17 @@ pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::
 }
 
 fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
+    save_json_with_directory_sync(path, snapshot, |parent| {
+        std::fs::File::open(parent)?.sync_all()
+    })
+}
+
+// Keep the post-replacement durability operation explicit and independently fallible.
+fn save_json_with_directory_sync<T: serde::Serialize>(
+    path: &Path,
+    snapshot: &T,
+    sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let target = resolve_write_target(path)?;
     let parent = snapshot_parent(&target);
     std::fs::create_dir_all(parent)?;
@@ -60,7 +71,9 @@ fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io:
         let _ = std::fs::remove_file(&tmp_path);
         return Err(err);
     }
-    sync_replaced_snapshot_directory(parent);
+    if let Err(err) = sync_directory(parent) {
+        crate::logging::session_directory_sync_failed(parent, &err.to_string());
+    }
     Ok(())
 }
 
@@ -69,13 +82,6 @@ fn snapshot_parent(target: &Path) -> &Path {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
-}
-
-// Replacement has already succeeded: a durability warning cannot undo it.
-fn sync_replaced_snapshot_directory(parent: &Path) {
-    if let Err(err) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
-        crate::logging::session_directory_sync_failed(parent, &err.to_string());
-    }
 }
 
 pub(super) fn save_to_paths(
@@ -200,30 +206,24 @@ mod tests {
 
     #[test]
     fn directory_sync_failure_after_replacement_is_nonfatal() {
-        use std::os::unix::fs::PermissionsExt;
-        struct RestorePermissions(PathBuf, std::fs::Permissions);
-        impl Drop for RestorePermissions {
-            fn drop(&mut self) {
-                std::fs::set_permissions(&self.0, self.1.clone()).unwrap();
-            }
-        }
         let root = crate::test_support::TempDir::socket();
         let path = root.path().join("session.json");
-        let _restore = RestorePermissions(
-            root.path().to_owned(),
-            std::fs::metadata(root.path()).unwrap().permissions(),
-        );
-        // Write/search permits replacement, but no directory read permits its open.
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
-        assert_eq!(
-            std::fs::File::open(root.path()).unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        save_json_to_path(&path, &serde_json::json!({"new":true}))
-            .expect("a successful replacement must report success even if directory sync fails");
+        let expected = serde_json::json!({"new":true});
+        std::fs::write(&path, "old snapshot").unwrap();
+        let mut called = false;
+        save_json_with_directory_sync(&path, &expected, |parent| {
+            called = true;
+            assert_eq!(parent, root.path());
+            let replaced: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(replaced, expected, "rename precedes directory sync");
+            Err(std::io::Error::other("fixture directory fsync failed"))
+        })
+        .expect("a successful replacement must report success even if directory sync fails");
+        assert!(called);
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(saved, serde_json::json!({"new":true}));
+        assert_eq!(saved, expected);
     }
 
     #[test]
