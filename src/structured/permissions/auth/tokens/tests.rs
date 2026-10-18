@@ -409,7 +409,8 @@ fn separate_handles_wait_for_admission_and_revocation_wins_after_it() {
     let (root, store, mut app) = setup();
     let issued = issue(&store, &mut app, "browser", &[Scope::Send]);
     let session = store.authenticate(&issued.token).unwrap();
-    let other = TokenStore::open(root.path()).unwrap();
+    let mut other = TokenStore::open(root.path()).unwrap();
+    other.2 = helper_binary();
     let store = Arc::new(store);
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -429,10 +430,7 @@ fn separate_handles_wait_for_admission_and_revocation_wins_after_it() {
     // Begin the real revocation while dispatch holds the OS lock. The staged
     // operation must wait, rather than fail Busy or delete an admitted record.
     let pending = other.begin_revoke("browser").unwrap();
-    assert!(matches!(
-        pending.guard.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
-    ));
+    assert!(priority::pending(&other.0).unwrap());
     assert_eq!(store.authenticate(&issued.token).unwrap().info, issued.info);
     release_tx.send(()).unwrap();
     pending.finish().unwrap();
@@ -450,7 +448,8 @@ fn separate_handles_wait_for_admission_and_revocation_wins_after_it() {
 fn revocation_lock_deadline_fails_without_removing_a_credential() {
     let (root, store, mut app) = setup();
     let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
-    let other = TokenStore::open(root.path()).unwrap();
+    let mut other = TokenStore::open(root.path()).unwrap();
+    other.2 = helper_binary();
     let guard = store.lock().unwrap();
     assert!(
         matches!(other.revoke(&app.client_token_authority().unwrap(), "browser"), Err(TokenError::Io(error)) if error.kind() == io::ErrorKind::TimedOut)
@@ -624,4 +623,155 @@ fn browser_open_does_not_widen_an_existing_operator_named_token() {
         store.authenticate(&issued.token).unwrap().info.scopes,
         scopes(&[Scope::Read])
     );
+}
+
+fn helper_binary() -> std::path::PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("flk{}", std::env::consts::EXE_SUFFIX))
+}
+#[test]
+fn revocation_intent_blocks_new_admissions_across_handles_without_starvation() {
+    let (_root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Send]);
+    let session = store.authenticate(&issued.token).unwrap();
+    let intent = priority::Intent::begin(&store.0, store.random::<16>().unwrap()).unwrap();
+    // The primary lock is free, so Busy proves intent priority rather than contention.
+    assert!(store.lock_file().unwrap().try_lock().is_ok());
+    for _ in 0..4096 {
+        assert!(matches!(
+            store.admit(&session, Scope::Send, |_| panic!(
+                "admission overtook revocation"
+            )),
+            Err(TokenError::Busy)
+        ));
+    }
+    drop(intent);
+    assert!(store.admit(&session, Scope::Send, |_| ()).is_ok());
+}
+#[test]
+fn looping_valid_admissions_cannot_make_operator_revocation_fail() {
+    let (root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Send]);
+    let session = store.authenticate(&issued.token).unwrap();
+    let mut other = TokenStore::open(root.path()).unwrap();
+    other.2 = helper_binary();
+    let store = Arc::new(store);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let worker = {
+        let store = store.clone();
+        let stop = stop.clone();
+        let session = session.clone();
+        std::thread::spawn(move || {
+            assert!(store.admit(&session, Scope::Send, |_| ()).is_ok());
+            tx.send(()).unwrap();
+            while !stop.load(Ordering::Acquire) {
+                match store.admit(&session, Scope::Send, |_| ()) {
+                    Ok(()) | Err(TokenError::Busy) | Err(TokenError::Revoked) => (),
+                    other => panic!("unexpected admission: {other:?}"),
+                }
+            }
+        })
+    };
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let result = other.revoke(&app.client_token_authority().unwrap(), "browser");
+    stop.store(true, Ordering::Release);
+    worker.join().unwrap();
+    result.unwrap();
+    assert!(matches!(
+        store.admit(&session, Scope::Send, |_| panic!("revoked callback")),
+        Err(TokenError::Revoked)
+    ));
+}
+
+#[test]
+fn temporary_directory_is_unsafe_entry_not_a_store_outage() {
+    let (root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
+    let path = root.path().join("client-tokens/.tmp-directory");
+    fs::create_dir(&path).unwrap();
+    let logs = crate::logging::capture_logs(|| {
+        let reopened = TokenStore::open(root.path()).unwrap();
+        assert_eq!(
+            reopened.authenticate(&issued.token).unwrap().info,
+            issued.info
+        );
+        assert!(reopened
+            .list(&app.client_token_authority().unwrap())
+            .is_ok());
+    });
+    assert!(path.is_dir());
+    assert!(logs.contains(&hex(b".tmp-directory")));
+}
+#[test]
+fn orphan_intent_and_invalid_dash_names_cannot_deny_or_issue() {
+    let (root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
+    let name = format!(".revoke-{}", "a".repeat(32));
+    let orphan = store.0.file(&name, true).unwrap();
+    drop(orphan);
+    assert!(!priority::pending(&store.0).unwrap());
+    assert!(store
+        .admit(
+            &store.authenticate(&issued.token).unwrap(),
+            Scope::Read,
+            |_| ()
+        )
+        .is_ok());
+    for name in ["--show-token", "-browser"] {
+        assert!(matches!(
+            store.issue(
+                &app.client_token_authority().unwrap(),
+                name,
+                scopes(&[Scope::Read])
+            ),
+            Err(TokenError::Unsafe)
+        ));
+        assert!(!root
+            .path()
+            .join("client-tokens")
+            .join(format!("{name}.token"))
+            .exists());
+    }
+}
+
+#[test]
+fn priority_process_fixture() {
+    let Some(root) = std::env::var_os("FLK_TOKEN_PRIORITY_FIXTURE") else {
+        return;
+    };
+    assert!(matches!(
+        TokenStore::open(Path::new(&root)),
+        Err(TokenError::Busy)
+    ));
+}
+#[test]
+fn intent_is_observed_by_an_independent_process_with_no_primary_lock_held() {
+    let (root, store, _app) = setup();
+    let intent = priority::Intent::begin(&store.0, store.random::<16>().unwrap()).unwrap();
+    let mut command = crate::process::TracedCommand::new(std::env::current_exe().unwrap(), "test");
+    command.args([
+        "--exact",
+        "structured::permissions::auth::tokens::tests::priority_process_fixture",
+        "--nocapture",
+    ]);
+    for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("FLOCK_")) {
+        command.env_remove(key);
+    }
+    command.env("FLK_TOKEN_PRIORITY_FIXTURE", root.path());
+    let output = command
+        .output_traced_with_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    drop(intent);
+    assert!(store.lock().is_ok());
 }
