@@ -172,6 +172,11 @@ impl Registry {
     /// without intervening registry mutations. Active entries, generations and worker
     /// observations remain owned by the live registry (ADR-0036 §1).
     pub(crate) fn swap_retained_state(&mut self, saved: &mut Self) {
+        // A fresh snapshot keeps preserved slots bound to the same active entries.
+        debug_assert!(
+            self.entries.keys().eq(saved.entries.keys()),
+            "retained snapshot must have the same live entries"
+        );
         std::mem::swap(&mut self.preserved, &mut saved.preserved);
         std::mem::swap(&mut self.retained, &mut saved.retained);
         std::mem::swap(&mut self.retention_extra, &mut saved.retention_extra);

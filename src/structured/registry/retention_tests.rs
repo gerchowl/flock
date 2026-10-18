@@ -279,12 +279,15 @@ fn retained_logs_separate_class_from_each_cause() {
     for (line, (class, cause)) in lines.iter().zip([
         ("DEAD", "non_object"),
         ("DEAD", "exact_duplicate"),
-        ("FORWARD", "Conflict"),
-        ("FORWARD", "InvalidRecord"),
+        ("FORWARD", "conflict"),
+        ("FORWARD", "invalid_record"),
         ("FORWARD", "unsupported_shape"),
     ]) {
         assert!(line.contains(&format!("class={class:?}")), "{line}");
         assert!(line.contains(&format!("cause={cause:?}")), "{line}");
+        if matches!(cause, "conflict" | "invalid_record") {
+            assert!(line.contains("detail="), "{line}");
+        }
     }
 }
 
@@ -343,4 +346,14 @@ fn retained_swap_installs_saved_state_exactly_without_cold_live_entries() {
     // Slot bindings remain valid after installing a snapshot with holes.
     live.remove(&known.agent_id, generation).unwrap();
     assert_eq!(serde_json::to_value(&live).unwrap(), json!([forward()]));
+}
+
+#[test]
+#[should_panic(expected = "retained snapshot must have the same live entries")]
+fn retained_swap_rejects_stale_entry_set() {
+    let mut live = registry(json!([]));
+    let mut saved = live.snapshot();
+    live.register(super::tests::record("agent_fixture_stale_swap"))
+        .unwrap();
+    live.swap_retained_state(&mut saved);
 }

@@ -93,6 +93,19 @@ pub enum RegistryError {
     GenerationExhausted,
 }
 
+impl RegistryError {
+    /// Stable diagnostic cause, independent of human-readable error wording.
+    fn retained_cause(&self) -> &'static str {
+        match self {
+            Self::InvalidRecord => "invalid_record",
+            Self::UnsupportedCollectionShape => "unsupported_collection_shape",
+            Self::Conflict => "conflict",
+            Self::StaleGeneration => "stale_generation",
+            Self::GenerationExhausted => "generation_exhausted",
+        }
+    }
+}
+
 impl std::fmt::Display for RegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -416,23 +429,28 @@ impl<'de> Deserialize<'de> for Registry {
         for (index, raw) in records.into_iter().enumerate() {
             let duplicate = !seen.insert(retention::digest(&raw));
             let dead = !raw.is_object() || duplicate;
-            let reason = if !raw.is_object() {
-                "non_object".to_owned()
+            let mut detail = String::new();
+            let cause = if !raw.is_object() {
+                "non_object"
             } else if duplicate {
-                "exact_duplicate".to_owned()
+                "exact_duplicate"
             } else {
                 match serde_json::from_value::<Record>(raw.clone()) {
                     Ok(record) => match registry.register_raw(record, raw.clone()) {
                         Ok(_) => continue,
-                        Err(error) => error.to_string(),
+                        Err(error) => {
+                            detail = error.to_string();
+                            error.retained_cause()
+                        }
                     },
-                    Err(_) => "unsupported_shape".to_owned(),
+                    Err(_) => "unsupported_shape",
                 }
             };
             tracing::warn!(
                 index,
                 class = if dead { "DEAD" } else { "FORWARD" },
-                cause = reason.as_str(),
+                cause,
+                detail = detail.as_str(),
                 "structured record skipped; raw data retained inactive"
             );
             registry
