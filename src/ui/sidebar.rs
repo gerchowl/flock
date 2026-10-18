@@ -3655,6 +3655,141 @@ mod tests {
     use crate::{detect::Agent, workspace::Workspace};
     use ratatui::{backend::TestBackend, Terminal};
 
+    fn server_identity1076_fixture() -> (crate::app::App, String) {
+        let identity = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
+        let node = identity.node_id();
+        let peer = crate::config::PeerConfig {
+            name: "node-b-alias.example".into(),
+            ssh: "node-b.example".into(),
+            ..Default::default()
+        };
+        crate::mesh::hello::with_store(|store| {
+            store
+                .put_pin(
+                    &peer.name,
+                    &crate::mesh::store::IdentityPin {
+                        node_id: node.clone(),
+                        public_key: identity.public_key().to_vec(),
+                    },
+                )
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let config = crate::config::Config {
+            peers: vec![peer],
+            ..Default::default()
+        };
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app =
+            crate::app::App::new(&config, true, None, rx, crate::api::EventHub::default());
+        app.node_id = Some(
+            crate::mesh::identity::NodeIdentity::load()
+                .unwrap()
+                .node_id(),
+        );
+        app.state.peer_summaries[0].error = Some("connect_refused".into());
+        let mut relayed: crate::api::schema::RelayedFleetPeer = serde_json::from_value(
+            serde_json::json!({"node_id":node,"name":"node-b.example","ssh_target":"node-b.example",
+                "host":"node-b-reported.example","origin":"node-b.example","age_secs":0,
+                "origin_last_ok_secs":0,"icon":"toad","workspaces":[{
+                    "workspace":"fixture", "status":"working"}]}),
+        )
+        .unwrap();
+        relayed.node_id = Some(node.clone());
+        crate::peers::merge_relayed_fleet(
+            &mut app.state.relayed_fleet_cache,
+            vec![relayed],
+            "node-b.example",
+        );
+        let pid = std::process::id();
+        let birth = crate::platform::process_start_time(pid).unwrap();
+        app.inbound
+            .attach(pid, birth, crate::platform::process_start_time)
+            .unwrap();
+        let edge = app
+            .inbound
+            .edge_mut(Some(pid), crate::platform::process_start_time)
+            .unwrap();
+        edge.enrollment.peer = "node-b.example".into();
+        edge.enrollment.node_id = Some(node.clone());
+        edge.enrollment.state = "pinned".into();
+        // Drive the real pin/path projection endpoint before building the band.
+        let request = serde_json::from_value(serde_json::json!({
+            "id":"fixture", "method":"peers.enrollment", "params":{}}))
+        .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert!(response.get("error").is_none());
+        assert!(app.mesh_routes.table.live_edges().contains(&node));
+        (app, node)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_identity1076_config_gossip_and_pin_fold_into_one_live_node() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (app, node) = server_identity1076_fixture();
+        let rows = app.state.remote_peers();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one configured alias and its live gossip must be one node"
+        );
+        assert_eq!(rows[0].1.node_id.as_deref(), Some(node.as_str()));
+        assert_ne!(
+            rows[0].1.reachability(),
+            crate::peers::PeerReachability::Down
+        );
+        assert_eq!(rows[0].1.workspaces.len(), 1, "retain the live reading");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_identity1076_enrolled_direct_edge_does_not_render_via_itself() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (mut app, _) = server_identity1076_fixture();
+        // Isolate the route symptom from the separately tested alias duplicate.
+        app.state.peer_summaries.clear();
+        let area = Rect::new(0, 0, 120, 16);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_servers_section(&app.state, frame, area, false))
+            .unwrap();
+        let text = (0..area.height)
+            .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("via node-b.example"),
+            "gossip provenance was rendered as a route"
+        );
+        assert!(text.contains("direct"));
+    }
+
+    #[test]
+    fn server_identity1076_icon_rows_always_include_the_node_name() {
+        for mode in [
+            crate::config::ServerLabelConfig::Icon,
+            crate::config::ServerLabelConfig::Both,
+            crate::config::ServerLabelConfig::Name,
+        ] {
+            let row = server_name_spans(Some("toad"), "node-b.example", mode, Style::default());
+            assert!(
+                spans_text(&row).contains("node-b.example"),
+                "a server row needs its name"
+            );
+        }
+    }
+
+    #[test]
+    fn server_identity1076_diagnose_carried_snapshot_identity_loss() {
+        let mut peer = peer_named_with_host("node-b-alias.example", "node-b.example");
+        peer.node_id = Some(crate::mesh::identity::NodeIdentity::fixture([7; 32]).node_id());
+        // Positional FleetPeer has no node field; the receiver cannot recover it.
+        let carried = crate::peers::peer_from_wire(crate::peers::peer_to_wire(&peer));
+        assert!(carried.node_id.is_none());
+    }
+
     fn remote_summary(
         workspace: &str,
         project_key: Option<&str>,
