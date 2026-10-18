@@ -145,3 +145,31 @@ fn retained_sidecar_sequence_entry_is_preserved_without_becoming_a_stamp() {
     assert_eq!(restored.retained_records()[0].first_seen_ms, Some(42));
     assert_eq!(restored.retained_stamps(), json!([stamp, sequence]));
 }
+
+#[test]
+fn retained_explicit_purge_respects_age_kind_missing_stamps_and_live_workers() {
+    let known = super::tests::record("agent_fixture_live");
+    let mut store =
+        registry(json!([serde_json::to_value(&known).unwrap(), {"invalid":true}, forward()]));
+    assert_eq!(store.purge_retained(true, Some(0), 100), 0);
+    store.prepare_retained_save(42);
+    let generation = store.get(&known.agent_id).unwrap().2;
+    store
+        .apply(
+            &known.agent_id,
+            generation,
+            Input::Lifecycle(Lifecycle::Live),
+            Instant::now(),
+            42,
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert_eq!(store.purge_retained(true, Some(10), 52), 0);
+    assert_eq!(store.purge_retained(false, Some(10), 53), 1);
+    assert_eq!(store.retained_records()[0].kind, RetainedKind::Forward);
+    assert_eq!(store.purge_retained(true, Some(10), 53), 1);
+    let (_, projection, unchanged_generation) = store.get(&known.agent_id).unwrap();
+    assert_eq!(generation, unchanged_generation);
+    assert_eq!(projection.update.state.lifecycle, Lifecycle::Live);
+    assert_eq!(store.records().len(), 1);
+}

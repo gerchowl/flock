@@ -116,6 +116,7 @@ error_codes! {
         InvalidRegex = "invalid_regex",
         InvalidRequest = "invalid_request",
         InvalidSessionName = "invalid_session_name",
+        RetainedCollectionShape = "retained_collection_shape",
         InvalidSignature = "invalid_signature",
         InvalidStateLabel = "invalid_state_label",
         LineageNotFound = "lineage_not_found",

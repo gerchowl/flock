@@ -325,6 +325,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("goal", "pause", "flk goal pause [--minutes N] [--agent TARGET] [--json]"),
     ("goal", "resume", "flk goal resume [--agent TARGET] [--json]"),
     ("goal", "stop", "flk goal stop [--reason TEXT] [--agent TARGET] [--json]"),
+    ("session", "retained", super::retained::USAGE),
     ("session", "list", "flk session list [--json]"),
     ("session", "attach", "flk session attach <name>"),
     ("session", "stop", "flk session stop <name> [--json]"),

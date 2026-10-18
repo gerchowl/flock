@@ -30,7 +30,7 @@ pub const RETAINED_DEAD_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 6
 pub const RETAINED_DEAD_MAX: usize = 256;
 
 /// Retained data never supplies runtime or operator authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetainedKind {
     /// An unknown runtime/harness may belong to a newer binary; never auto-prune it.
@@ -39,7 +39,7 @@ pub enum RetainedKind {
     Dead,
 }
 /// Retained-record metadata, without exposing the preserved payload.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedInfo {
     /// Position in the serialized structured_agents array.
     pub slot: usize,

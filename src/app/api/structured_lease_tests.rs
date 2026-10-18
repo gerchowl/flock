@@ -65,6 +65,18 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
         "requests.json",
         &serde_json::to_vec(&[
             Request {
+                id: "retained-list".into(),
+                method: Method::SessionRetainedList(EmptyParams {}),
+            },
+            Request {
+                id: "retained-purge".into(),
+                method: Method::SessionRetainedPurge(crate::api::retained::PurgeParams {
+                    selection: crate::api::retained::Selection::All,
+                    yes: true,
+                    older_than_ms: None,
+                }),
+            },
+            Request {
                 id: "owner".into(),
                 method: Method::OwnerPolicyAdopt(OwnerPolicyParams {
                     repo: root.display().to_string(),
@@ -126,7 +138,7 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
     app.current_api_peer_birth = None;
     let runtime = &owned.runtime;
     let socket_worker = std::thread::spawn(move || {
-        for _ in 0..3 {
+        for _ in 0..5 {
             let mut poll = libc::pollfd {
                 fd: listener.as_raw_fd(),
                 events: libc::POLLIN,
@@ -157,7 +169,7 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
         .try_submit(&serde_json::json!({"type":"user"}))
         .unwrap();
     let mut attributed = true;
-    for _ in 0..3 {
+    for _ in 0..5 {
         let msg = tokio::time::timeout(Duration::from_secs(10), app.api_rx.recv())
             .await
             .expect("bounded socket dispatch")
@@ -217,14 +229,16 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
     assert_eq!(
         (
             attributed,
-            responses[0]["error"]["code"].as_str(),
-            responses[1].get("result").is_some(),
+            responses[2]["error"]["code"].as_str(),
+            responses[3].get("result").is_some(),
             sent.from_agent.as_deref()
         ),
         (true, Some("operator_only"), true, Some(AGENT)),
         "{responses}"
     );
-    assert!(responses[2].get("result").is_some(), "{responses}");
+    assert_eq!(responses[0]["error"]["code"], "operator_only");
+    assert_eq!(responses[1]["error"]["code"], "operator_only");
+    assert!(responses[4].get("result").is_some(), "{responses}");
     assert!(sent.from_pane.is_none());
 }
 

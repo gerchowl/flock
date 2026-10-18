@@ -7,6 +7,7 @@ mod event_hub;
 mod events_read;
 pub mod question;
 mod reply_wait;
+pub mod retained;
 pub mod schema;
 pub(crate) mod server;
 mod status;
