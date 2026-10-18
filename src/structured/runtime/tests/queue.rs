@@ -1028,7 +1028,7 @@ fn readonly_runtime(mode: &str) {
             status.cause,
             PendingCause::QueueJournalNewer {
                 found: 999,
-                supported: 2
+                supported: crate::structured::queue::FORMAT_VERSION
             }
         );
         assert_eq!(

@@ -19,27 +19,6 @@ impl<'a> VerifiedToken<'a> {
     }
 }
 
-impl super::Principal<'_> {
-    /// Admission authority from authenticated dispatcher context (ADR-0036 §3).
-    /// Claimed producer names are never accepted as operator capabilities.
-    pub(crate) fn queue_origin(
-        &self,
-    ) -> Result<crate::structured::queue::admission::Principal, crate::api::error_code::ErrorCode>
-    {
-        use crate::structured::queue::{admission::Principal as QueuePrincipal, model::Producer};
-        match self {
-            Self::Operator => Ok(QueuePrincipal::Operator),
-            Self::Token(token) if token.decision_subject().is_some() => {
-                Ok(QueuePrincipal::Operator)
-            }
-            Self::Agent(id) | Self::Lease(id) if !id.is_empty() => {
-                Ok(QueuePrincipal::Origin(Producer::Agent((*id).into())))
-            }
-            _ => Err(crate::api::error_code::ErrorCode::NotAuthorized),
-        }
-    }
-}
-
 /// Test-only issuer; absent from production builds.
 #[cfg(test)]
 pub(crate) fn fixture(subject: &str, operate: bool) -> VerifiedToken<'_> {
