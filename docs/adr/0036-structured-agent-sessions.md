@@ -962,7 +962,10 @@ same queue (owner decision 5): there is no second input path.
 - **Queue custody completion (#2160, #2186, #2164).** The journal owner's
   committed fold is authoritative: a committed `MessageKey` cannot later be
   refused as never committed. The custody lookup shares that fold, without a
-  separate growing key index. Auxiliary tracking is bounded by in-flight
+  separate growing key index. Process identity reuse is already cached by
+  `NodeIdentity::load`; `local_custody_cached_identity_attests_without_reading_the_key_file`
+  pins that pre-existing behavior and is not a before/after regression proof
+  for #2164. Auxiliary tracking is bounded by in-flight
   admissions. Each lookup is O(retained journal items), with no file I/O on the
   server loop. The journal still retains its item history. The shared snapshot
   refreshes on admission completion and publication; between an append and that
@@ -973,6 +976,8 @@ same queue (owner decision 5): there is no second input path.
   Missing owners/runtimes, read-only or future-format journals and uncertain
   writes cannot prove absence. Admission persists `admission_pending` before
   dispatching to the owner, so expiry before acknowledgement retains uncertainty.
+  Every fresh native send performs this row update; a brief `queued` status with
+  `input_write_unknown:admission_pending` is an expected admission transition.
   Even a permanent recovery error then keeps the
   same key recovering until its existing inbox TTL (24 hours), never a fresh
   send or a terminal refusal. Jittered backoff is 4–5 seconds, then 48–60 seconds,
@@ -981,13 +986,24 @@ same queue (owner decision 5): there is no second input path.
   owner generation remain at least four seconds apart. A new owner generation
   can resume immediately on its wake; a failure's own notification cannot
   create a retry loop.
+  These longer intervals are scheduled deadlines in the absence of progress
+  wakes, not minimum retry intervals under load. An isolated 64-turn workload
+  using the real App worker loop and fixture transport (#2235, no model) measured
+  939 service polls and 447 changed wakes in 5.126 seconds (47.6%, 87.2 wakes/s),
+  with two attempts against an unavailable owner. Thus unrelated worker activity
+  can sustain the four-second floor rather than the 48–300-second schedule.
+  This is a measured fixture workload, not a deployed-fleet rate claim.
   Status stays `queued` with typed detail `input_write_unknown:<cause>`:
   `owner_unavailable`, `admission_pending`, `write_uncertain`,
   `commit_proven_settle_pending`, `journal_opaque`,
   `queue_journal_newer` or `queue_journal_corrupt`. These describe unresolved
   proof or settlement, independently of the error that triggered recovery.
   Positive proof whose delivery save fails records `commit_proven_settle_pending`
-  until settlement is durable. Expiry retains the correction path in this case
+  until settlement is durable. Its existing in-flight retry entry retains the
+  positive proof, including across owner loss or replacement. A subsequent
+  unavailable/opaque owner cannot negate that proof; no historical key index is
+  added, and the entry disappears on settlement or retention expiry.
+  Expiry retains the correction path in this case
   too, so a transient store failure cannot erase proven commitment. A reply is
   not journal commitment proof: `queued` and the unknown detail may coexist
   with a reply until the owner answers, custody settles, or its TTL expires.
@@ -1000,7 +1016,9 @@ same queue (owner decision 5): there is no second input path.
   expiry, only an expiry carrying unknown commitment can change to `Delivered`,
   exactly once, with typed detail `delivered_after_expiry:<item_id>` (the proven
   MessageKey's lifecycle identity). A commit proof never changes an existing
-  `Delivered` or `Refused` outcome.
+  `Delivered` or `Refused` outcome. A final conversation reply keeps the
+  `delivered_after_expiry` detail; this informational annotation does not block
+  ordinary reply collection or acknowledgement debt.
   If the delivery save fails again after expiry, a positive owner proof retains
   the same key and retries settlement on the existing capped backoff, including
   across wake notifications. Correction is bounded by the expired row's existing

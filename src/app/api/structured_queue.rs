@@ -65,6 +65,10 @@ pub(crate) struct Staged(
 pub(crate) struct Sends {
     #[cfg(test)]
     pub(super) custody_attempts: usize,
+    #[cfg(test)]
+    pub(super) custody_attempt_keys: HashMap<crate::mesh::key::MessageKey, usize>,
+    #[cfg(test)]
+    pub(crate) custody_worker_wakes: (u64, u64),
     waiting: HashMap<Key, Sender<ResultId>>,
     parked: Vec<Parked>,
     pub(super) acknowledged: Vec<super::structured_messages::Ack>,

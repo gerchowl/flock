@@ -267,6 +267,11 @@ impl App {
         #[cfg(test)]
         {
             self.structured_sends.custody_attempts += 1;
+            *self
+                .structured_sends
+                .custody_attempt_keys
+                .entry(signed.key.clone())
+                .or_default() += 1;
         }
         let (generation, data) = self.verified_queue_custody(signed)?;
         // Recovery snapshots can predate an owner's terminal refusal.
@@ -380,6 +385,7 @@ impl App {
                 now < r.at && (!changed || (!new_owner && now < r.wake_at))
             });
             let correcting = retry.is_some_and(|r| r.custody_correction);
+            let proven = retry.is_some_and(|r| r.custody_proven);
             // First expiry cleanup/proof bypasses admission backoff. A failed
             // post-expiry settlement uses its own bounded retry deadline.
             if stored(|s| s.get(&signed.key))
@@ -396,10 +402,11 @@ impl App {
                 self.structured_sends.recovering.push(signed);
                 continue;
             }
-            if self
-                .structured_workers
-                .queue_custody_committed(&signed.target_agent, &signed.key)
-                == Ok(true)
+            if proven
+                || self
+                    .structured_workers
+                    .queue_custody_committed(&signed.target_agent, &signed.key)
+                    == Ok(true)
             {
                 self.retry_queue_custody_at(signed, ErrorCode::InputWriteUnknown, now);
                 continue;
@@ -491,9 +498,18 @@ impl App {
         }
         // A recovered failure cannot revoke a key the journal owner committed.
         // Unknown ownership stays retryable until an owner can answer.
-        let committed = self
-            .structured_workers
-            .queue_custody_committed(&signed.target_agent, &signed.key);
+        // Commitment is monotonic. Losing the owner cannot invalidate its proof.
+        let committed = if self
+            .structured_sends
+            .retries
+            .get(&signed.key)
+            .is_some_and(|retry| retry.custody_proven)
+        {
+            Ok(true)
+        } else {
+            self.structured_workers
+                .queue_custody_committed(&signed.target_agent, &signed.key)
+        };
         if committed == Ok(true)
             && stored(|s| {
                 s.settle_queue_admission(&signed.key, None, super::messages::now_ms() as i64)
@@ -596,6 +612,7 @@ impl App {
             owner.unwrap_or(0),
             now,
         );
+        retry.custody_proven = committed == Ok(true);
         retry.custody_correction = expired
             || self
                 .structured_sends

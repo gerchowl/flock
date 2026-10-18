@@ -321,11 +321,18 @@ message was never committed. Recovery keeps the same message key until the
 `input_write_unknown:<cause>`, where the cause is `owner_unavailable`,
 `admission_pending`, `write_uncertain`, `commit_proven_settle_pending`,
 `journal_opaque`, `queue_journal_newer`
-or `queue_journal_corrupt`. A reply alone does not prove queue commitment, so
+or `queue_journal_corrupt`. Every fresh native send persists `admission_pending`
+before owner dispatch: a brief `queued` + `input_write_unknown:admission_pending`
+is expected while the journal admission finishes. The sending process reuses
+its cached node identity rather than reading the identity file for each send.
+A reply alone does not prove queue commitment, so
 that diagnostic can remain alongside a reply. Backoff is 4–5 seconds, then
 48–60 seconds, then 240–300 seconds, capped by the remaining TTL. Owner wakes
 may shorten long backoff, but attempts against the same owner generation remain
-at least four seconds apart. A new owner generation can resume immediately.
+at least four seconds apart. These longer schedules are deadlines in the
+absence of progress wakes. Busy unrelated worker activity can sustain the
+four-second floor, as the isolated workload measured in ADR-0036 §3 shows.
+A new owner generation can resume immediately.
 At expiry, status is `expired` with detail
 `input_write_unknown:commitment_unknown_at_expiry`. This ends admission recovery
 without claiming the queue never committed the message; positive proof can still
@@ -333,10 +340,15 @@ retain settlement recovery within the outcome window below.
 
 A positive journal proof settles delivery despite an elapsed inbox deadline.
 If saving that settlement fails, `commit_proven_settle_pending` preserves expiry
-protection until delivery is saved; expiry cannot erase that proof.
+protection until delivery is saved; expiry cannot erase that proof. The existing
+in-flight retry entry retains a positive proof across owner loss or replacement,
+so an unavailable owner cannot erase it. Recovery still stops at its original
+retention deadline, and the proof entry is removed on completion.
 If unknown expiry was already persisted, proof corrects only its status to
 `delivered`, once, with detail `delivered_after_expiry:<item_id>` identifying
-the committed lifecycle item. Proof never changes an existing delivered or
+the committed lifecycle item. A later final reply preserves this detail, and
+the annotation permits normal reply collection and acknowledgement handling.
+Proof never changes an existing delivered or
 refused outcome. If saving delivery fails again after expiry, positive proof keeps
 settlement retrying on the same capped backoff. Wake notifications cannot create
 a rapid retry loop. Correction ends at the expired row's existing `outcome_until`

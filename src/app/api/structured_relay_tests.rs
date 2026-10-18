@@ -2127,3 +2127,6 @@ fn relay_origin_presentation_lookup_failure_cannot_revoke_proven_delivery() {
         r.stop().await;
     });
 }
+
+#[path = "custody_observability_tests.rs"]
+mod observability;

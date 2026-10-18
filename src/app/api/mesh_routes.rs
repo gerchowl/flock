@@ -34,6 +34,8 @@ pub(super) struct Retry {
     pub(super) wake_at: Instant,
     /// A failed post-expiry custody settlement must honor its scheduled backoff.
     pub(super) custody_correction: bool,
+    /// Positive journal proof retained only with this in-flight custody retry.
+    pub(super) custody_proven: bool,
 }
 
 impl Retry {
@@ -70,6 +72,7 @@ impl Retry {
             at: now + delay,
             wake_at: now + Duration::from_secs(4),
             custody_correction: false,
+            custody_proven: false,
         }
     }
 }

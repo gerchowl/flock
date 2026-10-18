@@ -147,7 +147,11 @@ impl<D: DiskSpace> Store<D> {
         )?;
         if deadline <= now {
             self.finish(key, Outcome::InboxExpired, wall_ms)?;
-            Ok(None)
+            if cause == Some(Unknown::SettlementPending) {
+                self.queue_correction_remaining(key, wall_ms)
+            } else {
+                Ok(None)
+            }
         } else {
             Ok(Some((deadline - now) as u64))
         }

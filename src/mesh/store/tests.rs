@@ -5609,3 +5609,6 @@ fn custody_round2_proven_correction_is_bounded_by_outcome_retention() {
     store.maintain(until).unwrap();
     assert!(store.get(&mail.key).unwrap().is_none());
 }
+
+#[path = "custody_observability_tests.rs"]
+mod observability;

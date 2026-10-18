@@ -489,6 +489,7 @@ fn local_message_unknown_native_target_never_projects_as_legacy() {
     });
 }
 
+// Pin pre-existing process identity caching, not a before/after proof for #2164.
 #[test]
 fn local_custody_cached_identity_attests_without_reading_the_key_file() {
     run(async {

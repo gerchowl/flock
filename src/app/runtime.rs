@@ -230,6 +230,11 @@ impl App {
             &self.event_hub,
             &mut self.structured_sends,
         );
+        #[cfg(test)]
+        {
+            self.structured_sends.custody_worker_wakes.0 += 1;
+            self.structured_sends.custody_worker_wakes.1 += u64::from(changed || published);
+        }
         self.finish_structured_messages(changed || published, now);
         published || changed
     }

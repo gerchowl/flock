@@ -18,12 +18,14 @@ pub(super) fn record_answer(
         tx.execute(
             // A conversation answer is not the journal owner's commitment proof.
             "UPDATE envelopes SET collect_done=1,collect_error=CASE
-             WHEN state IN ('inbox','inbox_expired') AND substr(collect_error,1,length(?3))=?3
+             WHEN (state IN ('inbox','inbox_expired') AND substr(collect_error,1,length(?3))=?3)
+               OR (state IN ('delivered','read') AND substr(collect_error,1,length(?4))=?4)
              THEN collect_error ELSE NULL END WHERE origin=?1 AND id=?2",
             params![
                 request.origin_node,
                 request.message_id,
-                COMMITMENT_UNKNOWN_PREFIX
+                COMMITMENT_UNKNOWN_PREFIX,
+                super::queue_custody::DELIVERED_AFTER_EXPIRY
             ],
         )?;
     }
@@ -131,7 +133,7 @@ impl<D: DiskSpace> Store<D> {
                   AND recipient_node NOT IN ('',?1)
                   AND recipient_node IN (SELECT value FROM json_each(?5))
                   AND recipient_node NOT IN (SELECT value FROM json_each(?4))
-                  AND collect_error IS NULL AND (
+                  AND (collect_error IS NULL OR substr(collect_error,1,length(?6))=?6) AND (
                     (reply_expected=1 AND collect_done=0) OR remote_state IS NULL OR remote_state='delivered' OR EXISTS (
                       SELECT 1 FROM collect_acks a WHERE a.request_origin=e.origin AND a.request_id=e.id)))
                  WHERE rank=1 ORDER BY collect_at,id LIMIT ?3",
@@ -143,7 +145,8 @@ impl<D: DiskSpace> Store<D> {
                         now,
                         limit.min(BATCH_CAP) as i64,
                         serde_json::to_string(busy)?,
-                        serde_json::to_string(pinned)?
+                        serde_json::to_string(pinned)?,
+                        super::queue_custody::DELIVERED_AFTER_EXPIRY
                     ],
                     |r| {
                         Ok((
@@ -210,14 +213,16 @@ impl<D: DiskSpace> Store<D> {
         let due = clock.advance(wall_ms).saturating_add(5_000);
         self.connection.execute(
             "UPDATE envelopes SET collect_at=?2,collect_attempts=0 WHERE origin=?1
-             AND state='delivered' AND reply_expected=1 AND collect_done=0 AND collect_error IS NULL
+             AND state='delivered' AND reply_expected=1 AND collect_done=0
+             AND (collect_error IS NULL OR substr(collect_error,1,length(?5))=?5)
              AND collect_at>?2 AND (correlation IN (SELECT value FROM json_each(?3))
                OR recipient_node IN (SELECT value FROM json_each(?4)))",
             params![
                 origin,
                 due,
                 serde_json::to_string(correlations)?,
-                serde_json::to_string(peers)?
+                serde_json::to_string(peers)?,
+                super::queue_custody::DELIVERED_AFTER_EXPIRY
             ],
         )?;
         Ok(())
