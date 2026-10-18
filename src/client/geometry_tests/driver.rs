@@ -49,7 +49,7 @@ fn real_sigint_during_geometry_wait_exits_cleanly_before_the_deadline() {
 /// be able to see the client's stderr when startup fails before connecting.
 fn serve(
     listener: std::os::unix::net::UnixListener,
-    mut stop: tokio::sync::oneshot::Receiver<()>,
+    stop: tokio::sync::oneshot::Receiver<()>,
 ) -> io::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -57,22 +57,21 @@ fn serve(
     let mut peer = runtime
         .block_on(async {
             let listener = tokio::net::UnixListener::from_std(listener)?;
-            let accepted = tokio::time::timeout(DRIVER_FINISH_CAP, listener.accept());
-            let result = tokio::select! {
-                biased;
-                _ = &mut stop => return Err(io::Error::new(
-                    io::ErrorKind::Interrupted, "client exited before connecting",
-                )),
-                result = accepted => result,
-            };
-            result
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "client never reached the private listener",
-                    )
-                })?
-                .map(|(peer, _)| peer)
+            accept_or_stop(
+                async {
+                    tokio::time::timeout(DRIVER_FINISH_CAP, listener.accept())
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "client never reached the private listener",
+                            )
+                        })?
+                },
+                stop,
+            )
+            .await
+            .map(|(peer, _)| peer)
         })?
         .into_std()?;
     peer.set_nonblocking(false)?;
@@ -109,6 +108,25 @@ fn serve(
     Ok(())
 }
 
+/// A ready connection wins a simultaneous explicit stop. Dropping the sender
+/// disables cancellation; the accept future retains its own bounded deadline.
+async fn accept_or_stop<T>(
+    accepted: impl std::future::Future<Output = io::Result<T>>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> io::Result<T> {
+    tokio::select! {
+        biased;
+        result = accepted => result,
+        Ok(()) = &mut stop => Err(io::Error::new(
+            io::ErrorKind::Interrupted, "client exited before connecting",
+        )),
+    }
+}
+
+#[path = "driver/lifecycle.rs"]
+mod lifecycle;
+use lifecycle::ProbeCleanup;
+
 fn probe(mode: &str) -> (portable_pty::ExitStatus, String) {
     probe_with_interrupt(
         mode,
@@ -131,6 +149,8 @@ fn probe_with_interrupt(
     let success = mode == "stdin_tty";
     let has_server = success || mode == "stdin_tty_deadline";
     let (stop_server, stopped) = tokio::sync::oneshot::channel();
+    let mut owned_child = None;
+    let mut child = ProbeCleanup::new(&mut owned_child, stop_server);
     let (server, idle_listener) = if has_server {
         (
             Some(std::thread::spawn(move || serve(listener, stopped))),
@@ -169,10 +189,7 @@ fn probe_with_interrupt(
     for (_, directory) in environment.iter().take(4) {
         std::fs::create_dir_all(directory).unwrap();
     }
-    let (mut child, mut reader): (
-        Box<dyn portable_pty::Child + Send + Sync>,
-        Box<dyn io::Read + Send>,
-    ) = if matches!(mode, "deadline" | "interrupt") {
+    let mut reader: Box<dyn io::Read + Send> = if matches!(mode, "deadline" | "interrupt") {
         let mut command = portable_pty::CommandBuilder::new(std::env::current_exe().unwrap());
         command.args(arguments);
         command.cwd(root.path());
@@ -187,10 +204,8 @@ fn probe_with_interrupt(
         command.env("FLOCK_TEST_DRIVER_MODE", mode);
         command.env("TERM", "xterm-256color");
         let pair = pair.as_ref().unwrap();
-        (
-            pair.slave.spawn_command(command).unwrap(),
-            pair.master.try_clone_reader().unwrap(),
-        )
+        child.adopt(pair.slave.spawn_command(command).unwrap());
+        pair.master.try_clone_reader().unwrap()
     } else {
         let mut command = crate::platform::terminal_geometry::tests::detached_command();
         command
@@ -214,12 +229,19 @@ fn probe_with_interrupt(
             command.env(key, value);
         }
         command.env("FLOCK_TEST_DRIVER_MODE", mode);
-        let mut child =
-            crate::process::TracedCommand::from_command(command, "geometry-real-driver")
-                .spawn_traced()
-                .unwrap();
-        let stderr = child.stderr.take().unwrap();
-        (Box::new(child), Box::new(stderr))
+        let spawned = crate::process::TracedCommand::from_command(command, "geometry-real-driver")
+            .spawn_traced()
+            .unwrap();
+        child.adopt(Box::new(spawned));
+        let stderr = child
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<std::process::Child>()
+            .unwrap()
+            .stderr
+            .take()
+            .unwrap();
+        Box::new(stderr)
     };
     let (sent, received) = std::sync::mpsc::channel();
     let reading = std::thread::spawn(move || {
@@ -252,8 +274,7 @@ fn probe_with_interrupt(
     } else {
         None
     };
-    let status = finish_pty_child_with_timeout(
-        child,
+    let status = child.finish(
         !ready || interrupt_error.is_some(),
         if mode == "interrupt" {
             INTERRUPT_FINISH_CAP
@@ -261,9 +282,6 @@ fn probe_with_interrupt(
             DRIVER_FINISH_CAP
         },
     );
-    // Cancel a pending accept as soon as the owned client has exited. An
-    // accepted peer sees EOF when that client closes its socket.
-    let _ = stop_server.send(());
     drop(pair);
     let mut output = String::from_utf8_lossy(&reading.join().unwrap()).into_owned();
     assert!(
