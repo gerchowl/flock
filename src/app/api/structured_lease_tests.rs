@@ -147,7 +147,8 @@ async fn fake_claude_calls(mcp: bool) {
         // Derive it from this test artifact, never PATH or an installed binary.
         let executable = std::env::current_exe().unwrap();
         let binary = executable.parent().unwrap().parent().unwrap().join("flk");
-        crate::structured::launch::SessionMcp::new(&binary, &socket).unwrap()
+        crate::structured::launch::SessionMcp::new(&binary, &socket)
+            .expect("missing sibling flk binary from cargo/nextest all-target build")
     } else {
         fixture.mcp()
     };

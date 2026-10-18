@@ -222,6 +222,8 @@ pub(crate) struct Control {
 }
 
 /// Worker-owned cancellation exists before spawn, including deadline escalation.
+/// The tuple pairs the launch profile with the session MCP endpoint supplied for
+/// the same lease (ADR-0036 §1/§1a).
 pub(crate) fn run_controlled(
     state: &Path,
     (profile, mcp): (LaunchProfile, SessionMcp),
