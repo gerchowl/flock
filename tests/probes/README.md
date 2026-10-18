@@ -86,7 +86,8 @@ auto-detect servers are recorded by shared test support. Before spawning, the
 auto-detect launcher resolves and atomically records its canonical binary path,
 then executes that path. PID recording reads that launch fact rather than using
 live `argv[0]` as the binary identity. Missing or unreadable launch facts are
-logged and remain unproven; a launch path alone never authorizes a signal. Rust tests in
+logged and remain unproven; a launch path alone never authorizes a signal.
+Rust tests in
 `tests/sandbox_sweep.rs` exercise the actual wrapper, replacement binaries,
 identity refusals, graceful termination and escalation with real owned processes.
 The stage reader rejects EOF and unexpected output and fails within 30 seconds
@@ -100,11 +101,12 @@ Both supported CI legs (`ubuntu-latest` and `macos-15`) use
 again for shard selection and reports. Python is therefore a prerequisite before
 any Rust shard can run. This includes the `SignalChild` signal/escalation
 fixtures in `sandbox_sweep.rs`, not just the Python probe wrapper. The shared
-test job invokes Python at [ci-leg.yml:171](../../.github/workflows/ci-leg.yml#L171),
-before nextest installation and shard execution. Both legs select this workflow
-([Ubuntu](../../.github/workflows/ci.yml#L60) and
-[macOS](../../.github/workflows/ci.yml#L108)), so no interpreter-availability
-skip is needed. Local checks likewise require Python. A missing interpreter is
+`test` job in
+[ci-leg.yml](../../.github/workflows/ci-leg.yml) runs `Read nextest version`
+(`python3 scripts/nextest_version.py`) before `Install Rust tools` and `Run shard`.
+Both the Ubuntu and macOS legs select this workflow in
+[ci.yml](../../.github/workflows/ci.yml), so no interpreter-availability skip is
+needed. Local checks likewise require Python. A missing interpreter is
 an explicit setup failure rather than an unnoticed loss of the Rust crash proof.
 
 ## Socket-driven measurement scripts

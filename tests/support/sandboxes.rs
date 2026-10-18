@@ -72,7 +72,8 @@ impl ServerRecord {
                 Some("flk" | "flock")
             )
             || !server_argv(&self.argv)
-            || self.argv.first().map(Path::new) != Some(self.binary.as_path())
+            || (self.argv.first().map(Path::new) != Some(self.binary.as_path())
+                && captured_binary(&base).ok().as_ref() != Some(&self.binary))
         {
             return Some(false);
         }
@@ -99,6 +100,13 @@ impl ServerRecord {
 /// Recognize the server invocation produced by these fixture launchers.
 pub fn server_argv(argv: &[String]) -> bool {
     matches!(argv, [_, mode] if mode == "server")
+}
+
+// Relative argv is a launch spelling, not executable identity. Its separate
+// before-spawn fact must still match; live argv and birth are checked too.
+fn captured_binary(base: &Path) -> io::Result<PathBuf> {
+    File::open(base.join(".launch-binary.json"))
+        .and_then(|file| serde_json::from_reader(file).map_err(io::Error::other))
 }
 
 /// Capture the canonical executable before spawn and return the path to execute.
@@ -134,9 +142,7 @@ fn record_invocation(pid: u32, config: &Path, runtime: &Path, argv: Option<Vec<S
     else {
         return;
     };
-    let binary: PathBuf = match File::open(base.join(".launch-binary.json"))
-        .and_then(|file| serde_json::from_reader(file).map_err(io::Error::other))
-    {
+    let binary: PathBuf = match captured_binary(base) {
         Ok(binary) => binary,
         Err(error) => {
             eprintln!("sandbox server {pid} retained: no proven launch binary: {error}");

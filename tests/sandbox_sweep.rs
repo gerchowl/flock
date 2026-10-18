@@ -4,7 +4,7 @@
 mod support;
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Stdio};
@@ -545,4 +545,137 @@ fn direct_spawn_records_known_launch_argv_before_exec_is_visible() {
     );
     assert_eq!(record.binary, binary);
     assert_eq!(record.start_time, process_lifetime::birth(fixture.0.id()));
+}
+
+fn relative_launch_owner(root: &std::path::Path) {
+    let base = root.join(format!(
+        "flock-autodetect-test-{}-relative",
+        std::process::id()
+    ));
+    let config = base.join("config");
+    let runtime = base.join("runtime");
+    fs::create_dir_all(config.join(support::paths::app_dir_name())).unwrap();
+    fs::create_dir(&runtime).unwrap();
+    fs::write(
+        config
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
+        "onboarding = false\n",
+    )
+    .unwrap();
+    let alias = base.join("flk");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_flk"), &alias).unwrap();
+    sandboxes::prepare_launch(&alias, &runtime).unwrap();
+    let api = root.join("api.sock");
+    // Preserve legacy argv spelling while capturing the executable before spawn.
+    let server = SignalChild(
+        Command::new(&alias)
+            .arg0("./flk")
+            .arg("server")
+            .current_dir(&base)
+            .envs(support::environment::isolated_env(&config, &runtime))
+            .env("FLOCK_SOCKET_PATH", &api)
+            .env("FLOCK_CLIENT_SOCKET_PATH", root.join("client.sock"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    support::wait_for_socket(&api, Duration::from_secs(10));
+    sandboxes::record_runtime_candidates(&config, &runtime, None, [server.0.id()]);
+    io::stdout().write_all(b"RELATIVE_READY\n").unwrap();
+    io::stdout().flush().unwrap();
+    io::stdin().read_exact(&mut [0]).unwrap();
+}
+
+#[test]
+fn relative_argv_server_is_recorded_matched_and_swept() {
+    if let Some(root) = std::env::var_os("FLOCK_TEST_RELATIVE_ROOT") {
+        relative_launch_owner(std::path::Path::new(&root));
+        return;
+    }
+    let root = SocketDir::reserve("2175");
+    let mut owner = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "relative_argv_server_is_recorded_matched_and_swept",
+            "--nocapture",
+            "--format=terse",
+            "--color=never",
+        ])
+        .env("FLOCK_TEST_RELATIVE_ROOT", root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let base = root
+        .path()
+        .join(format!("flock-autodetect-test-{}-relative", owner.id()));
+    let stdout = owner.stdout.take().unwrap();
+    let mut probe = Probe {
+        root: Some(root),
+        owner,
+        stdout,
+        base,
+        record: None,
+    };
+    let death = ExitWatch::new(probe.owner.id()).unwrap();
+    assert_eq!(probe.line(&death), "\n");
+    assert_eq!(probe.line(&death), "running 1 test\n");
+    assert_eq!(probe.line(&death), "RELATIVE_READY\n");
+    let entries: Vec<_> = fs::read_dir(&probe.base)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry.file_name().to_string_lossy().starts_with(".server-")
+                && entry.file_name().to_string_lossy().ends_with(".json")
+        })
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let recorded: ServerRecord =
+        serde_json::from_slice(&fs::read(entries[0].path()).unwrap()).unwrap();
+    let canonical: PathBuf =
+        serde_json::from_slice(&fs::read(probe.base.join(".launch-binary.json")).unwrap()).unwrap();
+    // Cleanup uses the captured launch fact even when the regression writes a
+    // relative binary. Assertions inspect the unmodified durable record.
+    probe.record = Some(ServerRecord {
+        binary: canonical.clone(),
+        ..recorded.clone()
+    });
+    assert_eq!(recorded.binary, canonical);
+    assert_eq!(recorded.argv[0], "./flk");
+    assert_eq!(
+        recorded.argv,
+        support::process_table::process_info(recorded.pid)
+            .unwrap()
+            .argv
+    );
+    assert!(
+        recorded.matches(&probe.base),
+        "relative invocation must remain provable"
+    );
+    let marker = probe.base.join(".launch-binary.json");
+    let saved = probe.base.join(".saved-launch.json");
+    fs::rename(&marker, &saved).unwrap();
+    assert!(
+        !recorded.matches(&probe.base),
+        "relative argv needs its captured executable proof"
+    );
+    fs::rename(saved, marker).unwrap();
+    let mut wrong = recorded.clone();
+    wrong.argv[0] = "./other-flk".into();
+    assert!(
+        !wrong.matches(&probe.base),
+        "exact live argv must still match"
+    );
+    let exit = ExitWatch::new(recorded.pid).unwrap();
+    probe.orphan();
+    sandboxes::sweep(probe.root.as_ref().unwrap().path());
+    exit.wait(Duration::from_secs(5)).unwrap();
+    assert!(
+        !probe.base.exists(),
+        "relative argv stranded the dead-owner sandbox"
+    );
 }
