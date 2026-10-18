@@ -256,6 +256,10 @@ impl App {
         &mut self,
         signed: &Envelope,
     ) -> Result<(super::structured_queue::Ticket, Ack), ErrorCode> {
+        #[cfg(test)]
+        {
+            self.structured_sends.custody_attempts += 1;
+        }
         let (generation, data) = self.verified_queue_custody(signed)?;
         // Recovery snapshots can predate an owner's terminal refusal.
         let current = stored(|s| s.get(&signed.key))?.ok_or(ErrorCode::MessageNotFound)?;

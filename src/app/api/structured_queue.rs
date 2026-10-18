@@ -63,6 +63,8 @@ pub(crate) struct Staged(
 /// Bounded response routing attached to the existing sole completion consumer.
 #[derive(Default)]
 pub(crate) struct Sends {
+    #[cfg(test)]
+    pub(super) custody_attempts: usize,
     waiting: HashMap<Key, Sender<ResultId>>,
     parked: Vec<Parked>,
     pub(super) acknowledged: Vec<super::structured_messages::Ack>,
