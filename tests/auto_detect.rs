@@ -124,6 +124,22 @@ fn spawn_server(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
+    client_socket_path: &Path,
+) -> SpawnedFlock {
+    spawn_server_from(
+        Path::new(env!("CARGO_BIN_EXE_flk")),
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        client_socket_path,
+    )
+}
+
+fn spawn_server_from(
+    binary: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedFlock {
     fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
@@ -146,7 +162,8 @@ fn spawn_server(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
+    let binary = support::sandboxes::prepare_launch(binary, runtime_dir).unwrap();
+    let mut cmd = CommandBuilder::new(binary);
     cmd.arg("server");
     for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
         cmd.env(key, value);
@@ -175,6 +192,22 @@ fn spawn_flock_auto(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
+    client_socket_path: &Path,
+) -> SpawnedFlock {
+    spawn_flock_auto_from(
+        Path::new(env!("CARGO_BIN_EXE_flk")),
+        config_home,
+        runtime_dir,
+        api_socket_path,
+        client_socket_path,
+    )
+}
+
+fn spawn_flock_auto_from(
+    binary: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedFlock {
     fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
@@ -197,7 +230,8 @@ fn spawn_flock_auto(
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
+    let binary = support::sandboxes::prepare_launch(binary, runtime_dir).unwrap();
+    let mut cmd = CommandBuilder::new(binary);
     // No subcommand, no --no-session → auto-detect launch
     for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
         cmd.env(key, value);
@@ -845,7 +879,10 @@ fn auto_detect_default_socket_path_from_config_dir() {
         })
         .unwrap();
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
+    let binary =
+        support::sandboxes::prepare_launch(Path::new(env!("CARGO_BIN_EXE_flk")), &runtime_dir)
+            .unwrap();
+    let mut cmd = CommandBuilder::new(binary);
     cmd.arg("server");
     for (key, value) in support::environment::isolated_env(&config_home, &runtime_dir) {
         cmd.env(key, value);
@@ -1035,4 +1072,86 @@ fn auto_detect_respects_nested_guard_before_auto_attach() {
     );
 
     cleanup_spawned_flock(server, base);
+}
+
+#[test]
+fn direct_server_alias_records_canonical_launch_identity() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let alias = base.join("flk");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_flk"), &alias).unwrap();
+    let runtime = base.join("runtime");
+    let api = runtime.join("flock.sock");
+    let server = spawn_server_from(
+        &alias,
+        &base.join("config"),
+        &runtime,
+        &api,
+        &runtime.join("client.sock"),
+    );
+    wait_for_socket(&api, Duration::from_secs(10), None);
+    let pid = server.child.process_id().unwrap();
+    let record: support::sandboxes::ServerRecord =
+        serde_json::from_slice(&fs::read(base.join(format!(".server-{pid}.json"))).unwrap())
+            .unwrap();
+    assert_eq!(record.binary, alias.canonicalize().unwrap());
+    assert_durable_server_record(&base, pid);
+    cleanup_spawned_flock(server, base);
+}
+
+#[test]
+fn detached_daemon_alias_has_a_durable_exact_argv_record() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let alias = base.join("flk");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_flk"), &alias).unwrap();
+    let runtime = base.join("runtime");
+    let api = runtime.join("flock.sock");
+    let client = spawn_flock_auto_from(
+        &alias,
+        &base.join("config"),
+        &runtime,
+        &api,
+        &runtime.join("client.sock"),
+    );
+    wait_for_socket(&api, Duration::from_secs(10), client.child.process_id());
+    let records: Vec<_> = fs::read_dir(&base)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".server-") && name.ends_with(".json")
+        })
+        .collect();
+    assert_eq!(records.len(), 1, "exactly the detached server is recorded");
+    let record: support::sandboxes::ServerRecord =
+        serde_json::from_slice(&fs::read(records[0].path()).unwrap()).unwrap();
+    assert_ne!(Some(record.pid), client.child.process_id());
+    assert_eq!(record.binary, alias.canonicalize().unwrap());
+    assert_eq!(
+        record.argv,
+        vec![
+            record.binary.to_string_lossy().into_owned(),
+            "server".into()
+        ]
+    );
+    assert_eq!(
+        record.argv,
+        support::process_table::process_info(record.pid)
+            .unwrap()
+            .argv
+    );
+    assert_durable_server_record(&base, record.pid);
+    let mut mismatched = record.clone();
+    // Keep the record internally consistent so only the live argv rejects it.
+    mismatched.binary = base.canonicalize().unwrap().join("other/flk");
+    mismatched.argv[0] = mismatched.binary.to_string_lossy().into_owned();
+    assert!(
+        !mismatched.matches(&base),
+        "exact argv must remain required"
+    );
+    cleanup_spawned_flock(client, base);
 }

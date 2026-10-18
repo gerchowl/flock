@@ -526,12 +526,23 @@ fn direct_spawn_records_known_launch_argv_before_exec_is_visible() {
     fs::create_dir(&runtime).unwrap();
     // A forked child can still expose inherited argv before exec. This owned
     // producer supplies different argv deterministically; no signal uses this record.
+    let copied = base.join("bin/flk");
+    fs::create_dir(copied.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_flk"), &copied).unwrap();
+    let alias = base.join("flk");
+    std::os::unix::fs::symlink(&copied, &alias).unwrap();
+    let binary = sandboxes::prepare_launch(&alias, &runtime).unwrap();
+    fs::remove_file(alias).unwrap();
+    fs::remove_file(copied).unwrap();
     sandboxes::record_spawn(fixture.0.id(), &config, &runtime);
     let record: ServerRecord = serde_json::from_slice(
         &fs::read(base.join(format!(".server-{}.json", fixture.0.id()))).unwrap(),
     )
     .unwrap();
-    assert_eq!(record.argv, vec![env!("CARGO_BIN_EXE_flk"), "server"]);
-    assert_eq!(record.binary, PathBuf::from(env!("CARGO_BIN_EXE_flk")));
+    assert_eq!(
+        record.argv,
+        vec![binary.to_string_lossy().into_owned(), "server".into()]
+    );
+    assert_eq!(record.binary, binary);
     assert_eq!(record.start_time, process_lifetime::birth(fixture.0.id()));
 }
