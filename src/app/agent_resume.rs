@@ -220,6 +220,11 @@ impl App {
         }
 
         let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
+            // ADR-0028 §1/§3: retain the plan, but suppress automatic retries
+            // after a launch failure, including a command that cannot launch.
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.resume_failed = true;
+            }
             crate::logging::agent_resume_empty_argv(
                 pane_id.raw(),
                 &terminal_id.to_string(),
@@ -680,7 +685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_resume_argv_remains_eligible_without_a_failure_flag() {
+    async fn empty_resume_argv_fails_once_and_stops_automatic_retries() {
         let mut app = test_app();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("empty-resume")];
         app.state.ensure_test_terminals();
@@ -698,12 +703,30 @@ mod tests {
             argv: Vec::new(),
             dedupe_key: "empty-resume".into(),
         });
+        let now = Instant::now();
+        app.sync_pending_agent_resume_deadline(now);
+        assert!(app.pending_agent_resume_deadline.is_some());
         let logs = crate::logging::capture_logs(|| {
             assert!(!app.start_pending_agent_resumes(true));
         });
         assert!(logs.contains("reason=\"empty_argv\""), "{logs}");
-        assert!(!app.state.terminals[&terminal_id].resume_failed);
-        assert!(app.has_pending_agent_resumes());
+        let logs = crate::logging::capture_logs(|| {
+            assert!(!app.start_pending_agent_resumes(true));
+        });
+        assert!(
+            !logs.contains("empty_argv"),
+            "an invalid deferred plan must not be retried on the next tick: {logs}"
+        );
+        assert!(app.state.terminals[&terminal_id].resume_failed);
+        assert!(
+            app.state.terminals[&terminal_id]
+                .pending_agent_resume_plan
+                .is_some(),
+            "keep the saved plan for explicit recovery"
+        );
+        assert!(!app.has_pending_agent_resumes());
+        app.sync_pending_agent_resume_deadline(now);
+        assert!(app.pending_agent_resume_deadline.is_none());
         assert_eq!(app.terminal_runtimes.len(), 0);
     }
 
@@ -797,7 +820,10 @@ mod tests {
         let agent_id = terminal.agent_id.clone();
         let session = terminal.persisted_agent_session.clone();
         let snapshot = crate::persist::capture(
-            &app.state.structured_agents,
+            crate::persist::RegistryCapture {
+                registry: &app.state.structured_agents,
+                now_ms: Some(42),
+            },
             &app.state.workspaces,
             &app.state.terminals,
             &app.terminal_runtimes,
