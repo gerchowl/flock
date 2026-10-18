@@ -143,7 +143,7 @@ pub(crate) fn validate(
     let relative = path.strip_prefix(&home).map_err(|_| Failure::Path)?;
     let file =
         platform::structured::open_regular_beneath(&home, relative).map_err(|_| Failure::Path)?;
-    if platform::structured::file_link_count(&file).map_err(|_| Failure::Path)? > 1 {
+    if platform::structured::file_link_count(&file).map_err(|_| Failure::Metadata)? > 1 {
         return Err(Failure::HardLink);
     }
     let mut line = Vec::new();
