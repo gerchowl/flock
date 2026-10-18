@@ -217,6 +217,102 @@ fn fleet_lagged_id_retires_and_fresh_id_resnapshots_without_unsubscribe() {
     });
 }
 #[test]
+fn fleet_private_checkpoints_do_not_lag_other_readers() {
+    runtime(async {
+        use std::collections::BTreeSet;
+        async fn snapshot(wire: &mut Controlled, id: &str, count: usize) -> BTreeSet<String> {
+            let gap = wire.frame().await;
+            assert_eq!(gap["t"], "gap");
+            assert_eq!(gap["sub_id"], id);
+            let mut rows = BTreeSet::new();
+            for _ in 0..count {
+                let row = wire.frame().await;
+                assert_eq!(row["t"], "ev", "{row}");
+                assert_eq!(row["sub_id"], id);
+                assert!(rows.insert(row["ev"]["row"]["id"].as_str().unwrap().to_owned()));
+            }
+            assert_eq!(
+                wire.frame().await,
+                json!({"t":"synced","sub_id":id,"seq":gap["snapshot_to"]})
+            );
+            rows
+        }
+        async fn update(wire: &mut Controlled, id: &str) -> u64 {
+            let row = wire.frame().await;
+            assert_eq!(
+                row["t"], "ev",
+                "a different reader's checkpoint leaked: {row}"
+            );
+            assert_eq!(row["ev"]["type"], "fleet.upsert");
+            assert_eq!(row["ev"]["row"]["id"], id);
+            row["seq"].as_u64().unwrap()
+        }
+        async fn flush(case: &Case) {
+            // The owner replies only after publishing pending live deltas and registering this cut.
+            drop(
+                within(case.server.core.shared.fleet.subscribe(None))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut case = Case::new().await;
+        for n in 0..17 {
+            case.add(&format!("fixture-{n:02}"));
+        }
+        case.service();
+        let mut a = Controlled::new(&case);
+        let mut b = Controlled::new(&case);
+        let mut c = Controlled::new(&case);
+        a.sub("a", None);
+        let mut expected = snapshot(&mut a, "a", 17).await;
+        b.sub("b", None);
+        assert_eq!(snapshot(&mut b, "b", 17).await, expected);
+        c.sub("c", None);
+        assert_eq!(snapshot(&mut c, "c", 17).await, expected);
+        case.add("live-fixture");
+        case.service();
+        flush(&case).await;
+        let seq = update(&mut a, "live-fixture").await;
+        assert_eq!(update(&mut b, "live-fixture").await, seq);
+        assert_eq!(update(&mut c, "live-fixture").await, seq);
+        expected.insert("live-fixture".into());
+
+        case.add("paused-fixture");
+        case.service();
+        flush(&case).await;
+        let paused = a.delivery().await;
+        assert_eq!(
+            serde_json::to_value(&paused.frame).unwrap()["ev"]["row"]["id"],
+            "paused-fixture"
+        );
+        let seq = update(&mut b, "paused-fixture").await;
+        assert_eq!(update(&mut c, "paused-fixture").await, seq);
+        expected.insert("paused-fixture".into());
+        // Only a is slow: hold its real writer acknowledgement across twenty live changes.
+        for n in 0..20 {
+            let id = format!("changed-fixture-{n:02}");
+            case.add(&id);
+            case.service();
+            flush(&case).await;
+            let seq = update(&mut b, &id).await;
+            assert_eq!(update(&mut c, &id).await, seq);
+            expected.insert(id);
+        }
+        paused.delivered.unwrap().send(true).unwrap();
+        assert_eq!(a.frame().await["t"], "lagged");
+        a.sub("fresh", Some(0));
+        assert_eq!(snapshot(&mut a, "fresh", expected.len()).await, expected);
+        case.add("after-resnapshot");
+        case.service();
+        flush(&case).await;
+        let seq = update(&mut a, "after-resnapshot").await;
+        assert_eq!(update(&mut b, "after-resnapshot").await, seq);
+        assert_eq!(update(&mut c, "after-resnapshot").await, seq);
+        drop((a, b, c));
+        case.server.finish().await;
+    });
+}
+#[test]
 fn fleet_real_permission_book_supplies_harness_ids_and_clears_them() {
     runtime(async {
         use crate::structured::{
@@ -412,7 +508,22 @@ fn fleet_server_driven_script_removes_absent_rows_only_at_snapshot_completion() 
     });
 }
 #[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "Missing optional conformance tooling must be visible in nextest output"
+)]
 fn fleet_server_drives_the_real_client_through_nonempty_and_empty_replacement() {
+    match std::process::Command::new("bun").arg("--version").output() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("SKIP fleet_server_drives_the_real_client: Bun is absent from PATH; nextest CI provisioning is tracked in #2260");
+            return;
+        }
+        Err(error) => panic!("Bun probe failed: {error}"),
+        Ok(output) => assert!(
+            output.status.success(),
+            "Bun version probe failed: {output:?}"
+        ),
+    }
     runtime(async {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let mut case = Case::new().await;

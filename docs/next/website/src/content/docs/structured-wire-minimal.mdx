@@ -62,12 +62,16 @@ must never delete the lock.
 The stream owner persists `<data dir>/fleet.cursor` before replacing
 `<data dir>/fleet.json`, under the existing exclusive `fleet.lock`.
 It refreshes registry/S4/S6 observations before serving a cut. Checkpoint
-allocation, publication to existing subscribers and registration of the new
-subscriber are serialized off the app and heartbeat executors. Concurrent
-mutations follow the immutable replay cut, after its single synced barrier.
+allocation, publication of pending live deltas and registration of the new
+subscriber are serialized off the app and heartbeat executors. Each checkpoint
+is delivered only to its requesting subscription, through that cut's acknowledged
+replay path. Concurrent mutations follow the immutable replay cut, after its
+single synced barrier. Another reader's checkpoint cannot overflow the live ring.
 
 The live ring holds sixteen frames within the existing 64 KiB message limit,
-shared across cuts. Each socket retains the existing eight-active-subscription
+shared across cuts and carrying only live deltas. Row preflight reserves the
+maximum JSON-escaped subscription-ID overhead within that limit, so a row near
+the limit can lag even with a shorter actual ID. Each socket retains the existing eight-active-subscription
 and 1024-lifetime-ID limits. A slow cut may lag even during initial replay;
 resubscribe under a fresh ID from the applied cursor. Oversized rows also yield
 lagged rather than truncated payloads; recovery cannot make an oversized row fit.

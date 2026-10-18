@@ -403,7 +403,7 @@ impl Store {
     /// Create and persist an initial/recovery checkpoint. The returned owned cut
     /// remains stable through later mutations. Every row consumes a new seq per
     /// ADR-0036 §4; an empty checkpoint retains its nonzero head across restart.
-    /// 6b must serialize publication of the whole cut with live deltas.
+    /// 6b serializes cut capture with live registration, then delivers it privately.
     pub fn snapshot(&mut self) -> io::Result<Snapshot> {
         let rows = self.number(
             self.rows

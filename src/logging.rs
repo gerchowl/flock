@@ -5003,6 +5003,8 @@ pub(crate) fn client_token_entry_unsafe(entry: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[cfg(feature = "web")]
     #[test]
     fn structured_fleet_diagnostics_exclude_error_payloads() {
@@ -5021,8 +5023,6 @@ mod tests {
         assert!(out.contains("SnapshotCorrupt"), "{out}");
         assert!(!out.contains("private fixture error payload"), "{out}");
     }
-
-    use super::*;
 
     #[test]
     fn remote_bridge_started_logs_full_command_shape() {

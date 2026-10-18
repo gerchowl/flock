@@ -138,3 +138,43 @@ async fn preparing_worker_is_unavailable_until_its_real_permission_book_is_ready
     .await
     .expect("fleet preparation producer stayed silent");
 }
+
+#[test]
+fn fleet_frame_bound_reserves_the_maximum_escaped_subscription_id() {
+    let mut row = crate::structured::fleet_lite::FleetAgentRow {
+        id: "fixture-agent".into(),
+        label: "Example".into(),
+        state: crate::api::agent_state::AgentState::unknown(),
+        activity: None,
+        waiting_on_human: vec![String::new()],
+    };
+    let envelope = ServerFrame::Ev {
+        sub_id: String::new(),
+        stream: "fleet".into(),
+        seq: Some(1),
+        ts_ms: 0,
+        ev: WireEvent::Json(
+            serde_json::to_value(crate::structured::fleet_lite::FleetDelta::Upsert {
+                row: row.clone(),
+            })
+            .unwrap(),
+        ),
+    };
+    let available = MAX_MESSAGE - serde_json::to_vec(&envelope).unwrap().len();
+    row.waiting_on_human[0] = "r".repeat(available);
+    let delta = |row| Delta {
+        seq: 1,
+        event: crate::structured::fleet_lite::FleetDelta::Upsert { row },
+    };
+    assert!(matches!(
+        &*event(delta(row.clone()), 0, 1).unwrap(),
+        ServerFrame::Lagged { .. }
+    ));
+    row.waiting_on_human[0].truncate(available - 6 * super::super::subscriptions::ID_BYTES);
+    let mut accepted = (*event(delta(row), 0, 1).unwrap()).clone();
+    let ServerFrame::Ev { sub_id, .. } = &mut accepted else {
+        panic!("boundary row must fit")
+    };
+    *sub_id = "\0".repeat(super::super::subscriptions::ID_BYTES);
+    assert!(super::super::output::encode(accepted).is_some());
+}

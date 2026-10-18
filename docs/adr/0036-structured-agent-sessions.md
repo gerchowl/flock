@@ -1124,13 +1124,19 @@ loss a refusal, not a migration from an older snapshot. When both records are
 valid, the maximum high-water wins. Any uncertain write requires reopening the
 store before another publication. Slice 6b (#2225) wires the provider into
 authenticated `fleet` subscriptions.
-Its single owner serializes refresh, durable checkpoint allocation,
-checkpoint publication to existing cuts, and new-cut registration. Storage and
-frame preparation run off the executor; publication yields between frames. Replay retains
-an immutable cut while later mutations enter live continuation. Owner-turn
+Its single owner serializes refresh, durable checkpoint allocation, pending live
+publication, and new-cut registration. Each checkpoint belongs only to its
+requesting subscription, using that cut's acknowledged replay path. The shared
+ring carries only live deltas, so one reader's resnapshot cannot lag another
+reader. Checkpoint positions remain globally reserved: another cut's next live
+sequence can jump past those private positions without missing a mutation.
+Storage and frame preparation run off the executor; live publication
+yields between frames. Replay retains an immutable cut while later mutations
+enter its live continuation. Owner-turn
 observations coalesce to the latest materialization; the agent journal, not
 fleet-lite, retains every intermediate harness event. The live ring holds sixteen
-frames, each within the endpoint's existing 64 KiB message limit; overflow retires
+frames, each preflighted once with the maximum escaped subscription-ID overhead
+within the endpoint's existing 64 KiB message limit; overflow retires
 only the affected subscription ID. A fresh ID requests a complete snapshot, and
 absent rows disappear only at its advertised completion. Permission IDs come from
 the runtime book's open, non-automatic requests, never S4 phase inference. Before

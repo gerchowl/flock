@@ -103,21 +103,24 @@ impl Client {
     }
 }
 fn event(delta: Delta, ts_ms: u64, head: u64) -> io::Result<Arc<ServerFrame>> {
-    let frame = ServerFrame::Ev {
-        sub_id: String::new(),
+    let mut frame = ServerFrame::Ev {
+        // Reserve the largest JSON-escaped ID before admitting a frame to shared storage.
+        sub_id: "\0".repeat(super::subscriptions::ID_BYTES),
         stream: "fleet".into(),
         seq: Some(delta.seq),
         ts_ms,
         ev: WireEvent::Json(serde_json::to_value(delta.event)?),
     };
-    Ok(Arc::new(if super::output::fits(&frame) {
-        frame
-    } else {
-        ServerFrame::Lagged {
+    if !super::output::fits(&frame) {
+        frame = ServerFrame::Lagged {
             sub_id: String::new(),
             skipped_to: head,
-        }
-    }))
+        };
+    }
+    if let ServerFrame::Ev { sub_id, .. } = &mut frame {
+        sub_id.clear();
+    }
+    Ok(Arc::new(frame))
 }
 fn checkpoint(
     snapshot: crate::structured::fleet_lite::Snapshot,
@@ -223,10 +226,7 @@ async fn run(
         if let Some((after, reply)) = request {
             match snapshot {
                 Ok(Some((end, mut initial))) => {
-                    for frame in &initial {
-                        let _ = frames.send(Some(frame.clone()));
-                        tokio::task::yield_now().await;
-                    }
+                    // Only this cut owns its checkpoint. The ring carries live deltas.
                     initial.push_back(Arc::new(ServerFrame::Synced {
                         sub_id: String::new(),
                         seq: end,
@@ -318,14 +318,6 @@ pub(super) async fn replay(
     })?;
     loop {
         let frame = cut.next(id).await.map_err(|_| None)?;
-        let frame = if super::output::fits(&frame) {
-            frame
-        } else {
-            ServerFrame::Lagged {
-                sub_id: id.into(),
-                skipped_to: cut.head.load(Ordering::Acquire),
-            }
-        };
         let ended = matches!(frame, ServerFrame::Lagged { .. });
         if !deliver(data, live, frame).await || ended {
             return Ok(());
