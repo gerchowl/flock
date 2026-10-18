@@ -210,7 +210,7 @@ impl App {
                 .node_id
                 .as_deref()
                 .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
-            let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
+            let host = self.state.server_peer_host(peer);
             let route = Some(peer.peer.clone());
             for ws in &peer.workspaces {
                 for agent in &ws.agents {
@@ -237,7 +237,7 @@ impl App {
                 .node_id
                 .as_deref()
                 .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
-            let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
+            let host = self.state.server_peer_host(peer);
             for ws in &peer.workspaces {
                 for agent in &ws.agents {
                     entries.push(FleetAgentEntry {
@@ -329,6 +329,41 @@ impl App {
 mod tests {
     use crate::api::schema::{AgentStatus, PeerAgentSummary, PeerWorkspaceSummary};
     use crate::app::App;
+
+    #[test]
+    fn security2166_directory_and_notices_cannot_claim_a_configured_alias() {
+        let mut app = test_app();
+        app.state.peers.push(crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        let mut spoof = peer_with_agent(
+            "node-trusted.example",
+            "node-trusted.example",
+            "agent_remote_1",
+        );
+        spoof.node_id = Some("claimed-node".into());
+        app.state.relayed_fleet_cache.insert(
+            "claim".into(),
+            crate::peers::RelayedEntry {
+                peer: spoof,
+                via: Some("node-hub.example".into()),
+                hub_pushed: true,
+            },
+        );
+        let rows = app.collect_fleet_agents(&[]);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].host.contains("node-trusted.example"),
+            "{}",
+            rows[0].host
+        );
+        assert!(rows[0].host.contains("unverified"));
+        let location = app.locate_agent("agent_remote_1").unwrap();
+        assert_eq!(location.host, rows[0].host);
+        assert_eq!(location.node.as_deref(), Some("claimed-node"));
+        assert_eq!(location.route.as_deref(), Some("node-hub.example"));
+    }
 
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

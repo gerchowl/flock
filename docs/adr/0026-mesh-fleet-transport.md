@@ -204,6 +204,30 @@ launder a disallowed origin. Forwarding preserves the authenticated origin
 binding end to end, and an unknown/unbound origin cannot borrow a hub's
 name.
 
+### Peer names in presentation
+
+Configured names and locally pinned/enrolled bindings are authoritative;
+reported node IDs and carried snapshot names are claims. Every name-bearing
+UI surface uses the same presentation rule: an unverified claim matching a
+configured alias or local pin name (ASCII case-insensitively) renders as
+`unverified` plus its escaped short node ID, or just `unverified` without an
+ID. It never renders that claimed alias. The locally configured source may
+still display its own configured name while offline or awaiting enrollment.
+The rule applies to servers, spaces, agents, navigator rows and details,
+filter headers, checkout notices and switch labels, and the fleet directory
+host labels used by CLI output and message/wait notices. It changes no cache key,
+identity proof, policy binding or dial target. Wire summaries retain their
+observations; they cannot establish a trusted alias by presenting it.
+
+An unproven row with a node ID has the badge `unverified`; an ID-less legacy
+row has `legacy/unverified`. Neither badge grants identity or routing trust.
+A hub-pushed observation claiming the carried origin's node ID is annotated
+as an `unverified home claim` under the Origin row instead of taking another
+server slot. This is a presentation association, not deduplication or proof:
+its independent observation and workspaces remain available, and the Home
+switch still uses the reserved local target. ID-less rows remain separate;
+name similarity never establishes this association.
+
 `flk fleet pause` freezes custody completely on the paused node: no new send
 acceptance, retry, forwarding, collection/import, inbox delivery or expiry.
 Return an explicit paused refusal to incoming custody attempts and leave the

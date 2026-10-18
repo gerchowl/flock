@@ -317,9 +317,9 @@ fn remote_workspace_detail(
     let Some(summary) = peer.workspaces.get(peer_ws_idx) else {
         return String::new();
     };
-    let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
+    let host = app.server_peer_host(peer);
     let mut parts = vec![
-        super::grammar::solo_remote_label(app.server_label, peer, summary),
+        super::grammar::solo_remote_label(app.server_label, peer, summary, &host),
         format!("server {host}"),
     ];
     if let Some(agent) = summary.agent.as_deref().filter(|a| !a.is_empty()) {
@@ -512,4 +512,41 @@ fn truncate_text(text: &str, max_width: usize) -> String {
     }
     let prefix: String = text.chars().take(max_width.saturating_sub(1)).collect();
     format!("{prefix}…")
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    #[test]
+    fn security2166_navigator_detail_cannot_claim_a_configured_alias() {
+        let mut app = AppState::test_new();
+        app.peers.push(crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        peer.host = Some("node-trusted.example".into());
+        peer.node_id = Some("claimed-node".into());
+        peer.workspaces = vec![serde_json::from_value(serde_json::json!({
+            "workspace":"project", "status":"working"
+        }))
+        .unwrap()];
+        app.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "node-home.example".into(),
+            peers: vec![peer],
+            origin_summary: None,
+            received_at: std::time::Instant::now(),
+        });
+        let detail = remote_workspace_detail(
+            &app,
+            &crate::app::state::RemotePeerRef::Snapshot { entry_idx: 0 },
+            0,
+        );
+        assert!(!detail.contains("node-trusted.example"), "{detail}");
+        assert!(detail.contains("unverified"), "{detail}");
+    }
 }

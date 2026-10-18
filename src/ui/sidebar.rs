@@ -432,7 +432,7 @@ fn agent_panel_sort_key(entry: &AgentPanelEntry) -> (String, String, String) {
 fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     let mut entries = Vec::new();
     for (peer_ref, peer) in app.visible_remote_peers() {
-        let server = peer.display_name().to_string();
+        let server = app.server_peer_name(peer);
         // #164: the peer's gossiped icon — the same value the servers band
         // renders for this host.
         let icon = peer.icon.clone();
@@ -1176,8 +1176,8 @@ fn server_filter_label(app: &AppState) -> Option<String> {
             app.remote_peers()
                 .into_iter()
                 .find(|(_, peer)| peer.ssh_target == *ssh_target)
-                .map(|(_, peer)| peer.display_name().to_string())
-                .unwrap_or_else(|| ssh_target.clone()),
+                .map(|(_, peer)| app.server_peer_name(peer))
+                .unwrap_or_else(|| app.server_claim_name(ssh_target, None)),
         ),
     }
 }
@@ -1200,13 +1200,13 @@ pub(crate) fn remote_entry_label(
     let Some(ws) = peer.workspaces.get(ws_idx) else {
         return String::new();
     };
-    let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
+    let host = app.server_peer_host(peer);
     // #164: in `icon` mode the member reads `<glyph> · <branch>` (the server's
     // gossiped icon standing in for the host), else `<host>:<branch>`.
     let member = super::grammar::member_label_moded(
         app.server_label,
         peer.icon.as_deref(),
-        host,
+        &host,
         &super::grammar::remote_member_target(ws),
     );
     if indented {
@@ -1353,7 +1353,9 @@ fn server_band_slots_as(
     for (peer_ref, peer) in app.remote_peers() {
         // Origin rows fold into the spaces list, never a band slot — the Home
         // row above already stands for the origin server here.
-        if matches!(peer_ref, crate::app::state::RemotePeerRef::Origin) {
+        if matches!(peer_ref, crate::app::state::RemotePeerRef::Origin)
+            || app.server_home_claim(peer)
+        {
             continue;
         }
         // A BAND row is a server, not a space: switch there and let it keep
@@ -2206,6 +2208,43 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
             // the home row already stands for the origin server here.
             Some(crate::app::state::PeerSwitchRequest::OriginWorkspace { .. }) => continue,
         };
+        if matches!(target, Some(crate::app::state::PeerSwitchRequest::Home)) {
+            if let Some(snapshot) = app.fleet_snapshot.as_ref() {
+                let label = app.server_claim_name(
+                    &snapshot.origin,
+                    snapshot
+                        .origin_summary
+                        .as_ref()
+                        .and_then(|peer| peer.node_id.as_deref()),
+                );
+                build.name = server_name_spans(
+                    snapshot
+                        .origin_summary
+                        .as_ref()
+                        .and_then(|peer| peer.icon.as_deref()),
+                    &label,
+                    app.server_label,
+                    build.name.last().map(|span| span.style).unwrap_or_default(),
+                );
+                let claims = app
+                    .remote_peers()
+                    .iter()
+                    .filter(|(_, peer)| app.server_home_claim(peer))
+                    .count();
+                if claims > 0 {
+                    build.health.spans.insert(
+                        0,
+                        Span::styled(
+                            format!(
+                                "{claims} unverified home claim{}  ",
+                                if claims == 1 { "" } else { "s" }
+                            ),
+                            Style::default().fg(p.overlay0),
+                        ),
+                    );
+                }
+            }
+        }
         if let Some(peer) = remote {
             build.name = server_name_spans(
                 peer.icon.as_deref(),
@@ -2214,6 +2253,7 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 build.name.last().map(|span| span.style).unwrap_or_default(),
             );
             let route = match app.server_peer_node(peer) {
+                None if peer.node_id.is_some() => "unverified".to_string(),
                 None => "legacy/unverified".to_string(),
                 Some(node) => match app.server_paths.get(node) {
                     Some(hop) if hop == node => "direct".to_string(),
@@ -2569,12 +2609,14 @@ fn home_server_rows(
         HOME_ROW_GLYPH.to_string(),
         Style::default().fg(p.overlay0),
     )];
-    if identity.is_none() {
-        title_rest.push(Span::styled(
-            " legacy/unverified",
-            Style::default().fg(p.overlay0),
-        ));
-    }
+    title_rest.push(Span::styled(
+        if identity.is_some() {
+            " unverified"
+        } else {
+            " legacy/unverified"
+        },
+        Style::default().fg(p.overlay0),
+    ));
     let age_span = |sep: &str| {
         Span::styled(
             format!("{sep}snapshot {} old", format_age(age_secs)),
@@ -3694,6 +3736,205 @@ mod tests {
     use crate::{detect::Agent, workspace::Workspace};
     use ratatui::{backend::TestBackend, Terminal};
 
+    fn security2166_alias_fixture() -> AppState {
+        let mut app = AppState::test_new();
+        let alias = "node-trusted.example";
+        app.peers.push(crate::config::PeerConfig {
+            name: alias.into(),
+            ssh: "node-real.example".into(),
+            ..Default::default()
+        });
+        app.server_nodes.insert(alias.into(), "real-node".into());
+        let mut spoof = peer_named_with_host(alias, alias);
+        spoof.node_id = Some("claimed-node".into());
+        spoof.workspaces = vec![serde_json::from_value(serde_json::json!({
+            "id":"ws_remote", "workspace":"project", "branch":"main",
+            "agent":"cc", "status":"working"
+        }))
+        .unwrap()];
+        app.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "node-home.example".into(),
+            peers: vec![spoof],
+            origin_summary: None,
+            received_at: std::time::Instant::now(),
+        });
+        app
+    }
+
+    fn security2166_band_text(app: &AppState) -> String {
+        let area = Rect::new(0, 0, 120, 16);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_servers_section(app, frame, area, false))
+            .unwrap();
+        (0..area.height)
+            .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn security2166_alias_rule_preserves_local_sources_and_unknown_names() {
+        let mut app = security2166_alias_fixture();
+        for node in [None, Some("claimed-node".to_string())] {
+            app.fleet_snapshot.as_mut().unwrap().peers[0].node_id = node;
+            let peer = &app.fleet_snapshot.as_ref().unwrap().peers[0];
+            assert!(app.server_peer_name(peer).starts_with("unverified"));
+            assert!(app
+                .server_claim_name("NODE-TRUSTED.EXAMPLE", peer.node_id.as_deref())
+                .starts_with("unverified"));
+        }
+        app.server_nodes
+            .insert("node-inbound.example".into(), "inbound-node".into());
+        assert!(app
+            .server_claim_name("node-inbound.example", None)
+            .starts_with("unverified"));
+        assert_eq!(
+            app.server_claim_name("node-unknown.example", None),
+            "node-unknown.example"
+        );
+        let local = crate::peers::PeerSummaryState::new(&app.peers[0]);
+        app.peer_summaries.push(local);
+        assert_eq!(
+            app.server_peer_name(&app.peer_summaries[0]),
+            "node-trusted.example"
+        );
+    }
+
+    #[test]
+    fn security2166_band_never_renders_a_spoofed_configured_alias() {
+        let text = security2166_band_text(&security2166_alias_fixture());
+        assert!(!text.contains("node-trusted.example"), "{text}");
+        assert!(text.contains("unverified"), "{text}");
+    }
+
+    #[test]
+    fn security2166_spaces_member_never_renders_a_spoofed_configured_alias() {
+        let app = security2166_alias_fixture();
+        let row = remote_entry_label(
+            &app,
+            &crate::app::state::RemotePeerRef::Snapshot { entry_idx: 0 },
+            0,
+            true,
+        );
+        assert!(!row.contains("node-trusted.example"), "{row}");
+        assert!(row.contains("unverified"), "{row}");
+    }
+
+    #[test]
+    fn security2166_agents_never_render_a_spoofed_configured_alias() {
+        let mut app = security2166_alias_fixture();
+        let entries = remote_agent_panel_entries(&app);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].server.contains("node-trusted.example"));
+        assert!(entries[0].server.contains("unverified"));
+        app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
+        let area = Rect::new(0, 0, 120, 10);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| render_agent_detail(&app, &runtimes, frame, area))
+            .unwrap();
+        let text = (0..area.height)
+            .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("node-trusted.example"), "{text}");
+        assert!(text.contains("unverified"), "{text}");
+    }
+
+    #[test]
+    fn security2166_navigator_never_renders_a_spoofed_configured_alias() {
+        let app = security2166_alias_fixture();
+        let rows = app.navigator_rows();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].label.contains("node-trusted.example"),
+            "{:?}",
+            rows[0]
+        );
+        assert!(rows[0].label.contains("unverified"));
+    }
+
+    #[test]
+    fn security2166_filter_header_never_renders_a_spoofed_configured_alias() {
+        let mut app = security2166_alias_fixture();
+        app.server_filter = Some(crate::app::state::ServerFilter::Peer {
+            ssh_target: app.fleet_snapshot.as_ref().unwrap().peers[0]
+                .ssh_target
+                .clone(),
+        });
+        let label = server_filter_label(&app).unwrap();
+        assert!(!label.contains("node-trusted.example"), "{label}");
+        assert!(label.contains("unverified"));
+    }
+
+    #[tokio::test]
+    async fn security2166_switch_notice_never_renders_a_spoofed_configured_alias() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state = security2166_alias_fixture();
+        let prepared = app
+            .prepare_switch_server(crate::app::state::PeerSwitchRequest::SnapshotPeer {
+                entry_idx: 0,
+                ws_idx: Some(0),
+            })
+            .unwrap();
+        assert!(
+            !prepared.label.contains("node-trusted.example"),
+            "{}",
+            prepared.label
+        );
+        assert!(prepared.label.contains("unverified"));
+    }
+
+    #[test]
+    fn security2166_node_claim_badge_is_consistently_unverified() {
+        let mut app = security2166_alias_fixture();
+        let mut home = peer_named_with_host("node-home.example", "node-home.example");
+        home.node_id = Some("home-node".into());
+        app.fleet_snapshot.as_mut().unwrap().origin_summary = Some(home);
+        let text = security2166_band_text(&app);
+        assert!(!text.contains("legacy/unverified"), "{text}");
+        assert!(text.contains("unverified"), "{text}");
+    }
+
+    #[test]
+    fn security2166_home_claim_is_annotated_without_hiding_its_workspaces() {
+        let mut app = security2166_alias_fixture();
+        let mut origin = peer_named_with_host("node-home.example", "node-home.example");
+        origin.node_id = Some("home-node".into());
+        app.fleet_snapshot.as_mut().unwrap().origin_summary = Some(origin.clone());
+        origin.workspaces = app.fleet_snapshot.as_ref().unwrap().peers[0]
+            .workspaces
+            .clone();
+        app.fleet_snapshot.as_mut().unwrap().peers.clear();
+        app.relayed_fleet_cache.insert(
+            "claim".into(),
+            crate::peers::RelayedEntry {
+                peer: origin,
+                via: Some("node-hub.example".into()),
+                hub_pushed: true,
+            },
+        );
+        let slots = server_band_slots_as(&app, "node-self.example");
+        assert_eq!(slots.len(), 2, "only self and Home get server slots");
+        assert_eq!(
+            app.remote_peers().len(),
+            2,
+            "independent observations remain separate"
+        );
+        assert_eq!(remote_agent_panel_entries(&app).len(), 1);
+        let text = security2166_band_text(&app);
+        assert!(text.contains("1 unverified home claim"), "{text}");
+    }
+
     fn server_identity1076_fixture() -> (crate::app::App, String) {
         let identity = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
         let node = identity.node_id();
@@ -4088,7 +4329,8 @@ mod tests {
             .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("node-home.example"));
+        assert!(!text.contains("node-home.example"));
+        assert!(text.contains("unverified node-hom"));
         let snapshot = app.fleet_snapshot.as_ref().unwrap();
         let home = home_server_rows(
             snapshot,

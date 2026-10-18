@@ -174,8 +174,8 @@ pub(crate) fn solo_remote_label(
     mode: crate::config::ServerLabelConfig,
     peer: &crate::peers::PeerSummaryState,
     summary: &crate::api::schema::PeerWorkspaceSummary,
+    host: &str,
 ) -> String {
-    let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
     let member = member_label_moded(
         mode,
         peer.icon.as_deref(),
@@ -561,7 +561,12 @@ mod tests {
         let peer = peer_named("atlas");
         let summary = remote_summary(Some("github.com/gerchowl/flock"), Some("main"));
         assert_eq!(
-            solo_remote_label(crate::config::ServerLabelConfig::Both, &peer, &summary),
+            solo_remote_label(
+                crate::config::ServerLabelConfig::Both,
+                &peer,
+                &summary,
+                peer.display_name()
+            ),
             "gerchowl/flock \u{00b7} atlas:main"
         );
     }
@@ -573,7 +578,12 @@ mod tests {
         let peer = peer_named("atlas");
         let summary = remote_summary(None, Some("wip"));
         assert_eq!(
-            solo_remote_label(crate::config::ServerLabelConfig::Both, &peer, &summary),
+            solo_remote_label(
+                crate::config::ServerLabelConfig::Both,
+                &peer,
+                &summary,
+                peer.display_name()
+            ),
             "atlas:wip"
         );
     }
@@ -651,7 +661,12 @@ mod tests {
         peer.icon = Some("toad".into());
         let summary = remote_summary(Some("github.com/gerchowl/flock"), Some("main"));
         assert_eq!(
-            solo_remote_label(crate::config::ServerLabelConfig::Icon, &peer, &summary),
+            solo_remote_label(
+                crate::config::ServerLabelConfig::Icon,
+                &peer,
+                &summary,
+                peer.display_name()
+            ),
             format!("gerchowl/flock \u{00b7} {glyph} \u{00b7} main")
         );
     }
