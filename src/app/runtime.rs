@@ -646,17 +646,33 @@ impl App {
         }
 
         self.git_refresh_idle = None;
+        let cache = self.git_status_cache.clone();
+        self.dispatch_git_refresh(
+            now,
+            move || refresh_workspace_git_statuses_with_cache(workspaces, &cache),
+            spawn_git_refresh_worker,
+        );
+    }
+
+    /// Run an owned refresh operation and deliver its completion on the app channel.
+    /// The spawn boundary also permits deterministic worker-failure fixtures.
+    fn dispatch_git_refresh(
+        &mut self,
+        now: Instant,
+        run: impl FnOnce() -> WorkspaceGitRefreshOutput + Send + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) {
         self.git_refresh_in_flight = true;
         self.git_refresh_health.mark_started(now);
         let event_tx = self.event_tx.clone();
-        let cache = self.git_status_cache.clone();
-        std::thread::spawn(move || {
-            let output = refresh_workspace_git_statuses_with_cache(workspaces, &cache);
+        spawn(Box::new(move || {
+            let output = run();
             let _ = event_tx.blocking_send(AppEvent::GitStatusRefreshed {
                 results: output.results,
                 cache_updates: output.cache_updates,
             });
-        });
+        }))
+        .expect("git refresh worker spawn");
     }
 
     pub(crate) fn mark_git_status_refresh_due(&mut self, now: Instant) {
@@ -1776,6 +1792,10 @@ fn post_error_comment(gh_bin: &str, repo: &str, issue: u64, reason: &str) -> Res
         ));
     }
     Ok(())
+}
+
+fn spawn_git_refresh_worker(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new().spawn(job).map(|_| ())
 }
 
 pub(crate) fn deduplicate_git_refresh_items(
