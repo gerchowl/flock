@@ -657,3 +657,30 @@ async fn startup_with_unresolvable_endpoint_warns_and_only_structured_start_refu
     assert!(fixture.app.state.structured_agents.records().is_empty());
     assert!(!fixture.fixture.root.path().join("version.pid").exists());
 }
+
+#[test]
+fn endpoint_warning_has_a_closed_path_free_reason() {
+    for (failure, expected) in [
+        (crate::api::server::McpEndpointFailure::Exe, "exe"),
+        (crate::api::server::McpEndpointFailure::Socket, "socket"),
+    ] {
+        let capture = LogCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            crate::logging::structured_mcp_endpoint_unavailable(failure)
+        });
+        let bytes = capture.0.lock().unwrap().clone();
+        let log: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(log["fields"]["reason"], expected);
+        assert_eq!(
+            log["fields"]["event"],
+            "structured.mcp.endpoint_unavailable"
+        );
+        assert!(log["fields"].get("path").is_none());
+    }
+}
