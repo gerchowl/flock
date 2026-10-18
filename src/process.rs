@@ -571,20 +571,33 @@ fn redact_arg(arg: &str) -> String {
     let urls = redact_url_credentials(arg);
     let arg = urls.as_str();
     static HEADER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static COMPACT_HEADER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let header = HEADER.get_or_init(|| {
-        // HTTP allows compact values for recognized credential headers. Generic
-        // prefixed labels need spacing to distinguish refspecs and pane targets.
-        let label = crate::report::redact::secret_label_pattern("");
+        // Capture complete names, including ref paths and a glued curl option.
         regex::Regex::new(&format!(
-            r"(?i)(?:^|[^\w-])(?:((?:{label}|proxy-authorization|set-cookie|x-[\w-]*{label})[ \t]*:)|({}[ \t]*:)(?:\s|$))",
-            crate::report::redact::secret_label_pattern(r"[\w-]*")
+            r"(?i)(([\w/-]*{})[ \t]*:)",
+            crate::report::redact::secret_label_pattern("")
         ))
         .expect("static secret header pattern")
     });
-    if let Some(found) = header
-        .captures(arg)
-        .and_then(|captures| captures.get(1).or_else(|| captures.get(2)))
-    {
+    let compact = COMPACT_HEADER.get_or_init(|| {
+        regex::Regex::new(&format!(
+            r"(?i)^(?:authorization|proxy-authorization|cookie|set-cookie|{}|x-[\w-]*{})$",
+            crate::report::redact::API_KEY_LABEL_PATTERN,
+            crate::report::redact::secret_label_pattern("")
+        ))
+        .expect("static compact credential header pattern")
+    });
+    if let Some(found) = header.captures_iter(arg).find_map(|captures| {
+        let found = captures.get(1)?;
+        let name = captures.get(2)?.as_str();
+        let name = name.strip_prefix("-H").unwrap_or(name);
+        let rest = &arg[found.end()..];
+        // HTTP permits compact exact headers. Generic words need spacing so
+        // refspecs and terminal targets retain their values in the audit trail.
+        (compact.is_match(name) || rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .then_some(found)
+    }) {
         let rest = &arg[found.end()..];
         const AUTH_SCHEMES: [&str; 5] = ["bearer", "basic", "digest", "negotiate", "token"];
         let first = rest
@@ -1266,7 +1279,6 @@ mod tests {
             "X-Credentials",
             "X-Session",
             "Api-Key",
-            "Token",
         ] {
             let value = if name.ends_with("Authorization") {
                 format!("Bearer {secret}")
@@ -1304,6 +1316,44 @@ mod tests {
         for boundary in ['<', '>', ' ', '\t', '\n'] {
             let argument = format!("https://fixture-user:{prefix}{boundary}tail@example.com/repo");
             assert_eq!(redact_arg(&argument), argument);
+        }
+    }
+
+    #[test]
+    fn glued_curl_header_values_are_masked() {
+        let secret = ["fixture", "glued", "credential"].join("-");
+        for name in [
+            "Authorization",
+            "Proxy-Authorization",
+            "Cookie",
+            "X-Api-Key",
+            "X-Auth-Token",
+            "X-Amz-Security-Token",
+            "x-csrf-token",
+        ] {
+            let value = match name {
+                "Authorization" => format!("Bearer {secret}"),
+                "Cookie" => format!("a={secret}; c=d"),
+                _ => secret.clone(),
+            };
+            let logs = logged_fixture_args(&[format!("-H{name}:{value}"), "ordinary".into()]);
+            assert!(!logs.contains(&secret), "{name}: {logs}");
+            assert!(logs.contains(&format!("-H{name}:")), "{logs}");
+            assert!(logs.contains("<redacted> ordinary"), "{logs}");
+        }
+    }
+
+    #[test]
+    fn generic_compact_labels_inside_refspecs_are_unchanged() {
+        for argument in [
+            "refs/heads/token:refs/heads/x",
+            "+refs/heads/cookie:refs/x",
+            "token:main",
+            "session:0",
+            "deploy-token:main",
+            "mysession:0",
+        ] {
+            assert_eq!(redact_arg(argument), argument);
         }
     }
 
