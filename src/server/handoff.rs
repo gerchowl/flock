@@ -707,7 +707,13 @@ fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> 
         msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = space as _;
 
-        let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+        let read = unsafe {
+            libc::recvmsg(
+                stream.as_raw_fd(),
+                &mut msg,
+                crate::platform::received_fd::RECV_FLAGS,
+            )
+        };
         if read < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {

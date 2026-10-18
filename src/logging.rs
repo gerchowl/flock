@@ -61,7 +61,7 @@ pub(crate) fn client_accept_failed(
     let event = "client.listener.accept";
     match class {
         AcceptFailure::Connection => tracing::debug!(event, errno, ?class),
-        AcceptFailure::Resource => tracing::warn!(event, errno, ?class),
+        AcceptFailure::Resource | AcceptFailure::Unknown => tracing::warn!(event, errno, ?class),
         AcceptFailure::Fatal => tracing::error!(event, errno, ?class),
     }
 }

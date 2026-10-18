@@ -67,15 +67,23 @@ S8's complete adapter have landed.
 
 The foundation starts no listener. Its reusable accept policy treats peer resets,
 interrupted accepts and other per-connection errors as recoverable and logs them
-at debug level. Descriptor or buffer exhaustion emits a structured warning and
+at debug level. Resource exhaustion and unclassified errors (including errors
+without an errno) emit a structured warning and
 waits `ACCEPT_RESOURCE_BACKOFF` (100 ms) on the supplied monotonic clock before
 accepting again. Only an invalid listener descriptor (`EBADF`, `EINVAL`,
 `ENOTSOCK`) ends that listener task and publishes the typed `failed` state once.
 It does not end the headless server loop or its agents. Ping carries the optional
 `client_listener` state (`listening` or `failed`), absent when disabled.
+This state is owned by each API server and injected into its listener owner;
+independent server instances never share a process static.
 
-Every SCM_RIGHTS descriptor is made close-on-exec at the receive boundary before
-import can spawn a child. The listener descriptor helper additionally verifies
-that a transferred socket is listening and retains exporter rollback ownership
+On Linux, `MSG_CMSG_CLOEXEC` makes every SCM_RIGHTS descriptor close-on-exec
+atomically at receipt. Darwin has no equivalent receive flag: the immediate
+fcntl leaves a residual receive-to-fcntl window against concurrent fork/exec.
+The importer is already multithreaded: its deadline watchdog starts before
+receipt (logging may also own a worker), but those threads do not spawn children.
+The importer does not spawn its own children until descriptor protection is done.
+Every returned descriptor is protected before import can spawn a child. The listener descriptor helper additionally verifies
+that a transferred socket is IPv4, stream-typed and listening and retains exporter rollback ownership
 through duplication. Mounting and listener transfer through handoff remain the
 responsibility of the subsequent #1894 mounting change.
