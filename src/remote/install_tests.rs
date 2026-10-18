@@ -220,35 +220,37 @@ fn local_read_failure_keeps_its_type_before_remote_transfer_mismatch() {
         }
     }
     impl std::error::Error for ReadFailure {}
-    struct FailingReader(bool);
+    struct FailingReader(bool, io::ErrorKind);
     impl io::Read for FailingReader {
         fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
             if self.0 {
-                return Err(io::Error::new(io::ErrorKind::PermissionDenied, ReadFailure));
+                return Err(io::Error::new(self.1, ReadFailure));
             }
             self.0 = true;
             bytes[..7].copy_from_slice(b"partial");
             Ok(7)
         }
     }
-    let root = crate::test_support::TempDir::socket();
-    let upload = root.path().join("upload");
-    let child = std::process::Command::new("/bin/sh")
-        .args(["-c", "cat > \"$1\"; exit 30", "upload-fixture"])
-        .arg(&upload)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let error = finish_remote_upload(child, &mut FailingReader(false)).unwrap_err();
-    assert_eq!(fs::read(&upload).unwrap(), b"partial");
-    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-    assert!(error
-        .get_ref()
-        .unwrap()
-        .downcast_ref::<ReadFailure>()
-        .is_some());
+    for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::BrokenPipe] {
+        let root = crate::test_support::TempDir::socket();
+        let upload = root.path().join("upload");
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\"; exit 30", "upload-fixture"])
+            .arg(&upload)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let error = finish_remote_upload(child, &mut FailingReader(false, kind)).unwrap_err();
+        assert_eq!(fs::read(&upload).unwrap(), b"partial");
+        assert_eq!(error.kind(), kind);
+        assert!(error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<ReadFailure>()
+            .is_some());
+    }
 }
 
 #[test]
@@ -270,5 +272,47 @@ fn missing_dash_reports_the_skipped_script_coverage() {
     assert!(
         stderr.contains("SKIPPED dash script coverage: dash not found on PATH"),
         "{stderr}"
+    );
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // Waiting for the owned child fixes the closed-reader ordering before upload.
+fn early_remote_exit_preserves_stderr_instead_of_write_side_broken_pipe() {
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "printf '%s' 'Read-only file system' >&2; exit 2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Child::wait closes its stdin, so retain the writer until the reader has exited.
+    let stdin = child.stdin.take().unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(2));
+    child.stdin = Some(stdin);
+    let error = finish_remote_upload(child, &mut &b"complete binary"[..]).unwrap_err();
+    assert!(
+        error.to_string().contains("Read-only file system"),
+        "{error}"
+    );
+    assert_ne!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(crate::cli::io_error_exit(&error), crate::cli::exit::FAILURE);
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // The owned child drains a complete upload before reporting checksum mismatch.
+fn complete_copy_preserves_the_remote_checksum_mismatch() {
+    let child = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > /dev/null; exit 30"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut source = io::Cursor::new(b"complete binary");
+    let error = finish_remote_upload(child, &mut source).unwrap_err();
+    assert_eq!(source.position(), b"complete binary".len() as u64);
+    assert_eq!(
+        error.get_ref().unwrap().downcast_ref::<ErrorCode>(),
+        Some(&ErrorCode::RemoteChecksumMismatch)
     );
 }

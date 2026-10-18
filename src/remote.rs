@@ -1652,8 +1652,12 @@ fn finish_remote_upload(
     mut child: std::process::Child,
     source: &mut impl io::Read,
 ) -> io::Result<()> {
+    let mut source = UploadReader {
+        inner: source,
+        read_failed: false,
+    };
     let copy_result = if let Some(mut stdin) = child.stdin.take() {
-        io::copy(source, &mut stdin).map(|_| ())
+        io::copy(&mut source, &mut stdin).map(|_| ())
     } else {
         Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
@@ -1661,9 +1665,26 @@ fn finish_remote_upload(
         ))
     };
     let output = child.wait_with_output();
-    copy_result?;
+    if source.read_failed {
+        return copy_result;
+    }
     let output = output?;
-    remote_install_result(output.status, &output.stderr)
+    remote_install_result(output.status, &output.stderr)?;
+    copy_result
+}
+
+/// Identify read-side failures without wrapping or replacing the original error.
+struct UploadReader<'a, R> {
+    inner: &'a mut R,
+    read_failed: bool,
+}
+impl<R: io::Read> io::Read for UploadReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let result = self.inner.read(buffer);
+        // A retried Interrupted read must not misclassify a later write failure.
+        self.read_failed = result.is_err();
+        result
+    }
 }
 
 /// Stage and verify a received upload before atomically replacing the binary.
