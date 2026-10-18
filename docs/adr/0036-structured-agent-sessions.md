@@ -370,10 +370,15 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   existing response timeout. Subscription probes/polls and held output reads
   retain the captured socket credentials. Recognized server-UID reads use the
   same-UID cooperative rule. Held event reads retain the captured peer for
-  their release dispatch too. App admission also issues an in-process release
-  grant containing the authority class and an immutable hold ID. The holder
-  stores this grant and uses it on completion or hang-up, even after the caller
-  process exits. Hold registration uses the existing 5-second App response budget.
+  their release dispatch too. Before resolving a hold's caller pane or opening
+  any hold, the App classifies the captured UID and refuses `Unknown` with
+  `not_authorized`. Only `Operator` and `Agent` proceed to caller resolution;
+  a recognized caller outside an agent pane records no hold. Admission of an
+  agent-pane hold also issues an in-process release grant containing only its
+  immutable hold ID; the constructor checks the authority class but does not
+  retain it. The holder stores this grant and uses it on completion or hang-up,
+  even after the caller process exits. Hold registration uses the existing
+  5-second App response budget.
   Grant publication and reader abandonment share one synchronized handoff: if
   the reader leaves before a delayed admission, the App closes the newly opened
   hold by that grant's exact ID. A concurrent or unrelated hold is untouched, and

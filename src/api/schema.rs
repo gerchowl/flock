@@ -53,7 +53,6 @@ impl PartialEq for WaitAdmissionState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaitReleaseAuthority {
     wait_id: String,
-    authority: crate::structured::identity::Principal,
 }
 
 impl WaitReleaseAuthority {
@@ -65,8 +64,7 @@ impl WaitReleaseAuthority {
         authority: crate::structured::identity::Principal,
     ) -> Option<Self> {
         use crate::structured::identity::Principal;
-        matches!(authority, Principal::Operator | Principal::Agent)
-            .then_some(Self { wait_id, authority })
+        matches!(authority, Principal::Operator | Principal::Agent).then_some(Self { wait_id })
     }
 
     /// The original hold this grant can close, independent of caller lifetime.
@@ -6504,7 +6502,6 @@ mod wait_admission_tests {
             "later"
         );
         assert_eq!(admission.get().unwrap().release_id(), "first");
-        assert!(admission.eq(&admission));
     }
 
     #[test]
