@@ -460,8 +460,17 @@ it off with:
 enabled = false
 ```
 
-Disabled, Flock writes nothing at all: the window title stays whatever your
-shell last set it to.
+Both the server and the attaching client must enable titles. The server decides
+whether to publish its title, and the client reads its own local `[title]` config
+before writing it to the terminal. Set `enabled = false` locally to silence a
+remote attach, or on the server to prevent publishing to every client.
+
+A disabled client writes no title sequences, including on exit: it neither sets
+nor restores a title. Disabling it after a title was set leaves that title in
+place. The local setting is read at attach and refreshed by the existing client
+config reload request. If a title is unexpectedly absent, check both configs
+and terminal passthrough support. If disabling it on the server appears to have
+no effect, check that you edited the attached server's config and reloaded it.
 
 Inside tmux, the title only reaches the outer terminal if tmux is allowed to
 pass the sequence through:
@@ -471,8 +480,8 @@ set -g allow-passthrough on
 ```
 
 Without it tmux swallows the sequence and the window title is unchanged — the
-same as not publishing at all. The setting is read from the server you are
-attached to, so a remote attach follows the remote host's `[title]` section.
+same as not publishing at all. Allowing titles on one side cannot override the
+other side's veto.
 
 ## Sound
 
