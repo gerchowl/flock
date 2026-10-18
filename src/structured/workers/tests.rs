@@ -968,3 +968,15 @@ async fn registry_stream_owner_preserves_history_without_competing_with_state_si
     registry.remove(&case.id, case.generation).unwrap();
     assert!(workers.history(&registry, &case.id).is_none());
 }
+
+#[tokio::test]
+async fn finished_without_report_has_no_evidence_licensing_recovery() {
+    let wake = Arc::new(Notify::new());
+    let mut registry = Registry::default();
+    let mut workers = Workers::new(wake.clone());
+    let case = Case::uncertain(&mut registry, &mut workers, 432, &wake).await;
+    let worker = workers.entries.get_mut(&case.id).unwrap();
+    assert!(worker.finished && worker.thread.is_none());
+    worker.report = None;
+    assert!(!workers.history_recovery_allowed(&case.id));
+}

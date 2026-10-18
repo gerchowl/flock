@@ -286,6 +286,8 @@ impl Workers {
     }
     /// Cold recovery requires a quiescent producer and confirmed cleanup.
     /// Existing canonical history remains readable while a worker is active.
+    /// A finished worker without a report has no confirmed cleanup evidence and
+    /// remains busy. Only a report confirming released authority permits recovery.
     pub(crate) fn history_recovery_allowed(&self, id: &str) -> bool {
         self.entries.get(id).is_none_or(|worker| {
             worker.finished
