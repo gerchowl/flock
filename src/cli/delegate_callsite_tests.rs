@@ -852,3 +852,192 @@ fn keep_on_failure_is_a_start_flag() {
         assert!(parse_flags(verb, &args(&["d1", "--keep-on-failure"])).is_err());
     }
 }
+
+/// Real local socket and App dispatch, with no open repository workspace.
+struct ClosedWorkspaceFixture {
+    app: crate::app::App,
+    server: Option<crate::api::server::ServerHandle>,
+    repo: PathBuf,
+    checkout: PathBuf,
+    root: crate::test_support::TempDir,
+    env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+impl ClosedWorkspaceFixture {
+    fn new() -> Self {
+        let root = crate::test_support::TempDir::socket();
+        let mut env = vec![("FLOCK_CONFIG_PATH", std::env::var_os("FLOCK_CONFIG_PATH"))];
+        std::env::remove_var("FLOCK_CONFIG_PATH");
+        for (key, value) in [
+            ("HOME", root.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", root.path().join("config")),
+            ("XDG_STATE_HOME", root.path().join("state")),
+            ("FLOCK_SOCKET_PATH", root.path().join("api.sock")),
+        ] {
+            env.push((key, std::env::var_os(key)));
+            std::env::set_var(key, value);
+        }
+        let repo = crate::test_support::create_committed_repo("delegate-explicit-repo");
+        let checkout = root.path().join("checkout");
+        crate::test_support::run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree/delegate-recovery",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let hub = crate::api::EventHub::default();
+        let mut app = crate::app::App::new_with_runtime_config(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            hub.clone(),
+            crate::app::AppRuntimeConfig {
+                merge_gate: crate::worktree::MergeGateContext {
+                    gh_program: root.path().join("missing-gh"),
+                },
+                ..Default::default()
+            },
+        );
+        app.state.workspaces.clear();
+        app.state.active = None;
+        let server =
+            crate::api::server::start_server_with_capabilities(tx, hub, None, Default::default())
+                .unwrap();
+        Self {
+            app,
+            server: Some(server),
+            repo,
+            checkout,
+            root,
+            env,
+        }
+    }
+
+    async fn drive<T: Send + 'static>(&mut self, call: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, mut result) = tokio::sync::oneshot::channel();
+        let client = std::thread::spawn(move || {
+            let _ = done.send(call());
+        });
+        let output = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    output = &mut result => break output.unwrap(),
+                    request = self.app.api_rx.recv() => {
+                        let request = request.expect("owned listener remains live");
+                        self.app.current_api_peer_pid = request.peer_pid;
+                        self.app.current_api_peer_birth = Some(request.peer_birth);
+                        self.app.current_api_peer_uid = Some(request.peer_uid);
+                        let response = self.app.handle_api_request(request.request);
+                        request.respond_to.send(response).unwrap();
+                    }
+                }
+            }
+        })
+        .await
+        .expect("bounded delegate fixture request/response");
+        client.join().unwrap();
+        output
+    }
+}
+impl Drop for ClosedWorkspaceFixture {
+    fn drop(&mut self) {
+        self.server.take().unwrap().finish_for_test();
+        std::fs::remove_dir_all(&self.repo).unwrap();
+        for (key, prior) in self.env.drain(..).rev() {
+            match prior {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reap_with_all_workspaces_closed_removes_checkout_and_registry_without_pruning_siblings() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = ClosedWorkspaceFixture::new();
+    let sibling = fixture.root.path().join("temporarily-absent");
+    crate::test_support::run_git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "worktree/absent-sibling",
+            sibling.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    std::fs::remove_dir_all(&sibling).unwrap();
+    let mut entry = entry_for("closed-delegate");
+    entry.mode = "worktree".into();
+    entry.worktree = Some(fixture.checkout.to_string_lossy().into_owned());
+    entry.repo_root = Some(fixture.repo.to_string_lossy().into_owned());
+    entry.branch = Some("worktree/delegate-recovery".into());
+    write_entry(&entry).unwrap();
+    let path = entry_path(&entry.name);
+    let result = fixture
+        .drive(|| delegate_reap(&["closed-delegate".into(), "--json".into()]))
+        .await
+        .unwrap();
+    assert_eq!(result, 0);
+    assert!(!fixture.checkout.exists());
+    assert!(!path.exists());
+    assert!(crate::worktree::list_existing_worktrees(&fixture.repo)
+        .unwrap()
+        .iter()
+        .any(|row| row.path == sibling));
+}
+
+#[tokio::test]
+async fn placement_failure_cleans_up_with_no_open_workspace() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = ClosedWorkspaceFixture::new();
+    let repo = fixture.repo.to_string_lossy().into_owned();
+    let result = fixture
+        .drive(move || {
+            teardown_after_place_failure(
+                "failed-placement",
+                Some(&[]),
+                Mode::Worktree,
+                &start_flags_worktree("worktree/delegate-recovery"),
+                &repo,
+                CreateFailure::TimedOut,
+            )
+        })
+        .await;
+    assert_eq!(result, crate::cli::exit::FAILURE);
+    assert!(!fixture.checkout.exists());
+    assert!(fixture.repo.join(".git").is_dir());
+}
+
+#[tokio::test]
+async fn cli_explicit_repo_kill_works_without_an_open_workspace() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = ClosedWorkspaceFixture::new();
+    let repo = fixture.repo.to_string_lossy().into_owned();
+    let checkout = fixture.checkout.to_string_lossy().into_owned();
+    let result = fixture
+        .drive(move || {
+            crate::cli::worktree::run_worktree_command(&[
+                "kill".into(),
+                "--path".into(),
+                checkout,
+                "--repo".into(),
+                repo,
+                "--keep-branch".into(),
+                "--keep-procs".into(),
+                "--json".into(),
+            ])
+        })
+        .await
+        .unwrap();
+    assert_eq!(result, 0);
+    assert!(!fixture.checkout.exists());
+}

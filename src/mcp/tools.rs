@@ -945,6 +945,7 @@ fn build_worktree_kill(args: Value) -> Result<Method, McpError> {
     Ok(Method::WorktreeKill(WorktreeKillParams {
         workspace_id,
         path,
+        repo: None,
         force: optional_bool(&args, "force")?,
         keep_branch: optional_bool(&args, "keep_branch")?,
         dry_run,
