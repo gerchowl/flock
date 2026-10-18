@@ -43,7 +43,11 @@ impl Fixture {
         file.sync_all().unwrap();
         let source = History::default();
         source
-            .initialize(&file, records.last().map_or(0, |r| r.seq))
+            .initialize(
+                &file,
+                records.last().map_or(0, |r| r.seq),
+                file.metadata().unwrap().len(),
+            )
             .unwrap();
         Self {
             _root: root,
@@ -375,7 +379,7 @@ async fn readiness_publication_and_end_notifications_are_only_hints() {
     tokio::pin!(ready);
     ready.as_mut().enable();
     assert!(matches!(source.subscribe(None),Err(e) if e.kind()==io::ErrorKind::WouldBlock));
-    source.initialize(&fixture.file, 0).unwrap();
+    source.initialize(&fixture.file, 0, 0).unwrap();
     tokio::time::timeout(Duration::from_secs(5), ready)
         .await
         .expect("quiet empty stream must announce readiness");
@@ -512,27 +516,18 @@ fn gap_and_live_checkpoints_preserve_exact_record_boundaries() {
     assert_eq!(latest.read_bytes(), 0);
 }
 #[test]
-fn cold_tail_allocation_tracks_the_final_record_instead_of_the_file_limit() {
+fn cold_tail_recovers_the_final_record_across_bounded_chunks() {
     let fixture = long_history(5_000);
-    let mut tail = Vec::new();
     let length = fixture.file.metadata().unwrap().len();
-    assert_eq!(tail_head(&fixture.file, length, &mut tail).unwrap(), 5_000);
-    assert!(tail.len() <= PAGE_BYTES);
-    assert!(tail.capacity() <= PAGE_BYTES);
+    assert_eq!(tail_head(&fixture.file, length).unwrap(), 5_000);
     let fixture = Fixture::new(vec![record(
         1,
         json!({"type":"future","payload":"x".repeat(PAGE_BYTES*3)}),
     )]);
     assert_eq!(
-        tail_head(
-            &fixture.file,
-            fixture.file.metadata().unwrap().len(),
-            &mut tail
-        )
-        .unwrap(),
+        tail_head(&fixture.file, fixture.file.metadata().unwrap().len(),).unwrap(),
         1
     );
-    assert!(tail.len() <= PAGE_BYTES * 4);
 }
 
 #[test]
@@ -558,4 +553,40 @@ fn one_oversized_publication_lags_a_caught_up_cut_without_copying_the_arc() {
         "oversize lag must retain no payload copy"
     );
     assert!(matches!(cut.page().unwrap(), Item::Lagged(1)));
+}
+
+#[test]
+fn live_record_checkpoint_resumes_after_the_complete_record() {
+    let mut fixture = Fixture::new(vec![record(1, json!({"type":"user","message":{}}))]);
+    let mut cut = fixture.source.subscribe(Some(1)).unwrap();
+    assert!(matches!(next(&mut cut), Item::Synced(1)));
+    fixture.append(record(
+        2,
+        json!({"type":"user","message":{"content":"second"}}),
+    ));
+    assert_eq!(seq(next(&mut cut)), 2);
+    let hint = cut.checkpoint().unwrap();
+    let boundary = fixture.file.metadata().unwrap().len();
+    assert_eq!(hint.offset, boundary);
+    fixture.append(record(
+        3,
+        json!({"type":"user","message":{"content":"third"}}),
+    ));
+    let mut resumed = fixture.source.resume(2, &hint).unwrap();
+    assert_eq!(seq(next(&mut resumed)), 3);
+    assert!(matches!(next(&mut resumed), Item::Synced(3)));
+}
+#[test]
+fn registered_at_head_checkpoint_survives_later_publication() {
+    let mut fixture = Fixture::new(vec![record(1, json!({"type":"user","message":{}}))]);
+    let cut = fixture.source.subscribe(Some(1)).unwrap();
+    let hint = cut.checkpoint().unwrap();
+    assert_eq!(hint.offset, fixture.file.metadata().unwrap().len());
+    fixture.append(record(
+        2,
+        json!({"type":"user","message":{"content":"later"}}),
+    ));
+    let mut resumed = fixture.source.resume(1, &hint).unwrap();
+    assert_eq!(seq(next(&mut resumed)), 2);
+    assert!(matches!(next(&mut resumed), Item::Synced(2)));
 }
