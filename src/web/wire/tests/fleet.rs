@@ -508,22 +508,7 @@ fn fleet_server_driven_script_removes_absent_rows_only_at_snapshot_completion() 
     });
 }
 #[test]
-#[expect(
-    clippy::print_stderr,
-    reason = "Missing optional conformance tooling must be visible in nextest output"
-)]
 fn fleet_server_drives_the_real_client_through_nonempty_and_empty_replacement() {
-    match std::process::Command::new("bun").arg("--version").output() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("SKIP fleet_server_drives_the_real_client: Bun is absent from PATH; nextest CI provisioning is tracked in #2260");
-            return;
-        }
-        Err(error) => panic!("Bun probe failed: {error}"),
-        Ok(output) => assert!(
-            output.status.success(),
-            "Bun version probe failed: {output:?}"
-        ),
-    }
     runtime(async {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let mut case = Case::new().await;
@@ -540,7 +525,15 @@ fn fleet_server_drives_the_real_client_through_nonempty_and_empty_replacement() 
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
-        let mut child = child.spawn().expect("dev shell provides bun");
+        let mut child = match child.spawn() {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("SKIP fleet_server_drives_the_real_client: Bun is absent from PATH; nextest CI provisioning is tracked in #2260");
+                case.server.finish().await;
+                return;
+            }
+            Err(error) => panic!("Bun client launch failed: {error}"),
+        };
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
         let mut input = child.stdin.take().unwrap();
         let wake = case.server.wake.clone();
