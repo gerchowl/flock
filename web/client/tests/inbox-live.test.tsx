@@ -107,6 +107,13 @@ describe("live permission inbox", () => {
     expect(cards(root)[0]).toContain("just check");
   });
 
+  test("an open record shows a card even when fleet-lite does not list its id", () => {
+    const { root, fleet, event } = mountInbox();
+    fleet("atlas", ["listed"]);
+    event("atlas", "unlisted", "Edit", { file_path: "src/b.rs" });
+    expect(cards(root).map((text) => text.includes("src/b.rs"))).toEqual([true, false]);
+  });
+
   test("a listed id without its record is a visible pending card; once synced it says there is none", () => {
     const { root, fleet, synced } = mountInbox();
     fleet("atlas", ["request-one"]);

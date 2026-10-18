@@ -5,7 +5,9 @@
  * The state comes from the server's permission record on `agent/<id>`
  * (`wire/permission-record.ts`, #2224): a card shows from an open record and
  * goes on the closed record with the same `request_id`, never on a client
- * guess. A closed record for an id with no open record is ignored. Fleet-lite's
+ * guess. An open record on a subscribed stream shows a card even when
+ * fleet-lite does not list its id: the record is the authority (#2224). A
+ * closed record for an id with no open record is ignored. Fleet-lite's
  * `waiting_on_human` chooses which streams to subscribe to, and a listed id
  * with no record yet shows a loading card (or, once the stream has synced
  * without one, says so); a listed id is never hidden.
