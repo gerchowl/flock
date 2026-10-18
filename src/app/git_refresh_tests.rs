@@ -235,7 +235,7 @@ async fn failed_probe(script: Option<&str>, code: &str) {
             row["last_error"].as_str(),
             app.git_status_cache.len()
         ),
-        (Some(0), Some(code), 0)
+        (Some(1), Some(code), 0)
     );
 }
 
@@ -283,7 +283,7 @@ async fn git_refresh_timeout_is_counted_and_never_cached() {
             row["last_error"].as_str(),
             app.git_status_cache.len()
         ),
-        (Some(0), Some("timeout"), 0)
+        (Some(1), Some("timeout"), 0)
     );
 }
 
@@ -427,4 +427,24 @@ async fn git2034_repository_failure_isolated_and_recovery_clears_stale() {
         &app.terminal_runtimes
     )
     .contains("[git stale]"));
+}
+
+#[tokio::test]
+async fn git2034_all_repositories_failing_does_not_stamp_success() {
+    let mut app = app();
+    app.state.app_client_attached = true;
+    let fixture = GitFixture::new(Some("exit 7"));
+    app.state.workspaces[0].identity_cwd = fixture.cwd();
+    app.state.workspaces[0].tabs.clear();
+    let previous_success = Instant::now() - Duration::from_secs(10_000);
+    app.git_refresh_health.last_success = Some(previous_success);
+    for count in 1..=4 {
+        git2034_partial_round(&mut app).await;
+        assert_eq!(app.git_refresh_health.last_success, Some(previous_success));
+        assert_eq!(app.git_refresh_health.consecutive_failures, count);
+        let row = summary(&mut app);
+        assert_eq!(row["status"], "broken");
+        assert_eq!(row["last_error"], "git_exit");
+        assert_eq!(row["repositories"][0]["consecutive_failures"], count);
+    }
 }

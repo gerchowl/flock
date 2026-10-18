@@ -111,7 +111,8 @@ impl App {
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
-                        .into_owned(),
+                        .escape_default()
+                        .to_string(),
                     workspace_ids,
                     consecutive_failures: *count,
                     last_error: failure.error.as_str().into(),
@@ -146,6 +147,19 @@ mod tests {
         };
         app.state.workspaces.push(ws);
         (app, failure)
+    }
+
+    #[tokio::test]
+    async fn git2034_repository_diagnostic_escapes_terminal_control_text() {
+        let (mut app, mut failure) = fixture();
+        failure
+            .cache_key
+            .set_file_name("repo\u{9d}52;c;fixture\u{9c}\u{202e}");
+        app.apply_git_repository_outcome(&[], vec![failure]);
+        let row = app.git_repository_health_rows().remove(0);
+        assert!(row.repo.is_ascii());
+        assert!(row.repo.contains("\\u{9d}"));
+        assert!(row.repo.contains("\\u{202e}"));
     }
 
     #[tokio::test]

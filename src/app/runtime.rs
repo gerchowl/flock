@@ -1914,6 +1914,11 @@ pub(crate) fn refresh_workspace_git_statuses_with_cache(
             }));
     }
 
+    // A partial result is progress, but an entirely failed round is not success.
+    if output.error.is_none() && output.results.is_empty() {
+        output.error = output.failures.first().map(|failure| failure.error);
+    }
+
     output
 }
 

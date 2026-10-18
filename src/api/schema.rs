@@ -4940,7 +4940,7 @@ pub enum PollerReason {
 /// One repository's failed refresh, independent of the worker's health.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitRepositoryHealth {
-    /// Checkout basename only, never an absolute filesystem path.
+    /// ASCII-escaped checkout basename only, never an absolute filesystem path.
     pub repo: String,
     /// Workspace identities disambiguate repositories sharing a basename.
     pub workspace_ids: Vec<String>,
@@ -4980,7 +4980,7 @@ pub struct PollerHealth {
     /// Rounds skipped because the previous one had not finished. Sustained
     /// growth means the cadence is shorter than the work.
     pub skipped_rounds: u64,
-    /// Worker error, or the first listed repository error for a partial git round.
+    /// Round error, or the first listed repository error for a partial git round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }

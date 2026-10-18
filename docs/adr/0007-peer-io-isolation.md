@@ -139,16 +139,17 @@ Summary `last_error` is a closed code: `timeout` (command/round deadline),
 `git_io` (process I/O), `git_exit` (unsuccessful command), `git_output`
 (malformed output), `worker_panic`, `worker_spawn`, or `round_stalled`.
 No command output, path, host or panic payload is exposed in that field. Each
-worker failure increments the worker streak at most once, even when its watchdog
-fires before an error completion. A completed worker resets its own streak,
-independently of repository failures. Each failed repository has a separate
+round-level failure increments the global streak at most once, even when its
+watchdog fires before an error completion. A round with at least one healthy
+repository resets that streak; a round where every probe fails still counts as
+failed and never stamps success. Each failed repository has a separate
 consecutive-probe count, reset only by its own successful snapshot. Completed
 partial rounds are `degraded`, not permanently `broken` because one checkout
 fails repeatedly. Worker panics, spawn errors and stalled rounds retain their
 worker-level failure semantics.
 
 Summary `repositories` is an additive optional list of failed repositories,
-with checkout basenames, workspace IDs, counts and typed error codes. Basenames
+with ASCII-escaped checkout basenames, workspace IDs, counts and typed error codes. Basenames
 can collide; workspace IDs disambiguate them. No absolute paths enter these
 rows. Older mesh-v5 JSON summary readers ignore the extra field. Failed
 workspaces retain their last values with `[git stale]` in sidebar labels until
