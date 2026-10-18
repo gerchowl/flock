@@ -131,9 +131,10 @@ their meaning where they do not collide; collisions are resolved once:
 | 11 | delegate not started (was 8) | after inspecting | `delegate start/wait` |
 | 12 | `--field` path missing in the result | never | all (§3) |
 | 13 | refused by policy or scope (`msg` refused, channel scope, ADR-0014 boundary; was 4 for `msg`) | never without a change | `msg`, channel adapters, `question answer` (`question_closed`) |
+| 14 | dispatched mutation timed out (`request_outcome_unknown`) | inspect state first, never automatically | socket requests |
 | 75 | the client gave up reconnecting to its server (`RECONNECT_GAVE_UP_EXIT_CODE`, #436; EX_TEMPFAIL) | yes, once the server is back | the attached client and launcher |
 | 78 | client/server protocol gap (#868) | after a handoff | all |
-| 124 | timeout | yes | waits |
+| 124 | timeout before dispatch, or a read/idempotent timeout | yes | waits and socket requests |
 
 - **Four changes break scripts that branch on the old code**, and all four
   are listed in the release's changelog under *changed*:
@@ -158,6 +159,19 @@ their meaning where they do not collide; collisions are resolved once:
   registry.
 - MCP returns the same retry class in `data.retry` and the exit code in
   `data.exit`, beside the existing `data.refusal`.
+
+#### Client operation allowances (#921, #2189)
+
+Creation and cleanup requests (`worktree.create`, `worktree.kill`,
+`workspace.create`, `workspace.close`, `agent.start`) share the named
+`CLIENT_WORK_ALLOWANCE` through `client_work_allowance` in both delegate and
+the CLI operation table. Its 60 seconds include transport overhead and describe
+client patience, not a server execution or cancellation guarantee. Explicit
+caller deadlines may be shorter. After dispatch, expiry is outcome unknown,
+exit 14, and must not trigger an automatic retry. Server-side bounds require
+cancellation and partial-state cleanup semantics, tracked separately in #2209.
+Input writes instead reserve their server write budget, confirmation window
+and transport margin. Live handoff reserves its synchronous phase bounds.
 
 ### 3. Output: the result on stdout, selectable; diagnostics on stderr
 
@@ -629,4 +643,3 @@ accepted as recommended. The rejected alternative is kept for the record.
 4. **Refuse multi-row text without bracketed paste** (`unsafe_text`) instead
    of typing it line by line. Decided: yes; line-by-line typing submits the
    first line early in every harness.
-

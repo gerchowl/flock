@@ -10,6 +10,11 @@
 //! Unconfirmed cleanup retains lease
 //! authority and Unknown lifecycle, requiring explicit recovery rather than restart.
 #![deny(missing_docs)]
+/// Grace period for structured workers to stop before forced cleanup.
+pub(crate) const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bound on forced cleanup after the structured-worker grace period.
+pub(crate) const SHUTDOWN_CLEANUP: std::time::Duration = std::time::Duration::from_secs(10);
+
 use super::{
     launch::{LaunchError, LaunchProfile, SessionMcp},
     lease::SessionLeases,
@@ -415,7 +420,7 @@ impl Workers {
     /// cleanup interval. Diagnostics are cached and reported without vetoing handoff.
     /// Uncertain records cross handoff as Unknown; this call never retries teardown.
     pub fn shutdown(&mut self, registry: &mut Registry) -> Result<(), ShutdownError> {
-        self.shutdown_until(registry, Duration::from_secs(10), Duration::from_secs(10))
+        self.shutdown_until(registry, SHUTDOWN_GRACE, SHUTDOWN_CLEANUP)
     }
     fn shutdown_until(
         &mut self,

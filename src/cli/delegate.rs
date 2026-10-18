@@ -248,26 +248,12 @@ impl fmt::Display for BoundedError {
         }
     }
 }
-/// The one cap table: how long THIS module waits for each method on a quiet
-/// socket. The actual socket timeout is `cap.min(remaining deadline)` — a
-/// caller with a shorter deadline wins (K5). A cap handed in by hand would be
-/// a second table drifting from this one; `bounded` reads it, nothing else.
-///
-/// - 60 s: creates / kills / closes / `AgentStart` — a write that may block
-///   on filesystem work the operator sees.
-/// - 10 s: `PaneSendInput` — the brief submit is a human-latency write and
-///   must not stall the whole command if the socket goes quiet mid-type.
-/// - 2 s: every poll, get, and list.
+/// Use the shared CLI operation table with delegate's ordinary poll cap.
+/// Creation/cleanup uses the named client allowance, writes reserve their
+/// server write/confirmation budgets, and ordinary polls retain their short cap.
+/// The caller's remaining deadline may shorten any allowance (K5).
 fn cap_for(method: &Method) -> Duration {
-    match method {
-        Method::WorktreeCreate(_)
-        | Method::WorktreeKill(_)
-        | Method::WorkspaceCreate(_)
-        | Method::WorkspaceClose(_)
-        | Method::AgentStart(_) => Duration::from_secs(60),
-        Method::PaneSendInput(_) | Method::PaneSubmit(_) => Duration::from_secs(10),
-        _ => REQUEST_TIMEOUT,
-    }
+    crate::api::deadline::operation_timeout(method, REQUEST_TIMEOUT)
 }
 
 /// Make a socket request bounded by its cap and the caller's deadline.
@@ -306,7 +292,9 @@ fn bounded(method: Method, deadline: Option<Instant>) -> Result<serde_json::Valu
     // Retried with backoff on a transient socket error, reads only, and never
     // past the deadline (#910): under load a 2 s poll times out as EAGAIN while
     // the server is alive, and one of those used to fail the whole verb.
-    let client = ApiClient::local();
+    let client = ApiClient::local().with_class(crate::api::client::RequestClass::for_method(
+        &request.method,
+    ));
     let response = if RETRIES.get() {
         client.request_value_retrying(&request, timeout, deadline)
     } else {
@@ -1716,6 +1704,9 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
             ))
         }
         Err(BoundedError::Transport(e)) => {
+            if let Some(code) = super::outcome_unknown(&e) {
+                return Err(code);
+            }
             return Err(teardown_after_place_failure(
                 name,
                 worktrees_before.as_deref(),
@@ -1723,7 +1714,7 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
                 flags,
                 &repo,
                 CreateFailure::Transport(e.kind()),
-            ))
+            ));
         }
     };
 
@@ -2901,6 +2892,9 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         }
     }
     if let Err(reason) = submitted {
+        if let SubmitFailure::OutcomeUnknown(error) = reason {
+            return Err(error);
+        }
         if matches!(reason, SubmitFailure::Gone) {
             return Ok(emit_submit_gone(&entry, flags.json));
         }
@@ -3199,6 +3193,8 @@ enum SubmitFailure {
     /// The server refused before typing anything.
     Refused(ServerError),
     Unconfirmed(String),
+    /// Transport deadline after dispatch: never resubmit or tear down blindly.
+    OutcomeUnknown(io::Error),
     /// The pane exited before the harness took the brief: the harness died at
     /// launch or on the brief, so no round is running (#817).
     Gone,
@@ -3209,6 +3205,7 @@ impl fmt::Display for SubmitFailure {
         match self {
             Self::Refused(error) => write!(f, "{error}"),
             Self::Unconfirmed(reason) => f.write_str(reason),
+            Self::OutcomeUnknown(error) => write!(f, "{error}"),
             Self::Gone => f.write_str("the agent exited before it accepted the brief"),
         }
     }
@@ -3391,6 +3388,13 @@ fn bounded_submit(method: Method, deadline: Option<Instant>) -> Result<(), Submi
     match bounded(method, deadline) {
         Ok(response) => submit_outcome(&response),
         Err(BoundedError::TimedOut) => Err(SubmitFailure::Unconfirmed("timed out".to_string())),
+        Err(BoundedError::Transport(err))
+            if err
+                .get_ref()
+                .is_some_and(|e| e.is::<crate::api::deadline::RequestOutcomeUnknown>()) =>
+        {
+            Err(SubmitFailure::OutcomeUnknown(err))
+        }
         Err(BoundedError::Transport(err)) => Err(SubmitFailure::Unconfirmed(err.to_string())),
     }
 }
@@ -4010,6 +4014,9 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     }
 
     if let Err(reason) = submit_brief(&entry.pane_id, &sentence, None) {
+        if let SubmitFailure::OutcomeUnknown(error) = reason {
+            return Err(error);
+        }
         if matches!(reason, SubmitFailure::Gone) {
             // The round never started, so the record goes back to the last one
             // that did, which is what `status` and `reap` then answer from.
