@@ -545,9 +545,10 @@ stall reporting exactly as for started turns. The transport serializes its host
 fast response. This is an internal stream fact, not an EventHub event kind or
 mesh frame. Its monotonic stamp belongs only to the current launch and cannot
 be reconstructed on replay; a raw host record without that stamp is skipped.
-Admission is not proof of a successful pipe write or provider turn. A cancelled
-admission requests process shutdown as well as pipe cancellation. Transport
-failure remains an explicit worker failure, and output backpressure delays
+Admission is not proof of a successful pipe write or provider turn. An unavailable
+acceptance observer requests process shutdown as well as pipe cancellation.
+Ordinary I/O cancellation does not record stop intent or change the observed exit
+outcome. Transport failure remains an explicit worker failure, and output backpressure delays
 notification rather than dropping it. No queue/scheduler feed is needed.
 
 The caller supplies monotonic observation time and its configured `stall_ms`;
@@ -1089,6 +1090,21 @@ other axes survive; it must not discard the fleet delta. Snapshot rows use §5a'
 existing inline gap/checkpoint path. Fleet `ev` payloads are the closed tagged
 `FleetDelta` union: `{ type:"fleet.upsert", row: FleetAgentRow }` or
 `{ type:"fleet.remove", id }`, rather than session `WireEvent` payloads.
+
+S7-min slice 6a (#1832) supplies only the provider core: structured registry
+identity/label, S4 state, current activity and S6 waiting IDs project into these
+rows. Its exclusive-writer store atomically persists rows and high-water with
+file fsync, rename and directory fsync before returning changes or checkpoint
+cuts. Snapshot reads allocate dense positions for their complete upserts; empty
+snapshots preserve the existing head, including across restart. Invalid row
+entries are skipped, warned and retained raw, while invalid cursor metadata
+refuses loading rather than resetting it. Any uncertain write requires reopening
+the store before another publication. Slice 6b on #1832 wires the provider into
+subscriptions and serializes each checkpoint batch with live deltas; 6a has no
+product caller or transport. Before serving after cold boot, 6b refreshes the
+registry/S4/S6 provider cut; persisted observation state grants no process lease
+or resume authority. Local file locking does not implement S7-rest's single-writer
+handoff protocol.
 
 `cmd agent.decide` takes `AgentDecide { agent, request_id, decision, message? }`,
 where decision is `allow_once`, `allow_always` or `deny`. Only a token-authenticated
