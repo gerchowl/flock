@@ -43,7 +43,6 @@ impl ConnectionTarget {
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     target: ConnectionTarget,
-    request_timeout: Duration,
 }
 
 impl ApiClient {
@@ -52,10 +51,7 @@ impl ApiClient {
     }
 
     pub fn for_target(target: ConnectionTarget) -> Self {
-        Self {
-            target,
-            request_timeout: deadline::REQUEST_TIMEOUT,
-        }
+        Self { target }
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -68,7 +64,7 @@ impl ApiClient {
     }
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
-        let timeout = deadline::request_timeout(request, self.request_timeout);
+        let timeout = deadline::request_timeout(request, deadline::REQUEST_TIMEOUT);
         let end = Instant::now().checked_add(timeout).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -197,7 +193,7 @@ impl ApiClient {
         request: &Request,
         read_timeout: Option<Duration>,
     ) -> Result<(serde_json::Value, EventStream), ApiClientError> {
-        let mut stream = DeadlineStream::connect(&self.socket_path(), self.request_timeout)?;
+        let mut stream = DeadlineStream::connect(&self.socket_path(), deadline::REQUEST_TIMEOUT)?;
         write_request(&mut stream, request)?;
 
         let mut reader = BufReader::new(stream);
@@ -746,3 +742,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod deadline_tests;
