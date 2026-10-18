@@ -503,23 +503,23 @@ The changes ADR-0036 needs are for its owner to make, and are listed at the end 
    - The question record is durable (ADR-0028 §8a), so an open question stays open across a restart or an orderly handoff of its asker.
    - A held `blocking` call ends with the asker's process. Its record stays open, and a later answer is delivered as the deferred `reply` item (ADR-0036 §2a).
    - A thread's fork is an agent of its own, so it survives with its tile. Any wait pinned to the asker's old epoch ends with `observation_reset` (`after_inspecting`; ADR-0028, #1577). The thread tile re-reads the question record and the asker, then re-subscribes under §3.
-   - If the asker's identity is replaced, its pinned question ends with `subject_replaced` (`never`). The record closes as `withdrawn`, and the thread's merge-back is refused under the stale-answer rule below.
+   - If the asker's identity is replaced, its pinned question ends with `subject_replaced` (`never`). Once S6e amends ADR-0036, the record then closes as `withdrawn`, and the thread's merge-back is refused under the stale-answer rule below. Until then the question stays open with no asker to deliver to, and the card says that the asker was replaced.
    - The fork's own restart follows the same rules.
    - *Reason:* ADR-0028 already says which waits survive and which never come back. A question tied to a replaced agent must not be answered into its successor.
-4. **Who may answer: only the owner's authenticated client applies an answer.**
-   - An answer, a merge-back included, is applied only by `inbox.answer` from a GUI principal that authenticates as the owner (#1673). That is the `operate`-scoped token, which ADR-0036 §5 makes the operator's identity.
-   - For a question, a token with only the `answer` scope does not suffice. This narrows §5's `inbox.answer` row for questions. Permission prompts and feedback requests keep that row's scope.
-   - An answer never comes from another agent's pane input, and never from an agent's tool call.
-   - The fork **composes** the answer: its `question.resolve` records a **proposal**, not an answer. The person **applies** it.
-   - *Reason:* in #1673 a stray keystroke from another agent was recorded as an owner decision. An answer carries the owner's authority, so only the owner may apply one.
+4. **Who may answer: a client token the owner minted, never an agent.**
+   - An answer, a merge-back included, is applied only by `inbox.answer` from a client-token principal (ADR-0036 §5; `answer` or `operate` scope). It is never applied from an agent's session lease, an agent's tool call or pane input.
+   - The `answer` scope exists so the owner can hold a narrower token, for example on a phone. A client token the owner minted is the owner's authenticated principal, whichever of the two scopes it carries. §5's `inbox.answer` row is unchanged.
+   - The fork composes the proposal, and the person applies it. Once S6e amends ADR-0036, the fork's `question.resolve` records a **proposal**, not an answer. Until then it answers directly (ADR-0036 §2a), so the GUI offers no thread before S6e (G14 depends on it).
+   - *Reason:* in #1673 a stray keystroke from another agent was recorded as an owner decision. What #1673 excludes is agent principals and pane input, not the owner's own narrower token.
 5. **Blocking: the asker decides, and says why.**
-   - `flock_question_ask { blocking: true }` requires a non-empty `blocking_reason`: what the asker cannot proceed on, and why nothing else is open.
-   - Without `blocking`, a question is non-blocking. The server records the reason and never decides on the agent's behalf: ADR-0036 S6d's System-One check no longer holds a turn. A held turn is the asker's choice under the tool contract.
+   - Once S6e amends ADR-0036, `flock_question_ask { blocking: true }` requires a non-empty `blocking_reason`: what the asker cannot proceed on, and why nothing else is open.
+   - From then on, a question without `blocking` is non-blocking, and the server records the reason and never decides on the agent's behalf. S6d's System-One check no longer holds a turn, so a held turn is the asker's choice under the tool contract.
+   - Until then, ADR-0036 §2a applies: an absent `blocking` lets S6d's check decide, and there is no reason to show. The card then states only the server's `blocking` flag.
    - The GUI orders a blocking card first (§1) and shows "Blocking: <reason>" in the agent's own words. The agent's row shows the amber *needs you* mark (§2a), and its composer line states the server's phase (`waiting_on_human`).
    - A non-blocking card puts no mark on the agent. The GUI never judges whether a reason is honest.
    - *Reason:* "literally nothing else to work on" is a fact only the agent can know. A server-side guess either blocks an agent that had other work, or misses an honest blocker. A stated reason makes the choice visible and open to review.
 
-**A thread's life.** States follow the question record: `open → threaded → proposed → answered | withdrawn | expired`.
+**A thread's life.** Threads ship with G14, after S6e has amended ADR-0036; this describes the state after both. States follow the question record: `open → threaded → proposed → answered | withdrawn | expired`.
 - *Take as thread* forks the asker (decision 2) and opens the fork's `transcript` tile (§2) with its composer (§2a). It is not a new tile kind: the subject is the fork, and the tile header names the question it answers.
 - By default the thread fork is read-only: ADR-0036 §9's E12 `tools` (for example `Read,Grep,Glob`) under a deny-all permission policy. A thread is for discussion; work stays with the asker. Whether a person can widen a fork's tools is owner decision 14.
 - The fork's last step is the proposal (decision 4).
@@ -562,14 +562,14 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
 
 | Verb | Scope | Effect |
 |---|---|---|
-| `inbox.thread { item_id, at: question \| latest, dry_run? }` | `operate` | `question.fork` with `return_to_parent` and `answers`, read-only by default. `dry_run` returns the cost only. |
-| `inbox.answer { item_id, choice_index?, text?, proposal_id? }` | `operate` for a question (decision 4) | As in §5, and with `proposal_id` it records `via: fork`. Atomic (§3). |
+| `inbox.thread { item_id, at: question \| latest, dry_run? }` | `operate`: it starts an agent and costs tokens | `question.fork` with `return_to_parent` and `answers`, read-only by default. `dry_run` returns the cost only. |
+| `inbox.answer { item_id, choice_index?, text?, proposal_id? }` | `answer`, unchanged from §5 (decision 4) | As in §5, and with `proposal_id` it records `via: fork`. Atomic (§3). |
 
 **What ADR-0036 must change** (its owner amends it; this record does not):
 - owner decision 3's channel order;
 - `flock_question_ask`'s `blocking` default and `blocking_reason`, and S6d's check no longer holding;
 - the lease origin;
-- `question.resolve` as a proposal;
+- `question.resolve` as a proposal, and answers refused from agent principals (session leases, tool calls) while any client token with `answer` or `operate` scope may apply one;
 - `subject_replaced` closing a question as `withdrawn`;
 - the fork-point cost on the inbox item.
 
@@ -714,7 +714,7 @@ Each slice is at most about 400 production lines; TypeScript counts the same. **
 | G12 | `work` records, phase 2 (§8) | G8, owner decision 7 | no | 400 |
 | G13 | Telemetry views (§4a): `telemetry/traces`, `telemetry/logs` and `audit` reads in the server; trace, logs and audit tiles | S7, #1614, a vigil release (#1300) | no | 400 |
 | S6e | ADR-0036's question amendment, by its owner (§5b, "What ADR-0036 must change"): `flock_question_ask` as the one question path, `blocking` false by default with a required `blocking_reason`, the lease as the attested origin, `question.resolve` as a proposal, `subject_replaced` closing a question as `withdrawn` | S6b, S6c, S3b #1426, #1734 | no | ADR + 250 |
-| G14 | Threads on the wire: `InboxItem`'s `blocking_reason`, `threads` and `fork_points` (with `dry_run` cost), `inbox.thread`, `inbox.answer { proposal_id }`, and the `operate` check for question answers (#1673) | S6e, G5, S12, S8b | no | 300 |
+| G14 | Threads on the wire: `InboxItem`'s `blocking_reason`, `threads` and `fork_points` (with `dry_run` cost), `inbox.thread`, `inbox.answer { proposal_id }`, and refusing agent principals as answerers (#1673) | S6e, G5, S12, S8b | no | 300 |
 | G15 | The thread UX: *Take as thread* and *Thread from now*, the fork's tile, *Review and merge back* with editing, the card states and the stale-answer display (§5b) | G14, S9a, G2 | no | 400 TS |
 | G16 | Thread lifecycle against the scripted server: asker restart and handoff (`observation_reset`), identity replacement (`subject_replaced` → `withdrawn`), two threads racing on one question, a `pty` asker | G15, #1577 | no | 200 TS |
 
@@ -756,7 +756,7 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 - **A stale command after the idempotency window** is shown as "unknown outcome", never resent automatically.
 - **Cross-node commands** are refused until #1380. The UI shows the refusal in place.
 - **Layout loss.** Clearing browser storage resets the layout. Server state is unaffected.
-- **A thread's proposal is untrusted text.** The fork read the asker's context, which can hold injected content. The proposal is shown as text and applied only by the owner (§5b decision 4; owner decision 12).
+- **A thread's proposal is untrusted text.** The fork read the asker's context, which can hold injected content. The proposal is shown as text, and only a client token the owner minted applies it, never an agent (§5b decision 4; owner decision 12).
 - **A thread behind a compaction costs a cache write.** The rehydrate path is cold. The card shows the path and cost before forking (§5b decision 2).
 - **A thread on a `pty` asker starts after the question.** The card says so, and offers only *Thread from now*.
 - **The GUI cannot verify a blocking reason.** It is shown as the agent's own words. A dishonest reason costs that agent its own turn and puts its card first; it never holds another agent.
