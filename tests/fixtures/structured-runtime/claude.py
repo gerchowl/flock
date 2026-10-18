@@ -39,6 +39,10 @@ if sys.argv[1:] == ["--version"]:
     sys.exit(0)
 assert sys.argv[1:] == json.loads((root / "argv.json").read_text()), "argv drift"
 assert environment == allowed, "model environment leak"
+if "cwd" in case:
+    assert pathlib.Path.cwd() == pathlib.Path(case["cwd"]).resolve(), "requested cwd ignored"
+if "model" in case:
+    assert sys.argv[-2:] == ["--model", case["model"]], "requested model ignored"
 assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == "fixture-token-not-a-credential", "token seam"
 assert "fixture-token-not-a-credential" not in json.dumps(sys.argv), "token in argv"
 settings = pathlib.Path(sys.argv[sys.argv.index("--settings") + 1])
@@ -128,9 +132,21 @@ if mode.startswith("init-socket"):
     else:
         init["messaging_socket_path"] = 42 if mode.endswith("wrong-type") else None
 emit(init)
-if mode == "state-reducer":
+if mode in ("state-reducer", "worker-exit", "worker-exit-ok", "worker-stubborn"):
+    if mode == "worker-stubborn":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        descendant = os.fork()
+        if descendant == 0:
+            os.setsid()
+            parent_gone()
+            os._exit(0)
+        (root / "grandchild.pid").write_text(str(descendant))
     for event in (root / "state-events.jsonl").read_text().splitlines():
         emit(json.loads(event))
+    if mode == "worker-stubborn":
+        parent_gone()
+    if mode.startswith("worker-exit"):
+        sys.exit(0 if mode == "worker-exit-ok" else 7)
     sys.stdin.read()
     sys.exit(0)
 if mode == "lease-calls":
