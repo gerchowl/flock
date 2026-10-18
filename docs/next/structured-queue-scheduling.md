@@ -17,7 +17,8 @@ known top-level result, further inputs require a fresh S4 Idle snapshot. The
 worker tags each snapshot with the last session sequence reduced into it. Submit
 invalidates the cached gate; a result invalidates it again, and no snapshot
 covering less than that result sequence can release the next item. Equal Idle
-values with newer coverage still reach the queue. A refused offer writes no input and restores or holds the candidate; it never re-runs its gate.
+values with newer coverage still reach the queue. A refused offer writes no
+input and restores or holds the candidate; it never re-runs its gate.
 
 Before offering stdin, the scheduler durably replaces every member with the
 same batch ID and outstanding-result flag. It retains an owned reservation
@@ -82,8 +83,12 @@ owner completion. Saturation backpressures queue work and session delivery.
 Consumers drain through terminal completion before relaunch; terminal cuts remain
 available after process exit. Relaunch refuses with `session_busy` while any
 completion remains unread. An unchanged storage refusal does not generate another
-completion per harness event. Shutdown cancellation explicitly reports incomplete
-notification delivery and requires durable replay. Final persisted records drain
+completion per harness event.
+
+Until #1957/#1958 supply a production `Workers::queue_update` consumer, relaunch
+with a queue returns `session_busy` even after the process exits. Tests and
+internal adapters explicitly drain those terminal completions first. Shutdown
+cancellation explicitly reports incomplete notification delivery and requires durable replay. Final persisted records drain
 before reservation retirement. Producer routing is #1957/#1958 and queue/global
 publication is #1956, without new queue deadlines or public endpoints here.
 
