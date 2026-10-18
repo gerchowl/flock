@@ -2303,15 +2303,13 @@ pub enum ReadFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsSubscribeParams {
     pub subscriptions: Vec<Subscription>,
-    /// Stream events strictly after the cursor; absent starts at now.
-    /// `after` remains the compatible wire spelling. `after_sequence` and
-    /// typed `events_lost` require the `events_live_start` server capability.
-    #[serde(
-        default,
-        alias = "after_sequence",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Legacy replay cursor. Loss retains the `lagged` wire frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<u64>,
+    /// Explicit opt-in to typed loss and resumable sequences, strictly after
+    /// this cursor. Requires `events_live_start`; mutually exclusive with `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2938,7 +2936,8 @@ pub struct PeersEnrollResetParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerCapabilities {
-    /// Live subscription defaults, `after_sequence` alias and typed ring loss.
+    /// Explicit `after_sequence` opt-in, resumable stream sequences and
+    /// typed ring loss.
     #[serde(default)]
     pub events_live_start: bool,
     /// Enabled only after the complete server and client contract (#1639) ships.
@@ -5631,7 +5630,8 @@ mod tests {
             "subscriptions": [], "after_sequence": 7
         }))
         .unwrap();
-        assert_eq!(params.after, Some(7));
+        assert_eq!(params.after, None);
+        assert_eq!(params.after_sequence, Some(7));
     }
 
     #[test]

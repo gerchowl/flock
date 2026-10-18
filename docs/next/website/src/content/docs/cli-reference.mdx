@@ -603,8 +603,9 @@ flk events wait [--kinds K1,K2] [--subject ID]... [--after CURSOR] --timeout DUR
 
 The socket streaming API starts live by default: a new `events.subscribe` does
 not replay retained events unless a cursor is supplied. Clients must check the
-`events_live_start` capability before relying on `after_sequence` or structured
-`events_lost` notices. This does not change these CLI cursor defaults: `events
+`events_live_start` capability before sending distinct `after_sequence` requests
+and using structured `events_lost` notices. Legacy `after` and omitted cursors
+keep `lagged` notices. Stream events carry `seq` plus subscription identity. This does not change these CLI cursor defaults: `events
 read` still requests durable history from `--after` (default 0), and `events wait`
 starts at now unless `--after` is explicit. MCP `flock_events_read` keeps its
 explicit durable cursor (default 0). A streaming loss requires per-verb state

@@ -1068,6 +1068,7 @@ fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
                 id: "cli:wait:agent-status".into(),
                 method: Method::EventsSubscribe(crate::api::schema::EventsSubscribeParams {
                     after: None,
+                    after_sequence: None,
                     // `idle` is "ready for input", so it watches `done` too.
                     // Without the pair this verb hung on every unattended
                     // agent — an agent nobody is looking at goes quiet as

@@ -649,33 +649,49 @@ Subscribe to events when you need a long-lived stream:
 
 The first response acknowledges the subscription. Later lines are pushed events.
 
-Check `ping.result.capabilities.events_live_start` before relying on this contract.
-A missing or false capability means an older server; keep that server's legacy
-handling rather than inferring behavior from its protocol number. This capability
-is additive and does not change the protocol version.
-
 A subscription without a cursor starts at `event_hub.current_sequence()` when it
-attaches. It streams subsequent events without replaying the retained ring.
-Current-state predicates, such as an already-matching agent status, still report
-the current state. For retained events, pass `"after_sequence": 42` next to
-`subscriptions`: only events with `seq > 42` are eligible. `after` is the compatible
-alias and remains the spelling sent by existing clients. Supplying both is invalid.
-A cursor past the newest event is refused with `cursor_ahead`.
+attaches, as it already did on dev since #1030. It streams subsequent events
+without replaying retained events. Current-state predicates, such as an
+already-matching agent status, still report current state.
 
-If the cursor falls behind the 4,096-entry ring, the stream reports a structured
-error, including the subscription request id:
+For retained events, `after` requests events strictly after that cursor using the
+legacy contract. An omitted cursor or `after` keeps the documented loss frame:
 
 ```json
-{"id":"sub_1","error":{"code":"events_lost","message":"Events were lost. Resync with per-verb reads ...","data":{"requested_sequence":12,"oldest_available_sequence":20,"current_sequence":4115}}}
+{"event":"lagged","data":{"skipped_to":19},"subscription_index":0,"subscription":{"type":"msg.queued","pane":"ws_1:p1"}}
 ```
+
+Before sending `after_sequence`, check
+`ping.result.capabilities.events_live_start`. Missing or false support must
+produce a typed `server_version_gap` refusal; never silently omit the cursor or
+start live. The shared Rust client performs this bounded capability check.
+`after_sequence` is a distinct, explicit opt-in to typed loss, not an alias for
+`after`. Supplying both returns `invalid_params`. Either cursor past the newest
+event returns `cursor_ahead`. No protocol version bump is required.
+
+An opted-in request whose cursor falls behind the 4,096-entry ring receives:
+
+```json
+{"id":"sub_1","subscription_index":0,"subscription":{"type":"msg.queued","pane":"ws_1:p1"},"error":{"code":"events_lost","message":"Events were lost. Resync with per-verb reads ...","data":{"requested_sequence":12,"oldest_available_sequence":20,"current_sequence":4115}}}
+```
+
+Each loss notice and event identifies its zero-based `subscription_index` and
+original `subscription` descriptor, including when a stream has several
+subscriptions of the same type. Every event also carries `seq`, the hub sequence
+it covers. Hub events use their committed sequence; current-state predicates
+carry their observation cursor and do not provide historical predicate replay.
+Resume by sending that cursor as `after_sequence`. Deduplicate by subscription
+and `seq`; for several subscriptions on one stream, retain a cursor per
+subscription and reconnect from the minimum fully applied cursor. Loss notices
+are not applied event cursors.
 
 `events_lost` has retry class `after_inspecting`: resync before treating the stream
 as complete. Use `workspace.list`, `pane.list`, `agent.list` and `msg.list` as
-appropriate. The unified `session.snapshot` resync is tracked separately in #2163
-and is not available yet. The stream continues with retained events starting at
-`oldest_available_sequence`; dedupe on `seq` after resync. A later overflow emits
-another error. `msg.wait_reply` also reports this error if its continuation loses
-events. Other ring errors close the stream after the diagnostic.
+appropriate. The unified `session.snapshot` resync remains #2163. Both loss
+contracts continue at the retained boundary; later overflow produces another
+notice. Other ring errors close the stream after the diagnostic.
+`msg.wait_reply` rereads retained facts into its existing state on a ring gap and
+continues waiting, so a retained or later reply still completes the wait.
 
 Use `events.read` for durable history from a cursor; its disk retention and `gap`
 contract are unchanged. In-process bounded state folds are explicitly named

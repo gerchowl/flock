@@ -277,14 +277,24 @@ impl ActiveSubscription {
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
     ) -> Option<serde_json::Value> {
-        match self {
+        let mut event = match self {
             Self::Event(subscription) => subscription.poll(event_hub),
             Self::MsgQueued(subscription) => subscription.poll(event_hub),
             Self::OutputMatched(subscription) => {
                 serde_json::to_value(subscription.poll(api_tx)?).ok()
             }
             Self::AgentStatusChanged(subscription) => subscription.poll(api_tx, event_hub),
+        }?;
+        if event.get("error").is_none() {
+            let sequence = match self {
+                Self::Event(s) => s.last_sequence,
+                Self::MsgQueued(s) => s.last_sequence,
+                Self::AgentStatusChanged(s) => s.last_sequence,
+                Self::OutputMatched(_) => event_hub.current_sequence(),
+            };
+            event["seq"] = sequence.into();
         }
+        Some(event)
     }
 }
 
