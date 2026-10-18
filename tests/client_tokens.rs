@@ -209,6 +209,16 @@ fn client_token_cli_socket_roundtrip_private_files_and_fragment_url() {
 fn token_add_requires_terminal_stdout_or_explicit_secret_output() {
     use std::io::{IsTerminal, Read};
     let server = Server::start();
+    let disguised = server.cli(&["client", "token", "add", "--show-token", "--scopes", "read"]);
+    assert_eq!(disguised.status.code(), Some(2));
+    assert!(disguised.stdout.is_empty());
+    assert!(!server.directory().join("--show-token.token").exists());
+    let direct = server.api(
+        "client.token.add",
+        json!({"name":"--show-token", "scopes":["read"]}),
+    );
+    assert!(direct.get("error").is_some());
+    assert!(!server.directory().join("--show-token.token").exists());
     let args = ["client", "token", "add", "piped", "--scopes", "read"];
     let refused = server.cli(&args);
     assert_eq!(refused.status.code(), Some(2));
