@@ -108,3 +108,8 @@ pub(crate) fn machine_identity() -> std::io::Result<String> {
         "node identity machine binding is unsupported on this platform",
     ))
 }
+
+/// Unsupported process evidence never authorizes scoped requests.
+pub fn live_process_facts(_pid: u32) -> Option<(u32, u64)> {
+    None
+}
