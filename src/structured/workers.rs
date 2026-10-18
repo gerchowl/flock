@@ -115,7 +115,6 @@ impl Worker {
 /// Completed reports are bounded to the latest launch per agent. Removed records
 /// discard confirmed completions, while uncertain ownership remains recoverable.
 pub struct Workers {
-    retained_queues: BTreeMap<String, (u64, queue::publication::Source)>,
     entries: BTreeMap<String, Worker>,
     notify: Arc<Notify>,
     // Coalesced wake for teardown while the async server loop is quiescent.
@@ -132,7 +131,6 @@ impl Workers {
             wake,
             wakes,
             shutdown_result: None,
-            retained_queues: BTreeMap::new(),
             entries: BTreeMap::new(),
             notify,
         }
@@ -309,41 +307,21 @@ impl Workers {
             .ok_or(ErrorCode::AgentNotFound)?
             .queue_enqueue(request)
     }
-    /// Generation-fenced source lookup; this never opens or reads a file.
+    /// Retained live-generation provider, fenced by the registry epoch.
+    /// Cold sources refuse with queue_mode_unsupported until #1956 part 2.
+    /// This never performs filesystem work or returns an empty successful source.
     pub(crate) fn queue_source(
         &self,
         registry: &Registry,
         id: &str,
         generation: u64,
-    ) -> Option<queue::publication::Source> {
+    ) -> Result<queue::publication::Source, ErrorCode> {
         if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
-            return None;
+            return Err(ErrorCode::AgentNotFound);
         }
         self.runtime(id, generation)
             .and_then(Runtime::queue_source)
-            .or_else(|| {
-                self.retained_queues
-                    .get(id)
-                    .filter(|(g, _)| *g == generation)
-                    .map(|(_, source)| source.clone())
-            })
-    }
-    /// Install an I/O worker's cold source only if no newer owner won the epoch.
-    pub(crate) fn install_queue_source(
-        &mut self,
-        registry: &Registry,
-        id: &str,
-        generation: u64,
-        source: queue::publication::Source,
-    ) -> bool {
-        if registry.get(id).is_none_or(|(_, _, g)| g != generation)
-            || self.entries.contains_key(id)
-            || !source.belongs_to(id)
-        {
-            return false;
-        }
-        self.retained_queues.insert(id.into(), (generation, source));
-        true
+            .ok_or(ErrorCode::QueueModeUnsupported)
     }
     /// Consume an immutable completion/cut from the current generation only.
     /// Terminal cuts remain available after exit; drain before relaunch/removal.
