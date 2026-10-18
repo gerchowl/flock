@@ -55,8 +55,16 @@ async fn exchange(
         .and_then(|v| v.get("code").and_then(|v| v.as_str()).map(str::to_owned))
         .unwrap_or_default();
     let token = codes.exchange(&code, Instant::now());
-    let token =
-        token.filter(|token| TokenStore::open(&data).is_ok_and(|s| s.authenticate(token).is_ok()));
+    let token = match token {
+        Some(token) => super::store_io::shared()
+            .run(move || {
+                TokenStore::open(&data).ok()?.authenticate(&token).ok()?;
+                Some(token)
+            })
+            .await
+            .flatten(),
+        None => None,
+    };
     let response = match token {
         Some(token) => Json(serde_json::json!({"token": token})).into_response(),
         None => (StatusCode::UNAUTHORIZED, "client exchange refused").into_response(),
