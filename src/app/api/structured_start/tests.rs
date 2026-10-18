@@ -645,7 +645,10 @@ async fn startup_with_unresolvable_endpoint_warns_and_only_structured_start_refu
         output.contains("structured.mcp.endpoint_unavailable"),
         "{output}"
     );
-    assert!(output.contains("server_unavailable"), "{output}");
+    assert!(
+        output.contains("structured_endpoint_restart_required"),
+        "{output}"
+    );
     assert!(!output.contains("private resolver detail canary"));
     let response = fixture
         .request(Method::AgentList(crate::api::schema::EmptyParams {}))
@@ -653,7 +656,10 @@ async fn startup_with_unresolvable_endpoint_warns_and_only_structured_start_refu
     assert_eq!(response["result"]["agents"], json!([]));
     let params: AgentStartParams = serde_json::from_value(json!({"name":"fixture-launch", "runtime":"structured", "argv":["claude"], "cwd":fixture.fixture.root.path().join("project")})).unwrap();
     let response = fixture.request(Method::AgentStart(params)).await;
-    assert_eq!(response["error"]["code"], "server_unavailable");
+    assert_eq!(
+        response["error"]["code"],
+        "structured_endpoint_restart_required"
+    );
     assert!(fixture.app.state.structured_agents.records().is_empty());
     assert!(!fixture.fixture.root.path().join("version.pid").exists());
 }

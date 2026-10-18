@@ -2957,7 +2957,7 @@ The CLI and socket share App admission and the Workers owner's atomic pending
 reservation. The listener supplies the immutable MCP endpoint. Relative listener
 paths are resolved to absolute paths during endpoint provisioning. Endpoint
 resolution is optional at server startup: failure emits a typed
-`server_unavailable` warning without private resolution details, and a
+`structured_endpoint_restart_required` warning without private resolution details, and a
 structured start refuses with that code before registering metadata or reserving
 capacity. Endpoint recovery takes effect on the next listener initialization.
 Ordinary server startup and PTY routes remain available. The caller cannot
@@ -2981,3 +2981,8 @@ older server that might silently ignore it and launch a PTY. Existing PTY
 `AgentInfo` fields and the `agents` list are unchanged. Structured read/control
 continues to use the additive `structured_agents` and `StructuredAgentInfo`
 contracts. Refusals use registered error codes and their retry/exit mappings.
+
+Endpoint provisioning failures require operator recovery: correct executable or
+socket resolution, then restart or hand off the listener. The registered
+`structured_endpoint_restart_required` refusal has retry `after_human`, exit 1.
+Ordinary routes remain available. Repeating start alone cannot repair it.

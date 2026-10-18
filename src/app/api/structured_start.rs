@@ -64,7 +64,7 @@ impl App {
             .runtime_config
             .structured_mcp
             .clone()
-            .ok_or(ErrorCode::ServerUnavailable)?;
+            .ok_or(ErrorCode::StructuredEndpointRestartRequired)?;
         let is_new = existing.is_none();
         let (agent_id, generation) = if let Some((id, generation)) = existing {
             if params.cwd.is_some() || params.model.is_some() {

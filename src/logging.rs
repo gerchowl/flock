@@ -45,7 +45,7 @@ pub(crate) fn structured_mcp_endpoint_unavailable(reason: crate::api::server::Mc
     tracing::warn!(
         event = "structured.mcp.endpoint_unavailable",
         reason,
-        code = crate::api::error_code::ErrorCode::ServerUnavailable.as_str(),
+        code = crate::api::error_code::ErrorCode::StructuredEndpointRestartRequired.as_str(),
         "structured MCP endpoint unavailable; structured start will refuse"
     );
 }
