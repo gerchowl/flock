@@ -57,17 +57,19 @@ impl ServerHandle {
     }
 }
 
-pub fn start_server(
+pub(crate) fn start_server(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
+    uid_policy: crate::structured::identity::UidPolicy,
 ) -> std::io::Result<ServerHandle> {
-    start_server_for_mode(api_tx, event_hub, true)
+    start_server_for_mode(api_tx, event_hub, true, uid_policy)
 }
 
 pub(crate) fn start_server_for_mode(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     live_handoff: bool,
+    uid_policy: crate::structured::identity::UidPolicy,
 ) -> std::io::Result<ServerHandle> {
     let identity = crate::mesh::identity::NodeIdentity::load()?;
     if let Some(warning) = &identity.clone_detection_warning {
@@ -84,13 +86,15 @@ pub(crate) fn start_server_for_mode(
             agent_questions: true,
             pane_input_write_ack: false,
         }),
+        uid_policy,
     )
 }
 
-pub fn start_server_with_capabilities(
+pub(crate) fn start_server_with_capabilities(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
+    uid_policy: crate::structured::identity::UidPolicy,
 ) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
@@ -118,6 +122,7 @@ pub fn start_server_with_capabilities(
                 let capabilities = capabilities.clone();
                 let connection_running = Arc::clone(&listener_running);
                 let health = Arc::clone(&health);
+                let uid_policy = uid_policy.clone();
                 std::thread::spawn(move || {
                     if let Err(err) = handle_connection(
                         stream,
@@ -126,6 +131,7 @@ pub fn start_server_with_capabilities(
                         &connection_running,
                         capabilities,
                         &health,
+                        &uid_policy,
                     ) {
                         crate::logging::api_connection_failed(&err.to_string());
                     }
@@ -239,6 +245,7 @@ pub(crate) fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
+    uid_policy: &crate::structured::identity::UidPolicy,
 ) -> std::io::Result<()> {
     let peer = crate::platform::peer::credentials(&stream);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
@@ -403,6 +410,7 @@ pub(crate) fn handle_connection(
                 capabilities,
                 peer,
                 listener_health,
+                uid_policy,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             match &result {
@@ -432,6 +440,7 @@ fn handle_request(
     capabilities: Option<ServerCapabilities>,
     peer: crate::platform::peer::Credentials,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
+    uid_policy: &crate::structured::identity::UidPolicy,
 ) -> String {
     match request.method {
         Method::Ping(_) => serde_json::to_string(&SuccessResponse {
@@ -450,7 +459,7 @@ fn handle_request(
                 // unavailable opendirectoryd would hang `flk status` for
                 // exactly as long as the fault lasts.
                 session_health: Some(crate::health::confirmed()),
-                agent_account_diagnostic: crate::structured::identity::account_diagnostic(),
+                agent_account_diagnostic: uid_policy.account_diagnostic(),
                 api_listener: Some(
                     listener_health
                         .lock()
@@ -946,7 +955,16 @@ mod tests {
             &running,
             &health,
             |stream| {
-                handle_connection(stream, &tx, &hub, &connection_running, None, &health).unwrap();
+                handle_connection(
+                    stream,
+                    &tx,
+                    &hub,
+                    &connection_running,
+                    None,
+                    &health,
+                    &Default::default(),
+                )
+                .unwrap();
                 running.store(false, Ordering::Relaxed);
             },
         );
@@ -1066,6 +1084,7 @@ mod tests {
                 None,
                 Default::default(),
                 &health,
+                &Default::default(),
             );
             let response: serde_json::Value = serde_json::from_str(&response).unwrap();
             assert_eq!(response["result"]["api_listener"]["stopped"], true);
@@ -1296,6 +1315,7 @@ mod tests {
             None,
             crate::platform::peer::Credentials::default(),
             &Mutex::default(),
+            &app.runtime_config.uid_policy,
         );
         let parsed: SuccessResponse = serde_json::from_str(&reply).unwrap();
         assert!(
@@ -1310,6 +1330,73 @@ mod tests {
             ),
             "{reply}"
         );
+    }
+
+    #[tokio::test]
+    async fn identity_diagnostic_is_owned_per_server_instance() {
+        use crate::structured::identity::{Principal, UidPolicy};
+        let make_server = |operator, dedicated| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let app = crate::app::App::new_with_runtime_config(
+                &crate::config::Config::default(),
+                true,
+                None,
+                rx,
+                EventHub::default(),
+                crate::app::AppRuntimeConfig {
+                    uid_policy: UidPolicy {
+                        operator,
+                        dedicated,
+                    },
+                    ..Default::default()
+                },
+            );
+            (app, tx)
+        };
+        let (first, first_tx) = make_server(7, Ok(Some(7)).into());
+        let (second, second_tx) = make_server(9, Ok(Some(42)).into());
+        let ping = |app: &crate::app::App, tx: &ApiRequestSender| {
+            let response = handle_request(
+                Request {
+                    id: "instance-status".into(),
+                    method: Method::Ping(crate::api::schema::PingParams::default()),
+                },
+                tx,
+                None,
+                crate::platform::peer::Credentials::default(),
+                &Mutex::default(),
+                &app.runtime_config.uid_policy,
+            );
+            let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+            let ResponseResult::Pong {
+                agent_account_diagnostic,
+                ..
+            } = response.result
+            else {
+                panic!("expected pong");
+            };
+            agent_account_diagnostic
+        };
+        assert_eq!(
+            first.runtime_config.uid_policy.classify(Some(7)),
+            Principal::Agent
+        );
+        assert!(matches!(
+            ping(&first, &first_tx),
+            Some(crate::api::schema::AgentAccountDiagnostic::AgentAccountUidCollision { uid: 7 })
+        ));
+        assert_eq!(
+            second.runtime_config.uid_policy.classify(Some(9)),
+            Principal::Operator
+        );
+        assert!(
+            ping(&second, &second_tx).is_none(),
+            "a second server must not inherit the first server's collision"
+        );
+        assert!(matches!(
+            ping(&first, &first_tx),
+            Some(crate::api::schema::AgentAccountDiagnostic::AgentAccountUidCollision { uid: 7 })
+        ));
     }
 
     #[test]
@@ -1331,6 +1418,7 @@ mod tests {
             }),
             crate::platform::peer::Credentials::default(),
             &Mutex::default(),
+            &Default::default(),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1354,6 +1442,7 @@ mod tests {
                 None,
                 Default::default(),
                 &Mutex::default(),
+                &Default::default(),
             )
         });
 
@@ -1429,6 +1518,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &Default::default(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1468,6 +1558,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &Default::default(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1548,6 +1639,7 @@ mod tests {
             &running,
             None,
             &Mutex::default(),
+            &Default::default(),
         )
         .unwrap();
         drop(api_tx);
@@ -1646,6 +1738,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &Default::default(),
             )
         });
 
@@ -1698,7 +1791,15 @@ mod tests {
             let running = Arc::new(AtomicBool::new(true));
             let (hub, stop) = (event_hub.clone(), Arc::clone(&running));
             let thread = std::thread::spawn(move || {
-                handle_connection(server, &api_tx, &hub, &stop, None, &Mutex::default())
+                handle_connection(
+                    server,
+                    &api_tx,
+                    &hub,
+                    &stop,
+                    None,
+                    &Mutex::default(),
+                    &Default::default(),
+                )
             });
             client
                 .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1755,7 +1856,15 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let (hub, stop) = (event_hub.clone(), Arc::clone(&running));
         let thread = std::thread::spawn(move || {
-            handle_connection(server, &api_tx, &hub, &stop, None, &Mutex::default())
+            handle_connection(
+                server,
+                &api_tx,
+                &hub,
+                &stop,
+                None,
+                &Mutex::default(),
+                &Default::default(),
+            )
         });
         client
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1796,6 +1905,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &Default::default(),
             );
             done_tx.send(result).unwrap();
         });
