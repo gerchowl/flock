@@ -3974,6 +3974,14 @@ pub(crate) fn peer_summary_applied(
     );
 }
 
+/// A malformed peer routing token was discarded. The field is a fixed schema
+/// name; rejected values never enter this typed, content-free warning.
+pub(crate) fn peer_summary_identifier_dropped(field: &'static str) {
+    tracing::warn!(target: "flock::peers", event = "peer.summary.identifier_dropped",
+        code = crate::api::error_code::ErrorCode::InvalidParams.as_str(), field,
+        "discarding invalid peer summary identifier");
+}
+
 /// A gossiped fleet row carried an ssh destination or `ProxyJump` this host
 /// refuses to hand OpenSSH (#392), so the row was dropped.
 ///

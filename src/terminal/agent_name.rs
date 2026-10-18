@@ -24,21 +24,16 @@ fn unsafe_char(c: char) -> bool {
 /// a name-length cap. ZWJ and variation selectors remain intact. Callers apply
 /// their own display budgets after keeping the full sanitized search text.
 pub fn presentation(text: &str) -> String {
-    text.chars().filter(|c| !unsafe_char(*c)).collect()
+    presentation_limited(text, usize::MAX)
 }
 
-/// Sanitize a required peer presentation field without rejecting its record.
-pub fn deserialize_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    use serde::Deserialize;
-    String::deserialize(d).map(|text| presentation(&text))
-}
-
-/// Sanitize optional peer presentation text. Missing fields remain optional.
-pub fn deserialize_optional_text<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> Result<Option<String>, D::Error> {
-    use serde::Deserialize;
-    Option::<String>::deserialize(d).map(|text| text.map(|text| presentation(&text)))
+/// The presentation policy with a caller-supplied Unicode scalar budget.
+/// Filtering precedes truncation, so forbidden characters never consume it.
+pub fn presentation_limited(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .filter(|c| !unsafe_char(*c))
+        .take(max_chars)
+        .collect()
 }
 
 /// Validate raw text before trimming, so trailing newlines cannot disappear.
@@ -71,12 +66,6 @@ pub fn received(name: Option<String>, source: &'static str) -> Option<String> {
             true
         }
     })
-}
-
-/// JSON receive adapter. Missing names stay optional; invalid names are discarded.
-pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    use serde::Deserialize;
-    Ok(received(Option::<String>::deserialize(d)?, "peer_json"))
 }
 
 /// Escape a bounded legacy/config label at the final render boundary. Valid

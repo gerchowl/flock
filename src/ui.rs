@@ -99,6 +99,8 @@ pub(crate) use self::{
         SIDEBAR_MENU_BAND_ROWS,
     },
 };
+#[cfg(test)]
+pub(crate) use sidebar::remote_entry_label as test_remote_entry_label;
 // The scope-label rects are used by hit-area code in app::input::sidebar to
 // carve the spaces-header `new` button (#105) out of the all/current toggle's
 // row, and by tests.

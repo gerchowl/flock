@@ -155,6 +155,24 @@ only when drawing into the available width. Metadata API titles retain their
 existing 80-scalar budget. Empty reported agent labels return
 `invalid_agent_name` with a nonempty-label message, separately from policy refusals.
 
+Peer receive admission includes project keys, because the sidebar derives its
+project-group label from that key before considering `project_label`. JSON
+workspace/agent decoding and binary/relay conversion share a single admission
+method per record. Each peer presentation field retains at most 256 Unicode
+scalar values after sanitization: workspace, project key/label, branch, activity,
+peer name, reported host, version, icon, error and origin/route display labels.
+The cap bounds render/search work after the existing frame-size check. Identity
+labels still use 64 scalars; thermal labels additionally retain their 16-byte cap.
+Unknown icon names resolve to a blank icon; dial reasons are classified tokens.
+Opaque workspace/pane/agent/node identifiers are not edited into new identities:
+valid printable ASCII tokens up to 256 bytes remain exact; malformed identifiers
+are cleared with a content-free `invalid_params` warning. Empty directory entries
+are omitted. Workspace ids already support the legacy id-less/name-focus path.
+SSH destination and ProxyJump grammar is checked with the same 256-byte bound:
+invalid relay rows are refused, and invalid carried routes are disabled rather
+than partially rewritten. The reserved home target remains supported. The mesh
+layout and VERSION remain unchanged.
+
 ### 5. The ceiling is lineage-aware, not a single global counter
 
 A flat `max_concurrent_agents` is a footgun on its own: an adversarial or

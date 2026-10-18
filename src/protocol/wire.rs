@@ -404,6 +404,7 @@ impl From<FleetAgent> for crate::api::schema::PeerAgentSummary {
             agent: crate::terminal::agent_name::received(agent.agent, "mesh"),
             status: agent.status,
         }
+        .received()
     }
 }
 
@@ -411,23 +412,18 @@ impl From<FleetWorkspace> for crate::api::schema::PeerWorkspaceSummary {
     fn from(ws: FleetWorkspace) -> Self {
         Self {
             id: ws.id,
-            workspace: crate::terminal::agent_name::presentation(&ws.workspace),
+            workspace: ws.workspace,
             project_key: ws.project_key,
-            project_label: ws
-                .project_label
-                .map(|text| crate::terminal::agent_name::presentation(&text)),
-            branch: ws
-                .branch
-                .map(|text| crate::terminal::agent_name::presentation(&text)),
+            project_label: ws.project_label,
+            branch: ws.branch,
             is_linked_worktree: ws.is_linked_worktree,
             agent: crate::terminal::agent_name::received(ws.agent, "mesh"),
             status: ws.status,
             status_age_secs: ws.status_age_secs,
-            activity: ws
-                .activity
-                .map(|text| crate::terminal::agent_name::presentation(&text)),
+            activity: ws.activity,
             agents: ws.agents.into_iter().map(Into::into).collect(),
         }
+        .received()
     }
 }
 
