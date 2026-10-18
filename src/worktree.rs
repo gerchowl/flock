@@ -424,11 +424,6 @@ impl From<String> for WorktreeRemoveFailure {
         }
     }
 }
-impl From<&str> for WorktreeRemoveFailure {
-    fn from(message: &str) -> Self {
-        message.to_owned().into()
-    }
-}
 impl From<CheckoutUnreachable> for WorktreeRemoveFailure {
     fn from(error: CheckoutUnreachable) -> Self {
         Self {
@@ -4228,6 +4223,12 @@ mod tests {
         let access = alias.canonicalize();
         let failure = check_worktree_remove(&fixture.repo, &fixture.checkout);
         std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if access.is_ok() {
+            tracing::warn!(
+                "skipping permission-denied scenario: process bypasses fixture permissions"
+            );
+            return;
+        }
         assert_eq!(
             access.unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied

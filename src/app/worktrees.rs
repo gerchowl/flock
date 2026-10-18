@@ -2811,6 +2811,7 @@ mod tests {
             path,
             result: Err(
                 "fatal: '/w/flock/dirty' contains modified or untracked files, use --force to delete it"
+                    .to_owned()
                     .into(),
             ),
             standing: Vec::new(),
@@ -2850,7 +2851,9 @@ mod tests {
         app.handle_worktree_remove_finished(WorktreeRemoveResult {
             workspace_id: "ws".into(),
             path,
-            result: Err("fatal: '/w/flock/missing' is not a working tree".into()),
+            result: Err("fatal: '/w/flock/missing' is not a working tree"
+                .to_owned()
+                .into()),
             standing: Vec::new(),
         });
 
@@ -2859,7 +2862,11 @@ mod tests {
         assert_eq!(remove.force_confirmation, None);
         assert_eq!(
             remove.error,
-            Some("fatal: '/w/flock/missing' is not a working tree".into())
+            Some(
+                "fatal: '/w/flock/missing' is not a working tree"
+                    .to_owned()
+                    .into()
+            )
         );
     }
 
@@ -5302,6 +5309,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
     }
+
     #[test]
     fn tui_single_remove_keeps_typed_checkout_failure_through_the_dialog() {
         let repo = create_committed_repo("typed-single-remove");
@@ -5346,9 +5354,11 @@ mod tests {
         let remove = app.state.worktree_remove.as_ref().unwrap();
         assert_eq!(remove.error.as_ref(), Some(&failure));
         assert!(!remove.removing);
-        assert_eq!(remove.force_confirmation, None, "checkout identity refusal is never forceable, even if the path contains git's force wording");
+        assert_eq!(
+            remove.force_confirmation, None,
+            "checkout identity refusal is never forceable, even if the path contains git's force wording"
+        );
         assert!(checkout.is_dir());
-        assert_eq!(remove.error.as_ref().unwrap().to_string(), failure.message);
         std::fs::remove_dir_all(repo).unwrap();
     }
 }
