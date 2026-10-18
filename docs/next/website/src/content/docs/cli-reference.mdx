@@ -299,14 +299,9 @@ Worktrees are normal Flock workspaces with Git checkout provenance. `worktree cr
 
 `workspace close` closes Flock state only. `worktree remove` is the explicit checkout deletion path; it runs `git worktree remove`, never deletes the branch, and requires `--force` when Git refuses a dirty checkout.
 
-A registered checkout directory that is present but has no valid `.git` link
-back to this repository's worktree admin entry is refused with
-`worktree_checkout_unreachable` (exit 10, retry `after_human`). `--force` cannot
-override it. The TUI kill dialog gives the same recovery: remount and retry, or,
-if the checkout is really gone, remove the directory yourself and retry. Flock
-never runs `git worktree prune` during removal or kill: pruning is repo-wide
-and can unlink other checkouts that are only temporarily absent. A completely
-absent directory still permits Git to remove that single registration.
+Unreadable checkout identity or repository administration refuses removal even
+with `--force`. See [worktree removal recovery](/docs/socket-api/#worktree-removal-recovery)
+for the shared error codes, diagnostic fields and recovery instructions.
 
 `worktree list` prints a table ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. `AGE` is the last commit on the branch — deliberately not the directory's mtime, which a build that rewrites `target/` makes meaningless. `--scan` adds a `VERDICT` column (`merged`, `not_merged`, `open_pr`, `unknown`, `protected`; `unknown` is a gate that timed out or a `gh` that could not answer, with the reason on the next line) resolved through the same gate `worktree kill` runs, so a squash-merged branch reads `merged` here exactly as it does there; it is opt-in because it costs local Git plus a `gh` call per checkout. Absence of a verdict means "not scanned", never "not merged". `--json` prints the raw response, where the fields are `last_commit_at` and `kill_verdict`.
 

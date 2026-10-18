@@ -365,6 +365,14 @@ Built-in checks:
 
 Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`, and exactly one of `workspace_id` or `path` for `worktree.kill`. Raw socket `cwd` and `path` values must be absolute, and a relative one is refused with `invalid_request` naming the field (`cwd must be an absolute path, got "repo"`); the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Flock worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
 
+### Worktree removal recovery
+
+If the repository probe fails or its worktree administration directory cannot be
+read, removal refuses `worktree_repository_unreachable` (exit 10, retry
+`after_human`). Restore access to the repository and its Git administration
+metadata (mount, permissions or metadata repair), then retry; leave the checkout
+intact. The error names the repository requiring recovery.
+
 A registered checkout directory that is present but has no valid `.git` link
 back to this repository's worktree admin entry is refused with
 `worktree_checkout_unreachable` (exit 10, retry `after_human`). `--force` cannot
@@ -378,9 +386,12 @@ The refusal's `error.data` has `path` (the checkout path), `recovery` (the
 recovery text), and `possible_unmounted_mount_point` (`true` for the same device
 as its parent, `false` for a different device, or `null` if stat failed). This
 is a best-effort hint only; device identity never decides whether removal is
-allowed. Kill-by-path can use a remembered repository's registered worktree
-list when the checkout cannot identify itself; without a verified repository
-registration it still refuses `not_git_worktree`.
+allowed. Repository-side refusals additionally carry `repo` and set the checkout's
+mount-point hint to `null`; their recovery text concerns the repository only.
+Kill-by-path first reads a healthy checkout's own metadata. It uses a remembered
+repository's registered worktree list only when the checkout cannot identify
+itself; without verified registration it still refuses `not_git_worktree`.
+Unattended removals retain the typed refusal through sweep results and row state.
 
 `worktree.list` rows carry `last_commit_at` (unix seconds of the last commit on the branch) and are ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. Pass `"scan": true` to also resolve each linked row's `kill_verdict` — `{"verdict": "merged" | "not_merged" | "open_pr" | "unknown" | "checkout_missing", "evidence": ..., "protected": ..., "timed_out": ...}` — through the same gate `worktree.kill` enforces. Both fields are omitted rather than null when unknown: an absent `kill_verdict` means the row was not scanned, NOT that the branch is unmerged, and an absent `last_commit_at` means Git could not date it.
 

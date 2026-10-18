@@ -1846,6 +1846,7 @@ mod tests {
         let mut app = AppState::test_new();
         let mut remove = kill_dialog_state(None);
         let refusal = crate::worktree::CheckoutUnreachable {
+            repo: None,
             path: std::env::temp_dir().join("unreachable-render-fixture"),
             possible_unmounted_mount_point: Some(true),
         };

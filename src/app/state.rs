@@ -1099,7 +1099,7 @@ pub enum WorktreeKillRowStatus {
     Pending,
     Removing,
     Done,
-    Error(String),
+    Error(crate::worktree::WorktreeRemoveFailure),
 }
 
 /// State of the fleet-wide kill sweep dialog (#81): the resolved plan plus the
