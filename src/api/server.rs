@@ -262,9 +262,9 @@ pub(crate) fn handle_connection(
         return Ok(());
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
+    let (request, credential) = match super::scoped::decode(line) {
         Ok(request) => request,
-        Err(err) => {
+        Err(()) => {
             write_json_line_allow_disconnect(
                 &mut stream,
                 &ErrorResponse {
@@ -272,12 +272,29 @@ pub(crate) fn handle_connection(
                     error: ErrorBody {
                         data: None,
                         code: "invalid_request".into(),
-                        message: format!("invalid request: {err}"),
+                        message: "invalid request".into(),
                     },
                 },
             )?;
             return Ok(());
         }
+    };
+
+    let _scope = match credential {
+        Some(credential) => match super::scoped::Scope::enter(credential, peer, &request, api_tx) {
+            Ok(guard) => Some(guard),
+            Err(()) => {
+                return write_text_line_allow_disconnect(
+                    &mut stream,
+                    &error_response_json(
+                        request.id,
+                        crate::api::error_code::ErrorCode::NotAuthorized.as_str(),
+                        "scoped caller authentication refused".into(),
+                    ),
+                )
+            }
+        },
+        None => None,
     };
 
     let request_id = request.id.clone();
@@ -857,6 +874,12 @@ pub(super) fn should_stop_connection(
     stream: &mut UnixStream,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
+    if super::scoped::Scope::current()
+        .is_some_and(|scope| scope.caller() == crate::structured::lease::Caller::Uncertain)
+    {
+        return Ok(true);
+    }
+
     if !running.load(Ordering::Relaxed) {
         return Ok(true);
     }
@@ -903,6 +926,7 @@ pub(super) fn dispatch_to_app_with_timeout(
     timeout: Option<Duration>,
     peer: crate::platform::peer::Credentials,
 ) -> String {
+    let peer = super::scoped::Scope::current().map_or(peer, |scope| scope.peer());
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
@@ -911,6 +935,7 @@ pub(super) fn dispatch_to_app_with_timeout(
         peer_pid: peer.pid,
         peer_birth: peer.birth,
         peer_uid: peer.uid,
+        scope: super::scoped::Scope::current(),
     }) {
         return error_response_json(
             request_id,
