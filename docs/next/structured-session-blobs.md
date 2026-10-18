@@ -7,9 +7,19 @@ under `<data dir>/blobs/<sha256>`. The persisted message replaces each block wit
 `stream_event` deltas remain live-only and do not consume durable sequence numbers.
 Consumers must check `Received.persisted` before advancing a durable cursor.
 
-Registry-worker admission supplies the `[sessions]` storage settings explicitly
+Registry-worker admission must supply the `[sessions]` storage settings explicitly
 in `Launch.storage` (ADR-0036 §4). Each launch owns its policy snapshot; config
 changes affect subsequent launches.
+
+**Production admission tracking (#1923; owned by #1439 / #1843).** The first
+production caller of `Workers::start` must pass the loaded `config.sessions`
+(`StorageConfig`) through `Launch.storage`, with a test covering that production
+admission path. The test must load a non-default `blob_min_bytes` and assert that
+a complete content block whose encoded size lies between that threshold and
+2048 bytes is persisted through a blob reference. The existing registry-worker
+fixture covers the worker boundary, not production admission. A required storage
+field prevents omission, but cannot prevent a caller supplying `Default::default()`.
+This tracking item closes with #1843.
 
 The shared content store stores bytes only, without content type or other metadata.
 `put(reader,max_bytes)` hashes exactly the bytes it writes and enforces a per-call
