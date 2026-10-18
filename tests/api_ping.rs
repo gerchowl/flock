@@ -891,7 +891,7 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
     // this unwrapped on a missing field. Nothing below needs bash semantics:
     // the pane shell only has to accept a typed command line, and the work is
     // done by the `/bin/sh -c` it launches.
-    let child = spawn_flock_with_shell(&config_home, &runtime_dir, &socket_path, "/bin/sh");
+    let mut child = spawn_flock_with_shell(&config_home, &runtime_dir, &socket_path, "/bin/sh");
 
     let created = send_request(
         &socket_path,
@@ -905,14 +905,15 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         .unwrap()
         .to_string();
 
-    // `pwd > {cwd_marker}` is how the foreground process states its own
-    // directory. `/proc/<pid>/cwd` said the same thing but only exists on Linux,
-    // which is the whole reason this test used to be gated off macOS.
+    // Publish readiness only after pwd's redirection has closed: file existence
+    // alone does not prove its contents have been written. Builtin read then
+    // holds this shell in the foreground until teardown, without forking or
+    // execing a different process while the APIs sample its cwd.
     let command = format!(
-        "/bin/sh -c 'cd {} && touch {} && pwd > {} && sleep 30'",
+        "/bin/sh -c 'cd {} && pwd > {} && : > {} && read -r release'",
         foreground.display(),
-        marker.display(),
-        cwd_marker.display()
+        cwd_marker.display(),
+        marker.display()
     );
     let send_text = send_request(
         &socket_path,
@@ -936,35 +937,28 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
     );
     assert_eq!(send_enter["result"]["type"], "ok");
     let deadline = Instant::now() + Duration::from_secs(5);
-    wait_for_path(&marker, deadline.saturating_duration_since(Instant::now()));
-    wait_for_path(
-        &cwd_marker,
-        deadline.saturating_duration_since(Instant::now()),
-    );
-
-    // The foreground process is in `foreground`, by its own account. Compared
-    // with `assert_same_dir` because the shell reports the path as typed while
-    // the server reports it resolved, and on macOS `/tmp` is a symlink to
-    // `/private/tmp`.
-    assert_same_dir(
-        &serde_json::json!(fs::read_to_string(&cwd_marker).unwrap().trim()),
-        &foreground,
-    );
-
-    // File markers precede the server observing the foreground process change.
+    // The marker orders the shell's own cwd evidence before API sampling.
+    // The foreground group can still be changing, so wait for the actual API
+    // observation, bounded by the original deadline and server liveness.
     let expected = foreground.canonicalize().unwrap();
     let pane = loop {
+        assert!(
+            child.child.try_wait().unwrap().is_none(),
+            "server exited before foreground readiness"
+        );
         let mut reader = JsonLineReader::connect(&socket_path);
         reader.send_line(&format!(
             r#"{{"id":"fg_pane","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
             pane_id
         ));
         let pane = reader.read_json_line(deadline.saturating_duration_since(Instant::now()));
-        if pane["result"]["pane"]["foreground_cwd"]
-            .as_str()
-            .and_then(|cwd| Path::new(cwd).canonicalize().ok())
-            .as_ref()
-            == Some(&expected)
+        assert!(pane.get("error").is_none(), "pane.get failed: {pane}");
+        if marker.exists()
+            && pane["result"]["pane"]["foreground_cwd"]
+                .as_str()
+                .and_then(|cwd| Path::new(cwd).canonicalize().ok())
+                .as_ref()
+                == Some(&expected)
         {
             break pane;
         }
@@ -973,8 +967,11 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
             !remaining.is_zero(),
             "foreground cwd did not settle: {pane}"
         );
-        thread::park_timeout(remaining.min(Duration::from_millis(25)));
     };
+    assert_same_dir(
+        &serde_json::json!(fs::read_to_string(&cwd_marker).unwrap().trim()),
+        &foreground,
+    );
     assert_same_dir(&pane["result"]["pane"]["cwd"], &base);
     assert_same_dir(&pane["result"]["pane"]["foreground_cwd"], &foreground);
 

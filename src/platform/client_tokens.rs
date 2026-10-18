@@ -128,9 +128,31 @@ impl Namespace {
     }
     /// Remove only a temporary entry while the caller holds the writer lock.
     pub(crate) fn remove_temporary(&self, id: &str) -> io::Result<()> {
+        self.check()?;
         let bytes = Self::decode_entry(id)?;
         if !bytes.starts_with(b".tmp-") {
             return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let name = CString::new(bytes.clone()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        if bytes.contains(&b'/') {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: terminated component and owned directory; no final symlink is followed.
+        if unsafe {
+            libc::fstatat(
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful fstatat initialized stat.
+        if unsafe { stat.assume_init() }.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            return Err(io::ErrorKind::IsADirectory.into());
         }
         self.unlink(OsStr::from_bytes(&bytes))
     }
