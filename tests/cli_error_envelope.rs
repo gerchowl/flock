@@ -471,6 +471,24 @@ fn the_skew_envelope_says_the_exit_the_process_returns() {
     assert_eq!(value["error"]["retry"], "after_handoff");
 }
 
+/// A protocol-32 client refuses a write to a protocol-31 server before sending
+/// it, preserving the typed handoff recovery path across the snapshot bump.
+#[test]
+fn protocol_32_client_refuses_protocol_31_server_with_handoff_recovery() {
+    fn old_server(request: &Value) -> Value {
+        assert_eq!(
+            request["method"], "ping",
+            "no mutation reaches the old server"
+        );
+        json!({"result":{"type":"pong","version":"3.1.0","protocol":31}})
+    }
+    let (socket, _server) = scripted_server("snapshot-skew", old_server);
+    let output = flk(&socket, &["agent", "send", "w1", "fixture", "--json"]);
+    let value = envelope(&output, 78);
+    assert_eq!(value["error"]["code"], "server_version_gap");
+    assert_eq!(value["error"]["retry"], "after_handoff");
+}
+
 /// #1031: a park the server refuses for its predicate exits 2 (a usage
 /// error: fix the call), and one refused for the agent's open parks exits 10
 /// (refused before acting). A park that succeeds prints one human line, or

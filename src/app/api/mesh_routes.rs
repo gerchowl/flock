@@ -72,6 +72,13 @@ pub(crate) struct Completion {
     result: Result<Vec<Advert>, String>,
 }
 
+/// A reported identity is authoritative only after enrollment is pinned.
+fn enrolled_node(status: &crate::mesh::hello::Enrollment) -> Option<&str> {
+    (status.state == "pinned")
+        .then_some(status.node_id.as_deref())
+        .flatten()
+}
+
 impl App {
     pub(super) fn refresh_mesh_routes(&mut self) {
         for peer in crate::peer_stream::take_closed_edges() {
@@ -129,7 +136,11 @@ impl App {
             });
             match pinned {
                 Ok(pin) => {
-                    if let Some(node) = pin.flatten().map(|pin| pin.node_id).or(status.node_id) {
+                    if let Some(node) = pin
+                        .flatten()
+                        .map(|pin| pin.node_id)
+                        .or_else(|| enrolled_node(&status).map(str::to_owned))
+                    {
                         names.insert(peer.name.clone(), node);
                     }
                 }
@@ -407,8 +418,11 @@ impl App {
         self.refresh_mesh_routes();
         let mut names = self.mesh_routes.live.clone();
         for peer in &self.state.peers {
-            if let Some(node) = crate::peer_stream::enrollment(peer).node_id {
-                names.insert(node, peer.name.clone());
+            let status = crate::peer_stream::enrollment(peer);
+            if status.state == "pinned" {
+                if let Some(node) = status.node_id {
+                    names.insert(node, peer.name.clone());
+                }
             }
         }
         self.mesh_routes
@@ -542,6 +556,24 @@ mod tests {
             record.next_hop
         );
         assert_eq!(record.envelope.key, mail.key, "custody must be retained");
+    }
+
+    #[test]
+    fn server_identity1076_unpinned_enrollment_cannot_supply_a_name_binding() {
+        for state in ["pending", "refused", "retrying", "pinned"] {
+            let status = crate::mesh::hello::Enrollment {
+                peer: "node-b.example".into(),
+                source: crate::mesh::store::PinSource::Configured,
+                pin_origin: Default::default(),
+                node_id: Some("claimed-node".into()),
+                state: state.into(),
+                reason: None,
+            };
+            assert_eq!(
+                enrolled_node(&status),
+                (state == "pinned").then_some("claimed-node")
+            );
+        }
     }
 
     #[test]

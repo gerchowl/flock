@@ -2795,8 +2795,8 @@ impl AppState {
     // module-private constants so the reader sees the ordering in one place.
 
     /// Consolidate authenticated node IDs across sources. Legacy rows remain
-    /// separate; matching display names never establish identity. Prefer a live
-    /// reading over a failed one, then first-hand data and origin freshness.
+    /// separate; matching display names never establish identity. Configured
+    /// sources always win, then freshness breaks ties within the same tier.
     pub(crate) fn remote_peers(&self) -> Vec<(RemotePeerRef, &crate::peers::PeerSummaryState)> {
         let mut ordered: Vec<(RemotePeerRef, &crate::peers::PeerSummaryState, u8)> = Vec::new();
         let mut nodes: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -2806,23 +2806,23 @@ impl AppState {
                 continue;
             }
             let key = (
+                rank,
                 peer.reachability_with(
                     self.config.gossip.stale_after().as_secs(),
                     self.config.gossip.slow_threshold_ms(),
                 ) == crate::peers::PeerReachability::Down,
                 row_freshness(peer).is_none(),
-                rank,
                 row_freshness(peer),
             );
             if let Some(&idx) = node.and_then(|id| nodes.get(id)) {
                 let (_, current, current_rank) = &ordered[idx];
                 let old = (
+                    *current_rank,
                     current.reachability_with(
                         self.config.gossip.stale_after().as_secs(),
                         self.config.gossip.slow_threshold_ms(),
                     ) == crate::peers::PeerReachability::Down,
                     row_freshness(current).is_none(),
-                    *current_rank,
                     row_freshness(current),
                 );
                 if key < old {
@@ -2841,19 +2841,28 @@ impl AppState {
             .collect()
     }
 
-    /// A reported node wins over a name mapping, so conflicting known IDs stay
-    /// separate. Only configured rows may acquire identity through a local pin.
+    /// Only a local binding can authenticate a row's identity. Relayed claims
+    /// are proven only when their immediate enrolled source is that same node.
+    /// Carried snapshots have no such proof and cannot borrow a local alias.
     pub(crate) fn server_peer_node<'a>(
         &'a self,
         peer: &'a crate::peers::PeerSummaryState,
     ) -> Option<&'a str> {
-        peer.node_id.as_deref().or_else(|| {
-            self.peer_summaries
-                .iter()
-                .any(|p| std::ptr::eq(p, peer))
-                .then(|| self.server_nodes.get(&peer.peer).map(String::as_str))
-                .flatten()
-        })
+        if self.peer_summaries.iter().any(|p| std::ptr::eq(p, peer)) {
+            return self.server_nodes.get(&peer.peer).map(String::as_str);
+        }
+        let claimed = peer.node_id.as_deref()?;
+        self.relayed_fleet_cache
+            .values()
+            .find(|entry| {
+                std::ptr::eq(&entry.peer, peer)
+                    && entry
+                        .via
+                        .as_ref()
+                        .and_then(|via| self.server_nodes.get(via))
+                        .is_some_and(|bound| bound == claimed)
+            })
+            .map(|_| claimed)
     }
 
     /// Configured aliases precede inbound pin names for the same node.
@@ -2877,8 +2886,10 @@ impl AppState {
     /// Prefer the locally bound name; advertised names are presentation only.
     pub(crate) fn server_peer_name(&self, peer: &crate::peers::PeerSummaryState) -> String {
         if let Some(node) = self.server_peer_node(peer) {
-            if let Some(name) = self.server_node_name(node) {
-                return name.to_string();
+            if self.peer_summaries.iter().any(|p| std::ptr::eq(p, peer)) {
+                if let Some(name) = self.server_node_name(node).filter(|name| !name.is_empty()) {
+                    return name.to_string();
+                }
             }
             if peer.display_name().is_empty() {
                 return node
@@ -2889,7 +2900,10 @@ impl AppState {
             }
         }
         if peer.display_name().is_empty() {
-            "legacy/unverified".to_string()
+            peer.node_id
+                .as_deref()
+                .map(|id| id.chars().take(8).flat_map(char::escape_default).collect())
+                .unwrap_or_else(|| "legacy/unverified".to_string())
         } else {
             peer.display_name().to_string()
         }
@@ -2955,24 +2969,9 @@ impl AppState {
         // Ordered by host key: the cache is a HashMap, and iterating it
         // directly reshuffles these rows between renders.
         //
-        // #424: a hub-pushed row about the client's HOME is left out while a
-        // snapshot is carried. The origin slot stands for that machine and
-        // absorbs such readings as they arrive, so this only skips one stored
-        // before the client attached, which would render home twice.
-        let home_node = self
-            .fleet_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.origin_summary.as_ref())
-            .and_then(|peer| peer.node_id.as_ref());
-        let mut relayed: Vec<_> = self
-            .relayed_fleet_cache
-            .iter()
-            .filter(|(_, entry)| {
-                !(entry.hub_pushed
-                    && home_node.is_some()
-                    && entry.peer.node_id.as_ref() == home_node)
-            })
-            .collect();
+        // Snapshot identities are unproven claims. They cannot hide a row
+        // obtained from an independently authenticated source.
+        let mut relayed: Vec<_> = self.relayed_fleet_cache.iter().collect();
         relayed.sort_by_key(|(host_key, _)| *host_key);
         candidates.extend(relayed.into_iter().map(|(host_key, entry)| {
             (
@@ -3943,10 +3942,22 @@ mod tests {
             .unwrap()
             .peer
             .node_id = Some("fixture-node".into());
+        state
+            .server_nodes
+            .insert(local.peer.clone(), "fixture-node".into());
+        state
+            .relayed_fleet_cache
+            .get_mut("spoke2.invalid")
+            .unwrap()
+            .via = Some(local.peer.clone());
         state.peer_summaries = vec![local];
 
         let rows = state.remote_peers();
-        assert_eq!(rows.len(), 1, "one host must not produce two rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a proven self reading folds into its configured row"
+        );
         assert!(
             matches!(rows[0].0, RemotePeerRef::Config { .. }),
             "locally polled data outranks a relayed reading: {:?}",

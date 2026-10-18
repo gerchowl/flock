@@ -1347,18 +1347,10 @@ fn server_band_slots_as(
     slots.push((crate::peers::normalized_host_key(self_host), None));
 
     // Gossip v3 (#101 part 4): the band and the spaces list share ONE deduped
-    // remote-row list. Same authenticated node ID and live-reading priority,
+    // remote-row list. Same proven node ID and configured-source priority,
     // so a two-hub fleet cannot produce a duplicate row here that
     // the spaces list also shows, and both surfaces agree on which entry won.
     for (peer_ref, peer) in app.remote_peers() {
-        let home_node = app
-            .fleet_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.origin_summary.as_ref())
-            .and_then(|peer| peer.node_id.as_deref());
-        if home_node.is_some() && app.server_peer_node(peer) == home_node {
-            continue;
-        }
         // Origin rows fold into the spaces list, never a band slot — the Home
         // row above already stands for the origin server here.
         if matches!(peer_ref, crate::app::state::RemotePeerRef::Origin) {
@@ -2165,28 +2157,13 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 let Some(snapshot) = app.fleet_snapshot.as_ref() else {
                     continue;
                 };
-                let mut build = home_server_rows(
+                home_server_rows(
                     snapshot,
                     p,
                     app.server_label,
                     now,
                     stale_after_secs.as_secs(),
-                );
-                if let Some(origin) = snapshot.origin_summary.as_ref() {
-                    if let Some(name) = origin
-                        .node_id
-                        .as_deref()
-                        .and_then(|id| app.server_node_name(id))
-                    {
-                        build.name = server_name_spans(
-                            origin.icon.as_deref(),
-                            name,
-                            app.server_label,
-                            build.name.last().map(|span| span.style).unwrap_or_default(),
-                        );
-                    }
-                }
-                build
+                )
             }
             Some(crate::app::state::PeerSwitchRequest::SnapshotPeer { entry_idx, .. }) => {
                 let Some(peer) = app
@@ -3787,22 +3764,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn server_identity1076_config_gossip_and_pin_fold_into_one_live_node() {
+    async fn server_identity1076_unproven_claim_cannot_replace_a_pinned_target() {
         let (_lock, _scrub) = crate::config::test_config_env_guard();
         let _store = crate::mesh::runtime_store::TestStore::new();
-        let (app, node) = server_identity1076_fixture();
+        let (mut app, _) = server_identity1076_fixture();
+        let spoof = app.state.relayed_fleet_cache.values_mut().next().unwrap();
+        spoof.via = Some("node-c.example".into());
+        spoof.peer.ssh_target = "attacker.example".into();
         let rows = app.state.remote_peers();
-        assert_eq!(
-            rows.len(),
-            1,
-            "one configured alias and its live gossip must be one node"
-        );
-        assert_eq!(rows[0].1.node_id.as_deref(), Some(node.as_str()));
-        assert_ne!(
-            rows[0].1.reachability(),
-            crate::peers::PeerReachability::Down
-        );
-        assert_eq!(rows[0].1.workspaces.len(), 1, "retain the live reading");
+        assert_eq!(rows.len(), 2, "unproven claims remain separate");
+        let trusted = rows
+            .iter()
+            .find(|(entry, _)| matches!(entry, crate::app::state::RemotePeerRef::Config { .. }))
+            .unwrap()
+            .1;
+        assert_eq!(app.state.server_peer_name(trusted), "node-b-alias.example");
+        assert_eq!(trusted.ssh_target, "node-b.example");
+        let spoof = rows
+            .iter()
+            .find(|(entry, _)| matches!(entry, crate::app::state::RemotePeerRef::Relayed { .. }))
+            .unwrap()
+            .1;
+        assert!(app.state.server_peer_node(spoof).is_none());
+        assert_ne!(app.state.server_peer_name(spoof), "node-b-alias.example");
+        let area = Rect::new(0, 0, 120, 16);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_servers_section(&app.state, frame, area, false))
+            .unwrap();
+        let text = (0..area.height)
+            .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("unverified"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_identity1076_proven_self_reading_keeps_configured_target() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (mut app, _) = server_identity1076_fixture();
+        app.state
+            .relayed_fleet_cache
+            .values_mut()
+            .next()
+            .unwrap()
+            .peer
+            .ssh_target = "attacker.example".into();
+        let rows = app.state.remote_peers();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            rows[0].0,
+            crate::app::state::RemotePeerRef::Config { .. }
+        ));
+        assert_eq!(rows[0].1.ssh_target, "node-b.example");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3863,13 +3878,13 @@ mod tests {
         legacy.node_id = None;
         app.peer_summaries = vec![a, b, legacy.clone(), legacy];
         assert_eq!(app.remote_peers().len(), 4);
-        // A local pin never overrides an explicitly different reported ID.
+        // A configured row's local binding wins over its reported claim.
         app.server_nodes
             .insert("node-a.example".into(), "aaaaaaaa-node".into());
-        assert_eq!(app.remote_peers().len(), 2);
+        assert_eq!(app.remote_peers().len(), 1);
         assert_eq!(
             app.server_peer_node(&app.peer_summaries[1]),
-            Some("bbbbbbbb-node")
+            Some("aaaaaaaa-node")
         );
         let legacy = app.peer_summaries[2].clone();
         app.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
@@ -3884,7 +3899,7 @@ mod tests {
             None,
             "a legacy advertised alias cannot borrow a local pin"
         );
-        assert_eq!(app.remote_peers().len(), 3);
+        assert_eq!(app.remote_peers().len(), 2);
     }
 
     #[test]
@@ -3896,6 +3911,8 @@ mod tests {
         let mut fresh = stale.clone();
         fresh.origin_last_ok_secs = Some(0);
         fresh.ingested_at = Some(std::time::Instant::now());
+        app.server_nodes
+            .insert(stale.peer.clone(), "0123456789abcdef".into());
         app.peer_summaries = vec![stale, fresh];
         assert_eq!(app.remote_peers().len(), 1);
         assert!(matches!(
@@ -3967,7 +3984,10 @@ mod tests {
             .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("via node-b-alias.example"));
+        assert!(
+            text.contains("unverified"),
+            "a signed route does not authenticate a relayed row"
+        );
         assert!(text.contains("node-b-alias.example"));
         assert!(!text.contains("via node-c.example"));
     }
@@ -3995,8 +4015,8 @@ mod tests {
         crate::peers::merge_relayed_fleet(&mut cache, vec![row("node-one")], "node-c.example");
         assert_eq!(
             cache.len(),
-            2,
-            "the same node refreshes its existing reading"
+            3,
+            "claims from different sources remain separate"
         );
         let legacy = serde_json::from_value(serde_json::json!({
             "name":"legacy.example", "host":"node:node-one", "ssh_target":"legacy.example",
@@ -4005,7 +4025,7 @@ mod tests {
         crate::peers::merge_relayed_fleet(&mut cache, vec![legacy], "node-a.example");
         assert_eq!(
             cache.len(),
-            3,
+            4,
             "a legacy hostname cannot collide with a node key"
         );
     }
@@ -4016,7 +4036,12 @@ mod tests {
         let mut here = peer_named_with_host("node-a.example", "same.example");
         here.node_id = Some("node-here".into());
         let mut home = here.clone();
+        home.peer = "node-home.example".into();
         home.node_id = Some("node-home".into());
+        app.server_nodes
+            .insert(here.peer.clone(), "node-here".into());
+        app.server_nodes
+            .insert(home.peer.clone(), "node-home".into());
         app.server_node = here.node_id.clone();
         app.peer_summaries = vec![here, home.clone()];
         app.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
@@ -4027,8 +4052,8 @@ mod tests {
         });
         assert_eq!(
             server_band_slots(&app).len(),
-            2,
-            "only self and home remain"
+            3,
+            "a snapshot claim cannot hide a configured peer"
         );
         app.server_nodes
             .insert("home-alias.example".into(), "node-home".into());
@@ -4041,7 +4066,16 @@ mod tests {
             .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("home-alias.example"));
+        assert!(text.contains("node-home.example"));
+        let snapshot = app.fleet_snapshot.as_ref().unwrap();
+        let home = home_server_rows(
+            snapshot,
+            &app.palette,
+            app.server_label,
+            std::time::Instant::now(),
+            60,
+        );
+        assert_eq!(spans_text(&home.name), "node-home.example");
         app.fleet_snapshot
             .as_mut()
             .unwrap()
@@ -4357,11 +4391,10 @@ mod tests {
     }
 
     #[test]
-    fn server_band_dedups_same_host_keeping_config_peer() {
+    fn server_band_keeps_unproven_snapshot_separate_from_config_peer() {
         use crate::app::state::PeerSwitchRequest;
         let mut app = crate::app::state::AppState::test_new();
-        // `kiln` advertised BOTH as a carried snapshot row and a local config
-        // peer (the multi-hub double-count in #40). It must appear once.
+        // Matching snapshot claims cannot authenticate a configured peer.
         app.fleet_snapshot = Some(carried_snapshot_with_hosts(
             "hopper",
             &[("kiln-snap", "kiln")],
@@ -4382,8 +4415,8 @@ mod tests {
             .collect();
         assert_eq!(
             peer_slots.len(),
-            1,
-            "same host must appear once: {peer_slots:?}"
+            2,
+            "unproven snapshot remains separate: {peer_slots:?}"
         );
         assert!(
             matches!(peer_slots[0], PeerSwitchRequest::ConfigPeer { .. }),
@@ -4392,12 +4425,8 @@ mod tests {
     }
 
     #[test]
-    fn consolidated_dedup_makes_band_and_spaces_list_agree_on_same_host() {
-        // Gossip v3 (#101 part 4) RED: the band and the spaces list share a
-        // single deduped remote-row list (shared node ID as key).
-        // Two-source fixture: same host advertised via a carried snapshot AND
-        // a local config peer. Both surfaces must show ONE row about that
-        // host, and the LOCALLY-POLLED config peer must win the tie.
+    fn consolidated_dedup_makes_band_and_spaces_list_agree_on_unverified_claims() {
+        // Both surfaces retain the configured row and the unproven snapshot.
         let mut app = crate::app::state::AppState::test_new();
         app.fleet_snapshot = Some(carried_snapshot_with_hosts(
             "hopper",
@@ -4407,8 +4436,7 @@ mod tests {
         app.peer_summaries[0].node_id = Some("fixture-node".into());
         app.fleet_snapshot.as_mut().unwrap().peers[0].node_id = Some("fixture-node".into());
 
-        // Servers band: one non-Home/non-Self entry, and it MUST be the
-        // config peer (rank 0 beats the snapshot rank 2).
+        // The configured source remains first, independently of the claim.
         let band_peers: Vec<crate::app::state::PeerSwitchRequest> = server_band_slots(&app)
             .into_iter()
             .flatten()
@@ -4422,8 +4450,8 @@ mod tests {
             .collect();
         assert_eq!(
             band_peers.len(),
-            1,
-            "band must show ONE row: {band_peers:?}"
+            2,
+            "band retains the unproven claim: {band_peers:?}"
         );
         assert!(
             matches!(
@@ -4433,8 +4461,7 @@ mod tests {
             "locally polled config peer must win the dedup: {band_peers:?}"
         );
 
-        // Spaces list source of truth: single row about `kiln`, and it is
-        // the config peer ref (not the snapshot one). Both surfaces agree.
+        // The spaces list preserves the same separation.
         let remote_rows: Vec<crate::app::state::RemotePeerRef> = app
             .remote_peers()
             .into_iter()
@@ -4442,8 +4469,8 @@ mod tests {
             .collect();
         assert_eq!(
             remote_rows.len(),
-            1,
-            "spaces list must show ONE row: {remote_rows:?}"
+            2,
+            "spaces list retains the unproven claim: {remote_rows:?}"
         );
         assert!(
             matches!(
@@ -4455,11 +4482,8 @@ mod tests {
     }
 
     #[test]
-    fn consolidated_dedup_snapshot_ties_break_by_frozen_origin_freshness() {
-        // Gossip v3 (#101 part 4) RED: same-source ties (two snapshot rows
-        // about the same host — a scenario possible once relays fold into
-        // fleet_snapshot) break on frozen origin freshness. The SMALLER
-        // origin_last_ok_secs (fresher origin assertion) wins.
+    fn consolidated_dedup_snapshot_claims_cannot_replace_each_other() {
+        // Freshness does not prove that two snapshot claims identify one node.
         let mut app = crate::app::state::AppState::test_new();
         let mut stale = peer_named_with_host("kiln", "kiln");
         stale.node_id = Some("fixture-node".into());
@@ -4478,15 +4502,11 @@ mod tests {
         let remote_rows = app.remote_peers();
         assert_eq!(
             remote_rows.len(),
-            1,
-            "same-host duplicates must dedupe: {remote_rows:?}"
+            2,
+            "unproven claims stay separate: {remote_rows:?}"
         );
-        // The winner is the FRESHER of the two — origin_last_ok_secs = 3.
-        assert_eq!(
-            remote_rows[0].1.origin_last_ok_secs,
-            Some(3),
-            "fresher origin assertion must win same-source tie"
-        );
+        assert_eq!(remote_rows[0].1.origin_last_ok_secs, Some(45));
+        assert_eq!(remote_rows[1].1.origin_last_ok_secs, Some(3));
     }
 
     #[test]
@@ -6394,7 +6414,7 @@ mod tests {
     }
 
     #[test]
-    fn config_peer_shadows_matching_snapshot_entry() {
+    fn config_peer_keeps_matching_snapshot_claim_separate() {
         use crate::app::state::RemotePeerRef;
         let mut app = crate::app::state::AppState::test_new();
         let flock_row = || {
@@ -6444,8 +6464,9 @@ mod tests {
             vec![
                 RemotePeerRef::Snapshot { entry_idx: 1 },
                 RemotePeerRef::Config { peer_idx: 0 },
+                RemotePeerRef::Snapshot { entry_idx: 0 },
             ],
-            "the duplicated kiln renders once, from the polled config entry"
+            "configured and unproven snapshot rows remain separate"
         );
     }
 

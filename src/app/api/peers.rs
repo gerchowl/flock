@@ -2058,7 +2058,7 @@ mod tests {
         assert!(spoke
             .state
             .relayed_fleet_cache
-            .contains_key("\0node:test-node-node-home.example"));
+            .contains_key("\0node:node-home.example:test-node-node-home.example"));
     }
 
     #[tokio::test]
@@ -2347,10 +2347,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hub_pushed_row_about_home_never_renders_home_twice() {
-        // A row about the client's home stored before the client attached
-        // (a spoke hears its hub whether or not anyone is attached) must not
-        // stand beside the home row. The origin slot stands for that machine.
+    async fn a_snapshot_home_claim_cannot_hide_a_separately_received_row() {
+        // A carried home identity is an unproven claim, so it cannot hide
+        // a row received independently through an enrolled edge.
         let mut spoke = test_app();
         bind_relay(&mut spoke, "hopper");
         let mut hub = hub_row("hopper", "hopper", 0);
@@ -2367,7 +2366,7 @@ mod tests {
         assert!(spoke
             .state
             .relayed_fleet_cache
-            .contains_key("\0node:test-node-hopper"));
+            .contains_key("\0node:hopper:test-node-hopper"));
 
         let mut origin = summary("hopper", crate::protocol::HOME_SWITCH_TARGET);
         origin.node_id = Some("test-node-hopper".into());
@@ -2383,7 +2382,12 @@ mod tests {
             .into_iter()
             .map(|(peer_ref, _)| peer_ref)
             .collect();
-        assert_eq!(rows, vec![crate::app::state::RemotePeerRef::Origin]);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            rows[0],
+            crate::app::state::RemotePeerRef::Relayed { .. }
+        ));
+        assert!(matches!(rows[1], crate::app::state::RemotePeerRef::Origin));
     }
 
     #[test]

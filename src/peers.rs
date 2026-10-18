@@ -808,7 +808,7 @@ fn merge_relayed_rows(
         let host_key = entry
             .node_id
             .as_ref()
-            .map(|id| format!("\0node:{id}"))
+            .map(|id| format!("\0node:{via}:{id}"))
             .unwrap_or(legacy_key);
         let Some(mut materialised) = relayed_entry_from_wire(entry) else {
             continue;
