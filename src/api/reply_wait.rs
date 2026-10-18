@@ -316,7 +316,7 @@ pub(super) fn wait_for_reply(
     // disagree. NOT the durable log: `persisted_events_after` re-reads every
     // log file while holding the hub's lock, and every `emit_event` on the
     // app thread waits on that lock — a retried typo would stall the server.
-    for (_, event) in event_hub.events_after(0) {
+    for (_, event) in event_hub.ring_snapshot_after(0) {
         watch.observe(&event, &correlation_id);
     }
     if let Err(reason) = watch.refresh_mesh(
@@ -404,17 +404,14 @@ pub(super) fn wait_for_reply(
             .min(CONNECTION_POLL_INTERVAL);
         if event_hub.wait_after(cursor, slice) {
             event_woke = true;
-            let fresh = event_hub.events_after(cursor);
-            // More than the ring holds arrived between two wakes: the events
-            // just past the cursor are gone. Re-read what the ring still has
-            // rather than miss an answer among them silently.
-            let gap = fresh
-                .first()
-                .is_some_and(|(sequence, _)| *sequence > cursor + 1);
-            let batch = if gap {
-                event_hub.events_after(0)
-            } else {
-                fresh
+            let batch = match event_hub.events_after(cursor) {
+                Ok(events) => events,
+                Err(error) => {
+                    return Ok(Some(encode(&ErrorResponse {
+                        id: request_id,
+                        error,
+                    })))
+                }
             };
             for (sequence, event) in batch {
                 cursor = cursor.max(sequence);

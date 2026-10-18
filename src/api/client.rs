@@ -195,6 +195,8 @@ impl ApiClient {
         Ok((parse_response_value(ack)?, stream))
     }
 
+    /// `status().capabilities.events_live_start` must be true before a client
+    /// relies on the new loss/cursor contract; old servers keep legacy handling.
     pub fn subscribe_value(
         &self,
         request: &Request,

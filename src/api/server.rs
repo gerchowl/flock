@@ -85,6 +85,7 @@ pub(crate) fn start_server_for_mode(
             agent_start_label: true,
             agent_questions: true,
             pane_input_write_ack: false,
+            events_live_start: true,
         }),
         uid_policy,
     )
@@ -729,7 +730,7 @@ fn stream_subscriptions(
     if let Err(err) = write_json_line(
         &mut stream,
         &SuccessResponse {
-            id: request_id,
+            id: request_id.clone(),
             result: ResponseResult::SubscriptionStarted {},
         },
     ) {
@@ -746,13 +747,23 @@ fn stream_subscriptions(
 
         let mut wrote = false;
         for subscription in &mut subscriptions {
-            if let Some(event) = subscription.poll(api_tx, event_hub) {
+            if let Some(mut event) = subscription.poll(api_tx, event_hub) {
+                let error = event.get("error").is_some();
+                if error {
+                    event["id"] = request_id.clone().into();
+                }
+                let close = error
+                    && event["error"]["code"]
+                        != crate::api::error_code::ErrorCode::EventsLost.as_str();
                 wrote = true;
                 if let Err(err) = write_json_line(&mut stream, &event) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
                     }
                     return Err(err);
+                }
+                if close {
+                    return Ok(());
                 }
             }
         }
@@ -1413,6 +1424,7 @@ mod tests {
                 agent_start_label: true,
                 agent_questions: true,
                 pane_input_write_ack: false,
+                events_live_start: false,
             }),
             crate::platform::peer::Credentials::default(),
             &Mutex::default(),
@@ -1768,8 +1780,63 @@ mod tests {
         assert!(server_thread.join().unwrap().is_ok());
     }
 
+    #[test]
+    fn two_live_subscribers_at_the_same_head_do_not_replay_retained_events() {
+        let hub = EventHub::default();
+        hub.push(queued_for("ws_1:p1", "retained"));
+        let (tx, _rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let mut readers = Vec::new();
+        let mut owners = Vec::new();
+        for index in 0..2 {
+            let (client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(client);
+            let (events, api_tx) = (hub.clone(), tx.clone());
+            let running = Arc::new(AtomicBool::new(true));
+            let stop = running.clone();
+            let thread = std::thread::spawn(move || {
+                stream_subscriptions(
+                    server,
+                    format!("live-{index}"),
+                    crate::api::schema::EventsSubscribeParams {
+                        after: None,
+                        subscriptions: vec![crate::api::schema::Subscription::MsgQueued {
+                            pane: "ws_1:p1".into(),
+                        }],
+                    },
+                    &api_tx,
+                    &events,
+                    &stop,
+                )
+            });
+            let mut ack = String::new();
+            reader.read_line(&mut ack).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&ack).unwrap()["result"]["type"],
+                "subscription_started"
+            );
+            readers.push(reader);
+            owners.push((running, thread));
+        }
+        hub.push(queued_for("ws_1:p1", "live"));
+        for mut reader in readers {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["data"]["correlation_id"],
+                "live"
+            );
+        }
+        for (running, thread) in owners {
+            running.store(false, Ordering::Relaxed);
+            assert!(thread.join().unwrap().is_ok());
+        }
+    }
+
     /// #1030 (ADR-0028 §3): a subscription without `after` starts at now; one
-    /// whose cursor the ring has passed is told `lagged` before the events it
+    /// whose cursor the ring has passed is told `events_lost` before the events it
     /// still can have; one past the newest event is refused.
     #[test]
     fn a_subscription_starts_at_now_or_its_cursor_and_reports_lag() {
@@ -1813,11 +1880,25 @@ mod tests {
         // The ring holds c2 and c3, so c1 is gone.
         let (mut behind, behind_running, behind_thread) = subscribe(r#","after":0"#);
         assert_eq!(next(&mut behind)["result"]["type"], "subscription_started");
-        let lagged = next(&mut behind);
-        assert_eq!(lagged["event"], "lagged", "{lagged}");
-        assert_eq!(lagged["data"]["skipped_to"], 1);
+        let lost = next(&mut behind);
+        assert_eq!(lost["error"]["code"], "events_lost", "{lost}");
+        assert_eq!(lost["id"], "s");
+        assert_eq!(lost["error"]["data"]["requested_sequence"], 0);
+        assert_eq!(lost["error"]["data"]["oldest_available_sequence"], 2);
+        assert_eq!(lost["error"]["data"]["current_sequence"], 3);
+        assert!(lost["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("per-verb"));
         assert_eq!(next(&mut behind)["data"]["correlation_id"], "c2");
         assert_eq!(next(&mut behind)["data"]["correlation_id"], "c3");
+
+        let (mut explicit, explicit_running, explicit_thread) = subscribe(r#","after_sequence":2"#);
+        assert_eq!(
+            next(&mut explicit)["result"]["type"],
+            "subscription_started"
+        );
+        assert_eq!(next(&mut explicit)["data"]["correlation_id"], "c3");
 
         let (mut now, now_running, now_thread) = subscribe("");
         assert_eq!(next(&mut now)["result"]["type"], "subscription_started");
@@ -1825,10 +1906,24 @@ mod tests {
         assert_eq!(next(&mut now)["data"]["correlation_id"], "c4", "no replay");
         assert_eq!(next(&mut behind)["data"]["correlation_id"], "c4");
 
+        let (mut second, second_running, second_thread) = subscribe("");
+        assert_eq!(next(&mut second)["result"]["type"], "subscription_started");
+        event_hub.push(queued_for("ws_1:p1", "c5"));
+        assert_eq!(
+            next(&mut second)["data"]["correlation_id"],
+            "c5",
+            "no retained replay on second attachment"
+        );
+
         let (mut ahead, _, ahead_thread) = subscribe(r#","after":99"#);
         assert_eq!(next(&mut ahead)["error"]["code"], "cursor_ahead");
         assert!(ahead_thread.join().unwrap().is_ok());
-        for (running, thread) in [(now_running, now_thread), (behind_running, behind_thread)] {
+        for (running, thread) in [
+            (now_running, now_thread),
+            (behind_running, behind_thread),
+            (explicit_running, explicit_thread),
+            (second_running, second_thread),
+        ] {
             running.store(false, Ordering::Relaxed);
             assert!(thread.join().unwrap().is_ok());
         }

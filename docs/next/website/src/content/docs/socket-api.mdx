@@ -649,7 +649,37 @@ Subscribe to events when you need a long-lived stream:
 
 The first response acknowledges the subscription. Later lines are pushed events.
 
-A subscription starts at the moment of subscribing: it streams events that happen after it attached, never a replay of what the server already holds. Pass `"after": <seq>` next to `subscriptions` to start from a cursor instead. If the server no longer holds events that far back, the first line is `{"event":"lagged","data":{"skipped_to":<seq>}}` and the stream resumes after `skipped_to`, so a consumer that falls behind learns it rather than missing events silently. A cursor past the newest event is refused with `cursor_ahead`. Use `events.read` when the consumer must see every durable event from a cursor.
+Check `ping.result.capabilities.events_live_start` before relying on this contract.
+A missing or false capability means an older server; keep that server's legacy
+handling rather than inferring behavior from its protocol number. This capability
+is additive and does not change the protocol version.
+
+A subscription without a cursor starts at `event_hub.current_sequence()` when it
+attaches. It streams subsequent events without replaying the retained ring.
+Current-state predicates, such as an already-matching agent status, still report
+the current state. For retained events, pass `"after_sequence": 42` next to
+`subscriptions`: only events with `seq > 42` are eligible. `after` is the compatible
+alias and remains the spelling sent by existing clients. Supplying both is invalid.
+A cursor past the newest event is refused with `cursor_ahead`.
+
+If the cursor falls behind the 4,096-entry ring, the stream reports a structured
+error, including the subscription request id:
+
+```json
+{"id":"sub_1","error":{"code":"events_lost","message":"Events were lost. Resync with per-verb reads ...","data":{"requested_sequence":12,"oldest_available_sequence":20,"current_sequence":4115}}}
+```
+
+`events_lost` has retry class `after_inspecting`: resync before treating the stream
+as complete. Use `workspace.list`, `pane.list`, `agent.list` and `msg.list` as
+appropriate. The unified `session.snapshot` resync is tracked separately in #2163
+and is not available yet. The stream continues with retained events starting at
+`oldest_available_sequence`; dedupe on `seq` after resync. A later overflow emits
+another error. `msg.wait_reply` also reports this error if its continuation loses
+events. Other ring errors close the stream after the diagnostic.
+
+Use `events.read` for durable history from a cursor; its disk retention and `gap`
+contract are unchanged. In-process bounded state folds are explicitly named
+`ring_snapshot_after`; they do not claim complete history.
 
 Workspace event subscriptions include `workspace.created`, `workspace.updated`, `workspace.renamed`, `workspace.closed`, and `workspace.focused`.
 

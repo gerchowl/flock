@@ -2715,6 +2715,7 @@ mod tests {
                     agent_start_label: true,
                     agent_questions: true,
                     pane_input_write_ack: false,
+                    events_live_start: false,
                 }),
                 session_health: None,
                 api_listener: None,

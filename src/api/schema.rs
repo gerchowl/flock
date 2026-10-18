@@ -2303,10 +2303,14 @@ pub enum ReadFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsSubscribeParams {
     pub subscriptions: Vec<Subscription>,
-    /// ADR-0028 §3 (#1030): stream events with `seq > after`. Absent means
-    /// from now, never a replay of the ring. A cursor older than the ring
-    /// gets a `lagged { skipped_to }` line first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Stream events strictly after the cursor; absent starts at now.
+    /// `after` remains the compatible wire spelling. `after_sequence` and
+    /// typed `events_lost` require the `events_live_start` server capability.
+    #[serde(
+        default,
+        alias = "after_sequence",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub after: Option<u64>,
 }
 
@@ -2934,6 +2938,9 @@ pub struct PeersEnrollResetParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerCapabilities {
+    /// Live subscription defaults, `after_sequence` alias and typed ring loss.
+    #[serde(default)]
+    pub events_live_start: bool,
     /// Enabled only after the complete server and client contract (#1639) ships.
     #[serde(default)]
     pub pane_input_write_ack: bool,
@@ -5619,6 +5626,15 @@ mod tests {
     }
 
     #[test]
+    fn subscription_accepts_explicit_after_sequence() {
+        let params: EventsSubscribeParams = serde_json::from_value(serde_json::json!({
+            "subscriptions": [], "after_sequence": 7
+        }))
+        .unwrap();
+        assert_eq!(params.after, Some(7));
+    }
+
+    #[test]
     fn subscribe_request_parses_parameterized_subscriptions() {
         let json = r#"
         {
@@ -5708,6 +5724,7 @@ mod tests {
                     agent_start_label: true,
                     agent_questions: true,
                     pane_input_write_ack: false,
+                    events_live_start: false,
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
@@ -5920,6 +5937,7 @@ mod tests {
         assert!(!json.contains("label"), "{json}");
 
         let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+        assert!(!old.events_live_start);
         assert!(!old.agent_start_label);
     }
 
@@ -6356,6 +6374,7 @@ mod pr_info_tests {
     #[test]
     fn s3a_write_capability_defaults_false_and_negative_counts_are_invalid() {
         let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+        assert!(!old.events_live_start);
         assert!(!old.pane_input_write_ack);
         assert_eq!(
             serde_json::to_value(old).unwrap()["pane_input_write_ack"],

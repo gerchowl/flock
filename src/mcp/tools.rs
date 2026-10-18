@@ -1674,6 +1674,14 @@ mod tests {
             panic!("expected events.read");
         };
         assert_eq!(params.after, 4);
+        assert_eq!(serde_json::to_value(&params).unwrap()["after"], 4);
+        let Method::EventsRead(initial) = build_events_read(json!({})).unwrap() else {
+            panic!("expected events.read");
+        };
+        assert_eq!(
+            initial.after, 0,
+            "MCP still requests durable history explicitly"
+        );
         assert_eq!(params.subjects, ["ws_1:p1"]);
         assert_eq!(params.wait_ms, Some(MCP_EVENTS_READ_MAX_WAIT_MS));
         assert!(build_events_read(json!({"kinds": ["no_such_kind"]})).is_err());
