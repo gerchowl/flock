@@ -4,12 +4,12 @@ use super::*;
 pub(super) struct Intent<'a> {
     namespace: &'a Namespace,
     name: String,
-    file: File,
+    file: LockFile,
 }
 impl<'a> Intent<'a> {
     pub(super) fn begin(namespace: &'a Namespace, nonce: String) -> Result<Self, TokenError> {
         let staged = format!(".intent-{nonce}");
-        let file = namespace.file(&staged, true)?;
+        let file = LockFile::new(namespace.file(&staged, true)?);
         let mut intent = Self {
             namespace,
             name: staged,
@@ -43,6 +43,7 @@ pub(super) fn pending(namespace: &Namespace) -> Result<bool, TokenError> {
         }
         match namespace
             .file(name, false)
+            .map(LockFile::new)
             .and_then(|file| match file.try_lock() {
                 Ok(()) => Ok(false),
                 Err(TryLockError::WouldBlock) => Ok(true),

@@ -551,7 +551,7 @@ fn lease_probe_child() {
         return;
     };
     let file = private_fs::open_append_file(Path::new(&path)).unwrap();
-    match file.try_lock() {
+    match LockFile::new(file).try_lock() {
         Ok(()) => (),
         Err(std::fs::TryLockError::WouldBlock) => std::process::exit(42),
         Err(error) => panic!("unexpected lease failure: {error}"),
@@ -858,4 +858,25 @@ fn unknown_producer_tag_preserves_its_uninterpreted_payload() {
     assert_eq!(journal.items()[0].producer, Producer::Unknown(raw));
     assert_eq!(journal.replay(0).unwrap().records, [record]);
     assert!(journal.checkpoint().is_err());
+}
+
+#[test]
+fn inherited_queue_lock_does_not_refuse_reopen() {
+    let root = Root::new();
+    let mut journal = root.open();
+    journal.append(upsert("retained", 0)).unwrap();
+    let mut holder =
+        crate::platform::file_lock::inherited_holder::Holder::spawn(&journal._lease).unwrap();
+    drop(journal);
+    let reopened = Journal::open(&root.0, "fixture-agent");
+    holder.verify().unwrap();
+    assert!(
+        reopened.is_ok(),
+        "queue lease retained by child={} fd={} inode={}: {:?}",
+        holder.pid,
+        holder.descriptor,
+        holder.inode,
+        reopened.as_ref().err().map(io::Error::kind)
+    );
+    assert_eq!(reopened.unwrap().items.len(), 1);
 }

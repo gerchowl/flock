@@ -909,19 +909,23 @@ fn write_entry(entry: &Entry) -> io::Result<()> {
 /// `lock` because a busy delegate is an answer, not a queue: blocking here would
 /// turn `delegate send` into an unbounded wait nobody asked for.
 struct Lock {
-    /// Held open and never dropped early: the lock exists for exactly as long as
-    /// the `File` does, so closing it early would hand a second round the
-    /// delegate while this one is still typing into it.
-    _file: std::fs::File,
+    /// Dropping explicitly unlocks, independent of fork-inherited descriptors.
+    _file: crate::platform::file_lock::LockFile,
 }
 
 fn take_lock(name: &str) -> Result<Lock, &'static str> {
-    let path = lock_path(name);
+    take_lock_at(&lock_path(name))
+}
+
+/// Acquire the delegate lock at its resolved, unchanged registry path.
+fn take_lock_at(path: &Path) -> Result<Lock, &'static str> {
     let Some(dir) = path.parent() else {
         return Err("the lock path has no parent");
     };
     std::fs::create_dir_all(dir).map_err(|_| "could not create the delegate registry directory")?;
-    let file = open_lock_file(&path).map_err(|_| "could not open the delegate lock")?;
+    let file = crate::platform::file_lock::LockFile::new(
+        open_lock_file(path).map_err(|_| "could not open the delegate lock")?,
+    );
     match file.try_lock() {
         Ok(()) => Ok(Lock { _file: file }),
         Err(std::fs::TryLockError::WouldBlock) => Err("busy"),
@@ -4640,12 +4644,9 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
     // `removed: false` for every field — the serialisation we gave up by
     // skipping the lock is replaced by that record of who did what (F13).
     let _lock = match take_lock(name) {
-        Ok(lock) => lock,
+        Ok(lock) => Some(lock),
         Err("busy") if !flags.force => return Ok(fail(format!("delegate {name} is busy"))),
-        Err("busy") => match open_lock_file(&lock_path(name)) {
-            Ok(file) => Lock { _file: file },
-            Err(err) => return Ok(fail(format!("delegate {name}: {err}"))),
-        },
+        Err("busy") => None,
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
     let Some(entry) = read_entry(name) else {
@@ -5741,6 +5742,27 @@ fn emit_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inherited_delegate_lock_does_not_refuse_the_next_round() {
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let path = root.path().join("delegate.lock");
+        let lock = take_lock_at(&path).unwrap();
+        let mut holder =
+            crate::platform::file_lock::inherited_holder::Holder::spawn(&lock._file).unwrap();
+        drop(lock);
+        let next = take_lock_at(&path);
+        holder.verify().unwrap();
+        assert!(
+            next.is_ok(),
+            "delegate lock retained by child={} fd={} inode={}: {:?}",
+            holder.pid,
+            holder.descriptor,
+            holder.inode,
+            next.as_ref().err()
+        );
+    }
 
     #[test]
     fn expired_report_uses_cached_screen_without_io_or_advice() {
