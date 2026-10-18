@@ -23,6 +23,7 @@ struct Pane {
     registry: PathBuf,
     socket: PathBuf,
     calls: Arc<AtomicUsize>,
+    screen_reads: Arc<AtomicUsize>,
     /// `wait_ms` of each held `events.read`, when the fake plays a server
     /// with it (#1030).
     holds: Arc<Mutex<Vec<u64>>>,
@@ -89,6 +90,8 @@ impl Pane {
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let counted = calls.clone();
+        let screen_reads = Arc::new(AtomicUsize::new(0));
+        let counted_screens = screen_reads.clone();
         let mut stall_until: Option<Instant> = None;
         let holds = Arc::new(Mutex::new(Vec::new()));
         let held = holds.clone();
@@ -148,6 +151,7 @@ impl Pane {
                         record
                     }
                     "pane.read" => {
+                        counted_screens.fetch_add(1, Ordering::SeqCst);
                         // `delegate wait` asks for the faint-blanked copy too (#892).
                         assert!(["detection", "detection_unfaint"]
                             .contains(&request["params"]["source"].as_str().unwrap_or_default()));
@@ -231,6 +235,7 @@ impl Pane {
             base,
             socket,
             calls,
+            screen_reads,
             holds,
             stop,
             worker: Some(worker),
@@ -908,14 +913,17 @@ fn delegate_status_without_leftover_shells_says_false() {
 /// status that read the screen instead would report false here.
 #[test]
 fn delegate_status_takes_settled_shells_from_the_server_record() {
-    let pane = Pane::new("idle+shells", "DONE: recovered");
-    let status = pane
-        .command(&["delegate", "status", "fixture", "--json"], None)
-        .output()
-        .unwrap();
-    let status = Pane::json(&status);
-    assert_eq!(status["agent_status"], "idle");
-    assert_eq!(status["settled_with_background_shells"], true);
+    for state in ["idle", "done"] {
+        let pane = Pane::new(&format!("{state}+shells"), "DONE: recovered");
+        let status = pane
+            .command(&["delegate", "status", "fixture", "--json"], None)
+            .output()
+            .unwrap();
+        let status = Pane::json(&status);
+        assert_eq!(status["agent_status"], state);
+        assert_eq!(status["settled_with_background_shells"], true);
+        assert_eq!(pane.screen_reads.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[test]

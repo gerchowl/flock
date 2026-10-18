@@ -26,6 +26,8 @@ pub(super) struct InputPayload {
     pub deadline: Instant,
     pub operator_interrupt: bool,
     pub paste: Option<Paste>,
+    /// Admit an explicit lock choice while obtaining its actual write receipt.
+    pub codex_lock: bool,
 }
 
 struct PendingWrite {
@@ -256,6 +258,7 @@ impl super::App {
             deadline,
             operator_interrupt,
             mut paste,
+            codex_lock,
         } = payload;
         let Some(terminal) = self.state.terminal_id_for_pane(ws, pane) else {
             return super::api::responses::encode_error(
@@ -287,6 +290,12 @@ impl super::App {
             let (ticket, receipt) = WriteReceipt::channel(bytes, Some(deadline));
             let _ = ticket.write(|_| Ok(0));
             receipt
+        } else if codex_lock {
+            match runtime.try_resolve_codex_lock_at(bytes, deadline, Instant::now()) {
+                Ok(receipt) => receipt,
+                Err(code) => return super::api::responses::encode_error(id, code,
+                    "No key sent: lock absent or a prior choice is within its bounded write/settle window"),
+            }
         } else {
             runtime.try_send_tracked(bytes, deadline, operator_interrupt)
         };

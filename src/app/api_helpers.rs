@@ -184,6 +184,41 @@ pub(super) fn pane_agent_status_from_terminal(
     pane_agent_status_for_state(terminal, terminal.state, seen, runtime_present)
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_AGENT_OBSERVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Apply live lock evidence once for both pane and agent reporting (ADR-0027 §1b).
+/// Offline and hibernated identities keep their lifecycle status. A snapshot
+/// failure is Unknown and cannot supply a lock reason or prove an unlock.
+pub(super) fn pane_agent_observation(
+    terminal: &crate::terminal::TerminalState,
+    seen: bool,
+    runtime: Option<&crate::terminal::TerminalRuntime>,
+) -> (
+    crate::api::schema::AgentStatus,
+    Option<crate::pane::CodexLockState>,
+) {
+    use crate::api::schema::AgentStatus;
+    use crate::pane::CodexLockState;
+    #[cfg(test)]
+    TEST_AGENT_OBSERVATIONS.with(|count| count.set(count.get() + 1));
+    let status = pane_agent_status_from_terminal(terminal, seen, runtime.is_some());
+    if matches!(status, AgentStatus::Offline | AgentStatus::Hibernated)
+        || terminal.effective_known_agent() != Some(crate::detect::Agent::Codex)
+    {
+        return (status, None);
+    }
+    let lock = runtime.map(|runtime| runtime.codex_conversation_locked());
+    let status = match lock {
+        Some(CodexLockState::Locked) => AgentStatus::Blocked,
+        Some(CodexLockState::Unavailable(_)) => AgentStatus::Unknown,
+        _ => status,
+    };
+    (status, lock)
+}
+
 /// Project a detector transition through the terminal's current lifecycle.
 /// Lifecycle outranks both sides of a turn transition (ADR-0028 §1).
 pub(super) fn pane_agent_status_for_state(

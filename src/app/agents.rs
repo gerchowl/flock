@@ -1279,15 +1279,28 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
-        let status = super::api_helpers::pane_agent_status_from_terminal(
+        let (status, _) = super::api_helpers::pane_agent_observation(
             terminal,
             pane_state.seen,
-            self.terminal_runtimes.get(&terminal.id).is_some(),
+            self.terminal_runtimes.get(&terminal.id),
         );
+        Some((
+            terminal.agent_id.to_string(),
+            self.agent_state_for_status(terminal, status, now),
+        ))
+    }
+
+    /// Project state from the same status used by the rest of this record.
+    fn agent_state_for_status(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+        status: crate::api::schema::AgentStatus,
+        now: Instant,
+    ) -> crate::api::agent_state::AgentState {
         let provider_wait = (status == crate::api::schema::AgentStatus::Blocked)
             .then_some(terminal.provider_limit.as_ref())
             .flatten();
-        let state = super::api_helpers::agent_state(
+        super::api_helpers::agent_state(
             status,
             terminal.last_state_authority(),
             terminal.effective_known_agent(),
@@ -1301,8 +1314,7 @@ impl App {
                 terminal.question.as_ref(),
             ),
             self.waits.waiting(&terminal.agent_id.to_string()),
-        );
-        Some((terminal.agent_id.to_string(), state))
+        )
     }
 
     pub(super) fn agent_info(
@@ -1325,8 +1337,14 @@ impl App {
         if !terminal.is_agent_terminal() {
             return None;
         }
-        let pane = self.pane_info(ws_idx, pane_id)?;
-        let provider_wait = (pane.agent_status == crate::api::schema::AgentStatus::Blocked)
+        let (status, lock) = super::api_helpers::pane_agent_observation(
+            terminal,
+            pane_state.seen,
+            self.terminal_runtimes.get(&terminal.id),
+        );
+        let pane = self.pane_info_with_status(ws_idx, pane_id, status)?;
+        let codex_lock = lock == Some(crate::pane::CodexLockState::Locked);
+        let provider_wait = (status == crate::api::schema::AgentStatus::Blocked)
             .then_some(terminal.provider_limit.as_ref())
             .flatten();
         Some(crate::api::schema::AgentInfo {
@@ -1340,14 +1358,18 @@ impl App {
             // that has since moved on (a hook reporting work) outranks it.
             settled_with_background_shells: terminal.settled_with_background_shells
                 && matches!(
-                    pane.agent_status,
+                    status,
                     crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
                 ),
-            state: self
-                .agent_state_of_at(ws_idx, pane_id, now)
-                .map(|(_, state)| state),
-            agent_status: pane.agent_status,
-            blocked_reason: if terminal.resume_failed {
+            state: Some(self.agent_state_for_status(terminal, status, now)),
+            agent_status: status,
+            blocked_reason: if codex_lock {
+                Some(
+                    crate::api::error_code::ErrorCode::CodexConversationLocked
+                        .as_str()
+                        .into(),
+                )
+            } else if terminal.resume_failed {
                 Some("resume_failed".into())
             } else {
                 provider_wait.as_ref().map(|_| "provider_limit".into())
@@ -1506,6 +1528,221 @@ enum StartPlacement {
 #[cfg(test)]
 mod tests {
     use crate::api::schema::{AgentStartParams, Method, Request};
+
+    fn locked_codex_app() -> (super::App, crate::terminal::TerminalId, String) {
+        let (mut app, _) = app_with_workspace("lock-reporting", None);
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let (runtime, _receiver) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(
+            include_str!("../../tests/fixtures/codex/conversation-locked.txt")
+                .replace('\n', "\r\n")
+                .as_bytes(),
+        );
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Codex),
+                crate::detect::AgentState::Idle,
+            );
+        let public_id = app.public_pane_id(0, pane).unwrap();
+        (app, terminal_id, public_id)
+    }
+
+    fn assert_lock_read_status(app: &mut super::App, pane: &str, expected: &str) {
+        for (method, params, field, list) in [
+            (
+                "pane.get",
+                serde_json::json!({"pane_id": pane}),
+                "pane",
+                false,
+            ),
+            ("pane.list", serde_json::json!({}), "panes", true),
+            (
+                "agent.get",
+                serde_json::json!({"target": pane}),
+                "agent",
+                false,
+            ),
+            ("agent.list", serde_json::json!({}), "agents", true),
+        ] {
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "lock-read", "method": method, "params": params,
+            }))
+            .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert!(response.get("error").is_none(), "{method}: {response}");
+            let records = &response["result"][field];
+            let record = if list {
+                records
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["pane_id"] == pane)
+                    .unwrap()
+            } else {
+                records
+            };
+            assert_eq!(record["agent_status"], expected, "{method}: {response}");
+            if method.starts_with("agent.") {
+                assert_eq!(
+                    record["blocked_reason"].as_str(),
+                    (expected == "blocked").then_some("codex_conversation_locked")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_lock_pane_and_agent_api_reads_agree() {
+        let (mut app, _, pane) = locked_codex_app();
+        assert_lock_read_status(&mut app, &pane, "blocked");
+    }
+
+    #[tokio::test]
+    async fn codex_lock_poison_projects_unknown_without_failing_lists() {
+        for warm_cache in [false, true] {
+            let (mut app, terminal_id, pane) = locked_codex_app();
+            if warm_cache {
+                app.collect_agent_infos();
+            }
+            app.terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .test_poison_detection_core();
+            for _ in 0..3 {
+                assert_lock_read_status(&mut app, &pane, "unknown");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_lock_snapshot_failure_projects_unknown_without_failing_lists() {
+        let (mut app, terminal_id, pane) = locked_codex_app();
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_fail_detection_snapshot();
+        let before = crate::pane::PaneRuntime::test_detection_text_reads();
+        for _ in 0..3 {
+            assert_lock_read_status(&mut app, &pane, "unknown");
+        }
+        assert_eq!(
+            crate::pane::PaneRuntime::test_detection_text_reads() - before,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_info_uses_one_status_observation() {
+        let (app, _, public_pane) = locked_codex_app();
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let before = super::super::api_helpers::TEST_AGENT_OBSERVATIONS.with(std::cell::Cell::get);
+        let info = app.agent_info(0, pane).unwrap();
+        assert_eq!(info.pane_id, public_pane);
+        assert_eq!(info.agent_status, crate::api::schema::AgentStatus::Blocked);
+        assert_eq!(
+            info.state.unwrap().turn,
+            crate::api::agent_state::Turn::Unknown
+        );
+        assert_eq!(
+            super::super::api_helpers::TEST_AGENT_OBSERVATIONS.with(std::cell::Cell::get) - before,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_info_caches_codex_lock_per_screen_revision() {
+        use crate::api::schema::AgentStatus;
+        let (mut app, _) = app_with_workspace("lock-read-count", None);
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let (runtime, _receiver) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(
+            include_str!("../../tests/fixtures/codex/conversation-locked.txt")
+                .replace('\n', "\r\n")
+                .as_bytes(),
+        );
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        for state in [
+            crate::detect::AgentState::Idle,
+            crate::detect::AgentState::Working,
+            crate::detect::AgentState::Blocked,
+        ] {
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .set_detected_state(Some(crate::detect::Agent::Codex), state);
+            let before = crate::pane::PaneRuntime::test_detection_text_reads();
+            for _ in 0..100 {
+                for info in [
+                    app.agent_info(0, pane).unwrap(),
+                    app.collect_agent_infos().pop().unwrap(),
+                ] {
+                    assert_eq!(
+                        info.blocked_reason.as_deref(),
+                        Some("codex_conversation_locked")
+                    );
+                    assert_eq!(info.agent_status, AgentStatus::Blocked);
+                }
+            }
+            assert_eq!(
+                crate::pane::PaneRuntime::test_detection_text_reads() - before,
+                usize::from(state == crate::detect::AgentState::Idle)
+            );
+        }
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[2J\x1b[H> unlocked");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Codex),
+                crate::detect::AgentState::Idle,
+            );
+        let before = crate::pane::PaneRuntime::test_detection_text_reads();
+        let info = app.agent_info(0, pane).unwrap();
+        assert_eq!(info.agent_status, AgentStatus::Idle);
+        assert!(info.blocked_reason.is_none());
+        assert_eq!(
+            crate::pane::PaneRuntime::test_detection_text_reads() - before,
+            1
+        );
+        app.agent_info(0, pane).unwrap();
+        assert_eq!(
+            crate::pane::PaneRuntime::test_detection_text_reads() - before,
+            1
+        );
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .scroll_up(10);
+        let before = crate::pane::PaneRuntime::test_detection_text_reads();
+        app.agent_info(0, pane).unwrap();
+        assert_eq!(
+            crate::pane::PaneRuntime::test_detection_text_reads(),
+            before
+        );
+        app.terminal_runtimes
+            .get(&terminal_id)
+            .unwrap()
+            .resize(24, 100, 0, 0);
+        let before = crate::pane::PaneRuntime::test_detection_text_reads();
+        app.agent_info(0, pane).unwrap();
+        app.agent_info(0, pane).unwrap();
+        assert_eq!(
+            crate::pane::PaneRuntime::test_detection_text_reads() - before,
+            1
+        );
+    }
 
     #[test]
     fn deferred_restore_without_runtime_is_offline_and_resumable() {
