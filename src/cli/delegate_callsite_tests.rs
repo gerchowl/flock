@@ -995,3 +995,16 @@ fn r2_submit_cap_exceeds_the_server_waits_and_reply_margin() {
     let server_waits = crate::app::guarded_submit::SUBMIT_WAIT_BOUND;
     assert!(cap_for(&method) > server_waits + Duration::from_secs(1));
 }
+
+#[test]
+fn delegate_budget_probe_restores_the_callers_socket_setting() {
+    let _environment = SubmitTestEnv::capture();
+    let directory = crate::test_support::TempDir::socket();
+    let prior = directory.path().join("caller.sock");
+    std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &prior);
+    s4_delegate_write_budget_fits_the_actual_cap_and_preserves_unknown_effect();
+    assert_eq!(
+        std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR),
+        Some(prior.into_os_string())
+    );
+}

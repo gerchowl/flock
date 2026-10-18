@@ -240,3 +240,148 @@ fn guarded_final_receipt_keeps_its_existing_envelope() {
     );
     assert_eq!(peer.finish().len(), 2);
 }
+
+fn guarded_agent() -> Request {
+    serde_json::from_value(json!({"id":"guarded-agent","method":"agent.send",
+        "params":{"target":"fixture-agent","text":"hello","submit":true}}))
+    .unwrap()
+}
+
+#[test]
+fn explicit_write_range_errors_are_distinct_from_caller_budget_errors() {
+    for timeout in [json!(0), json!(40000), json!(-1), json!(1.5), json!("10")] {
+        let mut request = raw("pane.send_input");
+        if let Method::PaneSendInput(p) = &mut request.method {
+            p.write_timeout_ms = Some(timeout);
+        }
+        let error = bind(&request, CAP).unwrap_err();
+        assert_eq!(error["error"]["code"], "invalid_params");
+        assert_eq!(
+            error["error"]["message"],
+            "write_timeout_ms must be an integer in 1..=30000"
+        );
+    }
+    let error = bind(&raw("pane.send_input"), Duration::from_millis(1001)).unwrap_err();
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("caller budget"));
+}
+
+#[test]
+fn agent_target_refusal_drops_pane_expected_but_keeps_other_metadata() {
+    let peer = ScriptedApi::new(vec![
+        ("ping", Some(ping(true))),
+        (
+            "pane.write_text",
+            Some(json!({
+                "error":{"code":"pane_not_found","message":"missing pane", "data":{
+                    "expected":[{"type":"pane","pane":"<pane>"}],"candidates":[],"detail":"preserve"}}
+            })),
+        ),
+    ]);
+    let request: Request = serde_json::from_value(json!({"id":"agent","method":"agent.send",
+        "params":{"target":"missing","text":"hello","submit":false}}))
+    .unwrap();
+    let response = peer.client().request_value(&request).unwrap();
+    assert_eq!(response["error"]["code"], "agent_not_found");
+    assert!(response["error"]["data"].get("expected").is_none());
+    assert_eq!(response["error"]["data"]["detail"], "preserve");
+    assert_eq!(response["error"]["data"]["candidates"], json!([]));
+    assert_eq!(peer.finish().len(), 2);
+}
+
+#[test]
+fn guarded_agent_uses_the_server_derived_cap_and_preserves_its_method() {
+    let request = guarded_agent();
+    assert_eq!(cap(&request.method), SUBMIT_CAP);
+    assert!(requires(&request.method));
+    assert!(bind(&request, CAP).is_err());
+    assert_eq!(bind(&request, SUBMIT_CAP).unwrap().method, request.method);
+    let result = json!({"result":{"type":"guarded_submit","outcome":"accepted","reason":null,"retried":false}});
+    let peer = ScriptedApi::new(vec![
+        ("ping", Some(ping(true))),
+        ("agent.send", Some(result.clone())),
+    ]);
+    assert_eq!(
+        peer.client().request_value(&request).unwrap()["result"],
+        result["result"]
+    );
+    let calls = peer.finish();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1]["params"]["target"], "fixture-agent");
+    assert_eq!(calls[1]["params"]["submit"], true);
+    assert!(calls[1]["params"].get("pane_id").is_none());
+}
+
+#[test]
+fn guarded_agent_refuses_a_short_budget_before_dispatch() {
+    let peer = ScriptedApi::new(vec![("ping", Some(ping(true)))]);
+    let response = peer
+        .client()
+        .request_value_with_timeout(&guarded_agent(), Duration::from_secs(7))
+        .unwrap();
+    assert_eq!(response["error"]["code"], "invalid_params");
+    assert_eq!(peer.finish().len(), 1);
+}
+
+#[test]
+fn guarded_agent_lost_reply_is_unknown_and_never_replayed() {
+    let peer = ScriptedApi::new(vec![("ping", Some(ping(true))), ("agent.send", None)]);
+    let response = peer
+        .client()
+        .request_value_retrying(&guarded_agent(), SUBMIT_CAP, None)
+        .unwrap();
+    assert_eq!(response["error"]["code"], "input_write_unknown");
+    assert_eq!(peer.finish().len(), 2);
+}
+
+struct GatedInvocation;
+impl GatedInvocation {
+    fn begin(client: &ApiClient) -> Self {
+        crate::api::compatibility::begin_cli(client, true, |_| {});
+        Self
+    }
+}
+impl Drop for GatedInvocation {
+    fn drop(&mut self) {
+        crate::api::compatibility::end_cli();
+    }
+}
+
+#[test]
+fn gated_input_uses_one_fresh_probe_for_version_and_capability() {
+    let peer = ScriptedApi::new(vec![
+        ("ping", Some(ping(true))),
+        ("pane.write_input", Some(json!({"result":{"type":"ok"}}))),
+    ]);
+    let client = peer.client();
+    let _invocation = GatedInvocation::begin(&client);
+    assert!(client
+        .request_value(&raw("pane.send_input"))
+        .unwrap()
+        .get("result")
+        .is_some());
+    assert_eq!(
+        peer.finish()
+            .iter()
+            .filter(|r| r["method"] == "ping")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn gated_exhausted_budget_does_not_connect_for_a_version_probe() {
+    let directory = crate::test_support::TempDir::socket();
+    let socket = directory.path().join("unserved.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let client = ApiClient::for_target(ConnectionTarget::SocketPath(socket));
+    let _invocation = GatedInvocation::begin(&client);
+    let response = client
+        .request_value_with_timeout(&raw("pane.send_input"), Duration::ZERO)
+        .unwrap();
+    assert_eq!(response["error"]["code"], "invalid_params");
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+}

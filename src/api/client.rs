@@ -520,6 +520,52 @@ pub(crate) fn parse_response_value(
 mod tests {
     use super::*;
 
+    #[test]
+    fn bounded_reply_line_refuses_oversize_and_accepts_the_exact_limit() {
+        // The documented bounded-reply payload limit excludes its newline.
+        const LIMIT: usize = 8 * 1024 * 1024;
+        fn read_payload(bytes: usize) -> Result<serde_json::Value, ApiClientError> {
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            writer
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let task = std::thread::spawn(move || {
+                let data = format!("\"{}\"\n", "x".repeat(bytes - 2));
+                if let Err(error) = writer.write_all(data.as_bytes()) {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                        ),
+                        "{error}"
+                    );
+                }
+            });
+            let result = read_json_line_until(
+                &reader,
+                Instant::now() + Duration::from_secs(10),
+                Instant::now,
+            );
+            drop(reader);
+            task.join().unwrap();
+            result
+        }
+        let oversized = read_payload(LIMIT + 1);
+        assert!(oversized.is_err(), "oversized JSON reply must be refused");
+        let error = oversized.unwrap_err();
+        assert!(format!("{error:?}").starts_with("ReplyLineTooLarge"));
+        assert_eq!(
+            error.to_string(),
+            format!("api reply line exceeds {LIMIT} bytes")
+        );
+        for bytes in [LIMIT - 1, LIMIT] {
+            assert_eq!(
+                read_payload(bytes).unwrap().as_str().unwrap().len(),
+                bytes - 2
+            );
+        }
+    }
+
     /// Joining the peer gates the client after write until the reply and EOF exist.
     fn closed_reply(method: Method, result: serde_json::Value) {
         let tag = if matches!(method, Method::PaneSubmit(_)) {
