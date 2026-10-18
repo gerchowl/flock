@@ -9,14 +9,14 @@ fn forward() -> Value {
 }
 #[test]
 fn retained_dead_count_prunes_oldest_and_never_caps_forward() {
-    let mut raw: Vec<_> = (0..300).map(|i| json!({"invalid": i})).collect();
-    raw.extend((0..300).map(|_| forward()));
+    let mut raw: Vec<_> = (0..300).map(|i| json!(i)).collect();
+    raw.extend((0..300).map(|i| json!({"runtime":"future-runtime", "index":i})));
     let mut store = registry(Value::Array(raw));
-    store.prepare_retained_save(100);
+    store.prepare_retained_save(100, true);
     let saved = serde_json::to_value(&store).unwrap();
     assert_eq!(saved.as_array().unwrap().len(), RETAINED_DEAD_MAX + 300);
-    assert_eq!(saved[0], json!({"invalid":44}));
-    assert_eq!(saved[255], json!({"invalid":299}));
+    assert_eq!(saved[0], json!(44));
+    assert_eq!(saved[255], json!(299));
     let info = store.retained_records();
     assert_eq!(
         info.iter()
@@ -32,16 +32,15 @@ fn retained_dead_count_prunes_oldest_and_never_caps_forward() {
 }
 #[test]
 fn retained_dead_age_is_strict_and_clock_rollback_is_safe() {
-    let raw =
-        json!([{"invalid":true}, forward(), {"runtime":"structured","harness":"future-harness"}]);
+    let raw = json!([true, forward(), {"runtime":"structured","harness":"future-harness"}]);
     let mut store = registry(raw.clone());
-    store.prepare_retained_save(100);
-    store.prepare_retained_save(50);
+    store.prepare_retained_save(100, true);
+    store.prepare_retained_save(50, true);
     assert_eq!(serde_json::to_value(&store).unwrap(), raw);
     let age = RETAINED_DEAD_MAX_AGE.as_millis() as u64;
-    store.prepare_retained_save(100 + age);
+    store.prepare_retained_save(100 + age, true);
     assert_eq!(serde_json::to_value(&store).unwrap(), raw);
-    store.prepare_retained_save(101 + age);
+    store.prepare_retained_save(101 + age, true);
     assert_eq!(
         serde_json::to_value(&store).unwrap(),
         json!([forward(), {"runtime":"structured","harness":"future-harness"}])
@@ -55,7 +54,7 @@ fn retained_dead_age_is_strict_and_clock_rollback_is_safe() {
 fn retained_stamps_survive_roundtrip_without_changing_raw_record_bytes() {
     let mut store = registry(json!([forward(), {"invalid": 1}]));
     let before = serde_json::to_vec(&store).unwrap();
-    store.prepare_retained_save(42);
+    store.prepare_retained_save(42, true);
     assert_eq!(serde_json::to_vec(&store).unwrap(), before);
     let mut sidecar = store.retained_stamps();
     assert!(!sidecar.is_null(), "next save must stamp retained records");
@@ -67,7 +66,7 @@ fn retained_stamps_survive_roundtrip_without_changing_raw_record_bytes() {
     let mut restored = registry(serde_json::from_slice(&before).unwrap());
     restored.restore_retained_stamps(&sidecar);
     restored.restore_retained_stamps(&sidecar);
-    restored.prepare_retained_save(99);
+    restored.prepare_retained_save(99, true);
     assert!(restored
         .retained_records()
         .iter()
@@ -80,10 +79,10 @@ fn retained_stamps_survive_roundtrip_without_changing_raw_record_bytes() {
 #[test]
 fn retained_sidecar_mismatch_does_not_assign_another_records_age() {
     let mut original = registry(json!([{ "invalid": 1 }]));
-    original.prepare_retained_save(0);
+    original.prepare_retained_save(0, true);
     let mut changed = registry(json!([{ "invalid": 2 }]));
     changed.restore_retained_stamps(&original.retained_stamps());
-    changed.prepare_retained_save(10);
+    changed.prepare_retained_save(10, true);
     assert_eq!(changed.retained_records()[0].first_seen_ms, Some(10));
     let sidecar = changed.retained_stamps();
     let mut again = registry(serde_json::to_value(&changed).unwrap());
@@ -95,7 +94,7 @@ fn retained_unknown_sidecar_shape_is_preserved_without_automatic_pruning() {
     let mut store = registry(json!([{ "invalid": 1 }]));
     let opaque = json!({"future_retention_format":[1,2]});
     store.restore_retained_stamps(&opaque);
-    store.prepare_retained_save(u64::MAX);
+    store.prepare_retained_save(u64::MAX, true);
     assert_eq!(store.retained_stamps(), opaque);
     assert_eq!(store.retained_count(), 1);
     let mut metadata_only = registry(json!([]));
@@ -116,7 +115,7 @@ fn retained_non_array_admission_has_typed_actionable_error() {
     let message = error.to_string();
     assert!(message.contains("session-state repair guide"));
     assert!(message.contains("back up session.json"));
-    store.prepare_retained_save(u64::MAX);
+    store.prepare_retained_save(u64::MAX, true);
     assert_eq!(serde_json::to_value(store).unwrap(), raw);
 }
 #[test]
@@ -124,7 +123,7 @@ fn retained_shadow_duplicates_are_dead_and_removal_reindexes_stamps() {
     let known = super::tests::record("agent_fixture_known");
     let raw = serde_json::to_value(&known).unwrap();
     let mut store = registry(json!([raw, raw, forward()]));
-    store.prepare_retained_save(42);
+    store.prepare_retained_save(42, true);
     assert_eq!(store.retained_records()[0].kind, RetainedKind::Dead);
     let generation = store.get(&known.agent_id).unwrap().2;
     store.remove(&known.agent_id, generation).unwrap();
@@ -137,7 +136,7 @@ fn retained_shadow_duplicates_are_dead_and_removal_reindexes_stamps() {
 #[test]
 fn retained_sidecar_sequence_entry_is_preserved_without_becoming_a_stamp() {
     let mut original = registry(json!([forward()]));
-    original.prepare_retained_save(42);
+    original.prepare_retained_save(42, true);
     let stamp = original.retained_stamps()[0].clone();
     let sequence = json!([stamp["slot"], stamp["digest"], 7]);
     let mut restored = registry(json!([forward()]));
@@ -147,12 +146,79 @@ fn retained_sidecar_sequence_entry_is_preserved_without_becoming_a_stamp() {
 }
 
 #[test]
+fn retained_supported_tags_changed_shape_are_forward_past_age_and_count() {
+    let raw: Vec<_> = (0..300)
+        .map(|i| {
+            json!({
+                "runtime":"structured","harness":"claude", "agent_id":format!("future-{i}"),
+                "session_id":format!("session-{i}"),"cwd":{"future_path":["workspace"]}
+            })
+        })
+        .collect();
+    let mut store = registry(json!(raw));
+    assert!(store
+        .retained_records()
+        .iter()
+        .all(|r| r.kind == RetainedKind::Forward));
+    store.prepare_retained_save(42, true);
+    store.prepare_retained_save(43 + RETAINED_DEAD_MAX_AGE.as_millis() as u64, true);
+    assert_eq!(serde_json::to_value(&store).unwrap(), json!(raw));
+    assert_eq!(store.retained_count(), 300);
+}
+#[test]
+fn retained_non_identical_conflicts_and_odd_identities_are_forward() {
+    let record = super::tests::record("agent_fixture_conflict");
+    let original = serde_json::to_value(&record).unwrap();
+    let mut conflicting = original.clone();
+    conflicting["model"] = json!("different-model");
+    let mut odd = original.clone();
+    odd["agent_id"] = json!("");
+    let mut store = registry(json!([original, conflicting, odd]));
+    assert_eq!(store.retained_records().len(), 2);
+    assert!(store
+        .retained_records()
+        .iter()
+        .all(|r| r.kind == RetainedKind::Forward));
+    store.prepare_retained_save(0, true);
+    store.prepare_retained_save(u64::MAX, true);
+    assert_eq!(store.retained_count(), 2);
+    assert_eq!(store.records().len(), 1);
+}
+#[test]
+fn retained_exact_forward_duplicates_and_non_objects_are_dead_and_pruned() {
+    let raw = forward();
+    let sequence = json!([
+        "structured",
+        "agent_fixture_sequence",
+        null,
+        "claude",
+        "session-sequence",
+        "workspace",
+        null
+    ]);
+    let mut store = registry(json!([raw, raw, null, false, 7, "broken", [], sequence]));
+    assert!(
+        store.records().is_empty(),
+        "non-object Record sequences must never activate"
+    );
+    let info = store.retained_records();
+    assert_eq!(info[0].kind, RetainedKind::Forward);
+    assert!(info[1..].iter().all(|r| r.kind == RetainedKind::Dead));
+    store.prepare_retained_save(42, true);
+    store.prepare_retained_save(43 + RETAINED_DEAD_MAX_AGE.as_millis() as u64, true);
+    assert_eq!(serde_json::to_value(&store).unwrap(), json!([raw]));
+}
+
+#[test]
 fn retained_explicit_purge_respects_age_kind_missing_stamps_and_live_workers() {
     let known = super::tests::record("agent_fixture_live");
-    let mut store =
-        registry(json!([serde_json::to_value(&known).unwrap(), {"invalid":true}, forward()]));
+    let mut store = registry(json!([
+        serde_json::to_value(&known).unwrap(),
+        true,
+        forward()
+    ]));
     assert_eq!(store.purge_retained(true, Some(0), 100), 0);
-    store.prepare_retained_save(42);
+    store.prepare_retained_save(42, true);
     let generation = store.get(&known.agent_id).unwrap().2;
     store
         .apply(

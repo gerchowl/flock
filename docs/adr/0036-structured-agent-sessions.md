@@ -434,16 +434,24 @@ and other panes retain normal resume behavior. A registry-only session remains
 persistable even when it contains only inactive raw entries and no terminal
 workspaces.
 
-**Retained-record lifetime (owner decision, #1853).** Inactive records with an
-unknown nonempty runtime or harness tag are **FORWARD** data: a newer flk may
-understand them, so a rollback never auto-prunes them, regardless of age/count.
-Supported-tag records that are invalid or shadowed duplicates are **DEAD**.
+**Retained-record lifetime (corrected owner decision, #1853).** DEAD classification
+is version-independent: an element is **DEAD** only when it is not a JSON object,
+or its canonical digest equals a record already kept, live or retained (an exact
+duplicate). Canonical JSON here sorts object keys and preserves JSON value types.
+Everything else this build cannot use is **FORWARD**, never automatically pruned:
+supported-tag parse failures (including future field shapes), unknown runtime or
+harness values, empty/odd identity strings, and non-identical conflicting records
+sharing an agent ID, name or session ID. Current-build parsing/validation failure
+is never evidence that another version cannot use an object (ADR-0028 §3a).
 On save, prune DEAD records strictly older than `RETAINED_DEAD_MAX_AGE` (30 days)
 and then enforce `RETAINED_DEAD_MAX` (256), oldest first. Equal timestamps use
 original array order. The injected clock determines age; a backward clock never
-ages a record early. Missing stamps receive the next save's time, not an invented
-historical age. A failed wall clock or an unknown sidecar collection format logs
-a warning and refuses automatic retention maintenance, preserving data.
+ages a record early. Missing stamps receive the next capture/save time, not an
+invented historical age. Every capture runs stamp-only preparation on its snapshot copy
+with an injected clock; undo/test captures never prune or mutate live state.
+Only actual save/export boundaries prune the live registry. A failed wall clock
+or an unknown sidecar collection format logs a warning and refuses automatic
+retention maintenance, preserving data.
 
 `first_seen_ms` is Unix milliseconds in the additive `structured_retention`
 sidecar field, never a property inserted into preserved record JSON. Each entry

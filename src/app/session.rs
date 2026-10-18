@@ -31,14 +31,18 @@ impl App {
     }
 
     /// Run save-time maintenance at the runtime boundary, keeping registry/capture pure.
-    pub(crate) fn prepare_retained_save(&mut self) {
+    pub(crate) fn prepare_retained_save(&mut self) -> Option<u64> {
         match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(elapsed) => self
-                .state
-                .structured_agents
-                .prepare_retained_save(elapsed.as_millis().min(u64::MAX as u128) as u64),
+            Ok(elapsed) => {
+                let now_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+                self.state
+                    .structured_agents
+                    .prepare_retained_save(now_ms, true);
+                Some(now_ms)
+            }
             Err(error) => {
-                tracing::warn!("retained maintenance refused: invalid wall clock: {error}")
+                tracing::warn!("retained maintenance refused: invalid wall clock: {error}");
+                None
             }
         }
     }
@@ -47,9 +51,13 @@ impl App {
     pub(crate) fn capture_session_snapshot(
         &self,
         registry: &crate::structured::registry::Registry,
+        retained_at_ms: Option<u64>,
     ) -> crate::persist::SessionSnapshot {
         let mut snap = crate::persist::capture(
-            registry,
+            crate::persist::RegistryCapture {
+                registry,
+                now_ms: retained_at_ms,
+            },
             &self.state.workspaces,
             &self.state.terminals,
             &self.terminal_runtimes,
@@ -75,11 +83,11 @@ impl App {
             return;
         }
 
-        self.prepare_retained_save();
+        let retained_at_ms = self.prepare_retained_save();
         if self.state.workspaces.is_empty() && self.state.structured_agents.is_empty() {
             crate::persist::clear();
         } else {
-            let snap = self.capture_session_snapshot(&self.state.structured_agents);
+            let snap = self.capture_session_snapshot(&self.state.structured_agents, retained_at_ms);
             let history = self.persist_pane_history.then(|| {
                 crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
             });
@@ -320,7 +328,7 @@ mod tests {
         std::fs::create_dir_all(crate::config::config_dir()).unwrap();
         assert!(crate::session::data_dir().starts_with(root.path()));
         let path = crate::session::data_dir().join("session.json");
-        let mut entries: Vec<_> = (0..300).map(|i| serde_json::json!({"invalid":i})).collect();
+        let mut entries: Vec<_> = (0..300).map(|i| serde_json::json!(i)).collect();
         entries.push(serde_json::json!({"runtime":"future-runtime","opaque":[1,2]}));
         let raw = serde_json::Value::Array(entries);
         {
@@ -347,7 +355,7 @@ mod tests {
             let saved: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             assert_eq!(saved["structured_agents"].as_array().unwrap().len(), 257);
-            assert_eq!(saved["structured_agents"][0]["invalid"], 44);
+            assert_eq!(saved["structured_agents"][0], 44);
             assert_eq!(saved["structured_agents"][256], raw[300]);
             let loaded = crate::persist::load().unwrap();
             assert!(loaded

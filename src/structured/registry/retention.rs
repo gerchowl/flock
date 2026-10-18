@@ -9,19 +9,12 @@ pub(super) struct Retained {
     metadata: Value,
 }
 impl Retained {
-    pub(super) fn new(raw: &Value) -> Self {
-        let future = [("runtime", "structured"), ("harness", "claude")]
-            .iter()
-            .any(|(key, supported)| {
-                raw.get(key)
-                    .and_then(Value::as_str)
-                    .is_some_and(|tag| !tag.is_empty() && tag != *supported)
-            });
+    pub(super) fn new(dead: bool) -> Self {
         Self {
-            kind: if future {
-                RetainedKind::Forward
-            } else {
+            kind: if dead {
                 RetainedKind::Dead
+            } else {
+                RetainedKind::Forward
             },
             first_seen_ms: None,
             metadata: serde_json::json!({}),
@@ -34,7 +27,7 @@ struct Stamp {
     digest: String,
     first_seen_ms: u64,
 }
-fn digest(raw: &Value) -> String {
+pub(super) fn digest(raw: &Value) -> String {
     Sha256::digest(raw.to_string().as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -161,9 +154,10 @@ impl Registry {
         before - self.retained.len()
     }
 
-    /// Stamp and prune at the injected wall-clock time. Clock rollback cannot age data.
+    /// Stamp at the injected wall-clock time; prune only at an actual save boundary.
+    /// Capture/undo callers pass `false` so no record disappears from a snapshot.
     /// FORWARD records are never auto-pruned. Equal-age DEAD ties use original order.
-    pub fn prepare_retained_save(&mut self, now_ms: u64) {
+    pub fn prepare_retained_save(&mut self, now_ms: u64, prune_dead: bool) {
         if self.retention_opaque.is_some() {
             tracing::warn!("automatic retained-record pruning refused for unknown sidecar shape; see session-state repair guide");
             return;
@@ -174,6 +168,9 @@ impl Registry {
             if entry.kind == RetainedKind::Dead {
                 dead.push((first, slot));
             }
+        }
+        if !prune_dead {
+            return;
         }
         dead.sort_unstable();
         let expired = dead

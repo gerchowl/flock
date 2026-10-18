@@ -58,9 +58,9 @@ impl App {
             let all = selection == Selection::All;
             let mut candidate = self.state.structured_agents.snapshot();
             removed = candidate.purge_retained(all, older_than_ms, now);
-            candidate.prepare_retained_save(now);
+            candidate.prepare_retained_save(now, true);
             if !self.no_session {
-                let snapshot = self.capture_session_snapshot(&candidate);
+                let snapshot = self.capture_session_snapshot(&candidate, Some(now));
                 if let Err(error) = crate::persist::save_metadata(&snapshot) {
                     tracing::warn!("retained purge persistence failed: {error}");
                     return encode_error(
@@ -74,7 +74,9 @@ impl App {
             self.state
                 .structured_agents
                 .purge_retained(all, older_than_ms, now);
-            self.state.structured_agents.prepare_retained_save(now);
+            self.state
+                .structured_agents
+                .prepare_retained_save(now, true);
         }
         let records = self.state.structured_agents.retained_records();
         let forward = records

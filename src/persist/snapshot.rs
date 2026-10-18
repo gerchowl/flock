@@ -428,9 +428,19 @@ fn first_pane_id_in_layout(layout: &LayoutSnapshot) -> Option<u32> {
     }
 }
 
-/// Capture the current app state into a serializable snapshot.
+/// Borrowed registry and explicit clock for deterministic snapshot retention preparation.
+pub struct RegistryCapture<'a> {
+    /// Live registry; capture stamps only a copy and never mutates it.
+    pub registry: &'a crate::structured::registry::Registry,
+    /// Unix milliseconds, absent when the caller already reported a clock failure.
+    pub now_ms: Option<u64>,
+}
+
+/// Capture app state, stamping the snapshot copy at the injected Unix millisecond time.
+/// An unavailable clock leaves stamps unchanged; the caller reports the clock failure.
+/// Captures never prune; real saves prepare the live registry first (ADR-0036).
 pub fn capture(
-    structured_agents: &crate::structured::registry::Registry,
+    structured: RegistryCapture<'_>,
     workspaces: &[Workspace],
     terminals: &std::collections::HashMap<
         crate::terminal::TerminalId,
@@ -445,9 +455,13 @@ pub fn capture(
     collapsed_space_keys: std::collections::HashSet<String>,
     pane_id_aliases: std::collections::HashMap<u32, u32>,
 ) -> SessionSnapshot {
+    let mut structured_agents = structured.registry.snapshot();
+    if let Some(now_ms) = structured.now_ms {
+        structured_agents.prepare_retained_save(now_ms, false);
+    }
     SessionSnapshot {
         structured_retention: structured_agents.retained_stamps(),
-        structured_agents: structured_agents.snapshot(),
+        structured_agents,
         issue_draft: None,
         version: SNAPSHOT_VERSION,
         workspaces: workspaces
@@ -760,11 +774,31 @@ mod tests {
     }
 
     #[test]
+    fn retained_every_capture_stamps_without_pruning_snapshot_records() {
+        let raw: Vec<_> = (0..300).map(serde_json::Value::from).collect();
+        let mut state = crate::app::AppState::test_new();
+        state.structured_agents = serde_json::from_value(serde_json::json!(raw)).unwrap();
+        let captured = capture_from_state(&state);
+        assert_eq!(captured.structured_agents.retained_count(), 300);
+        assert!(captured
+            .structured_agents
+            .retained_records()
+            .iter()
+            .all(|r| r.first_seen_ms == Some(42)));
+        assert!(!captured.structured_retention.is_null());
+        assert!(state
+            .structured_agents
+            .retained_records()
+            .iter()
+            .all(|r| r.first_seen_ms.is_none()));
+    }
+
+    #[test]
     fn retained_snapshot_capture_does_not_age_or_prune_undo_state() {
         let raw = serde_json::json!([{"invalid":true}, {"runtime":"future-runtime"}]);
         let mut state = crate::app::AppState::test_new();
         state.structured_agents = serde_json::from_value(raw.clone()).unwrap();
-        state.structured_agents.prepare_retained_save(0);
+        state.structured_agents.prepare_retained_save(0, true);
         let captured = capture_from_state(&state);
         assert_eq!(
             serde_json::to_value(&captured.structured_agents).unwrap(),
@@ -785,7 +819,7 @@ mod tests {
         let raw = serde_json::json!([{"runtime":"future-runtime","opaque":[1,2]}]);
         let mut registry: crate::structured::registry::Registry =
             serde_json::from_value(raw.clone()).unwrap();
-        registry.prepare_retained_save(42);
+        registry.prepare_retained_save(42, true);
         let sidecar = registry.retained_stamps();
         let fixture = serde_json::json!({"version":3,"workspaces":[],"active":null,"selected":0,
             "structured_agents":raw,"structured_retention":sidecar});
@@ -800,7 +834,7 @@ mod tests {
         let handoff: SessionSnapshot = serde_json::from_str(&encoded).unwrap();
         let mut registry = handoff.structured_agents.snapshot();
         registry.restore_retained_stamps(&handoff.structured_retention);
-        registry.prepare_retained_save(99);
+        registry.prepare_retained_save(99, true);
         assert_eq!(registry.retained_stamps(), sidecar);
         assert_eq!(serde_json::to_value(&registry).unwrap(), raw);
         assert_eq!(
@@ -1140,7 +1174,10 @@ mod tests {
             .iter()
             .all(|workspace| !workspace.tabs[0].panes.is_empty()));
         let recaptured = capture(
-            &parsed.structured_agents,
+            crate::persist::RegistryCapture {
+                registry: &parsed.structured_agents,
+                now_ms: Some(42),
+            },
             &workspaces,
             &terminals,
             &runtimes.into(),
@@ -1209,7 +1246,10 @@ mod tests {
         terminal_runtimes: &TerminalRuntimeRegistry,
     ) -> SessionSnapshot {
         capture(
-            &state.structured_agents,
+            crate::persist::RegistryCapture {
+                registry: &state.structured_agents,
+                now_ms: Some(42),
+            },
             &state.workspaces,
             &state.terminals,
             terminal_runtimes,

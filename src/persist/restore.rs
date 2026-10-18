@@ -1689,7 +1689,10 @@ mod tests {
         let registry = crate::terminal::TerminalRuntimeRegistry::new();
         // gen1 env id 5 was aliased to the gen2 id by the previous handoff.
         let snapshot = super::super::snapshot::capture(
-            &crate::structured::registry::Registry::default(),
+            crate::persist::RegistryCapture {
+                registry: &crate::structured::registry::Registry::default(),
+                now_ms: Some(42),
+            },
             &[ws_old],
             &std::collections::HashMap::new(),
             &registry,
