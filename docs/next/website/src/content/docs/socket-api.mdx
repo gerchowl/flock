@@ -389,17 +389,28 @@ is a best-effort hint only; device identity never decides whether removal is
 allowed. Repository-side refusals additionally carry `repo` and set the checkout's
 mount-point hint to `null`; their recovery text concerns the repository only.
 Kill-by-path accepts only a canonical path equal to a registered linked-worktree
-root in `git worktree list` for an open or remembered repository. Subdirectories,
+root in `git worktree list` for a repository with an open workspace, or for an
+explicitly named repository. Optional `repo` is an absolute repository path,
+allowed only with `path`. When supplied, only that repository's registrations
+are eligible; it does not fall back to open workspaces. The requested checkout
+cannot be the repository's main checkout or the supplied `repo` itself.
+Subdirectories,
 plain directories and checkouts of unowned repositories refuse
 `worktree_path_not_root` (exit 10, retry `after_human`), even with `--force`.
 Its `error.data` carries `path` and `nearest_enclosing_worktree` (the closest
-enclosing registered root of an owned repository, or `null` if none is known).
-Retarget explicitly to that root if intended, or open the owning repository
-before retrying. An ancestor is never substituted for the requested checkout.
+enclosing registered root of an eligible repository, excluding its main checkout,
+or `null` if none is known).
+Retarget explicitly to that root if intended, supply its repository as `repo`,
+or open a workspace in the owning repository before retrying. Alternatively,
+use raw `git worktree remove <path>` from the owning repository, accepting Git's
+own checks. Ancestor matches are hints only.
 A healthy checkout's own metadata only prioritizes the registration queries;
-it does not establish ownership. Repository query failures retain the
-`worktree_repository_unreachable` recovery above. Registered absent paths and
-present unreachable checkouts keep the removal rules above.
+it does not establish ownership. A wrong or unresolvable explicit repository
+gives `worktree_path_not_root`.
+A known enclosing linked-worktree hint remains available even when an unrelated
+open repository cannot be queried. With no such answer, repository query failures
+retain the `worktree_repository_unreachable` recovery above. Registered absent
+paths and present unreachable checkouts keep the removal rules above.
 Unattended removals retain the typed refusal through sweep results and row state.
 
 `worktree.list` rows carry `last_commit_at` (unix seconds of the last commit on the branch) and are ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. Pass `"scan": true` to also resolve each linked row's `kill_verdict` — `{"verdict": "merged" | "not_merged" | "open_pr" | "unknown" | "checkout_missing", "evidence": ..., "protected": ..., "timed_out": ...}` — through the same gate `worktree.kill` enforces. Both fields are omitted rather than null when unknown: an absent `kill_verdict` means the row was not scanned, NOT that the branch is unmerged, and an absent `last_commit_at` means Git could not date it.

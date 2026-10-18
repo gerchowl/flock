@@ -1077,6 +1077,12 @@ impl App {
         &mut self,
         params: &WorktreeKillParams,
     ) -> Result<KillTarget, ApiFailure> {
+        if params.repo.is_some() && params.path.is_none() {
+            return Err(ApiFailure::new(
+                "invalid_request",
+                "repo requires a path kill",
+            ));
+        }
         match (params.workspace_id.as_deref(), params.path.as_deref()) {
             (Some(_), Some(_)) => Err(ApiFailure::new(
                 "invalid_request",
@@ -1116,29 +1122,50 @@ impl App {
                 let path = absolute_user_path("path", path)?;
                 let canonical = crate::worktree::canonical_or_original(&path);
                 // Requested-path metadata only orders probes; ownership comes from
-                // open/remembered workspaces, and removal requires exact registration.
+                // an open workspace or an explicit repo, with exact registration required.
                 let preferred = crate::workspace::git_space_metadata(&canonical).map(|space| {
                     crate::worktree::canonical_or_original(
                         &crate::worktree::main_root_from_common_dir(Path::new(&space.key)),
                     )
                 });
                 let mut owned = std::collections::BTreeSet::new();
-                for ws in &self.state.workspaces {
-                    let repo = ws
-                        .worktree_space_here()
-                        .map(|space| space.repo_root.clone())
-                        .or_else(|| {
-                            ws.git_space().map(|space| {
+                if let Some(repo) = &params.repo {
+                    let repo = absolute_user_path("repo", repo)?;
+                    let repo = crate::worktree::canonical_or_original(&repo);
+                    if repo != canonical {
+                        // Resolve the explicitly supplied repo family, so a linked
+                        // repo argument can never authorize removing its main root.
+                        let owner = crate::workspace::git_space_metadata(&repo)
+                            .map(|space| {
                                 crate::worktree::main_root_from_common_dir(Path::new(&space.key))
                             })
-                        })
-                        .or_else(|| {
-                            crate::workspace::git_space_metadata(&ws.identity_cwd).map(|space| {
-                                crate::worktree::main_root_from_common_dir(Path::new(&space.key))
+                            .unwrap_or(repo);
+                        owned.insert(crate::worktree::canonical_or_original(&owner));
+                    }
+                } else {
+                    for ws in &self.state.workspaces {
+                        let repo = ws
+                            .worktree_space_here()
+                            .map(|space| space.repo_root.clone())
+                            .or_else(|| {
+                                ws.git_space().map(|space| {
+                                    crate::worktree::main_root_from_common_dir(Path::new(
+                                        &space.key,
+                                    ))
+                                })
                             })
-                        });
-                    if let Some(repo) = repo {
-                        owned.insert(crate::worktree::canonical_or_original(&repo));
+                            .or_else(|| {
+                                crate::workspace::git_space_metadata(&ws.identity_cwd).map(
+                                    |space| {
+                                        crate::worktree::main_root_from_common_dir(Path::new(
+                                            &space.key,
+                                        ))
+                                    },
+                                )
+                            });
+                        if let Some(repo) = repo {
+                            owned.insert(crate::worktree::canonical_or_original(&repo));
+                        }
                     }
                 }
                 let mut owned: Vec<_> = owned.into_iter().collect();
@@ -1149,13 +1176,15 @@ impl App {
                     let rows = match crate::worktree::list_existing_worktrees(&repo) {
                         Ok(rows) => rows,
                         Err(_) => {
-                            probe_failure.get_or_insert_with(|| {
-                                ApiFailure::from(crate::worktree::CheckoutUnreachable {
-                                    path: canonical.clone(),
-                                    repo: Some(repo.clone()),
-                                    possible_unmounted_mount_point: None,
-                                })
-                            });
+                            if params.repo.is_none() {
+                                probe_failure.get_or_insert_with(|| {
+                                    ApiFailure::from(crate::worktree::CheckoutUnreachable {
+                                        path: canonical.clone(),
+                                        repo: Some(repo.clone()),
+                                        possible_unmounted_mount_point: None,
+                                    })
+                                });
+                            }
                             continue;
                         }
                     };
@@ -1184,7 +1213,8 @@ impl App {
                                 checkout: root,
                             });
                         }
-                        if canonical.starts_with(&root)
+                        if root != repo
+                            && canonical.starts_with(&root)
                             && nearest.as_ref().is_none_or(|current| {
                                 root.components().count() > current.components().count()
                             })
@@ -1193,14 +1223,16 @@ impl App {
                         }
                     }
                 }
-                if let Some(failure) = probe_failure {
-                    return Err(failure);
+                if nearest.is_none() {
+                    if let Some(failure) = probe_failure {
+                        return Err(failure);
+                    }
                 }
                 // ADR-0029 §4: an explicit retarget is required; force cannot
                 // turn an enclosing registered checkout into the requested root.
                 Err(ApiFailure {
                     code: crate::api::error_code::ErrorCode::WorktreePathNotRoot.as_str(),
-                    message: "path must be an exact registered linked-worktree root of an open or remembered repository; retarget explicitly or open its owning repository".into(),
+                    message: "path must be an exact registered linked-worktree root of an open workspace or explicitly named repository; retarget explicitly, provide repo, or open its owning repository".into(),
                     data: Some(serde_json::json!({"path":canonical,
                         "nearest_enclosing_worktree":nearest})),
                 })
@@ -3285,6 +3317,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                repo: None,
                 workspace_id: Some(ws_id),
                 path: None,
                 force: false,
@@ -3366,6 +3399,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                repo: None,
                 workspace_id: Some(ws_id),
                 path: None,
                 force: false,
@@ -3428,6 +3462,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                repo: None,
                 workspace_id: Some(ws_id),
                 path: None,
                 force: true,
@@ -3470,6 +3505,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                repo: None,
                 workspace_id: Some(ws_id),
                 path: None,
                 force: false,
@@ -3564,6 +3600,7 @@ mod tests {
 
         let kill = |dry_run: bool, keep_branch: bool| {
             crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                repo: None,
                 workspace_id: Some(ws_id.clone()),
                 path: None,
                 force: true,
@@ -3672,6 +3709,7 @@ mod tests {
         let ws_id = push_worktree_workspace(&mut app, &repo, &checkout);
         let kill = |dry_run: bool| {
             crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                repo: None,
                 workspace_id: Some(ws_id.clone()),
                 path: None,
                 force: true,
@@ -3814,6 +3852,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                repo: None,
                 workspace_id: Some(ws_id),
                 path: None,
                 force: false,
@@ -3877,6 +3916,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                repo: None,
                 workspace_id: Some(ws_id),
                 path: None,
                 force: false,
@@ -3924,6 +3964,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                repo: None,
                 workspace_id: Some(ws_id),
                 path: None,
                 force: false,
@@ -4000,6 +4041,7 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                repo: None,
                 workspace_id: Some(ws_id),
                 path: None,
                 force: true,
@@ -5533,6 +5575,106 @@ mod tests {
         std::fs::remove_dir_all(unowned).unwrap();
         std::fs::remove_dir_all(other).unwrap();
         std::fs::remove_dir_all(checkout).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+    fn explicit_repo_kill(app: &mut App, repo: &Path, path: &Path) -> serde_json::Value {
+        let request = serde_json::from_value(
+            serde_json::json!({"id":"explicit-repo", "method":"worktree.kill", "params": {
+                "repo":repo, "path":path, "force":true, "keep_branch":true, "keep_processes":true
+            }}),
+        )
+        .unwrap();
+        serde_json::from_str(&app.handle_api_request(request)).unwrap()
+    }
+
+    #[test]
+    fn explicit_repo_does_not_authorize_subdirectories_or_another_repositories_root() {
+        let (repo, checkout, mut app) = exact_root_fixture("explicit-repo-target");
+        let other = create_committed_repo("explicit-repo-unrelated");
+        let sub = checkout.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let response = explicit_repo_kill(&mut app, &other, &checkout);
+        assert_eq!(
+            response["error"]["code"], "worktree_path_not_root",
+            "{response}"
+        );
+        assert!(checkout.join(".git").is_file());
+        let nonrepo = crate::test_support::TempDir::socket();
+        let response = explicit_repo_kill(&mut app, nonrepo.path(), &checkout);
+        assert_eq!(
+            response["error"]["code"], "worktree_path_not_root",
+            "{response}"
+        );
+        app.state.workspaces.clear();
+        let response = explicit_repo_kill(&mut app, &repo, &sub);
+        assert_eq!(
+            response["error"]["code"], "worktree_path_not_root",
+            "{response}"
+        );
+        assert_eq!(
+            response["error"]["data"]["nearest_enclosing_worktree"],
+            checkout.to_string_lossy().as_ref()
+        );
+        assert!(checkout.join(".git").is_file());
+        for (proof, target) in [(&checkout, &repo), (&repo, &repo), (&checkout, &checkout)] {
+            let response = explicit_repo_kill(&mut app, proof, target);
+            assert!(response.get("error").is_some(), "{response}");
+            assert!(repo.join(".git").is_dir());
+            assert!(checkout.join(".git").is_file());
+        }
+        for params in [
+            serde_json::json!({"repo":"relative", "path":checkout}),
+            serde_json::json!({"repo":repo, "workspace_id":"w_fixture"}),
+        ] {
+            let request = serde_json::from_value(serde_json::json!({"id":"invalid-repo-proof", "method":"worktree.kill", "params":params})).unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert_eq!(response["error"]["code"], "invalid_request", "{response}");
+        }
+        std::fs::remove_dir_all(checkout).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn main_checkout_is_not_an_enclosing_linked_worktree_hint() {
+        let repo = create_committed_repo("main-checkout-hint")
+            .canonicalize()
+            .unwrap();
+        let sub = repo.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let mut app = app_with_parent(&repo);
+        assert_nonroot_kill_refused(&mut app, &sub, None);
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn unrelated_unlistable_repo_does_not_mask_a_known_enclosing_worktree() {
+        let (repo, checkout, mut app) = exact_root_fixture("known-enclosing");
+        let other = create_committed_repo("unlistable-other-owner");
+        let mut ws = Workspace::test_new("unlistable");
+        ws.identity_cwd = other.clone();
+        ws.cached_git_space = crate::workspace::git_space_metadata(&other);
+        app.state.workspaces.push(ws);
+        std::fs::rename(other.join(".git"), other.join("saved-git")).unwrap();
+        let sub = checkout.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_nonroot_kill_refused(&mut app, &sub, Some(&checkout));
+        let unregistered = unreachable_fixture_path("no-enclosing-answer");
+        let response = app.handle_api_request(Request {
+            id: "no-answer".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                path: Some(unregistered.to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["error"]["code"], "worktree_repository_unreachable",
+            "{response}"
+        );
+        std::fs::remove_dir_all(checkout).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
     }
 }
