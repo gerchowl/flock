@@ -12,11 +12,11 @@ use super::responses::{encode_error, encode_error_body, encode_error_with_data, 
 
 struct ApiFailure {
     code: &'static str,
-    message: String,
+    message: crate::process::CommandFailure,
 }
 
 impl ApiFailure {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    fn new(code: &'static str, message: impl Into<crate::process::CommandFailure>) -> Self {
         Self {
             code,
             message: message.into(),

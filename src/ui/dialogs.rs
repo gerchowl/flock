@@ -1964,7 +1964,7 @@ mod tests {
             let has_seed = plan.is_some();
             let mut app = AppState::test_new();
             let mut create = worktree_create_with(plan, "", WorktreeCreateFocus::Branch);
-            create.error = Some(explained.clone());
+            create.error = Some(explained.clone().into());
             app.worktree_create = Some(create);
 
             let rendered = render_worktree_dialog(&app);
@@ -1997,7 +1997,7 @@ mod tests {
                 let mut app = AppState::test_new();
                 let plan = has_seed.then(claude_fork_plan);
                 let mut create = worktree_create_with(plan, "seed", WorktreeCreateFocus::Branch);
-                create.error = Some(explained.clone());
+                create.error = Some(explained.clone().into());
                 app.worktree_create = Some(create);
 
                 let area = Rect::new(0, 0, 80, height);
