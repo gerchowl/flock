@@ -415,6 +415,28 @@ fn unlinked_binary_retains_the_server_until_the_file_is_restored() {
 }
 
 #[test]
+fn legacy_record_without_file_identity_is_retained_until_proof_is_restored() {
+    let mut probe = Probe::start();
+    let exit = ExitWatch::new(probe.record().pid).unwrap();
+    probe.orphan();
+    let mut legacy = serde_json::to_value(probe.record()).unwrap();
+    legacy.as_object_mut().unwrap().remove("file_identity");
+    let path = probe
+        .base
+        .join(format!(".server-{}.json", probe.record().pid));
+    fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let incomplete: ServerRecord = serde_json::from_value(legacy).unwrap();
+    assert!(!incomplete.matches(&probe.base));
+    sandboxes::sweep(probe.root.as_ref().unwrap().path());
+    assert!(probe.base.exists());
+    assert!(process_lifetime::pid_alive(probe.record().pid));
+    probe.record().write(&probe.base).unwrap();
+    sandboxes::sweep(probe.root.as_ref().unwrap().path());
+    assert!(!probe.base.exists());
+    exit.wait(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
 fn missing_birth_proof_retains_the_sandbox_and_its_server() {
     let mut probe = Probe::start();
     probe.orphan();

@@ -97,9 +97,9 @@ binary therefore retains its sandbox and server, even when argv and birth still
 match. Restore the original file at its recorded path to permit recovery, or
 inspect and stop the owned fixture manually. Rebuilding at the same path does
 not renew an existing server's proof.
-Rust tests in
-`tests/sandbox_sweep.rs` exercise the actual wrapper, replacement binaries,
-identity refusals, graceful termination and escalation with real owned processes.
+Rust tests in `tests/sandbox_sweep.rs` exercise the actual wrapper, replacement
+binaries, legacy records, identity refusals, graceful termination and escalation
+with real owned processes.
 The stage reader rejects EOF and unexpected output and fails within 30 seconds
 if a producer remains alive but silent, including after a partial line.
 
