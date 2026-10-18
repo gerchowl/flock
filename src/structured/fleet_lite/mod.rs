@@ -145,8 +145,19 @@ fn valid(row: &FleetAgentRow) -> bool {
         && !row.label.is_empty()
         && row.waiting_on_human.iter().all(|id| !id.is_empty())
 }
+fn sync_parent(path: &Path) -> io::Result<()> {
+    File::open(parent(path))?.sync_all()
+}
 // Both records use the same temp/fsync/rename/fsync-dir discipline, under one lock.
 fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    replace_with_parent_sync(path, bytes, sync_parent)
+}
+// Argument-only seam for testing directory-sync failures after a real rename.
+fn replace_with_parent_sync(
+    path: &Path,
+    bytes: &[u8],
+    sync: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let mut name = path.as_os_str().to_os_string();
     name.push(".tmp");
     let temp = PathBuf::from(name);
@@ -159,7 +170,7 @@ fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()?;
     drop(file);
     fs::rename(&temp, path)?;
-    File::open(parent(path))?.sync_all()
+    sync(path)
 }
 fn cursor(path: &Path) -> io::Result<Option<u64>> {
     match fs::read(path.with_extension("cursor")) {
@@ -181,11 +192,24 @@ impl Store {
     /// refuses loading even if an older snapshot survives. Lost/corrupt snapshots
     /// recover only with a valid cursor. Never delete both recovery records.
     /// Opening preserves damaged snapshot bytes; a later write replaces them.
-    /// An unmarked lock without either record can safely retry initialization at zero.
+    /// An empty, unmarked lock without either record is uninitialized and opens at
+    /// zero, including a legacy snapshot-only lock (#1974). This is safe because
+    /// an unmarked lock means nothing was ever reserved. Before marking the lock,
+    /// opening syncs the cursor's parent directory even when its value already
+    /// matches: a previous rename may have succeeded but its directory sync failed.
+    /// A directory-sync failure refuses opening and leaves the lock unmarked.
     /// `fleet.lock` carries the initialization marker: deleting it together with
     /// `fleet.cursor` while an older `fleet.json` survives reopens at that older
     /// head. Operators must never delete the lock.
     pub fn open(path: PathBuf) -> io::Result<Self> {
+        Self::open_with_parent_sync(path, sync_parent)
+    }
+
+    // Test seam shared by cursor replacement and initialization recovery.
+    fn open_with_parent_sync(
+        path: PathBuf,
+        mut sync: impl FnMut(&Path) -> io::Result<()>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(parent(&path))?;
         let lock_path = path.with_extension("lock");
         let mut lock = match OpenOptions::new()
@@ -253,10 +277,14 @@ impl Store {
             json!({"high_water":high_water,"rows":[]})
         };
         if reserved != Some(high_water) {
-            replace(
+            replace_with_parent_sync(
                 &path.with_extension("cursor"),
                 &serde_json::to_vec(&json!({"high_water":high_water}))?,
+                &mut sync,
             )?;
+        } else if !initialized {
+            // A previous open may have renamed the cursor without syncing its directory.
+            sync(&path.with_extension("cursor"))?;
         }
         if !initialized {
             // Mark the locked inode only after cursor durability, before any reservations.

@@ -591,3 +591,54 @@ fn empty_unmarked_lock_without_records_restarts_initialization_at_zero() {
     drop(store);
     assert_eq!(Store::open(path).unwrap().snapshot().unwrap().to, 1);
 }
+
+// The failed open leaves the real renamed cursor present but the lock unmarked.
+fn interrupted_cursor_initialization() -> PathBuf {
+    let path = path();
+    let error = Store::open_with_parent_sync(path.clone(), |cursor_path| {
+        assert_eq!(cursor_path, path.with_extension("cursor"));
+        assert_eq!(disk(cursor_path)["high_water"], 0);
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    })
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
+    path
+}
+
+#[test]
+fn matching_cursor_retry_propagates_directory_sync_failure_without_marking() {
+    let path = interrupted_cursor_initialization();
+    let error = Store::open_with_parent_sync(path.clone(), |_| {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    })
+    .err()
+    .expect("retry must propagate the directory-sync error");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 0);
+}
+
+#[test]
+fn matching_cursor_retry_syncs_directory_before_marking() {
+    let path = interrupted_cursor_initialization();
+    let mut synced = false;
+    let mut store = Store::open_with_parent_sync(path.clone(), |record_path| {
+        assert_eq!(parent(record_path), parent(&path));
+        assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
+        assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 0);
+        sync_parent(record_path)?;
+        synced = true;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        synced,
+        "the renamed cursor's directory must be synced again"
+    );
+    assert_eq!(fs::read(path.with_extension("lock")).unwrap(), b"1");
+    assert_eq!(store.snapshot().unwrap().to, 0);
+    drop(store);
+    assert_eq!(Store::open(path).unwrap().snapshot().unwrap().to, 0);
+}
