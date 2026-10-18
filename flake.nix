@@ -58,6 +58,8 @@
           flock-web = pkgs.callPackage ./nix/package.nix {
             buildCommit = self.rev or self.dirtyRev or null;
             withWeb = true;
+            # Until #1731 lands, missing assets receive the typed HTTP 503.
+            guiDist = self.packages.${system}.flock-client or null;
           };
           # The web client's production bundle (web/client/dist), built offline
           # from a fixed-output fetch of bun.lock (#1731). Only the bundle:

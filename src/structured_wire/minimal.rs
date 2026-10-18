@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 /// Structured-agent row in the minimal fleet snapshot and its upsert deltas.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub struct FleetAgentRow {
     /// Opaque structured-agent identity.
     pub id: String,
@@ -26,6 +28,8 @@ pub struct FleetAgentRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "type")]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub enum FleetDelta {
     /// Insert or replace the complete structured-agent row.
     #[serde(rename = "fleet.upsert")]
@@ -44,6 +48,8 @@ pub enum FleetDelta {
 /// Successful agent.decide ack result, echoing the applied answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub struct AgentDecideResult {
     /// Harness request identity whose answer was applied.
     pub request_id: String,
@@ -56,6 +62,8 @@ pub struct AgentDecideResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub enum AgentDecideErrorCode {
     /// No permission request has this identity.
     PermissionRequestUnknown,
@@ -68,6 +76,8 @@ pub enum AgentDecideErrorCode {
 /// Arguments for a token-authenticated client's agent.decide command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub struct AgentDecide {
     /// Agent whose open permission request is being answered.
     pub agent: String,
@@ -85,6 +95,8 @@ pub struct AgentDecide {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub enum PermissionDecision {
     /// Permit only this request.
     AllowOnce,

@@ -1,5 +1,8 @@
 //! Operator client management against an isolated real server and Unix socket.
 #![allow(clippy::disallowed_methods)] // Fixture drives the compiled CLI and owned PTY.
+#[cfg(feature = "web")]
+#[path = "client_tokens/mount.rs"]
+mod mount;
 mod support;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde_json::{json, Value};
@@ -17,9 +20,20 @@ struct Server {
     root: PathBuf,
     config: PathBuf,
     socket: PathBuf,
+    _port: Option<std::net::TcpListener>,
 }
 impl Server {
     fn start() -> Self {
+        Self::with_probe("#!/bin/sh\nprintf '%s\n' '{\"AllowFunnel\":{}}'\n").unwrap()
+    }
+    fn with_probe(probe: &str) -> std::io::Result<Self> {
+        Self::with_probe_bind(probe, None)
+    }
+    fn with_probe_bind(probe: &str, bind: Option<std::net::SocketAddr>) -> std::io::Result<Self> {
+        assert!(
+            probe.starts_with("#!/bin/sh\n"),
+            "controlled executable needs a valid interpreter line"
+        );
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -30,7 +44,28 @@ impl Server {
         let socket = root.join("a.sock");
         let directory = config.join(support::paths::app_dir_name());
         fs::create_dir_all(&directory).unwrap();
-        fs::write(directory.join("config.toml"), "onboarding = false\n[security]\nagent_account = 'none'\n[client]\nbind = '127.0.0.1:7682'\n").unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let requested = if let Some(bind) = bind {
+            bind
+        } else if cfg!(feature = "web") {
+            "127.0.0.1:0".parse().unwrap()
+        } else {
+            port.local_addr().unwrap()
+        };
+        let port = if cfg!(feature = "web") {
+            drop(port);
+            None
+        } else {
+            Some(port)
+        };
+        fs::write(directory.join("config.toml"), format!("onboarding = false\n[security]\nagent_account = 'none'\n[client]\nbind = '{requested}'\n")).unwrap();
+        let tools = root.join("tools");
+        fs::create_dir(&tools).unwrap();
+        fs::write(tools.join("tailscale"), probe).unwrap();
+        fs::set_permissions(tools.join("tailscale"), fs::Permissions::from_mode(0o700)).unwrap();
+        let gate = root.join("funnel-gate");
+        let gate_name = std::ffi::CString::new(gate.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(gate_name.as_ptr(), 0o600) }, 0);
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -47,26 +82,42 @@ impl Server {
         for (key, value) in support::environment::isolated_env(&config, &runtime) {
             cmd.env(key, value);
         }
-        cmd.env("FLOCK_LOG", "flk=debug,flock=debug");
+        cmd.env(
+            "PATH",
+            format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
+        );
+        cmd.env("FUNNEL_FIXTURE_GATE", &gate);
+        cmd.env("FUNNEL_FIXTURE_ENTERED", root.join("probe-entered"));
+        cmd.env("FLOCK_LOG", "debug");
         cmd.env("FLOCK_SOCKET_PATH", &socket);
         cmd.env("SHELL", "/bin/sh");
         support::environment::assert_pty_isolated(&cmd);
         let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
         drop(pair.slave);
-        let mut owner = support::server_startup::ServerStartup::new(
+        let owner = support::server_startup::ServerStartup::new(
             pair.master,
             child,
             &socket,
             Duration::from_secs(30),
         )
         .unwrap();
-        owner.wait_responsive().unwrap();
-        Self {
+        let mut server = Self {
             owner,
             root,
             config,
             socket,
+            _port: port,
+        };
+        if let Err(error) = server.owner.wait_responsive() {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; fixture_probe_entered={}",
+                    server.root.join("probe-entered").exists()
+                ),
+            ));
         }
+        Ok(server)
     }
     fn cli_command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_flk"));
@@ -160,10 +211,16 @@ fn client_token_cli_socket_roundtrip_private_files_and_fragment_url() {
         String::from_utf8_lossy(&open.stderr)
     );
     let url = String::from_utf8(open.stdout).unwrap();
-    let code = url
-        .trim()
-        .strip_prefix("http://127.0.0.1:7682/#code=")
+    let (endpoint, code) = url.trim().split_once("#code=").unwrap();
+    assert!(endpoint.starts_with("http://127.0.0.1:"));
+    let port: u16 = endpoint
+        .trim_end_matches('/')
+        .rsplit_once(':')
+        .unwrap()
+        .1
+        .parse()
         .unwrap();
+    assert_ne!(port, 0);
     assert_eq!(code.len(), 64);
     assert!(code
         .bytes()
@@ -179,7 +236,7 @@ fn client_token_cli_socket_roundtrip_private_files_and_fragment_url() {
         String::from_utf8_lossy(&printed.stderr)
     );
     let printed = String::from_utf8(printed.stdout).unwrap();
-    assert!(printed.starts_with("http://127.0.0.1:7682/#code="));
+    assert!(printed.starts_with(&format!("{endpoint}#code=")));
     assert_eq!(printed.lines().count(), 1);
     assert!(!printed.contains('{'));
     assert_eq!(

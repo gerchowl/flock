@@ -135,6 +135,7 @@ async fn fake_claude_calls(mcp: bool) {
     );
     let location = StreamLocation {
         data_dir: root.clone(),
+        storage: Default::default(),
         agent: AGENT.into(),
         session: SESSION.into(),
     };
@@ -198,6 +199,7 @@ async fn fake_claude_calls(mcp: bool) {
                 None,
                 &std::sync::Mutex::default(),
                 &Default::default(),
+                &crate::api::client_listener::Health::default(),
             )
             .unwrap();
         }

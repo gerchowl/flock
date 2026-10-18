@@ -194,6 +194,22 @@ impl ServerStartup {
         observe_exit(self.process_id(), true)
     }
 
+    /// Wait on the owned exit observer, without polling or consuming wait status.
+    pub fn wait_exited(&self, ceiling: Duration) -> io::Result<()> {
+        let notice = self
+            .exit_notice
+            .as_ref()
+            .expect("owned child exit observer");
+        Stages::new(ceiling).readable(&[notice.as_raw_fd()])?;
+        if self.has_exited()? {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "child exit observer ended before child exit",
+            ))
+        }
+    }
+
     /// Require this child's complete announcement once. Exit, malformed or
     /// excessive output, observer failure, EOF and silence are errors, not readiness.
     pub fn wait_ready(&mut self) -> io::Result<()> {
