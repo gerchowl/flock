@@ -463,8 +463,9 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     )
 }
 
-pub fn open_url(url: &str) -> std::io::Result<()> {
+pub(super) fn open_validated_url(url: &str) -> std::io::Result<()> {
     crate::process::TracedCommand::new("open", "platform")
+        .arg("--")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

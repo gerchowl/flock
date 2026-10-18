@@ -238,7 +238,9 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     false
 }
 
-pub fn open_url(url: &str) -> std::io::Result<()> {
+// xdg-open 1.2.1 rejects `--` as an unexpected option. The shared
+// HTTP(S) validator guarantees that this sole argument cannot be an option.
+pub(super) fn open_validated_url(url: &str) -> std::io::Result<()> {
     crate::process::TracedCommand::new("xdg-open", "platform")
         .arg(url)
         .stdin(Stdio::null())
