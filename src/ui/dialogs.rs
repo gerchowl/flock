@@ -1850,7 +1850,7 @@ mod tests {
             path: std::env::temp_dir().join("unreachable-render-fixture"),
             possible_unmounted_mount_point: Some(true),
         };
-        remove.error = Some(refusal.to_string());
+        remove.error = Some(refusal.into());
         app.worktree_remove = Some(remove);
         let rendered = render_kill_dialog(&app);
         let words = rendered

@@ -1748,8 +1748,11 @@ impl App {
                 &crate::worktree::processes::protected_pids(None),
             );
             let result = crate::worktree::check_worktree_remove(&repo_root, &path)
-                .map_err(|error| error.to_string())
-                .and_then(|()| crate::worktree::run_worktree_command(&command));
+                .map_err(crate::worktree::WorktreeRemoveFailure::from)
+                .and_then(|()| {
+                    crate::worktree::run_worktree_command(&command)
+                        .map_err(crate::worktree::WorktreeRemoveFailure::from)
+                });
             let _ =
                 event_tx.blocking_send(AppEvent::WorktreeRemoveFinished(WorktreeRemoveResult {
                     workspace_id,
@@ -2037,11 +2040,11 @@ impl App {
                 self.render_dirty.store(true, Ordering::Release);
                 self.render_notify.notify_one();
             }
-            Err(message) => {
+            Err(failure) => {
                 crate::logging::worktree_remove_failed(
                     &result.workspace_id.to_string(),
                     &result.path.display().to_string(),
-                    &message,
+                    &failure.message,
                 );
                 remove.removing = false;
                 // A refusal git will drop for `--force` becomes the second
@@ -2049,12 +2052,16 @@ impl App {
                 // travels with the flag, because the two say different things
                 // to the user. A second failure after forcing is a real error:
                 // the confirmation has already been spent.
-                match crate::worktree::classify_worktree_remove_error(&message) {
+                let forceable = (failure.code
+                    == crate::api::error_code::ErrorCode::WorktreeRemoveFailed)
+                    .then(|| crate::worktree::classify_worktree_remove_error(&failure.message))
+                    .flatten();
+                match forceable {
                     Some(refusal) if remove.force_confirmation.is_none() => {
                         remove.force_confirmation = Some(refusal);
                         remove.error = None;
                     }
-                    _ => remove.error = Some(message),
+                    _ => remove.error = Some(failure),
                 }
                 self.render_dirty.store(true, Ordering::Release);
                 self.render_notify.notify_one();
@@ -5294,5 +5301,54 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&checkout);
         let _ = std::fs::remove_dir_all(&repo);
+    }
+    #[test]
+    fn tui_single_remove_keeps_typed_checkout_failure_through_the_dialog() {
+        let repo = create_committed_repo("typed-single-remove");
+        let checkout = repo.join("contains modified or untracked files use --force to delete it");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree/typed-remove",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let mut app = app_for_worktree_tests();
+        let mut ws = crate::workspace::Workspace::test_new("typed-remove");
+        ws.identity_cwd = checkout.clone();
+        ws.cached_git_space = crate::workspace::git_space_metadata(&checkout);
+        ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: ws.cached_git_space.as_ref().unwrap().key.clone(),
+            label: "typed-remove".into(),
+            repo_root: repo.clone(),
+            checkout_path: checkout.clone(),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.open_remove_linked_worktree_confirmation(0);
+        std::fs::remove_file(checkout.join(".git")).unwrap();
+        app.start_worktree_remove();
+        let AppEvent::WorktreeRemoveFinished(result) = wait_for_worktree_event(&mut app) else {
+            panic!("single-remove completion required")
+        };
+        let failure = result.result.as_ref().unwrap_err().clone();
+        assert_eq!(
+            failure.code,
+            crate::api::error_code::ErrorCode::WorktreeCheckoutUnreachable
+        );
+        app.handle_worktree_remove_finished(result);
+        let remove = app.state.worktree_remove.as_ref().unwrap();
+        assert_eq!(remove.error.as_ref(), Some(&failure));
+        assert!(!remove.removing);
+        assert_eq!(remove.force_confirmation, None, "checkout identity refusal is never forceable, even if the path contains git's force wording");
+        assert!(checkout.is_dir());
+        assert_eq!(remove.error.as_ref().unwrap().to_string(), failure.message);
+        std::fs::remove_dir_all(repo).unwrap();
     }
 }

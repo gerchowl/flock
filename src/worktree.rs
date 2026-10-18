@@ -233,6 +233,14 @@ pub(crate) fn check_worktree_remove(repo: &Path, path: &Path) -> Result<(), Chec
         repo: Some(repo.to_owned()),
         possible_unmounted_mount_point: None,
     };
+    // Missing administration metadata is an orphan, not a repository access failure.
+    let admin_failure = |error: std::io::Error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            checkout_failure()
+        } else {
+            repo_failure()
+        }
+    };
     let common = run_command_capture(
         "git",
         &[
@@ -247,12 +255,12 @@ pub(crate) fn check_worktree_remove(repo: &Path, path: &Path) -> Result<(), Chec
     .map_err(|_| repo_failure())?;
     let common = PathBuf::from(common.trim())
         .canonicalize()
-        .map_err(|_| repo_failure())?;
+        .map_err(admin_failure)?;
     let admins = common
         .join("worktrees")
         .canonicalize()
-        .map_err(|_| repo_failure())?;
-    std::fs::read_dir(&admins).map_err(|_| repo_failure())?;
+        .map_err(admin_failure)?;
+    std::fs::read_dir(&admins).map_err(admin_failure)?;
     let gitfile = path.join(".git");
     let text = std::fs::read_to_string(&gitfile).map_err(|_| checkout_failure())?;
     let target = text
@@ -261,33 +269,33 @@ pub(crate) fn check_worktree_remove(repo: &Path, path: &Path) -> Result<(), Chec
         .ok_or_else(checkout_failure)?
         .trim();
     let candidate = path.join(target);
-    if candidate
+    let parent = candidate
         .parent()
-        .and_then(|p| p.canonicalize().ok())
-        .as_ref()
-        != Some(&admins)
-    {
+        .ok_or_else(checkout_failure)?
+        .canonicalize()
+        .map_err(admin_failure)?;
+    if parent != admins {
         return Err(checkout_failure());
     }
-    std::fs::read_dir(&candidate).map_err(|_| repo_failure())?;
-    let admin = candidate.canonicalize().map_err(|_| repo_failure())?;
+    std::fs::read_dir(&candidate).map_err(admin_failure)?;
+    let admin = candidate.canonicalize().map_err(admin_failure)?;
     if admin.parent() != Some(admins.as_path()) {
         return Err(checkout_failure());
     }
-    let back = std::fs::read_to_string(admin.join("gitdir")).map_err(|_| repo_failure())?;
+    let back = std::fs::read_to_string(admin.join("gitdir")).map_err(admin_failure)?;
     if admin
         .join(back.trim())
         .canonicalize()
-        .map_err(|_| repo_failure())?
+        .map_err(admin_failure)?
         != gitfile.canonicalize().map_err(|_| checkout_failure())?
     {
         return Err(checkout_failure());
     }
-    let owner = std::fs::read_to_string(admin.join("commondir")).map_err(|_| repo_failure())?;
+    let owner = std::fs::read_to_string(admin.join("commondir")).map_err(admin_failure)?;
     if admin
         .join(owner.trim())
         .canonicalize()
-        .map_err(|_| repo_failure())?
+        .map_err(admin_failure)?
         != common
     {
         return Err(checkout_failure());
@@ -395,7 +403,7 @@ fn may_force_unattended(checkout: &Path, refusal: WorktreeRemoveRefusal) -> bool
     matches!(refusal, WorktreeRemoveRefusal::Submodules) && force_destroys_nothing(checkout)
 }
 
-/// Typed removal failure retained through unattended workers and UI sweep state.
+/// Typed removal failure retained through workers, single-remove dialogs and sweeps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeRemoveFailure {
     /// Registered refusal; callers never need to classify prose.
@@ -414,6 +422,11 @@ impl From<String> for WorktreeRemoveFailure {
             code: crate::api::error_code::ErrorCode::WorktreeRemoveFailed,
             message,
         }
+    }
+}
+impl From<&str> for WorktreeRemoveFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
     }
 }
 impl From<CheckoutUnreachable> for WorktreeRemoveFailure {
@@ -4124,6 +4137,111 @@ mod tests {
     fn generated_branch_slug_is_worktree_namespaced_and_stable() {
         assert_eq!(generated_branch_slug(0), "worktree/brave-river-0000");
         assert_eq!(generated_branch_slug(9), "worktree/calm-cloud-0009");
+    }
+
+    struct AdminRemovalFixture {
+        repo: PathBuf,
+        checkout: PathBuf,
+        admin: PathBuf,
+    }
+    impl AdminRemovalFixture {
+        fn new(label: &str) -> Self {
+            let repo = crate::test_support::create_committed_repo(label);
+            let checkout = repo.join("child");
+            crate::test_support::run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "worktree/admin-classification",
+                    checkout.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            check_worktree_remove(&repo, &checkout).unwrap();
+            let text = std::fs::read_to_string(checkout.join(".git")).unwrap();
+            let admin = PathBuf::from(text.trim().strip_prefix("gitdir:").unwrap().trim());
+            Self {
+                repo,
+                checkout,
+                admin,
+            }
+        }
+    }
+    impl Drop for AdminRemovalFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.repo);
+        }
+    }
+
+    #[test]
+    fn pruned_admin_entry_is_an_orphaned_checkout_not_a_repository_failure() {
+        let fixture = AdminRemovalFixture::new("pruned-admin-classification");
+        std::fs::remove_dir_all(&fixture.admin).unwrap();
+        let failure = check_worktree_remove(&fixture.repo, &fixture.checkout).unwrap_err();
+        assert_eq!(
+            failure.code(),
+            crate::api::error_code::ErrorCode::WorktreeCheckoutUnreachable
+        );
+        assert!(failure.repo.is_none());
+        assert!(failure.to_string().contains(CheckoutUnreachable::RECOVERY));
+        assert!(!failure
+            .to_string()
+            .contains(CheckoutUnreachable::REPO_RECOVERY));
+        assert!(fixture.checkout.join(".git").is_file());
+    }
+
+    #[test]
+    fn missing_worktrees_directory_is_an_orphaned_checkout_not_a_repository_failure() {
+        let fixture = AdminRemovalFixture::new("missing-admin-directory");
+        std::fs::remove_dir_all(fixture.admin.parent().unwrap()).unwrap();
+        let failure = check_worktree_remove(&fixture.repo, &fixture.checkout).unwrap_err();
+        assert_eq!(
+            failure.code(),
+            crate::api::error_code::ErrorCode::WorktreeCheckoutUnreachable
+        );
+        assert!(failure.repo.is_none());
+        assert!(failure.to_string().contains(CheckoutUnreachable::RECOVERY));
+        assert!(fixture.checkout.join(".git").is_file());
+    }
+
+    #[test]
+    fn permission_denied_resolving_admin_alias_is_a_repository_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = AdminRemovalFixture::new("denied-admin-alias");
+        let restricted = fixture.repo.join("restricted");
+        std::fs::create_dir(&restricted).unwrap();
+        let alias = restricted.join("admins");
+        std::os::unix::fs::symlink(fixture.admin.parent().unwrap(), &alias).unwrap();
+        std::fs::write(
+            fixture.checkout.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                alias.join(fixture.admin.file_name().unwrap()).display()
+            ),
+        )
+        .unwrap();
+        // Restore before assertions, including when an unexpected successful read
+        // would mean this process can bypass the fixture's access restriction.
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let access = alias.canonicalize();
+        let failure = check_worktree_remove(&fixture.repo, &fixture.checkout);
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            access.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let failure = failure.unwrap_err();
+        assert_eq!(
+            failure.code(),
+            crate::api::error_code::ErrorCode::WorktreeRepositoryUnreachable
+        );
+        assert_eq!(failure.repo.as_ref(), Some(&fixture.repo));
+        assert!(failure
+            .to_string()
+            .contains(CheckoutUnreachable::REPO_RECOVERY));
+        check_worktree_remove(&fixture.repo, &fixture.checkout).unwrap();
     }
 
     #[test]

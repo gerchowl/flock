@@ -983,7 +983,7 @@ pub struct WorktreeRemoveState {
     pub workspace_id: String,
     pub repo_root: std::path::PathBuf,
     pub path: std::path::PathBuf,
-    pub error: Option<String>,
+    pub error: Option<crate::worktree::WorktreeRemoveFailure>,
     pub removing: bool,
     /// Set once an attempt has already failed on something `--force` clears,
     /// carrying WHICH refusal it was (#351) so the confirmation can name it.

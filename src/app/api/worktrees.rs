@@ -2018,7 +2018,10 @@ mod tests {
         let dialog = app.state.worktree_remove.as_ref().unwrap();
         assert_eq!(dialog.force_confirmation, None);
         assert_eq!(
-            dialog.error.as_deref(),
+            dialog
+                .error
+                .as_ref()
+                .map(|failure| failure.message.as_str()),
             Some(
                 crate::worktree::check_worktree_remove(&repo, &checkout)
                     .unwrap_err()
