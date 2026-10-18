@@ -503,16 +503,36 @@ impl App {
             delivery_attempts: 0,
             intent,
         };
-        let attested = key.as_ref().and_then(|key| {
-            crate::mesh::hello::with_store(|s| s.get(key).map_err(|e| e.to_string()))
-                .ok()
-                .flatten()
+        let attested = if let Some(key) = key.as_ref().filter(|_| local) {
+            let original = match crate::mesh::hello::with_store(|s| {
+                let binding = s.recipient_binding(key).map_err(|e| e.to_string())?;
+                Ok(s.get(key).map_err(|e| e.to_string())?.filter(|r| {
+                    binding.as_ref().is_some_and(|(agent, session)| {
+                        agent == &r.envelope.target_agent && session == &r.envelope.target_session
+                    })
+                }))
+            }) {
+                Ok(original) => original,
+                Err(_) => {
+                    return encode_error(
+                        id,
+                        crate::api::error_code::ErrorCode::MailStoreUnavailable.as_str(),
+                        "message custody unavailable",
+                    )
+                }
+            };
+            original
                 .filter(|r| {
-                    self.node_id.as_deref() == Some(r.envelope.key.origin_node.as_str())
+                    matches!(r.state.as_str(), "inbox" | "read" | "delivered")
+                        && self.node_id.as_deref() == Some(r.envelope.key.origin_node.as_str())
+                        && self.node_id.as_deref()
+                            == Some(r.envelope.return_binding.recipient_node.as_str())
                         && crate::mesh::sign::verify(&r.envelope).is_ok()
                 })
                 .map(|r| r.envelope.sender)
-        });
+        } else {
+            None
+        };
         if local {
             if let Some(target) = attested.as_ref().filter(|s| !s.is_empty()) {
                 match self.structured_send_target(target) {

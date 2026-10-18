@@ -1017,3 +1017,64 @@ fn custody_completion_settled_unknown_recipient_does_not_emit_a_refusal() {
         assert!(r.app.structured_sends.recovering.is_empty());
     });
 }
+
+#[test]
+fn custody_completion_node_signature_without_local_binding_is_not_sender_attestation() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2512).await;
+        let mut e = mail(&r).envelope;
+        let identity = NodeIdentity::existing().unwrap();
+        e.key = crate::mesh::key::MessageKey::mint(
+            identity.node_id(),
+            crate::app::notifications::now_ms(),
+        )
+        .unwrap();
+        e.sender = r.case.id.clone();
+        e.return_binding.request = e.key.clone();
+        e.return_binding.recipient_node = identity.node_id();
+        let mut data: Value = serde_json::from_slice(&e.body).unwrap();
+        data["message"]["from_agent"] = json!(r.case.id);
+        data["message"]["message_key"] = json!(e.key);
+        data["message"]["from_host"] = Value::Null;
+        e.body = serde_json::to_vec(&data).unwrap();
+        crate::mesh::sign::seal(&mut e, &identity);
+        with_store(|s| {
+            s.accept(
+                &e,
+                CUSTODY_TTL_MS,
+                crate::mesh::store::Admission::Inbox,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let message = serde_json::from_value(data["message"].clone()).unwrap();
+        r.app.mailboxes.record_delivered(&message);
+        let (tx, rx) = mpsc::channel();
+        let pid = std::process::id();
+        r.app
+            .handle_api_request_message(crate::api::ApiRequestMessage {
+            request: Request {
+                id: "unbound-reply".into(),
+                method: Method::MsgReply(
+                    serde_json::from_value(
+                        json!({"correlation_id":e.correlation_id,"body":"reply","intent":"fyi"}),
+                    )
+                    .unwrap(),
+                ),
+            },
+            respond_to: tx,
+            peer_pid: Some(pid),
+            peer_birth: crate::platform::process_start_time(pid),
+            peer_uid: Some(crate::platform::peer::effective_uid()),
+        });
+        let response = answer(&mut r, &rx).await;
+        assert!(response["result"]["item_id"].is_null(), "{response}");
+        assert!(r.inputs().is_empty());
+        r.app.restore_mesh_mail().unwrap();
+        assert!(r.app.structured_sends.recovering.is_empty());
+        assert!(r.app.mailboxes.pending_messages().is_empty());
+        r.stop().await;
+    });
+}

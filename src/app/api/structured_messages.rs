@@ -196,6 +196,13 @@ impl App {
             .structured_agents
             .get(&signed.target_agent)
             .ok_or(ErrorCode::AgentNotFound)?;
+        match stored(|s| s.recipient_binding(&signed.key))? {
+            None => return Err(ErrorCode::NotAuthorized),
+            Some((agent, session)) if agent != record.agent_id || session != record.session_id => {
+                return Err(ErrorCode::RecipientGone)
+            }
+            Some(_) => (),
+        }
         let remote = signed.key.origin_node != origin;
         if remote {
             if let Some(request) = &signed.request_key {
@@ -205,11 +212,6 @@ impl App {
             let name = stored(|s| s.origin_name(&signed.key.origin_node))?;
             if !self.state.config.msg.accepts_origin(name.as_deref()) {
                 return Err(ErrorCode::MsgNotAllowed);
-            }
-            if stored(|s| s.recipient_binding(&signed.key))?
-                != Some((record.agent_id.clone(), record.session_id.clone()))
-            {
-                return Err(ErrorCode::RecipientGone);
             }
         } else if record.session_id != signed.target_session {
             return Err(ErrorCode::RecipientGone);

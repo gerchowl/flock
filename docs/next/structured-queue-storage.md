@@ -243,7 +243,9 @@ reason use `msg_not_allowed`). Expired and refused duplicates return a terminal 
 admission. A changed native session returns `recipient_gone`.
 
 A local reply enters a structured queue only when its original sender comes
-from a verified, locally signed envelope. Claimed legacy `from_agent` metadata
+from a verified, locally signed envelope with a matching local recipient/session
+binding and a live or settled inbox outcome. A node signature alone does not
+prove local sender attestation. Claimed legacy `from_agent` metadata
 retains the terminal reply path and grants no structured routing authority.
 No custody schema, identity material, mesh version, or event kind changes.
 
