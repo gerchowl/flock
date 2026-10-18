@@ -122,6 +122,11 @@ if not line:
     sys.exit(0)
 assert json.loads(line)["type"] == "user", "private user envelope seam"
 (root / "input-received").write_text("input")
+# S4-only mode: no stdout evidence after accepting the user envelope.
+# Keep this mode separate from queue delivery fixture scenarios.
+if mode == "s4-accepted-silent":
+    sys.stdin.read()
+    sys.exit(0)
 emit(find("system", "hook_response"))
 init = json.loads((root / "restricted-init.json").read_text())
 if mode in ("init-oversize", "init-invalid-utf8"):
@@ -197,6 +202,7 @@ if mode in ("state-reducer", "worker-exit", "worker-exit-ok", "worker-stubborn")
         parent_gone()
     if mode.startswith("worker-exit"):
         sys.exit(0 if mode == "worker-exit-ok" else 7)
+
     sys.stdin.read()
     sys.exit(0)
 if mode == "lease-calls":
