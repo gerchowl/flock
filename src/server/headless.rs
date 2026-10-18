@@ -518,7 +518,9 @@ fn failed_handoff_response(
     };
     crate::app::encode_error_with_data(
         id,
-        api::error_code::ErrorCode::HandoffFailed.as_str(),
+        super::executable::error_code(err)
+            .unwrap_or(api::error_code::ErrorCode::HandoffFailed)
+            .as_str(),
         failed_handoff_message(err, dropped),
         serde_json::json!({"kind": kind}),
     )
@@ -1188,9 +1190,10 @@ impl HeadlessServer {
             );
             return Err(HandoffError::SessionBroken);
         }
+        let import_exe =
+            super::executable::resolve(params.import_exe.as_deref().map(std::path::Path::new))?;
         let structured_unknown = self.stop_structured_before_handoff();
         info!("starting live handoff");
-        let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
         let token = format!(
             "{}-{}",
@@ -1369,17 +1372,14 @@ impl HeadlessServer {
         {
             manifest.store_generation = store_generation.saturating_add(1);
         }
-        let mut import_child = match crate::server::handoff::spawn_handoff_import(
-            import_exe.as_deref(),
-            &socket_path,
-            &token,
-        ) {
-            Ok(child) => child,
-            Err(err) => {
-                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                return Err(err.into());
-            }
-        };
+        let mut import_child =
+            match crate::server::handoff::spawn_handoff_import(&import_exe, &socket_path, &token) {
+                Ok(child) => child,
+                Err(err) => {
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    return Err(err.into());
+                }
+            };
         let child_pid = import_child.id();
         crate::logging::handoff_import_spawned(child_pid, &socket_path);
 
@@ -4433,6 +4433,19 @@ mod tests {
         let mut ids = vec!["pane 7", "wA:p1", "w2:p1", "w1:pA", "w1:p2"];
         ids.sort_by_cached_key(|id| public_pane_sort_key(id));
         assert_eq!(ids, vec!["w1:p2", "w1:pA", "w2:p1", "wA:p1", "pane 7"]);
+    }
+
+    #[test]
+    fn failed_handoff_response_preserves_unresolved_executable_code() {
+        let base = crate::test_support::TempDir::socket();
+        let error = super::super::executable::resolve(Some(&base.path().join("removed")))
+            .err()
+            .expect("missing target");
+        let response: serde_json::Value =
+            serde_json::from_str(&failed_handoff_response("unresolved".into(), &error, &[]))
+                .unwrap();
+        assert_eq!(response["error"]["code"], "server_executable_unresolved");
+        assert!(response.get("result").is_none());
     }
 
     #[test]

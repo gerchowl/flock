@@ -96,23 +96,11 @@ pub(crate) fn handoff_socket_path() -> PathBuf {
 
 #[cfg(unix)]
 pub(crate) fn spawn_handoff_import(
-    import_exe: Option<&Path>,
+    exe: &super::executable::Executable,
     socket_path: &Path,
     token: &str,
 ) -> io::Result<Child> {
-    let fallback_exe;
-    let exe = if let Some(import_exe) = import_exe {
-        import_exe
-    } else {
-        fallback_exe = std::env::current_exe().map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("failed to determine flock executable path: {err}"),
-            )
-        })?;
-        &fallback_exe
-    };
-    let mut command = TracedCommand::new(exe, "server");
+    let mut command = TracedCommand::new(exe.as_path(), "server");
     command
         .arg("server")
         .arg("--handoff-import")
@@ -130,7 +118,7 @@ pub(crate) fn spawn_handoff_import(
             err.kind(),
             format!(
                 "failed to spawn handoff import server at {}: {err}",
-                exe.display()
+                exe.as_path().display()
             ),
         )
     })

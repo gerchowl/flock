@@ -11,6 +11,14 @@ Most automation should start with the CLI wrappers. Use the raw socket API only 
 
 `server.live_handoff` transfers the running server's panes to a replacement executable. Optional params are `import_exe` (executable path), `expected_protocol`, `expected_version`, and `skip_undrained` (default `false`). A `handoff_failed` response carries its stable cause category in `error.data.kind`: `import_refused`, `broken_pipe`, `connection_reset`, `invalid_input`, or `other`. The category describes the cause, not the ownership-commit stage. Treat every category, including unknown future values, as a failure and inspect `message` for diagnostics.
 
+The server canonicalizes an explicit `import_exe`, or its own executable when
+absent, before stopping workers or transferring panes. A missing, dangling or
+non-file target returns `server_executable_unresolved` (retry class
+`after_inspecting`). Restore the binary or select a valid target before retrying.
+Auto-detected daemons use the same resolver, with no unresolved-path fallback.
+The resolved pathname does not pin file contents, and handoff version/protocol
+checks remain required.
+
 ## Mesh edge enrollment
 
 `mesh.hello` is a held-relay handshake. A `begin` offer carries `mesh`,
