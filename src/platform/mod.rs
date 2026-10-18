@@ -5,6 +5,7 @@
 
 pub(crate) mod peer;
 pub(crate) mod structured;
+pub(crate) mod terminal_geometry;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
