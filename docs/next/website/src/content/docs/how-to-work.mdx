@@ -19,6 +19,13 @@ Flock starts or attaches to your local background session automatically. You do 
 
 Detach the client with `ctrl+b q`. Your panes keep running.
 
+If the controlling tty is gone (`EIO`, `ENXIO`, or `ENOTTY`), the client detaches
+without inventing or sending a replacement size. Transient query errors retain
+the last known geometry and send no resize; a structured debug event,
+`client.geometry_query_failed`, records the reason and stage. Before the first
+successful measurement, a transient error fails startup because no valid size
+is known. A confirmed tty-loss exit is final and does not start a redial loop.
+
 Reattach later:
 
 ```bash

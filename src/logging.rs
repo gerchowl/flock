@@ -1686,6 +1686,19 @@ pub(crate) fn client_conn_hello_read_failed(client_id: u64, err: &str) {
     );
 }
 
+/// Structured tty-query failures distinguish confirmed loss from retention.
+pub(crate) fn client_geometry_query_failed(
+    stage: &'static str,
+    gone: bool,
+    known: bool,
+    error: &std::io::Error,
+) {
+    tracing::debug!(event = "client.geometry_query_failed", subsystem = "client", stage,
+        reason = if gone { "tty_gone" } else { "transient_query_failure" },
+        outcome = if gone { "detached" } else if known { "geometry_retained" } else { "startup_failed" },
+        errno = error.raw_os_error(), kind = ?error.kind(), "terminal geometry query failed");
+}
+
 pub(crate) fn client_conn_write_failed(err: &str) {
     tracing::debug!(
         event = "client_conn.write",
