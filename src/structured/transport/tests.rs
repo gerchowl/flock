@@ -537,7 +537,8 @@ fn failed_persistence_never_publishes_or_reopens_idle_gate() {
         false,
         (
             &super::super::blobs::BlobStore::open(root.path()).expect("store"),
-            2048
+            2048,
+            &super::super::history::History::default()
         )
     )
     .is_err());
@@ -983,6 +984,7 @@ fn unknown_persisted_raw_kind_reopens_without_permission_state() {
         (
             &super::super::blobs::BlobStore::open(root.path()).expect("store"),
             2048,
+            &super::super::history::History::default(),
         ),
     )
     .unwrap();
@@ -1062,7 +1064,8 @@ fn failed_decision_audit_never_enqueues_a_control_response() {
         &plane,
         (
             &super::super::blobs::BlobStore::open(root.path()).expect("store"),
-            2048
+            2048,
+            &super::super::history::History::default()
         ),
     )
     .command(Command::Decide(control))
@@ -2213,4 +2216,160 @@ fn oversized_and_invalid_utf8_partial_summaries_never_enter_durable_stream() {
     drop(stdout);
     reader_done(&transport).unwrap();
     assert!(records(&root).is_empty());
+}
+
+#[test]
+fn history_provenance_survives_restart_and_version_change() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"type":"future-history","counter":1})
+    )
+    .unwrap();
+    let original = receive(&transport).record;
+    assert_eq!(original.known, Some(false));
+    assert!(original.shape.as_ref().unwrap().0.contains("2.1.296"));
+    let mut extended = serde_json::to_value(&original).unwrap();
+    extended["future_metadata"] = serde_json::json!({"new":true});
+    let reread: StreamRecord = serde_json::from_value(extended).unwrap();
+    assert_eq!(reread.shape, original.shape);
+    drop(output);
+    reader_done(&transport).unwrap();
+    drop(transport);
+    let (stdout, mut output) = pipe();
+    let (_input, stdin) = pipe();
+    let restarted = Transport::start(
+        stdout,
+        stdin,
+        location(&root),
+        "different-observed-version".into(),
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"type":"future-history","counter":1})
+    )
+    .unwrap();
+    let later = receive(&restarted).record;
+    assert_eq!(later.seq, original.seq + 1);
+    assert_ne!(later.shape, original.shape);
+    let mut cut = restarted.history.clone().subscribe(None).unwrap();
+    let crate::structured::history::Item::Record(replayed) = cut.page().unwrap() else {
+        panic!("old record")
+    };
+    assert_eq!(replayed.seq, original.seq);
+    assert_eq!(replayed.known, original.known);
+    assert_eq!(replayed.shape, original.shape);
+    drop(output);
+    reader_done(&restarted).unwrap();
+}
+
+#[test]
+fn history_and_state_receiver_share_permission_audits_but_not_partial_deltas() {
+    use crate::structured::history::Item;
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    let delta = include_str!("../../../tests/fixtures/claude-session/events.jsonl")
+        .lines()
+        .find(|line| line.contains("stream_event"))
+        .unwrap();
+    writeln!(output, "{delta}").unwrap();
+    assert!(!receive(&transport).persisted);
+    let mut cut = transport.history.clone().subscribe(None).unwrap();
+    assert!(matches!(cut.page().unwrap(), Item::Synced(0)));
+    writeln!(output,"{}",serde_json::json!({"type":"control_request","request_id":"history-permission",
+        "request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example","input":{"command":"true"}}})).unwrap();
+    let request = receive(&transport);
+    let open = receive(&transport);
+    assert!(matches!(request.event, SessionEvent::CanUseTool(_)));
+    assert!(open.state_input().is_none());
+    drop(output);
+    reader_done(&transport).unwrap();
+    let closed = receive(&transport);
+    assert!(matches!(
+        closed.state_input(),
+        Some(crate::structured::state::Input::ControlAnswered(
+            "history-permission"
+        ))
+    ));
+    let mut states = Vec::new();
+    for expected in 1..=3 {
+        let Item::Record(record) = cut.page().unwrap() else {
+            panic!("stored permission record")
+        };
+        assert_eq!(record.seq, expected);
+        let value: Value = serde_json::from_str(&record.raw).unwrap();
+        if value["type"] == "flk_permission_request" {
+            states.push(value["state"].as_str().unwrap().to_owned());
+        }
+    }
+    assert_eq!(states, vec!["open", "closed"]);
+    assert!(matches!(cut.page().unwrap(), Item::End));
+    assert_eq!(records(&root).len(), 3);
+}
+
+#[test]
+fn history_live_publication_uses_persisted_blob_projection() {
+    use crate::structured::history::Item;
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"type":"user","message":{}})
+    )
+    .unwrap();
+    receive(&transport);
+    let mut cut = transport.history.clone().subscribe(Some(1)).unwrap();
+    assert!(matches!(cut.page().unwrap(), Item::Synced(1)));
+    let content = "large result".repeat(400);
+    let input = serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-example","content":content}]}});
+    writeln!(output, "{input}").unwrap();
+    let live = receive(&transport);
+    assert_eq!(
+        serde_json::from_str::<Value>(&live.record.raw).unwrap(),
+        input
+    );
+    let Item::Record(stored) = cut.page().unwrap() else {
+        panic!("durable live continuation")
+    };
+    assert_eq!(stored.seq, 2);
+    assert_eq!(stored.known, Some(true));
+    let projected: Value = serde_json::from_str(&stored.raw).unwrap();
+    assert!(projected["message"]["content"][0]["blob"].is_string());
+    assert!(projected["message"]["content"][0].get("content").is_none());
+    assert_eq!(stored.raw, records(&root)[1].raw);
+    drop(output);
+    reader_done(&transport).unwrap();
+}
+
+#[test]
+fn history_partial_deltas_never_advance_a_durable_barrier() {
+    use crate::structured::history::Item;
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"type":"user","message":{}})
+    )
+    .unwrap();
+    receive(&transport);
+    let mut cut = transport.history.clone().subscribe(Some(1)).unwrap();
+    assert!(matches!(cut.page().unwrap(), Item::Synced(1)));
+    let delta = include_str!("../../../tests/fixtures/claude-session/events.jsonl")
+        .lines()
+        .find(|line| line.contains("stream_event"))
+        .unwrap();
+    writeln!(output, "{delta}").unwrap();
+    assert!(!receive(&transport).persisted);
+    assert!(matches!(cut.page().unwrap(), Item::Pending));
+    let mut fresh = transport.history.clone().subscribe(Some(1)).unwrap();
+    assert!(matches!(fresh.page().unwrap(), Item::Synced(1)));
+    assert_eq!(records(&root).len(), 1);
+    drop(output);
+    reader_done(&transport).unwrap();
 }

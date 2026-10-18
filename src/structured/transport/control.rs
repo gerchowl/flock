@@ -11,7 +11,11 @@ pub(super) struct Recorder<'a> {
     uncertain: &'a AtomicBool,
     cancel: &'a AtomicBool,
     controls: &'a ControlPlane,
-    storage: (&'a super::super::blobs::BlobStore, usize),
+    storage: (
+        &'a super::super::blobs::BlobStore,
+        usize,
+        &'a super::super::history::History,
+    ),
 }
 impl<'a> Recorder<'a> {
     pub fn new(
@@ -23,7 +27,11 @@ impl<'a> Recorder<'a> {
         uncertain: &'a AtomicBool,
         cancel: &'a AtomicBool,
         controls: &'a ControlPlane,
-        storage: (&'a super::super::blobs::BlobStore, usize),
+        storage: (
+            &'a super::super::blobs::BlobStore,
+            usize,
+            &'a super::super::history::History,
+        ),
     ) -> Self {
         Self {
             file,

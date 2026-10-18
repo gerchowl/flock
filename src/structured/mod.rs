@@ -2,6 +2,7 @@
 
 pub mod blobs;
 pub mod claude;
+pub mod history;
 pub mod launch;
 pub mod lease;
 pub mod permissions;

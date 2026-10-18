@@ -276,6 +276,12 @@ fn remove_transient_in(path: &Path, socket_pid: Option<u32>, roots: &[PathBuf]) 
     fs::remove_file(path)
 }
 
+/// Read a pinned replay descriptor without moving its shared append offset.
+pub(crate) fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(bytes, offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
