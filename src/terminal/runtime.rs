@@ -634,6 +634,7 @@ mod write_ack_tests {
             .insert(pane, runtime);
         let (respond_to, response) = reply::channel();
         api_tx.send(crate::api::ApiRequestMessage {
+            scope: None,
             request: serde_json::from_value(serde_json::json!({"id":"native","method":method,"params":{"pane_id":public,"target":public,"text":"é","keys":["Enter"],"raw":true,"write_timeout_ms":200}})).unwrap(),
             respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
         }).unwrap();
