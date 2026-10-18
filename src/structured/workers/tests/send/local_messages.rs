@@ -332,49 +332,16 @@ fn local_message_custody_cut_replays_idempotently_and_preserves_metadata() {
         assert_eq!(items[0].metadata["correlation_id"], "crash-cut");
         assert_eq!(items[0].metadata["in_reply_to"], "original-thread");
         drop(journal);
-        // Reopen the real owner, retaining the same native session and custody key.
-        let socket = r.case.fixture.root.path().join("queue.sock");
-        fs::remove_file(&socket).unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let launch = Launch {
-            agent_id: r.case.id.clone(),
-            generation: r.case.generation,
-            leases: r.case.leases.clone(),
-            state: r.case.fixture.root.path().to_owned(),
-            mcp: r.case.fixture.mcp(),
-            stall_after: STALL,
-            queue_rewrite_bytes: max_policy(),
-            lineage: None,
-        };
-        r.case.generation = r
-            .app
-            .structured_workers
-            .start(
-                &mut r.app.state.structured_agents,
-                launch,
-                r.case.factory("queue", vec![]),
-            )
-            .unwrap();
-        r.app.mailboxes = Default::default();
-        r.app.structured_sends = Default::default();
-        r.app.restore_mesh_mail().unwrap();
-        assert!(
-            r.app.mailboxes.reply_meta("crash-cut").is_none(),
-            "cold owner cannot acknowledge custody"
-        );
-        let mut driver = None;
-        r.until(|_| match listener.accept() {
-            Ok((stream, _)) => {
-                driver = Some(stream);
-                true
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-            Err(e) => panic!("restart handshake: {e}"),
+        r.restart(|r| {
+            r.app.mailboxes = Default::default();
+            r.app.structured_sends = Default::default();
+            r.app.restore_mesh_mail().unwrap();
+            assert!(
+                r.app.mailboxes.reply_meta("crash-cut").is_none(),
+                "cold owner cannot acknowledge custody"
+            );
         })
         .await;
-        r.driver = driver.unwrap();
-        r.driver.set_write_timeout(Some(LIMIT)).unwrap();
         r.until(|r| r.app.mailboxes.reply_meta("crash-cut").is_some())
             .await;
         assert_eq!(
@@ -478,6 +445,42 @@ fn local_message_missing_initialized_identity_refuses_without_creating_a_key() {
         match previous {
             Some(value) => std::env::set_var("XDG_STATE_HOME", value),
             None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    });
+}
+
+#[test]
+fn local_message_unknown_native_target_never_projects_as_legacy() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        for (n, unsigned) in [(2304, false), (2305, true)] {
+            let mut r = AppQueue::new(n, |_| max_policy()).await;
+            node(&mut r);
+            ready(&mut r).await;
+            let mut env = envelope(&r, "unregistered native recipient");
+            if unsigned {
+                let mut data: Value = serde_json::from_slice(&env.body).unwrap();
+                data["message"]["to_pane"] = json!("1-1");
+                env.body = serde_json::to_vec(&data).unwrap();
+                env.signature.clear();
+            }
+            persist(&r, &env);
+            r.stop().await;
+            r.app
+                .state
+                .structured_agents
+                .remove(&r.case.id, r.case.generation)
+                .unwrap();
+            r.app.restore_mesh_mail().unwrap();
+            assert!(
+                r.app.mailboxes.pending_messages().is_empty(),
+                "unregistered native identity must not become a legacy pane projection"
+            );
+            let retained = with_store(|s| s.get(&env.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.envelope, env);
+            assert_eq!(retained.state, "inbox");
         }
     });
 }

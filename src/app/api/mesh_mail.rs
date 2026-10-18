@@ -588,7 +588,18 @@ impl App {
             {
                 continue;
             }
-            if self.state.structured_agents.get(&record.target).is_some() {
+            let known_terminal = self
+                .state
+                .terminals
+                .values()
+                .any(|t| t.agent_id.to_string() == record.target);
+            // Legacy public-pane records without a native session remain legacy.
+            // Placement-free targets and bound native identities require the fence.
+            let native_shape = crate::terminal::AgentId::is_well_formed(&record.message.to_pane)
+                || (crate::terminal::AgentId::is_well_formed(&record.target)
+                    && !record.envelope.target_session.is_empty()
+                    && !known_terminal);
+            if self.state.structured_agents.get(&record.target).is_some() || native_shape {
                 if let Err(code) = self.verified_local_custody(&record.envelope) {
                     crate::logging::mesh_custody_failed("structured-restore", code.as_str());
                     continue;

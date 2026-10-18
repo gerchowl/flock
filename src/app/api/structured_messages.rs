@@ -1,7 +1,7 @@
 //! Authenticated local custody to the single queue owner (ADR-0036 §3/S5,
 //! ADR-0026). Signed native recipient fields fence recovery from legacy claims.
 use super::mesh_mail::{envelope, payload, Payload};
-use super::responses::encode_error;
+use super::responses::{encode_error, encode_error_with_data};
 use super::structured_queue::Staged;
 use crate::{
     api::{error_code::ErrorCode, schema::ResponseResult},
@@ -20,17 +20,29 @@ use crate::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-/// Deferred response and custody settlement, consumed only after owner commit.
+/// Deferred response and custody settlement for the owner's admission outcome.
 pub(super) struct Ack {
+    key: MessageKey,
+    recovered: bool,
     message: PendingMessage,
     request: Option<MessageKey>,
     warnings: Vec<String>,
 }
 impl Ack {
+    pub(super) fn refusal(&self, id: String, code: ErrorCode) -> String {
+        // A replay may refer to an already committed admission. Its failure
+        // cannot revoke that original custody or promise the sender a refusal.
+        let code = if self.recovered {
+            ErrorCode::InputWriteUnknown
+        } else {
+            code
+        };
+        admission_error(id, code, &self.key)
+    }
     pub(super) fn response(&self, item_id: String) -> ResponseResult {
         ResponseResult::MsgQueued {
             item_id: Some(item_id),
-            message_key: self.message.message_key.clone(),
+            message_key: Some(self.key.clone()),
             correlation_id: self.message.correlation_id.clone(),
             state: "queued".into(),
             warnings: self.warnings.clone(),
@@ -62,6 +74,29 @@ fn stored<T>(
     with_store(|s| Ok(op(s)))
         .map_err(|_| ErrorCode::MailStoreUnavailable)?
         .map_err(|error| ErrorCode::from_code(error.code()).unwrap_or(ErrorCode::InternalError))
+}
+/// A refusal becomes terminal before it is reported. Failed settlement is
+/// uncertain instead: preserve the key so a caller can inspect both stores.
+fn admission_error(id: String, mut code: ErrorCode, key: &MessageKey) -> String {
+    if code != ErrorCode::InputWriteUnknown {
+        match stored(|s| s.refuse(key, code.as_str(), super::messages::now_ms() as i64)) {
+            Ok(()) | Err(ErrorCode::MessageNotFound) => (),
+            Err(failure) => {
+                crate::logging::mesh_custody_failed("structured-refuse", failure.as_str());
+                code = ErrorCode::InputWriteUnknown;
+            }
+        }
+    }
+    encode_error_with_data(
+        id,
+        code.as_str(),
+        if code == ErrorCode::InputWriteUnknown {
+            "message admission outcome unknown; inspect custody and queue before retrying"
+        } else {
+            "message admission refused"
+        },
+        json!({"message_key":key,"item_id":lifecycle(key)}),
+    )
 }
 impl App {
     pub(super) fn local_structured_message(
@@ -134,8 +169,13 @@ impl App {
                     original.envelope.return_binding.collection_token;
             }
             crate::mesh::sign::seal(&mut signed, &identity);
-            stored(|s| s.accept_local(&signed, CUSTODY_TTL_MS, &target, &session, now as i64))?;
-            let (ticket, mut ack) = self.admit_local_custody(&signed)?;
+            let admission =
+                stored(|s| s.accept_local(&signed, CUSTODY_TTL_MS, &target, &session, now as i64))
+                    .and_then(|_| self.admit_local_custody(&signed));
+            let (ticket, mut ack) = match admission {
+                Ok(admitted) => admitted,
+                Err(code) => return Ok(admission_error(id.clone(), code, &signed.key)),
+            };
             ack.warnings = warnings;
             self.structured_sends.staged = Some(Staged(id.clone(), ticket, Some(ack)));
             Ok(String::new())
@@ -176,6 +216,11 @@ impl App {
         signed: &Envelope,
     ) -> Result<(super::structured_queue::Ticket, Ack), ErrorCode> {
         let (generation, mut data) = self.verified_local_custody(signed)?;
+        // Recovery snapshots can predate an owner's terminal refusal.
+        let current = stored(|s| s.get(&signed.key))?.ok_or(ErrorCode::MessageNotFound)?;
+        if current.state != "inbox" {
+            return Err(ErrorCode::MessageNotFound);
+        }
         self.structured_workers
             .runtime(&signed.target_agent, generation)
             .ok_or(ErrorCode::QueueSourceCold)?;
@@ -207,6 +252,8 @@ impl App {
         Ok((
             ticket,
             Ack {
+                key: signed.key.clone(),
+                recovered: false,
                 message: data.message,
                 request: signed.request_key.clone(),
                 warnings: vec![],
@@ -260,7 +307,8 @@ impl App {
         }
         for signed in std::mem::take(&mut self.structured_sends.recovering) {
             match self.admit_local_custody(&signed) {
-                Ok((ticket, ack)) => {
+                Ok((ticket, mut ack)) => {
+                    ack.recovered = true;
                     let (tx, _rx) = std::sync::mpsc::channel();
                     self.structured_sends
                         .park(Staged(String::new(), ticket, Some(ack)), tx);

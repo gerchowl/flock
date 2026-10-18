@@ -128,11 +128,14 @@ impl Sends {
                     };
                     encode_success(id.clone(), response)
                 }
-                Err(code) => encode_error(
-                    id.clone(),
-                    code.as_str(),
-                    "structured admission refused or uncertain",
-                ),
+                Err(code) => match ack.take() {
+                    Some(ack) => ack.refusal(id.clone(), code),
+                    None => encode_error(
+                        id.clone(),
+                        code.as_str(),
+                        "structured admission refused or uncertain",
+                    ),
+                },
             };
             let _ = reply.send(response);
             false
@@ -371,3 +374,7 @@ mod tests {
         assert!(sends.full(true));
     }
 }
+
+#[cfg(test)]
+#[path = "structured_queue_refusal_tests.rs"]
+mod refusal_tests;

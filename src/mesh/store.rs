@@ -799,6 +799,8 @@ impl<D: DiskSpace> Store<D> {
         self.finish_with_detail(key, outcome, None, wall_ms)
     }
 
+    /// Refuse pending custody or an own-node unread inbox admission. Actual reads
+    /// and remote-origin inbox deliveries cannot be changed to a refusal.
     pub fn refuse(&mut self, key: &MessageKey, reason: &str, wall_ms: i64) -> Result<()> {
         self.finish_with_detail(
             key,
@@ -830,6 +832,9 @@ impl<D: DiskSpace> Store<D> {
             return Ok(());
         }
         let valid = match outcome {
+            Outcome::Refused if state == "inbox" && key.origin_node == self.local_node => {
+                inbox.is_some_and(|deadline| deadline > now)
+            }
             Outcome::Read => state == "inbox" && inbox.is_some_and(|d| d > now),
             Outcome::InboxExpired => state == "inbox" && inbox.is_some_and(|d| d <= now),
             Outcome::Expired => {

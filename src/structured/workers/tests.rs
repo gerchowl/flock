@@ -877,6 +877,6 @@ mod queue;
 
 mod recovery;
 
-mod global;
+pub(crate) mod global;
 
 mod send;
