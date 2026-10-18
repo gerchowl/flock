@@ -90,3 +90,51 @@ fn oversized_permission_row_is_lagged_before_it_enters_the_live_ring() {
     ));
     assert!(super::super::output::fits(&frame));
 }
+#[tokio::test]
+async fn preparing_worker_is_unavailable_until_its_real_permission_book_is_ready() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        use crate::structured::workers::tests::Case as Worker;
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (stop, stopped) = watch::channel(false);
+        let wake = Arc::new(Notify::new());
+        let client = Client::new(wake.clone(), stopped);
+        let mut registry = Registry::default();
+        let mut workers = Workers::new(wake.clone());
+        let (mut worker, launch, factory) =
+            Worker::prepare(&mut registry, 2226, "state-reducer", vec![]);
+        let (entered, started) = oneshot::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        worker.generation = workers
+            .start(&mut registry, launch, move |record| {
+                entered.send(()).unwrap();
+                proceed
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("profile producer disappeared or stayed silent");
+                factory(record)
+            })
+            .unwrap();
+        started.await.unwrap();
+        assert!(workers.runtime(&worker.id, worker.generation).is_none());
+        client.observe(&registry, &workers, root.path());
+        assert!(
+            matches!(client.subscribe(None).await, Err(e) if e.kind()==io::ErrorKind::WouldBlock)
+        );
+        assert!(!root.path().join("fleet.json").exists());
+        release.send(()).unwrap();
+        let now = Instant::now();
+        worker.ready(&mut registry, &mut workers, &wake, now).await;
+        client.observe(&registry, &workers, root.path());
+        let mut cut = client.subscribe(None).await.unwrap();
+        assert!(matches!(
+            cut.next("ready").await.unwrap(),
+            ServerFrame::Gap { .. }
+        ));
+        worker
+            .finish(&mut registry, &mut workers, &wake, now, None)
+            .await;
+        stop.send_replace(true);
+        client.closed().await;
+    })
+    .await
+    .expect("fleet preparation producer stayed silent");
+}

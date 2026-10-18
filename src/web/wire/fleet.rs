@@ -72,11 +72,12 @@ impl Client {
                 let (_, view, generation) = registry
                     .get(&record.agent_id)
                     .ok_or(crate::api::error_code::ErrorCode::AgentNotFound)?;
-                let waiting = workers
-                    .runtime(&record.agent_id, generation)
-                    .map(|r| r.waiting_on_human())
-                    .transpose()?
-                    .unwrap_or_default();
+                let waiting = match workers.runtime(&record.agent_id, generation) {
+                    Some(runtime) => runtime.waiting_on_human()?,
+                    // Only a quiescent producer proves that an absent book is empty.
+                    None if workers.history_recovery_allowed(&record.agent_id) => Vec::new(),
+                    None => return Err(crate::api::error_code::ErrorCode::SessionBusy),
+                };
                 Ok(Agent(record, view.update.state.clone(), waiting))
             })
             .collect();

@@ -77,7 +77,10 @@ may replace an unprocessed one;
 use the agent journal for every intermediate event.
 
 An unavailable permission-book observation leaves stored rows intact and fails
-its readers instead of publishing an empty attention list. A later coherent
+its readers instead of publishing an empty attention list. This includes a
+preparing worker or one with unconfirmed cleanup: an absent Runtime book is
+empty only when no worker exists or its producer is joined and its authority
+released. A later coherent
 observation can serve fresh readers. Storage failure stops the fleet owner,
 logs the I/O kind and closes its readers. Repair the durable records as below
 and restart the owner; no cursor is reset or write retried silently.
