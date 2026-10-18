@@ -1387,7 +1387,7 @@ fn help_commands_exit_successfully() {
 }
 
 #[test]
-fn root_help_hides_explicit_client_command() {
+fn root_help_advertises_client_credentials_and_hides_internal_attachment() {
     let output = Command::new(env!("CARGO_BIN_EXE_flk"))
         .arg("--help")
         .output()
@@ -1395,9 +1395,12 @@ fn root_help_hides_explicit_client_command() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("flk client <token|open>"), "{stdout}");
     assert!(
-        !stdout.contains("flk client"),
-        "root help should not advertise the internal client command: {stdout}"
+        !stdout
+            .lines()
+            .any(|line| matches!(line.trim(), "flk client" | "client")),
+        "root help should not advertise the bare internal client command: {stdout}"
     );
 }
 

@@ -562,6 +562,8 @@ mod tests {
     /// Naming them here rather than only in the module docs is what keeps the
     /// choice reviewable: adding a seventh name is a visible act.
     const SELF_SERVED: &[&str] = &[
+        // Nested credential verbs share their complete operator-only usage.
+        "client",
         // What a target resolves from, and how reused branch names disambiguate.
         "lineage",
         // `--since` suffixes and where the rendered file lands by default.

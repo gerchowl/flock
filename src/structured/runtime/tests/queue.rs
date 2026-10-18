@@ -147,7 +147,7 @@ impl QueueRun {
         self.driver.write_all(&bytes).unwrap();
     }
     fn raw(&self, kind: &str) -> Received {
-        let event = self.running.receive();
+        let event = self.running.receive_after_accepted();
         assert_eq!(
             serde_json::from_str::<Value>(&event.record.raw).unwrap()["type"],
             kind,
