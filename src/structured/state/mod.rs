@@ -27,9 +27,23 @@ use std::time::{Duration, Instant};
 
 /// Facts supplied by the stream owner, never inferred from screen text.
 pub enum Input<'a> {
+    /// The transport accepted a user envelope, not necessarily delivered it.
+    /// `at` and `at_ms` name the same acceptance instant on the caller's clocks.
+    /// This arms silence observation without claiming a working turn (ADR-0036 S4).
+    Accepted {
+        /// Monotonic admission time, before any harness response.
+        at: Instant,
+        /// Admission time in Unix milliseconds, used by a stall report.
+        at_ms: u64,
+    },
     /// Every stdout event, including unknown lines, counts as stream progress.
+    /// Stream consumers must use `Received::state_input` to include host closes.
     Event(&'a SessionEvent),
-    /// An answer was sent for this exact incoming permission request.
+    /// Stdout progress whose tool request was already reserved by a grant.
+    /// It never opens a needs-human entry.
+    Progress,
+    /// The book durably closed this request (decision, cancel, result, interrupt
+    /// or end). This is not an acknowledgment of stdin delivery.
     ControlAnswered(&'a str),
     /// The process exited. A started input without result is crashed, not idle.
     ProcessExited,
@@ -50,7 +64,7 @@ pub struct Update {
     pub phase_changed: Option<(Phase, Phase)>,
     /// All currently open permission/question requests, in id order.
     pub needs_human: Vec<(String, HumanReason)>,
-    /// Last stdout's Unix ms, once per silent interval; no phase is changed.
+    /// Last stdout or accepted input's Unix ms, once per silent interval.
     pub stalled_since_ms: Option<u64>,
     /// Next monotonic observation boundary, if silence or settling needs one.
     pub observe_at: Option<Instant>,
@@ -75,7 +89,8 @@ pub struct SessionState {
     limit: Option<Option<u64>>,
     crashed: bool,
     started: bool,
-    stdout: Option<(Instant, u64)>,
+    progress: Option<(Instant, u64)>,
+    pending_input: bool,
     stalled: bool,
     phase: Phase,
     phase_since: Option<Instant>,
@@ -93,11 +108,28 @@ impl SessionState {
             limit: None,
             crashed: false,
             started: false,
-            stdout: None,
+            progress: None,
+            pending_input: false,
             stalled: false,
             phase: Phase::Unknown,
             phase_since: None,
         }
+    }
+
+    /// Set the initial registry lifecycle before any stream observations exist.
+    /// Used for cold restored records, without manufacturing a clock or event.
+    pub(super) fn set_initial_lifecycle(&mut self, lifecycle: Lifecycle) {
+        self.lifecycle = lifecycle;
+        self.phase = AgentState::derive(
+            Turn::Unknown,
+            Background::Unknown,
+            Attention::Unknown,
+            lifecycle,
+            Waiting::Unknown,
+            None,
+            StateSources::default(),
+        )
+        .phase;
     }
 
     /// Reduce one fact using monotonic time for ages and Unix ms for reset times.
@@ -111,15 +143,25 @@ impl SessionState {
         stall_after: Duration,
     ) -> Update {
         match input {
+            Input::Accepted { at, at_ms } => {
+                self.pending_input = true;
+                self.progress = Some((at, at_ms));
+                self.stalled = false;
+            }
             Input::Event(event) => {
-                self.stdout = Some((now, unix_ms));
+                self.progress = Some((now, unix_ms));
                 self.stalled = false;
                 self.event(event, now);
+            }
+            Input::Progress => {
+                self.progress = Some((now, unix_ms));
+                self.stalled = false;
             }
             Input::ControlAnswered(id) => {
                 self.controls.remove(id);
             }
             Input::ProcessExited => {
+                self.pending_input = false;
                 self.crashed = self.started;
                 self.controls.clear();
                 self.tools.clear();
@@ -178,9 +220,9 @@ impl SessionState {
             .filter(|_| self.lifecycle == Lifecycle::Live)
             .map(|at| millis(now.saturating_duration_since(at)));
         let stalled_since_ms = self
-            .stdout
+            .progress
             .filter(|(at, _)| {
-                self.started
+                (self.started || self.pending_input)
                     && !self.stalled
                     && !self.crashed
                     && self.lifecycle == Lifecycle::Live
@@ -191,9 +233,9 @@ impl SessionState {
             .map(|(_, unix)| unix);
         self.stalled |= stalled_since_ms.is_some();
         let stall_due = self
-            .stdout
+            .progress
             .filter(|_| {
-                self.started
+                (self.started || self.pending_input)
                     && !self.stalled
                     && !self.crashed
                     && self.lifecycle == Lifecycle::Live
@@ -243,6 +285,7 @@ impl SessionState {
             self.limit = None;
         }
         self.turn = Turn::Working;
+        self.pending_input = false;
         self.started = true;
         self.crashed = false;
     }
@@ -314,7 +357,6 @@ impl SessionState {
             SessionEvent::ControlCancel(e) => {
                 self.controls.remove(&e.request_id);
             }
-
             SessionEvent::ContentBlockStart(e) => self.tool_start(e.event.get("content_block")),
             SessionEvent::Assistant(e) => {
                 for block in e
@@ -353,6 +395,7 @@ impl SessionState {
         }
     }
     fn result(&mut self, now: Instant) {
+        self.pending_input = false;
         if self.turn != Turn::Idle {
             self.turn_since = Some(now);
         }

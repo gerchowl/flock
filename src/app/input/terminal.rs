@@ -415,7 +415,7 @@ impl App {
             crate::logging::terminal_key_forward_ambiguous(
                 &key_event,
                 &format!("{:?}", protocol),
-                &bytes,
+                bytes.len(),
             );
         }
 

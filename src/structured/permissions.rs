@@ -2,16 +2,18 @@
 //! Caller identity is trusted dispatcher context, never command JSON. Only an
 //! authenticated operator token may decide; socket UID and agent ancestry alone
 //! grant nothing. A new transport owns a new book, including on resume.
-//! At most 16 concurrent requests and 1024 lifetime IDs are accepted. Invalid or
+//! At most [`MAX_OPEN`] concurrent requests and 1024 lifetime IDs are accepted. Invalid or
 //! repeated harness IDs stop the transport rather than risk miscorrelation.
 //! The stream owner audits terminal closes before clearing runtime state.
 //! Audits and responses share the transport byte cap; an audit failure cancels
 //! delivery. Admission success reserves a decision, not its eventual delivery.
-//! S6a refuses allow_always with permission_decision_unsupported (not yet
-//! supported); session grants are tracked separately in #1809.
+//! Grants live only in this runtime as exact tool/canonical-input matches.
+//! Harness suggestions are never interpreted or forwarded. No settings are written.
+//! [`MAX_GRANTS`] bounds distinct exact grants, including pending grants.
 pub mod auth;
 
 pub(super) const MAX_OPEN: usize = 16;
+pub(super) const MAX_GRANTS: usize = 16;
 
 use super::claude::ToolRequest;
 use crate::api::error_code::ErrorCode;
@@ -47,7 +49,7 @@ impl Principal<'_> {
 pub enum Decision {
     /// Approve only this control request.
     AllowOnce,
-    /// Reserved for session grants, currently refused as not yet supported.
+    /// Approve for this live runtime only (never persistent policy).
     AllowAlways,
     /// Reject through the measured stdio deny carrier (A.12).
     Deny,
@@ -89,14 +91,22 @@ enum Stage {
     Closing,
     Closed,
 }
+#[derive(Clone)]
+struct Grant {
+    subject: String,
+    request_id: String,
+}
 pub(super) struct Open {
     request: ToolRequest,
     stage: Stage,
+    automatic: bool,
+    grant: Option<String>,
 }
 pub(super) struct Answer {
     pub id: String,
     pub response: Value,
     pub audit: Value,
+    grant: Option<(String, Grant)>,
 }
 pub(super) struct Closing {
     pub id: String,
@@ -108,6 +118,7 @@ pub(super) struct Book {
     active: bool,
     open: BTreeMap<String, Open>,
     seen: BTreeSet<String>,
+    grants: BTreeMap<String, Grant>,
 }
 pub(super) fn open_record(id: &str, request: &ToolRequest) -> Value {
     json!({"type":"flk_permission_request","state":"open","request_id":id,"request":request})
@@ -120,6 +131,7 @@ impl Book {
             active: true,
             open: BTreeMap::new(),
             seen: BTreeSet::new(),
+            grants: BTreeMap::new(),
         }
     }
     pub fn blocked(&self) -> bool {
@@ -128,7 +140,7 @@ impl Book {
     pub fn waiting(&self) -> Vec<String> {
         self.open
             .iter()
-            .filter(|(_, r)| r.stage != Stage::Closed)
+            .filter(|(_, r)| r.stage != Stage::Closed && !r.automatic)
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -137,6 +149,7 @@ impl Book {
     pub fn end(&mut self) {
         self.active = false;
         self.open.clear();
+        self.grants.clear();
     }
     pub fn observe(&mut self, id: &str, request: ToolRequest) -> Result<Value, ErrorCode> {
         if !self.active
@@ -154,11 +167,37 @@ impl Book {
             Open {
                 request,
                 stage: Stage::Open,
+                automatic: false,
+                grant: None,
             },
         );
         self.seen.insert(id.into());
         Ok(audit)
     }
+    pub fn automatic(&mut self, id: &str) -> Result<Option<Answer>, ErrorCode> {
+        let grant = self
+            .open
+            .get(id)
+            .and_then(|open| self.grants.get(&key(&open.request)))
+            .cloned();
+        grant
+            .map(|grant| {
+                let mut answer = self.answer(
+                    id,
+                    Decision::AllowOnce,
+                    None,
+                    &grant.subject,
+                    "session_grant",
+                )?;
+                if let Some(open) = self.open.get_mut(id) {
+                    open.automatic = true;
+                }
+                answer.audit["grant_request_id"] = json!(grant.request_id);
+                Ok(answer)
+            })
+            .transpose()
+    }
+
     fn missing(&self, id: &str) -> ErrorCode {
         if self.seen.contains(id) {
             ErrorCode::PermissionRequestClosed
@@ -194,22 +233,62 @@ impl Book {
         let missing = self.missing(id);
         let open = self
             .open
-            .get_mut(id)
+            .get(id)
             .filter(|r| r.stage == Stage::Open && self.active)
             .ok_or(missing)?;
-        if decision == Decision::AllowAlways {
-            return Err(ErrorCode::PermissionDecisionUnsupported);
-        }
+        let mut grant = None;
+        let mut ignored_suggestions = None;
         let response = if decision == Decision::Deny {
             json!({"behavior":"deny","message":message.unwrap_or("Denied by the operator")})
         } else {
-            json!({"behavior":"allow","updatedInput":open.request.input})
+            let response = json!({"behavior":"allow","updatedInput":open.request.input});
+            if decision == Decision::AllowAlways {
+                if open
+                    .request
+                    .permission_suggestions
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    .is_some_and(|rules| !rules.is_empty())
+                {
+                    // The durable open record contains the complete bundle.
+                    // Never interpret the harness rule grammar or forward rules.
+                    ignored_suggestions = Some(json!({"request_id":id,"reason":"not_forwarded"}));
+                }
+                let k = key(&open.request);
+                let reserved: BTreeSet<_> = self
+                    .open
+                    .values()
+                    .filter_map(|r| r.grant.as_ref())
+                    .filter(|key| !self.grants.contains_key(*key))
+                    .collect();
+                if self.grants.len() + reserved.len() >= MAX_GRANTS
+                    && !self.grants.contains_key(&k)
+                    && !reserved.contains(&k)
+                {
+                    return Err(ErrorCode::PermissionGrantLimit);
+                }
+                grant = Some((
+                    k,
+                    Grant {
+                        subject: subject.into(),
+                        request_id: id.into(),
+                    },
+                ));
+            }
+            response
         };
+        let open = self.open.get_mut(id).ok_or(missing)?;
+        open.grant = grant.as_ref().map(|(key, _)| key.clone());
         open.stage = Stage::Reserved;
+        let mut audit = json!({"type":"flk_permission_request","state":"closed","request_id":id,"decision":decision,"message":message,"principal":subject,"source":source});
+        if let Some(ignored) = ignored_suggestions {
+            audit["ignored_suggestions"] = ignored;
+        }
         Ok(Answer {
             id: id.into(),
             response: json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":response}}),
-            audit: json!({"type":"flk_permission_request","state":"closed","request_id":id,"decision":decision,"message":message,"principal":subject,"source":source}),
+            audit,
+            grant,
         })
     }
     pub fn oversized(
@@ -227,6 +306,8 @@ impl Book {
     pub fn aborted(&mut self, id: &str) {
         if let Some(open) = self.open.get_mut(id).filter(|r| r.stage == Stage::Reserved) {
             open.stage = Stage::Open;
+            open.automatic = false;
+            open.grant = None;
         }
     }
     // Once claimed by the stream writer, a decision cannot be replaced by a
@@ -244,8 +325,16 @@ impl Book {
         }
     }
     pub fn audited(&mut self, answer: &Answer) {
-        if let Some(open) = self.open.get_mut(&answer.id) {
+        if let Some(open) = self
+            .open
+            .get_mut(&answer.id)
+            .filter(|r| r.stage == Stage::Auditing && self.active)
+        {
             open.stage = Stage::Closed;
+            open.grant = None;
+            if let Some((key, grant)) = &answer.grant {
+                self.grants.insert(key.clone(), grant.clone());
+            }
         }
     }
     pub fn written(&mut self, answer: Answer) {
@@ -289,6 +378,12 @@ impl Book {
     pub fn closed(&mut self, id: &str) {
         self.open.remove(id);
     }
+}
+
+fn key(request: &ToolRequest) -> String {
+    let mut input = Value::Object(request.input.clone());
+    input.sort_all_objects();
+    json!([request.tool_name, input]).to_string()
 }
 
 #[cfg(test)]

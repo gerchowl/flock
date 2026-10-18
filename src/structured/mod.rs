@@ -4,9 +4,12 @@ pub mod claude;
 pub mod launch;
 pub mod lease;
 pub mod permissions;
+pub mod queue;
+pub mod registry;
 pub mod runtime;
 pub mod state;
 pub mod supervision;
 pub mod transport;
+pub mod workers;
 
 pub(crate) mod identity;

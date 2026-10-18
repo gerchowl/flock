@@ -516,11 +516,12 @@ fn restore_tab(
             .map(crate::terminal::AgentId::from_persisted)
             .unwrap_or_else(|| crate::terminal::AgentId::alloc(&crate::app::short_host_name()));
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
+        let unknown_runtime = saved_pane.and_then(|p| p.runtime.unknown());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
             let mut agent_restore = AgentRestoreState {
-                enabled: runtime_context.resume_agents_on_restore,
+                enabled: runtime_context.resume_agents_on_restore && unknown_runtime.is_none(),
                 resumed_sessions: resumed_agent_sessions,
             };
             pane_restore_startup(saved_agent_session, saved_history, &mut agent_restore)
@@ -572,6 +573,7 @@ fn restore_tab(
             }
             terminal.launch_argv = saved_launch_argv.clone();
             terminal.launch_env = saved_pane.map(|p| p.launch_env.clone()).unwrap_or_default();
+            terminal.persisted_runtime_tag = unknown_runtime.cloned();
             terminal.last_prompt = saved_last_prompt.clone();
             terminal.header_reserved = saved_header_reserved;
             if let Some(label) = saved_label {
@@ -646,6 +648,7 @@ fn restore_tab(
                     cwd.clone(),
                 );
                 terminal.launch_env = saved_pane.map(|p| p.launch_env.clone()).unwrap_or_default();
+                terminal.persisted_runtime_tag = unknown_runtime.cloned();
                 terminal.last_prompt = saved_last_prompt.clone();
                 terminal.header_reserved = saved_header_reserved;
                 if was_imported {
@@ -1162,6 +1165,8 @@ mod tests {
         // resolve, and nothing here asserts on which directory it is.
         let cwd = std::env::temp_dir();
         let snapshot = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1179,6 +1184,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            runtime: crate::persist::snapshot::PtyRuntime::Pty,
                             agent_id: None,
                             cwd,
                             label: None,
@@ -1255,6 +1261,8 @@ mod tests {
         questions: Option<crate::api::schema::QuestionPolicy>,
     ) -> SessionSnapshot {
         SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1272,6 +1280,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            runtime: crate::persist::snapshot::PtyRuntime::Pty,
                             agent_id: None,
                             cwd,
                             label: None,
@@ -1606,6 +1615,7 @@ mod tests {
         panes.insert(
             0,
             super::super::snapshot::PaneSnapshot {
+                runtime: crate::persist::snapshot::PtyRuntime::Pty,
                 agent_id: None,
                 cwd: cwd.clone(),
                 label: None,
@@ -1637,6 +1647,8 @@ mod tests {
             }],
         };
         let snapshot = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1677,6 +1689,10 @@ mod tests {
         let registry = crate::terminal::TerminalRuntimeRegistry::new();
         // gen1 env id 5 was aliased to the gen2 id by the previous handoff.
         let snapshot = super::super::snapshot::capture(
+            crate::persist::RegistryCapture {
+                registry: &crate::structured::registry::Registry::default(),
+                now_ms: Some(42),
+            },
             &[ws_old],
             &std::collections::HashMap::new(),
             &registry,

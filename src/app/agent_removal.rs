@@ -264,6 +264,10 @@ mod tests {
             replacement.to_string()
         );
         let snapshot = crate::persist::capture(
+            crate::persist::RegistryCapture {
+                registry: &app.state.structured_agents,
+                now_ms: Some(42),
+            },
             &app.state.workspaces,
             &app.state.terminals,
             &app.terminal_runtimes,

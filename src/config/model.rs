@@ -494,6 +494,14 @@ pub fn validated_prompt_float_lines(lines: u16) -> u16 {
     lines.min(MAX_PROMPT_FLOAT_LINES)
 }
 
+/// Opt-in structured GUI endpoint; slice 2 owns the listener lifecycle.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClientConfig {
+    /// Explicit IPv4 loopback address with a nonzero port, e.g. `127.0.0.1:7682`.
+    pub bind: Option<std::net::SocketAddr>,
+}
+
 /// Default bind for `flk web` — loopback only, xterm.js port.
 pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:7681";
 
@@ -711,6 +719,8 @@ pub struct Config {
     /// `[title]` — host terminal window title publishing (#361).
     pub title: TitleConfig,
     pub web: WebSectionConfig,
+    /// Structured GUI loopback listener. Absent disables it; separate from the PTY bridge.
+    pub client: ClientConfig,
     pub gossip: GossipConfig,
     pub checks: crate::checks::ChecksConfig,
     /// `[fleet]` — limits on agent-initiated spawn (#329, ADR-0014).

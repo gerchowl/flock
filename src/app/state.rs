@@ -2249,6 +2249,8 @@ pub(crate) struct SectionGroupingMemo {
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
+    /// Pane-free agent records and S4 reducers, independent of terminal runtime.
+    pub structured_agents: crate::structured::registry::Registry,
     pub terminals:
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
     /// Terminal ids whose size is currently owned by a direct attach client.
@@ -3524,6 +3526,7 @@ impl AppState {
         Self {
             issue_drop: None,
             issue_repo_cache: None,
+            structured_agents: crate::structured::registry::Registry::default(),
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),

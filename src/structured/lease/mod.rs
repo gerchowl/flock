@@ -116,6 +116,15 @@ impl SessionLeases {
             cleanup_confirmed: false,
         })
     }
+    /// Worker-side cleanup confirmation. Never wait on this lock in the app loop.
+    pub(crate) fn is_reserved(&self, session: &str) -> io::Result<bool> {
+        let entries = self
+            .0
+            .try_lock_for(LOCK_LIMIT)
+            .ok_or_else(|| io::Error::other("lease registry busy"))?;
+        Ok(entries.contains_key(session))
+    }
+
     /// Conservative live reservation counts, including pending agent-started launches.
     pub fn counts(&self, parent: &str) -> io::Result<(usize, usize)> {
         let entries = self
@@ -222,6 +231,10 @@ impl SessionLeases {
     }
 }
 impl Lease {
+    /// Require this live, unspawned reservation before installing session MCP.
+    pub(super) fn matches_session(&self, session: &str) -> bool {
+        !self.released && !self.spawned && self.session == session
+    }
     /// Verify that the reserved identity is the runtime's stream identity.
     pub(super) fn matches(&self, agent: &str, session: &str) -> bool {
         self.agent == agent && self.session == session
