@@ -124,7 +124,8 @@ fn delivery_failure(error: &serde_json::Value) -> PeerMessageFailure {
         .as_str()
         .and_then(crate::api::error_code::ErrorCode::from_code)
         .filter(|code| {
-            *code != crate::api::error_code::ErrorCode::MeshDeliveryRefused
+            permanent_refusal(code.as_str())
+                && *code != crate::api::error_code::ErrorCode::MeshDeliveryRefused
                 && matches!(
                     code.retry(),
                     crate::cli::exit::Retry::Never
@@ -254,6 +255,15 @@ mod tests {
                     .retryable(),
                 "{code}"
             );
+        }
+    }
+    #[test]
+    fn custody_completion_peer_lookup_misses_stay_retryable() {
+        for code in ["message_not_found", "msg_target_not_found"] {
+            let failure = super::delivery_failure(&serde_json::json!({
+                "code": code, "message": "recipient lookup is not ready"
+            }));
+            assert!(failure.retryable(), "{code}: {failure:?}");
         }
     }
     #[test]

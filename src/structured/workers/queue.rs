@@ -21,6 +21,16 @@ use std::{
 };
 /// Fixed notification bound, separate from one peek and the terminal fact tail.
 pub(crate) const COMPLETION_CAPACITY: usize = 4;
+type CommittedCustody =
+    Arc<parking_lot::Mutex<std::collections::HashSet<crate::mesh::key::MessageKey>>>;
+
+fn custody_key(item: &Item) -> Option<crate::mesh::key::MessageKey> {
+    let key: crate::mesh::key::MessageKey =
+        serde_json::from_value(item.metadata.get("message_key")?.clone()).ok()?;
+    (item.kind == crate::structured::queue::model::Kind::Message
+        && item.item_id == key.lifecycle_id())
+    .then_some(key)
+}
 type FinalFacts = Arc<parking_lot::Mutex<Vec<crate::api::queue_event::QueueItemState>>>;
 
 /// S4 projection after reducing every session record through this sequence.
@@ -64,8 +74,12 @@ pub(in crate::structured) struct Client {
     updates: mpsc::Receiver<Update>,
     peeked: RefCell<Option<Box<Update>>>,
     final_facts: FinalFacts,
+    committed_custody: CommittedCustody,
 }
 impl Client {
+    pub fn custody_committed(&self, key: &crate::mesh::key::MessageKey) -> bool {
+        self.committed_custody.lock().contains(key)
+    }
     /// Full returns session_busy; disconnection returns agent_not_found. Success
     /// accepts only the buffer slot; the completion acknowledges durability.
     pub fn enqueue(&self, request: Request) -> Result<(), ErrorCode> {
@@ -134,6 +148,7 @@ pub(in crate::structured) struct Service {
     updates: mpsc::SyncSender<Update>,
     pending: Option<Update>,
     final_facts: FinalFacts,
+    committed_custody: CommittedCustody,
     state: AgentState,
     covered: u64,
     required: u64,
@@ -155,6 +170,14 @@ impl Service {
         // Same four-completion bound as the session stream; no unbounded spool.
         let (updates, rx) = mpsc::sync_channel(COMPLETION_CAPACITY);
         let final_facts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let committed_custody = Arc::new(parking_lot::Mutex::new(
+            scheduler
+                .journal()
+                .items()
+                .iter()
+                .filter_map(custody_key)
+                .collect(),
+        ));
         Ok((
             Self {
                 publisher,
@@ -163,6 +186,7 @@ impl Service {
                 states,
                 updates,
                 final_facts: final_facts.clone(),
+                committed_custody: committed_custody.clone(),
                 pending: None,
                 state: AgentState::unknown(),
                 covered: 0,
@@ -180,6 +204,7 @@ impl Service {
                 states: state_tx,
                 updates: rx,
                 final_facts,
+                committed_custody,
                 peeked: RefCell::new(None),
             },
         ))
@@ -245,6 +270,7 @@ impl Service {
         let admitted = self.requests.try_recv().ok().map(|request| {
             changed = true;
             let id = request.item.item_id.clone();
+            let key = custody_key(&request.item);
             let result = if stopped {
                 Err(failure(ErrorCode::AgentNotFound))
             } else {
@@ -253,6 +279,11 @@ impl Service {
                         .enqueue(request.item, request.principal, request.gate)
                 })
             };
+            if result.is_ok() {
+                if let Some(key) = key {
+                    self.committed_custody.lock().insert(key);
+                }
+            }
             (id, result)
         });
         if changed {

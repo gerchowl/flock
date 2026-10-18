@@ -675,7 +675,8 @@ fn custody_completion_permanent_recovery_refusal_is_terminal_and_visible() {
         .unwrap();
         r.app.state.config.msg.allow_from = vec!["different.example".into()];
         r.app.structured_sends.recovering.push(d.envelope.clone());
-        r.app.finish_structured_messages(true);
+        r.app
+            .finish_structured_messages(true, std::time::Instant::now());
         assert_eq!(
             with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
                 .unwrap()
@@ -735,10 +736,9 @@ fn custody_completion_unknown_retries_in_process_with_the_same_key() {
             response["error"]["data"]["message_key"],
             json!(d.envelope.key)
         );
-        for retry in r.app.structured_sends.retries.values_mut() {
-            retry.at = std::time::Instant::now();
-        }
-        r.app.finish_structured_messages(false);
+        let now = std::time::Instant::now();
+        let due = r.app.structured_sends.recovery_deadline(now).unwrap_or(now);
+        r.app.service_structured_workers(due);
         r.until(|_| {
             with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
                 .unwrap()
@@ -841,7 +841,8 @@ fn custody_completion_session_replacement_is_recipient_gone() {
             Some(crate::api::error_code::ErrorCode::RecipientGone)
         );
         r.app.structured_sends.recovering.push(d.envelope.clone());
-        r.app.finish_structured_messages(true);
+        r.app
+            .finish_structured_messages(true, std::time::Instant::now());
         assert_eq!(
             with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
                 .unwrap()
@@ -932,7 +933,8 @@ fn custody_completion_backoff_does_not_hot_poll_idle_recovery() {
             crate::api::error_code::ErrorCode::InputWriteUnknown,
         );
         let at = r.app.structured_sends.retries[&d.envelope.key].at;
-        r.app.finish_structured_messages(false);
+        r.app
+            .finish_structured_messages(false, std::time::Instant::now());
         assert_eq!(r.app.structured_sends.recovering.len(), 1);
         assert_eq!(r.app.structured_sends.retries[&d.envelope.key].at, at);
         assert!(r.inputs().is_empty());
@@ -1075,6 +1077,121 @@ fn custody_completion_node_signature_without_local_binding_is_not_sender_attesta
         r.app.restore_mesh_mail().unwrap();
         assert!(r.app.structured_sends.recovering.is_empty());
         assert!(r.app.mailboxes.pending_messages().is_empty());
+        r.stop().await;
+    });
+}
+
+#[test]
+fn custody_completion_recovery_wakes_the_real_headless_loop_deadline() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2520).await;
+        let d = mail(&r);
+        let record = &r.app.state.structured_agents.get(&r.case.id).unwrap().0;
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (&record.agent_id, &record.session_id),
+                false,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        r.app.retry_queue_custody(
+            d.envelope.clone(),
+            crate::api::error_code::ErrorCode::InputWriteUnknown,
+        );
+        let due = r.app.structured_sends.retries[&d.envelope.key].at;
+        let now = std::time::Instant::now();
+        assert!(due > now, "the real bounded backoff must be exercised");
+        r.app.checks_heartbeat_deadline = None;
+        let deadline = r
+            .app
+            .next_headless_loop_deadline_with_git_refresh(now, false, false)
+            .expect("recovery must schedule a wake on an otherwise idle server");
+        assert!(
+            deadline <= due,
+            "deadline {deadline:?} misses retry {due:?}"
+        );
+        r.app.service_structured_workers(due);
+        assert!(
+            r.app.structured_sends.recovering.is_empty(),
+            "the due wake must retry, not merely reschedule"
+        );
+        r.until(|_| {
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state
+                == "delivered"
+        })
+        .await;
+        r.until(|r| !r.inputs().is_empty()).await;
+        assert_eq!(r.inputs().len(), 1);
+        r.stop().await;
+    });
+}
+#[test]
+fn custody_completion_recovered_conflict_cannot_revoke_committed_key() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2521).await;
+        let d = mail(&r);
+        let record = &r.app.state.structured_agents.get(&r.case.id).unwrap().0;
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (&record.agent_id, &record.session_id),
+                false,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let (ticket, _ack) = r.app.admit_queue_custody(&d.envelope).unwrap();
+        r.until(|_| ticket.committed.try_recv().is_ok_and(|v| v.is_ok()))
+            .await;
+        r.until(|r| !r.inputs().is_empty()).await;
+        r.stop().await;
+        let mut journal =
+            crate::structured::queue::Journal::open(r.case.fixture.root.path(), &r.case.id)
+                .unwrap();
+        let mut item = journal.items()[0].clone();
+        item.metadata.insert(
+            "admission_hash".into(),
+            json!("changed after the original commit"),
+        );
+        journal
+            .append(crate::structured::queue::Change::Upsert {
+                item: Box::new(item),
+                position: 0,
+            })
+            .unwrap();
+        drop(journal);
+        r.restart(|r| {
+            r.app.structured_sends = Default::default();
+            r.app.mailboxes = Default::default();
+        })
+        .await;
+        r.app.restore_mesh_mail().unwrap();
+        r.until(|_| {
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state
+                != "inbox"
+        })
+        .await;
+        let state = with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+            .unwrap()
+            .unwrap()
+            .state;
+        assert_eq!(
+            state, "delivered",
+            "a replay conflict cannot revoke committed custody"
+        );
+        assert_eq!(r.inputs().len(), 1);
         r.stop().await;
     });
 }

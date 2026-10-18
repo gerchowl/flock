@@ -235,7 +235,13 @@ which the single queue owner admits idempotently.
 Recovered transient failures, including `input_write_unknown`, retain the same
 custody key and retry in the running process using the existing bounded,
 jittered retry policy (up to five minutes). Owner progress can wake a waiting
-admission sooner. Fleet pause suspends admission. Permanent refusals settle the
+admission sooner. The server loop schedules the earliest recovery/backoff deadline,
+including on an otherwise idle headless server; fleet pause suspends admission.
+The sole journal owner retains an in-memory index of committed custody keys,
+rebuilt from the journal on reopen. Recovery checks that proof before refusing a
+key: a later admission conflict cannot revoke an already committed message.
+While ownership is unknown, custody remains retryable instead of being revoked.
+Permanent refusals settle the
 existing `refused` or `recipient_gone` outcome and emit `message_delivered` with
 `delivered: false`; ordinary `msg.status` exposes the refusal and its detail.
 Refused duplicates retain a registered terminal refusal code. Legacy rows

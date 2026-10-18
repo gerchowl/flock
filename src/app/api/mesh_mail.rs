@@ -712,7 +712,7 @@ impl App {
                 self.mailboxes.enqueue(record.message);
             }
         }
-        self.finish_structured_messages(true);
+        self.finish_structured_messages(true, std::time::Instant::now());
         self.sync_blocking_mail();
     }
 

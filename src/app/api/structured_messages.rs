@@ -30,9 +30,15 @@ pub(super) struct Ack {
     warnings: Vec<String>,
 }
 impl Ack {
-    pub(super) fn refusal(&self, id: String, code: ErrorCode) -> String {
-        // A recovered transient outcome keeps its stable key for in-process retry.
-        let code = if self.recovered && transient(code) {
+    pub(super) fn refusal(
+        &self,
+        id: String,
+        code: ErrorCode,
+        workers: &crate::structured::workers::Workers,
+    ) -> String {
+        let committed = workers.queue_custody_committed(&self.signed.target_agent, &self.key);
+        // Recovery cannot revoke a committed or still uncertain owner outcome.
+        let code = if self.recovered && (committed != Some(false) || transient(code)) {
             ErrorCode::InputWriteUnknown
         } else {
             code
@@ -298,7 +304,7 @@ impl App {
     }
     /// Recovery waits for an owner/capacity wake, never writes a journal itself.
     /// Unknown origin is retained in custody and refused, never re-attributed.
-    pub(crate) fn finish_structured_messages(&mut self, changed: bool) {
+    pub(crate) fn finish_structured_messages(&mut self, changed: bool, now: std::time::Instant) {
         for (ack, code) in std::mem::take(&mut self.structured_sends.failed) {
             match stored(|s| s.get(&ack.key)) {
                 Ok(Some(record)) if ack.recovered && record.state == "inbox" => {
@@ -377,7 +383,6 @@ impl App {
                 }
             }
         }
-        let now = std::time::Instant::now();
         for signed in std::mem::take(&mut self.structured_sends.recovering) {
             if self.fleet_pause.paused
                 || (!changed
@@ -412,7 +417,26 @@ impl App {
             self.structured_sends.retries.remove(&signed.key);
             return code;
         }
-        if !transient(code)
+        // A recovered failure cannot revoke a key the journal owner committed.
+        // Unknown ownership stays retryable until an owner can answer.
+        let committed = self
+            .structured_workers
+            .queue_custody_committed(&signed.target_agent, &signed.key);
+        if committed == Some(true)
+            && stored(|s| {
+                s.settle_queue_admission(&signed.key, None, super::messages::now_ms() as i64)
+            })
+            .is_ok()
+        {
+            self.structured_sends.retries.remove(&signed.key);
+            if let Ok(mut data) = payload(&signed) {
+                data.message.message_key = Some(signed.key.clone());
+                self.mailboxes.record_delivered(&data.message);
+            }
+            return ErrorCode::InputWriteUnknown;
+        }
+        if committed == Some(false)
+            && !transient(code)
             && stored(|s| {
                 s.settle_queue_admission(
                     &signed.key,
