@@ -158,6 +158,12 @@ failing relay are refused with a concrete reason. Version refusals include
 
 ## Server
 
+Starting a server (including automatic startup from `flk`) and peer enrollment
+may need the per-user mesh identity bootstrap lock. If another live or stopped
+process holds it for two seconds, acquisition ends with the typed `session_busy`
+refusal (`retry: "later"`, exit 1). Retry after that operation finishes or its
+owner releases the lock. Flock preserves the existing identity and lock paths.
+
 ```bash
 flk server
 flk server stop

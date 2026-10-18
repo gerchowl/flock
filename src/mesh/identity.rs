@@ -11,6 +11,25 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+/// Identity bootstrap holds its sidecar only for key validation or creation.
+/// A live or stopped competing process must not stall startup indefinitely.
+/// Refuse with `session_busy` / `later` after this monotonic acquisition budget.
+const IDENTITY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Typed contention retains a human explanation and a registered retry class.
+#[derive(Debug)]
+struct IdentityBusy;
+impl std::fmt::Display for IdentityBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("mesh identity is busy; retry after the competing operation finishes")
+    }
+}
+impl std::error::Error for IdentityBusy {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&crate::api::error_code::ErrorCode::SessionBusy)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct NodeIdentity {
     key: SigningKey,
@@ -87,7 +106,13 @@ impl NodeIdentity {
             &dir.join("identity.lock"),
             true,
         )?);
-        lock.lock()?;
+        lock.lock_for(IDENTITY_LOCK_TIMEOUT).map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(io::ErrorKind::WouldBlock, IdentityBusy)
+            } else {
+                error
+            }
+        })?;
         on_lock(&lock);
         let path = dir.join("identity.json");
         let (binding, unavailable_reason) = match machine {
@@ -303,6 +328,48 @@ mod tests {
             loaded.as_ref().err()
         );
         assert_eq!(loaded.unwrap().unwrap().node_id(), identity.node_id());
+    }
+
+    #[test]
+    fn live_identity_holder_refuses_with_registered_later_code_within_budget() {
+        use crate::api::error_code::ErrorCode;
+        use crate::platform::file_lock::inherited_holder::Holder;
+        use std::time::Duration;
+        let fixture = Fixture::new();
+        create_private_dir(&fixture.0.join("mesh")).unwrap();
+        let file = private_file(&fixture.0.join("mesh/identity.lock"), true).unwrap();
+        let mut holder = Holder::lock(&file).unwrap();
+        drop(file);
+        let path = fixture.0.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(NodeIdentity::load_at(&path, Ok("fixture-binding".into())));
+        });
+        let result = rx.recv_timeout(IDENTITY_LOCK_TIMEOUT + Duration::from_secs(1));
+        let alive = holder.verify();
+        // Always release the owned helper before joining a regressed blocking load.
+        drop(holder);
+        worker.join().unwrap();
+        alive.unwrap();
+        let error = result
+            .expect("identity loading exceeded its bounded acquisition budget")
+            .err()
+            .expect("live identity owner must refuse before the critical section");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            crate::cli::output::io_error_code(&error),
+            ErrorCode::SessionBusy
+        );
+        assert_eq!(
+            ErrorCode::SessionBusy.retry(),
+            crate::cli::exit::Retry::Later
+        );
+        assert!(error.to_string().contains("mesh identity is busy"));
+        assert!(
+            !fixture.path().exists(),
+            "refusal must not generate a new identity"
+        );
+        fixture.load("fixture-binding").unwrap();
     }
 
     #[test]

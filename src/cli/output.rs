@@ -248,6 +248,14 @@ pub(crate) fn effect(response: &Value, exit_code: i32) -> i32 {
 /// The registered code for an io error that ended a verb.
 pub(crate) fn io_error_code(err: &std::io::Error) -> ErrorCode {
     use std::io::ErrorKind::*;
+    // Preserve a registered refusal carried through an I/O boundary (ADR-0029).
+    let mut source = err.get_ref().map(|error| error as &dyn std::error::Error);
+    while let Some(error) = source {
+        if let Some(code) = error.downcast_ref::<ErrorCode>() {
+            return *code;
+        }
+        source = error.source();
+    }
     match err.kind() {
         TimedOut | WouldBlock => ErrorCode::Timeout,
         NotFound | ConnectionRefused | ConnectionReset | ConnectionAborted | BrokenPipe
@@ -479,6 +487,15 @@ mod tests {
             human_line("agent_not_found", "agent nosuch\n  not found\n"),
             "error: agent_not_found: agent nosuch not found"
         );
+    }
+
+    #[test]
+    fn io_errors_preserve_registered_busy_refusals() {
+        let error = std::io::Error::new(std::io::ErrorKind::WouldBlock, ErrorCode::SessionBusy);
+        let code = io_error_code(&error);
+        assert_eq!(code, ErrorCode::SessionBusy);
+        assert_eq!(code.retry(), crate::cli::exit::Retry::Later);
+        assert_eq!(code.exit(), exit::FAILURE);
     }
 
     #[test]

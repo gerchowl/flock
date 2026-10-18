@@ -10,6 +10,7 @@ use std::time::Duration;
 const CEILING: Duration = Duration::from_secs(5);
 const FILE_FD: i32 = 3;
 const CONTROL_FD: i32 = 4;
+const LOCK_ENV: &str = "FLOCK_TEST_HOLDER_LOCK";
 const INODE_ENV: &str = "FLOCK_TEST_HOLDER_INODE";
 
 /// Own exactly one exec'd helper; retain no parent copy of the lock description.
@@ -27,6 +28,13 @@ impl Holder {
     /// Pass only the target description and IPC through exec to a single fixture.
     /// Ordinary inherited CLOEXEC descriptors close before the readiness reply.
     pub(crate) fn spawn(file: &(impl AsRawFd + ?Sized)) -> io::Result<Self> {
+        Self::spawn_with_lock(file, false)
+    }
+    /// Acquire in the exec'd helper, proving contention from a live lock owner.
+    pub(crate) fn lock(file: &(impl AsRawFd + ?Sized)) -> io::Result<Self> {
+        Self::spawn_with_lock(file, true)
+    }
+    fn spawn_with_lock(file: &(impl AsRawFd + ?Sized), acquire: bool) -> io::Result<Self> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
         // SAFETY: descriptor is borrowed and the output buffer has the right size.
         if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
@@ -52,6 +60,7 @@ impl Holder {
                 "--exact",
                 &format!("{module}::holder_worker"),
                 "--nocapture",
+                "--ignored",
                 "--test-threads=1",
             ])
             .stdin(Stdio::null())
@@ -63,6 +72,9 @@ impl Holder {
             }
         }
         command.env(INODE_ENV, inode.to_string());
+        if acquire {
+            command.env(LOCK_ENV, "1");
+        }
         // SAFETY: only async-signal-safe descriptor operations run before exec.
         unsafe {
             command.pre_exec(move || {
@@ -124,10 +136,9 @@ fn pass_descriptor(fd: i32) -> io::Result<OwnedFd> {
 }
 
 #[test]
+#[ignore = "exec-only descriptor holder launched with explicit fixture descriptors"]
 fn holder_worker() {
-    let Some(inode) = std::env::var_os(INODE_ENV) else {
-        return;
-    };
+    let inode = std::env::var_os(INODE_ENV).expect("only the holder fixture launches this worker");
     let inode: u64 = inode.to_str().unwrap().parse().unwrap();
     // SAFETY: only Holder::spawn invokes this fixture, explicitly owning 3 and 4.
     let (file, mut control) = unsafe {
@@ -142,6 +153,12 @@ fn holder_worker() {
         unsafe { libc::fcntl(FILE_FD, libc::F_SETFD, libc::FD_CLOEXEC) },
         0
     );
+    let _lock = std::env::var_os(LOCK_ENV).map(|_| {
+        let lock = LockFile::new(file.try_clone().unwrap());
+        lock.try_lock()
+            .expect("helper must acquire before reporting ready");
+        lock
+    });
     control.set_read_timeout(Some(CEILING)).unwrap();
     loop {
         assert_eq!(file.metadata().unwrap().ino(), inode);

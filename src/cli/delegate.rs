@@ -4644,14 +4644,9 @@ fn delegate_reap(args: &[String]) -> io::Result<i32> {
     // `removed: false` for every field — the serialisation we gave up by
     // skipping the lock is replaced by that record of who did what (F13).
     let _lock = match take_lock(name) {
-        Ok(lock) => lock,
+        Ok(lock) => Some(lock),
         Err("busy") if !flags.force => return Ok(fail(format!("delegate {name} is busy"))),
-        Err("busy") => match open_lock_file(&lock_path(name)) {
-            Ok(file) => Lock {
-                _file: crate::platform::file_lock::LockFile::new(file),
-            },
-            Err(err) => return Ok(fail(format!("delegate {name}: {err}"))),
-        },
+        Err("busy") => None,
         Err(reason) => return Ok(fail(format!("delegate {name}: {reason}"))),
     };
     let Some(entry) = read_entry(name) else {
