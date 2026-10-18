@@ -3734,8 +3734,18 @@ impl AppState {
             if !space.is_linked_worktree {
                 continue;
             }
-            let main_root =
-                crate::worktree::main_root_from_common_dir(std::path::Path::new(&space.key));
+            let common = crate::worktree::canonical_or_original(std::path::Path::new(&space.key));
+            let main_root = self
+                .workspaces
+                .iter()
+                .filter_map(|ws| ws.git_space())
+                .find(|parent| {
+                    !parent.is_linked_worktree
+                        && crate::worktree::canonical_or_original(std::path::Path::new(&parent.key))
+                            == common
+                })
+                .map(|parent| parent.repo_root.clone())
+                .unwrap_or_else(|| crate::worktree::main_root_from_common_dir(&common));
             self.workspaces[idx].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
                 key: space.key.clone(),
                 label: space.label.clone(),
@@ -3753,7 +3763,12 @@ impl AppState {
                 }
                 let is_parent = self.workspaces[parent_idx]
                     .git_space()
-                    .is_some_and(|parent| !parent.is_linked_worktree && parent.key == space.key);
+                    .is_some_and(|parent| {
+                        !parent.is_linked_worktree
+                            && crate::worktree::canonical_or_original(std::path::Path::new(
+                                &parent.key,
+                            )) == common
+                    });
                 if is_parent {
                     self.workspaces[parent_idx].worktree_space =
                         Some(crate::workspace::WorktreeSpaceMembership {

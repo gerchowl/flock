@@ -1758,7 +1758,7 @@ fn place(name: &str, flags: &StartFlags, mode: Mode) -> Result<Placement, i32> {
         if mode == Mode::Worktree {
             if let (Some(path), Some(before)) = (worktree.as_deref(), worktrees_before.as_ref()) {
                 if checkout_is_new(before, path) {
-                    match kill(None, Some(path), true) {
+                    match kill(None, Some(path), Some(&repo), true) {
                         Ok(_) => {
                             eprintln!("delegate {name}: rollback removed stray checkout at {path}");
                         }
@@ -1839,7 +1839,7 @@ fn teardown_after_place_failure(
         flags,
         failure,
         |deadline| worktree_list_plain(repo, deadline),
-        |path| kill(None, Some(path), true),
+        |path| kill(None, Some(path), Some(repo), true),
     )
 }
 
@@ -2117,7 +2117,7 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
                     // IS the state we wanted, so match on the error rather
                     // than inspecting a response that is only ever a
                     // success envelope (W10).
-                    match kill(Some(&target.workspace_id), None, force) {
+                    match kill(Some(&target.workspace_id), None, None, force) {
                         Ok(_) => {
                             // The kill closes the workspace and removes the
                             // checkout with it, so both are accounted for.
@@ -2194,7 +2194,7 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
     // "Already gone" is the goal, not an error (W10 / a29).
     if let Some(checkout) = target.worktree.clone() {
         if !done.checkout_removed {
-            match kill(None, Some(&checkout), force) {
+            match kill(None, Some(&checkout), target.repo_root.as_deref(), force) {
                 Ok(_) => {
                     done.checkout_removed = true;
                 }
@@ -2202,26 +2202,6 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
                     done.checkout_removed = true;
                 }
                 Err(err) => return Err(err),
-            }
-        }
-        if !Path::new(&checkout).exists() {
-            if let Some(repo_root) = &target.repo_root {
-                // Directory deletion can leave Git's worktree registration behind.
-                let command = crate::worktree::WorktreeCommand {
-                    program: "git".to_string(),
-                    args: vec![
-                        "-C".to_string(),
-                        repo_root.clone(),
-                        "worktree".to_string(),
-                        "prune".to_string(),
-                        "--expire".to_string(),
-                        "now".to_string(),
-                    ],
-                };
-                crate::worktree::run_worktree_command(&command).map_err(|message| ServerError {
-                    code: "worktree_prune_failed".to_string(),
-                    message,
-                })?;
             }
         }
     }
@@ -2590,12 +2570,14 @@ fn parent_to_close_with(
 fn kill(
     workspace_id: Option<&str>,
     path: Option<&str>,
+    repo: Option<&str>,
     force: bool,
 ) -> Result<serde_json::Value, ServerError> {
     let response = match bounded(
         Method::WorktreeKill(WorktreeKillParams {
             workspace_id: workspace_id.map(str::to_string),
             path: path.map(str::to_string),
+            repo: repo.map(str::to_string),
             force,
             caller_pid: Some(std::process::id()),
             ..WorktreeKillParams::default()
