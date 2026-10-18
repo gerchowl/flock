@@ -7,7 +7,8 @@
 #![deny(missing_docs)]
 
 use super::launch::{
-    registry_has_messaging_socket, LaunchError, LaunchProfile, SessionConfigDir, VerifiedBinary,
+    registry_has_messaging_socket, LaunchError, LaunchProfile, SessionConfigDir, SessionMcp,
+    VerifiedBinary,
 };
 use super::supervision::{self, StopRequest};
 use super::transport::{
@@ -173,14 +174,16 @@ impl Drop for Runtime {
 /// lookup window; see `registry_has_messaging_socket`. Forward the returned exit
 /// through the caller's event channel. This API does not expose agent.start or
 /// reserve a lease; the caller must reserve before preparing the launch.
+/// `mcp` pins this build and the owning server socket; no ambient endpoint lookup.
 pub fn run(
     state: &Path,
     profile: LaunchProfile,
     lease: super::lease::Lease,
     location: StreamLocation,
+    mcp: SessionMcp,
     ready: impl FnOnce(Runtime),
 ) -> Result<Exit, LaunchError> {
-    run_notified(state, profile, lease, location, ready, || {})
+    run_notified(state, profile, lease, location, mcp, ready, || {})
 }
 
 /// Worker assembly with a nonblocking wake after each queued stream notification.
@@ -191,12 +194,13 @@ pub(crate) fn run_notified(
     profile: LaunchProfile,
     lease: super::lease::Lease,
     location: StreamLocation,
+    mcp: SessionMcp,
     ready: impl FnOnce(Runtime),
     notify: impl Fn() + Send + 'static,
 ) -> Result<Exit, LaunchError> {
     run_controlled(
         state,
-        profile,
+        (profile, mcp),
         lease,
         location,
         ready,
@@ -219,7 +223,7 @@ pub(crate) struct Control {
 /// Worker-owned cancellation exists before spawn, including deadline escalation.
 pub(crate) fn run_controlled(
     state: &Path,
-    profile: LaunchProfile,
+    (profile, mcp): (LaunchProfile, SessionMcp),
     mut lease: super::lease::Lease,
     location: StreamLocation,
     ready: impl FnOnce(Runtime),
@@ -235,6 +239,7 @@ pub(crate) fn run_controlled(
     {
         return Err(io::Error::other("structured lease/stream mismatch").into());
     }
+    profile.register_flock_mcp(Some(&lease), &mcp)?;
     let (queue, queue_client) = match queue_rewrite_bytes {
         Some(bytes) => {
             let (owner, client) =
