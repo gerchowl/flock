@@ -10,9 +10,11 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// Best-effort repair coordination never makes an unbounded number of attempts,
-/// even if the supplied clock stops advancing. Content publication takes priority.
+/// Guard against a supplied clock/sleeper that fails to advance. Normal
+/// contention is bounded by elapsed time after backoff, not by attempt count.
 const MAX_REPAIR_LOCK_ATTEMPTS: usize = 8;
+/// Start with a short sleep, doubling only up to the remaining clock budget.
+const REPAIR_LOCK_BACKOFF: Duration = Duration::from_millis(1);
 /// Stop retrying contention after this much supplied monotonic time. Individual
 /// filesystem operations retain their ordinary I/O failure behavior.
 const REPAIR_LOCK_WAIT: Duration = Duration::from_millis(20);
@@ -138,10 +140,13 @@ impl BlobStore {
     /// Only corrupt-object repair attempts advisory serialization and rechecks
     /// the current bytes before rename. Missing objects publish without locking:
     /// racing writers have identical verified bytes and emit no repair event.
-    /// Repair coordination tries at most eight nonblocking acquisitions within
-    /// 20 ms of supplied monotonic time. Lock errors or budget exhaustion warn
-    /// once with the error kind and fall back to unlocked publication; duplicate
-    /// repair diagnostics are then possible, but locking never loses content.
+    /// On contention the supplied clock sleeps for 1 ms, then doubles the
+    /// backoff, clipping every request to the remaining 20 ms budget. Eight
+    /// attempts guard only against a clock/sleeper that fails to advance.
+    /// Clock expiry warns with TimedOut; attempt exhaustion warns with WouldBlock.
+    /// Other lock errors warn immediately. Each warns once and falls back to
+    /// unlocked publication; duplicate diagnostics are then possible, but locking
+    /// never loses content. Sleep requests are bounded, not OS scheduling or I/O.
     /// Non-cooperating filesystem mutations are outside this advisory lock.
     /// Read/write/rename/sync failures remain explicit; reads report corruption.
     pub fn put(&self, reader: impl Read, max_bytes: u64) -> Result<BlobRef, BlobError> {
@@ -159,7 +164,7 @@ impl BlobStore {
         mut reader: impl Read,
         max_bytes: u64,
         now: &mut impl FnMut() -> Instant,
-        _sleep: &mut impl FnMut(Duration),
+        sleep: &mut impl FnMut(Duration),
         lock: &mut impl FnMut() -> io::Result<File>,
     ) -> Result<BlobRef, BlobError> {
         let mut entropy = [0; 16];
@@ -202,7 +207,7 @@ impl BlobStore {
                 Err(BlobError::Corrupt) => {
                     #[cfg(test)]
                     tests::corrupt_observed();
-                    let _publication = match Self::repair_lock(now, _sleep, lock) {
+                    let _publication = match Self::repair_lock(now, sleep, lock) {
                         Ok(guard) => Some(guard),
                         Err(error) => {
                             crate::logging::structured_blob_repair_lock_unavailable(
@@ -235,26 +240,36 @@ impl BlobStore {
         }
         result
     }
-    /// A bounded, best-effort wait driven by the caller's monotonic clock.
-    /// Only contention retries; unsupported locking immediately falls back.
+    /// A bounded, best-effort wait using the caller's matching now/sleep pair.
+    /// Only contention backs off; unsupported locking immediately falls back.
     fn repair_lock(
         now: &mut impl FnMut() -> Instant,
-        _sleep: &mut impl FnMut(Duration),
+        sleep: &mut impl FnMut(Duration),
         lock: &mut impl FnMut() -> io::Result<File>,
     ) -> io::Result<File> {
         let started = now();
-        for _ in 0..MAX_REPAIR_LOCK_ATTEMPTS {
+        let mut backoff = REPAIR_LOCK_BACKOFF;
+        for attempt in 0..MAX_REPAIR_LOCK_ATTEMPTS {
             match lock() {
                 Ok(guard) => return Ok(guard),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
                 Err(error) => return Err(error),
             }
-            if now().saturating_duration_since(started) >= REPAIR_LOCK_WAIT {
-                break;
+            let elapsed = now().saturating_duration_since(started);
+            let remaining = REPAIR_LOCK_WAIT.saturating_sub(elapsed);
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
             }
-            std::thread::yield_now();
+            if attempt + 1 == MAX_REPAIR_LOCK_ATTEMPTS {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            sleep(backoff.min(remaining));
+            if now().saturating_duration_since(started) >= REPAIR_LOCK_WAIT {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            backoff = backoff.saturating_mul(2).min(REPAIR_LOCK_WAIT);
         }
-        Err(io::ErrorKind::TimedOut.into())
+        Err(io::ErrorKind::WouldBlock.into())
     }
     fn publish(&self, temporary: &str, blob: &str) -> Result<(), BlobError> {
         #[cfg(test)]

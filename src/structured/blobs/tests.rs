@@ -306,7 +306,13 @@ fn unsafe_namespace_and_file_permissions_fail_without_repair() {
     );
 }
 
+struct HeldPublication {
+    ready: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
 std::thread_local! {
+    static HOLD_PUBLICATION: std::cell::RefCell<Option<HeldPublication>> = const { std::cell::RefCell::new(None) };
     static REPAIR_RACE: std::cell::RefCell<Option<Arc<Barrier>>> = const { std::cell::RefCell::new(None) };
     static CRASH_BEFORE_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -320,6 +326,14 @@ pub(super) fn corrupt_observed() {
 }
 
 pub(super) fn before_publish() {
+    if let Some(held) = HOLD_PUBLICATION.with(|slot| slot.borrow_mut().take()) {
+        held.ready
+            .send(())
+            .expect("repair holder must have a contender");
+        held.release
+            .recv_timeout(Duration::from_secs(5))
+            .expect("contender must release the repair holder");
+    }
     CRASH_BEFORE_PUBLISH.with(|enabled| {
         if enabled.get() {
             // Exit without unwinding: model a process crash after the temp fsync.
@@ -453,69 +467,95 @@ fn racing_corrupt_observers_emit_only_one_repair_event() {
     fs::write(root.path().join("blobs").join(ABC), b"bad").unwrap();
     let capture = RepairLog::default();
     let barrier = Arc::new(Barrier::new(2));
-    let (tx, rx) = mpsc::channel();
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
     let (published_tx, published_rx) = mpsc::channel();
-    let mut published_rx = Some(published_rx);
-    let workers: Vec<_> = (0..2)
-        .map(|index| {
-            // Independent stores exercise filesystem coordination, not an instance mutex.
-            let store = BlobStore::open(root.path()).unwrap();
-            let (barrier, tx, writer) = (barrier.clone(), tx.clone(), capture.clone());
-            let mut await_first = if index == 1 {
-                published_rx.take()
-            } else {
-                None
-            };
-            let published = (index == 0).then(|| published_tx.clone());
-            std::thread::spawn(move || {
-                REPAIR_RACE.with(|slot| *slot.borrow_mut() = Some(barrier));
-                let subscriber = tracing_subscriber::fmt()
-                    .json()
-                    .without_time()
-                    .with_max_level(tracing::Level::WARN)
-                    .with_writer(move || writer.clone())
-                    .finish();
-                let result = tracing::subscriber::with_default(subscriber, || {
-                    store.put_with_repair_lock(
-                        &b"abc"[..],
-                        3,
-                        &mut std::time::Instant::now,
-                        &mut |_| {},
-                        &mut || {
-                            // Both writers observed corruption at the barrier. Order acquisition
-                            // after publication so this assertion is independent of fsync speed
-                            // and the best-effort contention budget.
-                            if let Some(ready) = await_first.take() {
-                                ready.recv_timeout(Duration::from_secs(10)).expect(
-                                    "first repair must publish before the second acquisition",
-                                );
-                            }
-                            store.0.try_publication_lock()
-                        },
-                    )
-                });
-                if let Some(published) = published {
-                    published.send(()).unwrap();
-                }
-                tx.send(result).unwrap();
+    let (result_tx, result_rx) = mpsc::channel();
+    let (metrics_tx, metrics_rx) = mpsc::channel();
+    let first_store = BlobStore::open(root.path()).unwrap();
+    let first_barrier = barrier.clone();
+    let first_result = result_tx.clone();
+    let first_log = capture.clone();
+    let first = std::thread::spawn(move || {
+        REPAIR_RACE.with(|slot| *slot.borrow_mut() = Some(first_barrier));
+        // Pause after verification, with the real repair lock still held.
+        HOLD_PUBLICATION.with(|slot| {
+            *slot.borrow_mut() = Some(HeldPublication {
+                ready: held_tx,
+                release: release_rx,
             })
-        })
-        .collect();
-    drop(tx);
-    drop(published_tx);
-    // Bound the rendezvous too: a missing observer or a silent worker must fail.
+        });
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || first_log.clone())
+            .finish();
+        let result =
+            tracing::subscriber::with_default(subscriber, || first_store.put(&b"abc"[..], 3));
+        let _ = published_tx.send(result.is_ok());
+        first_result.send(result).unwrap();
+    });
+    let second_store = BlobStore::open(root.path()).unwrap();
+    let second_log = capture.clone();
+    let second = std::thread::spawn(move || {
+        use std::cell::Cell;
+        REPAIR_RACE.with(|slot| *slot.borrow_mut() = Some(barrier));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || second_log.clone())
+            .finish();
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let attempts = Cell::new(0);
+        let mut sleeps = Vec::new();
+        let mut release = Some(release_tx);
+        let mut held = Some(held_rx);
+        let result = tracing::subscriber::with_default(subscriber, || {
+            second_store.put_with_repair_lock(&b"abc"[..], 3, &mut || start + elapsed.get(), &mut |delay| {
+                sleeps.push(delay);
+                elapsed.set(elapsed.get() + delay);
+                release.take().expect("only the first contended attempt needs a wake")
+                    .send(()).expect("repair holder must still be alive");
+                assert!(published_rx.recv_timeout(Duration::from_secs(5))
+                    .expect("holder must finish after the supplied clock wakes it"));
+            }, &mut || {
+                if let Some(held) = held.take() {
+                    held.recv_timeout(Duration::from_secs(5))
+                        .expect("first writer must hold the repair lock before attempting it");
+                }
+                attempts.set(attempts.get() + 1);
+                let lock = second_store.0.try_publication_lock();
+                if attempts.get() == 1 {
+                    assert!(matches!(&lock, Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+                        "the first acquisition must genuinely contend");
+                }
+                lock
+            })
+        });
+        // Always release the fixture holder on failure too; never strand a test thread.
+        if let Some(release) = release.take() {
+            let _ = release.send(());
+        }
+        result_tx.send(result).unwrap();
+        metrics_tx
+            .send((attempts.get(), sleeps, elapsed.get()))
+            .unwrap();
+    });
     for _ in 0..2 {
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(10))
-                .expect("repair worker must complete")
+            result_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("each repair must finish or report failure")
                 .unwrap()
                 .blob,
             ABC
         );
     }
-    for worker in workers {
-        worker.join().unwrap();
-    }
+    first.join().unwrap();
+    second.join().unwrap();
     assert_eq!(store.get(ABC).unwrap(), b"abc");
     assert_eq!(names(&root), [ABC]);
     let bytes = capture.0.lock().unwrap().clone();
@@ -527,9 +567,78 @@ fn racing_corrupt_observers_emit_only_one_repair_event() {
     assert_eq!(
         events.len(),
         1,
-        "only the writer replacing corrupt bytes reports repair"
+        "a genuinely contended repair must not fall back or log twice"
     );
     assert_eq!(events[0]["fields"]["event"], "structured.blob.repaired");
+    let (attempts, sleeps, elapsed) = metrics_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(sleeps, [Duration::from_millis(1)]);
+    assert_eq!(elapsed, Duration::from_millis(1));
+}
+
+#[test]
+fn contended_repair_waits_through_the_clock_budget_then_warns_and_publishes() {
+    use std::cell::Cell;
+    let (root, holder) = setup();
+    holder.put(&b"abc"[..], 3).unwrap();
+    fs::write(root.path().join("blobs").join(ABC), b"bad").unwrap();
+    let _held = holder.0.try_publication_lock().unwrap();
+    let contender = BlobStore::open(root.path()).unwrap();
+    let capture = RepairLog::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    let start = Instant::now();
+    let elapsed = Cell::new(Duration::ZERO);
+    let attempts = Cell::new(0);
+    let mut sleeps = Vec::new();
+    let result = tracing::subscriber::with_default(subscriber, || {
+        contender.put_with_repair_lock(
+            &b"abc"[..],
+            3,
+            &mut || start + elapsed.get(),
+            &mut |delay| {
+                assert!(!delay.is_zero());
+                assert!(delay <= REPAIR_LOCK_WAIT.saturating_sub(elapsed.get()));
+                sleeps.push(delay);
+                elapsed.set(elapsed.get() + delay);
+            },
+            &mut || {
+                attempts.set(attempts.get() + 1);
+                let lock = contender.0.try_publication_lock();
+                assert!(matches!(&lock, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+                lock
+            },
+        )
+    });
+    assert!(
+        result.is_ok(),
+        "budget exhaustion must not lose content: {result:?}"
+    );
+    assert_eq!(
+        elapsed.get(),
+        REPAIR_LOCK_WAIT,
+        "the clock, not a tight retry loop, bounds contention"
+    );
+    assert_eq!(attempts.get(), 5);
+    assert_eq!(sleeps, [1, 2, 4, 8, 5].map(Duration::from_millis));
+    assert_eq!(holder.get(ABC).unwrap(), b"abc");
+    let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    let events: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0]["fields"]["event"],
+        "structured.blob.repair_lock_unavailable"
+    );
+    assert_eq!(events[0]["fields"]["error_kind"], "TimedOut");
+    assert_eq!(events[1]["fields"]["event"], "structured.blob.repaired");
 }
 
 #[test]
@@ -655,6 +764,9 @@ fn repair_lock_retry_budget_uses_supplied_time_and_bounds_a_frozen_clock() {
             .filter(|event| event["fields"]["event"] == "structured.blob.repair_lock_unavailable")
             .collect();
         assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0]["fields"]["error_kind"], "TimedOut");
+        assert_eq!(
+            warnings[0]["fields"]["error_kind"],
+            if advances { "TimedOut" } else { "WouldBlock" }
+        );
     }
 }
