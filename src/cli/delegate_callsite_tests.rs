@@ -996,6 +996,41 @@ async fn reap_with_all_workspaces_closed_removes_checkout_and_registry_without_p
 }
 
 #[tokio::test]
+async fn reap_externally_deleted_checkout_removes_only_its_registration_without_prune() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = ClosedWorkspaceFixture::new();
+    let sibling = fixture.root.path().join("missing-sibling");
+    crate::test_support::run_git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "worktree/missing-sibling",
+            sibling.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    std::fs::remove_dir_all(&sibling).unwrap();
+    std::fs::remove_dir_all(&fixture.checkout).unwrap();
+    let mut entry = entry_for("deleted-checkout");
+    entry.mode = "worktree".into();
+    entry.worktree = Some(fixture.checkout.to_string_lossy().into_owned());
+    entry.repo_root = Some(fixture.repo.to_string_lossy().into_owned());
+    entry.branch = Some("worktree/delegate-recovery".into());
+    write_entry(&entry).unwrap();
+    let result = fixture
+        .drive(|| delegate_reap(&["deleted-checkout".into(), "--json".into()]))
+        .await
+        .unwrap();
+    assert_eq!(result, 0);
+    assert!(!entry_path(&entry.name).exists());
+    let rows = crate::worktree::list_existing_worktrees(&fixture.repo).unwrap();
+    assert!(!rows.iter().any(|row| row.path == fixture.checkout));
+    assert!(rows.iter().any(|row| row.path == sibling));
+}
+
+#[tokio::test]
 async fn placement_failure_cleans_up_with_no_open_workspace() {
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = ClosedWorkspaceFixture::new();

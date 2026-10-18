@@ -899,6 +899,10 @@ fn schema_worktree_kill() -> Value {
                 "type": "string",
                 "description": "The checkout to tear down, by path — the `path` from `flock_worktree_list`. Use this for a checkout nobody has open. Exactly one of `workspace` and `path`.",
             },
+            "repo": {
+                "type": "string",
+                "description": "Optional absolute main checkout root proving ownership for a path kill. Only exact registered linked roots qualify. Unavailable repositories require recovery, and subdirectory proofs are refused.",
+            },
             "dry_run": {
                 "type": "boolean",
                 "default": true,
@@ -942,10 +946,18 @@ fn build_worktree_kill(args: Value) -> Result<Method, McpError> {
             "exactly one of `workspace` or `path` is required",
         ));
     }
+    let repo = optional_string(&args, "repo")?;
+    if let Some(repo) = &repo {
+        if path.is_none() || !std::path::Path::new(repo).is_absolute() {
+            return Err(McpError::invalid_params(
+                "`repo` requires `path` and must be an absolute main checkout root",
+            ));
+        }
+    }
     Ok(Method::WorktreeKill(WorktreeKillParams {
         workspace_id,
         path,
-        repo: None,
+        repo,
         force: optional_bool(&args, "force")?,
         keep_branch: optional_bool(&args, "keep_branch")?,
         dry_run,
@@ -1616,6 +1628,31 @@ mod tests {
             tool.descriptor()["inputSchema"]["properties"]["dry_run"]["default"],
             true
         );
+    }
+
+    #[test]
+    fn worktree_kill_exposes_and_preserves_repo_proof() {
+        let root = crate::test_support::TempDir::socket();
+        let tool = find("flock_worktree_kill").unwrap();
+        assert_eq!(
+            tool.descriptor()["inputSchema"]["properties"]["repo"]["type"],
+            "string"
+        );
+        let Method::WorktreeKill(params) =
+            (tool.build)(json!({"path":root.path().join("checkout"), "repo":root.path()})).unwrap()
+        else {
+            panic!("expected worktree kill")
+        };
+        assert_eq!(
+            params.repo,
+            Some(root.path().to_string_lossy().into_owned())
+        );
+        for args in [
+            json!({"path":root.path(), "repo":"relative"}),
+            json!({"workspace":"w_fixture", "repo":root.path()}),
+        ] {
+            assert!((tool.build)(args).is_err());
+        }
     }
 
     #[test]

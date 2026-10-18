@@ -390,9 +390,13 @@ allowed. Repository-side refusals additionally carry `repo` and set the checkout
 mount-point hint to `null`; their recovery text concerns the repository only.
 Kill-by-path accepts only a canonical path equal to a registered linked-worktree
 root in `git worktree list` for a repository with an open workspace, or for an
-explicitly named repository. Optional `repo` is an absolute repository path,
+explicitly named repository. Optional `repo` is the absolute main checkout root of that repository,
 allowed only with `path`. When supplied, only that repository's registrations
-are eligible; it does not fall back to open workspaces. The requested checkout
+are eligible; it does not fall back to open workspaces. A subdirectory or linked
+checkout supplied as `repo` is refused with `invalid_request`. If the proof
+repository cannot be queried, the response is `worktree_repository_unreachable`
+(retry `after_human`): restore access and retry. The main checkout is identified
+by the first porcelain row, including separate-git-dir and submodule layouts. The requested checkout
 cannot be the repository's main checkout or the supplied `repo` itself.
 Subdirectories,
 plain directories and checkouts of unowned repositories refuse
