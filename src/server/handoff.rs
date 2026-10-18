@@ -717,6 +717,10 @@ fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> 
             return Err(io::Error::other("handoff fd control message was truncated"));
         }
         collected?;
+        // Set every received PTY/listener descriptor before any importer child can be spawned.
+        for fd in &out[before..] {
+            crate::platform::received_fd::close_on_exec(*fd)?;
+        }
         if byte[0] != FD_BATCH_TAG {
             return Err(io::Error::other(format!(
                 "handoff fd batch carried data byte {:#04x}, expected {:#04x}",
@@ -1180,6 +1184,11 @@ mod tests {
         // Each received fd must be the write end of the pipe at the same
         // index: the importer pairs fds with manifest panes by position.
         for (idx, &fd) in received.iter().enumerate() {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0,
+                "PTY descriptor must not reach an importer child"
+            );
             let tag = idx as u8;
             assert_eq!(unsafe { libc::write(fd, (&tag as *const u8).cast(), 1) }, 1);
             let mut got = 0u8;

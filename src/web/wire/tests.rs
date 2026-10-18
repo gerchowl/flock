@@ -16,7 +16,7 @@ async fn within<T>(work: impl Future<Output = T>) -> T {
         .expect("transport producer stayed silent")
 }
 #[derive(Clone)]
-struct TestClock(Arc<ClockState>);
+pub(crate) struct TestClock(Arc<ClockState>);
 struct ClockState {
     base: Instant,
     elapsed: AtomicU64,
@@ -24,7 +24,7 @@ struct ClockState {
     deadlines: Mutex<Vec<Instant>>,
 }
 impl TestClock {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (signal, _) = watch::channel(0);
         Self(Arc::new(ClockState {
             base: Instant::now(),
@@ -33,11 +33,11 @@ impl TestClock {
             deadlines: Mutex::new(Vec::new()),
         }))
     }
-    fn advance(&self, ms: u64) {
+    pub(crate) fn advance(&self, ms: u64) {
         self.0.elapsed.fetch_add(ms, Ordering::SeqCst);
         self.0.signal.send_modify(|generation| *generation += 1);
     }
-    async fn deadline(&self, ms: u64) {
+    pub(crate) async fn deadline(&self, ms: u64) {
         self.deadline_count(ms, 1).await;
     }
     fn count(&self, ms: u64) -> usize {

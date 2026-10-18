@@ -62,3 +62,20 @@ exercises their hello, token refusal and heartbeat portions only, remapping the
 fictional credential to an isolated deterministic token record. It does not
 claim full client/subscription-script conformance before the later slices and
 S8's complete adapter have landed.
+
+## Listener recovery foundation (#1894)
+
+The foundation starts no listener. Its reusable accept policy treats peer resets,
+interrupted accepts and other per-connection errors as recoverable and logs them
+at debug level. Descriptor or buffer exhaustion emits a structured warning and
+waits `ACCEPT_RESOURCE_BACKOFF` (100 ms) on the supplied monotonic clock before
+accepting again. Only an invalid listener descriptor (`EBADF`, `EINVAL`,
+`ENOTSOCK`) ends that listener task and publishes the typed `failed` state once.
+It does not end the headless server loop or its agents. Ping carries the optional
+`client_listener` state (`listening` or `failed`), absent when disabled.
+
+Every SCM_RIGHTS descriptor is made close-on-exec at the receive boundary before
+import can spawn a child. The listener descriptor helper additionally verifies
+that a transferred socket is listening and retains exporter rollback ownership
+through duplication. Mounting and listener transfer through handoff remain the
+responsibility of the subsequent #1894 mounting change.
