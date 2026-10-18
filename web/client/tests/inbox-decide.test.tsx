@@ -94,6 +94,33 @@ describe("the card's state is the outbox entry's", () => {
 });
 
 describe("answering a prompt", () => {
+  test("a refusal code outside AgentDecideErrorCode, like invalid_params, shows its message, is never retried, and waits for a new seq", () => {
+    const app = prompt();
+    button(app, "Allow once").click();
+    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("invalid_params") });
+    expect(status(app)).toBe(`${STATUS_LABELS.failed}: server said invalid_params`);
+    for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(1);
+    app.event("atlas", "r1", "Bash", { command: "just check" }, 42);
+    expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
+  });
+
+  test("a caught send error covers the status only until the status changes", () => {
+    const app = prompt();
+    const connection = app.h.connection as unknown as { command: (...args: unknown[]) => string };
+    const real = connection.command.bind(connection);
+    connection.command = () => {
+      throw new Error("could not queue the answer");
+    };
+    button(app, "Allow once").click();
+    expect(status(app)).toBe("could not queue the answer");
+    expect(cmds(app)).toHaveLength(0);
+    connection.command = real;
+    app.gap("atlas");
+    expect(status(app)).toBe("This agent's history has a gap; answering waits for it to catch up.");
+  });
+
   test("every typed refusal has plain words", () => {
     const app = prompt();
     button(app, "Deny").click();

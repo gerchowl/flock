@@ -79,7 +79,11 @@ const CHOICES: readonly { readonly label: string; readonly decision: PermissionD
   { label: "Deny", decision: "deny" },
 ];
 
-/** The longest message the server takes, in UTF-8 bytes of the trimmed text (the server limit is being filed; one constant to change). */
+/**
+ * The longest message the server takes, in UTF-8 bytes of the trimmed text. The server
+ * bound is #2249 (2048 bytes, `prompt_control_bytes` rules, typed `invalid_params`); this
+ * constant becomes generated once #2249 lands.
+ */
 export const MESSAGE_MAX_BYTES = 2048;
 
 const utf8Bytes = (text: string): number => new TextEncoder().encode(text).length;
@@ -154,7 +158,7 @@ export function PermissionActions(props: { readonly card: InboxCard; readonly se
     setError("The request changed; review it again.");
   });
   // A send error covers the status only until the status moves on.
-  const stateKey = createMemo(() => JSON.stringify(state()));
+  const stateKey = createMemo(() => blocked());
   createEffect(on(stateKey, () => setError(null), { defer: true }));
   return (
     <div class="decide" data-testid="decide">
