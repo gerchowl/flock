@@ -167,24 +167,43 @@ impl Registry {
         before - self.retained.len()
     }
 
-    /// Stamp at the injected wall-clock time; prune only at an actual save boundary.
-    /// Capture/undo callers pass `false` so no record disappears from a snapshot.
+    /// Install the saved snapshot's inactive records and sidecar after durable commit.
+    /// The snapshot must come from this registry during synchronous maintenance,
+    /// without intervening registry mutations. Active entries, generations and worker
+    /// observations remain owned by the live registry (ADR-0036 §1).
+    pub(crate) fn swap_retained_state(&mut self, saved: &mut Self) {
+        std::mem::swap(&mut self.preserved, &mut saved.preserved);
+        std::mem::swap(&mut self.retained, &mut saved.retained);
+        std::mem::swap(&mut self.retention_extra, &mut saved.retention_extra);
+        std::mem::swap(&mut self.retention_opaque, &mut saved.retention_opaque);
+    }
+
+    /// Stamp missing first-seen times without pruning capture/undo records.
+    /// Unknown sidecar shapes remain untouched (ADR-0028 §3a).
+    pub fn stamp_retained_records(&mut self, now_ms: u64) {
+        if self.retention_opaque.is_none() {
+            for entry in self.retained.values_mut() {
+                entry.first_seen_ms.get_or_insert(now_ms);
+            }
+        }
+    }
+
+    /// Stamp and prune at an actual save boundary, using the injected wall clock.
     /// FORWARD records are never auto-pruned. Equal-age DEAD ties use original order.
-    pub fn prepare_retained_save(&mut self, now_ms: u64, prune_dead: bool) {
+    pub fn prepare_retained_save(&mut self, now_ms: u64) {
         if self.retention_opaque.is_some() {
             tracing::warn!("automatic retained-record pruning refused for unknown sidecar shape; see session-state repair guide");
             return;
         }
-        let mut dead = Vec::new();
-        for (&slot, entry) in &mut self.retained {
-            let first = *entry.first_seen_ms.get_or_insert(now_ms);
-            if entry.kind == RetainedKind::Dead {
-                dead.push((first, slot));
-            }
-        }
-        if !prune_dead {
-            return;
-        }
+        self.stamp_retained_records(now_ms);
+        let mut dead: Vec<_> = self
+            .retained
+            .iter()
+            .filter_map(|(&slot, entry)| {
+                (entry.kind == RetainedKind::Dead)
+                    .then_some((entry.first_seen_ms.unwrap_or(now_ms), slot))
+            })
+            .collect();
         dead.sort_unstable();
         let expired = dead
             .iter()

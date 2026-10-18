@@ -35,9 +35,7 @@ impl App {
         match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(elapsed) => {
                 let now_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
-                self.state
-                    .structured_agents
-                    .prepare_retained_save(now_ms, true);
+                self.state.structured_agents.prepare_retained_save(now_ms);
                 Some(now_ms)
             }
             Err(error) => {

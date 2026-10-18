@@ -58,7 +58,7 @@ impl App {
             let all = selection == Selection::All;
             let mut candidate = self.state.structured_agents.snapshot();
             candidate.purge_retained(all, older_than_ms, now);
-            candidate.prepare_retained_save(now, true);
+            candidate.prepare_retained_save(now);
             removed = self.state.structured_agents.retained_count() - candidate.retained_count();
             if !self.no_session {
                 let snapshot = self.capture_session_snapshot(&candidate, Some(now));
@@ -71,13 +71,9 @@ impl App {
                     );
                 }
             }
-            // Apply the same selection after commit, without replacing active worker state.
             self.state
                 .structured_agents
-                .purge_retained(all, older_than_ms, now);
-            self.state
-                .structured_agents
-                .prepare_retained_save(now, true);
+                .swap_retained_state(&mut candidate);
         }
         let records = self.state.structured_agents.retained_records();
         let forward = records

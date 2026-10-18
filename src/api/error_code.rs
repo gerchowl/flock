@@ -116,7 +116,6 @@ error_codes! {
         InvalidRegex = "invalid_regex",
         InvalidRequest = "invalid_request",
         InvalidSessionName = "invalid_session_name",
-        RetainedCollectionShape = "retained_collection_shape",
         InvalidSignature = "invalid_signature",
         InvalidStateLabel = "invalid_state_label",
         LineageNotFound = "lineage_not_found",
@@ -135,6 +134,7 @@ error_codes! {
         NoCallerPane = "no_caller_pane",
         NoCheckout = "no_checkout",
         NotAnEdge = "not_an_edge",
+        NotAuthorized = "not_authorized",
         NotFound = "not_found",
         NotFromAPane = "not_from_a_pane",
         NotGitWorktree = "not_git_worktree",
@@ -142,20 +142,19 @@ error_codes! {
         NotImplemented = "not_implemented",
         NotLinkedWorktree = "not_linked_worktree",
         OperatorOnly = "operator_only",
-        NotAuthorized = "not_authorized",
-        PermissionGrantLimit = "permission_grant_limit",
-        PermissionInputAlreadyHeld = "permission_input_already_held",
-        PermissionRequestTooLarge = "permission_request_too_large",
-        PermissionRequestUnknown = "permission_request_unknown",
-        PermissionRequestClosed = "permission_request_closed",
-        // Retained for compatibility with runtimes predating session grants.
-        PermissionDecisionUnsupported = "permission_decision_unsupported",
         OriginMismatch = "origin_mismatch",
         OwnerPolicyChanged = "owner_policy_changed",
         OwnerPolicyUnreadable = "owner_policy_unreadable",
         PaneGone = "pane_gone",
         PaneNotFound = "pane_not_found",
         Parked = "parked",
+        // Retained for compatibility with runtimes predating session grants.
+        PermissionDecisionUnsupported = "permission_decision_unsupported",
+        PermissionGrantLimit = "permission_grant_limit",
+        PermissionInputAlreadyHeld = "permission_input_already_held",
+        PermissionRequestClosed = "permission_request_closed",
+        PermissionRequestTooLarge = "permission_request_too_large",
+        PermissionRequestUnknown = "permission_request_unknown",
         PromptControlBytes = "prompt_control_bytes",
         PromptEmpty = "prompt_empty",
         PromptTooLong = "prompt_too_long",
@@ -166,6 +165,7 @@ error_codes! {
         ReplyUnavailable = "reply_unavailable",
         RestartDisabled = "restart_disabled",
         RestartUnsupported = "restart_unsupported",
+        RetainedCollectionShape = "retained_collection_shape",
         SelfCompactInstructionsUnsupported = "self_compact_instructions_unsupported",
         SelfCompactUnavailable = "self_compact_unavailable",
         SelfKillUnconfirmed = "self_kill_unconfirmed",
@@ -226,8 +226,6 @@ error_codes! {
     Yes:
         Timeout = "timeout";
     Later:
-        SessionBusy = "session_busy",
-        InputWriteCancelled = "input_write_cancelled",
         AgentNotReady = "agent_not_ready",
         AtAgentCapacity = "at_agent_capacity",
         AtFanoutLimit = "at_fanout_limit",
@@ -236,6 +234,7 @@ error_codes! {
         HandoffUndrained = "handoff_undrained",
         InjectionPending = "injection_pending",
         InputNotEmpty = "input_not_empty",
+        InputWriteCancelled = "input_write_cancelled",
         MailStoreFull = "mail_store_full",
         MailboxFull = "mailbox_full",
         MeshNotEnrolled = "mesh_not_enrolled",
@@ -246,28 +245,29 @@ error_codes! {
         RestartBusy = "restart_busy",
         RestartPending = "restart_pending",
         RestartRateLimited = "restart_rate_limited",
+        SessionBusy = "session_busy",
         SessionUnconfirmed = "session_unconfirmed",
         TooManyWaits = "too_many_waits",
         UnknownComposer = "unknown_composer",
         WorktreeMergeUnknown = "worktree_merge_unknown",
         WorktreeOpenPr = "worktree_open_pr";
     AfterInspecting:
-        InputWriteFailed = "input_write_failed",
-        InputWriteUnknown = "input_write_unknown",
         AgentExitedAtStart = "agent_exited_at_start",
         AgentExitedBeforeReady = "agent_exited_before_ready",
+        InputWriteFailed = "input_write_failed",
+        InputWriteUnknown = "input_write_unknown",
         NoResult = "no_result",
         SelfSubmitUnconfirmed = "self_submit_unconfirmed",
         SessionMismatch = "session_mismatch";
     AfterHuman:
-        StructuredWorkerPanicked = "structured_worker_panicked",
-        StructuredWorkerTimeout = "structured_worker_timeout",
-        StructuredWorkerCleanupFailed = "structured_worker_cleanup_failed",
         ClaudeFolderTrust = "claude_folder_trust",
         CodexFolderTrust = "codex_folder_trust",
         CodexHookReview = "codex_hook_review",
         StructuredHarnessVersionUnsupported = "structured_harness_version_unsupported",
-        StructuredNeedsAgentUser = "structured_needs_agent_user";
+        StructuredNeedsAgentUser = "structured_needs_agent_user",
+        StructuredWorkerCleanupFailed = "structured_worker_cleanup_failed",
+        StructuredWorkerPanicked = "structured_worker_panicked",
+        StructuredWorkerTimeout = "structured_worker_timeout";
     AfterHandoff:
         MailStoreSchemaTooNew = "mail_store_schema_too_new",
         MeshVersionMismatch = "mesh_version_mismatch",
@@ -278,6 +278,15 @@ error_codes! {
 #[cfg(test)]
 mod tests {
     use super::ErrorCode;
+
+    #[test]
+    fn retained_error_registry_lists_each_retry_class_alphabetically() {
+        for pair in ErrorCode::ALL.windows(2) {
+            if pair[0].retry() == pair[1].retry() {
+                assert!(pair[0].as_str() < pair[1].as_str(), "{pair:?}");
+            }
+        }
+    }
 
     #[test]
     fn parked_restart_requires_a_different_call_and_has_a_usage_exit() {

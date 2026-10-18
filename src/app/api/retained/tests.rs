@@ -145,8 +145,28 @@ async fn retained_purge_persists_before_mutation_and_refuses_failed_commit() {
     std::env::set_var(keys[2], root.path().join("config"));
     let mut app = operator();
     app.no_session = false;
-    let raw = json!([true,{"runtime":"future-runtime"}]);
+    let known = json!({"runtime":"structured", "harness":"claude",
+        "agent_id":"agent_fixture_saved", "session_id":"session-fixture-saved",
+        "cwd":root.path(), "future_field":"preserve"});
+    let raw = json!([known, true,{"runtime":"future-runtime"}]);
     app.state.structured_agents = serde_json::from_value(raw.clone()).unwrap();
+    let generation = app
+        .state
+        .structured_agents
+        .get("agent_fixture_saved")
+        .unwrap()
+        .2;
+    app.state
+        .structured_agents
+        .apply(
+            "agent_fixture_saved",
+            generation,
+            crate::structured::state::Input::Lifecycle(crate::api::agent_state::Lifecycle::Live),
+            std::time::Instant::now(),
+            42,
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
     let dir = crate::session::data_dir();
     assert!(dir.starts_with(root.path()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -156,8 +176,26 @@ async fn retained_purge_persists_before_mutation_and_refuses_failed_commit() {
     assert_eq!(response["result"]["removed"], 1, "{response}");
     let saved = crate::persist::load().unwrap();
     assert_eq!(
-        serde_json::to_value(saved.structured_agents).unwrap(),
-        json!([raw[1]])
+        serde_json::to_value(&saved.structured_agents).unwrap(),
+        json!([raw[0], raw[2]])
+    );
+    assert_eq!(
+        serde_json::to_value(&app.state.structured_agents).unwrap(),
+        serde_json::to_value(&saved.structured_agents).unwrap()
+    );
+    assert_eq!(
+        app.state.structured_agents.retained_stamps(),
+        saved.structured_retention
+    );
+    let (_, projection, actual_generation) = app
+        .state
+        .structured_agents
+        .get("agent_fixture_saved")
+        .unwrap();
+    assert_eq!(actual_generation, generation);
+    assert_eq!(
+        projection.update.state.lifecycle,
+        crate::api::agent_state::Lifecycle::Live
     );
     assert_eq!(
         std::fs::read_to_string(&history).unwrap(),
