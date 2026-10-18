@@ -1167,6 +1167,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let snapshot = SessionSnapshot {
             structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1262,6 +1263,7 @@ mod tests {
     ) -> SessionSnapshot {
         SessionSnapshot {
             structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1647,6 +1649,7 @@ mod tests {
         };
         let snapshot = SessionSnapshot {
             structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1687,7 +1690,10 @@ mod tests {
         let registry = crate::terminal::TerminalRuntimeRegistry::new();
         // gen1 env id 5 was aliased to the gen2 id by the previous handoff.
         let snapshot = super::super::snapshot::capture(
-            &crate::structured::registry::Registry::default(),
+            crate::persist::RegistryCapture {
+                registry: &crate::structured::registry::Registry::default(),
+                now_ms: Some(42),
+            },
             &[ws_old],
             &std::collections::HashMap::new(),
             &registry,

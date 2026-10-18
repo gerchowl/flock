@@ -1,3 +1,5 @@
+pub(crate) mod types;
+
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -85,7 +87,58 @@ pub(crate) fn init_file_logging(file_name: &str) {
         .flatten_event(true)
         .with_current_span(false)
         .with_span_list(false)
+        .event_format(InputJsonFormat::default())
         .try_init();
+}
+
+/// Bridge typed input metadata into stable tracing's scalar-only field API.
+/// The JSON writer expands the sealed metadata into canonical top-level fields,
+/// preserving the modifiers object and omitting inapplicable fields (ADR-0039).
+struct InputJsonFormat(
+    tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Json>,
+);
+
+impl Default for InputJsonFormat {
+    fn default() -> Self {
+        Self(
+            tracing_subscriber::fmt::format()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false),
+        )
+    }
+}
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for InputJsonFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        if event.metadata().fields().field("input_metadata").is_none() {
+            return self.0.format_event(ctx, writer, event);
+        }
+        let mut text = String::new();
+        self.0.format_event(
+            ctx,
+            tracing_subscriber::fmt::format::Writer::new(&mut text),
+            event,
+        )?;
+        let mut record: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&text).map_err(|_| std::fmt::Error)?;
+        let metadata = record.remove("input_metadata").ok_or(std::fmt::Error)?;
+        let fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(metadata.as_str().ok_or(std::fmt::Error)?)
+                .map_err(|_| std::fmt::Error)?;
+        record.extend(fields);
+        writeln!(writer, "{}", serde_json::Value::Object(record))
+    }
 }
 
 pub(crate) fn help_log_paths_summary() -> String {
@@ -2256,88 +2309,67 @@ pub(crate) fn render_virtual_frame(cols: u16, rows: u16, foreground_client_id: O
 }
 
 // --- raw_input family (logging redesign PR-5) ------------------------------
-// The stdin decoder is downstream of every keystroke the host terminal
-// produces, so its debug/warn tail runs hot. Byte payloads are Debug-formatted
-// but BOUNDED (see `bounded_bytes_debug`) so a runaway paste can't turn the log
-// into a memory hog. Levels mirror the pre-facade calls: unsupported/dropped
-// buffers are DEBUG (routine framing noise), the lone-escape flush is WARN
-// (may reach the pane as a spurious Esc), UTF-8-continuation waits are TRACE.
+// Raw input is content. Keep only typed classes and lengths (ADR-0039 §1).
+// Unsupported/dropped buffers are DEBUG, lone-escape flushes WARN, and
+// UTF-8 continuation waits TRACE, matching the existing level discipline.
 
-const MAX_TRACE_BYTE_PREVIEW: usize = 64;
-
-/// Shape a byte slice for a tracing field so a runaway paste can't blow up
-/// the log. Long payloads are truncated with a "(+N more)" tail; the Debug
-/// form (`[0x1b, 0x5b, ...]`) survives.
-pub(crate) fn bounded_bytes_debug(bytes: &[u8]) -> String {
-    if bytes.len() <= MAX_TRACE_BYTE_PREVIEW {
-        format!("{:?}", bytes)
-    } else {
-        let head = &bytes[..MAX_TRACE_BYTE_PREVIEW];
-        format!(
-            "{:?} (+{} more)",
-            head,
-            bytes.len() - MAX_TRACE_BYTE_PREVIEW
-        )
-    }
+/// Record sanitized input metadata without accepting raw bytes or Debug text.
+pub(crate) fn raw_input_event_parsed(input: types::InputMetadata) {
+    tracing::debug!(event = "raw_input.parsed", subsystem = "raw_input", outcome = "ok",
+        input_metadata = %input, "raw input event parsed");
 }
 
-pub(crate) fn raw_input_event_parsed(chunk: &[u8], event: &str) {
-    tracing::debug!(
-        event = "raw_input.parsed",
-        subsystem = "raw_input",
-        outcome = "ok",
-        raw_bytes = bounded_bytes_debug(chunk),
-        parsed = event,
-        "raw input event parsed"
-    );
-}
-
-pub(crate) fn raw_input_flushing_lone_escape(bytes: &[u8]) {
+/// Record only the length of a flushed escape.
+pub(crate) fn raw_input_flushing_lone_escape(input_len: usize) {
     tracing::warn!(
         event = "raw_input.flush",
         subsystem = "raw_input",
         outcome = "lone_escape",
-        bytes = bounded_bytes_debug(bytes),
-        "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
+        input_len,
+        "flushing lone escape after input timeout"
     );
 }
 
-pub(crate) fn raw_input_waiting_utf8_continuation(bytes: &[u8]) {
+/// Record only the number of pending UTF-8 bytes.
+pub(crate) fn raw_input_waiting_utf8_continuation(input_len: usize) {
     tracing::trace!(
         event = "raw_input.wait",
         subsystem = "raw_input",
         outcome = "utf8_continuation",
-        bytes = bounded_bytes_debug(bytes),
+        input_len,
         "waiting for UTF-8 continuation bytes"
     );
 }
 
-pub(crate) fn raw_input_waiting_escaped_utf8_continuation(bytes: &[u8]) {
+/// Record only the number of pending escaped UTF-8 bytes.
+pub(crate) fn raw_input_waiting_escaped_utf8_continuation(input_len: usize) {
     tracing::trace!(
         event = "raw_input.wait",
         subsystem = "raw_input",
         outcome = "escaped_utf8_continuation",
-        bytes = bounded_bytes_debug(bytes),
+        input_len,
         "waiting for escaped UTF-8 continuation bytes"
     );
 }
 
-pub(crate) fn raw_input_dropping_incomplete_buffer(bytes: &[u8]) {
+/// Record only the length of a discarded incomplete buffer.
+pub(crate) fn raw_input_dropping_incomplete_buffer(input_len: usize) {
     tracing::debug!(
         event = "raw_input.drop",
         subsystem = "raw_input",
         outcome = "incomplete",
-        bytes = bounded_bytes_debug(bytes),
+        input_len,
         "dropping incomplete raw input buffer after timeout"
     );
 }
 
-pub(crate) fn raw_input_unsupported_escape(sequence: &str) {
+/// Record only the length of an unsupported escape sequence.
+pub(crate) fn raw_input_unsupported_escape(input_len: usize) {
     tracing::debug!(
         event = "raw_input.drop",
         subsystem = "raw_input",
         outcome = "unsupported_escape",
-        sequence,
+        input_len,
         "dropping unsupported escape sequence"
     );
 }
@@ -3061,14 +3093,9 @@ pub(crate) fn agent_resume_send_command_failed(pane: u32, terminal: &str, agent:
 // intercepts are DEBUG (routine but story-critical when a keybind misfires),
 // modifier-only drops are DEBUG, empty-encoding is WARN.
 
-/// Shape a crossterm KeyEvent for the tracing tail: the code / modifiers /
-/// kind / state tuple every terminal-key site cares about. Single formatter
-/// so a schema change lands in one place instead of eighteen.
-pub(crate) fn shape_key_event(event: &crossterm::event::KeyEvent) -> String {
-    format!(
-        "code={:?} modifiers={:?} kind={:?} state={:?}",
-        event.code, event.modifiers, event.kind, event.state
-    )
+/// Discard character values before a key enters telemetry (ADR-0039 §1).
+pub(crate) fn shape_key_event(event: &crossterm::event::KeyEvent) -> types::InputMetadata {
+    types::InputMetadata::key(event.code, event.modifiers)
 }
 
 pub(crate) fn terminal_key_intercept_action(event: &crossterm::event::KeyEvent, action: &str) {
@@ -3076,7 +3103,7 @@ pub(crate) fn terminal_key_intercept_action(event: &crossterm::event::KeyEvent, 
         event = "terminal_key.intercept",
         subsystem = "terminal_key",
         outcome = "action",
-        key = shape_key_event(event),
+        input_metadata = %shape_key_event(event),
         action,
         "intercepted terminal direct keybinding before forwarding to pane"
     );
@@ -3087,7 +3114,7 @@ pub(crate) fn terminal_key_intercept_command(event: &crossterm::event::KeyEvent,
         event = "terminal_key.intercept",
         subsystem = "terminal_key",
         outcome = "command",
-        key = shape_key_event(event),
+        input_metadata = %shape_key_event(event),
         command,
         "intercepted terminal direct custom command before forwarding to pane"
     );
@@ -3098,7 +3125,7 @@ pub(crate) fn terminal_key_page_intercept(code: &crossterm::event::KeyCode, line
         event = "terminal_key.intercept",
         subsystem = "terminal_key",
         outcome = "page_scroll",
-        code = format!("{:?}", code),
+        input_metadata = %types::InputMetadata::key(*code, crossterm::event::KeyModifiers::empty()),
         lines,
         "intercepted page key for pane scrollback"
     );
@@ -3109,7 +3136,7 @@ pub(crate) fn terminal_key_modifier_only_dropped(event: &crossterm::event::KeyEv
         event = "terminal_key.drop",
         subsystem = "terminal_key",
         outcome = "modifier_only",
-        key = shape_key_event(event),
+        input_metadata = %shape_key_event(event),
         "dropping modifier-only terminal key event instead of forwarding it to pane"
     );
 }
@@ -3117,15 +3144,15 @@ pub(crate) fn terminal_key_modifier_only_dropped(event: &crossterm::event::KeyEv
 pub(crate) fn terminal_key_forward_ambiguous(
     event: &crossterm::event::KeyEvent,
     protocol: &str,
-    encoded: &[u8],
+    input_len: usize,
 ) {
     tracing::debug!(
         event = "terminal_key.forward",
         subsystem = "terminal_key",
         outcome = "ambiguous",
-        key = shape_key_event(event),
+        input_metadata = %shape_key_event(event),
         protocol,
-        encoded = bounded_bytes_debug(encoded),
+        input_len,
         "forwarding potentially-ambiguous terminal key to pane"
     );
 }
@@ -3135,7 +3162,7 @@ pub(crate) fn terminal_key_empty_encoding(event: &crossterm::event::KeyEvent) {
         event = "terminal_key.encode",
         subsystem = "terminal_key",
         outcome = "empty",
-        key = shape_key_event(event),
+        input_metadata = %shape_key_event(event),
         "key produced empty encoding"
     );
 }
@@ -5720,30 +5747,136 @@ mod tests {
 
     // ------ logging redesign PR-5: raw_input family ------------------------
 
-    #[test]
-    fn bounded_bytes_debug_truncates_long_payloads() {
-        let short = bounded_bytes_debug(&[1, 2, 3]);
-        assert_eq!(short, "[1, 2, 3]", "short payloads Debug as-is");
-        let long: Vec<u8> = (0..100).collect();
-        let shaped = bounded_bytes_debug(&long);
-        assert!(shaped.starts_with('['), "still Debug-shaped: {shaped}");
-        assert!(
-            shaped.contains("(+36 more)"),
-            "long payload truncated with count: {shaped}"
-        );
-        assert!(
-            !shaped.contains("99"),
-            "the tail is dropped so a runaway paste can't blow up the log: {shaped}"
-        );
+    fn capture_input_json(f: impl FnOnce()) -> String {
+        let dir = crate::test_support::TempDir::socket();
+        let path = dir.path().join("input.log");
+        let file = File::create(&path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(Mutex::new(file))
+            .with_max_level(tracing::Level::TRACE)
+            .event_format(InputJsonFormat::default())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        fs::read_to_string(path).unwrap()
     }
 
     #[test]
-    fn raw_input_event_parsed_is_debug_with_bounded_bytes() {
-        let out = capture_logs(|| raw_input_event_parsed(&[0x1b, 0x5b, 0x41], "Key(Up, empty)"));
-        assert!(out.contains("event=\"raw_input.parsed\""), "{out}");
-        assert!(out.contains("subsystem=\"raw_input\""), "{out}");
-        assert!(out.contains("raw_bytes=\"[27, 91, 65]\""), "{out}");
-        assert!(out.contains("parsed=\"Key(Up, empty)\""), "{out}");
+    fn written_input_json_has_canonical_shape() {
+        let out = capture_input_json(|| {
+            let _ = crate::raw_input::parse_raw_input_bytes_sync(
+                b"a\x1b[A\x1b[15~\x1b[200~secret\x1b[201~\x1b[I\x1b[<4;2;3M",
+            );
+            raw_input_waiting_utf8_continuation(1);
+            raw_input_waiting_escaped_utf8_continuation(2);
+        });
+        let records: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let inputs: Vec<_> = records
+            .iter()
+            .filter(|r| r["event"] == "raw_input.parsed")
+            .collect();
+        assert_eq!(inputs.len(), 6, "{out}");
+        assert_eq!(inputs[0]["key_class"], "character");
+        assert_eq!(inputs[0]["modifiers"], serde_json::json!({}));
+        assert_eq!(inputs[1]["named_key"], "up");
+        assert_eq!(inputs[2]["function_key"], 5);
+        assert_eq!(inputs[3]["input_class"], "paste");
+        assert_eq!(inputs[3]["input_len"], 18);
+        assert_eq!(inputs[4]["input_class"], "focus");
+        assert_eq!(inputs[5]["input_class"], "mouse");
+        assert_eq!(inputs[5]["modifiers"], serde_json::json!({"shift":true}));
+        for (index, record) in inputs.iter().enumerate() {
+            assert!(record.get("input_len").is_some());
+            assert!(record.get("input_metadata").is_none());
+            if index >= 3 {
+                assert!(record.get("key_class").is_none());
+            }
+            if index != 1 {
+                assert!(record.get("named_key").is_none());
+            }
+            if index != 2 {
+                assert!(record.get("function_key").is_none());
+            }
+            assert!(!record.as_object().unwrap().values().any(|v| v.is_null()));
+        }
+        for record in records.iter().filter(|r| r["event"] == "raw_input.wait") {
+            assert!(record.get("input_len").is_some());
+            assert!(record.get("bytes").is_none());
+        }
+    }
+
+    #[test]
+    fn typed_input_canary_never_reaches_logs() {
+        let canary = "PaneSecret1698🦩";
+        let out = capture_input_json(|| {
+            let mut framer = crate::raw_input::RawInputFramer::default();
+            for character in canary.chars() {
+                let mut bytes = [0; 4];
+                let text = character.encode_utf8(&mut bytes);
+                // Splitting the scalar also exercises pending UTF-8 handling.
+                for byte in text.bytes() {
+                    for event in framer.push(&[byte]) {
+                        if let crate::raw_input::RawInputEvent::Key(key) = event {
+                            let event = crossterm::event::KeyEvent::new(key.code, key.modifiers);
+                            terminal_key_empty_encoding(&event);
+                        }
+                    }
+                    assert!(framer.flush_timeout().is_empty());
+                }
+            }
+            let paste = format!("\x1b[200~{canary}\x1b[201~");
+            assert!(matches!(framer.push(paste.as_bytes()).as_slice(),
+                [crate::raw_input::RawInputEvent::Paste(text)] if text == canary));
+        });
+        assert!(
+            out.contains("raw_input.parsed"),
+            "input path must emit logs"
+        );
+        for line in out.lines() {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            for field in [
+                "raw_bytes",
+                "parsed",
+                "bytes",
+                "key",
+                "code",
+                "sequence",
+                "encoded",
+                "input_metadata",
+            ] {
+                assert!(
+                    record.get(field).is_none(),
+                    "legacy input field {field} escaped into telemetry"
+                );
+            }
+            assert!(
+                !line.contains(canary),
+                "paste content escaped into telemetry"
+            );
+            assert!(
+                !line.contains("🦩"),
+                "typed character escaped into telemetry"
+            );
+            assert!(
+                !line.contains("Char("),
+                "character debug escaped into telemetry"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_input_event_parsed_is_debug_with_typed_metadata() {
+        let out = capture_logs(|| {
+            let _ = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[A");
+        });
+        assert!(out.contains("raw_input.parsed"), "{out}");
+        assert!(out.contains("input_len"), "{out}");
+        assert!(out.contains("named_key"), "{out}");
+        assert!(!out.contains("raw_bytes"), "{out}");
+        assert!(!out.contains("parsed="), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
     }
 
@@ -5795,22 +5928,22 @@ mod tests {
     }
 
     #[test]
-    fn raw_input_flushing_lone_escape_is_warn_with_bytes() {
-        let out = capture_logs(|| raw_input_flushing_lone_escape(&[0x1b]));
+    fn raw_input_flushing_lone_escape_is_warn_with_length() {
+        let out = capture_logs(|| raw_input_flushing_lone_escape(1));
         assert!(out.contains("event=\"raw_input.flush\""), "{out}");
         assert!(out.contains("outcome=\"lone_escape\""), "{out}");
-        assert!(out.contains("bytes=\"[27]\""), "{out}");
+        assert!(out.contains("input_len=1"), "{out}");
         assert!(out.contains("WARN"), "lone-escape must WARN: {out}");
     }
 
     #[test]
     fn raw_input_waiting_events_are_trace() {
-        let utf8 = capture_logs(|| raw_input_waiting_utf8_continuation(&[0xc3]));
+        let utf8 = capture_logs(|| raw_input_waiting_utf8_continuation(1));
         assert!(utf8.contains("event=\"raw_input.wait\""), "{utf8}");
         assert!(utf8.contains("outcome=\"utf8_continuation\""), "{utf8}");
         assert!(utf8.contains("TRACE"), "{utf8}");
 
-        let esc = capture_logs(|| raw_input_waiting_escaped_utf8_continuation(&[0x1b, 0xc3]));
+        let esc = capture_logs(|| raw_input_waiting_escaped_utf8_continuation(2));
         assert!(
             esc.contains("outcome=\"escaped_utf8_continuation\""),
             "{esc}"
@@ -5820,19 +5953,19 @@ mod tests {
 
     #[test]
     fn raw_input_dropping_incomplete_buffer_is_debug() {
-        let out = capture_logs(|| raw_input_dropping_incomplete_buffer(&[0xff, 0xfe]));
+        let out = capture_logs(|| raw_input_dropping_incomplete_buffer(2));
         assert!(out.contains("event=\"raw_input.drop\""), "{out}");
         assert!(out.contains("outcome=\"incomplete\""), "{out}");
-        assert!(out.contains("bytes=\"[255, 254]\""), "{out}");
+        assert!(out.contains("input_len=2"), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
     }
 
     #[test]
-    fn raw_input_unsupported_escape_is_debug_with_sequence() {
-        let out = capture_logs(|| raw_input_unsupported_escape("\x1b[?9999z"));
+    fn raw_input_unsupported_escape_is_debug_with_length() {
+        let out = capture_logs(|| raw_input_unsupported_escape(9));
         assert!(out.contains("event=\"raw_input.drop\""), "{out}");
         assert!(out.contains("outcome=\"unsupported_escape\""), "{out}");
-        assert!(out.contains("sequence="), "{out}");
+        assert!(out.contains("input_len=9"), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
     }
 
@@ -5880,18 +6013,16 @@ mod tests {
     }
 
     #[test]
-    fn shape_key_event_covers_all_four_fields() {
-        let ev = crossterm::event::KeyEvent::new_with_kind_and_state(
-            crossterm::event::KeyCode::Char('a'),
+    fn shape_key_event_discards_character_and_state() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('🦩'),
             crossterm::event::KeyModifiers::CONTROL,
-            crossterm::event::KeyEventKind::Press,
-            crossterm::event::KeyEventState::empty(),
         );
-        let shaped = shape_key_event(&ev);
-        assert!(shaped.contains("code="), "{shaped}");
-        assert!(shaped.contains("modifiers="), "{shaped}");
-        assert!(shaped.contains("kind="), "{shaped}");
-        assert!(shaped.contains("state="), "{shaped}");
+        let shaped = serde_json::to_value(shape_key_event(&ev)).unwrap();
+        assert_eq!(
+            shaped,
+            serde_json::json!({"input_class":"key", "key_class":"character", "modifiers":{"control":true}})
+        );
     }
 
     #[test]
@@ -5904,7 +6035,7 @@ mod tests {
         assert!(a.contains("event=\"terminal_key.intercept\""), "{a}");
         assert!(a.contains("outcome=\"action\""), "{a}");
         assert!(a.contains("action=\"ToggleFloat\""), "{a}");
-        assert!(a.contains("code="), "{a}");
+        assert!(a.contains("key_class"), "{a}");
         assert!(a.contains("DEBUG"), "{a}");
 
         let c = capture_logs(|| terminal_key_intercept_command(&ev, "edit config"));
@@ -5919,7 +6050,7 @@ mod tests {
             capture_logs(|| terminal_key_page_intercept(&crossterm::event::KeyCode::PageUp, 24));
         assert!(out.contains("event=\"terminal_key.intercept\""), "{out}");
         assert!(out.contains("outcome=\"page_scroll\""), "{out}");
-        assert!(out.contains("code=\"PageUp\""), "{out}");
+        assert!(out.contains("page_up"), "{out}");
         assert!(out.contains("lines=24"), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
     }
@@ -5937,16 +6068,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_key_forward_ambiguous_debug_with_protocol_and_encoded() {
+    fn terminal_key_forward_ambiguous_debug_with_protocol_and_length() {
         let ev = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Esc,
             crossterm::event::KeyModifiers::empty(),
         );
-        let out = capture_logs(|| terminal_key_forward_ambiguous(&ev, "Legacy", &[0x1b]));
+        let out = capture_logs(|| terminal_key_forward_ambiguous(&ev, "Legacy", 1));
         assert!(out.contains("event=\"terminal_key.forward\""), "{out}");
         assert!(out.contains("outcome=\"ambiguous\""), "{out}");
         assert!(out.contains("protocol=\"Legacy\""), "{out}");
-        assert!(out.contains("encoded=\"[27]\""), "{out}");
+        assert!(out.contains("input_len=1"), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
     }
 
