@@ -74,7 +74,7 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_agent_get",
-            description: "Get one agent's details. `target` accepts a public \
+            description: "Get one PTY or pane-free structured agent's typed details. `target` accepts a public \
                           pane id, a terminal id, or a unique agent name. \
                           `settled_with_background_shells: true` on an \
                           `idle`/`done` agent means its turn ended while \
@@ -366,7 +366,7 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_agent_start",
-            description: "Start a FRESH agent in an existing checkout. You \
+            description: "Optional runtime structured starts pane-free Claude with a framed opening turn; model is structured-only. Requires a current server and the same attested spawn policy. Start a FRESH agent in an existing checkout. You \
                           supply a PROMPT, never a command line — there is no \
                           argv here by design. Prefer \
                           this over `flock_agent_fork` when the child does not \
@@ -1713,6 +1713,7 @@ mod tests {
             vec![
                 "flock_agent_list",
                 "flock_agent_get",
+                "flock_agent_stop",
                 "flock_agent_read",
                 "flock_agent_fork",
                 "flock_agent_lineage",
@@ -2586,5 +2587,39 @@ mod restart_tests {
         ] {
             assert!(build_agent_restart(args).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod structured_tests {
+    use super::*;
+    #[test]
+    fn structured_start_selectors_and_stop_are_narrowed() {
+        let args = json!({"runtime":"structured","agent":"claude","model":"small",
+        "prompt":"review the change", "name":"reviewer",
+        "location":{"kind":"workspace_id","workspace_id":"ws_fixture"},
+        "argv":["untrusted-binary"],"credential":"untrusted"});
+        let Method::AgentSpawn(p) = build_agent_start(args.clone()).unwrap() else {
+            panic!("narrowed spawn required")
+        };
+        assert_eq!(p.runtime, crate::api::schema::AgentRuntime::Structured);
+        assert_eq!(p.model.as_deref(), Some("small"));
+        let wire = serde_json::to_value(p).unwrap();
+        assert!(wire.get("argv").is_none() && wire.get("credential").is_none());
+        for bad in [json!(null), json!(false), json!("future")] {
+            let mut bad_args = args.clone();
+            bad_args["runtime"] = bad;
+            assert!(build_agent_start(bad_args).is_err());
+        }
+        let stop = find("flock_agent_stop").unwrap();
+        assert!(matches!(
+            (stop.build)(json!({"target":"reviewer"})).unwrap(),
+            Method::AgentStop(_)
+        ));
+        assert!((stop.build)(json!({})).is_err());
+        assert_eq!(
+            schema_agent_start()["properties"]["runtime"]["enum"],
+            json!(["pty", "structured"])
+        );
     }
 }

@@ -2955,25 +2955,27 @@ The local `agent.start` contract adds the closed selector `runtime` (`pty` by
 absence, `structured` by explicit request) and the optional structured `model`.
 The CLI and socket share App admission and the Workers owner's atomic pending
 reservation. The listener supplies the immutable MCP endpoint. Relative listener
-paths are resolved to absolute paths during endpoint provisioning. Endpoint
+paths are resolved to absolute paths once at listener bind time. Endpoint
 resolution is optional at server startup: failure emits a typed
-`structured_endpoint_restart_required` warning without private resolution details, and a
-structured start refuses with that code before registering metadata or reserving
-capacity. Endpoint recovery takes effect on the next listener initialization.
-Ordinary server startup and PTY routes remain available. The caller cannot
-supply a binary, MCP endpoint, credential or harness flags: the only accepted
-structured argv is `claude`. `cwd` must resolve to an existing absolute
-directory. A resumed identity keeps its native session, cwd and model; launch
-overrides on resume are refused. Structured launches create no pane placement.
-Pane-only placement, focus, dry-run and readiness options are refused rather
-than ignored. Unknown restored ownership remains fenced before any start.
+`structured_endpoint_restart_required` warning with fixed reason `exe` or
+`socket`, without private resolution details, and a structured start refuses
+with that code before registering metadata or reserving capacity. Endpoint
+recovery takes effect on the next listener initialization. Ordinary server
+startup and PTY routes remain available. The caller cannot supply a binary, MCP
+endpoint, credential or harness flags: the only accepted structured argv is
+`claude`. `cwd` must resolve to an existing absolute directory. A resumed
+identity keeps its native session, cwd and model; launch overrides on resume are
+refused. Structured launches create no pane placement. Pane-only placement,
+focus, dry-run and readiness options are refused rather than ignored. Unknown
+restored ownership remains fenced before any start.
 
-Default `run_as = "agent"` refuses until the dedicated-user launcher exists.
+Default `run_as = "flk-agent"` refuses until the dedicated-user launcher exists.
 Operator execution requires the explicit `run_as = "operator"` opt-in and
 retains #1177's cooperative same-UID limitation. Preparation and bounded version
 verification run off the owner thread; startup/cleanup facts remain asynchronous
 worker observations. The first production Workers caller forwards the loaded
-`sessions` storage policy and `stall_ms` together, without substituting defaults.
+`sessions` storage policy and `stall_ms` together, without substituting
+defaults.
 
 Both production start gates stay closed until part 3 supplies narrowed MCP
 admission and capability negotiation: a client must not send this selector to an
@@ -2986,3 +2988,46 @@ Endpoint provisioning failures require operator recovery: correct executable or
 socket resolution, then restart or hand off the listener. The registered
 `structured_endpoint_restart_required` refusal has retry `after_human`, exit 1.
 Ordinary routes remain available. Repeating start alone cannot repair it.
+
+### Amendment: Public structured routing (#1843 part 3)
+
+The public CLI/socket gate opens with narrowed MCP admission. Servers advertise
+`structured_agents`; CLI and MCP refuse absent or malformed capability evidence
+before transmitting a structured selector, avoiding a legacy PTY launch.
+`agent.spawn` adds default-PTY `runtime` and optional structured `model`. MCP's
+`flock_agent_start` continues to build only that narrowed verb, never raw
+`agent.start`. Structured Claude resolves a tracked checkout, validates and
+nonce-frames the opening prompt (ADR-0014 §4), and submits it once through the
+worker's bounded runtime input. Failure stops the owned session and reports a
+typed start failure. CLI starts remain idle. There is no prompt in launch argv.
+
+Both routes share App admission and the Workers owner reservation from parts
+2a/2b. MCP uses Spawn policy, including explicit node opt-in and attested caller
+identity. Lineage, depth, fanout, capacity and pending accounting remain intact.
+An unattested MCP caller never receives the operator exemption. #1734's scoped
+credential remains only in generated private MCP configuration and immutable MCP
+client context, never the model environment. Verification and revocation at
+effect admission apply equally to these newly public verbs.
+
+MCP mirrors the additive `structured_agents` list and typed get result, with no
+invented placement. `flock_agent_stop` wraps typed stop; authority remains the
+operator and the structured agent itself, never its lineage parent. Public start
+never accepts caller-selected binaries, harness flags or MCP endpoints. Unknown
+restored ownership remains fenced, and default agent-user execution still
+refuses until #1208. The operator-mode #1177 cooperative limitation and #1629
+detachment limitation remain explicit. Permission decisions and question routing
+remain S6 (#1307); explicit structured question policies are refused. Pane-only
+read/control operations retain registered `runtime_unsupported` (retry `never`,
+exit 2). PTY fields/contracts and mesh VERSION 5 are unchanged.
+
+The executable dogfood is `tests/probes/structured_public.py`, documented in
+`tests/probes/structured-public.md` and run by nextest's `structured_public`
+integration binary. It owns a separate server and HOME, fake Claude and real
+scoped MCP child, readiness pipes and finite failure ceilings. No live server,
+profile, model, sleeps or retry loops participate.
+
+The current live-reload whitelist does not apply `[structured]` or `[fleet]`
+changes (#2043); use a fresh server after changing launch/admission policy.
+`[sessions]` live-reload semantics remain tracked by #1975. The dogfood isolates
+its policy cases in fresh servers rather than assuming a successful reload
+report changed these startup values.

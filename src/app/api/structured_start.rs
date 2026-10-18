@@ -19,6 +19,7 @@ impl App {
     ) -> Result<ResponseResult, ErrorCode> {
         self.start_structured_request(params, caller, crate::spawn::SpawnVerb::Fork, None)
     }
+    /// Shared funnel; MCP supplies Spawn policy and a validated framed turn.
     pub(super) fn start_structured_request(
         &mut self,
         params: AgentStartParams,

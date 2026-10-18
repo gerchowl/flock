@@ -308,3 +308,70 @@ fn stop_authority_excludes_pty_agents_and_lineage_parents() {
     ));
     assert!(may_stop(SpawnCaller::Operator { pane: None }, target));
 }
+
+/// The narrowed scoped wire is fresh-only; Unknown metadata remains fenced.
+#[tokio::test]
+async fn scoped_structured_spawn_never_resumes_an_existing_identity() {
+    for unknown in [false, true] {
+        let (leases, _lease, scope, peer) = crate::api::scoped::tests::live_scope();
+        let mut app = app();
+        app.session_leases = leases;
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: peer.uid.unwrap(),
+            dedicated: Ok(None).into(),
+        };
+        app.state.config.fleet.agent_spawn_enabled = true;
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("scoped-fresh")];
+        app.state.ensure_test_terminals();
+        register(&mut app);
+        if unknown {
+            app.state
+                .structured_agents
+                .restore_handoff_unknown(&["structured-fixture".into()]);
+        }
+        let generation = app
+            .state
+            .structured_agents
+            .get("structured-fixture")
+            .unwrap()
+            .2;
+        let workspace = app.public_workspace_id(0);
+        let request: Request =
+            serde_json::from_value(json!({"id":"scoped-fresh", "method":"agent.spawn",
+            "params":{"runtime":"structured", "agent":"claude", "name":"fixture-agent",
+            "prompt":"fresh task", "location":{"kind":"workspace_id","workspace_id":workspace}}}))
+            .unwrap();
+        let (respond_to, response) = std::sync::mpsc::channel();
+        app.handle_api_request_message(crate::api::ApiRequestMessage {
+            request,
+            respond_to,
+            peer_pid: peer.pid,
+            peer_birth: peer.birth,
+            peer_uid: peer.uid,
+            scope: Some(scope),
+        });
+        let result: Value = serde_json::from_str(
+            &response
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            result["error"]["code"],
+            if unknown {
+                "structured_recovery_required"
+            } else {
+                "agent_name_taken"
+            }
+        );
+        assert_eq!(
+            app.state
+                .structured_agents
+                .get("structured-fixture")
+                .unwrap()
+                .2,
+            generation
+        );
+        assert_eq!(app.state.structured_agents.records().len(), 1);
+    }
+}

@@ -1166,4 +1166,56 @@ mod tests {
             assert_eq!(data["exit"], 8);
         }
     }
+
+    #[test]
+    fn structured_start_never_sends_a_selector_to_an_old_server() {
+        for capability in [false, true] {
+            let api = MockApi::ok(
+                json!({"result":{"type":"pong","capabilities":{"structured_agents":capability}}}),
+            );
+            let result = route(
+                "tools/call",
+                json!({"name":"flock_agent_start","arguments":{
+                "runtime":"structured","agent":"claude","prompt":"review",
+                "location":{"kind":"workspace_id","workspace_id":"ws_fixture"}}}),
+                &api,
+                &ChannelOptions::off(),
+            );
+            assert_eq!(
+                api.calls
+                    .borrow()
+                    .iter()
+                    .filter(|m| matches!(m, Method::AgentSpawn(_)))
+                    .count(),
+                usize::from(capability)
+            );
+            if !capability {
+                assert_eq!(
+                    result.unwrap_err().data.unwrap()["refusal"],
+                    "server_version_gap"
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+    #[test]
+    fn structured_list_rows_are_mirrored_without_pty_placement() {
+        let row = json!({"runtime":"structured","agent_id":"agent_atlas_fixture","name":"worker"});
+        let api = MockApi::ok(
+            json!({"result":{"type":"agent_list","agents":[],"structured_agents":[row.clone()]}}),
+        );
+        let result = route(
+            "tools/call",
+            json!({"name":"flock_agent_list","arguments":{}}),
+            &api,
+            &ChannelOptions::off(),
+        )
+        .unwrap();
+        let result: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(result["agents"], json!([]));
+        assert_eq!(result["structured_agents"], json!([row]));
+        assert!(result["structured_agents"][0].get("pane_id").is_none());
+    }
 }

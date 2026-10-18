@@ -36,7 +36,7 @@ pub(crate) fn structured_worker_shutdown_failed(error: &crate::structured::worke
 }
 
 /// Optional structured launch provisioning must never prevent server startup.
-/// Resolution details may contain private paths, so report only the typed code.
+/// Resolution details may contain private paths; report only the typed code and category.
 pub(crate) fn structured_mcp_endpoint_unavailable(reason: crate::api::server::McpEndpointFailure) {
     let reason = match reason {
         crate::api::server::McpEndpointFailure::Exe => "exe",

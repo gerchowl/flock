@@ -272,16 +272,23 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     } = flags;
     if runtime == crate::api::schema::AgentRuntime::Structured {
         if wait_ready {
-            eprintln!("runtime_unsupported: structured sessions have no pane readiness");
-            return Ok(crate::cli::exit::USAGE);
+            return Ok(super::output::error(
+                &serde_json::json!({"error":{
+                "code":"runtime_unsupported", "message":"structured sessions have no pane readiness"}}),
+                crate::cli::exit::USAGE,
+            ));
         }
         let pong = super::send_request(&Request {
             id: "cli:ping:structured".into(),
             method: Method::Ping(crate::api::schema::PingParams::default()),
         })?;
         if !crate::api::compatibility::advertises_structured(&pong) {
-            eprintln!("server_version_gap: structured admission requires a newer server");
-            return Ok(crate::cli::exit::PROTOCOL_GAP);
+            return Ok(super::output::error(
+                &serde_json::json!({"error":{
+                "code":crate::api::compatibility::ERROR_CODE,
+                "message":"structured admission requires a newer server"}}),
+                crate::cli::exit::PROTOCOL_GAP,
+            ));
         }
     }
     let asked = asked.gate(

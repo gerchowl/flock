@@ -272,7 +272,9 @@ impl Workers {
                         lease,
                         location,
                         |runtime| {
-                            if let Some(prompt) = &opening_turn {
+                            if cancelled.requested() {
+                                runtime.stop();
+                            } else if let Some(prompt) = &opening_turn {
                                 let user = serde_json::json!({"type":"user", "message":{
                                     "role":"user", "content":prompt.as_argv_element()},
                                     "parent_tool_use_id":null,"session_id":""});
@@ -280,9 +282,6 @@ impl Workers {
                                     input_failed = true;
                                     runtime.stop();
                                 }
-                            }
-                            if cancelled.requested() {
-                                runtime.stop();
                             }
                             let _ = tx.try_send(Message::Ready(runtime));
                             notify.notify_one();

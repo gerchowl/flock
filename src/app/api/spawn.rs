@@ -268,12 +268,36 @@ impl App {
                     "unsupported structured spawn options",
                 );
             }
+            let name = params
+                .name
+                .unwrap_or_else(crate::app::worktrees::generated_fork_run_id);
+            match self.structured_target(&name) {
+                Ok(None) => {}
+                Ok(Some((agent, _))) => {
+                    let code =
+                        if self
+                            .state
+                            .structured_agents
+                            .get(&agent)
+                            .is_some_and(|(_, p, _)| {
+                                p.update.state.lifecycle
+                                    == crate::api::agent_state::Lifecycle::Unknown
+                            })
+                        {
+                            crate::api::error_code::ErrorCode::StructuredRecoveryRequired
+                        } else {
+                            crate::api::error_code::ErrorCode::AgentNameTaken
+                        };
+                    return encode_error(id, code.as_str(), "MCP spawn requires a fresh identity");
+                }
+                Err(code) => {
+                    return encode_error(id, code.as_str(), "structured name is ambiguous")
+                }
+            }
             let start = crate::api::schema::AgentStartParams {
                 runtime: params.runtime,
                 model: params.model,
-                name: params
-                    .name
-                    .unwrap_or_else(crate::app::worktrees::generated_fork_run_id),
+                name,
                 cwd: Some(cwd.to_string_lossy().into_owned()),
                 argv: vec!["claude".into()],
                 dry_run: false,

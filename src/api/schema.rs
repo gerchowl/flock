@@ -1169,7 +1169,7 @@ impl AgentRuntime {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStartParams {
-    /// Explicit opt-in; the public route remains gated until #1843 part 3.
+    /// Explicit opt-in, sent only to a server advertising structured_agents.
     #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
     pub runtime: AgentRuntime,
     /// Structured model selector, never raw launch flags.

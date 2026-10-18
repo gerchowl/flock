@@ -1,4 +1,4 @@
-//! Typed structured read/control routes; public launch stays gated until #1843 part 3.
+//! Typed structured read/control routes (ADR-0036 S3a-3).
 use super::{
     responses::{encode_error, encode_success},
     spawn::SpawnCaller,

@@ -89,6 +89,13 @@ impl AdmissionFixture {
         path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
         env.set("PATH", Some(std::env::join_paths(path).unwrap()));
         let socket = if relative {
+            // guardrails-ok(hermetic): cwd is supplied by this owned subprocess fixture.
+            assert_eq!(
+                std::env::current_dir().unwrap(),
+                PathBuf::from(
+                    std::env::var_os("FLK_RELATIVE_FIXTURE_CWD").expect("owned child cwd")
+                )
+            );
             PathBuf::from("relative.sock")
         } else {
             root.join("api.sock")
@@ -109,6 +116,10 @@ impl AdmissionFixture {
         let script = fs::read_to_string(root.join("claude")).unwrap().replace(
             "assert sys.argv[1:] == json.loads((root / \"argv.json\").read_text()), \"argv drift\"",
             "assert sys.argv[1:4] == ['-p', '--input-format', 'stream-json']\nassert '--restricted' in sys.argv and '--strict-mcp-config' in sys.argv\nimport uuid\nuuid.UUID(sys.argv[sys.argv.index('--session-id') + 1])");
+        // Publish complete observed config atomically before readiness events.
+        let script = script.replace(
+            r#"(root / "observed-mcp.json").write_text(json.dumps(registration))"#,
+            "(root / \"observed-mcp.pending\").write_text(json.dumps(registration))\nos.replace(root / \"observed-mcp.pending\", root / \"observed-mcp.json\")");
         fixture.file("claude", script.as_bytes(), 0o700);
         let config: crate::config::Config = toml::from_str(&format!("[sessions]\nstall_ms = {stall_ms}\nblob_min_bytes = 64\n[structured]\nrun_as = 'operator'\nprofile = 'fixture'\ntoken_file = {:?}\n",root.join("token").to_str().unwrap())).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -563,6 +574,7 @@ async fn startup_with_relative_socket_keeps_legacy_routes_available() {
         command.args(["--exact", "app::api::structured_start::tests::startup_with_relative_socket_keeps_legacy_routes_available", "--nocapture", "--test-threads=1"])
             .env_clear().env("PATH", std::env::var_os("PATH").unwrap())
             .env("FLK_RELATIVE_FIXTURE_CHILD", "1")
+            .env("FLK_RELATIVE_FIXTURE_CWD", cwd.path())
             .current_dir(cwd.path()).process_group(0);
         let output = command
             .output_traced_with_timeout_and_limit(LIMIT, 1024 * 1024)
