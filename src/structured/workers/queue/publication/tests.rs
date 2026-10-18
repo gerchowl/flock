@@ -218,15 +218,12 @@ fn queue_provider_bootstrap_refusal_never_claims_a_snapshot_or_sync() {
 #[test]
 fn queue_provider_ahead_cursor_and_producer_loss_close_explicitly() {
     let root = root();
-    let mut j = journal(&root, 0);
-    let (mut p, source) = Publisher::new(j.replay(0).unwrap());
-    let mut ahead = source.subscribe(Some(100)).unwrap();
-    p.capture(|| j.subscription().map_err(Into::into), None);
+    let j = journal(&root, 0);
+    let (p, source) = Publisher::new(j.replay(0).unwrap());
     assert!(matches!(
-        ahead.page(),
-        Page::Refused(ErrorCode::InvalidRequest)
+        source.subscribe(Some(100)),
+        Err(ErrorCode::CursorAhead)
     ));
-    assert!(matches!(ahead.page(), Page::End));
     let mut waiting = source.subscribe(None).unwrap();
     drop(p);
     assert!(matches!(
@@ -512,4 +509,26 @@ fn queue_provider_active_resume_never_recaptures_or_rescans_the_prefix() {
     let tail = pages(&mut resumed);
     assert_eq!(sequences(&tail), [head]);
     assert!(tail.len() <= 3);
+}
+
+#[test]
+fn queue_provider_ahead_cursor_cannot_become_valid_during_bootstrap() {
+    let root = root();
+    let mut j = journal(&root, 1);
+    assert_eq!(j.replay(0).unwrap().through, 1);
+    let path = root.path().join("sessions/publication-fixture/queue.jsonl");
+    let before = fs::read(&path).unwrap();
+    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let mut request = source.subscribe(Some(2));
+    let observed = if let Ok(reader) = &mut request {
+        publisher.capture(|| j.subscription().map_err(Into::into), None);
+        pages(reader)
+    } else {
+        vec![]
+    };
+    assert!(
+        matches!(request, Err(ErrorCode::CursorAhead)),
+        "ahead cursor became valid during bootstrap: {observed:?}"
+    );
+    assert_eq!(fs::read(path).unwrap(), before);
 }

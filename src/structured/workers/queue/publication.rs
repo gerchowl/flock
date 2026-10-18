@@ -59,7 +59,7 @@ impl Book {
             return Ok(());
         }
         if after.is_some_and(|n| n > self.retained.through) {
-            return Err(ErrorCode::InvalidRequest);
+            return Err(ErrorCode::CursorAhead);
         }
         live.lock().packets.push_back(Packet(
             self.retained.clone(),
@@ -130,6 +130,9 @@ impl Provider for Source {
     fn subscribe(&self, after: Option<u64>) -> Result<Reader, ErrorCode> {
         let live = Arc::new(Mutex::new(Live::default()));
         let mut book = self.1.try_lock().ok_or(ErrorCode::SessionBusy)?;
+        if after.is_some_and(|n| n > book.retained.through) {
+            return Err(ErrorCode::CursorAhead);
+        }
         if book.ended {
             book.register(after, live.clone())?;
         } else {

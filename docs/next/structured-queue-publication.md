@@ -14,7 +14,8 @@ the checkpoint callback. No append/publication can fall between those steps.
 
 Pages contain a replacement gap with `snapshot_to`, original records, typed
 status and exactly one `synced` barrier before live changes. Empty checkpoints
-still have a gap and high-water barrier. An ahead cursor is `invalid_request`.
+still have a gap and high-water barrier. An ahead cursor is `cursor_ahead`, checked before bootstrap can advance the
+head.
 Bootstrap/storage failure closes with its typed refusal and never claims a
 successful snapshot or barrier. Unexpected producer loss closes explicitly.
 A real terminal worker retains its final cut for late subscriptions.
