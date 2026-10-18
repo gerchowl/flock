@@ -148,6 +148,161 @@ pub(crate) fn build_worktree_remove_command(
     }
 }
 
+/// A present path whose linked-checkout identity cannot be verified (#370).
+/// Force cannot establish identity. Device observations never decide refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckoutUnreachable {
+    /// The registered checkout path, preserved for recovery.
+    pub path: PathBuf,
+    /// Repository-side failure; a healthy checkout must be left intact.
+    pub repo: Option<PathBuf>,
+    /// Same device as the parent suggests an unmounted mount point; unknown on stat failure.
+    pub possible_unmounted_mount_point: Option<bool>,
+}
+impl CheckoutUnreachable {
+    /// Recovery needs external action, never a repo-wide prune or forced retry.
+    pub const RECOVERY: &'static str = concat!(
+        "Remount and retry, or, if the checkout is really gone, ",
+        "remove the directory yourself and retry. ",
+        "Flock will not run git worktree prune: it is repo-wide ",
+        "and can unlink temporarily absent checkouts."
+    );
+    /// Repo-side failure recovery never directs removal of the checkout.
+    pub const REPO_RECOVERY: &'static str = concat!(
+        "Restore access to the repository and its Git administration metadata ",
+        "(mount, permissions or metadata repair), then retry; leave the checkout intact."
+    );
+    /// Typed refusal shared with unattended sweeps and API exit mapping.
+    pub fn code(&self) -> crate::api::error_code::ErrorCode {
+        if self.repo.is_some() {
+            crate::api::error_code::ErrorCode::WorktreeRepositoryUnreachable
+        } else {
+            crate::api::error_code::ErrorCode::WorktreeCheckoutUnreachable
+        }
+    }
+    /// Stable structured detail shared by API removal and kill-by-path.
+    pub fn data(&self) -> serde_json::Value {
+        let mut data = serde_json::json!({"path":self.path.display().to_string(),
+            "possible_unmounted_mount_point":self.possible_unmounted_mount_point,
+            "recovery":if self.repo.is_some() {Self::REPO_RECOVERY} else {Self::RECOVERY}});
+        if let Some(repo) = &self.repo {
+            data["repo"] = serde_json::json!(repo);
+        }
+        data
+    }
+}
+impl std::fmt::Display for CheckoutUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(repo) = &self.repo {
+            return write!(
+                f,
+                "Repository {} Git administration could not be read to verify checkout {}. {}",
+                repo.display(),
+                self.path.display(),
+                Self::REPO_RECOVERY
+            );
+        }
+        write!(
+            f,
+            "Checkout {} is present but its Git worktree registration cannot be verified. {}{}",
+            self.path.display(),
+            if self.possible_unmounted_mount_point == Some(true) {
+                "It may be an unmounted mount point (same device as parent; hint only). "
+            } else {
+                ""
+            },
+            Self::RECOVERY
+        )
+    }
+}
+
+/// Classify before removal: absent paths retain git's single-record cleanup.
+/// present paths must have mutually matching gitfile/admin/common-dir identities.
+/// This is deliberately separate from stderr's forceable-refusal classifier.
+pub(crate) fn check_worktree_remove(repo: &Path, path: &Path) -> Result<(), CheckoutUnreachable> {
+    if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(());
+    }
+    let checkout_failure = || CheckoutUnreachable {
+        path: path.to_owned(),
+        repo: None,
+        possible_unmounted_mount_point: crate::platform::same_device_as_parent(path),
+    };
+    let repo_failure = || CheckoutUnreachable {
+        path: path.to_owned(),
+        repo: Some(repo.to_owned()),
+        possible_unmounted_mount_point: None,
+    };
+    // Missing administration metadata is an orphan, not a repository access failure.
+    let admin_failure = |error: std::io::Error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            checkout_failure()
+        } else {
+            repo_failure()
+        }
+    };
+    let common = run_command_capture(
+        "git",
+        &[
+            "-C",
+            &repo.to_string_lossy(),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+        None,
+    )
+    .map_err(|_| repo_failure())?;
+    let common = PathBuf::from(common.trim())
+        .canonicalize()
+        .map_err(admin_failure)?;
+    let admins = common
+        .join("worktrees")
+        .canonicalize()
+        .map_err(admin_failure)?;
+    std::fs::read_dir(&admins).map_err(admin_failure)?;
+    let gitfile = path.join(".git");
+    let text = std::fs::read_to_string(&gitfile).map_err(|_| checkout_failure())?;
+    let target = text
+        .trim()
+        .strip_prefix("gitdir:")
+        .ok_or_else(checkout_failure)?
+        .trim();
+    let candidate = path.join(target);
+    let parent = candidate
+        .parent()
+        .ok_or_else(checkout_failure)?
+        .canonicalize()
+        .map_err(admin_failure)?;
+    if parent != admins {
+        return Err(checkout_failure());
+    }
+    std::fs::read_dir(&candidate).map_err(admin_failure)?;
+    let admin = candidate.canonicalize().map_err(admin_failure)?;
+    if admin.parent() != Some(admins.as_path()) {
+        return Err(checkout_failure());
+    }
+    let back = std::fs::read_to_string(admin.join("gitdir")).map_err(admin_failure)?;
+    if admin
+        .join(back.trim())
+        .canonicalize()
+        .map_err(admin_failure)?
+        != gitfile.canonicalize().map_err(|_| checkout_failure())?
+    {
+        return Err(checkout_failure());
+    }
+    let owner = std::fs::read_to_string(admin.join("commondir")).map_err(admin_failure)?;
+    if admin
+        .join(owner.trim())
+        .canonicalize()
+        .map_err(admin_failure)?
+        != common
+    {
+        return Err(checkout_failure());
+    }
+    Ok(())
+}
+
 /// Why git refused a `git worktree remove`, when the refusal is one `--force`
 /// clears (#351).
 ///
@@ -248,6 +403,36 @@ fn may_force_unattended(checkout: &Path, refusal: WorktreeRemoveRefusal) -> bool
     matches!(refusal, WorktreeRemoveRefusal::Submodules) && force_destroys_nothing(checkout)
 }
 
+/// Typed removal failure retained through workers, single-remove dialogs and sweeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRemoveFailure {
+    /// Registered refusal; callers never need to classify prose.
+    pub(crate) code: crate::api::error_code::ErrorCode,
+    /// Recovery diagnostic for the operator.
+    pub message: String,
+}
+impl std::fmt::Display for WorktreeRemoveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl From<String> for WorktreeRemoveFailure {
+    fn from(message: String) -> Self {
+        Self {
+            code: crate::api::error_code::ErrorCode::WorktreeRemoveFailed,
+            message,
+        }
+    }
+}
+impl From<CheckoutUnreachable> for WorktreeRemoveFailure {
+    fn from(error: CheckoutUnreachable) -> Self {
+        Self {
+            code: error.code(),
+            message: error.to_string(),
+        }
+    }
+}
+
 /// What one worktree-removal attempt sequence actually cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorktreeRemoveOutcome {
@@ -259,9 +444,9 @@ pub enum WorktreeRemoveOutcome {
     /// — the classification, not git's raw wording, so a caller can report what
     /// it agreed to lose instead of re-deriving it from a string.
     Recovered { refusal: WorktreeRemoveRefusal },
-    /// Not removed. The message is git's own, from whichever attempt got
-    /// furthest.
-    Failed(String),
+    /// Not removed. Shared checkout-identity refusal or git's error from the
+    /// attempt that got furthest.
+    Failed(WorktreeRemoveFailure),
 }
 
 /// Remove a worktree checkout for a caller with nobody to ask (#402).
@@ -289,12 +474,18 @@ pub(crate) fn remove_worktree_unattended(
     path: &Path,
     force: bool,
 ) -> WorktreeRemoveOutcome {
-    let attempt =
-        |force: bool| run_worktree_command(&build_worktree_remove_command(repo_root, path, force));
+    let attempt = |force: bool| {
+        check_worktree_remove(repo_root, path).map_err(WorktreeRemoveFailure::from)?;
+        run_worktree_command(&build_worktree_remove_command(repo_root, path, force))
+            .map_err(WorktreeRemoveFailure::from)
+    };
     let Err(err) = attempt(force) else {
         return WorktreeRemoveOutcome::Removed { forced: force };
     };
-    let Some(refusal) = classify_worktree_remove_error(&err) else {
+    if err.code != crate::api::error_code::ErrorCode::WorktreeRemoveFailed {
+        return WorktreeRemoveOutcome::Failed(err);
+    }
+    let Some(refusal) = classify_worktree_remove_error(&err.message) else {
         // Not one `--force` clears: a locked worktree, a missing registration,
         // anything else. Git's own words are the answer.
         return WorktreeRemoveOutcome::Failed(err);
@@ -3941,6 +4132,159 @@ mod tests {
     fn generated_branch_slug_is_worktree_namespaced_and_stable() {
         assert_eq!(generated_branch_slug(0), "worktree/brave-river-0000");
         assert_eq!(generated_branch_slug(9), "worktree/calm-cloud-0009");
+    }
+
+    struct AdminRemovalFixture {
+        repo: PathBuf,
+        checkout: PathBuf,
+        admin: PathBuf,
+    }
+    impl AdminRemovalFixture {
+        fn new(label: &str) -> Self {
+            let repo = crate::test_support::create_committed_repo(label);
+            let checkout = repo.join("child");
+            crate::test_support::run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "worktree/admin-classification",
+                    checkout.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            check_worktree_remove(&repo, &checkout).unwrap();
+            let text = std::fs::read_to_string(checkout.join(".git")).unwrap();
+            let admin = PathBuf::from(text.trim().strip_prefix("gitdir:").unwrap().trim());
+            Self {
+                repo,
+                checkout,
+                admin,
+            }
+        }
+    }
+    impl Drop for AdminRemovalFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.repo);
+        }
+    }
+
+    #[test]
+    fn pruned_admin_entry_is_an_orphaned_checkout_not_a_repository_failure() {
+        let fixture = AdminRemovalFixture::new("pruned-admin-classification");
+        std::fs::remove_dir_all(&fixture.admin).unwrap();
+        let failure = check_worktree_remove(&fixture.repo, &fixture.checkout).unwrap_err();
+        assert_eq!(
+            failure.code(),
+            crate::api::error_code::ErrorCode::WorktreeCheckoutUnreachable
+        );
+        assert!(failure.repo.is_none());
+        assert!(failure.to_string().contains(CheckoutUnreachable::RECOVERY));
+        assert!(!failure
+            .to_string()
+            .contains(CheckoutUnreachable::REPO_RECOVERY));
+        assert!(fixture.checkout.join(".git").is_file());
+    }
+
+    #[test]
+    fn missing_worktrees_directory_is_an_orphaned_checkout_not_a_repository_failure() {
+        let fixture = AdminRemovalFixture::new("missing-admin-directory");
+        std::fs::remove_dir_all(fixture.admin.parent().unwrap()).unwrap();
+        let failure = check_worktree_remove(&fixture.repo, &fixture.checkout).unwrap_err();
+        assert_eq!(
+            failure.code(),
+            crate::api::error_code::ErrorCode::WorktreeCheckoutUnreachable
+        );
+        assert!(failure.repo.is_none());
+        assert!(failure.to_string().contains(CheckoutUnreachable::RECOVERY));
+        assert!(fixture.checkout.join(".git").is_file());
+    }
+
+    #[test]
+    fn permission_denied_resolving_admin_alias_is_a_repository_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = AdminRemovalFixture::new("denied-admin-alias");
+        let restricted = fixture.repo.join("restricted");
+        std::fs::create_dir(&restricted).unwrap();
+        let alias = restricted.join("admins");
+        std::os::unix::fs::symlink(fixture.admin.parent().unwrap(), &alias).unwrap();
+        std::fs::write(
+            fixture.checkout.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                alias.join(fixture.admin.file_name().unwrap()).display()
+            ),
+        )
+        .unwrap();
+        // Restore before assertions, including when an unexpected successful read
+        // would mean this process can bypass the fixture's access restriction.
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let access = alias.canonicalize();
+        let failure = check_worktree_remove(&fixture.repo, &fixture.checkout);
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if access.is_ok() {
+            tracing::warn!(
+                "skipping permission-denied scenario: process bypasses fixture permissions"
+            );
+            return;
+        }
+        assert_eq!(
+            access.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let failure = failure.unwrap_err();
+        assert_eq!(
+            failure.code(),
+            crate::api::error_code::ErrorCode::WorktreeRepositoryUnreachable
+        );
+        assert_eq!(failure.repo.as_ref(), Some(&fixture.repo));
+        assert!(failure
+            .to_string()
+            .contains(CheckoutUnreachable::REPO_RECOVERY));
+        check_worktree_remove(&fixture.repo, &fixture.checkout).unwrap();
+    }
+
+    #[test]
+    fn removal_checks_gitdir_owner_and_backlink_before_force() {
+        let repo = crate::test_support::create_committed_repo("remove-admin-owner");
+        let root = crate::test_support::unique_temp_path("remove-admin-checkouts");
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&root).unwrap();
+        for (path, branch) in [(&a, "worktree/a"), (&b, "worktree/b")] {
+            crate::test_support::run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            check_worktree_remove(&repo, path).unwrap();
+        }
+        let original = std::fs::read(a.join(".git")).unwrap();
+        std::fs::copy(b.join(".git"), a.join(".git")).unwrap();
+        assert!(
+            check_worktree_remove(&repo, &a).is_err(),
+            "another entry's backlink is not this checkout"
+        );
+        assert!(
+            matches!(remove_worktree_unattended(&repo, &a, true), WorktreeRemoveOutcome::Failed(failure) if failure.message.contains(CheckoutUnreachable::RECOVERY))
+        );
+        std::fs::write(a.join(".git"), original).unwrap();
+        let foreign = crate::test_support::create_committed_repo("foreign-remove-admin-owner");
+        assert!(
+            check_worktree_remove(&foreign, &a).is_err(),
+            "a valid gitdir must still belong to the requested repo"
+        );
+        check_worktree_remove(&repo, &a).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(foreign).unwrap();
     }
 
     #[test]

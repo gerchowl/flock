@@ -365,6 +365,37 @@ Built-in checks:
 
 Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`, and exactly one of `workspace_id` or `path` for `worktree.kill`. Raw socket `cwd` and `path` values must be absolute, and a relative one is refused with `invalid_request` naming the field (`cwd must be an absolute path, got "repo"`); the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Flock worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
 
+### Worktree removal recovery
+
+If the repository probe fails or access to its worktree administration metadata
+fails for a reason other than missing metadata, removal refuses
+`worktree_repository_unreachable` (exit 10, retry `after_human`). Restore access
+to the repository and its Git administration metadata (mount, permissions or
+metadata repair), then retry; leave the checkout intact. The error names the
+repository requiring recovery.
+
+A registered checkout directory that is present but has no valid `.git` link
+back to this repository's worktree admin entry is refused with
+`worktree_checkout_unreachable` (exit 10, retry `after_human`). A missing admin
+entry or `worktrees/` directory also means the checkout is orphaned and uses
+this code and recovery text. `--force` cannot override it. The TUI kill dialog
+gives the same recovery: remount and retry, or, if the checkout is really gone,
+remove the directory yourself and retry. Flock never runs `git worktree prune`
+during removal or kill: pruning is repo-wide and can unlink other checkouts that
+are only temporarily absent. A completely absent directory still permits Git to
+remove that single registration.
+
+The refusal's `error.data` has `path` (the checkout path), `recovery` (the
+recovery text), and `possible_unmounted_mount_point` (`true` for the same device
+as its parent, `false` for a different device, or `null` if stat failed). This
+is a best-effort hint only; device identity never decides whether removal is
+allowed. Repository-side refusals additionally carry `repo` and set the checkout's
+mount-point hint to `null`; their recovery text concerns the repository only.
+Kill-by-path first reads a healthy checkout's own metadata. It uses a remembered
+repository's registered worktree list only when the checkout cannot identify
+itself; without verified registration it still refuses `not_git_worktree`.
+Unattended removals retain the typed refusal through sweep results and row state.
+
 `worktree.list` rows carry `last_commit_at` (unix seconds of the last commit on the branch) and are ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. Pass `"scan": true` to also resolve each linked row's `kill_verdict` — `{"verdict": "merged" | "not_merged" | "open_pr" | "unknown" | "checkout_missing", "evidence": ..., "protected": ..., "timed_out": ...}` — through the same gate `worktree.kill` enforces. Both fields are omitted rather than null when unknown: an absent `kill_verdict` means the row was not scanned, NOT that the branch is unmerged, and an absent `last_commit_at` means Git could not date it.
 
 `worktree.kill` accepts `path` as well as `workspace_id`, so a checkout no workspace has open is still killable through the gate instead of by hand. A path that IS open resolves to its workspace and closes it with the checkout; the response's `workspace_id` is omitted when no workspace held the checkout. A branch that heads an open PR is live work (#1278): a dry run reports `open_pr: true` with `merged` and `would_delete_branch` false, and a real kill without `keep_branch` is refused with `worktree_open_pr` (retry class `later`) before anything is removed, whatever `force` says. A `gh` that could not answer for a repo with a github.com remote gives verdict `unknown` (`merge_unknown: true`, reason in `evidence`) and the same refusal as `worktree_merge_unknown`. Containment in a remote branch outside the landing set is never merge evidence.
