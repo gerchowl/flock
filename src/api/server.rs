@@ -30,11 +30,20 @@ const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 
+/// Fixed categories for optional MCP provisioning; never expose path details.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum McpEndpointFailure {
+    Exe,
+    Socket,
+}
+
 pub struct ServerHandle {
     _thread: Option<std::thread::JoinHandle<()>>,
-    /// Kernel executable lookup, independent of request-selected launch data.
+    /// Fixture-only executable failure injection.
+    #[cfg(test)]
     pub(crate) mcp_executable: fn() -> io::Result<PathBuf>,
     path: PathBuf,
+    mcp_socket: Option<PathBuf>,
     pub(crate) node_id: Option<String>,
     pub(crate) clone_detection_warning: Option<String>,
     identity: SocketFileIdentity,
@@ -55,11 +64,17 @@ impl Drop for ServerHandle {
 
 impl ServerHandle {
     /// Pin MCP to this listener, independent of inherited client variables.
-    pub(crate) fn session_mcp(&self) -> std::io::Result<crate::structured::launch::SessionMcp> {
-        crate::structured::launch::SessionMcp::new(
-            &(self.mcp_executable)()?,
-            &std::path::absolute(&self.path)?,
-        )
+    pub(crate) fn session_mcp(
+        &self,
+    ) -> Result<crate::structured::launch::SessionMcp, McpEndpointFailure> {
+        let socket = self.mcp_socket.as_ref().ok_or(McpEndpointFailure::Socket)?;
+        #[cfg(test)]
+        let binary = (self.mcp_executable)();
+        #[cfg(not(test))]
+        let binary = std::env::current_exe();
+        let binary = binary.map_err(|_| McpEndpointFailure::Exe)?;
+        crate::structured::launch::SessionMcp::new(&binary, socket)
+            .map_err(|_| McpEndpointFailure::Exe)
     }
 
     /// Stop and join this fixture's owned listener, without signaling processes.
@@ -128,6 +143,7 @@ pub(crate) fn start_server_with_capabilities(
     let path = socket_path();
     prepare_socket_path(&path)?;
 
+    let mcp_socket = std::path::absolute(&path).ok();
     let listener = UnixListener::bind(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
@@ -172,7 +188,9 @@ pub(crate) fn start_server_with_capabilities(
 
     Ok(ServerHandle {
         _thread: Some(thread),
+        #[cfg(test)]
         mcp_executable: std::env::current_exe,
+        mcp_socket,
         node_id,
         clone_detection_warning,
         path,
