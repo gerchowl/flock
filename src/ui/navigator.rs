@@ -328,7 +328,7 @@ fn remote_workspace_detail(
     if let Some(activity) = summary.activity.as_deref().filter(|a| !a.is_empty()) {
         parts.push(activity.to_string());
     }
-    parts.join(" \u{00b7} ")
+    crate::terminal::agent_name::presentation(&parts.join(" \u{00b7} "))
 }
 
 fn workspace_detail(app: &AppState, ws_idx: usize) -> String {
@@ -512,6 +512,33 @@ fn truncate_text(text: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn security2090_remote_detail_sanitizes_legacy_presentation() {
+        for text in ["task\u{202e}tail", "task\u{9d}tail", "task\u{200b}tail"] {
+            let mut app = AppState::test_new();
+            let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+                name: "peer.invalid".into(),
+                ..Default::default()
+            });
+            let mut ws: crate::api::schema::PeerWorkspaceSummary = serde_json::from_value(
+                serde_json::json!({"workspace":"fixture", "status":"working"}),
+            )
+            .unwrap();
+            // Bypass receive admission to exercise the renderer's defence.
+            ws.workspace = text.into();
+            ws.activity = Some(text.into());
+            peer.workspaces.push(ws);
+            app.peer_summaries.push(peer);
+            let shown = remote_workspace_detail(
+                &app,
+                &crate::app::state::RemotePeerRef::Config { peer_idx: 0 },
+                0,
+            );
+            assert!(!shown.contains(text));
+            assert!(shown.contains("tasktail"));
+        }
+    }
+
     #[test]
     fn security_agent_name_navigator_escapes_legacy_peer_identity() {
         for (case, name) in crate::test_support::hostile_agent_names() {

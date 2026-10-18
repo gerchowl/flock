@@ -411,15 +411,21 @@ impl From<FleetWorkspace> for crate::api::schema::PeerWorkspaceSummary {
     fn from(ws: FleetWorkspace) -> Self {
         Self {
             id: ws.id,
-            workspace: ws.workspace,
+            workspace: crate::terminal::agent_name::presentation(&ws.workspace),
             project_key: ws.project_key,
-            project_label: ws.project_label,
-            branch: ws.branch,
+            project_label: ws
+                .project_label
+                .map(|text| crate::terminal::agent_name::presentation(&text)),
+            branch: ws
+                .branch
+                .map(|text| crate::terminal::agent_name::presentation(&text)),
             is_linked_worktree: ws.is_linked_worktree,
             agent: crate::terminal::agent_name::received(ws.agent, "mesh"),
             status: ws.status,
             status_age_secs: ws.status_age_secs,
-            activity: ws.activity,
+            activity: ws
+                .activity
+                .map(|text| crate::terminal::agent_name::presentation(&text)),
             agents: ws.agents.into_iter().map(Into::into).collect(),
         }
     }
@@ -1107,6 +1113,32 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     // ---- Round-trip: ClientMessage ----
+
+    #[test]
+    fn security2090_binary_peer_presentation_is_sanitized_without_wire_change() {
+        for text in ["task\u{202e}tail", "task\u{9d}tail", "task\u{200b}tail"] {
+            let raw = FleetWorkspace {
+                id: "fixture-workspace".into(),
+                workspace: text.into(),
+                project_key: None,
+                project_label: None,
+                branch: None,
+                is_linked_worktree: false,
+                agent: None,
+                status: crate::api::schema::AgentStatus::Working,
+                status_age_secs: None,
+                activity: Some(text.into()),
+                agents: vec![],
+            };
+            let bytes = bincode::serde::encode_to_vec(&raw, bincode::config::standard()).unwrap();
+            let (decoded, _): (FleetWorkspace, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            let ws: crate::api::schema::PeerWorkspaceSummary = decoded.into();
+            assert_eq!(ws.workspace, "tasktail");
+            assert_eq!(ws.activity.as_deref(), Some("tasktail"));
+        }
+        assert_eq!(crate::mesh::hello::VERSION, 5);
+    }
 
     #[test]
     fn security_agent_name_binary_wire_keeps_layout_but_drops_bad_names() {

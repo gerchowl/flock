@@ -1929,17 +1929,7 @@ const API_NOTIFICATION_RATE_LIMIT: Duration = Duration::from_secs(1);
 fn sanitized_notification_text(value: &str, max_chars: usize) -> Option<String> {
     let mut sanitized = String::new();
     let mut previous_space = false;
-    for ch in value.chars() {
-        let replacement = if ch == '\n' || ch == '\r' || ch == '\t' {
-            Some(' ')
-        } else if ch.is_control() {
-            None
-        } else {
-            Some(ch)
-        };
-        let Some(ch) = replacement else {
-            continue;
-        };
+    for ch in crate::terminal_notify::sanitize_text(value).chars() {
         if ch.is_whitespace() {
             if previous_space {
                 continue;

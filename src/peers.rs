@@ -700,7 +700,9 @@ pub fn relayed_entry_from_wire(
     // Everything below renders in the sidebar, so it is cleaned the way every
     // other receive boundary cleans it: the host-declared system summary is
     // clamped, and free-form names lose any control bytes a peer planted.
-    let strip = |text: String| crate::control_bytes::strip(&text);
+    let strip = |text: String| {
+        crate::terminal::agent_name::presentation(&crate::control_bytes::strip(&text))
+    };
     Some(RelayedEntry {
         peer: PeerSummaryState {
             node_id: entry.node_id,
@@ -720,6 +722,7 @@ pub fn relayed_entry_from_wire(
                 .into_iter()
                 .map(|mut ws| {
                     ws.workspace = strip(ws.workspace);
+                    ws.activity = ws.activity.map(strip);
                     ws.project_label = ws.project_label.map(strip);
                     ws.branch = ws.branch.map(strip);
                     ws.agent = crate::terminal::agent_name::received(ws.agent, "relay");
@@ -1628,6 +1631,31 @@ mod tests {
             origin_last_ok_secs: Some(3),
             proxy_jump: proxy_jump.map(Into::into),
             icon: None,
+        }
+    }
+
+    #[test]
+    fn security2090_peer_json_and_relay_sanitize_presentation() {
+        for text in ["task\u{202e}tail", "task\u{9d}tail", "task\u{200b}tail"] {
+            let response = serde_json::json!({"id":"text-fixture","result":{
+                "host":"fixture.example","workspaces":[{"workspace":text,"status":"working","activity":text}]
+            }}).to_string();
+            let payload = parse_summary_response(&response, 0).unwrap();
+            assert_eq!(payload.workspaces[0].workspace, "tasktail");
+            assert_eq!(payload.workspaces[0].activity.as_deref(), Some("tasktail"));
+            let mut relay = wire_peer("spoke.invalid", None);
+            let mut ws = payload.workspaces[0].clone();
+            ws.workspace = text.into();
+            ws.activity = Some(text.into());
+            relay.workspaces.push(ws);
+            let accepted = relayed_entry_from_wire(relay).unwrap();
+            let ws = &accepted.peer.workspaces[0];
+            assert_eq!(ws.workspace, "tasktail");
+            assert_eq!(ws.activity.as_deref(), Some("tasktail"));
+            assert!(
+                !serde_json::to_string(ws).unwrap().contains(text),
+                "GUI snapshot"
+            );
         }
     }
 

@@ -5064,6 +5064,7 @@ pub struct PeerWorkspaceSummary {
     #[serde(default)]
     pub id: String,
     /// Workspace display name (custom name or derived label).
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize_text")]
     pub workspace: String,
     /// Machine-independent project identity (normalized origin URL or
     /// `dir:<name>`), used to fold remote rows into local project groups.
@@ -5071,8 +5072,10 @@ pub struct PeerWorkspaceSummary {
     pub project_key: Option<String>,
     /// Repo folder name, labels remote-only project groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize_optional_text")]
     pub project_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize_optional_text")]
     pub branch: Option<String>,
     #[serde(default)]
     pub is_linked_worktree: bool,
@@ -5086,6 +5089,7 @@ pub struct PeerWorkspaceSummary {
     pub status_age_secs: Option<u64>,
     /// Live status-line activity while Working (e.g. "Implementing the parser").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize_optional_text")]
     pub activity: Option<String>,
     /// Every agent in this workspace, by fleet-global identity — the rows that
     /// make a directory possible (ADR-0008).

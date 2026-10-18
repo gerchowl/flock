@@ -554,8 +554,8 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         if let Some(label) = params.label {
-            if terminal.set_manual_label(label).is_err() {
-                return invalid_agent(id);
+            if terminal.set_manual_label(label.clone()).is_err() {
+                return invalid_agent(id, &label);
             }
         } else {
             terminal.clear_manual_label();
@@ -642,7 +642,7 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
-            return invalid_agent(id);
+            return invalid_agent(id, &params.agent);
         };
         let session_ref = crate::agent_resume::session_ref_from_report(
             &params.source,
@@ -683,7 +683,7 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         if normalize_reported_agent_label(&params.agent).is_none() {
-            return invalid_agent(id);
+            return invalid_agent(id, &params.agent);
         }
         let prompt = sanitize_reported_prompt(&params.prompt);
         if prompt.is_empty() {
@@ -707,7 +707,7 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         if normalize_reported_agent_label(&params.agent).is_none() {
-            return invalid_agent(id);
+            return invalid_agent(id, &params.agent);
         }
         let recap = sanitize_reported_prompt(&params.recap);
         if recap.is_empty() {
@@ -733,7 +733,7 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         if normalize_reported_agent_label(&params.agent).is_none() {
-            return invalid_agent(id);
+            return invalid_agent(id, &params.agent);
         }
         let reply = sanitize_reported_prompt(&params.reply);
         if reply.is_empty() {
@@ -754,7 +754,7 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
-            return invalid_agent(id);
+            return invalid_agent(id, &params.agent);
         };
         // Normalize once and use it twice: the identity event below, and the
         // self-compaction (#540), whose whole completion signal IS this field.
@@ -813,7 +813,7 @@ impl App {
         let agent_label = match params.agent.as_deref() {
             Some(agent) => match normalize_reported_agent_label(agent) {
                 Some(agent_label) => Some(agent_label),
-                None => return invalid_agent(id),
+                None => return invalid_agent(id, agent),
             },
             None => None,
         };
@@ -831,7 +831,7 @@ impl App {
             .as_deref()
             .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
         {
-            return invalid_agent(id);
+            return invalid_agent(id, params.display_agent.as_deref().unwrap_or_default());
         }
         let display_agent = normalize_presentation_text(params.display_agent);
         let custom_status = normalize_custom_status(params.custom_status);
@@ -1008,7 +1008,7 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
-            return invalid_agent(id);
+            return invalid_agent(id, &params.agent);
         };
         self.handle_internal_event(crate::events::AppEvent::HookAgentReleased {
             pane_id,
@@ -1438,9 +1438,8 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 
 fn normalize_presentation_text(value: Option<String>) -> Option<String> {
     let trimmed = value?.trim().to_string();
-    let normalized: String = trimmed
+    let normalized: String = crate::terminal::agent_name::presentation(&trimmed)
         .chars()
-        .filter(|ch| !ch.is_control())
         .take(80)
         .collect();
     (!normalized.trim().is_empty()).then(|| normalized.trim().to_string())
@@ -1482,11 +1481,15 @@ fn pane_not_found(id: String, pane_id: &str) -> String {
     encode_error(id, "pane_not_found", format!("pane {pane_id} not found"))
 }
 
-fn invalid_agent(id: String) -> String {
+fn invalid_agent(id: String, label: &str) -> String {
     encode_error(
         id,
         crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
-        crate::terminal::agent_name::POLICY,
+        if crate::terminal::agent_name::validate(label).is_ok_and(str::is_empty) {
+            "agent label must not be empty"
+        } else {
+            crate::terminal::agent_name::POLICY
+        },
     )
 }
 
@@ -2603,6 +2606,74 @@ mod tests {
             }
             assert!(app.state.terminals[&id].effective_agent_label().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn security2090_titles_are_safe_in_api_events_and_navigator() {
+        for title in ["task\u{202e}tail", "task\u{9d}tail", "task\u{200b}tail"] {
+            let (mut app, _, public) = app_with_terminal();
+            let request = serde_json::from_value(serde_json::json!({
+                "id":"title-fixture", "method":"pane.report_metadata",
+                "params":{"pane_id":public,"source":"custom:fixture","title":title}
+            }))
+            .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert!(response.get("error").is_none());
+            let pane = app.state.workspaces[0].tabs[0].root_pane;
+            // An internal producer bypasses API normalization, like restored metadata.
+            app.handle_internal_event(crate::events::AppEvent::HookMetadataReported {
+                pane_id: pane,
+                source: "custom:internal".into(),
+                agent_label: None,
+                applies_to_source: None,
+                title: Some(title.into()),
+                display_agent: None,
+                custom_status: None,
+                state_labels: Default::default(),
+                clear_title: false,
+                clear_display_agent: false,
+                clear_custom_status: false,
+                clear_state_labels: false,
+                seq: None,
+                ttl: None,
+            });
+            let info = app.pane_info(0, pane).unwrap();
+            assert_eq!(info.title.as_deref(), Some("tasktail"), "API title");
+            let mut emitted = false;
+            for (_, event) in app.event_hub.events_after(0) {
+                if let crate::api::schema::EventData::PaneAgentStatusChanged { title, .. } =
+                    &event.data
+                {
+                    assert_eq!(title.as_deref(), Some("tasktail"), "GUI title");
+                    emitted = true;
+                }
+            }
+            assert!(emitted, "metadata must reach the GUI stream");
+            app.state.open_navigator();
+            assert!(app
+                .state
+                .navigator_rows()
+                .iter()
+                .any(|row| row.label == "tasktail"));
+        }
+    }
+
+    #[tokio::test]
+    async fn security2090_empty_report_label_has_its_own_refusal() {
+        let (mut app, _, public) = app_with_terminal();
+        let request = serde_json::from_value(serde_json::json!({
+            "id":"empty-fixture", "method":"pane.report_agent",
+            "params":{"pane_id":public,"source":"custom:fixture","agent":" ","state":"working"}
+        }))
+        .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert_eq!(response["error"]["code"], "invalid_agent_name");
+        assert_eq!(
+            response["error"]["message"],
+            "agent label must not be empty"
+        );
     }
 
     /// App with one workspace whose root pane has a live TerminalState.

@@ -141,6 +141,20 @@ and GUI status events drop invalid agent labels rather than forwarding them.
 This does not change the wire layout or mesh version. The separate delegate
 filename restriction remains narrower than the general Unicode display rule.
 
+#### Presentation text (#2090)
+
+Titles and peer workspace/activity text are presentation, not identity. Strip
+characters forbidden by the identity policy above, preserving ZWJ and variation
+selectors, rather than refusing the record. Apply this at metadata admission and
+projection (including older/internal producers), peer JSON, binary fleet and
+relay receive boundaries, and notification output. Mesh v5 layout stays unchanged
+so older peers remain readable. The GUI and CLI receive sanitized strings, and
+the navigator sanitizes legacy text at its render boundary. Presentation text
+has no identity-length cap: retain full sanitized text for search, and truncate
+only when drawing into the available width. Metadata API titles retain their
+existing 80-scalar budget. Empty reported agent labels return
+`invalid_agent_name` with a nonempty-label message, separately from policy refusals.
+
 ### 5. The ceiling is lineage-aware, not a single global counter
 
 A flat `max_concurrent_agents` is a footgun on its own: an adversarial or

@@ -380,7 +380,9 @@ impl TerminalState {
         enforce_ttl: bool,
     ) -> EffectivePresentation {
         let mut presentation = EffectivePresentation::empty();
-        presentation.title = self.newest_metadata_title(now, enforce_ttl);
+        presentation.title = self
+            .newest_metadata_title(now, enforce_ttl)
+            .map(|title| crate::terminal::agent_name::presentation(&title));
         presentation.display_agent = self.newest_metadata_display_agent(now, enforce_ttl);
         presentation.state_labels = self.effective_metadata_state_labels(now, enforce_ttl);
         presentation.custom_status =
