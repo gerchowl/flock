@@ -2567,14 +2567,17 @@ fn assert_failed_fd_transfer_keeps_old_server(close_reader: bool) {
         fs::write(
             &importer,
             r#"import json
+import os
 from pathlib import Path
 import socket
 import sys
 
+assert len(sys.argv) == 4, "handoff credential must use the environment"
+token = os.environ.pop("FLOCK_HANDOFF_TOKEN")
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
     peer.settimeout(30)
     peer.connect(sys.argv[3])
-    peer.sendall((sys.argv[4] + "\n").encode())
+    peer.sendall((token + "\n").encode())
     manifest = json.loads(peer.makefile("rb").readline())
     assert len(manifest["panes"]) == 150, manifest
     peer.shutdown(socket.SHUT_RD)
