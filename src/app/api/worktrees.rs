@@ -6316,6 +6316,78 @@ mod tests {
     }
 
     #[test]
+    fn two_failed_repositories_without_enclosing_hint_return_first_failure() {
+        let repo = create_committed_repo("two-failures-first")
+            .canonicalize()
+            .unwrap();
+        let other = create_committed_repo("two-failures-second")
+            .canonicalize()
+            .unwrap();
+        let mut app = app_with_parent(&repo);
+        let mut workspace = Workspace::test_new("other-failed-owner");
+        workspace.identity_cwd = other.clone();
+        app.state.workspaces.push(workspace);
+        for workspace in &mut app.state.workspaces {
+            workspace.cached_git_space =
+                crate::workspace::git_space_metadata(&workspace.identity_cwd);
+        }
+        let mut identities = Vec::new();
+        for root in [&repo, &other] {
+            let expected = crate::workspace::git_space_metadata(root).unwrap().key;
+            std::fs::rename(root.join(".git"), root.join("saved-git")).unwrap();
+            let replacement = root.join("replacement-admin");
+            run_git(
+                root,
+                &["init", "--separate-git-dir", replacement.to_str().unwrap()],
+            );
+            identities.push((root.clone(), expected, replacement.canonicalize().unwrap()));
+        }
+        let target = repo.join("plain-directory");
+        std::fs::create_dir(&target).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
+            id: "two-failures-no-hint".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                path: Some(target.to_string_lossy().into_owned()),
+                force: true,
+                keep_processes: true,
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+        assert!(target.is_dir());
+        std::fs::remove_dir_all(&repo).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
+        assert_eq!(
+            response["error"]["code"], "worktree_repository_unreachable",
+            "{response}"
+        );
+        let data = &response["error"]["data"];
+        // The target's current repository sorts first; both saved identities
+        // differ from the replacement Git dirs, so neither provides a hint.
+        assert_eq!(data["repo"], serde_json::json!(repo));
+        assert_eq!(data["reason"], "workspace_repository_identity_changed");
+        assert_eq!(
+            data["expected_common_dir"],
+            serde_json::json!(identities[0].1)
+        );
+        assert_eq!(
+            data["observed_common_dir"],
+            serde_json::json!(identities[0].2)
+        );
+        for (_, expected, observed) in &identities {
+            assert_ne!(Path::new(expected), observed);
+        }
+        assert!(
+            data.get("nearest_enclosing_worktree").is_none(),
+            "{response}"
+        );
+        assert!(
+            data.get("repository_probe_failures").is_none(),
+            "{response}"
+        );
+    }
+
+    #[test]
     fn branch_deletion_invalid_stored_repo_requires_retargeting() {
         let (repo, checkout, _app) = exact_root_fixture("invalid-branch-repo");
         let invalid = repo.join("plain-directory");

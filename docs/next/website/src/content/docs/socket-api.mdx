@@ -421,12 +421,15 @@ plain directories and checkouts of unowned repositories refuse
 `worktree_path_not_root` (exit 10, retry `after_human`), even with `--force`.
 Its `error.data` carries `path` and `nearest_enclosing_worktree` (the closest
 enclosing registered root of an eligible repository, excluding its main checkout,
-or `null` if none is known). `repository_probe_failures` is always an array on
-every `worktree_path_not_root` response. It holds probe failures from the other
-owned repositories as `{code, message, data}` objects, including expected and
-observed common directories for changed workspace identities. The array is `[]`
-when `nearest_enclosing_worktree` is `null`; it can be non-empty only alongside a
-non-null hint. A hint never grants permission to remove its root.
+or `null` if none is known). Every `worktree_path_not_root` response includes
+`repository_probe_failures` as an array. With a non-null hint, it contains all
+collected probe failures from the other owned repositories as `{code, message,
+data}` objects, including expected and observed common directories for changed
+workspace identities; it is `[]` if those probes succeeded. With no enclosing
+hint, any probe failure returns immediately as the top-level typed error, before
+the `worktree_path_not_root` response is constructed; remaining probe failures
+are not returned. Thus a `worktree_path_not_root` response with a null hint has
+`repository_probe_failures: []`. A hint never grants permission to remove its root.
 Retarget explicitly to that root if intended, supply its repository as `repo`,
 or open a workspace in the owning repository before retrying. Alternatively,
 use raw `git worktree remove <path>` from the owning repository, accepting Git's
