@@ -1477,12 +1477,17 @@ impl HeadlessServer {
         }
         crate::server::handoff::wait_owned_ack(&mut stream);
 
+        self.commit_handoff_shutdown();
+        info!("live handoff completed; old server exiting");
+        Ok(skipped_undrained)
+    }
+
+    /// Enter exporter shutdown only after the replacement's owned acknowledgement.
+    fn commit_handoff_shutdown(&mut self) {
         self.shutting_down = true;
         self.app.state.should_quit = true;
         self.app.no_session = true;
         self.handoff_completed = true;
-        info!("live handoff completed; old server exiting");
-        Ok(skipped_undrained)
     }
 
     #[cfg(not(unix))]
@@ -5005,7 +5010,7 @@ mod tests {
             .0
             .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
         // The committed handoff keeps this diagnostic but must exit successfully.
-        server.handoff_completed = true;
+        server.commit_handoff_shutdown();
         let log = crate::logging::capture_logs(|| assert!(server.complete_shutdown().is_ok()));
         assert!(log.contains("structured.worker.shutdown_failed"));
         assert!(log.contains("structured_worker_cleanup_failed"));

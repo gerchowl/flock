@@ -75,6 +75,7 @@ impl Case {
             storage: Default::default(),
             stall_after: STALL,
             lineage: None,
+            admission: None,
         };
         let f = fixture.clone();
         let authority = leases.clone();
@@ -916,4 +917,119 @@ async fn registry_worker_launch_uses_configured_blob_threshold() {
     assert_eq!(reference.size, bytes.len() as u64);
     assert_eq!(store.get(&reference.blob).unwrap(), bytes);
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), block);
+}
+
+fn limited_launch(mut launch: Launch, leases: &SessionLeases) -> Launch {
+    launch.leases = leases.clone();
+    launch.lineage = Some(("fixture-parent".into(), 0));
+    launch.admission = Some(Admission {
+        config: crate::spawn::FleetConfig {
+            max_concurrent_agents: 1,
+            ..Default::default()
+        },
+        pty: crate::spawn::SpawnCensus {
+            live_agent_started: 0,
+            parent_live_children: 0,
+            child_depth: 1,
+        },
+        paused: false,
+        verb: crate::spawn::SpawnVerb::Fork,
+    });
+    launch
+}
+
+/// A producer held before lease acquisition cannot leave an uncounted admission gap.
+#[tokio::test]
+async fn owner_pending_reservation_blocks_concurrent_start_and_failure_frees_it() {
+    let (mut registry, mut workers, notify, now) = owner();
+    let leases = SessionLeases::default();
+    let (first, launch, _) = Case::prepare(&mut registry, 120, "state-reducer", vec![]);
+    let (release, barrier) = mpsc::channel();
+    workers.before_reserve = Some(barrier);
+    let generation = workers
+        .start(&mut registry, limited_launch(launch, &leases), |_| {
+            Err(io::Error::other("fixture preparation failure").into())
+        })
+        .unwrap();
+    assert_eq!(workers.counts(&leases, "fixture-parent"), Ok((1, 1)));
+    assert!(!leases.is_reserved(&first.session).unwrap());
+    workers.poll(&mut registry, now + Duration::from_secs(3600), 1000);
+    assert_eq!(
+        workers.counts(&leases, "fixture-parent"),
+        Ok((1, 1)),
+        "a clock cannot release pending admission"
+    );
+    let (_, second, _) = Case::prepare(&mut registry, 121, "state-reducer", vec![]);
+    let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = prepared.clone();
+    let refused = workers.start(&mut registry, limited_launch(second, &leases), move |_| {
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(io::Error::other("unadmitted preparation").into())
+    });
+    release.send(()).unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&first.id, generation).is_some()
+    })
+    .await;
+    let remaining = workers.counts(&leases, "fixture-parent");
+    let cleanup = workers.shutdown(&mut registry);
+    assert_eq!(refused, Err(ErrorCode::AtAgentCapacity));
+    assert!(!prepared.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        remaining,
+        Ok((0, 0)),
+        "failed preparation releases reservation"
+    );
+    cleanup.unwrap();
+    let (_, third, _) = Case::prepare(&mut registry, 122, "state-reducer", vec![]);
+    workers
+        .start(&mut registry, limited_launch(third, &leases), |_| {
+            Err(io::Error::other("fixture preparation failure").into())
+        })
+        .unwrap();
+    workers.shutdown(&mut registry).unwrap();
+}
+
+#[test]
+fn owner_counts_deduplicate_pending_and_leased_identity() {
+    let (_, mut workers, _, _) = owner();
+    let leases = SessionLeases::default();
+    workers
+        .pending
+        .insert("fixture-child".into(), Some("fixture-parent".into()));
+    let lease = leases
+        .reserve(
+            "fixture-child",
+            "00000000-0000-4000-8000-000000000123",
+            Some(("fixture-parent", 0)),
+        )
+        .unwrap();
+    assert_eq!(workers.counts(&leases, "fixture-parent"), Ok((1, 1)));
+    drop(lease);
+    assert_eq!(workers.counts(&leases, "fixture-parent"), Ok((1, 1)));
+}
+
+#[tokio::test]
+async fn owner_failed_lease_acquisition_releases_pending_reservation() {
+    let (mut registry, mut workers, notify, _) = owner();
+    let leases = SessionLeases::default();
+    let (case, launch, _) = Case::prepare(&mut registry, 124, "state-reducer", vec![]);
+    let existing = leases
+        .reserve("other-fixture-agent", &case.session, None)
+        .unwrap();
+    let generation = workers
+        .start(&mut registry, limited_launch(launch, &leases), |_| {
+            panic!("a duplicate lease must never prepare a profile")
+        })
+        .unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&case.id, generation).is_some()
+    })
+    .await;
+    let pending = workers.pending.contains_key(&case.id);
+    drop(existing);
+    let _ = workers.shutdown(&mut registry);
+    assert!(!pending, "lease failure must release its owner reservation");
 }

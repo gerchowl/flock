@@ -1005,7 +1005,6 @@ Remove these settings and callers:
 
 Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown keys with file and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
 
-
 ### Structured session read/control contracts
 
 `agent.list` adds `structured_agents` (defaulting to `[]` when absent in an older
@@ -1022,7 +1021,7 @@ For structured targets the response type is `structured_agent_info`, containing
 `agent`. A name shared with a PTY target is `agent_target_ambiguous`; use an id.
 `agent.stop` takes the same target shape and returns the current structured
 record while cancellation and cleanup run asynchronously. It requires operator
-or owning-agent authority. Offline stop is idempotent; Unknown ownership refuses
+or structured-self authority. Offline stop is idempotent; Unknown ownership refuses
 with `structured_recovery_required` (retry `after_human`, CLI exit 1).
 Pane-only operations return `runtime_unsupported` (retry `never`, CLI exit 2).
 These contracts do not enable public structured start; that remains gated until

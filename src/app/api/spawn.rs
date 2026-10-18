@@ -475,8 +475,8 @@ impl App {
             SpawnCaller::Operator { .. } => return Ok(None),
         };
         let (leased, children) = self
-            .session_leases
-            .counts(agent_id)
+            .structured_workers
+            .counts(&self.session_leases, agent_id)
             .map_err(|_| SpawnRefusal::CallerUnknown)?;
         census.live_agent_started += leased;
         census.parent_live_children += children;

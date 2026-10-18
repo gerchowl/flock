@@ -491,3 +491,16 @@ fn public_lease_state_reports_binding_without_authority_or_waiting() {
     lease.release();
     assert_eq!(leases.state("agent", "session"), LeaseState::Absent);
 }
+
+#[test]
+fn owner_admission_refuses_contended_lease_snapshot_without_waiting() {
+    let leases = SessionLeases::default();
+    let _held = leases.0.lock();
+    assert!(leases.admitted_identities().is_none());
+    let workers =
+        crate::structured::workers::Workers::new(std::sync::Arc::new(tokio::sync::Notify::new()));
+    assert_eq!(
+        workers.counts(&leases, "fixture-parent"),
+        Err(crate::api::error_code::ErrorCode::SpawnCallerUnknown)
+    );
+}
