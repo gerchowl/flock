@@ -312,7 +312,8 @@ For native queue custody, an unavailable journal owner cannot prove that a
 message was never committed. Recovery keeps the same message key until the
 24-hour inbox TTL. Status remains `queued` with detail
 `input_write_unknown:<cause>`, where the cause is `owner_unavailable`,
-`admission_pending`, `write_uncertain`, `journal_opaque`, `queue_journal_newer`
+`admission_pending`, `write_uncertain`, `commit_proven_settle_pending`,
+`journal_opaque`, `queue_journal_newer`
 or `queue_journal_corrupt`. A reply alone does not prove queue commitment, so
 that diagnostic can remain alongside a reply. Backoff is 4–5 seconds, then
 48–60 seconds, then 240–300 seconds, capped by the remaining TTL. Owner wakes
@@ -323,6 +324,8 @@ At expiry, status is `expired` with detail
 claiming the queue never committed the message.
 
 A positive journal proof settles delivery despite an elapsed inbox deadline.
+If saving that settlement fails, `commit_proven_settle_pending` preserves expiry
+protection until delivery is saved; expiry cannot erase that proof.
 If unknown expiry was already persisted, proof corrects only its status to
 `delivered`, once, with detail `delivered_after_expiry:<item_id>` identifying
 the committed lifecycle item. Proof never changes an existing delivered or

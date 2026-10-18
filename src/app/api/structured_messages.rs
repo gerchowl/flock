@@ -519,12 +519,15 @@ impl App {
             self.structured_sends.retries.remove(&signed.key);
             return code;
         }
+        // Positive proof must protect expiry until delivery settlement is durable.
+        // A failed save cannot turn proven commitment into an ordinary expiry.
+        let cause = match committed {
+            Ok(true) => Some(crate::structured::queue::custody::Unknown::SettlementPending),
+            Ok(false) => None,
+            Err(cause) => Some(cause),
+        };
         let remaining = match stored(|s| {
-            s.queue_commitment_unknown(
-                &signed.key,
-                committed.err(),
-                super::messages::now_ms() as i64,
-            )
+            s.queue_commitment_unknown(&signed.key, cause, super::messages::now_ms() as i64)
         }) {
             Ok(Some(remaining)) => Some(remaining),
             Ok(None) => {

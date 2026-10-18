@@ -975,9 +975,13 @@ same queue (owner decision 5): there is no second input path.
   can resume immediately on its wake; a failure's own notification cannot
   create a retry loop.
   Status stays `queued` with typed detail `input_write_unknown:<cause>`:
-  `owner_unavailable`, `admission_pending`, `write_uncertain`, `journal_opaque`,
-  `queue_journal_newer` or `queue_journal_corrupt`. These describe the owner's
-  uncertainty, independently of the error that triggered recovery. A reply is
+  `owner_unavailable`, `admission_pending`, `write_uncertain`,
+  `commit_proven_settle_pending`, `journal_opaque`,
+  `queue_journal_newer` or `queue_journal_corrupt`. These describe unresolved
+  proof or settlement, independently of the error that triggered recovery.
+  Positive proof whose delivery save fails records `commit_proven_settle_pending`
+  until settlement is durable. Expiry retains the correction path in this case
+  too, so a transient store failure cannot erase proven commitment. A reply is
   not journal commitment proof: `queued` and the unknown detail may coexist
   with a reply until the owner answers, custody settles, or its TTL expires.
   At TTL expiry the existing expiry/tombstone path records

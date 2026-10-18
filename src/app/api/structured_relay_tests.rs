@@ -1590,3 +1590,179 @@ fn custody_followup_payloadless_expiry_settles_from_owner_proof() {
         r.stop().await;
     });
 }
+
+#[test]
+fn custody_round1_already_gone_owner_wakes_have_a_counted_retry_bound() {
+    run(async {
+        use crate::api::error_code::ErrorCode;
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2541).await;
+        let d = mail(&r);
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (
+                    &r.case.id,
+                    &r.app
+                        .state
+                        .structured_agents
+                        .get(&r.case.id)
+                        .unwrap()
+                        .0
+                        .session_id,
+                ),
+                false,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        r.stop().await;
+        r.app.structured_workers = crate::structured::workers::Workers::new(r.notify.clone());
+        r.app
+            .retry_queue_custody(d.envelope.clone(), ErrorCode::AgentNotFound);
+        let now = std::time::Instant::now();
+        for n in 0..100 {
+            r.app
+                .finish_structured_messages(true, now + std::time::Duration::from_millis(n));
+        }
+        assert_eq!(
+            r.app.structured_sends.custody_attempts, 0,
+            "owner failure notifications must not bypass the retry floor"
+        );
+        r.app
+            .finish_structured_messages(true, now + std::time::Duration::from_secs(4));
+        assert_eq!(r.app.structured_sends.custody_attempts, 1);
+        for n in 1..100 {
+            r.app.finish_structured_messages(
+                true,
+                now + std::time::Duration::from_secs(4) + std::time::Duration::from_millis(n),
+            );
+        }
+        assert_eq!(r.app.structured_sends.custody_attempts, 1);
+        assert_eq!(r.app.structured_sends.recovering.len(), 1);
+        assert_eq!(r.app.structured_sends.recovering[0].key, d.envelope.key);
+    });
+}
+
+#[test]
+fn custody_round1_positive_proof_save_failure_survives_expiry() {
+    run(async {
+        use crate::api::error_code::ErrorCode;
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2542).await;
+        let d = mail(&r);
+        let now = crate::app::notifications::now_ms() as i64;
+        with_store(|s| {
+            let session = &r
+                .app
+                .state
+                .structured_agents
+                .get(&r.case.id)
+                .unwrap()
+                .0
+                .session_id;
+            s.accept_bound_delivery(&d, (&r.case.id, session), false, now)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let (ticket, ack) = r.app.admit_queue_custody(&d.envelope).unwrap();
+        r.until(|_| ticket.committed.try_recv().is_ok_and(|x| x.is_ok()))
+            .await;
+        let connection =
+            rusqlite::Connection::open(with_store(|s| Ok(s.path().to_owned())).unwrap()).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_delivery_save BEFORE UPDATE OF state ON envelopes
+            WHEN NEW.state='delivered' BEGIN SELECT RAISE(FAIL,'injected delivery save failure'); END;").unwrap();
+        let attempts = r.app.structured_sends.custody_attempts;
+        r.app
+            .retry_queue_custody(d.envelope.clone(), ErrorCode::InputWriteUnknown);
+        let pending = with_store(|s| {
+            s.collection_error(&d.envelope.key.origin_node, &d.envelope.correlation_id)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        with_store(|s| {
+            s.maintain(now + crate::mesh::store::DAY_MS)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        connection
+            .execute_batch("DROP TRIGGER fail_delivery_save")
+            .unwrap();
+        r.app
+            .finish_structured_messages(false, std::time::Instant::now());
+        let row = with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state, "delivered",
+            "a failed save must not erase positive proof's expiry protection"
+        );
+        assert!(row.envelope.body.is_empty());
+        assert_eq!(
+            pending.as_deref(),
+            Some("input_write_unknown:commit_proven_settle_pending")
+        );
+        assert_eq!(
+            r.app.structured_sends.custody_attempts, attempts,
+            "proof recovery must not re-admit"
+        );
+        drop(ack);
+        r.until(|r| r.inputs().len() == 1).await;
+        r.stop().await;
+    });
+}
+
+#[test]
+fn custody_round1_replacement_owner_bypasses_long_backoff_immediately() {
+    run(async {
+        use crate::api::error_code::ErrorCode;
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2543).await;
+        let d = mail(&r);
+        let now = crate::app::notifications::now_ms() as i64;
+        with_store(|s| {
+            let session = &r
+                .app
+                .state
+                .structured_agents
+                .get(&r.case.id)
+                .unwrap()
+                .0
+                .session_id;
+            s.accept_bound_delivery(&d, (&r.case.id, session), false, now)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        r.stop().await;
+        let before = std::time::Instant::now();
+        for _ in 0..3 {
+            r.app
+                .retry_queue_custody(d.envelope.clone(), ErrorCode::QueueSourceCold);
+        }
+        let retry = r
+            .app
+            .structured_sends
+            .retries
+            .get_mut(&d.envelope.key)
+            .unwrap();
+        assert!(retry.at >= before + std::time::Duration::from_secs(240));
+        // Hold both deadlines in the long-backoff window: only replacement
+        // progress may bypass them, independently of the speed of the fixture.
+        retry.wake_at = retry.at;
+        let attempts = r.app.structured_sends.custody_attempts;
+        r.restart(|_| {}).await;
+        r.until(|r| r.app.queue_observation(&r.case.id).is_some())
+            .await;
+        r.app
+            .finish_structured_messages(true, std::time::Instant::now());
+        assert_eq!(
+            r.app.structured_sends.custody_attempts,
+            attempts + 1,
+            "replacement owner must resume on its wake, not wait for backoff"
+        );
+        r.until(|r| r.inputs().len() == 1).await;
+        assert!(r.app.structured_sends.recovering.is_empty());
+        r.stop().await;
+    });
+}
