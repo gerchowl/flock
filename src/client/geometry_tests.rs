@@ -333,9 +333,7 @@ fn startup_guard_worker() {
         &signal
     )
     .is_ok());
-    let (mut handshake_peer, _) = listener.accept().unwrap();
-    handshake_peer.set_nonblocking(true).unwrap();
-    assert_eq!(io::Read::read(&mut handshake_peer, &mut [0]).unwrap(), 0);
+    assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
     assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     io::stdout().write_all(b"GEOMETRY_STAGE_SETUP\n").unwrap();
     let guard = setup_direct_attach_terminal().unwrap();
@@ -450,6 +448,7 @@ fn zero_startup_geometry_waits_until_sized_and_transient_logs_only_transition() 
     let samples = std::cell::Cell::new(0);
     let logs = crate::logging::capture_logs(|| {
         let result = wait_for_initial_geometry(
+            &AtomicBool::new(false),
             || {
                 let sample = samples.get();
                 samples.set(sample + 1);
@@ -478,6 +477,7 @@ fn zero_geometry_deadline_is_visible_typed_and_nonzero_without_invented_size() {
     let clock = std::cell::Cell::new(Instant::now());
     let started = clock.get();
     let result = wait_for_initial_geometry(
+        &AtomicBool::new(false),
         || Err(GeometryError::Transient(io::ErrorKind::WouldBlock.into())),
         || clock.get(),
         |duration| clock.set(clock.get() + duration),
@@ -676,74 +676,107 @@ fn zero_attach_worker() {
     io::stdout().flush().unwrap();
 }
 
-fn startup_error_child(mode: &str, expected: &str) {
-    use std::process::Stdio;
-    let mut command = crate::platform::terminal_geometry::tests::detached_command();
-    command
-        .args([
-            "--exact",
-            "client::geometry_tests::startup_error_worker",
-            "--ignored",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(|key| key.starts_with("FLOCK_")) {
-            command.env_remove(key);
-        }
-    }
-    command.env("FLOCK_TEST_GEOMETRY_ERROR", mode);
-    let mut child = crate::process::TracedCommand::from_command(command, "geometry-startup-error")
-        .spawn_traced()
-        .unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let status = finish_pty_child(Box::new(child), false);
-    let mut output = String::new();
-    io::Read::read_to_string(&mut stderr, &mut output).unwrap();
-    assert_eq!(
-        status.exit_code(),
-        crate::cli::exit::FAILURE as u32,
-        "{output}"
-    );
-    assert!(output.contains(expected), "{output}");
-}
+#[path = "geometry_tests/driver.rs"]
+mod driver;
+
 #[test]
 fn no_tty_startup_has_visible_error_and_nonzero_exit() {
-    startup_error_child("no_tty", "terminal_unavailable: no terminal is available");
+    driver::expect_failure("no_tty", "terminal_unavailable: no terminal is available");
 }
 #[test]
 fn unsized_startup_has_visible_deadline_error_and_nonzero_exit() {
-    startup_error_child(
+    driver::expect_failure(
         "deadline",
         "timeout: terminal geometry did not become nonzero",
     );
 }
+
 #[test]
-#[ignore = "exec-only fixture needs explicitly isolated stdio and session"]
-fn startup_error_worker() {
-    let mode = std::env::var("FLOCK_TEST_GEOMETRY_ERROR").expect("requires explicit fixture mode");
-    let mut probe = terminal_geometry_query();
+fn startup_geometry_quit_is_clean_before_and_during_the_wait() {
+    let quit = AtomicBool::new(true);
+    assert!(wait_for_initial_geometry(
+        &quit,
+        || panic!("quit must precede the probe"),
+        Instant::now,
+        |_| panic!("quit must not wait")
+    )
+    .unwrap()
+    .is_none());
+    quit.store(false, Ordering::Release);
     let clock = std::cell::Cell::new(Instant::now());
+    let mut samples = 0;
     let result = wait_for_initial_geometry(
+        &quit,
         || {
-            if mode == "deadline" {
-                Err(GeometryError::Transient(io::ErrorKind::WouldBlock.into()))
-            } else {
-                probe(false)
-            }
+            samples += 1;
+            Err(GeometryError::Transient(io::ErrorKind::WouldBlock.into()))
         },
         || clock.get(),
-        |duration| clock.set(clock.get() + duration),
+        |delay| {
+            quit.store(true, Ordering::Release);
+            clock.set(clock.get() + delay);
+        },
     );
-    match result {
-        Err(error) => {
-            // The exec fixture must expose the user-facing error to its parent.
-            writeln!(io::stderr(), "{}", ClientError::TerminalGeometry(error)).unwrap();
-            std::process::exit(crate::cli::exit::FAILURE);
-        }
-        other => panic!("startup must report a visible error: {other:?}"),
+    assert!(result.unwrap().is_none());
+    assert_eq!(samples, 1);
+}
+
+#[test]
+fn geometry_wait_never_reserves_a_server_handshake_slot() {
+    let root = crate::structured::launch::SessionConfigDir::create(Path::new("/tmp")).unwrap();
+    let socket = root.path().join("client.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let quit = Arc::new(AtomicBool::new(false));
+    let probe_quit = quit.clone();
+    let query: GeometryQuery = Box::new(move |_| {
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "startup probe must precede socket connect"
+        );
+        probe_quit.store(true, Ordering::Release);
+        Err(GeometryError::Transient(io::ErrorKind::WouldBlock.into()))
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (_tx, mut input) = tokio::sync::mpsc::channel(4);
+    let result = run_attach_attempt(
+        &socket,
+        RenderEncoding::TerminalAnsi,
+        None,
+        true,
+        false,
+        query,
+        None,
+        &mut None,
+        &mut input,
+        &runtime,
+        &quit,
+        &crate::config::SoundConfig::default(),
+        3,
+        false,
+        Instant::now(),
+        false,
+        &AttachSignal::default(),
+    );
+    assert!(result.is_ok());
+}
+
+#[test]
+fn local_geometry_failure_does_not_retry_in_an_open_handoff_window() {
+    let mut retry = HandoffRetry::default();
+    let refusal = AttachAttemptError::Handshake(ClientError::HandshakeRejected {
+        version: PROTOCOL_VERSION,
+        error: protocol::LIVE_HANDOFF_ATTACH_NOTICE.into(),
+    });
+    assert!(retry.should_retry(&refusal, Duration::ZERO));
+    for no_tty in [true, false] {
+        let failure = AttachAttemptError::Handshake(ClientError::TerminalGeometry(
+            geometry_startup_error(no_tty),
+        ));
+        assert!(!retry.should_retry(&failure, Duration::ZERO));
+        assert!(!failure.is_redial_failure());
     }
 }

@@ -1318,6 +1318,9 @@ impl HandoffRetry {
             AttachAttemptError::Handshake(ClientError::HandshakeRejected { version, .. }) => {
                 *version <= PROTOCOL_VERSION
             }
+            // Terminal geometry is local to this client; a server handoff
+            // cannot repair it, even while transport churn is retryable.
+            AttachAttemptError::Handshake(ClientError::TerminalGeometry(_)) => false,
             AttachAttemptError::Handshake(_) => true,
         }
     }
@@ -1694,13 +1697,11 @@ fn run_attach_attempt(
     hold_on_transport_loss: bool,
     signal: &AttachSignal,
 ) -> Result<(), AttachAttemptError> {
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
-
     // Read the terminal geometry before the handshake, while still outside
     // raw mode. Re-read on every attempt so a resize that happens during a
     // handoff window is honored.
     let Some((cols, rows, cell_width_px, cell_height_px)) = wait_for_initial_geometry(
+        should_quit,
         || geometry_probe(kitty_graphics_enabled),
         Instant::now,
         std::thread::park_timeout,
@@ -1709,6 +1710,10 @@ fn run_attach_attempt(
     else {
         return Ok(());
     };
+
+    // Do not occupy a server handshake slot until this client has geometry.
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|err| AttachAttemptError::Handshake(ClientError::ConnectionFailed(err)))?;
 
     // Perform handshake while the stream is still in blocking mode.
     let negotiated_encoding = do_handshake(
@@ -4369,6 +4374,7 @@ fn geometry_startup_error(no_tty: bool) -> io::Error {
 }
 
 fn wait_for_initial_geometry(
+    should_quit: &AtomicBool,
     mut geometry: impl FnMut() -> Result<TerminalGeometry, GeometryError>,
     now: impl Fn() -> Instant,
     mut wait: impl FnMut(Duration),
@@ -4376,7 +4382,14 @@ fn wait_for_initial_geometry(
     let deadline = now() + INITIAL_GEOMETRY_TIMEOUT;
     let mut last_failure = None;
     loop {
-        match geometry() {
+        if should_quit.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let observed = geometry();
+        if should_quit.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match observed {
             Ok(size) => return Ok(Some(size)),
             Err(GeometryError::Gone(error)) => {
                 crate::logging::client_geometry_query_failed(

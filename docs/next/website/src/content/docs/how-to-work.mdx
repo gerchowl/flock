@@ -23,7 +23,10 @@ Flock selects the first terminal on stdout, stdin, or `/dev/tty`, so a stdio
 PTY works even without a controlling tty. At startup it waits up to two seconds
 for nonzero geometry (including a PTY created at 0×0). If geometry never becomes
 valid, startup fails visibly with `timeout`; with no tty at all it fails with
-`terminal_unavailable`. Neither path sends an invented 80×24 size.
+`terminal_unavailable`. Sizing happens before connecting, so an unsized terminal
+occupies no server handshake slot. Quitting during the wait exits cleanly.
+Local geometry failures are final even during a live handoff; they do not consume
+its reconnect window. Neither path sends an invented 80×24 size.
 
 Once a terminal is selected, `EIO`, `ENXIO`, or `ENOTTY` on that tty detaches the
 client. Other query errors retain the last known geometry and send no resize.
