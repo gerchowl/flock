@@ -1182,6 +1182,50 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   infeasible. Keep the store bounded at 128 live codes and request bodies at
   1024 bytes. Cross-origin and non-loopback requests are refused, and neither
   codes nor tokens enter diagnostic logs.
+  The opener's URL argument is an explicit credential-in-argv exception:
+  `open`/`xdg-open` have no stdin or environment URL channel. The exchange code
+  is visible through `ps` for the opener's lifetime. Single use, the 60-second
+  TTL and fragment-only transport bound this known exposure; process logging
+  masks the code. This exception does not permit long-lived tokens in argv.
+  Log-only argv scrubbing also masks userinfo in malformed URL tokens: raw
+  `/`, `#` or quotes before the final `@` must not expose a password prefix.
+  Without escaping, userinfo and path text containing `@` are ambiguous; the
+  conservative rule can hide preceding host/path text in logs. Quoted URL
+  wrappers are retained when the URL tail has no such ambiguity. Whitespace
+  and angle brackets (`<`, `>`) terminate URL tokens: malformed userinfo with
+  these characters can leave a password prefix visible. This backstop cannot
+  replace keeping credentials in stdin or the environment.
+  Query/fragment names containing a full credential label (shared with the
+  report scrubber), or `code`, `key` or `signature`, have their values masked
+  even when the label is mid-name, such as `api_key_v2` or `token_type`.
+  This intentionally also masks false positives such as `keyboard`, `monkey`,
+  `unicode` and `sessionid`; the short `sig` alias
+  matches only the complete name, preserving ordinary `design` parameters.
+  Exact credential header names (`Authorization`, `Proxy-Authorization`,
+  `Private-Token`, `Cookie`, `Set-Cookie`, API-key names and the `X-`
+  credential-header family)
+  allow horizontal whitespace before `:` and mask values even without space
+  after it, including names glued to curl's `-H` option or a short-flag
+  cluster ending in uppercase `H`, such as `-sSLH`, `-4H`, `-0sH`, `-#H`
+  or `-:H`. Digit, progress-meter and next-transfer flags are valid cluster
+  members; lowercase `h` requests help and is not a header option. Header
+  recognition classifies the complete name, so `refs/heads/cookie` is a ref name rather
+  than a `Cookie` header. Generic credential labels such as `token`, `session`
+  and `secret`, including prefixed labels, require whitespace or end-of-string
+  after `:`. This preserves refspecs and terminal targets such as
+  `refs/heads/token:refs/heads/x`, `token:main`, `deploy-token:main` and
+  `mysession:0`.
+  Bare compact refspecs such as `cookie:cookie` and `authorization:main` are
+  masked in logs because they are indistinguishable from compact credential
+  headers, an acceptable loss of diagnostic detail to avoid exposing secrets.
+  Everything after the first header-shaped label is value, never part of a
+  later label. If a later credential-header match would retain text following
+  an earlier colon, mask the whole argument instead. Curl's leading `-:` switch
+  is not a header delimiter. This deliberately over-masks ambiguous chains such
+  as `-:Hfoo:HAuthorization:z`, including `z`, and may hide option labels in that
+  argument; the program and other arguments remain logged. Skipped matches never
+  promote earlier values into a retained label.
+  These rules shape diagnostic logs only; executed argv is never rewritten.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location
   (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.

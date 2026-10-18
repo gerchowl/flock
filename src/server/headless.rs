@@ -4147,10 +4147,18 @@ pub fn run_server() -> io::Result<()> {
             .get(3)
             .map(PathBuf::from)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff socket"))?;
-        let token = args
-            .get(4)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
-        return run_handoff_import_server(&socket_path, token);
+        // Old running exporters use the positional channel. Keep import compatible
+        // across upgrades; new exporters supply only the environment channel.
+        let token = std::env::var(crate::server::handoff::HANDOFF_TOKEN_ENV)
+            .or_else(|_| args.get(4).cloned().ok_or(std::env::VarError::NotPresent))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
+        // Consume before starting threads or children, so panes cannot inherit it.
+        // Removal cannot scrub the kernel's startup-environment copy: process
+        // inspection can expose it for the server lifetime. The token is single-use
+        // and is dead after the handoff consumes it.
+        std::env::remove_var(crate::server::handoff::HANDOFF_TOKEN_ENV);
+        let token = zeroize::Zeroizing::new(token);
+        return run_handoff_import_server(&socket_path, &token);
     }
 
     init_logging();
