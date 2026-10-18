@@ -764,7 +764,9 @@ fn stream_subscriptions(
         &mut stream,
         &SuccessResponse {
             id: request_id.clone(),
-            result: ResponseResult::SubscriptionStarted {},
+            result: ResponseResult::SubscriptionStarted {
+                start_sequence: Some(start),
+            },
         },
     ) {
         if is_connection_closed_error(&err) {
@@ -1894,6 +1896,132 @@ mod tests {
         for (running, thread) in owners {
             running.store(false, Ordering::Relaxed);
             assert!(thread.join().unwrap().is_ok());
+        }
+    }
+
+    struct ResumeSubscription {
+        reader: BufReader<UnixStream>,
+        running: Arc<AtomicBool>,
+        owner: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    }
+    impl ResumeSubscription {
+        fn new(hub: EventHub, after: Option<u64>, filters: Vec<serde_json::Value>) -> Self {
+            let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut params = serde_json::json!({"subscriptions":filters});
+            if let Some(cursor) = after {
+                params["after_sequence"] = cursor.into();
+            }
+            writeln!(
+                client,
+                "{}",
+                serde_json::json!({"id":"resume","method":"events.subscribe","params":params})
+            )
+            .unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            let stop = running.clone();
+            let owner = std::thread::spawn(move || {
+                handle_connection(
+                    server,
+                    &api_tx,
+                    &hub,
+                    &stop,
+                    None,
+                    &Mutex::default(),
+                    &Default::default(),
+                )
+            });
+            Self {
+                reader: BufReader::new(client),
+                running,
+                owner: Some(owner),
+            }
+        }
+        fn next(&mut self) -> serde_json::Value {
+            let mut line = String::new();
+            self.reader.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+    }
+    impl Drop for ResumeSubscription {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::Relaxed);
+            let _ = self.reader.get_ref().shutdown(std::net::Shutdown::Both);
+            if let Some(owner) = self.owner.take() {
+                let _ = owner.join();
+            }
+        }
+    }
+
+    #[test]
+    fn subscription_ack_has_a_live_floor_even_when_every_filter_is_quiet() {
+        let hub = EventHub::default();
+        hub.push(queued_for("ws_1:p1", "retained"));
+        let mut stream = ResumeSubscription::new(
+            hub,
+            None,
+            vec![serde_json::json!({"type":"workspace.closed"})],
+        );
+        let ack = stream.next();
+        assert_eq!(ack["result"]["type"], "subscription_started");
+        assert_eq!(ack["result"]["start_sequence"], 1);
+    }
+
+    #[test]
+    fn subscription_ack_floor_protects_an_unapplied_earlier_filter_on_resume() {
+        let hub = EventHub::default();
+        hub.push(queued_for("ws_1:p2", "earlier"));
+        hub.push(queued_for("ws_1:p1", "later"));
+        let mut stream = ResumeSubscription::new(
+            hub.clone(),
+            Some(0),
+            vec![
+                serde_json::json!({"type":"msg.queued","pane":"ws_1:p1"}),
+                serde_json::json!({"type":"msg.queued","pane":"ws_1:p2"}),
+                serde_json::json!({"type":"workspace.closed"}),
+            ],
+        );
+        let ack = stream.next();
+        let floor = ack["result"]["start_sequence"]
+            .as_u64()
+            .expect("quiet filters need an acknowledged cursor");
+        let mut applied = [floor; 3];
+        let first = stream.next();
+        assert_eq!(first["data"]["correlation_id"], "later");
+        applied[first["subscription_index"].as_u64().unwrap() as usize] =
+            first["seq"].as_u64().unwrap();
+        assert_eq!(applied, [2, 0, 0]);
+        let resume = *applied.iter().min().unwrap();
+        drop(stream);
+        let mut resumed = ResumeSubscription::new(
+            hub,
+            Some(resume),
+            vec![serde_json::json!({"type":"msg.queued","pane":"ws_1:p2"})],
+        );
+        assert_eq!(resumed.next()["result"]["start_sequence"], resume);
+        let recovered = resumed.next();
+        assert_eq!(recovered["seq"], 1);
+        assert_eq!(recovered["data"]["correlation_id"], "earlier");
+    }
+
+    #[test]
+    fn ordinary_subscription_events_identify_same_type_filters_independently() {
+        let hub = EventHub::default();
+        hub.push(queued_for("ws_1:p2", "earlier"));
+        hub.push(queued_for("ws_1:p1", "later"));
+        let a = serde_json::json!({"type":"msg.queued","pane":"ws_1:p1"});
+        let b = serde_json::json!({"type":"msg.queued","pane":"ws_1:p2"});
+        let mut stream = ResumeSubscription::new(hub, Some(0), vec![a.clone(), b.clone()]);
+        assert_eq!(stream.next()["result"]["type"], "subscription_started");
+        for (index, descriptor, seq, correlation) in [(0, a, 2, "later"), (1, b, 1, "earlier")] {
+            let event = stream.next();
+            assert_eq!(event["subscription_index"], index);
+            assert_eq!(event["subscription"], descriptor);
+            assert_eq!(event["seq"], seq);
+            assert_eq!(event["data"]["correlation_id"], correlation);
         }
     }
 

@@ -3510,7 +3510,12 @@ pub enum ResponseResult {
     PaneRead {
         read: PaneReadResult,
     },
-    SubscriptionStarted {},
+    SubscriptionStarted {
+        /// Initial cursor shared by all accepted filters. New servers always
+        /// include it; absence identifies an older acknowledgement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_sequence: Option<u64>,
+    },
     WaitMatched {
         event: EventEnvelope,
     },

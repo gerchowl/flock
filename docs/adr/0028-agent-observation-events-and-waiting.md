@@ -1146,7 +1146,11 @@ the one log, not a second event system.
   checks `events_live_start` before sending it and refuses missing support with
   `server_version_gap`; both cursor fields together are `invalid_params`.
   No protocol bump is needed. Every stream event carries `seq`; events and loss
-  notices identify the subscription index and descriptor. Loss continues at the
+  notices identify the subscription index and descriptor. The acknowledgement
+  supplies `start_sequence`, the initial cursor for every filter. Initialize an
+  applied cursor per subscription to it, advance only the emitting subscription,
+  and resume from the minimum, including quiet filters. Current-state predicate
+  watermarks never advance other filters. Loss continues at the
   retained boundary after resync using existing per-verb reads; `session.snapshot`
   remains #2163. A reply wait folds the retained ring again and continues on gaps.
   Internal bounded state folds use a distinct API and do not claim complete replay.
