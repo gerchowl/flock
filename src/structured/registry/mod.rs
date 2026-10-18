@@ -131,7 +131,16 @@ impl Registry {
     /// Admit a record before a worker exists. It starts offline, without authority.
     /// A worker must explicitly supply Live after acquiring its actual lease.
     /// Duplicate identity/name/session and unsupported harnesses are refused.
+    /// Retained names are reserved too, without interpreting unknown runtime data.
     pub fn register(&mut self, record: Record) -> Result<u64, RegistryError> {
+        if record.name.as_deref().is_some_and(|name| {
+            self.preserved
+                .iter()
+                .flatten()
+                .any(|raw| raw.get("name").and_then(Value::as_str) == Some(name))
+        }) {
+            return Err(RegistryError::Conflict);
+        }
         let raw = serde_json::to_value(&record).map_err(|_| RegistryError::InvalidRecord)?;
         self.register_raw(record, raw)
     }
@@ -161,6 +170,27 @@ impl Registry {
             Entry::cold(record, generation, self.preserved.len()),
         );
         self.preserved.push(Some(raw));
+        self.generation = generation;
+        Ok(generation)
+    }
+
+    /// Start a fresh launch observation epoch while retaining the durable record.
+    /// A new generation fences all previous worker deliveries. Live follows readiness.
+    pub(crate) fn begin_launch(
+        &mut self,
+        agent_id: &str,
+        current: u64,
+    ) -> Result<u64, RegistryError> {
+        let entry = self
+            .entries
+            .get_mut(agent_id)
+            .filter(|entry| entry.generation == current)
+            .ok_or(RegistryError::StaleGeneration)?;
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(RegistryError::GenerationExhausted)?;
+        *entry = Entry::cold(entry.record.clone(), generation, entry.slot);
         self.generation = generation;
         Ok(generation)
     }
@@ -195,7 +225,9 @@ impl Registry {
         Ok(&entry.projection.update)
     }
 
-    /// Remove the matching generation and retained entries sharing its id/name/session.
+    /// Remove the matching generation and retained entries sharing its id/session.
+    /// Known-runtime shadows also match by name; future-runtime names alone do not
+    /// prove identity and must survive removal (#1858).
     /// Compact storage so removed slots cannot accumulate. Runtime cleanup must precede this.
     pub fn remove(&mut self, agent_id: &str, generation: u64) -> Result<Record, RegistryError> {
         if self
@@ -213,14 +245,14 @@ impl Registry {
         let mut compact = Vec::new();
         for (slot, raw) in self.preserved.drain(..).enumerate() {
             let Some(raw) = raw else { continue };
-            let conflicts = raw.get("agent_id").and_then(Value::as_str)
-                == Some(record.agent_id.as_str())
-                || raw.get("session_id").and_then(Value::as_str)
-                    == Some(record.session_id.as_str())
-                || record
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| raw.get("name").and_then(Value::as_str) == Some(name));
+            let conflicts =
+                raw.get("agent_id").and_then(Value::as_str) == Some(record.agent_id.as_str())
+                    || raw.get("session_id").and_then(Value::as_str)
+                        == Some(record.session_id.as_str())
+                    || (raw.get("runtime").and_then(Value::as_str) == Some("structured")
+                        && record.name.as_deref().is_some_and(|name| {
+                            raw.get("name").and_then(Value::as_str) == Some(name)
+                        }));
             if slot != entry.slot && !conflicts {
                 slots[slot] = compact.len();
                 compact.push(Some(raw));
@@ -257,6 +289,25 @@ impl Registry {
             generation: self.generation,
             preserved: self.preserved.clone(),
             unparsed: self.unparsed.clone(),
+        }
+    }
+
+    /// Carry uncertainty across further handoffs even when no worker was restored.
+    pub(crate) fn handoff_unknown(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| entry.projection.update.state.lifecycle == Lifecycle::Unknown)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Restore only the exporter's uncertainty, without a process, lease or resume.
+    pub(crate) fn restore_handoff_unknown(&mut self, ids: &[String]) {
+        for id in ids {
+            if let Some(entry) = self.entries.get_mut(id) {
+                entry.reducer.set_initial_lifecycle(Lifecycle::Unknown);
+                entry.projection.update.state = AgentState::unknown();
+            }
         }
     }
 

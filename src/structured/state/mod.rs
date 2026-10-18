@@ -357,7 +357,6 @@ impl SessionState {
             SessionEvent::ControlCancel(e) => {
                 self.controls.remove(&e.request_id);
             }
-
             SessionEvent::ContentBlockStart(e) => self.tool_start(e.event.get("content_block")),
             SessionEvent::Assistant(e) => {
                 for block in e

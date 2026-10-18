@@ -116,6 +116,15 @@ impl SessionLeases {
             cleanup_confirmed: false,
         })
     }
+    /// Worker-side cleanup confirmation. Never wait on this lock in the app loop.
+    pub(crate) fn is_reserved(&self, session: &str) -> io::Result<bool> {
+        let entries = self
+            .0
+            .try_lock_for(LOCK_LIMIT)
+            .ok_or_else(|| io::Error::other("lease registry busy"))?;
+        Ok(entries.contains_key(session))
+    }
+
     /// Conservative live reservation counts, including pending agent-started launches.
     pub fn counts(&self, parent: &str) -> io::Result<(usize, usize)> {
         let entries = self
