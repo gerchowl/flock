@@ -149,8 +149,14 @@ impl Service {
     }
     /// Whether this operation failed at the stdin boundary.
     pub fn tick(&mut self, input: &InputHandle, stopped: bool, notify: &impl Fn()) -> bool {
-        self.publisher
-            .capture(|| self.scheduler.subscription(), self.status.clone());
+        let blocked = self.blocked;
+        self.publisher.capture(
+            || match blocked {
+                Some(code) => Err(failure(code)),
+                None => self.scheduler.subscription(),
+            },
+            self.status.clone(),
+        );
         let mut changed = self.initial;
         if let Ok(state) = self.states.try_recv() {
             if state.through >= self.required {
@@ -270,10 +276,24 @@ impl Service {
         error.is_some_and(|e| e.0 == ErrorCode::InputWriteFailed)
     }
     pub fn finish(&mut self, input: &InputHandle, notify: &impl Fn()) -> bool {
-        self.publisher
-            .capture(|| self.scheduler.subscription(), self.status.clone());
+        let blocked = self.blocked;
+        self.publisher.capture(
+            || match blocked {
+                Some(code) => Err(failure(code)),
+                None => self.scheduler.subscription(),
+            },
+            self.status.clone(),
+        );
         let error = self.policy().and_then(|_| self.scheduler.exited()).err();
         self.publish(input, true, None, error);
+        let blocked = self.blocked;
+        self.publisher.finish(
+            || match blocked {
+                Some(code) => Err(failure(code)),
+                None => self.scheduler.subscription(),
+            },
+            self.status.clone(),
+        );
         self.flush(true, notify);
         self.lost
     }

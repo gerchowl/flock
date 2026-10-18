@@ -23,6 +23,10 @@ pub(crate) enum Page {
     Synced(u64),
     /// Reservation/read-only status and operation refusal.
     Status(Option<Pending>, Option<ErrorCode>),
+    /// Terminal refusal: no successful snapshot/barrier was served.
+    Refused(ErrorCode),
+    /// Bounded progress; page again without waiting for another wake.
+    Progress,
     /// Await readiness; this never retries a mutation.
     Pending,
     /// Closed overflow; resume from the last applied cursor.
@@ -30,53 +34,52 @@ pub(crate) enum Page {
     /// Generation ended after draining committed publications.
     End,
 }
-struct Packet(Arc<Cut>, Option<Pending>, Option<ErrorCode>, bool);
+struct Packet(Arc<Cut>, Option<Pending>, Option<ErrorCode>, bool, u64);
 #[derive(Default)]
 struct Live {
     packets: VecDeque<Packet>,
     bytes: usize,
     lagged: Option<u64>,
+    refusal: Option<ErrorCode>,
 }
 struct Book {
     retained: Arc<Cut>,
     status: Option<Pending>,
     error: Option<ErrorCode>,
     ended: bool,
+    refusal: Option<ErrorCode>,
     readers: Vec<Weak<Mutex<Live>>>,
 }
 impl Book {
     fn register(&mut self, after: Option<u64>, live: Arc<Mutex<Live>>) -> Result<(), ErrorCode> {
+        if let Some(code) = self.refusal {
+            live.lock().refusal = Some(code);
+            return Ok(());
+        }
         if after.is_some_and(|n| n > self.retained.through) {
             return Err(ErrorCode::InvalidRequest);
         }
-        let cursor = after.unwrap_or(0);
-        let start = self
-            .retained
-            .records
-            .partition_point(|v| v["seq"].as_u64().is_some_and(|n| n <= cursor));
-        let mut cut = Cut {
-            records: self.retained.records[start..].to_vec(),
-            through: self.retained.through,
-            gap: self.retained.gap.clone(),
-        };
-        cut.gap = cut
-            .gap
-            .filter(|g| after.is_none() || cursor <= g.to)
-            .map(|mut g| {
-                g.from = cursor.saturating_add(1);
-                g
-            });
-        live.lock()
-            .packets
-            .push_back(Packet(Arc::new(cut), self.status.clone(), self.error, true));
+        live.lock().packets.push_back(Packet(
+            self.retained.clone(),
+            self.status.clone(),
+            self.error,
+            true,
+            after.unwrap_or(0),
+        ));
         self.readers.retain(|r| r.strong_count() != 0);
         self.readers.push(Arc::downgrade(&live));
         Ok(())
     }
     fn publish(&mut self, mut cut: Cut, status: Option<Pending>, error: Option<ErrorCode>) {
-        if cut.through <= self.retained.through {
-            cut.records.clear();
+        let replacement = cut.gap.is_some() && cut.gap != self.retained.gap;
+        if !replacement {
             cut.gap = None;
+            let start = cut.records.partition_point(|v| {
+                v["seq"]
+                    .as_u64()
+                    .is_some_and(|n| n <= self.retained.through)
+            });
+            cut.records.drain(..start);
         }
         let bytes = cut
             .records
@@ -100,7 +103,7 @@ impl Book {
                 reader.bytes += bytes;
                 reader
                     .packets
-                    .push_back(Packet(cut.clone(), status.clone(), error, false));
+                    .push_back(Packet(cut.clone(), status.clone(), error, false, 0));
             }
             true
         });
@@ -124,7 +127,7 @@ impl Provider for Source {
     type Subscription = Reader;
     fn subscribe(&self, after: Option<u64>) -> Result<Reader, ErrorCode> {
         let live = Arc::new(Mutex::new(Live::default()));
-        let mut book = self.1.lock();
+        let mut book = self.1.try_lock().ok_or(ErrorCode::SessionBusy)?;
         if book.ended {
             book.register(after, live.clone())?;
         } else {
@@ -160,8 +163,14 @@ impl Subscription for Reader {
         if self.closed {
             return Page::End;
         }
-        let book = self.source.1.lock();
+        let Some(book) = self.source.1.try_lock() else {
+            return Page::Pending;
+        };
         let mut live = self.live.lock();
+        if let Some(code) = live.refusal.or(book.refusal) {
+            self.closed = true;
+            return Page::Refused(code);
+        }
         if let Some(head) = live.lagged {
             self.closed = true;
             return Page::Lagged(head);
@@ -175,7 +184,10 @@ impl Subscription for Reader {
                         .saturating_sub(packet.0.records.iter().map(|v| v.to_string().len()).sum());
                 }
             }
-            self.index = 0;
+            self.index = self.current.as_ref().map_or(0, |p| {
+                p.0.records
+                    .partition_point(|v| v["seq"].as_u64().is_some_and(|n| n <= p.4))
+            });
             self.stage = 0;
         }
         let Some(packet) = &self.current else {
@@ -189,7 +201,13 @@ impl Subscription for Reader {
         if self.stage == 0 {
             self.stage = 1;
             if let Some(gap) = &packet.0.gap {
-                return Page::Gap(gap.clone());
+                if !packet.3 || packet.4 <= gap.to {
+                    let mut gap = gap.clone();
+                    if packet.3 {
+                        gap.from = packet.4.saturating_add(1);
+                    }
+                    return Page::Gap(gap);
+                }
             }
         }
         if let Some(record) = packet.0.records.get(self.index) {
@@ -202,7 +220,7 @@ impl Subscription for Reader {
         }
         let synced = packet.3.then_some(packet.0.through);
         self.current = None;
-        synced.map_or(Page::Pending, Page::Synced)
+        synced.map_or(Page::Progress, Page::Synced)
     }
 }
 /// Sole writer's publication half; capture and registration share its book lock.
@@ -217,6 +235,7 @@ impl Publisher {
                 status: None,
                 error: None,
                 ended: false,
+                refusal: None,
                 readers: Vec::new(),
             })),
             Arc::new(Notify::new()),
@@ -231,6 +250,14 @@ impl Publisher {
         let Ok(Capture(after, live)) = self.1.try_recv() else {
             return;
         };
+        capture_locked(&self.0 .1, Capture(after, live), snapshot, status);
+        self.0 .2.notify_waiters();
+    }
+    pub fn finish(
+        &mut self,
+        snapshot: impl FnOnce() -> Result<Cut, Failure>,
+        status: Option<Pending>,
+    ) {
         let mut book = self.0 .1.lock();
         match snapshot() {
             Ok(cut) => {
@@ -238,22 +265,10 @@ impl Publisher {
                     book.publish(cut, status, None);
                 }
             }
-            Err(error) => {
-                book.error = Some(error.code);
-            }
+            Err(error) => book.refusal = Some(error.code),
         }
-        if let Err(error) = book.register(after, live.clone()) {
-            live.lock().packets.push_back(Packet(
-                Arc::new(Cut {
-                    gap: None,
-                    records: vec![],
-                    through: book.retained.through,
-                }),
-                None,
-                Some(error),
-                true,
-            ));
-        }
+        book.ended = true;
+        drop(book);
         self.0 .2.notify_waiters();
     }
     pub fn publish(&mut self, update: &Update) {
@@ -263,6 +278,14 @@ impl Publisher {
                 update.pending.clone(),
                 update.offer.as_ref().err().map(|e| e.code),
             );
+        } else {
+            self.0 .1.lock().refusal = Some(
+                update
+                    .offer
+                    .as_ref()
+                    .err()
+                    .map_or(ErrorCode::InternalError, |e| e.code),
+            );
         }
         self.0 .2.notify_waiters();
     }
@@ -270,13 +293,44 @@ impl Publisher {
 impl Drop for Publisher {
     fn drop(&mut self) {
         let mut book = self.0 .1.lock();
+        if !book.ended {
+            book.refusal = Some(ErrorCode::InternalError);
+        }
         book.ended = true;
-        if std::thread::panicking() {
-            book.error = Some(ErrorCode::InternalError);
-        }
         while let Ok(Capture(after, live)) = self.1.try_recv() {
-            let _ = book.register(after, live);
+            if let Err(code) = book.register(after, live.clone()) {
+                live.lock().refusal = Some(code);
+            }
         }
+        drop(book);
         self.0 .2.notify_waiters();
     }
 }
+
+// The lock type is generic so the same critical section can be checked with
+// an unlock witness. Production uses parking_lot's native mutex unchanged.
+fn capture_locked<R: parking_lot::lock_api::RawMutex>(
+    owner: &parking_lot::lock_api::Mutex<R, Book>,
+    Capture(after, live): Capture,
+    snapshot: impl FnOnce() -> Result<Cut, Failure>,
+    status: Option<Pending>,
+) {
+    let mut book = owner.lock();
+    match snapshot() {
+        Ok(cut) => {
+            if cut.through != book.retained.through || cut.gap != book.retained.gap {
+                book.publish(cut, status, None);
+            }
+        }
+        Err(error) => {
+            live.lock().refusal = Some(error.code);
+        }
+    }
+    if let Err(error) = book.register(after, live.clone()) {
+        live.lock().refusal = Some(error);
+    }
+    drop(book);
+}
+
+#[cfg(test)]
+mod tests;
