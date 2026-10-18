@@ -102,6 +102,11 @@ filter = 'binary(=delegate_r4) & test(=a28_a_frozen_server_cannot_hold_start_in_
 retries = 0
 
 [[profile.default.overrides]]
+# #2000: admission and helper lock-lifetime regressions must fail on first run.
+filter = 'binary(=flk) & (test(structured::permissions::auth::tokens::) | test(platform::client_token_lock::))'
+retries = 0
+
+[[profile.default.overrides]]
 # The remaining integration binaries also spawn the real `flock` process; let
 # them run in parallel but retry to ride out timing hiccups under CI load.
 # #1371's rollback handshake and receiver checks need no retry.
