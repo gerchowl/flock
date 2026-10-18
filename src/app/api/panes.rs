@@ -1557,6 +1557,7 @@ mod tests {
     async fn codex_lock_raw_callers_share_one_pending_choice_until_unlocked() {
         let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
         let runtime = &app.state.workspaces[0].tabs[0].runtimes[&pane];
+        assert!(runtime.end_injection_lease("held"));
         runtime.test_process_pty_bytes(
             include_str!("../../../tests/fixtures/codex/conversation-locked.txt")
                 .replace('\n', "\r\n")
@@ -1576,8 +1577,6 @@ mod tests {
         let response: serde_json::Value =
             serde_json::from_str(&second.try_recv().unwrap()).unwrap();
         assert_eq!(response["error"]["code"], "injection_pending", "{response}");
-        let runtime = &app.state.workspaces[0].tabs[0].runtimes[&pane];
-        assert!(runtime.end_injection_lease("held"));
         app.input_writes.service();
         assert_eq!(bytes.try_recv().unwrap().as_ref(), b"r");
         assert!(bytes.try_recv().is_err());
