@@ -32,6 +32,7 @@ struct WriteState {
     payload: Bytes,
     progress: WriteProgress,
     deadline: Option<Instant>,
+    failed_at: Option<Instant>,
     notify: Option<Arc<tokio::sync::Notify>>,
 }
 
@@ -72,6 +73,7 @@ impl WriteState {
 
     fn fail(&mut self, reason: WriteFailure) {
         self.progress.failure.get_or_insert(reason);
+        self.failed_at.get_or_insert_with(Instant::now);
         self.payload = Bytes::new();
         self.progress.remainder_discarded = true;
         self.notify();
@@ -133,6 +135,7 @@ impl WriteReceipt {
                 payload: bytes,
                 progress,
                 deadline,
+                failed_at: None,
                 notify: None,
             }),
         });
@@ -153,6 +156,12 @@ impl WriteReceipt {
             state.fail(WriteFailure::Deadline);
         }
         state.progress
+    }
+
+    /// First terminal-write instant, including failed/partial writes.
+    pub(crate) fn finished_at(&self) -> Option<Instant> {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.progress.completed_at.or(state.failed_at)
     }
 
     /// Observe expiry under the writer gate even when a live producer is silent.
@@ -274,6 +283,22 @@ mod tests {
 
     fn tracked(deadline: Option<Instant>) -> (WriteCompletion, WriteReceipt) {
         WriteReceipt::channel(Bytes::from_static(b"paste"), deadline)
+    }
+
+    #[test]
+    fn failed_write_terminal_time_does_not_move_when_observed_or_cancelled() {
+        let (ticket, receipt) = WriteReceipt::channel(Bytes::from_static(b"rf"), None);
+        ticket.write(|_| Ok(1)).unwrap().unwrap();
+        let before = Instant::now();
+        ticket.retire(WriteFailure::WriterBroken);
+        let after = Instant::now();
+        let finished = receipt.finished_at().unwrap();
+        assert!(finished >= before && finished <= after);
+        assert_eq!(receipt.progress().bytes_written, 1);
+        assert_eq!(receipt.progress().completed_at, None);
+        receipt.cancel();
+        receipt.retire(WriteFailure::OwnerChanged);
+        assert_eq!(receipt.finished_at(), Some(finished));
     }
 
     #[test]

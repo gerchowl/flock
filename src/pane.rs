@@ -789,11 +789,8 @@ impl CodexLockWrite {
         if progress.failure.is_some() && progress.bytes_written == 0 {
             return false;
         }
-        let completed = match progress.completed_at {
-            Some(at) => at,
-            // Incomplete retirement has no successful final-write instant.
-            None if progress.failure.is_some() => self.write_deadline,
-            None => return true,
+        let Some(completed) = self.receipt.finished_at() else {
+            return true;
         };
         now < completed + std::time::Duration::from_millis(crate::api::schema::CODEX_LOCK_SETTLE_MS)
     }

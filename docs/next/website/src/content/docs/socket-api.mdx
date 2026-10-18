@@ -1025,8 +1025,8 @@ fence immediately, including a deferred failure. A still-locked screen admits
 another explicit choice after the window; no key is automatically re-sent.
 The 60-second settle window is also the CLI's maximum confirmation bound;
 `--ready-timeout` can shorten the CLI wait. Pending writes retain the existing
-1..=30000 ms write budget. If an incomplete failed write has no completion
-instant, its original write deadline bounds the start of the settle window.
+1..=30000 ms write budget. Failed or partial writes retain their first terminal-write timestamp, so
+later cancellation or observation cannot extend the settle window.
 Invalid budgets refuse before admission. This is an explicit keyboard
 operation, not an automatic reply or an MCP tool. Use `delegate send
 --resolve-lock` for a recorded choice and bounded screen confirmation. Older

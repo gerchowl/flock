@@ -188,9 +188,10 @@ server's owner turn and admits exactly one `r` or `f` with no Enter. A per-pane
 fence refuses another choice with `injection_pending` during the bounded write
 and a fixed 60-second settle window measured from its completed write. The
 actual receipt releases the fence immediately on zero-byte failure, including
-deferred failure; an observed unlock also releases it. A failed incomplete
-write without a completion instant uses its original write deadline to bound
-the settle window. Pending writes retain their existing bounded write budget.
+deferred failure; an observed unlock also releases it. Failed or partial
+writes retain their first terminal-write timestamp, so later cancellation or
+observation cannot extend the settle window. Pending writes retain their
+existing bounded write budget.
 The CLI uses the same 60-second maximum for confirmation, with smaller
 `--ready-timeout` values shortening its wait. After inspecting a still-locked
 pane, the operator can choose again after the settle window; flock never
