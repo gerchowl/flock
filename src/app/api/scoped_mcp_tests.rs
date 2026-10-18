@@ -213,7 +213,7 @@ impl Fixture {
 fn tool(id: &str, name: &str, args: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":args}})
 }
-async fn next_effect(app: &mut App) -> ApiRequestMessage {
+pub(super) async fn next_effect(app: &mut App) -> ApiRequestMessage {
     tokio::time::timeout(CEILING, async {
         loop {
             let msg = app

@@ -128,6 +128,8 @@ impl SpawnCaller {
 pub(super) struct SpawnLineage {
     pub parent_agent_id: String,
     pub child_depth: u32,
+    /// PTY-only facts; the owner adds lease and pending identities atomically.
+    pub pty_census: SpawnCensus,
 }
 
 impl App {
@@ -474,10 +476,11 @@ impl App {
             }
             SpawnCaller::Operator { .. } => return Ok(None),
         };
+        let pty_census = census;
         let (leased, children) = self
             .structured_workers
             .counts(&self.session_leases, agent_id)
-            .map_err(|_| SpawnRefusal::CallerUnknown)?;
+            .map_err(|_| SpawnRefusal::RegistryBusy)?;
         census.live_agent_started += leased;
         census.parent_live_children += children;
         if let Some((ws_idx, pane_id)) = inherits_depth_from {
@@ -494,6 +497,10 @@ impl App {
         Ok(Some(SpawnLineage {
             parent_agent_id: agent_id.clone(),
             child_depth: census.child_depth,
+            pty_census: SpawnCensus {
+                child_depth: census.child_depth,
+                ..pty_census
+            },
         }))
     }
 
@@ -632,7 +639,10 @@ pub(super) fn refusal_data(refusal: &SpawnRefusal) -> serde_json::Value {
                 map.insert("env_value".into(), value.clone().into());
             }
         }
-        SpawnRefusal::FleetPaused | SpawnRefusal::NotEnabled | SpawnRefusal::CallerUnknown => {}
+        SpawnRefusal::RegistryBusy
+        | SpawnRefusal::FleetPaused
+        | SpawnRefusal::NotEnabled
+        | SpawnRefusal::CallerUnknown => {}
     }
     data
 }

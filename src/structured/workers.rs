@@ -45,6 +45,8 @@ pub struct Launch {
     pub state: PathBuf,
     /// Pinned flock executable and owning server socket for this session.
     pub mcp: SessionMcp,
+    /// Loaded session storage policy, supplied by the authenticated launch caller.
+    pub storage: super::blobs::StorageConfig,
     /// Caller-supplied sessions stall policy, with no guessed default.
     pub stall_after: Duration,
     /// Optional authenticated delegation lineage.
@@ -159,6 +161,7 @@ impl Workers {
             leases,
             state,
             mcp,
+            storage,
             stall_after,
             lineage,
             admission,
@@ -253,6 +256,7 @@ impl Workers {
                     let profile = prepare().map_err(|error| (error.code(), error.to_string()))?;
                     let location = StreamLocation {
                         data_dir: state.clone(),
+                        storage,
                         agent: record.agent_id.clone(),
                         session: record.session_id.clone(),
                     };
@@ -376,6 +380,7 @@ impl Workers {
                         worker.report = Some(report);
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        self.pending.remove(id);
                         worker.stop();
                         worker.report = Some(Report {
                             result: Err((

@@ -166,14 +166,23 @@ impl SessionLeases {
 
     /// Nonblocking owner census facts; metadata never grants caller authority.
     pub(crate) fn admitted_identities(&self) -> Option<BTreeMap<String, Option<String>>> {
+        if let Some(entries) = self.1.try_lock() {
+            return Some(
+                entries
+                    .iter()
+                    .map(|e| (e.agent.clone(), e.parent.clone()))
+                    .collect(),
+            );
+        }
         let entries = self.0.try_lock()?;
         Some(
             entries
                 .values()
-                .map(|entry| (entry.agent.clone(), entry.parent.clone()))
+                .map(|e| (e.agent.clone(), e.parent.clone()))
                 .collect(),
         )
     }
+
     /// Conservative live reservation counts, including pending agent-started launches.
     pub fn counts(&self, parent: &str) -> io::Result<(usize, usize)> {
         let entries = self

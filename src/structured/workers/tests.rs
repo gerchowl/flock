@@ -72,6 +72,7 @@ impl Case {
             leases: leases.clone(),
             state: fixture.root.path().to_owned(),
             mcp: fixture.mcp(),
+            storage: Default::default(),
             stall_after: STALL,
             lineage: None,
             admission: None,
@@ -624,7 +625,11 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
     let (mut registry, mut workers, notify, now) = owner();
     let (a, launch, _) = Case::prepare(&mut registry, 10, "state-reducer", vec![]);
     let (tx, messages) = mpsc::sync_channel(2);
-    drop(tx);
+    let producer = std::thread::spawn(move || drop(tx));
+    producer.join().unwrap();
+    workers
+        .pending
+        .insert(a.id.clone(), Some("fixture-parent".into()));
     workers.entries.insert(
         a.id.clone(),
         Worker {
@@ -644,6 +649,11 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
         workers.report(&a.id, a.generation).is_some()
     })
     .await;
+    assert!(
+        !workers.pending.contains_key(&a.id),
+        "disconnected launch must free its pending slot"
+    );
+    assert_eq!(workers.counts(&a.leases, "fixture-parent"), Ok((0, 0)));
     assert!(workers.entries[&a.id].thread.is_none());
     let report = workers.report(&a.id, a.generation).unwrap();
     assert!(report.authority_retained);
@@ -1014,4 +1024,59 @@ async fn owner_lease_acquisition_retires_pending_without_double_counting() {
     );
     assert_eq!(count_before, Ok((1, 1)));
     assert_eq!(count_after, Ok((1, 1)));
+}
+
+#[tokio::test]
+async fn registry_worker_launch_uses_configured_blob_threshold() {
+    let (mut registry, mut workers, notify, now) = owner();
+    let config: crate::config::Config =
+        toml::from_str("[sessions]\nblob_min_bytes = 64\n").unwrap();
+    let block = json!({"type":"thinking", "thinking":"x".repeat(256)});
+    let bytes = serde_json::to_vec(&block).unwrap();
+    assert!(bytes.len() > config.sessions.blob_min_bytes);
+    assert!(bytes.len() < 2048);
+    let message = json!({"type":"assistant", "message":{"role":"assistant", "content":[block]}});
+    let (mut case, mut launch, factory) = Case::prepare(
+        &mut registry,
+        1919,
+        "worker-exit-ok",
+        vec![message, event("result")],
+    );
+    launch.storage = config.sessions;
+    case.generation = workers.start(&mut registry, launch, factory).unwrap();
+    case.ready(&mut registry, &mut workers, &notify, now).await;
+    case.submit(&workers);
+    wait(&notify, || {
+        workers.poll(&mut registry, now, 1000);
+        workers.report(&case.id, case.generation).is_some()
+    })
+    .await;
+    let report = workers.report(&case.id, case.generation).unwrap();
+    assert_eq!(report.result.as_ref().unwrap().outcome, Outcome::Exited);
+    assert!(!report.authority_retained);
+    assert!(workers.entries[&case.id].thread.is_none());
+    let stream = fs::read_to_string(
+        case.fixture
+            .root
+            .path()
+            .join("sessions")
+            .join(&case.id)
+            .join(format!("{}.jsonl", case.session)),
+    )
+    .unwrap();
+    let stored = stream
+        .lines()
+        .map(|line| {
+            let envelope: Value = serde_json::from_str(line).unwrap();
+            serde_json::from_str::<Value>(envelope["raw"].as_str().unwrap()).unwrap()
+        })
+        .find(|value| value["type"] == "assistant")
+        .expect("worker persisted assistant");
+    let reference: crate::structured::blobs::BlobRef =
+        serde_json::from_value(stored["message"]["content"][0].clone())
+            .expect("configured threshold must project this block");
+    let store = crate::structured::blobs::BlobStore::open(case.fixture.root.path()).unwrap();
+    assert_eq!(reference.size, bytes.len() as u64);
+    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), block);
 }

@@ -271,7 +271,14 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   requests by `request_id`, and the agent stays `waiting_on_human` until
   every one of them is answered. Working is `system/status: requesting` or
   an open `message_start`. A stall is an accepted or started input with no stdout event for
-  `[sessions] stall_ms` while no control request and no tool call is open;
+  `[sessions] stall_ms` while no control request and no tool call is open.
+  This optional setting defaults to **120000 ms** (2 minutes), with an inclusive
+  range of **5000..=3600000 ms**. Out-of-range values, including zero, are config
+  validation errors; there is no disabled value or silent clamping. A stall is
+  an observation that leaves the phase unchanged, so false positives are cheap.
+  Provider retries and rate-limit backoff can produce tens of seconds of silence;
+  two minutes avoids reporting those as stalls while exposing a hung harness.
+  The production worker caller passes the loaded value, without another default;
   a long-running tool is not a stall (its `tool_use` is open). A stall is
   reported as `agent.session_stalled{since}` and leaves the phase as it is
   (ADR-0028 §1 derivation is unchanged); it is an observation, not a timeout
@@ -2931,11 +2938,39 @@ The Workers owner is the single admission authority for structured launches.
 It checks limits and reserves a pending slot keyed by agent id in one owner
 operation before starting a producer. Counts combine live leases with pending
 slots, deduplicated by agent id. Agent-started launches count toward capacity
-and parent fanout; the attested operator exemption is unchanged. Lease-table
-contention refuses with `spawn_caller_unknown` without waiting on the App thread.
+and parent fanout; the attested operator exemption is unchanged. Admission reads the published lease copy nonblockingly, falling back to the live
+copy. If both copies are busy, `session_busy` is a typed retryable refusal.
+Neither path waits on the App thread or changes caller identity.
 
 A pending slot ends on lease acquisition or launch failure, never on elapsed
 time alone. Pending metadata grants neither caller identity nor signaling
 rights. Preparation remains off-thread and bounded by its owner. Part 2b adds
 the production CLI/socket caller and its loaded session policy; public client
 and server start remain gated until part 3 completes narrowed MCP admission.
+
+### Amendment: Shared structured CLI/socket launch (#1843 part 2b)
+
+The local `agent.start` contract adds the closed selector `runtime` (`pty` by
+absence, `structured` by explicit request) and the optional structured `model`.
+The CLI and socket share App admission and the Workers owner's atomic pending
+reservation. The listener supplies the immutable MCP endpoint. The caller
+cannot supply a binary, MCP endpoint, credential or harness flags: the only
+accepted structured argv is `claude`. `cwd` must resolve to an existing absolute
+directory. A resumed identity keeps its native session, cwd and model; launch
+overrides on resume are refused. Structured launches create no pane placement.
+Pane-only placement, focus, dry-run and readiness options are refused rather
+than ignored. Unknown restored ownership remains fenced before any start.
+
+Default `run_as = "agent"` refuses until the dedicated-user launcher exists.
+Operator execution requires the explicit `run_as = "operator"` opt-in and
+retains #1177's cooperative same-UID limitation. Preparation and bounded version
+verification run off the owner thread; startup/cleanup facts remain asynchronous
+worker observations. The first production Workers caller forwards the loaded
+`sessions` storage policy and `stall_ms` together, without substituting defaults.
+
+Both production start gates stay closed until part 3 supplies narrowed MCP
+admission and capability negotiation: a client must not send this selector to an
+older server that might silently ignore it and launch a PTY. Existing PTY
+`AgentInfo` fields and the `agents` list are unchanged. Structured read/control
+continues to use the additive `structured_agents` and `StructuredAgentInfo`
+contracts. Refusals use registered error codes and their retry/exit mappings.
