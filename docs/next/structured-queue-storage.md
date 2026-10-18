@@ -238,8 +238,9 @@ jittered retry policy (up to five minutes). Owner progress can wake a waiting
 admission sooner. Fleet pause suspends admission. Permanent refusals settle the
 existing `refused` or `recipient_gone` outcome and emit `message_delivered` with
 `delivered: false`; ordinary `msg.status` exposes the refusal and its detail.
-Refused duplicates retain the recorded refusal code (legacy rows without a
-reason use `msg_not_allowed`). Expired and refused duplicates return a terminal code instead of restarting
+Refused duplicates retain a registered terminal refusal code. Legacy rows
+without a terminal typed reason use `msg_not_allowed`; their original detail
+remains available through message status. Expired and refused duplicates return a terminal code instead of restarting
 admission. A changed native session returns `recipient_gone`.
 
 A local reply enters a structured queue only when its original sender comes
