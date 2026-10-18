@@ -145,9 +145,13 @@ impl BlobStore {
     /// Non-cooperating filesystem mutations are outside this advisory lock.
     /// Read/write/rename/sync failures remain explicit; reads report corruption.
     pub fn put(&self, reader: impl Read, max_bytes: u64) -> Result<BlobRef, BlobError> {
-        self.put_with_repair_lock(reader, max_bytes, &mut Instant::now, &mut || {
-            self.0.try_publication_lock()
-        })
+        self.put_with_repair_lock(
+            reader,
+            max_bytes,
+            &mut Instant::now,
+            &mut std::thread::sleep,
+            &mut || self.0.try_publication_lock(),
+        )
     }
     // Keep time and lock acquisition injectable for filesystem failure tests.
     fn put_with_repair_lock(
@@ -155,6 +159,7 @@ impl BlobStore {
         mut reader: impl Read,
         max_bytes: u64,
         now: &mut impl FnMut() -> Instant,
+        _sleep: &mut impl FnMut(Duration),
         lock: &mut impl FnMut() -> io::Result<File>,
     ) -> Result<BlobRef, BlobError> {
         let mut entropy = [0; 16];
@@ -197,7 +202,7 @@ impl BlobStore {
                 Err(BlobError::Corrupt) => {
                     #[cfg(test)]
                     tests::corrupt_observed();
-                    let _publication = match Self::repair_lock(now, lock) {
+                    let _publication = match Self::repair_lock(now, _sleep, lock) {
                         Ok(guard) => Some(guard),
                         Err(error) => {
                             crate::logging::structured_blob_repair_lock_unavailable(
@@ -234,6 +239,7 @@ impl BlobStore {
     /// Only contention retries; unsupported locking immediately falls back.
     fn repair_lock(
         now: &mut impl FnMut() -> Instant,
+        _sleep: &mut impl FnMut(Duration),
         lock: &mut impl FnMut() -> io::Result<File>,
     ) -> io::Result<File> {
         let started = now();

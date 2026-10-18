@@ -480,6 +480,7 @@ fn racing_corrupt_observers_emit_only_one_repair_event() {
                         &b"abc"[..],
                         3,
                         &mut std::time::Instant::now,
+                        &mut |_| {},
                         &mut || {
                             // Both writers observed corruption at the barrier. Order acquisition
                             // after publication so this assertion is independent of fsync speed
@@ -536,7 +537,7 @@ fn missing_put_never_attempts_the_repair_lock() {
     let (_root, store) = setup();
     let mut attempts = 0;
     let now = std::time::Instant::now();
-    let result = store.put_with_repair_lock(&b"abc"[..], 3, &mut || now, &mut || {
+    let result = store.put_with_repair_lock(&b"abc"[..], 3, &mut || now, &mut |_| {}, &mut || {
         attempts += 1;
         Err(io::ErrorKind::Unsupported.into())
     });
@@ -564,7 +565,7 @@ fn corrupt_repair_survives_lock_error_and_warns_without_content() {
     let now = std::time::Instant::now();
     let mut attempts = 0;
     let result = tracing::subscriber::with_default(subscriber, || {
-        store.put_with_repair_lock(&b"abc"[..], 3, &mut || now, &mut || {
+        store.put_with_repair_lock(&b"abc"[..], 3, &mut || now, &mut |_| {}, &mut || {
             attempts += 1;
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -629,6 +630,7 @@ fn repair_lock_retry_budget_uses_supplied_time_and_bounds_a_frozen_clock() {
                     }
                     now
                 },
+                &mut |_| {},
                 &mut || {
                     attempts += 1;
                     // Even a regressed loop fails explicitly instead of hanging the suite.
