@@ -69,6 +69,18 @@ struct ControlPlane {
     input: mpsc::SyncSender<Input>,
 }
 
+/// Typed refusal: lossy stdout has not established whether the turn ended.
+/// Only a real result or a new runtime permits further stdin; inspecting this
+/// error or the status flag never clears the S3a guard.
+#[derive(Debug)]
+pub struct TurnEndUnknown;
+impl std::fmt::Display for TurnEndUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("structured_turn_end_unknown")
+    }
+}
+impl std::error::Error for TurnEndUnknown {}
+
 /// Durable stream location. Components are validated before any worker starts.
 pub struct StreamLocation {
     /// Existing flock data root (not the harness profile).
@@ -481,6 +493,11 @@ impl InputHandle {
         self.busy.load(Ordering::Acquire)
     }
 
+    /// Read-only observation of the existing unconfirmed-boundary guard.
+    pub(super) fn turn_end_unknown(&self) -> bool {
+        self.uncertain.load(Ordering::Acquire)
+    }
+
     /// Offer one user envelope at idle. WouldBlock means busy; it never queues a
     /// mid-turn steering write. Input is capped before serialization allocation.
     /// Success records acceptance for S4's caller-supplied stall policy, even if
@@ -496,7 +513,7 @@ impl InputHandle {
             ));
         }
         if self.uncertain.load(Ordering::Acquire) {
-            return Err(io::Error::other("structured_turn_end_unknown"));
+            return Err(io::Error::other(TurnEndUnknown));
         }
         let permissions = self
             .permissions

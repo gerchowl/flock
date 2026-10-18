@@ -173,7 +173,41 @@ Remove a linked checkout:
 {"id":"req_3","method":"worktree.remove","params":{"workspace_id":"2","force":false}}
 ```
 
-`agent.send` accepts `{ "target": "worker", "text": "review the auth module", "submit": true }`. Without `submit`, `agent.send`, `pane.send_text` and `pane.send_input` (with `text`) refuse before typing into an agent pane whose composer holds a draft (`input_not_empty`) or that a flock injection holds (`injection_pending`); `"raw": true` types anyway (#1162). A shell pane is never refused. Omit `submit` (or set it to `false`) to paste text without submitting. Both `agent.send` and `pane.send_text` use bracketed paste when enabled and strip embedded paste delimiters; otherwise they send text bytes directly. Use `pane.send_keys` for control keys such as `Enter`, `C-c`, or `Esc`, because control bytes are pasted text when bracketed paste is enabled. With `submit: true`, the paste is followed by a 120 ms gap and a negotiated Enter key event. Submission retains its guarded write and harness-observation flow; a raw `write_timeout_ms` is rejected when `submit` is true. A closed or restarted execution is refused before Enter. This operator input method is intentionally absent from MCP; agents exchange messages through `flock_msg_send` instead. With `submit: true` and the [injection lock](./configuration.mdx#injection-lock) on, a one-row draft is moved aside and typed back. One flock could not put back is kept for `pane.stash_show` / `pane.stash_restore` (`{ "pane_id": "..." }`). Both answer `{ "type": "pane_stash", "pane_id", "drafts" }`: show lists the kept drafts, oldest first, and restore returns the one it typed.
+For a structured agent, `agent.send` resolves its stable identity or unique
+structured name without requiring a terminal. `submit: true` enters the same
+worker-owned queue used by the operator composer and authenticated S7-min send
+service (ADR-0036 §3/S5). Its response is
+`{ "type": "agent_queued", "item_id": "<uuid>" }` after durable admission;
+execution waits for S4 Idle and the preceding real turn result. This acknowledges
+custody, not harness delivery. Queue and global lifecycle facts report progress.
+
+Structured `submit: false` returns `structured_submit_required` (retry `never`)
+before queue or stdin work. `raw` and `write_timeout_ms` are terminal-only options.
+An optional canonical lower-case `item_id` UUID makes an identical committed
+retry idempotent; a different payload under that ID returns `queue_item_conflict`.
+One outstanding admission per item and at most 128 outstanding tickets/replies
+are accepted. Non-operator requests stop at 112 outstanding tickets/replies,
+reserving 16 slots for the operator; `session_busy` is retryable after capacity
+clears. If the worker
+exits or its generation changes before an acknowledgement is consumed,
+`input_write_unknown` requires inspecting the queue before retrying with the
+same lifecycle ID. The admission may already have committed when the worker
+exited; never retry under a fresh ID. There is no
+automatic retry or queue delivery timeout.
+
+Socket operator authority requires a kernel-attested PID and operator UID,
+with neither an agent pane/lease nor an inbound relay edge. Missing or unknown
+credentials and relays receive `not_authorized`; pane/lease-attested agents retain
+their agent identity. Shared-service operator tokens must be verified. Producer
+strings in command JSON never grant authority. A structured self-send is refused
+with `self_message_forbidden`; names or IDs shared with a terminal are refused
+with `agent_target_ambiguous`. Only operator-origin
+slash commands are isolated, verbatim harness turns. Agent-origin slash text is
+ordinary nonce-framed message content. Cold/offline agents require an explicit
+launch; admission does not launch a second writer. The external S7-min send
+adapter is tracked in #1831 and does not add another admission path.
+
+For terminal targets, `agent.send` accepts `{ "target": "worker", "text": "review the auth module", "submit": true }`. Without `submit`, `agent.send`, `pane.send_text` and `pane.send_input` (with `text`) refuse before typing into an agent pane whose composer holds a draft (`input_not_empty`) or that a flock injection holds (`injection_pending`); `"raw": true` types anyway (#1162). A shell pane is never refused. Omit `submit` (or set it to `false`) to paste text without submitting. Both `agent.send` and `pane.send_text` use bracketed paste when enabled and strip embedded paste delimiters; otherwise they send text bytes directly. Use `pane.send_keys` for control keys such as `Enter`, `C-c`, or `Esc`, because control bytes are pasted text when bracketed paste is enabled. With `submit: true`, the paste is followed by a 120 ms gap and a negotiated Enter key event. Submission retains its guarded write and harness-observation flow; a raw `write_timeout_ms` is rejected when `submit` is true. A closed or restarted execution is refused before Enter. This operator input method is intentionally absent from MCP; agents exchange messages through `flock_msg_send` instead. With `submit: true` and the [injection lock](./configuration.mdx#injection-lock) on, a one-row draft is moved aside and typed back. One flock could not put back is kept for `pane.stash_show` / `pane.stash_restore` (`{ "pane_id": "..." }`). Both answer `{ "type": "pane_stash", "pane_id", "drafts" }`: show lists the kept drafts, oldest first, and restore returns the one it typed.
 
 A guarded `agent.send` or `pane.submit` refusal with `unknown_composer` includes current pane diagnostics in `error.data` when the runtime is available: `columns` and `rows` are terminal dimensions, and `bottom_rows` contains up to eight lines of detection text. No input is sent on this refusal. The data is diagnostic context, not a causal sample receipt.
 
@@ -202,7 +236,47 @@ Events the 1.x server wrote in between are kept, ordered after the recovered one
 {"id":"req_4","method":"agent.fork","params":{"target":"1-1","branch":"fork/alt","pivot":"try plan B on <branch>"}}
 ```
 
-`msg.send` queues a message for another pane's agent. Delivery is a pull: Flock never types into a session, and the recipient reads its own inbox with `msg.read`. What Flock pushes is the *wake* — at the recipient's next turn boundary its agent integration is told how many messages are waiting and which tool reads them, never what they say. `msg.wake` is the method that decides whether that wake may fire at all; it answers with a count and returns zero while the fleet is paused or the recipient has muted itself with `msg.mute`, in which case the messages stay queued and `msg.list`/`msg.read` are unaffected. A mute is not silent (ADR-0018): every `needs_reply` message that is waiting when `msg.mute` is called, or arrives while it holds, gets exactly one automatic reply to its sender — `in_reply_to` the message, intent `fyi` so it never asks for an answer back, and a body stating the deferral, the optional `reason` the mute was given (sanitised, cut to `[msg] mute_reason_max_chars`, default 200) and the UTC time the mute lifts. It travels the ordinary reply path, so a sender on another host hears it the same way. Renewing or extending a mute does not repeat it, nor does a restart; `fyi` messages get none, and `seconds: 0` (clear) sends nothing. `msg.mute` answers with `muted_until_ms` and `deferred`, the number of already-waiting senders it just answered — accepted durably, not delivered: a direct-edge deferral counts once it is held in the custody store for collection — and each deferral is recorded as a durable `message_deferred` event. A recipient that is already idle — and so has no turn boundary coming — is reached differently: for a message that is not `fyi`, flock types a fixed sentence naming the count and the tool into an idle Claude pane, under the gates described in [Waking idle agents](./configuration.mdx#waking-idle-agents). The destination is structured: `{"type":"pane","pane":"..."}` or `{"type":"repo_pane","repo":"...","pane":"..."}`. Messages carry a client-suppliable `correlation_id` (a client label, not the deduplication identity), a sender stamp inferred from the caller's process ancestry (routing and audit metadata only — never authorization), and survive server restarts via the custody store. They also carry an `intent`, stamped by the sender and delivered on the envelope so a recipient knows what is wanted before it reads the body. It defaults to `fyi` on the wire and is required on the `flock_msg_send` MCP tool. The wake reads it (ADR-0018): `msg.wake` reports zero, with `suppressed: "fyi_only"`, for an inbox holding only `fyi` messages, and once any `needs_reply` or `blocking` message is waiting it reports every queued message, notices included, so the read it prompts clears them. A reply whose `in_reply_to` names a `needs_reply` or `blocking` message wakes its recipient whatever its own stamp, except a mute's automatic deferral. A claimed `from_agent` must be shaped like an agent id, or the send is refused with `invalid_request`. A socket sender cannot assert a remote host. A nudge still names a count and a tool and nothing else. `blocking` additionally surfaces the recipient in the attention cycle under a mail label of its own (never the `blocked` state), files an operator notification when the recipient is muted, and is budgeted per sender by `[msg] blocking_per_hour` — past it the message is still queued, as `needs_reply`, and the result's `warnings` carry `blocking_budget_spent_sent_as_needs_reply` (or `blocking_disabled_sent_as_needs_reply` when the budget is 0). The budget is keyed on an agent the receiving server attested; every unattested sender, relayed ones included, shares one bucket. `msg.reply` routes an answer back to the original sender's pane by correlation id; `msg.list` shows undelivered messages. A message whose sender has no inbox at all (sent from an ssh shell or a script, outside any pane) can still be answered: the reply is **held** under the original's correlation id, recorded in the custody store, and `msg.reply` answers `state: "held"` with the warning `reply_held_for_waiter`. A muted recipient answers such a sender the same way, with a held deferral. `msg.status` carries the answer as `reply` (`correlation_id`, `kind` `reply`/`deferral`, `body`, sender stamp, `held`) once there is one, whether it was delivered to an inbox or held; `state` keeps describing the message's own delivery. `msg.wait_reply` waits for that answer, see [Waiting for state](#waiting-for-state). Rate limit: 20 messages/minute per sender pane; mailbox depth 32; undelivered messages expire after 24 hours. Errors include `msg_target_not_found`, `msg_target_ambiguous`, `self_message_forbidden`, `msg_rate_limited`, `mailbox_full`, and `message_not_found`. Mesh sends remain `queued` when transport is unavailable; replies can remain `held`. Permanent refusals report `refused` with a reason, and incompatible edges expose `peer_incompatible`.
+For a local structured recipient, `msg.send` with
+`{"to":{"type":"agent","agent":"<agent-id>"}}` and a local `msg.reply`
+use the same durable owner as structured `agent.send`. Success adds `item_id`,
+the queue lifecycle UUID, alongside the custody `message_key` and correlation.
+It acknowledges journal commit, not a harness turn or a read. Authenticated
+agents receive their attested producer attribution; a local operator is human.
+A claimed `from_agent` cannot change that attribution. Slash text remains a
+nonce-framed Message, including operator messages. Structured recipients never
+receive a legacy inbox nudge for the same message.
+
+Admission reuses the server's initialized node signing identity. It refuses
+`identity_unknown` rather than creating a key. Local custody and queue admission
+are separate durable commits: recovery verifies the existing Envelope signature
+and native session binding, then retries the same MessageKey-derived lifecycle
+UUID through the owner. An unproven recovered origin is refused and retained in
+custody. A cold owner reports retryable `queue_source_cold`; retained recovery
+waits for an owner or capacity notification. If an acknowledgement is lost,
+inspect the message key and lifecycle before sending a new request: a correlation
+label alone is not an idempotency key.
+
+A known admission refusal, including `session_busy`, settles the own-node
+custody record to the existing terminal `refused` state before returning the
+error. Recovery cannot later enqueue that refused message. This applies to
+immediate admission errors and deferred owner completions. Recovery rechecks
+the current custody state before offering even a previously captured inbox
+snapshot. A failed replay cannot revoke an earlier successful admission.
+An uncertain effect is different: `input_write_unknown` preserves custody and
+returns
+`error.data.message_key` plus `error.data.item_id` for inspection. Do not issue
+a fresh send until that outcome is resolved. A failure to settle a refusal
+also returns this unknown outcome with both keys, rather than promising that
+nothing can be delivered. Actual reads and remote-origin inbox deliveries
+cannot be changed to this local admission refusal.
+
+Unknown native recipients remain in custody with a typed refusal diagnostic;
+missing registry entries or forged pane metadata never fall back to a legacy
+inbox projection. Known terminal recipients retain their normal routing.
+Authenticated relay producers follow in
+[#1958](https://github.com/gerchowl/flock/issues/1958).
+
+For terminal recipients, `msg.send` queues a message for another pane's agent. Delivery is a pull: Flock never types into a session, and the recipient reads its own inbox with `msg.read`. What Flock pushes is the *wake* — at the recipient's next turn boundary its agent integration is told how many messages are waiting and which tool reads them, never what they say. `msg.wake` is the method that decides whether that wake may fire at all; it answers with a count and returns zero while the fleet is paused or the recipient has muted itself with `msg.mute`, in which case the messages stay queued and `msg.list`/`msg.read` are unaffected. A mute is not silent (ADR-0018): every `needs_reply` message that is waiting when `msg.mute` is called, or arrives while it holds, gets exactly one automatic reply to its sender — `in_reply_to` the message, intent `fyi` so it never asks for an answer back, and a body stating the deferral, the optional `reason` the mute was given (sanitised, cut to `[msg] mute_reason_max_chars`, default 200) and the UTC time the mute lifts. It travels the ordinary reply path, so a sender on another host hears it the same way. Renewing or extending a mute does not repeat it, nor does a restart; `fyi` messages get none, and `seconds: 0` (clear) sends nothing. `msg.mute` answers with `muted_until_ms` and `deferred`, the number of already-waiting senders it just answered — accepted durably, not delivered: a direct-edge deferral counts once it is held in the custody store for collection — and each deferral is recorded as a durable `message_deferred` event. A recipient that is already idle — and so has no turn boundary coming — is reached differently: for a message that is not `fyi`, flock types a fixed sentence naming the count and the tool into an idle Claude pane, under the gates described in [Waking idle agents](./configuration.mdx#waking-idle-agents). The destination is structured: `{"type":"pane","pane":"..."}` or `{"type":"repo_pane","repo":"...","pane":"..."}`. Messages carry a client-suppliable `correlation_id` (a client label, not the deduplication identity), a sender stamp inferred from the caller's process ancestry (routing and audit metadata only — never authorization), and survive server restarts via the custody store. They also carry an `intent`, stamped by the sender and delivered on the envelope so a recipient knows what is wanted before it reads the body. It defaults to `fyi` on the wire and is required on the `flock_msg_send` MCP tool. The wake reads it (ADR-0018): `msg.wake` reports zero, with `suppressed: "fyi_only"`, for an inbox holding only `fyi` messages, and once any `needs_reply` or `blocking` message is waiting it reports every queued message, notices included, so the read it prompts clears them. A reply whose `in_reply_to` names a `needs_reply` or `blocking` message wakes its recipient whatever its own stamp, except a mute's automatic deferral. A claimed `from_agent` must be shaped like an agent id, or the send is refused with `invalid_request`. A socket sender cannot assert a remote host. A nudge still names a count and a tool and nothing else. `blocking` additionally surfaces the recipient in the attention cycle under a mail label of its own (never the `blocked` state), files an operator notification when the recipient is muted, and is budgeted per sender by `[msg] blocking_per_hour` — past it the message is still queued, as `needs_reply`, and the result's `warnings` carry `blocking_budget_spent_sent_as_needs_reply` (or `blocking_disabled_sent_as_needs_reply` when the budget is 0). The budget is keyed on an agent the receiving server attested; every unattested sender, relayed ones included, shares one bucket. `msg.reply` routes an answer back to the original sender's pane by correlation id; `msg.list` shows undelivered messages. A message whose sender has no inbox at all (sent from an ssh shell or a script, outside any pane) can still be answered: the reply is **held** under the original's correlation id, recorded in the custody store, and `msg.reply` answers `state: "held"` with the warning `reply_held_for_waiter`. A muted recipient answers such a sender the same way, with a held deferral. `msg.status` carries the answer as `reply` (`correlation_id`, `kind` `reply`/`deferral`, `body`, sender stamp, `held`) once there is one, whether it was delivered to an inbox or held; `state` keeps describing the message's own delivery. `msg.wait_reply` waits for that answer, see [Waiting for state](#waiting-for-state). Rate limit: 20 messages/minute per sender pane; mailbox depth 32; undelivered messages expire after 24 hours. Errors include `msg_target_not_found`, `msg_target_ambiguous`, `self_message_forbidden`, `msg_rate_limited`, `mailbox_full`, and `message_not_found`. Mesh sends remain `queued` when transport is unavailable; replies can remain `held`. Permanent refusals report `refused` with a reason, and incompatible edges expose `peer_incompatible`.
 
 Message acceptance commits to the mesh custody store before returning a `message_key` containing `origin_node` and a server-minted ULID `message_id`. Correlation IDs remain caller-selected conversation labels: two accepted sends with the same correlation ID have distinct message keys.
 
@@ -1004,3 +1078,19 @@ Remove these settings and callers:
 - The `forward_limit` and `peer_not_configured` routing refusals: known owners route through the mesh or queue while offline; unknown owners without a stored hint are refused as unknown.
 
 Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown keys with file and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
+
+
+### Queue item lifecycle facts
+
+`queue_item_state` is a durable, local event emitted after an existing queue
+item changes state. It carries `agent`, `item_id`, optional `batch_id`, the typed
+`producer`, `from`, `to`, `stream` (`queue/<agent>`) and `stream_seq`. The last
+field identifies the original committed queue transition; the event log's `seq`
+is a separate cursor and orders facts across agents.
+
+Known states are `queued`, `held`, `stashed`, `delivered`, `done`, `cancelled` and
+`dropped`. A reader skips a fact with an unknown state, just as an older reader
+skips an unknown event kind, while preserving the global cursor high-water.
+Adding, editing, reordering or checkpointing items does not emit lifecycle
+facts. Recovery from `delivered` to `held` does. These facts use the existing
+event-log retention and rotation and are not relayed over the mesh.

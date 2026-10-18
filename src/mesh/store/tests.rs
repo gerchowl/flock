@@ -5138,3 +5138,53 @@ fn route_generation_clears_a_withdrawn_recipient_while_its_hub_stays_adjacent() 
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn inbox_admission_refusal_is_terminal_but_read_cannot_be_refused() {
+    for read in [false, true] {
+        let fixture = Fixture::new();
+        let mut store = fixture.open(0);
+        let mail = envelope();
+        store.set_local_node(&mail.key.origin_node);
+        store
+            .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 0)
+            .unwrap();
+        if read {
+            store.finish(&mail.key, Outcome::Read, 1).unwrap();
+            assert!(matches!(
+                store.refuse(&mail.key, "session_busy", 2),
+                Err(Error::InvalidState)
+            ));
+        } else {
+            store.refuse(&mail.key, "session_busy", 1).unwrap();
+            store
+                .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 2)
+                .unwrap();
+            assert!(store.mailbox_keys().unwrap().is_empty());
+            drop(store);
+            let store = fixture.open(3);
+            let status = store
+                .status(&mail.key.origin_node, &mail.correlation_id, 3)
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.state, "refused");
+            assert_eq!(status.detail.as_deref(), Some("session_busy"));
+        }
+    }
+}
+
+#[test]
+fn remote_origin_inbox_cannot_be_changed_to_refused() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store.set_local_node("other.example");
+    store
+        .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    assert!(matches!(
+        store.refuse(&mail.key, "session_busy", 1),
+        Err(Error::InvalidState)
+    ));
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "inbox");
+}
