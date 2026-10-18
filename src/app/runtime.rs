@@ -2297,6 +2297,10 @@ mod tests {
                 cache_updates: output.cache_updates,
             });
             assert_eq!(app.state.workspaces[0].git_status_stale, fails);
+            assert_eq!(
+                app.state.workspaces[0].cached_git_branch.as_deref(),
+                Some(if fails { "last-known" } else { "updated" })
+            );
             let skipped = &app.state.workspaces[1];
             assert!(!skipped.git_status_stale);
             assert_eq!(skipped.cached_git_branch.as_deref(), Some("last-known"));

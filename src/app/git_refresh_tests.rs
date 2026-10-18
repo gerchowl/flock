@@ -24,10 +24,16 @@ fn summary(app: &mut App) -> serde_json::Value {
         .clone()
 }
 
-fn empty_output() -> WorkspaceGitRefreshOutput {
+fn successful_output(workspace: &Workspace) -> WorkspaceGitRefreshOutput {
     WorkspaceGitRefreshOutput {
         error: None,
-        results: vec![],
+        results: vec![WorkspaceGitStatus {
+            workspace_id: workspace.id.clone(),
+            resolved_identity_cwd: workspace.identity_cwd.clone(),
+            branch: Some("refreshed-fixture".into()),
+            ahead_behind: None,
+            space: None,
+        }],
         failures: vec![],
         cache_updates: vec![],
     }
@@ -113,6 +119,8 @@ impl Drop for Release {
 #[tokio::test]
 async fn git_refresh_watchdog_counts_once_retains_ownership_and_recovers() {
     let mut app = app();
+    app.state.workspaces[0].tabs.clear();
+    let output = successful_output(&app.state.workspaces[0]);
     let start = Instant::now();
     let (release_tx, release_rx) = mpsc::channel();
     let release = Release(Some(release_tx));
@@ -123,7 +131,7 @@ async fn git_refresh_watchdog_counts_once_retains_ownership_and_recovers() {
             release_rx
                 .recv_timeout(Duration::from_secs(30))
                 .expect("fixture was never released");
-            empty_output()
+            output
         },
         tracked_spawn(tx),
     );
@@ -147,6 +155,10 @@ async fn git_refresh_watchdog_counts_once_retains_ownership_and_recovers() {
     assert!(!app.git_refresh_in_flight);
     assert_eq!(app.git_refresh_health.consecutive_failures, 0);
     assert_eq!(summary(&mut app)["status"], "ok");
+    assert_eq!(
+        app.state.workspaces[0].cached_git_branch.as_deref(),
+        Some("refreshed-fixture")
+    );
 }
 
 /// Each nextest test has its own process. Keep PATH scoped until its worker has
