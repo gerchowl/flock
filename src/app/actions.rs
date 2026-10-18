@@ -3331,6 +3331,7 @@ impl AppState {
 
         // Copy the token and keep its selection visible as short-lived feedback.
         let mut selection = Selection::range(pane_id, viewport_row, start_col, end_col, metrics);
+        rt.pin_selection(&mut selection, None);
         if !selection.finish() {
             return false;
         }
@@ -3439,6 +3440,15 @@ impl AppState {
                 self.request_clipboard_write = Some(text.into_bytes());
                 info!("copied selection to clipboard");
             }
+        } else if sel.content_revision.is_some() {
+            crate::logging::selection_content_unavailable();
+            self.toast = Some(ToastNotification {
+                kind: ToastKind::NeedsAttention,
+                title: "Cannot copy selection".into(),
+                context: "Selected content was evicted or is unavailable".into(),
+                position: None,
+                target: None,
+            });
         }
 
         self.clear_selection();

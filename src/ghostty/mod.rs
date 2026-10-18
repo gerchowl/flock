@@ -24,9 +24,17 @@ use std::slice;
 use std::sync::{Once, OnceLock};
 
 pub use bindings as ffi;
+mod tracked_selection;
+pub(crate) use tracked_selection::TrackedSelection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error(ffi::GhosttyResult);
+impl Error {
+    /// No surviving content exists for the requested selection anchor.
+    pub(crate) fn selection_unavailable() -> Self {
+        Self(ffi::GhosttyResult_GHOSTTY_NO_VALUE)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormatterFormat {
