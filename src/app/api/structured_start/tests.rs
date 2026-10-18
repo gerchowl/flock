@@ -582,7 +582,30 @@ async fn startup_with_relative_socket_keeps_legacy_routes_available() {
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = AdmissionFixture::with_endpoint("s4-accepted-silent", 5000, true, false);
     assert!(!fixture.socket.is_absolute());
-    assert!(fixture.app.runtime_config.structured_mcp.is_some());
+    let (agent, generation) = fixture.start().await;
+    fixture.submit(&agent, generation);
+    let observed = fixture.fixture.root.path().join("observed-mcp.json");
+    let notify = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        observed.is_file()
+    })
+    .await;
+    let registered: Value = serde_json::from_slice(&fs::read(observed).unwrap()).unwrap();
+    let registered_socket = PathBuf::from(
+        registered["mcpServers"]["flock"]["env"]["FLOCK_SOCKET_PATH"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(registered_socket.is_absolute());
+    assert_eq!(
+        registered_socket.canonicalize().unwrap(),
+        fixture.socket.canonicalize().unwrap()
+    );
     let response = fixture
         .request(Method::AgentList(crate::api::schema::EmptyParams {}))
         .await;
