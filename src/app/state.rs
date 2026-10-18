@@ -671,8 +671,8 @@ pub enum PeerSwitchRequest {
         entry_idx: usize,
         ws_idx: Option<usize>,
     },
-    /// A relayed-cache row (#101 gossip v3 part 4): keyed by lowercased host
-    /// into `state.relayed_fleet_cache`. Resolves the target and any stamped
+    /// A relayed-cache row: an opaque key into `state.relayed_fleet_cache`.
+    /// Resolves the target and any stamped
     /// ProxyJump identity from the cached entry.
     RelayedPeer {
         host_key: String,
@@ -2327,10 +2327,16 @@ pub struct AppState {
     pub peers: Vec<crate::config::PeerConfig>,
     /// Latest polled summary per configured peer (sidebar remote rows).
     pub peer_summaries: Vec<crate::peers::PeerSummaryState>,
+    /// Local pin/enrollment names, never inferred from advertised hostnames.
+    pub server_nodes: std::collections::BTreeMap<String, String>,
+    /// Actual held or learned mesh path: destination node to next-hop node.
+    pub server_paths: std::collections::BTreeMap<String, String>,
+    /// Attached server identity, used to omit its remote copies.
+    pub server_node: Option<String>,
     /// Gossip v3 relay cache (#101): fleet entries this server received via
-    /// its config peers' `relayed_fleet`. Keyed on lowercased reported host
-    /// (fallback: ssh_target), so a host advertised by two hubs collapses to
-    /// one row with the freshest wins. Never re-relayed — the answering
+    /// its config peers' `relayed_fleet`. Known nodes use NUL-prefixed `node:<id>` keys.
+    /// Legacy observations retain their source host key. Known IDs never
+    /// collapse merely because their hostnames match. Never re-relayed — the answering
     /// server's own `peers.summary` only relays its OWN polled peers,
     /// bounding hop count to one.
     pub relayed_fleet_cache: std::collections::HashMap<String, crate::peers::RelayedEntry>,
@@ -2788,60 +2794,105 @@ impl AppState {
     // Rank tiers for `remote_row_candidates` — LOWER wins. Kept as
     // module-private constants so the reader sees the ordering in one place.
 
-    /// Federated peers feeding BOTH the servers band and the spaces list's
-    /// remote rows — ONE consolidated dedup (#101 gossip v3 part 4). Key:
-    /// lowercased reported host (fallback: ssh_target). Tie-break tier:
-    /// locally-polled ConfigPeer (top) → relayed cache (freshest wins by
-    /// `origin_last_ok_secs`) → carried snapshot entry → origin summary. On
-    /// same-source ties the entry with the smaller `origin_last_ok_secs`
-    /// wins (fresher). Rendering surfaces read from the same source of
-    /// truth, so a two-hub fleet cannot produce duplicate rows or divergent
-    /// state across surfaces.
+    /// Consolidate authenticated node IDs across sources. Legacy rows remain
+    /// separate; matching display names never establish identity. Prefer a live
+    /// reading over a failed one, then first-hand data and origin freshness.
     pub(crate) fn remote_peers(&self) -> Vec<(RemotePeerRef, &crate::peers::PeerSummaryState)> {
-        // Single pass, insertion-order preserved: for each candidate in the
-        // enumeration order, record either the first sighting of its host
-        // key or REPLACE the previous winner in place when the new one has a
-        // strictly higher tier / freshness. This keeps the layout stable
-        // across renders — no hashmap-hop or `.sort()` shuffle.
-        let mut ordered: Vec<(
-            RemotePeerRef,
-            &crate::peers::PeerSummaryState,
-            u8,
-            Option<u64>,
-        )> = Vec::new();
-        let mut host_to_idx: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-
+        let mut ordered: Vec<(RemotePeerRef, &crate::peers::PeerSummaryState, u8)> = Vec::new();
+        let mut nodes: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (rank, entry_ref, peer) in self.remote_row_candidates() {
-            let host_key = row_host_key(peer);
-            let freshness = row_freshness(peer);
-            if let Some(&idx) = host_to_idx.get(&host_key) {
-                let (_, _, cur_rank, cur_fresh) = ordered[idx];
-                // Lower rank number = higher tier (0 = ConfigPeer wins).
-                let replace = if rank != cur_rank {
-                    rank < cur_rank
-                } else {
-                    // Same source tier: freshest (smaller frozen origin
-                    // seconds) wins; a Some value beats None.
-                    match (cur_fresh, freshness) {
-                        (Some(cur), Some(new)) => new < cur,
-                        (None, Some(_)) => true,
-                        _ => false,
-                    }
-                };
-                if replace {
-                    ordered[idx] = (entry_ref, peer, rank, freshness);
+            let node = self.server_peer_node(peer);
+            if node.is_some() && node == self.server_node.as_deref() {
+                continue;
+            }
+            let key = (
+                peer.reachability_with(
+                    self.config.gossip.stale_after().as_secs(),
+                    self.config.gossip.slow_threshold_ms(),
+                ) == crate::peers::PeerReachability::Down,
+                row_freshness(peer).is_none(),
+                rank,
+                row_freshness(peer),
+            );
+            if let Some(&idx) = node.and_then(|id| nodes.get(id)) {
+                let (_, current, current_rank) = &ordered[idx];
+                let old = (
+                    current.reachability_with(
+                        self.config.gossip.stale_after().as_secs(),
+                        self.config.gossip.slow_threshold_ms(),
+                    ) == crate::peers::PeerReachability::Down,
+                    row_freshness(current).is_none(),
+                    *current_rank,
+                    row_freshness(current),
+                );
+                if key < old {
+                    ordered[idx] = (entry_ref, peer, rank);
                 }
             } else {
-                host_to_idx.insert(host_key, ordered.len());
-                ordered.push((entry_ref, peer, rank, freshness));
+                if let Some(node) = node {
+                    nodes.insert(node, ordered.len());
+                }
+                ordered.push((entry_ref, peer, rank));
             }
         }
-
         ordered
             .into_iter()
-            .map(|(entry_ref, peer, _, _)| (entry_ref, peer))
+            .map(|(entry, peer, _)| (entry, peer))
             .collect()
+    }
+
+    /// A reported node wins over a name mapping, so conflicting known IDs stay
+    /// separate. Only configured rows may acquire identity through a local pin.
+    pub(crate) fn server_peer_node<'a>(
+        &'a self,
+        peer: &'a crate::peers::PeerSummaryState,
+    ) -> Option<&'a str> {
+        peer.node_id.as_deref().or_else(|| {
+            self.peer_summaries
+                .iter()
+                .any(|p| std::ptr::eq(p, peer))
+                .then(|| self.server_nodes.get(&peer.peer).map(String::as_str))
+                .flatten()
+        })
+    }
+
+    /// Configured aliases precede inbound pin names for the same node.
+    pub(crate) fn server_node_name(&self, node: &str) -> Option<&str> {
+        self.peers
+            .iter()
+            .find(|peer| {
+                self.server_nodes
+                    .get(&peer.name)
+                    .is_some_and(|id| id == node)
+            })
+            .map(|peer| peer.name.as_str())
+            .or_else(|| {
+                self.server_nodes
+                    .iter()
+                    .find(|(_, id)| id.as_str() == node)
+                    .map(|(name, _)| name.as_str())
+            })
+    }
+
+    /// Prefer the locally bound name; advertised names are presentation only.
+    pub(crate) fn server_peer_name(&self, peer: &crate::peers::PeerSummaryState) -> String {
+        if let Some(node) = self.server_peer_node(peer) {
+            if let Some(name) = self.server_node_name(node) {
+                return name.to_string();
+            }
+            if peer.display_name().is_empty() {
+                return node
+                    .chars()
+                    .take(8)
+                    .flat_map(char::escape_default)
+                    .collect();
+            }
+        }
+        if peer.display_name().is_empty() {
+            "legacy/unverified".to_string()
+        } else {
+            peer.display_name().to_string()
+        }
     }
 
     /// Drop relay-cache rows that have aged out of usefulness (#101).
@@ -2908,15 +2959,18 @@ impl AppState {
         // snapshot is carried. The origin slot stands for that machine and
         // absorbs such readings as they arrive, so this only skips one stored
         // before the client attached, which would render home twice.
-        let origin_key = self
+        let home_node = self
             .fleet_snapshot
             .as_ref()
-            .map(|snapshot| snapshot.origin.to_ascii_lowercase());
+            .and_then(|snapshot| snapshot.origin_summary.as_ref())
+            .and_then(|peer| peer.node_id.as_ref());
         let mut relayed: Vec<_> = self
             .relayed_fleet_cache
             .iter()
-            .filter(|(host_key, entry)| {
-                !(entry.hub_pushed && origin_key.as_deref() == Some(host_key.as_str()))
+            .filter(|(_, entry)| {
+                !(entry.hub_pushed
+                    && home_node.is_some()
+                    && entry.peer.node_id.as_ref() == home_node)
             })
             .collect();
         relayed.sort_by_key(|(host_key, _)| *host_key);
@@ -3007,9 +3061,8 @@ const REMOTE_ROW_RANK_RELAYED: u8 = 1;
 const REMOTE_ROW_RANK_SNAPSHOT: u8 = 2;
 const REMOTE_ROW_RANK_ORIGIN: u8 = 3;
 
-/// Machine-independent host key: the peer's reported host (fallback: config
-/// name or ssh_target), lowercased. Used across surfaces so a host cannot
-/// dedupe under different keys on the band vs. the spaces list.
+/// Exact legacy carried-route lookup key, preserving complete host spelling.
+/// Never used to consolidate records or infer a known node ID.
 pub(crate) fn row_host_key(peer: &crate::peers::PeerSummaryState) -> String {
     let fallback = if peer.peer.is_empty() {
         peer.ssh_target.as_str()
@@ -3557,6 +3610,9 @@ impl AppState {
             branch_pivot_message: String::new(),
             peers: Vec::new(),
             peer_summaries: Vec::new(),
+            server_nodes: Default::default(),
+            server_paths: Default::default(),
+            server_node: None,
             relayed_fleet_cache: std::collections::HashMap::new(),
             switch_failures: std::collections::HashMap::new(),
             fleet_snapshot: None,
@@ -3880,6 +3936,13 @@ mod tests {
         });
         local.host = Some("spoke2.invalid".into());
         local.last_ok = Some(std::time::Instant::now());
+        local.node_id = Some("fixture-node".into());
+        state
+            .relayed_fleet_cache
+            .get_mut("spoke2.invalid")
+            .unwrap()
+            .peer
+            .node_id = Some("fixture-node".into());
         state.peer_summaries = vec![local];
 
         let rows = state.remote_peers();

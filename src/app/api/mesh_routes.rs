@@ -116,6 +116,30 @@ impl App {
         self.mesh_routes
             .table
             .set_live_edges(live.keys().cloned().collect());
+        self.state.server_node = self.node_id.clone();
+        self.state.server_paths = self.custody_routes();
+        let mut names: BTreeMap<String, String> = live
+            .iter()
+            .map(|(node, name)| (name.clone(), node.clone()))
+            .collect();
+        for peer in &self.state.peers {
+            let status = crate::peer_stream::enrollment(peer);
+            let pinned = crate::mesh::runtime_store::read(|store| {
+                store.get_pin(&peer.name).map_err(|e| e.to_string())
+            });
+            match pinned {
+                Ok(pin) => {
+                    if let Some(node) = pin.flatten().map(|pin| pin.node_id).or(status.node_id) {
+                        names.insert(peer.name.clone(), node);
+                    }
+                }
+                Err(_) => tracing::warn!(
+                    code = "server_pin_unavailable",
+                    "server identity unavailable"
+                ),
+            }
+        }
+        self.state.server_nodes = names;
         if self.mesh_routes.table.own().is_some() && live == self.mesh_routes.live {
             return;
         }
@@ -159,6 +183,7 @@ impl App {
             self.mesh_routes.live = live;
             Ok::<_, String>(())
         })();
+        self.state.server_paths = self.custody_routes();
         if let Err(reason) = result {
             crate::logging::mesh_routing_failed("build_advert", "", &reason);
         }
@@ -217,6 +242,7 @@ impl App {
         self.mesh_routes
             .table
             .learn(&supplier, crate::mesh::routes::decode_adverts(adverts));
+        self.state.server_paths = self.custody_routes();
         encode_success(
             id,
             ResponseResult::MeshRoutes {
@@ -359,6 +385,7 @@ impl App {
                     &completion.node,
                     adverts.into_iter().take(crate::mesh::routes::MAX_RECORDS),
                 );
+                self.state.server_paths = self.custody_routes();
             }
             Err(reason) => {
                 self.mesh_routes.sent.remove(&completion.peer.name);

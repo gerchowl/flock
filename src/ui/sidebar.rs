@@ -1347,10 +1347,18 @@ fn server_band_slots_as(
     slots.push((crate::peers::normalized_host_key(self_host), None));
 
     // Gossip v3 (#101 part 4): the band and the spaces list share ONE deduped
-    // remote-row list. Same key (lowercased reported host), same tier + freshness
-    // tie-break — so a two-hub fleet CANNOT produce a duplicate row here that
+    // remote-row list. Same authenticated node ID and live-reading priority,
+    // so a two-hub fleet cannot produce a duplicate row here that
     // the spaces list also shows, and both surfaces agree on which entry won.
     for (peer_ref, peer) in app.remote_peers() {
+        let home_node = app
+            .fleet_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.origin_summary.as_ref())
+            .and_then(|peer| peer.node_id.as_deref());
+        if home_node.is_some() && app.server_peer_node(peer) == home_node {
+            continue;
+        }
         // Origin rows fold into the spaces list, never a band slot — the Home
         // row above already stands for the origin server here.
         if matches!(peer_ref, crate::app::state::RemotePeerRef::Origin) {
@@ -2077,9 +2085,9 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
     let stale_after_secs = app.config.gossip.stale_after();
     let slow_threshold_ms = app.config.gossip.slow_threshold_ms();
     let down = app
-        .peer_summaries
-        .iter()
-        .filter(|peer| {
+        .remote_peers()
+        .into_iter()
+        .filter(|(_, peer)| {
             peer.reachability_with(stale_after_secs.as_secs(), slow_threshold_ms)
                 == crate::peers::PeerReachability::Down
         })
@@ -2137,7 +2145,20 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
         // the standard highlight fill, one visual language for "current"
         // across workspaces, agents, and servers.
         let is_current = target.is_none();
-        let build = match target {
+        let remote = target.as_ref().and_then(|target| match target {
+            crate::app::state::PeerSwitchRequest::ConfigPeer { peer_idx, .. } => {
+                app.peer_summaries.get(*peer_idx)
+            }
+            crate::app::state::PeerSwitchRequest::SnapshotPeer { entry_idx, .. } => {
+                app.fleet_snapshot.as_ref()?.peers.get(*entry_idx)
+            }
+            crate::app::state::PeerSwitchRequest::RelayedPeer { host_key, .. } => app
+                .relayed_fleet_cache
+                .get(host_key)
+                .map(|entry| &entry.peer),
+            _ => None,
+        });
+        let mut build = match target {
             // The local server: no hit-area, anchors the band.
             None => self_server_rows(app, now),
             Some(crate::app::state::PeerSwitchRequest::Home) => {
@@ -2176,12 +2197,7 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                 build
             }
             Some(crate::app::state::PeerSwitchRequest::RelayedPeer { ref host_key, .. }) => {
-                // A two-hop peer, known to us only because one of our peers
-                // relayed it. It reads like a directly-polled row — the band
-                // shows the FLEET, not our routing table — plus one chip,
-                // `via <hub>` (#410): its freshness is the relayer's, and on
-                // a spoke, which polls nobody, that is the only thing saying
-                // why a row goes stale when the hub goes quiet.
+                // Gossip provenance is kept for dialing, never shown as a route.
                 let Some(entry) = app.relayed_fleet_cache.get(host_key) else {
                     continue;
                 };
@@ -2192,25 +2208,40 @@ fn render_servers_section(app: &AppState, frame: &mut Frame, area: Rect, is_navi
                     entry.peer.shown_failure_reason(),
                     p,
                 );
-                // Leading, not trailing: the band is narrow, and the latency
-                // after it is the relayer's measurement, not ours — the less
-                // important of the two to lose to truncation.
-                if let Some(via) = entry.via.as_deref() {
-                    build.title_rest.insert(
-                        0,
-                        Span::styled(
-                            // The hub's name is self-declared by its relay.
-                            format!("via {} ", crate::control_bytes::strip(via)),
-                            Style::default().fg(p.overlay0),
-                        ),
-                    );
-                }
                 build
             }
             // Origin-workspace rows fold into the spaces list rather than the band —
             // the home row already stands for the origin server here.
             Some(crate::app::state::PeerSwitchRequest::OriginWorkspace { .. }) => continue,
         };
+        if let Some(peer) = remote {
+            build.name = server_name_spans(
+                peer.icon.as_deref(),
+                &app.server_peer_name(peer),
+                app.server_label,
+                build.name.last().map(|span| span.style).unwrap_or_default(),
+            );
+            let route = match app.server_peer_node(peer) {
+                None => "legacy/unverified".to_string(),
+                Some(node) => match app.server_paths.get(node) {
+                    Some(hop) if hop == node => "direct".to_string(),
+                    Some(hop) => {
+                        let name = app
+                            .server_node_name(hop)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                hop.chars().take(8).flat_map(char::escape_default).collect()
+                            });
+                        format!("via {name}")
+                    }
+                    None => "unrouted".to_string(),
+                },
+            };
+            build.title_rest.insert(
+                0,
+                Span::styled(format!("{route} "), Style::default().fg(p.overlay0)),
+            );
+        }
         prepared.push((rect, is_current, build));
     }
     let digit_width = prepared
@@ -2399,29 +2430,23 @@ fn server_icon_span(icon_name: Option<&str>, style: Style) -> Span<'static> {
     }
 }
 
-/// The name field of a band row, per the viewer's `server_label` mode (#164):
-/// `both` (default) = the fixed icon slot + hostname; `icon` = the glyph alone
-/// (falling back to the hostname when the server declared no icon); `name` =
-/// the bare hostname (the pre-icon look). The band's global name-pad aligns the
-/// count columns across whatever widths these produce.
+/// Server rows always carry a readable name. Icon modes add the icon slot.
+/// They never substitute a glyph for the identity (ADR-0026 Origin policy).
 fn server_name_spans(
     icon_name: Option<&str>,
     host: &str,
     mode: crate::config::ServerLabelConfig,
     style: Style,
 ) -> Vec<Span<'static>> {
-    use crate::config::ServerLabelConfig;
-    match mode {
-        ServerLabelConfig::Name => vec![Span::styled(host.to_string(), style)],
-        ServerLabelConfig::Both => vec![
-            server_icon_span(icon_name, style),
-            Span::styled(host.to_string(), style),
-        ],
-        ServerLabelConfig::Icon => match icon_name.and_then(crate::server_icons::resolve) {
-            Some(glyph) => vec![Span::styled(glyph.to_string(), style)],
-            None => vec![Span::styled(host.to_string(), style)],
-        },
+    let mut spans = Vec::new();
+    if mode == crate::config::ServerLabelConfig::Both
+        || (mode == crate::config::ServerLabelConfig::Icon
+            && icon_name.and_then(crate::server_icons::resolve).is_some())
+    {
+        spans.push(server_icon_span(icon_name, style));
     }
+    spans.push(Span::styled(host.to_string(), style));
+    spans
 }
 
 fn self_server_rows(app: &AppState, now: std::time::Instant) -> ServerRowBuild {
@@ -3782,12 +3807,230 @@ mod tests {
     }
 
     #[test]
-    fn server_identity1076_diagnose_carried_snapshot_identity_loss() {
+    fn server_identity1076_carried_snapshot_preserves_identity() {
         let mut peer = peer_named_with_host("node-b-alias.example", "node-b.example");
         peer.node_id = Some(crate::mesh::identity::NodeIdentity::fixture([7; 32]).node_id());
-        // Positional FleetPeer has no node field; the receiver cannot recover it.
+        // Client snapshots must preserve the identity used for row consolidation.
         let carried = crate::peers::peer_from_wire(crate::peers::peer_to_wire(&peer));
-        assert!(carried.node_id.is_none());
+        assert_eq!(carried.node_id, peer.node_id);
+    }
+
+    #[test]
+    fn server_identity1076_never_coalesces_known_or_legacy_names() {
+        let mut app = AppState::test_new();
+        let mut a = peer_named_with_host("node-a.example", "same.example");
+        a.node_id = Some("aaaaaaaa-node".into());
+        let mut b = a.clone();
+        b.node_id = Some("bbbbbbbb-node".into());
+        let mut legacy = a.clone();
+        legacy.node_id = None;
+        app.peer_summaries = vec![a, b, legacy.clone(), legacy];
+        assert_eq!(app.remote_peers().len(), 4);
+        // A local pin never overrides an explicitly different reported ID.
+        app.server_nodes
+            .insert("node-a.example".into(), "aaaaaaaa-node".into());
+        assert_eq!(app.remote_peers().len(), 2);
+        assert_eq!(
+            app.server_peer_node(&app.peer_summaries[1]),
+            Some("bbbbbbbb-node")
+        );
+        let legacy = app.peer_summaries[2].clone();
+        app.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "node-home.example".into(),
+            peers: vec![legacy],
+            origin_summary: None,
+            received_at: std::time::Instant::now(),
+        });
+        let legacy = &app.fleet_snapshot.as_ref().unwrap().peers[0];
+        assert_eq!(
+            app.server_peer_node(legacy),
+            None,
+            "a legacy advertised alias cannot borrow a local pin"
+        );
+        assert_eq!(app.remote_peers().len(), 3);
+    }
+
+    #[test]
+    fn server_identity1076_names_fall_back_to_short_node_and_stale_loses() {
+        let mut app = AppState::test_new();
+        let mut stale = peer_named_with_host("", "node-b.example");
+        stale.node_id = Some("0123456789abcdef".into());
+        stale.origin_last_ok_secs = Some(100_000);
+        let mut fresh = stale.clone();
+        fresh.origin_last_ok_secs = Some(0);
+        fresh.ingested_at = Some(std::time::Instant::now());
+        app.peer_summaries = vec![stale, fresh];
+        assert_eq!(app.remote_peers().len(), 1);
+        assert!(matches!(
+            app.remote_peers()[0].0,
+            crate::app::state::RemotePeerRef::Config { peer_idx: 1 }
+        ));
+        assert_eq!(app.server_peer_name(app.remote_peers()[0].1), "01234567");
+        let mut untrusted = peer_named_with_host("", "node-b.example");
+        untrusted.node_id = Some("\u{202e}\u{9d}id".into());
+        let shown = app.server_peer_name(&untrusted);
+        assert!(
+            shown.is_ascii(),
+            "unverified wire IDs must be escaped for display"
+        );
+        assert!(shown.contains("\\u{202e}"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_identity1076_real_next_hop_replaces_gossip_supplier() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (mut app, node) = server_identity1076_fixture();
+        use crate::mesh::routes::{Adjacency, Advert};
+        let local = crate::mesh::identity::NodeIdentity::load().unwrap();
+        let middle = crate::mesh::identity::NodeIdentity::fixture([7; 32]);
+        let far = crate::mesh::identity::NodeIdentity::fixture([8; 32]);
+        let adjacency = |id: String| Adjacency {
+            node_id: id,
+            name: "unbound.example".into(),
+        };
+        app.mesh_routes.table.learn(
+            &node,
+            vec![
+                Advert::signed(
+                    &middle,
+                    "node-b.example".into(),
+                    (1, 1),
+                    vec![adjacency(local.node_id()), adjacency(far.node_id())],
+                ),
+                Advert::signed(
+                    &far,
+                    "node-c.example".into(),
+                    (1, 1),
+                    vec![adjacency(node.clone())],
+                ),
+            ],
+        );
+        let row = serde_json::from_value(serde_json::json!({"node_id":far.node_id(),
+            "name":"node-c.example", "host":"node-c.example", "ssh_target":"node-c.example",
+            "origin":"node-c.example", "age_secs":0}))
+        .unwrap();
+        crate::peers::merge_relayed_fleet(
+            &mut app.state.relayed_fleet_cache,
+            vec![row],
+            "node-c.example",
+        );
+        let request = serde_json::from_value(
+            serde_json::json!({"id":"route", "method":"peers.enrollment", "params":{}}),
+        )
+        .unwrap();
+        app.handle_api_request(request);
+        assert_eq!(app.state.server_paths.get(&far.node_id()), Some(&node));
+        let area = Rect::new(0, 0, 120, 16);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_servers_section(&app.state, frame, area, false))
+            .unwrap();
+        let text = (0..area.height)
+            .map(|y| buffer_row_text(terminal.backend().buffer(), area, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("via node-b-alias.example"));
+        assert!(text.contains("node-b-alias.example"));
+        assert!(!text.contains("via node-c.example"));
+    }
+
+    #[test]
+    fn server_identity1076_gossip_cache_preserves_distinct_ids_with_same_host() {
+        let mut cache = std::collections::HashMap::new();
+        let row = |id: &str| {
+            serde_json::from_value(serde_json::json!({
+            "node_id": id, "name":"node-b.example", "host":"same.example",
+            "ssh_target":"node-b.example", "origin":"node-a.example",
+            "age_secs":0, "origin_last_ok_secs":0}))
+            .unwrap()
+        };
+        crate::peers::merge_relayed_fleet(
+            &mut cache,
+            vec![row("node-one"), row("node-two")],
+            "node-a.example",
+        );
+        assert_eq!(
+            cache.len(),
+            2,
+            "hostnames cannot overwrite a different node"
+        );
+        crate::peers::merge_relayed_fleet(&mut cache, vec![row("node-one")], "node-c.example");
+        assert_eq!(
+            cache.len(),
+            2,
+            "the same node refreshes its existing reading"
+        );
+        let legacy = serde_json::from_value(serde_json::json!({
+            "name":"legacy.example", "host":"node:node-one", "ssh_target":"legacy.example",
+            "origin":"node-a.example", "age_secs":0}))
+        .unwrap();
+        crate::peers::merge_relayed_fleet(&mut cache, vec![legacy], "node-a.example");
+        assert_eq!(
+            cache.len(),
+            3,
+            "a legacy hostname cannot collide with a node key"
+        );
+    }
+
+    #[test]
+    fn server_identity1076_self_and_home_copies_fold_by_id_only() {
+        let mut app = AppState::test_new();
+        let mut here = peer_named_with_host("node-a.example", "same.example");
+        here.node_id = Some("node-here".into());
+        let mut home = here.clone();
+        home.node_id = Some("node-home".into());
+        app.server_node = here.node_id.clone();
+        app.peer_summaries = vec![here, home.clone()];
+        app.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "node-home.example".into(),
+            peers: vec![],
+            origin_summary: Some(home),
+            received_at: std::time::Instant::now(),
+        });
+        assert_eq!(
+            server_band_slots(&app).len(),
+            2,
+            "only self and home remain"
+        );
+        app.fleet_snapshot
+            .as_mut()
+            .unwrap()
+            .origin_summary
+            .as_mut()
+            .unwrap()
+            .node_id = Some("different-home".into());
+        assert_eq!(
+            server_band_slots(&app).len(),
+            3,
+            "matching names cannot hide a different ID"
+        );
+    }
+
+    #[test]
+    fn server_identity1076_home_name_claims_cannot_hide_other_ids_or_legacy() {
+        let mut home = peer_named_with_host("node-home.example", "node-home.example");
+        home.node_id = Some("home-node".into());
+        let snapshot = crate::peers::FleetSnapshotState {
+            origin: "node-home.example".into(),
+            peers: vec![],
+            origin_summary: Some(home),
+            received_at: std::time::Instant::now(),
+        };
+        let row = |id: Option<&str>| {
+            serde_json::from_value(serde_json::json!({
+            "node_id":id, "name":"node-home.example", "host":"node-home.example",
+            "ssh_target":"node-home.example", "origin":"node-a.example"}))
+            .unwrap()
+        };
+        let rows = snapshot.without_origin_claims(vec![
+            row(Some("home-node")),
+            row(Some("other-node")),
+            row(None),
+        ]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].node_id.as_deref(), Some("other-node"));
+        assert_eq!(rows[1].node_id, None);
     }
 
     fn remote_summary(
@@ -4075,6 +4318,8 @@ mod tests {
             &[("kiln-snap", "kiln")],
         ));
         app.peer_summaries = vec![peer_named_with_host("kiln-cfg", "kiln")];
+        app.peer_summaries[0].node_id = Some("fixture-node".into());
+        app.fleet_snapshot.as_mut().unwrap().peers[0].node_id = Some("fixture-node".into());
 
         let peer_slots: Vec<PeerSwitchRequest> = server_band_slots(&app)
             .into_iter()
@@ -4110,6 +4355,8 @@ mod tests {
             &[("kiln-from-snap", "kiln")],
         ));
         app.peer_summaries = vec![peer_named_with_host("kiln-cfg", "kiln")];
+        app.peer_summaries[0].node_id = Some("fixture-node".into());
+        app.fleet_snapshot.as_mut().unwrap().peers[0].node_id = Some("fixture-node".into());
 
         // Servers band: one non-Home/non-Self entry, and it MUST be the
         // config peer (rank 0 beats the snapshot rank 2).
@@ -4166,8 +4413,10 @@ mod tests {
         // origin_last_ok_secs (fresher origin assertion) wins.
         let mut app = crate::app::state::AppState::test_new();
         let mut stale = peer_named_with_host("kiln", "kiln");
+        stale.node_id = Some("fixture-node".into());
         stale.origin_last_ok_secs = Some(45);
         let mut fresh = peer_named_with_host("kiln", "kiln");
+        fresh.node_id = Some("fixture-node".into());
         fresh.origin_last_ok_secs = Some(3);
         let snapshot = crate::peers::FleetSnapshotState {
             origin: "hopper".to_string(),
@@ -4841,7 +5090,7 @@ mod tests {
             )),
             format!("{glyph} hopper")
         );
-        // `icon` = glyph alone...
+        // `icon` retains the name in the servers band.
         assert_eq!(
             text(&server_name_spans(
                 Some("toad"),
@@ -4849,7 +5098,7 @@ mod tests {
                 ServerLabelConfig::Icon,
                 style
             )),
-            glyph
+            format!("{glyph} hopper")
         );
         // ...falling back to the hostname when the server declared no (usable) icon.
         assert_eq!(
@@ -6112,6 +6361,9 @@ mod tests {
                 ),
             ],
         ));
+
+        app.peer_summaries[0].node_id = Some("fixture-node".into());
+        app.fleet_snapshot.as_mut().unwrap().peers[0].node_id = Some("fixture-node".into());
 
         let remote_peers: Vec<RemotePeerRef> = workspace_list_entries(&app)
             .into_iter()

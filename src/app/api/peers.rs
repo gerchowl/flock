@@ -152,14 +152,19 @@ impl App {
             return refusal;
         }
         // The verified key maps to this locally enrolled name.
-        let Some(hub) = self
+        let Some((hub, hub_node)) = self
             .inbound
             .edge(
                 self.current_api_peer_pid,
                 crate::platform::process_start_time,
             )
             .filter(|edge| edge.enrolled())
-            .map(|edge| edge.enrollment.peer.clone())
+            .map(|edge| {
+                (
+                    edge.enrollment.peer.clone(),
+                    edge.enrollment.node_id.clone(),
+                )
+            })
         else {
             return super::responses::encode_error(
                 id,
@@ -176,7 +181,10 @@ impl App {
         let hub_self = params
             .hub_self
             .map(|row| *row)
-            .filter(|row| crate::peers::wire_row_identity(row) == hub_key);
+            .filter(|row| match row.node_id.as_deref() {
+                Some(node) => hub_node.as_deref() == Some(node),
+                None => crate::peers::wire_row_identity(row) == hub_key,
+            });
         match self.state.fleet_snapshot.as_mut() {
             Some(snapshot) => {
                 // The home row is the one the operator trusts, so exactly one
@@ -186,8 +194,18 @@ impl App {
                 // polls can report any host), so it is dropped rather than
                 // absorbed, and never stored as a second home row either.
                 fleet = snapshot.without_origin_claims(fleet);
-                if let Some(row) = hub_self {
-                    if snapshot.origin.eq_ignore_ascii_case(&hub) {
+                if let Some(mut row) = hub_self {
+                    let home_node = snapshot
+                        .origin_summary
+                        .as_ref()
+                        .and_then(|peer| peer.node_id.as_deref());
+                    let is_home = match home_node {
+                        Some(node) => hub_node.as_deref() == Some(node),
+                        None => row.node_id.is_none() && snapshot.origin.eq_ignore_ascii_case(&hub),
+                    };
+                    if is_home {
+                        // A legacy self reading cannot erase an established identity.
+                        row.node_id = home_node.map(str::to_owned);
                         snapshot.absorb_hub_self(row);
                     } else {
                         fleet.push(row);
@@ -241,7 +259,7 @@ impl App {
             .map(|peer| {
                 let age_secs = peer.last_ok.map(|at| at.elapsed().as_secs());
                 RelayedFleetPeer {
-                    node_id: peer.node_id.clone(),
+                    node_id: self.state.server_peer_node(peer).map(str::to_owned),
                     // #418: how this server's dials to the peer are failing,
                     // which is what `flk peers` shows.
                     dial: peer.dial_report(std::time::Instant::now()),
@@ -356,6 +374,7 @@ impl App {
     /// post-attach focus target. `age_secs = 0`: stamped fresh at switch.
     fn origin_self_summary(&self) -> crate::protocol::FleetPeer {
         crate::protocol::FleetPeer {
+            node_id: self.node_id.clone(),
             name: short_host_name(),
             ssh_target: crate::protocol::HOME_SWITCH_TARGET.to_string(),
             host: Some(short_host_name()),
@@ -431,25 +450,12 @@ fn focus_target(target: Option<&PeerWorkspaceSummary>) -> Option<String> {
         .filter(|id| !id.trim().is_empty())
 }
 
-/// Host key a fleet entry dedupes under: the host it reports about itself,
-/// falling back to its ssh target, lowercased. Mirrors the receiving end's
-/// `row_host_key`, so emit-side and render-side collapse the same rows.
-fn wire_host_key(peer: &crate::protocol::FleetPeer) -> String {
-    peer.host
-        .as_deref()
-        .filter(|host| !host.is_empty())
-        .unwrap_or(&peer.ssh_target)
-        .to_ascii_lowercase()
-}
-
 /// Union two fleet peer lists into the one a leg carries.
 ///
-/// Entries about the hop target (it becomes the self row over there) and about
-/// the snapshot's origin (the home row owns that slot) are dropped. Otherwise
-/// one entry survives per host: the FRESHER by `origin_last_ok_secs` (the
-/// origin's reading plus however long it has since sat somewhere), ties going
-/// to the earlier list — the same quantity `AppState::remote_peers` ranks on
-/// when it renders them, so a row can't win here and lose there.
+/// Consolidate known node IDs, keeping the freshest origin reading and
+/// preferring the earlier list on ties. Legacy entries remain separate.
+/// Known copies of self and home are suppressed by ID on the receiving end.
+/// Legacy hop destinations still use the exact SSH target exclusion.
 ///
 /// Capped like the carried snapshot itself: the list rides an env var between
 /// attach legs, and an unbounded fleet could brush ARG_MAX and kill the leg.
@@ -461,21 +467,15 @@ fn merge_fleet_peers(
     first: Vec<crate::protocol::FleetPeer>,
     rest: Vec<crate::protocol::FleetPeer>,
     exclude_ssh_target: &str,
-    origin: &str,
 ) -> Vec<crate::protocol::FleetPeer> {
-    let exclude_lower = exclude_ssh_target.to_ascii_lowercase();
-    let origin_lower = origin.to_ascii_lowercase();
     let mut merged: Vec<crate::protocol::FleetPeer> = Vec::new();
-    let mut by_host: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_node: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for peer in first.into_iter().chain(rest) {
-        let key = wire_host_key(&peer);
-        if key == exclude_lower
-            || key == origin_lower
-            || peer.ssh_target.eq_ignore_ascii_case(exclude_ssh_target)
-        {
+        let key = peer.node_id.clone();
+        if key.is_none() && peer.ssh_target == exclude_ssh_target {
             continue;
         }
-        match by_host.get(&key) {
+        match key.as_ref().and_then(|id| by_node.get(id)) {
             Some(&idx) => {
                 // Smaller age = fresher; a known age beats an unknown.
                 let current = merged[idx].origin_last_ok_secs;
@@ -489,7 +489,9 @@ fn merge_fleet_peers(
                 }
             }
             None => {
-                by_host.insert(key, merged.len());
+                if let Some(key) = key {
+                    by_node.insert(key, merged.len());
+                }
                 merged.push(peer);
             }
         }
@@ -707,13 +709,19 @@ impl App {
         pushed: &crate::peers::PeerSummaryState,
         ws_idx: Option<usize>,
     ) -> Option<PreparedServerSwitch> {
-        let carried = self
-            .state
-            .fleet_snapshot
-            .as_ref()?
-            .peers
-            .iter()
-            .find(|entry| crate::app::state::row_host_key(entry) == host_key)?;
+        let carried =
+            self.state
+                .fleet_snapshot
+                .as_ref()?
+                .peers
+                .iter()
+                .find(|entry| match pushed.node_id.as_deref() {
+                    Some(node) => entry.node_id.as_deref() == Some(node),
+                    None => {
+                        entry.node_id.is_none()
+                            && crate::app::state::row_host_key(entry) == host_key
+                    }
+                })?;
         let ssh_target = carried.ssh_target.clone();
         let proxy_jump = carried.proxy_jump.clone();
         let target = ws_idx.and_then(|ws_idx| pushed.workspaces.get(ws_idx));
@@ -758,7 +766,11 @@ impl App {
             .state
             .peer_summaries
             .iter()
-            .map(crate::peers::peer_to_wire)
+            .map(|peer| {
+                let mut wire = crate::peers::peer_to_wire(peer);
+                wire.node_id = self.state.server_peer_node(peer).map(str::to_owned);
+                wire
+            })
             .map(stamp_proxy_jump)
             .collect();
         // #410: never a row a hub pushed down. It is another server's view that
@@ -792,12 +804,11 @@ impl App {
                 // (When we ARE the carried origin, the merge drops this again:
                 // the home row already stands for us over there.)
                 ours.push(self.self_peer_entry(&us));
-                snapshot.peers =
-                    merge_fleet_peers(ours, snapshot.peers, exclude_ssh_target, &snapshot.origin);
+                snapshot.peers = merge_fleet_peers(ours, snapshot.peers, exclude_ssh_target);
                 snapshot
             }
             None => crate::protocol::FleetSnapshot {
-                peers: merge_fleet_peers(ours, Vec::new(), exclude_ssh_target, &us),
+                peers: merge_fleet_peers(ours, Vec::new(), exclude_ssh_target),
                 origin: us,
                 // The hub is not its own peer; embed its own workspaces so
                 // the spoke can see the way-home spaces, not just peers (#66).
@@ -1957,6 +1968,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_identity1076_enrolled_names_cannot_replace_a_different_home_id() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut spoke = test_app();
+        spoke.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "node-home.example".into(),
+            peers: vec![],
+            origin_summary: Some(summary(
+                "node-home.example",
+                crate::protocol::HOME_SWITCH_TARGET,
+            )),
+            received_at: std::time::Instant::now(),
+        });
+        spoke
+            .state
+            .fleet_snapshot
+            .as_mut()
+            .unwrap()
+            .origin_summary
+            .as_mut()
+            .unwrap()
+            .node_id = Some("different-home".into());
+        bind_relay(&mut spoke, "node-home.example");
+        let mut row = hub_row("node-home.example", "node-home.example", 0);
+        row.node_id = Some("test-node-node-home.example".into());
+        row.workspaces = vec![planted_space("other-node-space")];
+        push_down(
+            &mut spoke,
+            crate::api::schema::PeersHubFleetParams {
+                hub: "node-home.example".into(),
+                fleet: vec![],
+                hub_self: Some(Box::new(row)),
+            },
+        );
+        assert!(home_workspaces(&spoke).is_empty());
+        assert_eq!(
+            spoke
+                .state
+                .fleet_snapshot
+                .as_ref()
+                .unwrap()
+                .origin_summary
+                .as_ref()
+                .unwrap()
+                .node_id
+                .as_deref(),
+            Some("different-home")
+        );
+        assert!(spoke
+            .state
+            .relayed_fleet_cache
+            .contains_key("\0node:test-node-node-home.example"));
+    }
+
+    #[tokio::test]
     async fn only_the_home_hub_itself_can_repaint_the_home_row() {
         // #425 review blocker: the home row is the one the operator trusts.
         // Any spoke the hub polls can REPORT any host, so a row in `fleet`
@@ -1965,7 +2030,17 @@ mod tests {
         // a hub that is not home, or one naming a machine other than the hub.
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(carried_home());
+        spoke
+            .state
+            .fleet_snapshot
+            .as_mut()
+            .unwrap()
+            .origin_summary
+            .as_mut()
+            .unwrap()
+            .node_id = Some("test-node-hopper".into());
         let mut claim = hub_row("hopper", "hopper", 0);
+        claim.node_id = Some("test-node-hopper".into());
         claim.workspaces = vec![planted_space("planted-by-a-spoke")];
         let mut forged_self = hub_row("hopper", "hopper", 0);
         forged_self.workspaces = vec![planted_space("planted-by-kiln")];
@@ -1995,8 +2070,18 @@ mod tests {
         // polled node's say-so. Only the hub's own `hub_self` counts.
         let mut spoke = test_app();
         spoke.state.fleet_snapshot = Some(carried_home());
+        spoke
+            .state
+            .fleet_snapshot
+            .as_mut()
+            .unwrap()
+            .origin_summary
+            .as_mut()
+            .unwrap()
+            .node_id = Some("test-node-hopper".into());
         bind_relay(&mut spoke, "hopper");
         let mut genuine = hub_row("hopper", "hopper", 0);
+        genuine.node_id = Some("test-node-hopper".into());
         genuine.workspaces = vec![planted_space("home-for-real")];
         push_down(
             &mut spoke,
@@ -2196,21 +2281,28 @@ mod tests {
         // stand beside the home row. The origin slot stands for that machine.
         let mut spoke = test_app();
         bind_relay(&mut spoke, "hopper");
+        let mut hub = hub_row("hopper", "hopper", 0);
+        hub.node_id = Some("test-node-hopper".into());
         push_down(
             &mut spoke,
             crate::api::schema::PeersHubFleetParams {
                 hub: "hopper".into(),
                 fleet: Vec::new(),
-                hub_self: Some(Box::new(hub_row("hopper", "hopper", 0))),
+                hub_self: Some(Box::new(hub)),
             },
         );
         spoke.current_api_peer_pid = None;
-        assert!(spoke.state.relayed_fleet_cache.contains_key("hopper"));
+        assert!(spoke
+            .state
+            .relayed_fleet_cache
+            .contains_key("\0node:test-node-hopper"));
 
+        let mut origin = summary("hopper", crate::protocol::HOME_SWITCH_TARGET);
+        origin.node_id = Some("test-node-hopper".into());
         spoke.state.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
             origin: "hopper".into(),
             peers: Vec::new(),
-            origin_summary: Some(summary("hopper", crate::protocol::HOME_SWITCH_TARGET)),
+            origin_summary: Some(origin),
             received_at: std::time::Instant::now(),
         });
         let rows: Vec<_> = spoke

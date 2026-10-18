@@ -5618,6 +5618,7 @@ mod tests {
         let fleet = protocol::FleetSnapshot {
             origin: "hopper".to_string(),
             peers: vec![protocol::FleetPeer {
+                node_id: None,
                 name: "kiln".to_string(),
                 ssh_target: "operator@kiln".to_string(),
                 host: Some("kiln".to_string()),
