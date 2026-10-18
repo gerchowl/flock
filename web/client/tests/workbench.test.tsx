@@ -14,6 +14,7 @@ import { createManager, emptyLayout, type Layout } from "../src/layout/model";
 import { createFixtureTransport } from "../src/transport/fixture";
 import { createWireTransport } from "../src/wire/transport";
 import { STATUS_LABELS, phaseLine, rowLine, sendHint, type Sender } from "../src/workbench/Composer";
+import type { AgentState } from "../src/gen/AgentState";
 import type { Phase } from "../src/gen/Phase";
 import { SAMPLE_INBOX } from "../src/workbench/inbox";
 import { markFor } from "../src/workbench/marks";
@@ -39,7 +40,7 @@ function mount(view: () => ReturnType<typeof App>): HTMLElement {
 }
 
 /** The generated `AgentState` a real fleet row carries (ADR-0028 §3a). */
-const workingState = { turn: "working", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} };
+const workingState: AgentState = { turn: "working", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} };
 
 const $ = (root: ParentNode, id: string): Element | null => root.querySelector(`[data-testid="${id}"]`);
 const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAll(`[data-testid="${id}"]`)];

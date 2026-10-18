@@ -61,7 +61,7 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
         {(card) => {
           const reason = createUniqueId();
           return (
-          <article class="card" classList={{ "card--blocking": card.blocking }} data-testid="inbox-card">
+          <article class="card" classList={{ "card--blocking": card.blocking }} data-testid="inbox-card" data-request-seq={card.requestSeq}>
             <p class="card__meta">
               {card.kind === "permission" ? "Permission" : "Question"} · {card.agentLabel}
             </p>

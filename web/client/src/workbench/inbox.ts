@@ -3,7 +3,7 @@
  *
  * {@link InboxCard} is a presentation type. Fixture mode shows the sample
  * cards below, labelled as samples. Live mode shows open permission prompts
- * (`workbench/permissions.ts`, #1749 PR 1). In both, the answer buttons are
+ * (`workbench/permissions.ts`, #1749 PR 1; the server's open/closed record, `wire/permission-record.ts`). In both, the answer buttons are
  * disabled and name what they wait for.
  *
  * @module
@@ -25,6 +25,8 @@ export type InboxCard = {
   readonly blocking: boolean;
   /** What answering waits for, shown beside the disabled choices. */
   readonly waitsFor: string;
+  /** A permission card's server `request_seq`, verbatim, for PR 2's decide; absent on samples and pending cards. */
+  readonly requestSeq?: number;
 };
 
 const SAMPLE_WAITS_FOR = "the inbox stream (G5 #1597)";

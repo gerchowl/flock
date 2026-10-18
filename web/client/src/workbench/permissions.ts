@@ -2,13 +2,13 @@
  * The live inbox of open permission prompts (ADR-0038 §1, §2a, §3; #1749
  * PR 1, read-only).
  *
- * The source of truth is fleet-lite's `waiting_on_human` list per agent: a
- * card exists exactly while its request id is listed, and goes only when the
- * server drops it. Details come from that agent's `agent/<id>` stream, from
- * the `control_request` event whose `request_id` matches and whose
- * `request.subtype` is `can_use_tool`. A listed id whose details have not
- * arrived shows a loading card, and one the stream never matches says so; a
- * listed id is never hidden. An event with no listed id shows nothing.
+ * The state comes from the server's permission record on `agent/<id>`
+ * (`wire/permission-record.ts`, #2224): a card shows from an open record and
+ * goes on the closed record with the same `request_id`, never on a client
+ * guess. A closed record for an id with no open record is ignored. Fleet-lite's
+ * `waiting_on_human` chooses which streams to subscribe to, and a listed id
+ * with no record yet shows a loading card (or, once the stream has synced
+ * without one, says so); a listed id is never hidden.
  *
  * One subscription per agent with listed ids, opened when its first id is
  * listed and closed when its list empties. The focused transcript tile's own
@@ -16,8 +16,8 @@
  *
  * Order: every permission prompt blocks its agent, so all cards block. Agents
  * sort by when each one's list first became non-empty (oldest first); within
- * an agent, cards sort by the matched event's stream seq, and ids still
- * without details follow, in the server's listed order.
+ * an agent, cards sort by the open record's stream seq, and listed ids still
+ * without a record follow, in the server's listed order.
  *
  * @module
  */
@@ -25,18 +25,22 @@ import { createSignal, type Accessor } from "solid-js";
 
 import type { AgentRow } from "../fleet";
 import type { Subscription, Transport } from "../transport";
+import { permissionRecord, type OpenPermissionRecord } from "../wire/permission-record";
 import { commandOf } from "../views/turns";
 import type { InboxCard } from "./inbox";
 
-/** The prompt's tool and input summary, from its `control_request` event. */
-type Details = { readonly seq: number; readonly tool: string; readonly summary: string };
+/** An open record, with the stream seq it arrived at. */
+type Open = { readonly seq: number; readonly record: OpenPermissionRecord };
 
 type Tracked = {
   label: string;
   ids: readonly string[];
   /** Orders agents by age: assigned when the list first became non-empty. */
   readonly listedAt: number;
-  readonly details: Map<string, Details>;
+  /** Open records by `request_id`; a closed record removes its entry. */
+  readonly open: Map<string, Open>;
+  /** Ids whose closed record arrived: not shown as pending while the fleet still lists them. */
+  readonly closed: Set<string>;
   synced: boolean;
   failure: string | null;
   subscription: Subscription | null;
@@ -61,24 +65,24 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
   let listed = 0;
   let closed = false;
 
-  const card = (agent: string, tracked: Tracked, id: string): InboxCard => {
-    const found = tracked.details.get(id);
+  const card = (agent: string, tracked: Tracked, id: string, found: Open | undefined): InboxCard => {
     const pending =
       tracked.failure !== null
         ? `Details unavailable: ${tracked.failure}`
         : tracked.synced
-          ? "This agent's history has no matching permission request."
+          ? "This agent's stream has no open permission record for it."
           : "Loading details…";
     return {
       id,
       kind: "permission",
       agent,
       agentLabel: tracked.label,
-      title: found?.tool ?? `${tracked.label} · permission ${id}`,
-      detail: found?.summary ?? pending,
+      title: found === undefined ? `${tracked.label} · permission ${id}` : (found.record.request.display_name ?? found.record.request.tool_name),
+      detail: found === undefined ? pending : commandOf(found.record.request.input),
       choices: CHOICES,
       blocking: true,
       waitsFor: WAITS_FOR,
+      ...(found === undefined ? {} : { requestSeq: found.record.request_seq }),
     };
   };
 
@@ -86,9 +90,9 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
     const ordered = [...agents.entries()].sort(([, a], [, b]) => a.listedAt - b.listedAt);
     setCards(
       ordered.flatMap(([agent, tracked]) => {
-        const rank = (id: string): number => tracked.details.get(id)?.seq ?? Number.POSITIVE_INFINITY;
-        // `sort` is stable, so unmatched ids keep the server's listed order.
-        return [...tracked.ids].sort((a, b) => rank(a) - rank(b)).map((id) => card(agent, tracked, id));
+        const records = [...tracked.open.values()].sort((a, b) => a.seq - b.seq).map((found) => card(agent, tracked, found.record.request_id, found));
+        const pending = tracked.ids.filter((id) => !tracked.open.has(id) && !tracked.closed.has(id)).map((id) => card(agent, tracked, id, undefined));
+        return [...records, ...pending];
       }),
     );
   };
@@ -96,10 +100,16 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
   const open = (agent: string, tracked: Tracked): void => {
     tracked.subscription = transport.subscribe(`agent/${agent}`, null, {
       entry: (entry) => {
-        if (entry.kind !== "known" || entry.event.type !== "control_request") return;
-        const { request_id: id, request } = entry.event;
-        if (request?.subtype !== "can_use_tool") return;
-        tracked.details.set(id, { seq: entry.seq, tool: request.display_name ?? request.tool_name, summary: commandOf(request.input) });
+        if (entry.kind !== "known") return;
+        const record = permissionRecord(entry.event);
+        if (record === null) return;
+        if (record.state === "open") {
+          tracked.open.set(record.request_id, { seq: entry.seq, record });
+          tracked.closed.delete(record.request_id);
+        } else {
+          tracked.open.delete(record.request_id);
+          tracked.closed.add(record.request_id);
+        }
         publish();
       },
       synced: () => {
@@ -112,7 +122,8 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
         publish();
       },
       reset: () => {
-        tracked.details.clear();
+        tracked.open.clear();
+        tracked.closed.clear();
         tracked.synced = false;
         publish();
       },
@@ -136,7 +147,7 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
           tracked.ids = row.waitingOnHuman;
           continue;
         }
-        const fresh: Tracked = { label: row.label, ids: row.waitingOnHuman, listedAt: listed++, details: new Map(), synced: false, failure: null, subscription: null };
+        const fresh: Tracked = { label: row.label, ids: row.waitingOnHuman, listedAt: listed++, open: new Map(), closed: new Set(), synced: false, failure: null, subscription: null };
         agents.set(agent, fresh);
         open(agent, fresh);
       }

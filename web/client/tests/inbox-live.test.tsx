@@ -1,11 +1,13 @@
 /**
  * The live inbox of open permission prompts (#1749 PR 1): fleet-lite's
- * `waiting_on_human` ids, matched to `can_use_tool` events on `agent/<id>`.
+ * `waiting_on_human` ids choose the streams, and the server's open/closed
+ * permission record on `agent/<id>` (#2224) decides the cards.
  * Scripted fake server, virtual time, no sleeps.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { render } from "solid-js/web";
 
+import type { AgentState } from "../src/gen/AgentState";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import { emptyLayout } from "../src/layout/model";
 import type { Mode } from "../src/layout/phone";
@@ -22,10 +24,11 @@ afterEach(() => {
   localStorage.clear();
 });
 
-const state = { turn: "idle", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "needs_human", source: {} };
+const state: AgentState = { turn: "idle", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "needs_human", source: {} };
 const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAll(`[data-testid="${id}"]`)];
 
-type App = { h: Harness; root: HTMLElement; fleet: (id: string, waiting: string[]) => void; event: (agent: string, id: string, tool?: string, input?: object) => void; synced: (agent: string) => void };
+type App = { h: Harness; root: HTMLElement; fleet: (id: string, waiting: string[]) => void; event: (agent: string, id: string, tool?: string, input?: object, requestSeq?: number) => void;
+  close: (agent: string, id: string) => void; synced: (agent: string) => void };
 
 function mountInbox(mode: Mode = "desktop"): App {
   const h = new Harness();
@@ -47,15 +50,17 @@ function mountInbox(mode: Mode = "desktop"): App {
     h,
     root,
     fleet: (id, waiting) => send({ t: "ev", sub_id: fleetSub, stream: "fleet", seq: ++fleetSeq, ts_ms: 0, ev: { type: "fleet.upsert", row: { id, label: id.toUpperCase(), state, waiting_on_human: waiting } } }),
-    event: (agent, id, tool = "Bash", input = { command: "just check" }) =>
+    event: (agent, id, tool = "Bash", input = { command: "just check" }, requestSeq = 7) =>
       send({
         t: "ev",
         sub_id: agentSub(agent),
         stream: `agent/${agent}`,
         seq: ++agentSeq,
         ts_ms: 0,
-        ev: { type: "control_request", request_id: id, request: { subtype: "can_use_tool", tool_name: tool, input, tool_use_id: `tool-${id}` } } as never,
+        ev: { type: "flk_permission_request", state: "open", request_id: id, request_seq: requestSeq, request: { subtype: "can_use_tool", tool_name: tool, input, tool_use_id: `tool-${id}` } } as never,
       }),
+    close: (agent, id) =>
+      send({ t: "ev", sub_id: agentSub(agent), stream: `agent/${agent}`, seq: ++agentSeq, ts_ms: 0, ev: { type: "flk_permission_request", state: "closed", request_id: id, decision: "allow" } as never }),
     synced: (agent) => send({ t: "synced", sub_id: agentSub(agent), seq: agentSeq }),
   };
 }
@@ -65,8 +70,8 @@ const frames = (h: Harness, t: string, stream?: string): { sub_id: string }[] =>
   sentFrames(h).filter((f) => (f as { t: string }).t === t && (stream === undefined || (f as { stream?: string }).stream === stream)) as { sub_id: string }[];
 
 describe("live permission inbox", () => {
-  test("a listed id with a matching can_use_tool shows tool, input and agent; dropping the id removes the card", () => {
-    const { h, root, fleet, event } = mountInbox();
+  test("an open record shows a card with its tool, input and agent; the closed record removes it", () => {
+    const { h, root, fleet, event, close } = mountInbox();
     fleet("atlas", ["request-one"]);
     event("atlas", "request-one");
     expect(cards(root)).toHaveLength(1);
@@ -75,31 +80,41 @@ describe("live permission inbox", () => {
     expect(text).toContain("Bash");
     expect(text).toContain("just check");
     expect(frames(h, "sub", "agent/atlas")).toHaveLength(1);
-    fleet("atlas", []);
+    close("atlas", "request-one");
+    expect(cards(root)).toEqual([]);
+    // The fleet may still list the id for a moment; the closed record wins, so no pending card returns.
+    fleet("atlas", ["request-one"]);
     expect(cards(root)).toEqual([]);
   });
 
-  test("a listed id without its event is a visible pending card; an event without a listed id shows nothing", () => {
-    const { root, fleet, event, synced } = mountInbox();
+  test("request_seq is carried verbatim on the card model", () => {
+    const seen: (number | undefined)[] = [];
+    const { root, fleet, event } = mountInbox();
+    fleet("atlas", ["r1", "r2"]);
+    event("atlas", "r1", "Bash", {}, 41);
+    event("atlas", "r2", "Bash", {}, 3);
+    for (const card of $$(root, "inbox-card")) seen.push(Number(card.getAttribute("data-request-seq")));
+    expect(seen).toEqual([41, 3]);
+  });
+
+  test("a closed record for an unknown id is ignored without crashing", () => {
+    const { root, fleet, event, close } = mountInbox();
+    fleet("atlas", ["request-one"]);
+    close("atlas", "never-opened");
+    expect(cards(root)).toHaveLength(1);
+    expect(cards(root)[0]).toContain("Loading details…");
+    event("atlas", "request-one");
+    expect(cards(root)[0]).toContain("just check");
+  });
+
+  test("a listed id without its record is a visible pending card; once synced it says there is none", () => {
+    const { root, fleet, synced } = mountInbox();
     fleet("atlas", ["request-one"]);
     expect(cards(root)[0]).toContain("ATLAS · permission request-one");
     expect(cards(root)[0]).toContain("Loading details…");
-    event("atlas", "unlisted");
-    expect(cards(root)).toHaveLength(1);
-    expect(cards(root)[0]).toContain("Loading details…");
     synced("atlas");
     expect(cards(root)).toHaveLength(1);
-    expect(cards(root)[0]).toContain("no matching permission request");
-  });
-
-  test("a can_use_tool event that arrives before its id is listed shows nothing until the id is listed", () => {
-    const { root, fleet, event } = mountInbox();
-    fleet("atlas", ["request-one"]);
-    event("atlas", "request-two", "Edit", { file_path: "src/a.rs" });
-    expect(cards(root)).toHaveLength(1);
-    expect(cards(root)[0]).not.toContain("src/a.rs");
-    fleet("atlas", ["request-one", "request-two"]);
-    expect(cards(root).map((text) => text.includes("src/a.rs"))).toEqual([true, false]);
+    expect(cards(root)[0]).toContain("no open permission record");
   });
 
   for (const mode of ["desktop", "phone"] as const) {
