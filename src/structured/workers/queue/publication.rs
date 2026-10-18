@@ -126,7 +126,7 @@ impl<R: parking_lot::lock_api::RawMutex> Book<R> {
         });
         if cut.gap.is_some() {
             self.retained = cut.clone();
-        } else if !cut.records.is_empty() || self.retained.through != cut.through {
+        } else if !cut.records.is_empty() || cut.through > self.retained.through {
             // A still-unread replay shares the old cut. Only an actual append
             // needs copy-on-write; status-only updates never copy its prefix.
             let retained = Arc::make_mut(&mut self.retained);

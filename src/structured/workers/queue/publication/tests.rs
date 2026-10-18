@@ -715,3 +715,22 @@ fn queue_provider_high_water_advances_even_without_a_record_packet() {
     }));
     assert_eq!(source.1.lock().retained.through, 5);
 }
+
+#[test]
+fn queue_provider_high_water_never_rewinds_on_a_stale_status_cut() {
+    let root = root();
+    let j = journal(&root, 0);
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
+    for through in [5, 4, 0] {
+        publisher.publish(&update(Cut {
+            gap: None,
+            records: vec![],
+            through,
+        }));
+        assert_eq!(
+            source.1.lock().retained.through,
+            5,
+            "rewound retained high-water"
+        );
+    }
+}
