@@ -187,6 +187,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn app_and_listener_keep_the_same_policy_instance() {
+        use crate::config::model::AgentAccount;
+        for account in [AgentAccount::FlkAgent, AgentAccount::None] {
+            let mut config = crate::config::Config::default();
+            config.security.agent_account = account;
+            let runtime_config = crate::app::AppRuntimeConfig::for_config(&config);
+            let listener_policy = runtime_config.uid_policy.clone();
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let app = crate::app::App::new_with_runtime_config(
+                &config,
+                true,
+                None,
+                rx,
+                crate::api::EventHub::default(),
+                runtime_config,
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &app.runtime_config.uid_policy.dedicated.0,
+                    &listener_policy.dedicated.0
+                ),
+                "app and listener must share their configured cache for {account:?}"
+            );
+            assert_eq!(
+                app.runtime_config.uid_policy.operator,
+                listener_policy.operator
+            );
+            assert!(!listener_policy.dedicated.0.started.is_completed());
+            if account == AgentAccount::None {
+                assert_eq!(listener_policy.dedicated.get(), Ok(None));
+            }
+        }
+    }
+
     #[test]
     fn policy_construction_leaves_its_owned_cache_unstarted() {
         let (done, result) = mpsc::channel();
@@ -253,13 +288,13 @@ mod tests {
                 None,
                 rx,
                 crate::api::EventHub::default(),
-                crate::app::AppRuntimeConfig {
-                    uid_policy: UidPolicy {
+                crate::app::AppRuntimeConfig::for_config_with_uid_policy(
+                    &config,
+                    UidPolicy {
                         operator: 7,
                         dedicated: lookup,
                     },
-                    ..Default::default()
-                },
+                ),
             );
             started
                 .send(app.runtime_config.uid_policy.dedicated.clone())
