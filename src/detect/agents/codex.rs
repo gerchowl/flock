@@ -531,7 +531,7 @@ pub(in crate::detect) fn has_codex_conversation_lock(content: &str) -> bool {
     flat.contains("this conversation is open in another app")
         && flat.contains("close it there and press r to continue here")
         && flat
-            .split_once("r retry f fork esc/ctrl+c/q exit ctrl+t ")
+            .rsplit_once("r retry f fork esc/ctrl+c/q exit ctrl+t ")
             .is_some_and(|(_, end)| end.replace(' ', "") == "transcript")
 }
 
@@ -572,6 +572,9 @@ mod tests {
         let screen = include_str!("../../../tests/fixtures/codex/conversation-locked.txt");
         assert_eq!(detect(screen), AgentState::Blocked);
         assert!(has_visible_blocker(screen));
+        let earlier_footer =
+            format!("r retry f fork esc/ctrl+c/q exit ctrl+t transcript\n{screen}");
+        assert_eq!(detect(&earlier_footer), AgentState::Blocked);
         let history = format!("{screen}\n› Ask Codex to do anything\n  ? for shortcuts\n");
         assert_eq!(detect(&history), AgentState::Idle);
         assert!(!has_visible_blocker(&history));

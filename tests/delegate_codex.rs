@@ -1622,6 +1622,10 @@ fn codex_conversation_lock_is_named_mid_life() {
         stdout_json(&out)["error"]["code"],
         "codex_conversation_locked"
     );
+    assert_eq!(
+        stdout_json(&out)["error"]["data"]["choices"],
+        serde_json::json!(["retry", "fork"])
+    );
     assert_eq!(typed(&server), before);
 }
 
