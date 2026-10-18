@@ -259,7 +259,7 @@ async fn cold_queue_preparation_owner_is_rechecked_at_admission_and_installation
     );
 }
 #[tokio::test]
-async fn cold_queue_live_producer_wins_before_an_older_completion_installs() {
+async fn cold_queue_new_live_generation_rejects_an_older_recovery_completion() {
     let (mut registry, mut workers, notify, _) = owner();
     let (case, launch, factory) = Case::prepare(&mut registry, 948, "idle", vec![]);
     seed(&case);
