@@ -36,6 +36,7 @@ fn api(r: &mut AppQueue, params: AgentSendParams) -> mpsc::Receiver<String> {
     };
     r.app
         .handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "send-fixture".into(),
                 method: Method::AgentSend(params),

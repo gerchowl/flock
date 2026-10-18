@@ -30,7 +30,7 @@ pub(super) struct Retry {
     generation: u64,
     attempts: u32,
     pub(super) at: Instant,
-    /// Owner wakes may shorten long recovery backoff, but never this floor.
+    /// Repeated failure wakes from one owner never bypass this floor.
     pub(super) wake_at: Instant,
 }
 

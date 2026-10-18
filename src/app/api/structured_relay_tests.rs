@@ -93,6 +93,7 @@ fn request(r: &mut AppQueue, d: Deliver) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     r.app
         .handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "relay".into(),
                 method: Method::MeshDeliver(Box::new(d)),
@@ -516,6 +517,7 @@ fn relay_queue_reply_routes_by_verified_custody_origin_not_claimed_host() {
         let (tx, rx) = mpsc::channel();
         r.app
             .handle_api_request_message(crate::api::ApiRequestMessage {
+                scope: None,
                 request: Request {
                     id: "reply".into(),
                     method: Method::MsgReply(crate::api::schema::MsgReplyParams {
@@ -886,6 +888,7 @@ fn custody_completion_legacy_sender_claim_never_routes_to_a_queue() {
         let pid = std::process::id();
         r.app
             .handle_api_request_message(crate::api::ApiRequestMessage {
+                scope: None,
                 request: Request {
                     id: "legacy-reply".into(),
                     method: Method::MsgReply(
@@ -1074,6 +1077,7 @@ fn custody_completion_node_signature_without_local_binding_is_not_sender_attesta
         let pid = std::process::id();
         r.app
             .handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "unbound-reply".into(),
                 method: Method::MsgReply(
@@ -1419,11 +1423,11 @@ fn custody_followup_changed_wakes_have_a_counted_retry_bound() {
             .map_err(|e| e.to_string())
         })
         .unwrap();
+        r.app
+            .retry_queue_custody(d.envelope.clone(), ErrorCode::InputWriteUnknown);
+        let now = std::time::Instant::now();
         r.stop().await;
         r.app.structured_workers = crate::structured::workers::Workers::new(r.notify.clone());
-        r.app
-            .retry_queue_custody(d.envelope.clone(), ErrorCode::AgentNotFound);
-        let now = std::time::Instant::now();
         for n in 0..100 {
             r.app
                 .finish_structured_messages(true, now + std::time::Duration::from_millis(n));

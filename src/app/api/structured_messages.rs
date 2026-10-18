@@ -378,14 +378,10 @@ impl App {
                     .retries
                     .get(&signed.key)
                     .is_some_and(|r| {
-                        let owner = self.custody_owner_generation(&signed);
-                        now < r.at
-                            && (!changed
-                                || (!r.superseded(
-                                    u64::from(owner.is_some()),
-                                    owner.unwrap_or(0),
-                                    false,
-                                ) && now < r.wake_at))
+                        let new_owner = self
+                            .custody_owner_generation(&signed)
+                            .is_some_and(|generation| r.superseded(1, generation, false));
+                        now < r.at && (!changed || (!new_owner && now < r.wake_at))
                     }))
             {
                 self.structured_sends.recovering.push(signed);
