@@ -319,19 +319,7 @@ impl Scheduler {
                 }
             }
         }
-        let result = match event {
-            SessionEvent::Success(e) => e
-                .parent_tool_use_id
-                .as_ref()
-                .and_then(Option::as_ref)
-                .is_none(),
-            SessionEvent::ExecutionError(e) => e
-                .parent_tool_use_id
-                .as_ref()
-                .and_then(Option::as_ref)
-                .is_none(),
-            _ => false,
-        };
+        let result = ends_turn(event);
         if result {
             let mut items = self.members();
             for item in &mut items {
@@ -356,5 +344,22 @@ impl Scheduler {
         self.refused = None;
         self.virgin = false;
         Ok(())
+    }
+}
+
+/// Only known top-level results establish the next S4 coverage boundary.
+pub(in crate::structured) fn ends_turn(event: &SessionEvent) -> bool {
+    match event {
+        SessionEvent::Success(e) => e
+            .parent_tool_use_id
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_none(),
+        SessionEvent::ExecutionError(e) => e
+            .parent_tool_use_id
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_none(),
+        _ => false,
     }
 }

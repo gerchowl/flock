@@ -94,8 +94,11 @@ impl Runtime {
             .ok_or(crate::api::error_code::ErrorCode::QueueModeUnsupported)?
             .enqueue(request)
     }
-    pub(super) fn queue_state(&self, state: crate::api::agent_state::AgentState) -> bool {
+    pub(super) fn queue_state(&self, state: super::workers::queue::Snapshot) -> bool {
         self.queue.as_ref().is_some_and(|q| q.state(state))
+    }
+    pub(super) fn queue_updates_pending(&self) -> bool {
+        self.queue.as_ref().is_some_and(|q| q.has_updates())
     }
     pub(super) fn queue_update(&self) -> Option<super::workers::queue::Update> {
         self.queue.as_ref()?.update()
@@ -496,7 +499,7 @@ fn collect(
                         // Drain their bounded persisted records before retiring items.
                         while let Ok(received) = transport.try_receive() {
                             queue.flush(true, notify);
-                            queue.event(&input, &received.event, true);
+                            queue.event(&input, &received, true);
                         }
                         queue.flush(true, notify);
                         queue.finish(&input, notify);
@@ -568,7 +571,7 @@ fn collect(
                         facts.delivery_cancelled = true;
                     }
                     if let Some(queue) = &mut queue {
-                        queue.event(&input, &received.event, stop.requested());
+                        queue.event(&input, &received, stop.requested());
                     }
                     if !control.cancelled() {
                         pending = Some(received);

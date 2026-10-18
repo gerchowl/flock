@@ -70,7 +70,8 @@ struct Worker {
     finished: bool,
     events_closed: bool,
     stall_after: Duration,
-    queue_state: Option<crate::api::agent_state::AgentState>,
+    queue_state: Option<queue::Snapshot>,
+    queue_seq: u64,
     thread: Option<JoinHandle<()>>,
 }
 impl Worker {
@@ -136,8 +137,9 @@ impl Workers {
     }
     /// Reserve before preparation, then bind the registered cwd/model before spawn.
     /// Preparation must be bounded by its owner. Stop during preparation is latched
-    /// and checked on both sides of the factory. Live/unconfirmed workers refuse
-    /// replacement. Failure may advance the observation epoch but never the record.
+    /// and checked on both sides of the factory. Live/unconfirmed workers and
+    /// unread terminal queue completions refuse replacement with session_busy.
+    /// Failure may advance the observation epoch but never the record.
     pub fn start(
         &mut self,
         registry: &mut Registry,
@@ -161,6 +163,10 @@ impl Workers {
                     .report
                     .as_ref()
                     .is_some_and(|r| r.authority_retained)
+                || previous
+                    .runtime
+                    .as_ref()
+                    .is_some_and(Runtime::queue_updates_pending)
             {
                 return Err(ErrorCode::SessionBusy);
             }
@@ -268,6 +274,7 @@ impl Workers {
                 events_closed: false,
                 stall_after,
                 queue_state: None,
+                queue_seq: 0,
                 thread: Some(thread),
             },
         );
@@ -383,6 +390,7 @@ impl Workers {
                 };
                 match runtime.try_receive() {
                     Ok(received) => {
+                        worker.queue_seq = received.record.seq;
                         if let Some(input) = received.state_input() {
                             changed |= worker.reduce(
                                 registry,
@@ -410,14 +418,17 @@ impl Workers {
             }
             if let Some((_, view, _)) = registry.get(id).filter(|(_, _, g)| *g == worker.generation)
             {
-                let state = &view.update.state;
-                if worker.queue_state.as_ref() != Some(state)
+                let state = queue::Snapshot {
+                    state: view.update.state.clone(),
+                    through: worker.queue_seq,
+                };
+                if worker.queue_state.as_ref() != Some(&state)
                     && worker
                         .runtime
                         .as_ref()
                         .is_some_and(|runtime| runtime.queue_state(state.clone()))
                 {
-                    worker.queue_state = Some(state.clone());
+                    worker.queue_state = Some(state);
                 }
             }
             if let Some(report) = worker

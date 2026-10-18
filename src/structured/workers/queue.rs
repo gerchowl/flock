@@ -3,16 +3,23 @@
 //! and event delivery. Shutdown cancellation explicitly requires durable replay.
 use crate::api::{agent_state::AgentState, error_code::ErrorCode};
 use crate::structured::{
-    claude::SessionEvent,
     queue::{
         admission::{Admission, Failure, Gate, Principal, MAX_BATCH},
         scheduler::{Offer, Pending, Scheduler},
         Cut, Item, Journal, RewritePolicy,
     },
-    transport::InputHandle,
+    transport::{InputHandle, Received},
 };
-use std::{io, num::NonZeroU64, path::Path, sync::mpsc};
+use std::{cell::RefCell, io, num::NonZeroU64, path::Path, sync::mpsc};
 
+/// S4 projection after reducing every session record through this sequence.
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::structured) struct Snapshot {
+    /// Authoritative axes for this exact worker generation.
+    pub state: AgentState,
+    /// Last session record included, even if it did not change the axes.
+    pub through: u64,
+}
 /// Admission fields are supplied by the authenticated dispatcher, never decoded
 /// as authority from a producer string. Buffer acceptance is not durable success.
 pub(crate) struct Request {
@@ -38,8 +45,9 @@ pub(crate) struct Update {
 /// Bounded, nonblocking server-side endpoint. It never owns a file or writer.
 pub(in crate::structured) struct Client {
     requests: mpsc::SyncSender<Request>,
-    states: mpsc::SyncSender<AgentState>,
+    states: mpsc::SyncSender<Snapshot>,
     updates: mpsc::Receiver<Update>,
+    peeked: RefCell<Option<Box<Update>>>,
 }
 impl Client {
     /// Full returns session_busy; disconnection returns agent_not_found. Success
@@ -50,11 +58,23 @@ impl Client {
             mpsc::TrySendError::Disconnected(_) => ErrorCode::AgentNotFound,
         })
     }
-    pub fn state(&self, state: AgentState) -> bool {
+    pub fn state(&self, state: Snapshot) -> bool {
         self.states.try_send(state).is_ok()
     }
+    /// Inspect a finished producer without consuming its next completion.
+    pub fn has_updates(&self) -> bool {
+        let mut peeked = self.peeked.borrow_mut();
+        if peeked.is_none() {
+            *peeked = self.updates.try_recv().ok().map(Box::new);
+        }
+        peeked.is_some()
+    }
     pub fn update(&self) -> Option<Update> {
-        self.updates.try_recv().ok()
+        self.peeked
+            .borrow_mut()
+            .take()
+            .map(|update| *update)
+            .or_else(|| self.updates.try_recv().ok())
     }
 }
 /// Constructed on the launch worker, then moved once to the session event pump.
@@ -62,10 +82,13 @@ impl Client {
 pub(in crate::structured) struct Service {
     scheduler: Scheduler,
     requests: mpsc::Receiver<Request>,
-    states: mpsc::Receiver<AgentState>,
+    states: mpsc::Receiver<Snapshot>,
     updates: mpsc::SyncSender<Update>,
     pending: Option<Update>,
     state: AgentState,
+    covered: u64,
+    required: u64,
+    error: Option<ErrorCode>,
     cursor: u64,
     initial: bool,
     blocked: Option<ErrorCode>,
@@ -88,6 +111,9 @@ impl Service {
                 updates,
                 pending: None,
                 state: AgentState::unknown(),
+                covered: 0,
+                required: 0,
+                error: None,
                 cursor: 0,
                 initial: true,
                 blocked: None,
@@ -98,6 +124,7 @@ impl Service {
                 requests: tx,
                 states: state_tx,
                 updates: rx,
+                peeked: RefCell::new(None),
             },
         ))
     }
@@ -117,7 +144,10 @@ impl Service {
     pub fn tick(&mut self, input: &InputHandle, stopped: bool, notify: &impl Fn()) {
         let mut changed = self.initial;
         if let Ok(state) = self.states.try_recv() {
-            self.state = state;
+            if state.through >= self.required {
+                self.covered = state.through;
+                self.state = state.state;
+            }
             changed = true;
             notify();
         }
@@ -138,8 +168,16 @@ impl Service {
             self.publish(input, stopped, admitted, None);
         }
     }
-    pub fn event(&mut self, input: &InputHandle, event: &SessionEvent, stopped: bool) {
-        let result = self.policy().and_then(|_| self.scheduler.observe(event));
+    pub fn event(&mut self, input: &InputHandle, received: &Received, stopped: bool) {
+        // The pump sees this result before the registry reduces it. Only a
+        // snapshot covering this sequence may re-establish the stdin gate.
+        if crate::structured::queue::scheduler::ends_turn(&received.event) {
+            self.required = self.required.max(received.record.seq);
+            self.state = AgentState::unknown();
+        }
+        let result = self
+            .policy()
+            .and_then(|_| self.scheduler.observe(&received.event));
         self.publish(input, stopped, None, result.err());
     }
     fn policy(&mut self) -> Result<(), Failure> {
@@ -179,6 +217,10 @@ impl Service {
                 self.blocked = Some(error.code);
             }
         }
+        if matches!(offer, Ok(Offer::Submitted { .. })) {
+            self.required = self.covered.saturating_add(1);
+            self.state = AgentState::unknown();
+        }
         let pending = self.scheduler.status_on(input);
         let cut = match self.scheduler.journal().replay(self.cursor) {
             Ok(cut) => Some(cut),
@@ -188,16 +230,18 @@ impl Service {
                 None
             }
         };
+        let error = offer.as_ref().err().map(|e| e.code);
         let changed = self.initial
             || cut.as_ref().is_some_and(|c| c.through != self.cursor)
             || pending != self.status
             || admitted.is_some()
-            || offer.is_err();
+            || error != self.error;
         if changed {
             if let Some(cut) = &cut {
                 self.cursor = cut.through;
             }
             self.initial = false;
+            self.error = error;
             self.status = pending.clone();
             self.pending = Some(Update {
                 admitted,

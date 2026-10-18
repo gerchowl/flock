@@ -298,6 +298,9 @@ async fn worker_queue_delivers_fifo_on_real_result_and_keeps_a_single_writer() {
     assert!(r.admission(1).is_ok());
     r.until(|r| !r.inputs().is_empty()).await;
     assert_eq!(r.inputs()[0]["input"]["uuid"], id(1));
+    r.control(json!({"op":"lifecycle","state":"started"}));
+    r.until(|r| r.registry.get(&r.case.id).unwrap().1.update.state.turn == Turn::Working)
+        .await;
     r.admit(2).await;
     assert!(r.admission(2).is_ok());
     assert_eq!(r.pending().unwrap().cause, PendingCause::AwaitingResult);
@@ -321,6 +324,9 @@ async fn worker_queue_delivers_fifo_on_real_result_and_keeps_a_single_writer() {
         [id(1), id(2)]
     );
     assert_eq!(r.latest_item(1).unwrap()["state"], "done");
+    r.control(json!({"op":"lifecycle","state":"started"}));
+    r.until(|r| r.registry.get(&r.case.id).unwrap().1.update.state.turn == Turn::Working)
+        .await;
     r.control(json!({"op":"result"}));
     r.until(|r| r.latest_item(2).is_some_and(|v| v["state"] == "done"))
         .await;
@@ -537,4 +543,208 @@ async fn worker_queue_torn_tail_counts_toward_reopen_threshold_without_repair() 
     );
     r.stop().await;
     assert_eq!(fs::read(path(&r.case)).unwrap(), bytes);
+}
+
+// Keep registry polling paused while the pump consumes an entire turn's burst.
+// This reproduces the stale pre-turn Idle gate without a scheduling race.
+async fn pump_burst(r: &mut Run, events: Vec<Value>, exit: bool) {
+    r.control(json!({"op":"burst","events":events,"exit":exit}));
+    let notify = r.notify.clone();
+    wait(&notify, || {
+        while let Some(update) = r
+            .workers
+            .queue_update(&r.registry, &r.case.id, r.case.generation)
+        {
+            r.updates.push(update);
+        }
+        r.latest_item(1).is_some_and(|v| v["state"] == "done")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn worker_queue_result_requires_s4_covering_its_attention_event() {
+    let mut r = Run::new(220, "queue", default_policy).await;
+    r.control(json!({"op":"result"}));
+    r.until(|r| r.registry.get(&r.case.id).unwrap().1.update.state.turn == Turn::Idle)
+        .await;
+    r.admit(1).await;
+    r.until(|r| !r.inputs().is_empty()).await;
+    r.admit(2).await;
+    let mut started = event("command_lifecycle");
+    started["command_uuid"] = json!(id(1));
+    let mut limit = event("rate_limit_event");
+    limit["rate_limit_info"]["status"] = json!("rejected");
+    let result = event("result");
+    pump_burst(&mut r, vec![started, limit, result], false).await;
+    assert!(
+        r.latest_item(2).unwrap().get("awaiting_result").is_none(),
+        "next input crossed a result before its S4 projection"
+    );
+    let stale = owner_queue::Snapshot {
+        state: r.registry.get(&r.case.id).unwrap().1.update.state.clone(),
+        through: r.workers.entries[&r.case.id].queue_seq,
+    };
+    let notify = r.notify.clone();
+    wait(&notify, || {
+        r.workers
+            .runtime(&r.case.id, r.case.generation)
+            .unwrap()
+            .queue_state(stale.clone())
+    })
+    .await;
+    r.workers
+        .enqueue(&r.registry, &r.case.id, r.case.generation, request(3))
+        .unwrap();
+    wait(&notify, || {
+        while let Some(update) = r
+            .workers
+            .queue_update(&r.registry, &r.case.id, r.case.generation)
+        {
+            r.updates.push(update);
+        }
+        r.updates
+            .iter()
+            .any(|u| u.admitted.as_ref().is_some_and(|(key, _)| key == &id(3)))
+    })
+    .await;
+    assert!(
+        r.latest_item(2).unwrap().get("awaiting_result").is_none(),
+        "stale Idle snapshot bypassed result sequence coverage"
+    );
+    r.until(|r| {
+        matches!(
+            r.registry.get(&r.case.id).unwrap().1.update.state.attention,
+            Attention::Blocked {
+                reason: crate::api::agent_state::BlockedReason::ProviderLimit,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(r.inputs().len(), 1);
+    r.control(json!({"op":"event","event":event("rate_limit_event")}));
+    r.until(|r| r.inputs().len() == 2).await;
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn worker_queue_result_followed_by_exit_never_offers_the_next_item() {
+    let mut r = Run::new(221, "queue", default_policy).await;
+    r.control(json!({"op":"result"}));
+    r.until(|r| r.registry.get(&r.case.id).unwrap().1.update.state.turn == Turn::Idle)
+        .await;
+    r.admit(1).await;
+    r.until(|r| !r.inputs().is_empty()).await;
+    r.admit(2).await;
+    pump_burst(&mut r, vec![event("result")], true).await;
+    assert!(
+        r.latest_item(2).unwrap().get("awaiting_result").is_none(),
+        "next input offered before the exit reached S4"
+    );
+    let notify = r.notify.clone();
+    wait(&notify, || {
+        let worker = r.workers.entries.get_mut(&r.case.id).unwrap();
+        match worker.messages.try_recv() {
+            Ok(Message::End(report)) => {
+                worker.report = Some(report);
+                true
+            }
+            Ok(Message::Ready(_)) => panic!("duplicate readiness during exit"),
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(error) => panic!("producer lost its exit report: {error}"),
+        }
+    })
+    .await;
+    r.ended().await;
+    assert!(r
+        .updates
+        .iter()
+        .filter_map(|u| u.cut.as_ref())
+        .flat_map(|c| &c.records)
+        .all(|v| !v
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items
+                .iter()
+                .any(|i| i["item_id"] == id(2) && i["awaiting_result"] == true))));
+}
+
+#[tokio::test]
+async fn worker_queue_needs_human_turn_keeps_the_next_item_queued() {
+    let mut r = Run::new(222, "queue", default_policy).await;
+    r.admit(1).await;
+    r.until(|r| !r.inputs().is_empty()).await;
+    r.control(json!({"op":"lifecycle","state":"started"}));
+    r.until(|r| r.registry.get(&r.case.id).unwrap().1.update.state.turn == Turn::Working)
+        .await;
+    r.admit(2).await;
+    r.control(json!({"op":"event","event":event("control_request")}));
+    r.until(|r| {
+        matches!(
+            r.registry.get(&r.case.id).unwrap().1.update.state.attention,
+            Attention::NeedsHuman { .. }
+        )
+    })
+    .await;
+    assert!(r.latest_item(2).unwrap().get("awaiting_result").is_none());
+    assert_eq!(r.inputs().len(), 1);
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn worker_queue_readonly_error_does_not_repeat_a_completion_per_event() {
+    let mut r = Run::new(223, "queue", |case| {
+        let _ = unknown(case);
+        NonZeroU64::new(1).unwrap()
+    })
+    .await;
+    r.updates.clear();
+    let mut events = vec![event("rate_limit_event"); 12];
+    events.push(event("control_request"));
+    r.control(json!({"op":"burst","events":events}));
+    r.until(|r| {
+        matches!(
+            r.registry.get(&r.case.id).unwrap().1.update.state.attention,
+            Attention::NeedsHuman { .. }
+        )
+    })
+    .await;
+    assert!(
+        r.updates.is_empty(),
+        "unchanged read-only status emitted {} completions",
+        r.updates.len()
+    );
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn worker_queue_restart_refuses_to_discard_undrained_completions() {
+    let mut r = Run::new(224, "queue", default_policy).await;
+    r.admit(1).await;
+    r.until(|r| !r.inputs().is_empty()).await;
+    r.workers.stop(&r.case.id, r.case.generation);
+    let notify = r.notify.clone();
+    wait(&notify, || {
+        r.workers.poll(&mut r.registry, Instant::now(), 1000);
+        r.workers.report(&r.case.id, r.case.generation).is_some()
+    })
+    .await;
+    let launch = Launch {
+        agent_id: r.case.id.clone(),
+        generation: r.case.generation,
+        leases: r.case.leases.clone(),
+        state: r.case.fixture.root.path().to_owned(),
+        stall_after: STALL,
+        queue_rewrite_bytes: r.threshold,
+        lineage: None,
+    };
+    assert_eq!(
+        r.workers
+            .start(&mut r.registry, launch, r.case.factory("queue", vec![])),
+        Err(ErrorCode::SessionBusy)
+    );
+    r.pump();
+    r.restart().await;
+    r.stop().await;
 }
