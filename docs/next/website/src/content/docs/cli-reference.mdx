@@ -821,6 +821,18 @@ Speaks the Model Context Protocol over stdio: newline-delimited JSON-RPC 2.0 on 
 
 The server advertises two capabilities: `tools` (the closed table below) and `resources` (handed-over files). It claims no `subscribe`/`listChanged` sub-capability, because it pushes no resource notifications.
 
+### Structured session registration
+
+The structured runtime prepares its own private `--mcp-config` with exactly one MCP server named flock: an absolute pinned flk executable running `mcp serve`, with the owning server's explicit `FLOCK_SOCKET_PATH`. It does not install or edit the operator's MCP profile. The JSON contains no setup-token, operator credentials or trusted agent-id hint. Under ADR-0036 §1/§1a, the MCP child inherits the live Claude process ancestry; the server checks the reserved session's PID and birth time to attribute calls to that agent. A missing, mismatched or already released reservation refuses registration with `structured_mcp_lease_required` (exit 2, retry `never`), before any server is added.
+
+Missing or relative executable paths and relative socket paths fail preparation. Private-file I/O errors propagate without falling back to operator config. Registration does not assert that the harness connected successfully; MCP process startup and tool failures remain harness/tool failures.
+
+The config is mode 0600 inside a fresh mode 0700 session directory. Rotation replaces only that session's MCP file. Unstarted or failed-spawn sessions remove it; running sessions retain it until supervision confirms descendant cleanup. Unconfirmed cleanup retains files and the lease for investigation. The persistent harness transcript profile remains available for resume.
+
+The available tools are the closed table below, subject to the same per-tool policy as socket calls. Messaging and `flock_delegate_list` with `architect: "self"` use the attested structured agent identity. Operator-only owner/policy writes have no MCP tool and refuse as `not_exposed_via_mcp`; direct socket attempts from the same leased ancestry still refuse with `operator_only` (exit 13). Tools requiring a pane, including pane-based restart, self-compaction and wait parking, do not acquire a pane from this registration and can refuse with `no_caller_pane` or their existing tool-specific refusal.
+
+This wires the internal runtime; public structured starts remain gated by #1439. It does not pre-allow tools or answer permission requests: stdio permissions and richer MCP question handling remain the S6 work in ADR-0036 (#1307). The default dedicated-user launch is still refused until #1208; explicit operator-mode sessions retain operator-uid filesystem access, and process detachment remains a limit until uid enforcement (#1629).
+
 ### Addressing across hosts
 
 A pane id names a placement on **one** server, so it cannot address anything on another machine. An `agent_id` can: it is fleet-global and restart-stable (ADR-0008), and it is what `flock_agent_list`'s `fleet` rows report alongside the `host` the agent lives on and a `local` flag.
@@ -844,7 +856,7 @@ Replies need no addressing: `flock_msg_reply` carries the incoming `correlation_
 
 Each hop verifies the origin signature and evaluates `[msg] allow_from` against that origin's configured name, never the forwarding hub. An origin without a configured name matches only `"*"`. Forwarders persist custody before acknowledging and delete their body copy after transfer. The origin retains its copy until final receipt or expiry. Requests carry a visited-node list and a hop budget of eight; loops and exhausted budgets retain upstream custody until routing changes. Fleet pause freezes custody and its TTL. Multi-hop answers and receipts are separate mesh work.
 
-The tool table is closed and intentionally read-mostly. Mutating verbs (`pane.close`, `worktree.remove`/`create`, `agent.start`/`rename`/`focus`, raw pane `send_*`, `server.*`, `notification.*`, `integration.*`) are not exposed and refuse with JSON-RPC code `-32000` and `data.refusal = "not_exposed_via_mcp"`. Modelled flock refusals (`unsupported_for_agent`, `no_agent_session`, `transcript_not_found`, …) propagate through the same code with the flock error code in `data.refusal`.
+The tool table is closed and intentionally read-mostly. Mutating verbs (`pane.close`, `worktree.remove`/`create`, `agent.rename`/`focus`, raw pane `send_*`, `server.*`, `notification.*`, `integration.*`) are not exposed and refuse with JSON-RPC code `-32000` and `data.refusal = "not_exposed_via_mcp"`. Modelled flock refusals (`unsupported_for_agent`, `no_agent_session`, `transcript_not_found`, …) propagate through the same code with the flock error code in `data.refusal`.
 
 Exposed tools:
 
@@ -1001,7 +1013,9 @@ entry reported by list. Only the local operator outside agent panes may use
 these commands; other callers receive `operator_only` (exit 13). Issuance prints
 its bearer only when stdout is a terminal, unless `--json` or `--show-token`
 explicitly permits secret output to a pipe or file. Otherwise it refuses before
-creating a token.
+creating a token. Token names cannot begin with `-`; an operand named
+`--show-token` is not consent. Use `token rm --entry HEX_ID` to revoke an
+older unsafe record by the identifier reported by list.
 
 `flk client open [--print]` creates or reuses the operator credential and opens
 a new browser tab or window at a configured loopback URL containing a single-use

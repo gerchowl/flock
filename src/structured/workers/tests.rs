@@ -72,6 +72,7 @@ impl Case {
             leases: leases.clone(),
             state: fixture.root.path().to_owned(),
             storage: Default::default(),
+            mcp: fixture.mcp(),
             stall_after: STALL,
             lineage: None,
         };

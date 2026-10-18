@@ -179,11 +179,22 @@ pub(crate) struct AppRuntimeConfig {
 impl AppRuntimeConfig {
     /// Capture one server's launch-time identity policy before starting listeners.
     pub(crate) fn for_config(config: &Config) -> Self {
-        let mut runtime = Self::default();
+        Self::for_config_with_uid_policy(config, Default::default())
+    }
+
+    /// Select account policy from injected dependencies before cloning for listeners.
+    pub(crate) fn for_config_with_uid_policy(
+        config: &Config,
+        mut uid_policy: crate::structured::identity::UidPolicy,
+    ) -> Self {
+        // Absence is explicit policy, never an inference from a pending lookup.
         if config.security.agent_account == crate::config::model::AgentAccount::None {
-            runtime.uid_policy.dedicated = Ok(None).into();
+            uid_policy.dedicated = Ok(None).into();
         }
-        runtime
+        Self {
+            merge_gate: Default::default(),
+            uid_policy,
+        }
     }
 }
 
@@ -549,18 +560,16 @@ impl App {
 
     /// Construct an app with explicit process dependencies. Missing executables
     /// retain the merge gate's normal failure classification, without fallback.
+    /// Select account policy with `AppRuntimeConfig::for_config` or its injected
+    /// variant before cloning it for the API listener; this preserves that cache.
     pub(crate) fn new_with_runtime_config(
         config: &Config,
         no_session: bool,
         config_diagnostic: Option<String>,
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
-        mut runtime_config: AppRuntimeConfig,
+        runtime_config: AppRuntimeConfig,
     ) -> Self {
-        // Absence is explicit policy, never an inference from a pending lookup.
-        if config.security.agent_account == crate::config::model::AgentAccount::None {
-            runtime_config.uid_policy.dedicated = Ok(None).into();
-        }
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
         crate::channels::issue_tokens(&config.channels, &short_host_name());
@@ -1353,7 +1362,8 @@ impl App {
             crate::handoff_runtime::ImportedHandoffRuntime,
         >,
     ) -> io::Result<Self> {
-        let structured_agents = snapshot.structured_agents.snapshot();
+        let mut structured_agents = snapshot.structured_agents.snapshot();
+        structured_agents.restore_retained_stamps(&snapshot.structured_retention);
         // Self::new restores attempt evidence once, including interrupted submissions.
         let mut app = Self::new(config, true, config_diagnostic, api_rx, event_hub);
         let (workspaces, terminals, runtimes) = crate::persist::restore_handoff(
