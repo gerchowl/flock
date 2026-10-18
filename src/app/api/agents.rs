@@ -677,6 +677,34 @@ impl App {
     }
 
     pub(super) fn handle_agent_send(&mut self, id: String, params: AgentSendParams) -> String {
+        use crate::api::error_code::ErrorCode;
+        use crate::structured::permissions::Principal;
+        // The dispatcher admits the UID before resolution. Same-UID shell
+        // callers and enrolled relays retain cooperative terminal send rights.
+        match self.structured_send_target(&params.target) {
+            Ok(Some(_)) => {
+                let operator = self.caller_is_local_operator();
+                let caller = self.spawn_caller();
+                let principal = match &caller {
+                    super::SpawnCaller::Operator { .. } if operator => Principal::Operator,
+                    super::SpawnCaller::Agent { agent_id, .. }
+                    | super::SpawnCaller::Structured {
+                        agent_id: Some(agent_id),
+                        ..
+                    } => Principal::Agent(agent_id),
+                    _ => {
+                        return encode_error(
+                            id,
+                            ErrorCode::NotAuthorized.as_str(),
+                            "caller identity is unconfirmed",
+                        )
+                    }
+                };
+                return self.handle_structured_send(id, params, &principal);
+            }
+            Err(code) => return encode_error(id, code.as_str(), "agent target is ambiguous"),
+            Ok(None) => (),
+        }
         if params.submit && params.write_timeout_ms.is_some() {
             return encode_error(
                 id,

@@ -284,6 +284,52 @@ pub(crate) fn handle_connection(
     let changes_ui = request_changes_ui(&request);
     crate::logging::api_request_started(&request_id, method, changes_ui);
 
+    // Read fast paths must cross the same UID/ancestry boundary as App dispatch.
+    if matches!(
+        request.method,
+        Method::EventsSubscribe(_)
+            | Method::MsgWaitReply(_)
+            | Method::EventsRead(_)
+            | Method::PaneWaitForOutput(_)
+    ) {
+        use crate::structured::identity::Principal;
+        match uid_policy.classify(peer.uid) {
+            Principal::Operator => (), // Same-UID reads are cooperative (#1177).
+            Principal::Unknown => {
+                return write_json_line_allow_disconnect(
+                    &mut stream,
+                    &ErrorResponse {
+                        id: request_id,
+                        error: ErrorBody {
+                            data: None,
+                            code: crate::api::error_code::ErrorCode::NotAuthorized
+                                .as_str()
+                                .into(),
+                            message: "socket caller lacks authority for this operation".into(),
+                        },
+                    },
+                );
+            }
+            Principal::Agent => {
+                let response = dispatch_to_app_with_timeout(
+                    Request {
+                        id: request_id.clone(),
+                        method: Method::AuthorizeRead,
+                    },
+                    api_tx,
+                    Some(APP_RESPONSE_TIMEOUT),
+                    peer,
+                );
+                match serde_json::from_str::<SuccessResponse>(&response) {
+                    Ok(reply)
+                        if reply.id == request_id
+                            && matches!(reply.result, ResponseResult::Ok {}) => {}
+                    _ => return write_text_line_allow_disconnect(&mut stream, &response),
+                }
+            }
+        }
+    }
+
     match request.method {
         Method::EventsSubscribe(params) => {
             let result = stream_subscriptions(
@@ -293,6 +339,7 @@ pub(crate) fn handle_connection(
                 api_tx,
                 event_hub,
                 running,
+                peer,
             );
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -375,8 +422,14 @@ pub(crate) fn handle_connection(
             result
         }
         Method::PaneWaitForOutput(params) => {
-            let Some(response) =
-                wait_for_output(request_id.clone(), params, &mut stream, api_tx, running)?
+            let Some(response) = wait_for_output(
+                request_id.clone(),
+                params,
+                &mut stream,
+                api_tx,
+                running,
+                peer,
+            )?
             else {
                 crate::logging::api_request_completed(
                     &request_id,
@@ -591,8 +644,13 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ClientOpen(_) => "client.open",
         Method::ChannelHello(_) => "channel.hello",
         Method::WaitPark(_) => "wait.park",
+        #[cfg(test)]
         Method::WaitHold(..) => "wait.hold",
+        #[cfg(test)]
         Method::WaitRelease(_) => "wait.release",
+        Method::WaitHoldAdmitted(..) => "wait.hold",
+        Method::WaitReleaseAdmitted(_) => "wait.release",
+        Method::AuthorizeRead => "authority.read",
         Method::OwnerBind(_) => "owner.bind",
         Method::OwnerUnbind(_) => "owner.unbind",
         Method::OwnerList(_) => "owner.list",
@@ -685,6 +743,7 @@ fn stream_subscriptions(
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
+    peer: crate::platform::peer::Credentials,
 ) -> std::io::Result<()> {
     // ADR-0028 §3 (#1030): from the caller's cursor, else from now. A
     // cursor past the newest event is refused, as `events.read` refuses it,
@@ -711,6 +770,7 @@ fn stream_subscriptions(
             start,
             api_tx,
             event_hub,
+            peer,
         ) {
             Ok(active) => active,
             Err(response) => {
@@ -923,6 +983,58 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Mutex, OnceLock};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn unattested_read_fast_paths_refuse_before_cursor_or_target_validation() {
+        let requests = [
+            serde_json::json!({"method":"events.read","params":{"after":999}}),
+            serde_json::json!({"method":"pane.wait_for_output","params":{
+                "pane_id":"missing.example","source":"recent","match":{"type":"regex","value":"["}}}),
+            serde_json::json!({"method":"events.subscribe","params":{"subscriptions":[{
+                "type":"pane.output_matched","pane_id":"missing.example","source":"recent",
+                "match":{"type":"regex","value":"["}}]}}),
+        ];
+        for mut request in requests {
+            request["id"] = serde_json::json!("authority");
+            // Classify the owned socket's real UID as unknown without changing accounts.
+            let uid = crate::platform::peer::effective_uid();
+            let policy = crate::structured::identity::UidPolicy {
+                operator: uid.wrapping_add(1),
+                dedicated: Ok(None).into(),
+            };
+            let (server, mut client) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            writeln!(client, "{request}").unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            handle_connection(
+                server,
+                &tx,
+                &EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+                &Mutex::default(),
+                &policy,
+            )
+            .unwrap();
+            let mut line = String::new();
+            BufReader::new(client).read_line(&mut line).unwrap();
+            let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                reply,
+                serde_json::json!({"id":"authority","error":{
+                "code":"not_authorized","message":"socket caller lacks authority for this operation"}})
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "no target or cursor lookup may reach the App"
+            );
+        }
+        assert!(serde_json::from_value::<Request>(serde_json::json!({
+            "id":"forged","method":"authority.read","params":{}}))
+        .is_err());
+    }
 
     #[test]
     fn accept_error_then_success_serves_ping_and_reports_health() {
@@ -1604,7 +1716,16 @@ mod tests {
         let app = std::thread::spawn(move || {
             let mut seen = Vec::new();
             while let Some(message) = api_rx.blocking_recv() {
-                if matches!(message.request.method, Method::WaitHold(..)) {
+                if let Method::WaitHoldAdmitted(_, _, admission) = &message.request.method {
+                    admission
+                        .set(
+                            crate::api::schema::WaitReleaseAuthority::admitted(
+                                "w_1".into(),
+                                crate::structured::identity::Principal::Operator,
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
                     assert_eq!(
                         message.peer_uid,
                         Some(crate::platform::peer::effective_uid())
@@ -1663,13 +1784,14 @@ mod tests {
             subjects: vec!["ws_1:p2".into()],
             after: 1,
         };
-        assert_eq!(
-            seen,
-            [
-                Method::WaitHold(predicate, 50),
-                Method::WaitRelease("w_1".into())
-            ]
-        );
+        let [Method::WaitHoldAdmitted(held, 50, admission), Method::WaitReleaseAdmitted(grant)] =
+            seen.as_slice()
+        else {
+            panic!("the read must open and release its admitted hold: {seen:?}");
+        };
+        assert_eq!(held, &predicate);
+        assert_eq!(admission.get(), Some(grant));
+        assert_eq!(grant.release_id(), Some("w_1"));
     }
 
     /// #1028: `events.read` filters by subject and holds the request on the

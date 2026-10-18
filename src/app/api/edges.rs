@@ -82,6 +82,10 @@ impl App {
         respond_to: std::sync::mpsc::Sender<String>,
         response: String,
     ) {
+        if let Some(staged) = self.structured_sends.staged.take() {
+            self.structured_sends.park(staged, respond_to);
+            return;
+        }
         let respond_to = match self.input_writes.park(respond_to) {
             Ok(()) => {
                 self.start_ready_pastes();

@@ -20,6 +20,7 @@ pub(super) fn wait_for_output(
     stream: &mut UnixStream,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
+    peer: crate::platform::peer::Credentials,
 ) -> std::io::Result<Option<String>> {
     crate::logging::api_wait_started(&request_id, &params.pane_id, params.timeout_ms);
     let deadline = params
@@ -62,12 +63,8 @@ pub(super) fn wait_for_output(
                 strip_ansi: params.strip_ansi,
             }),
         };
-        let response = dispatch_to_app_with_timeout(
-            read_request,
-            api_tx,
-            Some(APP_RESPONSE_TIMEOUT),
-            Default::default(),
-        );
+        let response =
+            dispatch_to_app_with_timeout(read_request, api_tx, Some(APP_RESPONSE_TIMEOUT), peer);
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else {
             return Ok(Some(response));
         };
