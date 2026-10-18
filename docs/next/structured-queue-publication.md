@@ -68,8 +68,11 @@ serve their immutable replay and `synced`, then `End`. A later live generation
 uses its own fenced owner and continues at the persisted queue sequence.
 Retired sources are removed from the owner cache during registry polling.
 
-Lease contention is `session_busy`. I/O/opening failures, including a missing
-journal, are `queue_recovery_failed` with `retry: after_inspecting`: recovery
+A missing queue namespace is `queue_not_found` (`retry: never`): resolve or
+create the queue before requesting recovery. It performs no creation. An
+existing journal may receive its durable first-subscription bootstrap.
+Lease contention is `session_busy`. Other I/O/opening failures are
+`queue_recovery_failed` with `retry: after_inspecting`: recovery
 may have repaired a tail or completed a bootstrap before the failure. No
 mutation is automatically retried. Worker loss/panic is
 `structured_worker_panicked`. The configured rewrite policy re-derives

@@ -38,7 +38,8 @@ fn cold_queue_recovery_missing_journal_never_creates_an_empty_source() {
     let error = Source::open_retained(root.path(), "missing-fixture", policy())
         .err()
         .expect("created a missing queue");
-    assert_eq!(error.code.as_str(), "queue_recovery_failed");
+    assert_eq!(error.code.as_str(), "queue_not_found");
+    assert_eq!(error.code.retry().as_str(), "never");
     assert_eq!(error.source.unwrap().kind(), std::io::ErrorKind::NotFound);
     assert!(!root.path().join("sessions/missing-fixture").exists());
 }
