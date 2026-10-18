@@ -71,7 +71,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const sender: Sender = {
     commands: () => (revision(), connection.commands()),
     // `submit` sends the message, not only types it (`AgentSendParams`; S7a's agent-send script).
-    send: (agent, text) => connection.command("agent.send", { target: agent, text, submit: true }),
+    send: (agent, text, echoAfter) => connection.command("agent.send", { target: agent, text, submit: true }, undefined, echoAfter),
     blocked: () => (revision(), connection.principal === null ? "Sending opens once the server has welcomed this client." : null),
   };
   connection.connect();
