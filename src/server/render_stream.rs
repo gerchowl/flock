@@ -469,6 +469,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn pane_osc_titles_are_consumed_before_both_frame_encodings() {
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 2, &[]);
+        runtime.test_process_pty_bytes(b"\x1b]0;pane-zero\x07\x1b]2;pane-two\x1b\\visible");
+        let (buffer, cursor) = render_terminal_virtual(&runtime, Rect::new(0, 0, 20, 2));
+        let frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &[]);
+        assert!(frame
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>()
+            .contains("visible"));
+        for encoding in [RenderEncoding::SemanticFrame, RenderEncoding::TerminalAnsi] {
+            let mut state = ClientRenderState::new(encoding);
+            let prepared = state.prepare_frame(frame.clone()).unwrap();
+            let bytes = match prepared.message() {
+                ServerMessage::Terminal(terminal) => terminal.bytes.clone(),
+                ServerMessage::Frame(semantic) => BlitEncoder::new().encode(semantic, true).bytes,
+                other => panic!("unexpected render: {other:?}"),
+            };
+            assert!(!bytes
+                .windows(4)
+                .any(|bytes| bytes == b"\x1b]0;" || bytes == b"\x1b]2;"));
+            assert!(!bytes
+                .windows(b"pane-two".len())
+                .any(|bytes| bytes == b"pane-two"));
+        }
+    }
+
     #[test]
     fn semantic_inactive_pane_skips_repeated_render_work() {
         let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
