@@ -13,7 +13,9 @@ pub const POLICY: &str =
 // Unicode Cf is broader than bidi controls. ZWJ supports emoji sequences.
 // variation selectors are marks, not Cf, and remain permitted. Reject the
 // entire tag block too, including its currently unassigned positions.
-fn unsafe_char(c: char) -> bool {
+/// Shared forbidden-scalar predicate for identities and presentation text
+/// (ADR-0014 §4). ZWJ and variation selectors remain permitted.
+pub(crate) fn unsafe_char(c: char) -> bool {
     c.is_control()
         || (c.is_format() && c != '\u{200d}')
         || matches!(c, '\u{2028}' | '\u{2029}' | '\u{e0000}'..='\u{e007f}')

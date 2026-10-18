@@ -157,10 +157,12 @@ existing 80-scalar budget. Empty reported agent labels return
 
 Peer receive admission includes project keys, because the sidebar derives its
 project-group label from that key before considering `project_label`. JSON
-workspace/agent decoding and binary/relay conversion share a single admission
-method per record. Each peer presentation field retains at most 256 Unicode
+workspace/agent admission and binary/relay conversion share a single admission
+method per record. Generic schema deserialization remains data-only, without
+peer warnings; the JSON summary parser, binary conversion and relay merger are
+the admission boundaries. Each peer presentation field retains at most 256 Unicode
 scalar values after sanitization: workspace, project key/label, branch, activity,
-peer name, reported host, version, icon, error and origin/route display labels.
+peer display name, version, icon, error and origin display labels.
 The cap bounds render/search work after the existing frame-size check. Identity
 labels still use 64 scalars; thermal labels additionally retain their 16-byte cap.
 Unknown icon names resolve to a blank icon; dial reasons are classified tokens.
@@ -172,6 +174,17 @@ SSH destination and ProxyJump grammar is checked with the same 256-byte bound:
 invalid relay rows are refused, and invalid carried routes are disabled rather
 than partially rewritten. The reserved home target remains supported. The mesh
 layout and VERSION remain unchanged.
+Reported hosts and `via` edge names are identities, not presentation. Validate
+raw values with the shared forbidden-scalar predicate and a 256-byte routing
+bound, without trimming, stripping or truncation. Empty reported hosts retain
+the legacy destination fallback; an empty `via` cannot route a row. Unsafe hosts
+refuse a direct JSON summary, drop a relayed row, or disable a carried binary
+route. Invalid `via` refuses the batch. A content-free
+`peer.summary.identifier_dropped` warning carries `invalid_params` and the fixed
+field name only. Thus host keys computed after admission still represent the
+raw received identity (apart from the existing ASCII case-insensitive lookup),
+and a control/bidi-laden host cannot compete with the plain host after cleaning.
+
 
 ### 5. The ceiling is lineage-aware, not a single global counter
 

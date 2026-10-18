@@ -17,6 +17,21 @@ pub(crate) fn text(value: &str) -> String {
     crate::terminal::agent_name::presentation_limited(value, MAX_TEXT_CHARS)
 }
 
+/// Validate a routing/host identity without rewriting it. Unlike presentation,
+/// identities may not lose controls, format characters or an oversized suffix.
+/// The byte bound matches other opaque routing tokens; warnings carry no value.
+pub(super) fn identity(value: &str, field: &'static str) -> bool {
+    if value.is_empty()
+        || value.len() > MAX_TOKEN_BYTES
+        || value.chars().any(crate::terminal::agent_name::unsafe_char)
+    {
+        crate::logging::peer_summary_identifier_dropped(field);
+        false
+    } else {
+        true
+    }
+}
+
 fn optional(value: &mut Option<String>) {
     if let Some(text_value) = value {
         *text_value = text(text_value);
@@ -69,8 +84,12 @@ impl PeerWorkspaceSummary {
 
 impl super::PeerSummaryPayload {
     /// Admit the parsed JSON envelope before it can populate state or snapshots.
-    pub(super) fn received(mut self) -> Self {
-        self.host = text(&self.host);
+    pub(super) fn received(mut self) -> Result<Self, String> {
+        if !self.host.is_empty() && !identity(&self.host, "host") {
+            return Err(crate::api::error_code::ErrorCode::InvalidParams
+                .as_str()
+                .into());
+        }
         optional(&mut self.version);
         optional(&mut self.icon);
         if let Some(node) = &mut self.node_id {
@@ -87,15 +106,30 @@ impl super::PeerSummaryPayload {
         self.relayed_fleet = self
             .relayed_fleet
             .into_iter()
-            .map(crate::api::schema::RelayedFleetPeer::received)
+            .filter_map(crate::api::schema::RelayedFleetPeer::received)
             .collect();
-        self
+        Ok(self)
     }
 }
 
 impl super::PeerSummaryState {
     /// Admit a materialized fleet row. Invalid SSH routes are disabled, never edited.
     pub(super) fn received(mut self) -> Self {
+        let invalid_host = self
+            .host
+            .as_deref()
+            .filter(|host| !host.is_empty())
+            .is_some_and(|host| !identity(host, "host"));
+        if invalid_host {
+            self.host = None;
+            self.ssh_target.clear();
+            self.proxy_jump = None;
+            self.error = Some(
+                crate::api::error_code::ErrorCode::InvalidParams
+                    .as_str()
+                    .into(),
+            );
+        }
         self.peer = text(&self.peer);
         for field in [
             &mut self.host,
@@ -119,7 +153,9 @@ impl super::PeerSummaryState {
                 || (jump.len() <= MAX_TOKEN_BYTES && crate::remote::is_valid_ssh_proxy_jump(jump))
         });
         if !valid_target || !valid_jump {
-            crate::logging::peer_summary_identifier_dropped("ssh_route");
+            if !invalid_host {
+                crate::logging::peer_summary_identifier_dropped("ssh_route");
+            }
             self.ssh_target = String::new();
             self.proxy_jump = None;
             self.error = Some(
@@ -139,8 +175,17 @@ impl super::PeerSummaryState {
 
 impl crate::api::schema::RelayedFleetPeer {
     /// Admit a raw relayed row before keying its cache or exposing its fields.
+    /// Refuse unsafe host identities before cleaning any presentation text.
     /// SSH destinations remain untouched here and are checked before admission.
-    pub(crate) fn received(mut self) -> Self {
+    pub(crate) fn received(mut self) -> Option<Self> {
+        if self
+            .host
+            .as_deref()
+            .filter(|host| !host.is_empty())
+            .is_some_and(|host| !identity(host, "host"))
+        {
+            return None;
+        }
         self.name = text(&self.name);
         self.origin = text(&self.origin);
         for field in [
@@ -169,6 +214,6 @@ impl crate::api::schema::RelayedFleetPeer {
             .into_iter()
             .map(PeerWorkspaceSummary::received)
             .collect();
-        self
+        Some(self)
     }
 }
