@@ -973,9 +973,9 @@ from the operator (the cooperative limit tracked in #1177; ADR-0036 §1a).
 
 `flk config check` and startup diagnostics warn if `agent_account = "none"` is
 combined with `[structured] run_as = "flk-agent"`. A launched agent using a
-separate dedicated UID then remains `Unknown` (read-only). Enable account
-recognition when using that launch identity, or explicitly select operator-mode
-launch when no dedicated account is used. The warning does not change authority.
+separate dedicated UID then remains `Unknown` (read-only). Set
+`security.agent_account = "flk-agent"` when using that launch identity, or
+explicitly select operator-mode launch when no dedicated account is used. The warning does not change authority.
 Account lookup and collision diagnostics belong to each server instance; its app
 and API listener share the same policy, and Ping never starts or waits for NSS.
 
