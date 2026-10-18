@@ -337,7 +337,8 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   resolved absent account does too. A dedicated UID equal to the server UID
   is a §1a misconfiguration, never operator authority. Report
   `agent_account_uid_collision` once in the log and retain the typed diagnostic
-  in server status until restart.
+  in server status until restart. Each server owns its account cache and
+  collision-reporting state; its app and API listener share the same policy.
 
   Explicit `agent_account = "none"` declares that no dedicated account is used.
   The server never starts the dedicated-account NSS lookup, and callers with
