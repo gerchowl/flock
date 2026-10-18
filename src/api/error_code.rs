@@ -49,7 +49,8 @@ impl ErrorCode {
             ErrorCode::InputWriteCancelled
             | ErrorCode::WorktreeCheckoutUnreachable
             | ErrorCode::WorktreePathNotRoot
-            | ErrorCode::WorktreeRepositoryUnreachable => exit::REFUSED,
+            | ErrorCode::WorktreeRepositoryUnreachable
+            | ErrorCode::WorktreeRepositoryInvalidProof => exit::REFUSED,
             ErrorCode::InputWriteFailed | ErrorCode::InputWriteUnknown => exit::UNCONFIRMED,
             ErrorCode::ServerVersionGap => exit::PROTOCOL_GAP,
             // ADR-0029 §2: the wrong operation requires a corrected call.
@@ -267,6 +268,7 @@ error_codes! {
         WorktreeCheckoutUnreachable = "worktree_checkout_unreachable",
         WorktreePathNotRoot = "worktree_path_not_root",
         WorktreeRepositoryUnreachable = "worktree_repository_unreachable",
+        WorktreeRepositoryInvalidProof = "worktree_repository_invalid_proof",
         StructuredWorkerPanicked = "structured_worker_panicked",
         StructuredWorkerTimeout = "structured_worker_timeout",
         StructuredWorkerCleanupFailed = "structured_worker_cleanup_failed",
@@ -292,6 +294,7 @@ mod tests {
             ErrorCode::WorktreeCheckoutUnreachable,
             ErrorCode::WorktreePathNotRoot,
             ErrorCode::WorktreeRepositoryUnreachable,
+            ErrorCode::WorktreeRepositoryInvalidProof,
         ] {
             assert_eq!(code.retry().as_str(), "after_human");
             assert_eq!(code.exit(), crate::cli::exit::REFUSED);
@@ -349,7 +352,7 @@ mod tests {
             ("yes", "timeout"),
             ("later", "agent_not_ready at_agent_capacity at_fanout_limit channel_token_unavailable fleet_paused handoff_undrained injection_pending input_not_empty input_write_cancelled mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active restart_busy restart_pending restart_rate_limited session_busy session_unconfirmed too_many_waits unknown_composer worktree_merge_unknown worktree_open_pr"),
             ("after_inspecting", "agent_exited_at_start agent_exited_before_ready input_write_failed input_write_unknown no_result self_submit_unconfirmed session_mismatch"),
-            ("after_human", "claude_folder_trust codex_folder_trust codex_hook_review structured_harness_version_unsupported structured_needs_agent_user structured_worker_cleanup_failed structured_worker_panicked structured_worker_timeout worktree_checkout_unreachable worktree_path_not_root worktree_repository_unreachable"),
+            ("after_human", "claude_folder_trust codex_folder_trust codex_hook_review structured_harness_version_unsupported structured_needs_agent_user structured_worker_cleanup_failed structured_worker_panicked structured_worker_timeout worktree_checkout_unreachable worktree_path_not_root worktree_repository_invalid_proof worktree_repository_unreachable"),
             ("after_handoff", "mail_store_schema_too_new mesh_version_mismatch peer_incompatible server_version_gap"),
         ]
         .into_iter()
@@ -372,7 +375,8 @@ mod tests {
                 ErrorCode::InputWriteCancelled
                 | ErrorCode::WorktreeCheckoutUnreachable
                 | ErrorCode::WorktreePathNotRoot
-                | ErrorCode::WorktreeRepositoryUnreachable => 10,
+                | ErrorCode::WorktreeRepositoryUnreachable
+                | ErrorCode::WorktreeRepositoryInvalidProof => 10,
                 ErrorCode::InputWriteFailed | ErrorCode::InputWriteUnknown => 8,
                 ErrorCode::ServerVersionGap => 78,
                 ErrorCode::NotAuthorized

@@ -858,12 +858,16 @@ struct ClosedWorkspaceFixture {
     app: crate::app::App,
     server: Option<crate::api::server::ServerHandle>,
     repo: PathBuf,
+    repo_cleanup: PathBuf,
     checkout: PathBuf,
     root: crate::test_support::TempDir,
     env: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 impl ClosedWorkspaceFixture {
     fn new() -> Self {
+        Self::layout("normal")
+    }
+    fn layout(layout: &str) -> Self {
         let root = crate::test_support::TempDir::socket();
         let mut env = vec![("FLOCK_CONFIG_PATH", std::env::var_os("FLOCK_CONFIG_PATH"))];
         std::env::remove_var("FLOCK_CONFIG_PATH");
@@ -876,7 +880,26 @@ impl ClosedWorkspaceFixture {
             env.push((key, std::env::var_os(key)));
             std::env::set_var(key, value);
         }
-        let repo = crate::test_support::create_committed_repo("delegate-explicit-repo");
+        let mut repo = crate::test_support::create_committed_repo("delegate-explicit-repo");
+        let repo_cleanup = repo.clone();
+        if layout == "separate" {
+            crate::test_support::run_git(
+                &repo,
+                &[
+                    "init",
+                    "--separate-git-dir",
+                    root.path().join("admin").to_str().unwrap(),
+                ],
+            );
+        } else if layout == "submodule" {
+            let source = crate::test_support::create_committed_repo("delegate-module-source");
+            crate::test_support::run_git_over_file_protocol(
+                &repo,
+                &["submodule", "add", source.to_str().unwrap(), "sub"],
+            );
+            std::fs::remove_dir_all(source).unwrap();
+            repo = repo.join("sub").canonicalize().unwrap();
+        }
         let checkout = root.path().join("checkout");
         crate::test_support::run_git(
             &repo,
@@ -913,6 +936,7 @@ impl ClosedWorkspaceFixture {
             app,
             server: Some(server),
             repo,
+            repo_cleanup,
             checkout,
             root,
             env,
@@ -948,7 +972,7 @@ impl ClosedWorkspaceFixture {
 impl Drop for ClosedWorkspaceFixture {
     fn drop(&mut self) {
         self.server.take().unwrap().finish_for_test();
-        std::fs::remove_dir_all(&self.repo).unwrap();
+        std::fs::remove_dir_all(&self.repo_cleanup).unwrap();
         for (key, prior) in self.env.drain(..).rev() {
             match prior {
                 Some(value) => std::env::set_var(key, value),
@@ -1028,6 +1052,62 @@ async fn reap_externally_deleted_checkout_removes_only_its_registration_without_
     let rows = crate::worktree::list_existing_worktrees(&fixture.repo).unwrap();
     assert!(!rows.iter().any(|row| row.path == fixture.checkout));
     assert!(rows.iter().any(|row| row.path == sibling));
+}
+
+async fn real_layout_reap(layout: &str) {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = ClosedWorkspaceFixture::layout(layout);
+    let mut entry = entry_for("real-layout-reap");
+    entry.mode = "worktree".into();
+    entry.worktree = Some(fixture.checkout.to_string_lossy().into_owned());
+    entry.repo_root = Some(fixture.repo.to_string_lossy().into_owned());
+    entry.branch = Some("worktree/delegate-recovery".into());
+    write_entry(&entry).unwrap();
+    let result = fixture
+        .drive(|| delegate_reap(&["real-layout-reap".into(), "--json".into()]))
+        .await
+        .unwrap();
+    assert_eq!(result, 0);
+    assert!(!fixture.checkout.exists());
+    assert!(!entry_path(&entry.name).exists());
+    assert!(fixture.repo.is_dir());
+}
+#[tokio::test]
+async fn separate_git_dir_real_checkout_proof_reaps() {
+    real_layout_reap("separate").await;
+}
+#[tokio::test]
+async fn submodule_real_checkout_proof_reaps() {
+    real_layout_reap("submodule").await;
+}
+
+async fn real_layout_placement_cleanup(layout: &str) {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = ClosedWorkspaceFixture::layout(layout);
+    let repo = fixture.repo.to_string_lossy().into_owned();
+    let result = fixture
+        .drive(move || {
+            teardown_after_place_failure(
+                "layout-placement",
+                Some(&[]),
+                Mode::Worktree,
+                &start_flags_worktree("worktree/delegate-recovery"),
+                &repo,
+                CreateFailure::TimedOut,
+            )
+        })
+        .await;
+    assert_eq!(result, crate::cli::exit::FAILURE);
+    assert!(!fixture.checkout.exists());
+    assert!(fixture.repo.is_dir());
+}
+#[tokio::test]
+async fn separate_git_dir_real_checkout_placement_cleans_up() {
+    real_layout_placement_cleanup("separate").await;
+}
+#[tokio::test]
+async fn submodule_real_checkout_placement_cleans_up() {
+    real_layout_placement_cleanup("submodule").await;
 }
 
 #[tokio::test]

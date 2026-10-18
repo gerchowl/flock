@@ -308,10 +308,11 @@ for the shared error codes, diagnostic fields and recovery instructions.
 `worktree kill` is the scriptable twin of the TUI's "Kill worktree & branch": it runs the same merge gate (merged PR via `gh`, merged into a landing branch or the branch's own PR base, an unpushed branch with no commits of its own, or content already landed by a squash or rebase) and deletes the local branch only with positive evidence. Containment in some other remote feature branch is not evidence. A branch that heads an **open** PR is live work: `--dry-run` reports `open_pr: true` and `would_delete_branch: false` (exit 3), and a real kill is refused with `worktree_open_pr`, exit 10, before anything moves; `--force` does not clear it. When `gh` cannot answer for a repo with a github.com remote (rate limit, offline, logged out, missing), the verdict is `unknown`: `--dry-run` reports `merge_unknown: true` with the reason in `evidence`, and a real kill is refused with `worktree_merge_unknown`, exit 10, retryable once `gh` answers. `--keep-branch` removes the checkout alone in both cases, as does `worktree remove`. The same refusals reach `delegate reap`, and the TUI's kill-all sweep and the scheduled reap skip such checkouts entirely. Address it with `--workspace ID` or `--path PATH`; a path that is open as a workspace closes that workspace too. `--path` is what makes a stale checkout nobody has open actionable at all — removing one with raw `git worktree remove` leaves the workspace pointing at a directory that no longer exists. `--dry-run` prints the gate verdict as JSON (exit 0 evidence found, 3 none); `--keep-branch` always preserves the branch; dirty checkouts exit 4 until `--force`. The landing branches (the detected default branch plus `dev`, `main` and `master`, and any `[worktrees] integration_branches` entry) and any `[worktrees] protected_branches` entry are kept under every path. See [Which branch counts as merged](/docs/configuration/#which-branch-counts-as-merged) for how that set is decided.
 
 `worktree kill --path PATH --repo REPO` explicitly identifies the repository when
-it has no open workspace. `REPO` must be the repository's main checkout root,
-identified by Git's first porcelain row. The CLI makes `--repo` absolute; the
-server verifies the root proof and that `PATH` is exactly a registered linked
-root of that repository. A wrong repo,
+it has no open workspace. `REPO` must be the real main checkout root (or bare
+repository root), not an admin directory or Git's first porcelain row. The CLI
+makes `--repo` absolute; the server verifies the root proof and that `PATH` is
+exactly a registered linked root of that repository. Invalid proofs and
+inaccessible repositories use the [typed recovery rules](./socket-api/#worktree-removal-recovery). A wrong repo,
 a subdirectory or the repository's main checkout cannot be removed this way.
 `delegate reap` and failed-placement cleanup pass the repository recorded at
 start, so they still work after all relevant workspaces have closed. They remove
