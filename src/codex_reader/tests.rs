@@ -64,7 +64,7 @@ impl Fixture {
 }
 fn limits() -> Limits {
     Limits {
-        file_bytes: 2 * 1024 * 1024,
+        work_bytes: 2 * 1024 * 1024,
         record_bytes: 256 * 1024,
         turn_ids: 256,
     }
@@ -97,7 +97,7 @@ fn verified_appends_reduce_once_and_quiet_eof_has_no_age_lease() {
         let update = reader.poll(later).unwrap();
         assert!(update.bytes.is_empty());
         assert_eq!(update.checkpoint, first.checkpoint);
-        assert_eq!(update.eof_at, later);
+        assert_eq!(update.eof_at, Some(later));
         reducer.feed(&update.bytes, later);
         assert_eq!(reducer.observe(later).turn, Turn::Working);
     }
@@ -268,24 +268,17 @@ fn referenced_history_uses_declared_base_and_unknown_kinds_preserve_continuity()
 }
 
 #[test]
-fn file_record_and_turn_budgets_never_truncate_or_evict_evidence() {
+fn record_and_turn_budgets_never_truncate_or_evict_evidence() {
     let f = Fixture::new(meta());
     f.append(&event("task_started", "first"));
-    for bounded in [
-        Limits {
-            file_bytes: 2,
-            ..limits()
-        },
-        Limits {
-            record_bytes: 2,
-            ..limits()
-        },
-    ] {
-        assert!(matches!(
-            f.reader(bounded).poll(Instant::now()),
-            Err(Reason::CapacityExceeded)
-        ));
-    }
+    let bounded = Limits {
+        record_bytes: 2,
+        ..limits()
+    };
+    assert!(matches!(
+        f.reader(bounded).poll(Instant::now()),
+        Err(Reason::CapacityExceeded)
+    ));
     let bounded = Limits {
         turn_ids: 1,
         ..limits()
@@ -365,4 +358,157 @@ fn invalid_history_modes_bases_and_ordinal_overflow_cannot_guess_continuity() {
             Err(Reason::OrdinalDiscontinuity)
         ));
     }
+}
+
+// A work unit is not an EOF observation or a total-history budget.
+fn drain(reader: &mut Reader, now: Instant) -> (Vec<u8>, usize) {
+    let mut delivered = Vec::new();
+    let mut scanned = 0;
+    for _ in 0..100_000 {
+        let update = reader.poll(now).unwrap();
+        assert!(update.scanned <= reader.scan.limits.work_bytes);
+        assert!(update.bytes.len() <= reader.scan.limits.work_bytes);
+        assert!(update.checkpoint.partial.len() <= reader.scan.limits.record_bytes);
+        scanned += update.scanned;
+        delivered.extend(update.bytes);
+        if update.eof_at.is_some() {
+            assert_eq!(update.eof_at, Some(now));
+            return (delivered, scanned);
+        }
+    }
+    panic!("bounded scan never reached EOF");
+}
+
+#[test]
+fn streaming_work_units_remove_the_total_file_cliff_and_hash_each_byte_once_per_pass() {
+    let f = Fixture::new(meta());
+    for _ in 0..200 {
+        f.append(&line(
+            json!({"type":"event_msg","payload":{"type":"future_event","text":"padding"}}),
+        ));
+    }
+    f.append(&event("task_started", "active"));
+    let mut reader = f.reader(Limits {
+        work_bytes: 17,
+        ..limits()
+    });
+    let now = Instant::now();
+    let bytes = fs::read(&f.path).unwrap();
+    let (delivered, scanned) = drain(&mut reader, now);
+    assert_eq!(delivered, bytes);
+    assert_eq!(scanned, bytes.len());
+    let mut reducer = limits().reducer(None);
+    reducer.feed(&delivered, now);
+    for hours in [1, 10, 100] {
+        let later = now + Duration::from_secs(hours * 3600);
+        let (delivered, scanned) = drain(&mut reader, later);
+        assert!(delivered.is_empty());
+        assert_eq!(scanned, bytes.len());
+        assert_eq!(reducer.observe(later).turn, Turn::Working);
+        assert_eq!(reducer.observe(later).boundary.unwrap().at, now);
+    }
+    let end = event("task_complete", "active");
+    f.append(&end);
+    let (delivered, scanned) = drain(&mut reader, now);
+    assert_eq!(delivered, end);
+    assert_eq!(scanned, bytes.len() + end.len());
+    reducer.feed(&delivered, now);
+    assert_eq!(reducer.observe(now).turn, Turn::Idle);
+    assert!(drain(&mut reader, now).0.is_empty());
+}
+
+#[test]
+fn streamed_prefix_edits_and_shrink_fail_before_any_suffix_is_delivered() {
+    for shrink in [false, true] {
+        let f = Fixture::new(meta());
+        for _ in 0..40 {
+            f.append(&line(json!({"type":"future_record","text":"unchanged"})));
+        }
+        let mut reader = f.reader(Limits {
+            work_bytes: 7,
+            ..limits()
+        });
+        let now = Instant::now();
+        drain(&mut reader, now);
+        let old = reader.scan.cursor.clone();
+        let first = reader.poll(now).unwrap();
+        assert_eq!(first.scanned, 7);
+        assert!(first.bytes.is_empty());
+        assert!(first.eof_at.is_none());
+        assert_eq!(first.checkpoint, old);
+        let mut bytes = fs::read(&f.path).unwrap();
+        if shrink {
+            bytes.truncate(bytes.len() - 1);
+        } else {
+            let n = bytes.len() - 5;
+            bytes[n] = b'x';
+        }
+        fs::write(&f.path, bytes).unwrap();
+        f.append(&event("task_started", "must-not-leak"));
+        let mut failed = false;
+        for _ in 0..10_000 {
+            match reader.poll(now) {
+                Ok(update) => {
+                    assert!(update.bytes.is_empty());
+                    assert!(update.eof_at.is_none());
+                }
+                Err(reason) => {
+                    assert_eq!(reason, Reason::SourceDiscontinuity);
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "mutation was never diagnosed");
+        assert!(matches!(reader.poll(now), Err(Reason::SourceDiscontinuity)));
+    }
+}
+
+#[test]
+fn streamed_record_overflow_and_ordinal_gap_remain_explicit_failures() {
+    for ordinal_gap in [false, true] {
+        let f = Fixture::new(if ordinal_gap {
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":"child","cli_version":TESTED_VERSION,"history_mode":"paginated"}})
+        } else {
+            meta()
+        });
+        if ordinal_gap {
+            f.append(&line(json!({"type":"future_record","ordinal":2})));
+        } else {
+            f.append(&vec![b'x'; 257]);
+        }
+        let mut reader = f.reader(Limits {
+            work_bytes: 3,
+            record_bytes: 256,
+            ..limits()
+        });
+        let expected = if ordinal_gap {
+            Reason::OrdinalDiscontinuity
+        } else {
+            Reason::CapacityExceeded
+        };
+        let mut failure = None;
+        for _ in 0..1000 {
+            match reader.poll(Instant::now()) {
+                Ok(_) => {}
+                Err(reason) => {
+                    failure = Some(reason);
+                    break;
+                }
+            }
+        }
+        assert_eq!(failure, Some(expected));
+    }
+    let f = Fixture::new(meta());
+    assert!(matches!(
+        Scan::new(
+            &fs::File::open(&f.path).unwrap(),
+            &f.path,
+            Limits {
+                work_bytes: 0,
+                ..limits()
+            }
+        ),
+        Err(Reason::CapacityExceeded)
+    ));
 }

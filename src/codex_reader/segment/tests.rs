@@ -26,7 +26,14 @@ impl Fixture {
             .unwrap();
     }
     fn snapshot(&self) -> Snapshot {
-        Snapshot::capture(&mut File::open(&self.path).unwrap(), &self.path, limits()).unwrap()
+        let mut capture =
+            Capture::new(File::open(&self.path).unwrap(), self.path.clone(), limits()).unwrap();
+        for _ in 0..10000 {
+            if let Some(snapshot) = capture.step(Instant::now()).unwrap() {
+                return snapshot;
+            }
+        }
+        panic!("snapshot did not reach EOF");
     }
     fn validated(&self, key: &Key) -> Result<Validated, Failure> {
         let writer = Writer {
@@ -54,7 +61,7 @@ impl Fixture {
 }
 fn limits() -> Limits {
     Limits {
-        file_bytes: 1024 * 1024,
+        work_bytes: 1024 * 1024,
         record_bytes: 4096,
         turn_ids: 64,
     }
@@ -89,7 +96,7 @@ fn admit(
     mode: Mode,
 ) -> Result<Segment, Error> {
     let k = key(b);
-    Segment::admit(
+    admit_ready(
         b,
         &k,
         f.validated(&k),
@@ -98,6 +105,24 @@ fn admit(
         limits(),
         Instant::now(),
     )
+}
+
+fn admit_ready(
+    b: &mut Binding,
+    k: &Key,
+    validated: Result<Validated, Failure>,
+    mode: Mode,
+    owners: &mut Ownership,
+    limits: Limits,
+    now: Instant,
+) -> Result<Segment, Error> {
+    let mut admission = Admission::begin(b, k, validated, mode, owners, limits)?;
+    for _ in 0..10000 {
+        if let Some(segment) = admission.step(b, owners, now)? {
+            return Ok(segment);
+        }
+    }
+    panic!("admission did not reach EOF");
 }
 
 #[test]
@@ -213,7 +238,7 @@ fn copied_resume_needs_exact_prefix_explicit_copy_and_local_validation() {
     let mut owners = Ownership::default();
     let k = key(&mut b);
     assert!(matches!(
-        Segment::admit(
+        admit_ready(
             &mut b,
             &k,
             Err(Failure::Writer),
@@ -343,7 +368,7 @@ fn revoked_handoff_and_stale_callback_cannot_change_new_claim() {
         Err(Error::Compaction)
     ));
     assert!(matches!(
-        Segment::admit(
+        admit_ready(
             &mut b,
             &stale,
             f.validated(&stale),
@@ -355,7 +380,7 @@ fn revoked_handoff_and_stale_callback_cannot_change_new_claim() {
         Err(Error::Binding(Failure::Route))
     ));
     assert!(b.pending(&current));
-    Segment::admit(
+    admit_ready(
         &mut b,
         &current,
         f.validated(&current),
@@ -391,10 +416,12 @@ fn compaction_preserves_partial_cursor_and_rejects_prefix_or_destination_changes
     f.append(&event("task_started", "current"));
     let mut b = Binding::new(owner());
     let mut owners = Ownership::default();
-    let segment = admit(&f, &mut b, &mut owners, Mode::Fresh).unwrap();
+    let mut segment = admit(&f, &mut b, &mut owners, Mode::Fresh).unwrap();
     let complete = event("task_complete", "current");
     let middle = complete.len() / 2;
     f.append(&complete[..middle]);
+    segment.poll(Instant::now()).unwrap();
+    assert_eq!(segment.reader.scan.cursor.partial, complete[..middle]);
     let handoff = segment.handoff(&b, &owners, Instant::now()).unwrap();
     f.append(&complete[middle..]);
     let segment = admit(&f, &mut b, &mut owners, Mode::Compact(handoff)).unwrap();
@@ -421,7 +448,7 @@ fn compaction_preserves_partial_cursor_and_rejects_prefix_or_destination_changes
     let mut binding = Binding::new(destination.clone());
     let key = binding.begin(&destination, 0, "child".into()).unwrap();
     assert!(matches!(
-        Segment::admit(
+        admit_ready(
             &mut binding,
             &key,
             f.validated(&key),
@@ -478,7 +505,7 @@ fn compaction_rejects_a_different_live_local_writer() {
         },
         4096,
     );
-    let result = Segment::admit(
+    let result = admit_ready(
         &mut b,
         &k,
         candidate,
@@ -510,4 +537,178 @@ fn child_delimiter_without_child_start_cannot_promote_imported_turns() {
             Decision::BindingValidationFailed(Failure::Metadata)
         );
     }
+}
+
+fn small_limits() -> Limits {
+    Limits {
+        work_bytes: 11,
+        ..limits()
+    }
+}
+fn capture_small(f: &Fixture) -> Snapshot {
+    let mut capture =
+        Capture::new(File::open(&f.path).unwrap(), f.path.clone(), small_limits()).unwrap();
+    for _ in 0..100_000 {
+        if let Some(snapshot) = capture.step(Instant::now()).unwrap() {
+            return snapshot;
+        }
+        assert!(capture.scan.cursor.partial.len() <= small_limits().record_bytes);
+    }
+    panic!("capture never reached EOF");
+}
+
+#[test]
+fn long_history_snapshot_resume_fork_and_compaction_admit_with_bounded_work() {
+    for mode_name in ["resume", "copy", "fork", "fresh"] {
+        let f = Fixture::new();
+        for _ in 0..100 {
+            f.append(&line(
+                json!({"type":"future_history","payload":{"text":"bounded"}}),
+            ));
+        }
+        let mode = match mode_name {
+            "resume" | "copy" => {
+                let old_start = event("task_started", "inherited");
+                f.append(&old_start[..old_start.len() - 1]);
+                let snapshot = capture_small(&f);
+                assert_eq!(
+                    snapshot.checkpoint.read_offset,
+                    fs::metadata(&f.path).unwrap().len()
+                );
+                if mode_name == "copy" {
+                    let replacement = f.root.path().join("copy");
+                    fs::copy(&f.path, &replacement).unwrap();
+                    fs::rename(replacement, &f.path).unwrap();
+                }
+                f.append(b"\n");
+                f.append(&event("task_complete", "inherited"));
+                Mode::Resume {
+                    snapshot,
+                    copied: mode_name == "copy",
+                }
+            }
+            "fork" => {
+                f.append(&event("task_started", "parent"));
+                f.append(&event("task_complete", "parent"));
+                f.append(&delimiter("parent"));
+                f.append(&delimiter("child"));
+                Mode::Fork
+            }
+            _ => Mode::Fresh,
+        };
+        f.append(&event("task_started", "current"));
+        let mut binding = Binding::new(owner());
+        let mut owners = Ownership::default();
+        let k = key(&mut binding);
+        let mut admission = Admission::begin(
+            &mut binding,
+            &k,
+            f.validated(&k),
+            mode,
+            &mut owners,
+            small_limits(),
+        )
+        .unwrap();
+        assert!(admission
+            .step(&mut binding, &mut owners, Instant::now())
+            .unwrap()
+            .is_none());
+        assert_eq!(binding.decision(&owners), Decision::Unknown);
+        let mut result = None;
+        for _ in 0..100_000 {
+            if let Some(segment) = admission
+                .step(&mut binding, &mut owners, Instant::now())
+                .unwrap()
+            {
+                result = Some(segment);
+                break;
+            }
+            assert!(binding.pending(&k));
+            assert_eq!(binding.decision(&owners), Decision::Unknown);
+        }
+        let segment = result.expect("admission never reached EOF");
+        assert_eq!(binding.decision(&owners), Decision::Bound);
+        assert_eq!(
+            segment.observe(Instant::now()).boundary.unwrap().turn_id,
+            "current"
+        );
+        let before = segment.observe(Instant::now()).boundary.unwrap().clone();
+        let handoff = segment.handoff(&binding, &owners, Instant::now()).unwrap();
+        let k = key(&mut binding);
+        let segment = admit_ready(
+            &mut binding,
+            &k,
+            f.validated(&k),
+            Mode::Compact(handoff),
+            &mut owners,
+            small_limits(),
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(segment.observe(Instant::now()).boundary, Some(&before));
+        assert_eq!(segment.observe(Instant::now()).turn, Turn::Working);
+    }
+}
+
+#[test]
+fn late_duplicate_delimiter_and_malformed_history_never_commit_early_trust() {
+    for malformed in [false, true] {
+        let f = Fixture::new();
+        f.append(&delimiter("child"));
+        f.append(&event("task_started", "current"));
+        for _ in 0..30 {
+            f.append(&line(json!({"type":"future_history"})));
+        }
+        if malformed {
+            f.append(b"invalid json\n");
+        } else {
+            f.append(&delimiter("child"));
+        }
+        let mut binding = Binding::new(owner());
+        let mut owners = Ownership::default();
+        let k = key(&mut binding);
+        assert!(admit_ready(
+            &mut binding,
+            &k,
+            f.validated(&k),
+            Mode::Fork,
+            &mut owners,
+            small_limits(),
+            Instant::now()
+        )
+        .is_err());
+        assert_eq!(
+            binding.decision(&owners),
+            Decision::BindingValidationFailed(Failure::Metadata)
+        );
+    }
+}
+
+#[test]
+fn incremental_admission_cannot_finish_or_reject_a_replacement_claim() {
+    let f = Fixture::new();
+    f.append(&event("task_started", "current"));
+    let mut b = Binding::new(owner());
+    let mut owners = Ownership::default();
+    let old = key(&mut b);
+    let mut admission = Admission::begin(
+        &mut b,
+        &old,
+        f.validated(&old),
+        Mode::Fresh,
+        &mut owners,
+        small_limits(),
+    )
+    .unwrap();
+    assert!(admission
+        .step(&mut b, &mut owners, Instant::now())
+        .unwrap()
+        .is_none());
+    let current = key(&mut b);
+    assert!(matches!(
+        admission.step(&mut b, &mut owners, Instant::now()),
+        Err(Error::Binding(Failure::Route))
+    ));
+    assert!(b.pending(&current));
+    assert_eq!(b.decision(&owners), Decision::Unknown);
 }
