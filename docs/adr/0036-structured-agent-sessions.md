@@ -1245,6 +1245,15 @@ shape. A legacy record without classification, or an unknown without its shape,
 yields a typed history gap with reason `provenance_missing`; later records still
 replay. It is neither a whole-replay refusal nor an entity snapshot. A missing
 retained prefix uses the same gap path with reason `retained_prefix`.
+Complete invalid storage wrappers use `GapReason::CorruptWrapper`
+(`corrupt_wrapper`). This is a coarse diagnosis: if corrupt lines adjoin a
+retained-prefix loss, the whole missing range between valid sequence anchors
+uses this reason. An invalid wrapper cannot reliably identify its original
+sequence, so replay does not invent a boundary between the two causes.
+These reasons are internal history diagnostics. The agent subscription adapter
+matches `Item::Gap { from, to, .. }`; wire `gap` frames carry the range without a
+reason field. No optional wire reason exists, and this does not change the
+serialized contract.
 
 The registry's runtime stream owner registers bounded continuation and captures
 its durable head under one publication lock. An owned file cut pages through that

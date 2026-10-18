@@ -30,7 +30,9 @@ pub enum GapReason {
     RetainedPrefix,
     /// Legacy record lacks original classification or sender shape.
     ProvenanceMissing,
-    /// One or more complete lines have an invalid storage wrapper.
+    /// Complete invalid wrappers were observed alongside missing sequences.
+    /// Attribution is coarse: adjacent retained loss shares this reason because
+    /// invalid wrappers cannot reliably identify their original sequences.
     CorruptWrapper,
 }
 /// One bounded replay/publication step. A barrier precedes every live record.

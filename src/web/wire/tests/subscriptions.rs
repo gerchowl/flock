@@ -768,6 +768,7 @@ fn page_capacity_wait_is_cancellable_and_does_not_close_siblings() {
         assert_eq!(case.frame(&mut socket).await["seq"], 2);
         assert_eq!(case.frame(&mut socket).await["t"], "synced");
         case.server.finish().await;
+        // IO is process-global, so exact capacity relies on nextest process isolation.
         // Acquire all slots to await cancelled socket jobs without a scheduling race.
         let returned = within(IO.acquire_many(32)).await.unwrap();
         drop(returned);
@@ -803,5 +804,24 @@ fn explicit_revocation_ends_all_live_cuts_for_the_principal() {
         ));
         case.stored.append(record(1));
         case.server.finish().await;
+    });
+}
+
+#[test]
+fn mixed_corruption_and_retained_loss_gap_omits_internal_reason_on_wire() {
+    runtime(async {
+        for invalid_json in [false, true] {
+            let mut case = Case::new(vec![record(1), record(2), record(6)]).await;
+            case.stored.corrupt_wrapper(1, invalid_json);
+            let mut socket = case.open().await;
+            case.sub(&mut socket, "mixed-loss", Some(1)).await;
+            assert_eq!(
+                case.frame(&mut socket).await,
+                json!({"t":"gap","sub_id":"mixed-loss","from":2,"to":5})
+            );
+            assert_eq!(case.frame(&mut socket).await["seq"], 6);
+            assert_eq!(case.frame(&mut socket).await["t"], "synced");
+            case.server.finish().await;
+        }
     });
 }

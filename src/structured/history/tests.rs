@@ -727,3 +727,30 @@ fn corrupt_unsequenced_noise_does_not_consume_valid_sequences() {
     assert_eq!(seq(next(&mut cut)), 2);
     assert!(matches!(next(&mut cut), Item::Synced(2)));
 }
+
+#[test]
+fn corrupt_wrapper_and_adjacent_retained_loss_have_coarse_attribution() {
+    for invalid_json in [false, true] {
+        let mut fixture = Fixture::new(
+            [1, 2, 6]
+                .map(|seq| record(seq, json!({"type":"assistant","message":{}})))
+                .into(),
+        );
+        fixture.corrupt_wrapper(1, invalid_json);
+        let mut cut = fixture.source.subscribe(Some(1)).unwrap();
+        assert!(matches!(
+            next(&mut cut),
+            Item::Gap {
+                from: 2,
+                to: 5,
+                reason: GapReason::CorruptWrapper
+            }
+        ));
+        let hint = cut.checkpoint().unwrap();
+        let mut resumed = fixture.source.resume(5, &hint).unwrap();
+        assert_eq!(seq(next(&mut resumed)), 6);
+        assert!(matches!(next(&mut resumed), Item::Synced(6)));
+        assert_eq!(seq(next(&mut cut)), 6);
+        assert!(matches!(next(&mut cut), Item::Synced(6)));
+    }
+}
