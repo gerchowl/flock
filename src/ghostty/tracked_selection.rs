@@ -41,11 +41,12 @@ impl TrackedSelection {
     /// Keep the handle and its terminal behind the same lock, including pin
     /// destruction, or under the same exclusive owner during destruction.
     pub(crate) unsafe fn new(terminal: &Terminal, points: [(u32, u16); 2]) -> Option<Self> {
+        let screen = terminal.active_screen().ok()?;
         let mut result = Self {
             points: [ptr::null_mut(); 2],
             owner: terminal.raw,
-            screen: terminal.active_screen().ok()?,
-            erase_generation: terminal.selection_erases.generation,
+            screen,
+            erase_generation: terminal.selection_erases.generation(screen),
         };
         for (reference, (row, col)) in result.points.iter_mut().zip(points) {
             // SAFETY: terminal is live and the out pointer is an owned slot.
@@ -66,7 +67,7 @@ impl TrackedSelection {
     pub(crate) fn points(&self, terminal: &Terminal) -> Option<[(u32, u16); 2]> {
         if self.owner != terminal.raw
             || self.screen != terminal.active_screen().ok()?
-            || self.erase_generation != terminal.selection_erases.generation
+            || self.erase_generation != terminal.selection_erases.generation(self.screen)
             || self.erase_generation == u64::MAX
         {
             return None;
@@ -130,8 +131,15 @@ pub(super) struct SelectionEraseTracker {
     parameters: [u16; 24],
     parameters_len: usize,
     colon: bool,
-    pub(super) alternate_exists: bool,
-    pub(super) generation: u64,
+    screen: Option<ActiveScreen>,
+    screens: [ScreenEraseFacts; 2],
+}
+
+/// Facts belong to the screen containing the pinned cells, never its peer.
+#[derive(Default)]
+struct ScreenEraseFacts {
+    generation: u64,
+    loss_on_resize: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -146,8 +154,68 @@ enum EraseState {
 }
 
 impl SelectionEraseTracker {
-    pub(super) fn invalidate(&mut self) {
-        self.generation = self.generation.saturating_add(1);
+    /// Mirror native screen creation policy without querying inactive history.
+    pub(super) fn new(primary_no_scrollback: bool) -> Self {
+        Self {
+            screen: Some(ActiveScreen::Primary),
+            screens: [
+                ScreenEraseFacts {
+                    generation: 0,
+                    loss_on_resize: primary_no_scrollback,
+                },
+                // Terminal.switchScreen always creates alternate with max_scrollback=0.
+                ScreenEraseFacts {
+                    generation: 0,
+                    loss_on_resize: true,
+                },
+            ],
+            ..Self::default()
+        }
+    }
+
+    fn index(screen: ActiveScreen) -> usize {
+        match screen {
+            ActiveScreen::Primary => 0,
+            ActiveScreen::Alternate => 1,
+        }
+    }
+
+    /// Identity of one screen; saturation permanently refuses its old anchors.
+    pub(super) fn generation(&self, screen: ActiveScreen) -> u64 {
+        self.screens[Self::index(screen)].generation
+    }
+
+    fn invalidate_screen(&mut self, screen: ActiveScreen) {
+        let facts = &mut self.screens[Self::index(screen)];
+        facts.generation = facts.generation.saturating_add(1);
+    }
+
+    fn invalidate_active(&mut self) {
+        match self.screen {
+            Some(screen) => self.invalidate_screen(screen),
+            // XTRESTORE does not reveal its saved value. A later erase in the
+            // same chunk may target either screen, so refuse both until resynced.
+            None => self.invalidate_all(),
+        }
+    }
+
+    fn invalidate_all(&mut self) {
+        self.invalidate_screen(ActiveScreen::Primary);
+        self.invalidate_screen(ActiveScreen::Alternate);
+    }
+
+    /// Record native resize history loss independently for each screen.
+    pub(super) fn resize(&mut self) {
+        for facts in &mut self.screens {
+            if facts.loss_on_resize {
+                facts.generation = facts.generation.saturating_add(1);
+            }
+        }
+    }
+
+    /// Restore authoritative active-screen knowledge around each native write.
+    pub(super) fn synchronize_screen(&mut self, screen: Option<ActiveScreen>) {
+        self.screen = screen;
     }
 
     pub(super) fn write(&mut self, bytes: &[u8]) {
@@ -182,8 +250,8 @@ impl SelectionEraseTracker {
                     0x20..=0x2f => self.state = EscapeIntermediate(byte == b'#'),
                     0x30..=0x7e => {
                         if byte == b'c' {
-                            self.invalidate();
-                            self.alternate_exists = false;
+                            self.invalidate_all();
+                            self.screen = Some(ActiveScreen::Primary);
                         }
                         self.state = Ground;
                     }
@@ -193,7 +261,7 @@ impl SelectionEraseTracker {
                     0x20..=0x2f => self.state = EscapeIntermediate(false),
                     0x30..=0x7e => {
                         if decaln && byte == b'8' {
-                            self.invalidate();
+                            self.invalidate_active();
                         }
                         self.state = Ground;
                     }
@@ -256,22 +324,34 @@ impl SelectionEraseTracker {
             self.parameters[self.parameters_len] = self.parameter;
             self.parameters_len += 1;
         }
-        let parameters = &self.parameters[..self.parameters_len];
-        let display_erase = final_byte == b'J' && matches!(parameters, [2 | 3]);
-        let screen_mode = self.private && matches!(final_byte, b'h' | b'l' | b'r');
-        let screen_clear = screen_mode
-            && parameters
-                .iter()
-                // Mode 3 clears through Ghostty's internal resize when mode 40
-                // permits it. Conservatively refuse even if mode 40 is disabled.
-                .any(|p| matches!(p, 3 | 1047 | 1049) || (final_byte == b'r' && *p == 47));
-        // XTRESTORE can switch/clear using either saved value. Avoid mirroring
-        // saved mode bits: conservatively remember possible alternate allocation.
-        self.alternate_exists |= screen_mode
-            && matches!(final_byte, b'h' | b'r')
-            && parameters.iter().any(|p| matches!(p, 47 | 1047 | 1049));
-        if display_erase || screen_clear {
-            self.invalidate();
+        if final_byte == b'J' && matches!(&self.parameters[..self.parameters_len], [2 | 3]) {
+            self.invalidate_active();
+        }
+        if !self.private || !matches!(final_byte, b'h' | b'l' | b'r') {
+            return;
+        }
+        // Process mode lists in order: later erases use the newly active screen.
+        for i in 0..self.parameters_len {
+            match self.parameters[i] {
+                3 => {
+                    // DECCOLM's internal resize can lose inactive history too.
+                    self.resize();
+                    self.invalidate_active();
+                }
+                mode @ (47 | 1047 | 1049) => {
+                    if mode != 47 || final_byte == b'r' {
+                        self.invalidate_screen(ActiveScreen::Alternate);
+                    }
+                    self.screen = match final_byte {
+                        b'h' => Some(ActiveScreen::Alternate),
+                        b'l' => Some(ActiveScreen::Primary),
+                        // Saved bits are deliberately not mirrored. Terminal.write
+                        // resynchronizes from the native screen after each chunk.
+                        _ => None,
+                    };
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -286,7 +366,8 @@ mod erase_tests {
         for byte in b"\x1b[0003J\x1b[?2J\x1bc\x1b[?25;1049h\x1b[?1047l" {
             tracker.write(&[*byte]);
         }
-        assert_eq!(tracker.generation, 5);
+        assert_eq!(tracker.generation(ActiveScreen::Primary), 3);
+        assert_eq!(tracker.generation(ActiveScreen::Alternate), 5);
     }
 
     #[test]
@@ -294,7 +375,8 @@ mod erase_tests {
         let mut tracker = SelectionEraseTracker::default();
         tracker.write(b"title [3J\x1b]0;[3J\x07\x1bP[2J\x1b\\\x1b[3;J\x1b[>3J\x1b[3\x18J\x1b[22J");
         assert_eq!(
-            tracker.generation, 1,
+            tracker.generation(ActiveScreen::Primary),
+            1,
             "ED 3 with a trailing separator must invalidate the selection"
         );
     }
@@ -305,7 +387,12 @@ mod erase_tests {
             let mut terminal = Terminal::new(40, 6, capacity).unwrap();
             terminal.write(b"selected\r\n");
             terminal.resize(20, 8, 1, 1).unwrap();
-            assert_eq!(terminal.selection_erases.generation, expected);
+            assert_eq!(
+                terminal
+                    .selection_erases
+                    .generation(terminal.active_screen().unwrap()),
+                expected
+            );
         }
     }
 }
@@ -353,7 +440,9 @@ mod parameter_tests {
             terminal.write(b"history\r\n".repeat(20).as_slice());
             terminal.write(b"\x1b[H TOP\x1b[6;1HBOTTOM\x1b[3;1H");
             let history = terminal.scrollbar().unwrap().total;
-            let generation = terminal.selection_erases.generation;
+            let generation = terminal
+                .selection_erases
+                .generation(terminal.active_screen().unwrap());
             let command = format!("\x1b[{parameters}J");
             for byte in command.bytes() {
                 terminal.write(&[byte]);
@@ -375,7 +464,10 @@ mod parameter_tests {
                 "native history: {parameters:?}"
             );
             assert_eq!(
-                terminal.selection_erases.generation - generation,
+                terminal
+                    .selection_erases
+                    .generation(terminal.active_screen().unwrap())
+                    - generation,
                 u64::from(matches!(mode, Some(2 | 3))),
                 "generation: {parameters:?}"
             );
@@ -395,7 +487,9 @@ mod mode_restore_tests {
                 if saved {
                     terminal.write(format!("\x1b[?{mode}h\x1b[?{mode}s\x1b[?{mode}l").as_bytes());
                 }
-                let generation = terminal.selection_erases.generation;
+                let generation = terminal
+                    .selection_erases
+                    .generation(ActiveScreen::Alternate);
                 terminal.write(format!("\x1b[?{mode}r").as_bytes());
                 assert_eq!(
                     terminal.active_screen().unwrap(),
@@ -406,19 +500,25 @@ mod mode_restore_tests {
                     }
                 );
                 assert_eq!(
-                    terminal.selection_erases.generation,
+                    terminal
+                        .selection_erases
+                        .generation(ActiveScreen::Alternate),
                     generation + 1,
                     "XTRESTORE mode {mode}, saved={saved}"
                 );
-                assert!(
-                    terminal.selection_erases.alternate_exists,
-                    "allocation must be conservative for either restored value"
+                assert_eq!(
+                    terminal.selection_erases.generation(ActiveScreen::Primary),
+                    0
                 );
                 terminal.write(b"\x1b[?47l");
-                let generation = terminal.selection_erases.generation;
+                let generation = terminal
+                    .selection_erases
+                    .generation(ActiveScreen::Alternate);
                 terminal.resize(20, 3, 1, 1).unwrap();
                 assert_eq!(
-                    terminal.selection_erases.generation,
+                    terminal
+                        .selection_erases
+                        .generation(ActiveScreen::Alternate),
                     generation + 1,
                     "inactive allocation after restore mode {mode}, saved={saved}"
                 );
@@ -434,8 +534,16 @@ mod mode_restore_tests {
             let before = terminal.read_text_viewport((0, 0), (39, 5), false).unwrap();
             terminal.write(format!("\x1b[?{mode}s\x1b[?{mode}$p").as_bytes());
             assert_eq!(terminal.active_screen().unwrap(), ActiveScreen::Primary);
-            assert_eq!(terminal.selection_erases.generation, 0);
-            assert!(!terminal.selection_erases.alternate_exists);
+            assert_eq!(
+                terminal
+                    .selection_erases
+                    .generation(ActiveScreen::Alternate),
+                0
+            );
+            assert_eq!(
+                terminal.selection_erases.generation(ActiveScreen::Primary),
+                0
+            );
             assert_eq!(
                 terminal.read_text_viewport((0, 0), (39, 5), false).unwrap(),
                 before
@@ -457,7 +565,9 @@ mod full_screen_clear_tests {
                     terminal.write(b"\x1b[?47h");
                 }
                 terminal.write(b"SELECTA\x1b[?40h");
-                let generation = terminal.selection_erases.generation;
+                let generation = terminal
+                    .selection_erases
+                    .generation(terminal.active_screen().unwrap());
                 for byte in format!("\x1b[?3{final_byte}").bytes() {
                     terminal.write(&[byte]);
                 }
@@ -469,14 +579,24 @@ mod full_screen_clear_tests {
                     .read_text_viewport((0, 0), (39, 5), false)
                     .unwrap()
                     .contains("SELECTA"));
-                assert_eq!(terminal.selection_erases.generation, generation + 1);
+                assert!(
+                    terminal
+                        .selection_erases
+                        .generation(terminal.active_screen().unwrap())
+                        > generation
+                );
             }
         }
         // Mode 40 is deliberately not mirrored, including across XTRESTORE.
         let mut terminal = Terminal::new(40, 6, 256 * 1024).unwrap();
         terminal.write(b"SELECTA\x1b[?3h");
         assert_eq!(terminal.cols().unwrap(), 40);
-        assert_eq!(terminal.selection_erases.generation, 1);
+        assert_eq!(
+            terminal
+                .selection_erases
+                .generation(terminal.active_screen().unwrap()),
+            1
+        );
         assert!(terminal
             .read_text_viewport((0, 0), (39, 5), false)
             .unwrap()
@@ -504,10 +624,60 @@ mod full_screen_clear_tests {
             let text = terminal.read_text_viewport((0, 0), (39, 5), false).unwrap();
             assert_eq!(text.contains("SELECTA"), !clears, "native: {bytes:?}");
             assert_eq!(
-                terminal.selection_erases.generation,
+                terminal
+                    .selection_erases
+                    .generation(terminal.active_screen().unwrap()),
                 u64::from(clears),
                 "generation: {bytes:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod screen_scope_tests {
+    use super::*;
+
+    #[test]
+    fn one_chunk_alternate_erases_do_not_change_primary_identity() {
+        for mode in [47, 1047, 1049] {
+            let mut terminal = Terminal::new(40, 6, 256 * 1024).unwrap();
+            terminal.write(b"SELECTA");
+            terminal.write(format!("\x1b[?{mode}hALT\x1b[3J\x1b[?{mode}l").as_bytes());
+            assert_eq!(terminal.active_screen().unwrap(), ActiveScreen::Primary);
+            assert_eq!(
+                terminal.selection_erases.generation(ActiveScreen::Primary),
+                0
+            );
+            assert!(
+                terminal
+                    .selection_erases
+                    .generation(ActiveScreen::Alternate)
+                    > 0
+            );
+            assert!(terminal
+                .read_text_viewport((0, 0), (39, 5), false)
+                .unwrap()
+                .contains("SELECTA"));
+        }
+    }
+
+    #[test]
+    fn unknown_restored_screen_erases_fail_safe_until_native_resynchronization() {
+        let mut terminal = Terminal::new(40, 6, 256 * 1024).unwrap();
+        terminal.write(b"\x1b[?1049r\x1b[3J");
+        assert!(terminal.selection_erases.generation(ActiveScreen::Primary) > 0);
+        assert!(
+            terminal
+                .selection_erases
+                .generation(ActiveScreen::Alternate)
+                > 0
+        );
+        let primary = terminal.selection_erases.generation(ActiveScreen::Primary);
+        terminal.write(b"\x1b[?47h\x1b[3J\x1b[?47l");
+        assert_eq!(
+            terminal.selection_erases.generation(ActiveScreen::Primary),
+            primary
+        );
     }
 }

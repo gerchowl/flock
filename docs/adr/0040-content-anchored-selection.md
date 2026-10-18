@@ -18,7 +18,7 @@ The terminal model follows scrolling and resize/reflow and invalidates a
 reference whose content was pruned or reset. An unavailable endpoint, wrong
 revision or different active screen refuses the copy with a typed attention
 toast; do not substitute the rows now occupying the old coordinates.
-Flock also records a terminal erase generation in each runtime anchor.
+Flock records the owning screen’s erase generation in each runtime anchor.
 ED 3 (`CSI 3 J`) calls `Screen.eraseHistory` → `PageList.eraseRows` /
 `erasePage`. Those operations relocate tracked pins into a surviving row
 without marking them garbage. A generation mismatch therefore refuses in
@@ -38,45 +38,52 @@ via `clearRows`; at a semantic shell prompt it may first scroll them into
 history. Neither path reliably invalidates pins. Treat ED 2 as a destructive
 boundary too. ED 22 scrolls active rows into history and retains the anchors.
 DECCOLM (private mode 3 when mode 40 permits it) calls `Terminal.deccolm`
-through `stream_terminal.zig:502`, resizing internally and then calling
-`eraseDisplay(.complete)` (`Terminal.zig:2866–2878`). That bypasses flock's
+through `Handler.setMode`, resizing internally and then calling
+`Terminal.eraseDisplay(.complete)`. That bypasses flock's
 resize hook. Invalidate on private mode 3 set/reset/restore (`h`, `l`, `r`)
 without mirroring mode 40; this intentionally refuses even when mode 40
 would suppress the operation. DECALN (`ESC # 8`) calls `Terminal.decaln`,
-which clears all active rows in place and fills them with E
-(`Terminal.zig:2638–2675`). Recognize its single `#` intermediate across
+which clears all active rows in place and fills them with E. Recognize its single `#` intermediate across
 fragmented writes and invalidate before resolving either endpoint. Both
-operations invalidate on primary and alternate screens. This adopts the
+operations invalidate the screen being erased. This adopts the
 full-screen-clear refusal policy for #2151; the broader partial/in-place
 erase policy, including ED 0 after cursor-home, remains tracked by #2143.
 Ordinary retained-cell rewrites still follow the copy policy in §2.
 
-Full reset (`ESC c`), mode 1047/1049 screen clears and no-scrollback resize
-also invalidate the generation. The latter calls `eraseHistory` in
-`Screen.resize`. `Terminal.resize` resizes an allocated alternate screen
-even while primary is active, so the tracker remembers its allocation
-across `?47l` and invalidates on resize until full reset removes it.
-XTRESTORE (`CSI ? Pm r`) also reaches `setMode` and `switchScreenMode`:
-restoring false for 1047 clears the departing alternate screen, and restoring
-true for 1049 clears the entered alternate screen. Every private restore
-naming 47, 1047 or 1049 therefore invalidates and conservatively marks
-alternate allocation possible, regardless of the saved value. Saved mode
-bits are not mirrored. Full reset clears both the saved modes and allocation;
-a subsequent restore marks possible allocation again, even when unsaved
-(false). Resizes conservatively invalidate primary-screen anchors too once
-alternate allocation is known or possible.
+Full reset (`ESC c`) invalidates both screen generations. Screen mode
+1047/1049 clears invalidate alternate identity, including XTRESTORE (`CSI ? Pm
+r`) regardless of the saved value; mode 47 restore is conservatively treated
+as alternate loss too. None of these alternate facts invalidate primary cells.
+`TrackedSelection::points` compares only its captured screen’s generation and
+requires that screen to be active before resolving endpoints.
 
-Audit: `stream.zig` dispatches XTSAVE to `save_mode`, which only stores bits
-(`stream_terminal.zig:191`); XTRESTORE dispatches `restore_mode` through
-`modes.restore` and `setMode` (`stream_terminal.zig:192–194`). Only modes
-47, 1047 and 1049 call `switchScreenMode` in that setter
-(`stream_terminal.zig:490–492`); mode 1048 saves/restores the cursor only.
-DECRQM calls `requestMode` / `getReport` and sends a report without setting
-modes or switching screens (`stream_terminal.zig:423–426`). Native-terminal
-tests cover saved true and unsaved false for all three screen modes and
-confirm XTSAVE/DECRQM preserve content. Real-PTY tests cover both destructive
-restore paths, plus capture after reset/restore followed by resize. Ordinary primary resize/reflow before alternate allocation
-with scrollback remains supported.
+`SelectionEraseTracker` owns per-screen loss-on-resize facts. Primary loses
+history on resize only when configured with zero scrollback. Alternate is
+always created with zero scrollback by native `Terminal.switchScreen`.
+`Terminal::resize` therefore invalidates alternate identity even while it is
+inactive, and primary identity only for primary loss. Alternate history or
+past allocation never vetoes a primary anchor. This covers modes 47, 1047 and
+1049, saved restores and teardown without a bridge or C-API change (#2146).
+
+`SelectionEraseTracker::dispatch_csi` follows known screen switches in wire
+order, so alternate enter/output/erase/exit in one `Terminal::write` chunk
+cannot leak alternate erase facts into primary. Saved mode bits are not
+mirrored: after XTRESTORE the active screen is unknown until the native write
+finishes and `synchronize_screen` reads it back. An erase while that own-screen
+fact is unknown invalidates both generations, failing safe. DECCOLM also
+applies the per-screen resize-loss facts before invalidating its active erase.
+
+Audit: the stream dispatcher sends XTSAVE to `save_mode` / `modes.save`,
+which only stores bits; XTRESTORE dispatches `restore_mode` through
+`modes.restore` and `Handler.setMode`. Only modes 47, 1047 and 1049 call
+`Terminal.switchScreenMode` in that setter; mode 1048 saves/restores the cursor
+only. DECRQM calls `Handler.requestMode` / `getReport` and sends a report
+without setting modes or switching screens. Native-terminal tests cover saved
+true and unsaved false for all three screen modes and confirm XTSAVE/DECRQM
+preserve content. Real-PTY tests cover destructive restore paths, primary preservation after
+full-screen apps and unsaved restore, primary loss without scrollback, and
+active/inactive alternate loss or teardown in all three screen modes. Ordinary
+primary resize/reflow with scrollback remains supported after alternate use.
 The other `erasePage` path trims blank trailing resize rows only after
 checking that no tracked pin occupies them; normal history pruning already
 marks evicted pins garbage. Flock does not expose the full application's

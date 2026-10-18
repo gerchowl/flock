@@ -564,7 +564,6 @@ pub struct Terminal {
     raw: ffi::GhosttyTerminal_ptr,
     write_pty_callback: Option<Box<WritePtyCallbackState>>,
     selection_erases: tracked_selection::SelectionEraseTracker,
-    no_scrollback: bool,
 }
 
 impl Terminal {
@@ -582,17 +581,20 @@ impl Terminal {
         Ok(Self {
             raw,
             write_pty_callback: None,
-            selection_erases: Default::default(),
-            no_scrollback: max_scrollback == 0,
+            selection_erases: tracked_selection::SelectionEraseTracker::new(max_scrollback == 0),
         })
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
+        self.selection_erases
+            .synchronize_screen(self.active_screen().ok());
         self.selection_erases.write(bytes);
         // SAFETY: self.raw is a live terminal handle for self's lifetime.
         unsafe {
             ffi::ghostty_terminal_vt_write(self.raw, bytes.as_ptr(), bytes.len());
         }
+        self.selection_erases
+            .synchronize_screen(self.active_screen().ok());
     }
 
     pub fn resize(
@@ -602,14 +604,9 @@ impl Terminal {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> Result<(), Error> {
-        // Terminal.resize also resizes an allocated, inactive alternate screen.
-        // Its no-scrollback Screen.resize erases history and can retarget pins.
-        if self.no_scrollback
-            || self.selection_erases.alternate_exists
-            || self.active_screen().ok() == Some(ActiveScreen::Alternate)
-        {
-            self.selection_erases.invalidate();
-        }
+        // Native Screen.resize discards history only on its no-scrollback screen.
+        // Per-screen facts protect inactive alternate pins without vetoing primary.
+        self.selection_erases.resize();
         let cell_width_px = cell_width_px.max(1);
         let cell_height_px = cell_height_px.max(1);
         // SAFETY: self.raw is valid and sizes are plain values.
