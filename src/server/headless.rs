@@ -3799,6 +3799,7 @@ impl HeadlessServer {
     /// would never see the fault that only the server can have.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         self.app.state.app_client_attached = self.has_app_client();
+        self.app.check_git_refresh_watchdog(now);
         self.app.input_writes.service_due(now);
         let structured_changed = self.app.service_structured_workers(now);
         self.app.start_ready_pastes();
@@ -6269,6 +6270,21 @@ next_tab = ""
         assert_eq!(row["status"], "idle");
         assert_eq!(row["reason"], "no_viewer");
         assert_eq!(row["consecutive_failures"], 0);
+    }
+
+    #[tokio::test]
+    async fn headless_git_refresh_watchdog_runs_without_a_viewer() {
+        let mut server = test_headless_server();
+        let start = Instant::now();
+        server.app.git_refresh_in_flight = true;
+        server.app.git_refresh_health.mark_started(start);
+        server.handle_scheduled_tasks_headless(start + Duration::from_secs(61), false);
+        assert_eq!(server.app.git_refresh_health.consecutive_failures, 1);
+        assert_eq!(
+            server.app.git_refresh_health.last_error.map(|e| e.as_str()),
+            Some("round_stalled")
+        );
+        assert!(server.app.git_refresh_in_flight);
     }
 
     fn app_client_marks_git_refresh_due_on_first_attach(render_encoding: RenderEncoding) {

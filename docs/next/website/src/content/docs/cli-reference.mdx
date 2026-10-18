@@ -87,8 +87,18 @@ success timestamp. Old results alone are `degraded` with `"awaiting_refresh"`;
 and carries a typed `last_error` (including `"round_stalled"`). An in-flight
 stalled round remains visible even after the last viewer leaves. Status remains
 an open string; the optional reason is additive on mesh v5, and unknown future
-reasons decode as `unknown`. Worker/command failure accounting is completed by
-the second [#1722](https://github.com/gerchowl/flock/issues/1722) slice.
+reasons decode as `unknown`.
+
+Git subprocesses have a 10-second ceiling within the 60-second round deadline.
+`last_error` is one of `timeout`, `git_io`, `git_exit`, `git_output`,
+`worker_panic`, `worker_spawn` or `round_stalled`. Failed probes do not replace
+the last valid cached status. A stalled worker retains ownership until it
+returns, so no replacement worker accumulates behind a blocked filesystem call.
+Restore access to that checkout's filesystem to let it finish; while it remains
+blocked, its rising in-flight age and typed error explain why git refresh cannot
+recover yet. Worker panics and spawn failures are reported as broken; subsequent
+rounds use the existing cadence. No command output or paths appear in the error
+code.
 
 ## Peer enrollment
 

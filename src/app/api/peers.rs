@@ -132,9 +132,10 @@ impl App {
             health.in_flight_since,
             |kind| kind.as_str().to_owned(),
         );
-        if health
-            .in_flight_age_secs(now)
-            .is_some_and(|age| age >= crate::health::GIT_REFRESH_MAX_ROUND_SECS)
+        if self.git_refresh_timed_out
+            || health
+                .in_flight_age_secs(now)
+                .is_some_and(|age| age >= crate::health::GIT_REFRESH_MAX_ROUND_SECS)
         {
             row.status = "broken".into();
             row.last_error = Some(crate::health::GitRefreshErrorKind::Stalled.as_str().into());
@@ -152,6 +153,18 @@ impl App {
                 row.status = "idle".into();
                 return row;
             }
+        }
+        if matches!(
+            health.last_error,
+            Some(
+                crate::health::GitRefreshErrorKind::WorkerPanic
+                    | crate::health::GitRefreshErrorKind::WorkerSpawn
+            )
+        ) {
+            row.status = "broken".into();
+        }
+        if row.last_error.is_some() && row.status == "ok" {
+            row.status = "degraded".into();
         }
         // Age alone diagnoses missing freshness, never an invented failure.
         if row.last_error.is_none() && row.status != "ok" {

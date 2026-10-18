@@ -223,16 +223,24 @@ impl App {
         }
 
         if let AppEvent::GitStatusRefreshed {
+            error,
             results,
             cache_updates,
         } = ev
         {
             self.git_refresh_in_flight = false;
-            // Health (#295): the arrival of this event IS the refresh's
-            // success signal. A round that panicked in the worker never
-            // reaches here — it is reaped on the next dispatch tick instead.
-            self.git_refresh_health
-                .mark_success(std::time::Instant::now());
+            if let Some(error) = error {
+                if self.git_refresh_timed_out {
+                    // The watchdog already counted this owned round's failure.
+                    self.git_refresh_health.last_error = Some(error);
+                    self.git_refresh_health.in_flight_since = None;
+                } else {
+                    self.git_refresh_health.mark_failure(Instant::now(), error);
+                }
+            } else {
+                self.git_refresh_health.mark_success(Instant::now());
+            }
+            self.git_refresh_timed_out = false;
             // #262: the periodic probe is flock's freshness contract for every
             // other git fact it shows, so it is also the right cadence for the
             // memoized filesystem answers the render path reads (repo-family

@@ -313,16 +313,28 @@ pub(super) fn git_dir_for_repo_root(repo_root: &Path) -> Option<PathBuf> {
     })
 }
 
-pub(super) fn git_symbolic_head_full(repo_root: &Path) -> Option<String> {
-    git_trimmed_stdout(repo_root, &["symbolic-ref", "--quiet", "HEAD"])
+pub(super) fn git_symbolic_head_full(
+    repo_root: &Path,
+    deadline: std::time::Instant,
+) -> Result<Option<String>, crate::health::GitRefreshErrorKind> {
+    super::probe::text(
+        repo_root,
+        &["symbolic-ref", "--quiet", "HEAD"],
+        Some(1),
+        deadline,
+    )
 }
 
 fn git_symbolic_head_short(repo_root: &Path) -> Option<String> {
     git_trimmed_stdout(repo_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
 }
 
-pub(super) fn git_rev_parse_verify(repo_root: &Path, revision: &str) -> Option<String> {
-    git_trimmed_stdout(repo_root, &["rev-parse", "--verify", revision])
+pub(super) fn git_rev_parse_verify(
+    repo_root: &Path,
+    revision: &str,
+    deadline: std::time::Instant,
+) -> Result<Option<String>, crate::health::GitRefreshErrorKind> {
+    super::probe::revision(repo_root, revision, deadline)
 }
 
 pub(super) fn git_ref_storage_is_reftable(git_common_dir: &Path) -> bool {
@@ -422,7 +434,7 @@ fn git_trimmed_stdout(repo_root: &Path, args: &[&str]) -> Option<String> {
         .arg("-C")
         .arg(repo_root)
         .args(args)
-        .output_traced()
+        .output_traced_with_timeout(super::probe::GIT_EXEC_TIMEOUT)
         .ok()?;
     if !output.status.success() {
         return None;
@@ -778,10 +790,22 @@ mod tests {
         run_git(&root, &["config", "user.name", "Flock Test"]);
         run_git(&root, &["commit", "--allow-empty", "-m", "initial"]);
 
-        let head_oid = git_rev_parse_verify(&root, "HEAD").unwrap();
+        let head_oid = git_rev_parse_verify(
+            &root,
+            "HEAD",
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(
-            git_rev_parse_verify(&root, "refs/heads/main").as_deref(),
+            git_rev_parse_verify(
+                &root,
+                "refs/heads/main",
+                std::time::Instant::now() + std::time::Duration::from_secs(60)
+            )
+            .unwrap()
+            .as_deref(),
             Some(head_oid.as_str())
         );
 
