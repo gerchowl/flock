@@ -29,7 +29,8 @@ pub(crate) enum Page {
     Progress,
     /// Await readiness; this never retries a mutation.
     Pending,
-    /// Closed overflow; resume from the last applied cursor.
+    /// Closed overflow discards unread replay as well as queued live packets.
+    /// Resume from the client's last applied cursor, never the overflow head.
     Lagged(u64),
     /// Generation ended after draining committed publications.
     End,
@@ -62,14 +63,17 @@ impl Book {
         if after.is_some_and(|n| n > self.retained.through) {
             return Err(ErrorCode::CursorAhead);
         }
-        live.lock().ended = self.ended;
-        live.lock().packets.push_back(Packet(
-            self.retained.clone(),
-            self.status.clone(),
-            self.error,
-            true,
-            after.unwrap_or(0),
-        ));
+        register_live(
+            &live,
+            Packet(
+                self.retained.clone(),
+                self.status.clone(),
+                self.error,
+                true,
+                after.unwrap_or(0),
+            ),
+            self.ended,
+        );
         self.readers.retain(|r| r.strong_count() != 0);
         self.readers.push(Arc::downgrade(&live));
         Ok(())
@@ -119,7 +123,7 @@ impl Book {
         });
         if cut.gap.is_some() {
             self.retained = cut.clone();
-        } else if !cut.records.is_empty() {
+        } else if !cut.records.is_empty() || self.retained.through != cut.through {
             // A still-unread replay shares the old cut. Only an actual append
             // needs copy-on-write; status-only updates never copy its prefix.
             let retained = Arc::make_mut(&mut self.retained);
@@ -141,6 +145,17 @@ impl Book {
             true
         });
     }
+}
+// Generic locking lets the test unlock witness observe the actual registration
+// critical section without a production test hook.
+fn register_live<R: parking_lot::lock_api::RawMutex>(
+    live: &parking_lot::lock_api::Mutex<R, Live>,
+    packet: Packet,
+    ended: bool,
+) {
+    let mut live = live.lock();
+    live.packets.push_back(packet);
+    live.ended = ended;
 }
 struct Capture(Option<u64>, Arc<Mutex<Live>>);
 /// Retained generation source. Cold opening belongs exclusively on an I/O worker.

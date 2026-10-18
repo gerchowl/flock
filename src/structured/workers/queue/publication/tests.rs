@@ -423,6 +423,7 @@ async fn queue_provider_ready_and_live_wakes_follow_lock_release() {
 }
 
 thread_local! {
+    static REGISTRATION_WITNESS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static UNLOCK_WITNESS: std::cell::RefCell<Option<Arc<Mutex<Live>>>> = const { std::cell::RefCell::new(None) };
 }
 struct Witness(parking_lot::RawMutex);
@@ -441,6 +442,12 @@ unsafe impl parking_lot::lock_api::RawMutex for Witness {
         unsafe {
             parking_lot::lock_api::RawMutex::unlock(&self.0);
         }
+        REGISTRATION_WITNESS.with(|w| {
+            let observe = w.borrow_mut().take();
+            if let Some(observe) = observe {
+                observe();
+            }
+        });
         UNLOCK_WITNESS.with(|w| {
             if let Some(live) = w.borrow().as_ref() {
                 assert!(
@@ -649,4 +656,54 @@ fn queue_provider_status_only_publish_never_copies_the_retained_snapshot() {
         Arc::ptr_eq(&retained, &source.1.lock().retained),
         "status update cloned the entire retained snapshot"
     );
+}
+
+#[test]
+fn queue_provider_late_capture_has_synced_before_end_at_every_registration_unlock() {
+    let root = root();
+    let mut j = journal(&root, 2);
+    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let mut reader = source.subscribe(None).unwrap();
+    publisher.finish(|| j.subscription().map_err(Into::into), None);
+    assert!(matches!(reader.page(), Page::Pending));
+    // At each registration unlock, observe exactly what a pager could observe.
+    // This delegates exclusion to the native mutex, with no racing threads.
+    let witnessed = Arc::new(parking_lot::lock_api::Mutex::<Witness, _>::new(
+        Live::default(),
+    ));
+    let watched = witnessed.clone();
+    REGISTRATION_WITNESS.with(|w| {
+        *w.borrow_mut() = Some(Box::new(move || {
+            let live = watched
+                .try_lock()
+                .expect("witness ran before releasing the lock");
+            assert!(
+                !live.ended || !live.packets.is_empty(),
+                "reader could return End before replay/Synced"
+            );
+        }))
+    });
+    register_live(
+        &witnessed,
+        Packet(source.1.lock().retained.clone(), None, None, true, 0),
+        true,
+    );
+    drop(publisher);
+    let replay = pages(&mut reader);
+    assert_eq!(sequences(&replay), [3, 4]);
+    assert!(matches!(replay.last(), Some(Page::Synced(4))));
+    assert!(matches!(reader.page(), Page::End));
+}
+
+#[test]
+fn queue_provider_high_water_advances_even_without_a_record_packet() {
+    let root = root();
+    let j = journal(&root, 0);
+    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    publisher.publish(&update(Cut {
+        gap: None,
+        records: vec![],
+        through: 5,
+    }));
+    assert_eq!(source.1.lock().retained.through, 5);
 }
