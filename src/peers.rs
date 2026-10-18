@@ -1710,6 +1710,183 @@ mod tests {
         }
     }
 
+    fn assert_strict_host_refused(raw: String) {
+        let response = serde_json::json!({"id":"fixture", "result":{"host":raw}}).to_string();
+        let mut hostile = wire_peer("node-a.invalid", None);
+        hostile.host = Some(raw.clone());
+        let mut carried =
+            super::peer_to_wire(&super::PeerSummaryState::new(&crate::config::PeerConfig {
+                name: "node-a.invalid".into(),
+                ..Default::default()
+            }));
+        carried.host = Some(raw.clone());
+        let logs = crate::logging::capture_logs(|| {
+            assert_eq!(
+                super::parse_summary_response(&response, 0).unwrap_err(),
+                "invalid_params"
+            );
+            for json in [false, true] {
+                let mut cache = std::collections::HashMap::new();
+                let mut plain = wire_peer("node-a.invalid", None);
+                plain.host = Some("node-a.invalid".into());
+                super::merge_relayed_fleet(&mut cache, vec![plain], "hub.invalid");
+                let entries = if json {
+                    let response = serde_json::json!({"id":"fixture", "result":{
+                        "host":"hub.invalid", "relayed_fleet":[hostile.clone()]}})
+                    .to_string();
+                    super::parse_summary_response(&response, 0)
+                        .unwrap()
+                        .relayed_fleet
+                } else {
+                    vec![hostile.clone()]
+                };
+                super::merge_relayed_fleet(&mut cache, entries, "hub.invalid");
+                assert_eq!(
+                    cache.len(),
+                    1,
+                    "invalid host added a distinct row (JSON: {json})"
+                );
+                assert_eq!(
+                    cache["node-a.invalid"].peer.host.as_deref(),
+                    Some("node-a.invalid")
+                );
+            }
+            let peer = super::peer_from_wire(carried);
+            assert!(peer.host.is_none());
+            assert!(peer.ssh_target.is_empty());
+            assert!(peer.proxy_jump.is_none());
+            assert_eq!(peer.error.as_deref(), Some("invalid_params"));
+        });
+        assert!(logs.contains("peer.summary.identifier_dropped"));
+        assert!(logs.contains("invalid_params"));
+        assert!(!logs.contains(&raw));
+    }
+
+    #[test]
+    fn security2200_host_rejects_zwj() {
+        assert_strict_host_refused("node-a.invalid\u{200d}".into());
+    }
+
+    #[test]
+    fn security2200_host_rejects_combining_mark() {
+        assert_strict_host_refused("node-a.invalid\u{301}".into());
+    }
+
+    #[test]
+    fn security2200_host_rejects_variation_selector() {
+        assert_strict_host_refused("node-a.invalid\u{fe0f}".into());
+    }
+
+    #[test]
+    fn security2200_host_rejects_cyrillic_confusable() {
+        assert_strict_host_refused("n\u{43e}de-a.invalid".into());
+    }
+
+    #[test]
+    fn security2200_host_rejects_space() {
+        assert_strict_host_refused("node-a.invalid ".into());
+    }
+
+    #[test]
+    fn security2200_host_rejects_trailing_dot() {
+        assert_strict_host_refused("node-a.invalid.".into());
+    }
+
+    #[test]
+    fn security2200_host_rejects_overlong_label() {
+        assert_strict_host_refused(format!("{}.invalid", "a".repeat(64)));
+    }
+
+    #[test]
+    fn security2200_host_rejects_overlong_total() {
+        for last_len in [62, 63] {
+            assert_strict_host_refused(
+                [
+                    "a".repeat(63),
+                    "b".repeat(63),
+                    "c".repeat(63),
+                    "d".repeat(last_len),
+                ]
+                .join("."),
+            );
+        }
+    }
+
+    #[test]
+    fn security2200_host_rejects_non_hostname_forms() {
+        for raw in [
+            "-node.invalid",
+            "node-.invalid",
+            "node..invalid",
+            "node_a.invalid",
+            "operator@node-a.invalid",
+            "node-a.invalid:22",
+            "[2001:db8::1]",
+            "2001:db8::1",
+        ] {
+            assert_strict_host_refused(raw.into());
+        }
+    }
+
+    #[test]
+    fn security2200_host_accepts_ldh_and_keeps_ssh_grammar_separate() {
+        let max_host = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61),
+        ]
+        .join(".");
+        for host in [
+            "node-a.invalid",
+            "NODE-A.INVALID",
+            "node-a",
+            "0",
+            "192.0.2.1",
+            "xn--bcher-kva.invalid",
+            &max_host,
+        ] {
+            let response = serde_json::json!({"id":"fixture", "result":{"host":host}}).to_string();
+            assert_eq!(
+                super::parse_summary_response(&response, 0).unwrap().host,
+                host
+            );
+            for target in [
+                "operator@node-a.invalid:2222",
+                "[2001:db8::1]",
+                "operator@[2001:db8::1]:22",
+                "node_alias.invalid",
+            ] {
+                let mut row = wire_peer("node-a.invalid", None);
+                row.host = Some(host.into());
+                row.ssh_target = target.into();
+                row.proxy_jump = Some("operator@[2001:db8::2]:22,hub.invalid".into());
+                let mut cache = std::collections::HashMap::new();
+                super::merge_relayed_fleet(&mut cache, vec![row.clone()], "hub.invalid");
+                let admitted = &cache[&host.to_ascii_lowercase()].peer;
+                assert_eq!(admitted.host.as_deref(), Some(host));
+                assert_eq!(admitted.ssh_target, target);
+                assert_eq!(admitted.proxy_jump, row.proxy_jump);
+                let carried = super::peer_from_wire(super::peer_to_wire(admitted));
+                assert_eq!(carried.host.as_deref(), Some(host));
+                assert_eq!(carried.ssh_target, target);
+            }
+        }
+        let response = serde_json::json!({"id":"fixture", "result":{"host":""}}).to_string();
+        assert_eq!(
+            super::parse_summary_response(&response, 0).unwrap().host,
+            ""
+        );
+        let mut row = wire_peer("node-a.invalid", None);
+        row.host = Some(String::new());
+        let mut cache = std::collections::HashMap::new();
+        super::merge_relayed_fleet(&mut cache, vec![row], "hub.invalid");
+        assert!(
+            cache.contains_key("node-a.invalid"),
+            "legacy empty host uses its SSH destination"
+        );
+    }
+
     #[test]
     fn security2117_routing_via_is_validated_never_cleaned() {
         for via in [

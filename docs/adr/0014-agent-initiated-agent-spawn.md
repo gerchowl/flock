@@ -174,16 +174,32 @@ SSH destination and ProxyJump grammar is checked with the same 256-byte bound:
 invalid relay rows are refused, and invalid carried routes are disabled rather
 than partially rewritten. The reserved home target remains supported. The mesh
 layout and VERSION remain unchanged.
-Reported hosts and `via` edge names are identities, not presentation. Validate
-raw values with the shared forbidden-scalar predicate and a 256-byte routing
-bound, without trimming, stripping or truncation. Empty reported hosts retain
-the legacy destination fallback; an empty `via` cannot route a row. Unsafe hosts
-refuse a direct JSON summary, drop a relayed row, or disable a carried binary
-route. Invalid `via` refuses the batch. A content-free
+Reported hosts are hostname identities, not agent display names. Admit only
+ASCII LDH labels: letters, digits and internal hyphens, with an alphanumeric
+first and last byte, 1–63 bytes per label and at most 253 bytes overall.
+Dot-separated labels may not be empty; a trailing dot is refused. IDNA A-labels
+(`xn--bcher-kva`) are accepted as plain ASCII, without decoding or Unicode conversion.
+IPv4 text naturally meets this grammar. Reject spaces, underscores, Unicode
+(including ZWJ, combining marks, variation selectors and confusables), controls
+and overlong values before keying or presentation cleaning. Never trim, strip,
+truncate or normalize a rejected identity into an admitted one. Valid spelling
+is retained apart from the existing ASCII case-insensitive cache lookup.
+
+The reported host comes from the node's configured `name` or its OS hostname;
+a node with a non-LDH name must configure an LDH name to participate in peer
+summaries. SSH destinations are separate: `user@host`, ports, bracketed IPv6 and
+SSH aliases keep their existing destination/ProxyJump grammar and 256-byte bound.
+They are not admitted as reported host identities. An absent or empty reported
+host means no reported identity and retains the legacy SSH-destination fallback,
+whose route grammar is still checked. Relay `via` edge names retain the shared
+forbidden-scalar predicate and 256-byte routing bound; they are not reported
+host fields. An empty `via` cannot route a row.
+
+An invalid raw host refuses a direct JSON summary, drops a relayed row, or
+disables a carried binary route. Invalid `via` refuses the batch. A content-free
 `peer.summary.identifier_dropped` warning carries `invalid_params` and the fixed
-field name only. Thus host keys computed after admission still represent the
-raw received identity (apart from the existing ASCII case-insensitive lookup),
-and a control/bidi-laden host cannot compete with the plain host after cleaning.
+field name only. Generic deserialization remains data-only. The mesh layout and
+VERSION remain unchanged.
 
 
 ### 5. The ceiling is lineage-aware, not a single global counter

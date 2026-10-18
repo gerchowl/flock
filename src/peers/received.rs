@@ -17,7 +17,27 @@ pub(crate) fn text(value: &str) -> String {
     crate::terminal::agent_name::presentation_limited(value, MAX_TEXT_CHARS)
 }
 
-/// Validate a routing/host identity without rewriting it. Unlike presentation,
+/// Admit a reported hostname without rewriting it (ADR-0014 §4). A-labels
+/// remain ASCII; SSH destinations and relay edge names have separate grammars.
+fn host(value: &str) -> bool {
+    let valid = !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            bytes.len() <= 63
+                && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        });
+    if !valid {
+        crate::logging::peer_summary_identifier_dropped("host");
+    }
+    valid
+}
+
+/// Validate a relay edge identity without rewriting it. Unlike presentation,
 /// identities may not lose controls, format characters or an oversized suffix.
 /// The byte bound matches other opaque routing tokens; warnings carry no value.
 pub(super) fn identity(value: &str, field: &'static str) -> bool {
@@ -85,7 +105,7 @@ impl PeerWorkspaceSummary {
 impl super::PeerSummaryPayload {
     /// Admit the parsed JSON envelope before it can populate state or snapshots.
     pub(super) fn received(mut self) -> Result<Self, String> {
-        if !self.host.is_empty() && !identity(&self.host, "host") {
+        if !self.host.is_empty() && !host(&self.host) {
             return Err(crate::api::error_code::ErrorCode::InvalidParams
                 .as_str()
                 .into());
@@ -119,7 +139,7 @@ impl super::PeerSummaryState {
             .host
             .as_deref()
             .filter(|host| !host.is_empty())
-            .is_some_and(|host| !identity(host, "host"));
+            .is_some_and(|value| !host(value));
         if invalid_host {
             self.host = None;
             self.ssh_target.clear();
@@ -182,7 +202,7 @@ impl crate::api::schema::RelayedFleetPeer {
             .host
             .as_deref()
             .filter(|host| !host.is_empty())
-            .is_some_and(|host| !identity(host, "host"))
+            .is_some_and(|value| !host(value))
         {
             return None;
         }
