@@ -578,11 +578,6 @@ const HARNESSES: [HarnessSpec; 3] = [
         result_grace: Duration::from_secs(10),
         startup_dialogs: &[
             StartupDialog {
-                code: lock::NAME,
-                shows: crate::detect::codex_conversation_locked,
-                refusal: lock::REFUSAL,
-            },
-            StartupDialog {
                 code: "codex_hook_review",
                 shows: crate::detect::codex_waiting_on_hook_review,
                 refusal: "Codex is waiting on its hook-review dialog; see #626, or `flk integration install codex` to trust flk's hook",
@@ -593,6 +588,11 @@ const HARNESSES: [HarnessSpec; 3] = [
                 code: "codex_folder_trust",
                 shows: crate::detect::codex_waiting_on_folder_trust,
                 refusal: "Codex is waiting on its folder-trust dialog (see #828); trust the repository once in Codex, which covers its worktrees, or add a trusted [projects] entry for the repository root to ~/.codex/config.toml",
+            },
+            StartupDialog {
+                code: lock::NAME,
+                shows: crate::detect::codex_conversation_locked,
+                refusal: lock::REFUSAL,
             },
         ],
     },
