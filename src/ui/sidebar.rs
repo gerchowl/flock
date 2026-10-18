@@ -1070,7 +1070,10 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             if local_project_keys.contains(project_key) {
                 continue;
             }
-            let rows = &remotes_by_project[project_key];
+            let mut rows = remotes_by_project[project_key].clone();
+            // Home has an actual carried route. A display-only claim about it
+            // must not displace the clickable project leader; keep both rows.
+            rows.sort_by_key(|(peer, _)| !matches!(peer, RemotePeerRef::Origin));
             let entries: Vec<WorkspaceListEntry> = rows
                 .iter()
                 .enumerate()
@@ -6187,6 +6190,58 @@ mod tests {
             project_key: project_key.into(),
         });
         ws
+    }
+
+    #[test]
+    fn server_identity1076_home_project_leads_its_unverified_copy() {
+        let mut app = AppState::test_new();
+        let mut home = peer_with_workspaces(
+            "node-home.example",
+            vec![remote_summary(
+                "alpha",
+                Some("example.invalid/alpha"),
+                Some("alpha"),
+                Some("main"),
+            )],
+        );
+        home.node_id = Some("claimed-home-node".into());
+        let mut claim = home.clone();
+        claim.ssh_target = "node-claim.example".into();
+        app.relayed_fleet_cache.insert(
+            "claim".into(),
+            crate::peers::RelayedEntry {
+                peer: claim,
+                via: Some("node-hub.example".into()),
+                hub_pushed: true,
+            },
+        );
+        home.ssh_target = crate::protocol::HOME_SWITCH_TARGET.into();
+        app.fleet_snapshot = Some(crate::peers::FleetSnapshotState {
+            origin: "node-home.example".into(),
+            origin_summary: Some(home),
+            peers: Vec::new(),
+            received_at: std::time::Instant::now(),
+        });
+        assert_eq!(
+            workspace_list_entries(&app),
+            vec![
+                WorkspaceListEntry::Remote {
+                    peer: crate::app::state::RemotePeerRef::Origin,
+                    ws_idx: 0,
+                    indented: false
+                },
+                WorkspaceListEntry::Remote {
+                    peer: crate::app::state::RemotePeerRef::Relayed {
+                        host_key: "claim".into()
+                    },
+                    ws_idx: 0,
+                    indented: true
+                },
+            ]
+        );
+        assert!(app
+            .server_peer_node(&app.relayed_fleet_cache["claim"].peer)
+            .is_none());
     }
 
     #[test]

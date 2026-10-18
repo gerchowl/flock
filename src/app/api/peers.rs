@@ -453,7 +453,8 @@ fn focus_target(target: Option<&PeerWorkspaceSummary>) -> Option<String> {
 /// Consolidate known node IDs, keeping the freshest origin reading and
 /// preferring the earlier list on ties. Legacy entries remain separate.
 /// Known copies of self and home are suppressed by ID on the receiving end.
-/// Legacy hop destinations still use the exact SSH target exclusion.
+/// Every hop destination uses the exact SSH target exclusion, independent
+/// of its node ID. Identity merging never admits the next leg itself.
 ///
 /// Capped like the carried snapshot itself: the list rides an env var between
 /// attach legs, and an unbounded fleet could brush ARG_MAX and kill the leg.
@@ -469,10 +470,10 @@ fn merge_fleet_peers(
     let mut merged: Vec<crate::protocol::FleetPeer> = Vec::new();
     let mut by_node: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for peer in first.into_iter().chain(rest) {
-        let key = peer.node_id.clone();
-        if key.is_none() && peer.ssh_target == exclude_ssh_target {
+        if peer.ssh_target == exclude_ssh_target {
             continue;
         }
+        let key = peer.node_id.clone();
         match key.as_ref().and_then(|id| by_node.get(id)) {
             Some(&idx) => {
                 // Smaller age = fresher; a known age beats an unknown.
@@ -1137,6 +1138,29 @@ mod tests {
             ingested_at: None,
             proxy_jump: None,
             icon: None,
+        }
+    }
+
+    #[test]
+    fn server_identity1076_hop_exclusion_is_independent_of_node_id_and_source() {
+        for node in [None, Some("claimed-node".to_string())] {
+            for first_hand in [false, true] {
+                let mut hop = summary("node-b.example", "operator@node-b.example");
+                hop.node_id = node.clone();
+                let hop = crate::peers::peer_to_wire(&hop);
+                let other = crate::peers::peer_to_wire(&summary(
+                    "node-c.example",
+                    "operator@node-c.example",
+                ));
+                let (first, rest) = if first_hand {
+                    (vec![hop, other], Vec::new())
+                } else {
+                    (vec![other], vec![hop])
+                };
+                let rows = super::merge_fleet_peers(first, rest, "operator@node-b.example");
+                assert_eq!(rows.len(), 1, "node {node:?}, first_hand {first_hand}");
+                assert_eq!(rows[0].ssh_target, "operator@node-c.example");
+            }
         }
     }
 
