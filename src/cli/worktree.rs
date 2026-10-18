@@ -692,9 +692,9 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
 /// remedy for the same refusal.
 pub(super) fn kill_error_exit_code(error: &serde_json::Value) -> i32 {
     match error.get("code").and_then(|v| v.as_str()).unwrap_or("") {
-        code @ ("worktree_checkout_unreachable" | "worktree_repository_unreachable") => {
-            super::error_code_exit(code, false)
-        }
+        code @ ("worktree_checkout_unreachable"
+        | "worktree_repository_unreachable"
+        | "worktree_path_not_root") => super::error_code_exit(code, false),
         "not_linked_worktree" | "workspace_not_found" => super::exit::WORKTREE_NOT_LINKED,
         // The retryable class: the same call with --force clears it.
         "dirty_worktree_requires_force" | "submodule_worktree_requires_force" => {
@@ -911,6 +911,7 @@ mod tests {
         for code in [
             "worktree_checkout_unreachable",
             "worktree_repository_unreachable",
+            "worktree_path_not_root",
         ] {
             assert_eq!(
                 super::kill_error_exit_code(&serde_json::json!({"code":code})),

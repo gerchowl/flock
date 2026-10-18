@@ -32,6 +32,16 @@ impl ApiFailure {
     }
 }
 
+impl From<crate::worktree::CheckoutUnreachable> for ApiFailure {
+    fn from(failure: crate::worktree::CheckoutUnreachable) -> Self {
+        Self {
+            code: failure.code().as_str(),
+            message: failure.to_string(),
+            data: Some(failure.data()),
+        }
+    }
+}
+
 /// Put the sweep's findings on the wire (#400).
 fn process_infos(
     processes: &[crate::worktree::processes::CheckoutProcess],
@@ -783,13 +793,7 @@ impl App {
         checkout: &Path,
         force: bool,
     ) -> Result<(), ApiFailure> {
-        crate::worktree::check_worktree_remove(repo_root, checkout).map_err(|failure| {
-            ApiFailure {
-                code: failure.code().as_str(),
-                message: failure.to_string(),
-                data: Some(failure.data()),
-            }
-        })?;
+        crate::worktree::check_worktree_remove(repo_root, checkout).map_err(ApiFailure::from)?;
         let command = crate::worktree::build_worktree_remove_command(repo_root, checkout, force);
         if let Err(err) = crate::worktree::run_worktree_command(&command) {
             // Both codes mean "rerun with force"; they differ in what the
@@ -1111,76 +1115,94 @@ impl App {
             (None, Some(path)) => {
                 let path = absolute_user_path("path", path)?;
                 let canonical = crate::worktree::canonical_or_original(&path);
-                if let Some(ws_idx) = self.open_workspace_idx_for_checkout(&canonical) {
-                    if let Some(space) = self
-                        .state
-                        .workspaces
-                        .get(ws_idx)
-                        .and_then(|ws| ws.worktree_space_here().cloned())
-                        .filter(|space| space.is_linked_worktree)
-                    {
-                        return Ok(KillTarget {
-                            workspace_idx: Some(ws_idx),
-                            repo_root: space.repo_root,
-                            checkout: space.checkout_path,
+                // Requested-path metadata only orders probes; ownership comes from
+                // open/remembered workspaces, and removal requires exact registration.
+                let preferred = crate::workspace::git_space_metadata(&canonical).map(|space| {
+                    crate::worktree::canonical_or_original(
+                        &crate::worktree::main_root_from_common_dir(Path::new(&space.key)),
+                    )
+                });
+                let mut owned = std::collections::BTreeSet::new();
+                for ws in &self.state.workspaces {
+                    let repo = ws
+                        .worktree_space_here()
+                        .map(|space| space.repo_root.clone())
+                        .or_else(|| {
+                            ws.git_space().map(|space| {
+                                crate::worktree::main_root_from_common_dir(Path::new(&space.key))
+                            })
+                        })
+                        .or_else(|| {
+                            crate::workspace::git_space_metadata(&ws.identity_cwd).map(|space| {
+                                crate::worktree::main_root_from_common_dir(Path::new(&space.key))
+                            })
                         });
+                    if let Some(repo) = repo {
+                        owned.insert(crate::worktree::canonical_or_original(&repo));
                     }
                 }
-                let readable = crate::workspace::git_space_metadata(&canonical);
-                // Ancestor metadata cannot identify a nested registered checkout.
-                if readable.as_ref().is_none_or(|space| {
-                    crate::worktree::canonical_or_original(&space.repo_root) != canonical
-                }) {
-                    // Verify registration in a remembered repo, never infer ownership
-                    // from an unreadable checkout's parent directory.
-                    let mut seen_repos = std::collections::BTreeSet::new();
-                    for ws in &self.state.workspaces {
-                        let Some(space) = crate::workspace::git_space_metadata(&ws.identity_cwd)
-                        else {
-                            continue;
-                        };
-                        let repo =
-                            crate::worktree::main_root_from_common_dir(Path::new(&space.key));
-                        if !seen_repos.insert(repo.clone()) {
-                            continue;
-                        }
-                        let registered =
-                            crate::worktree::list_existing_worktrees(&repo).is_ok_and(|rows| {
-                                rows.iter().any(|row| {
-                                    !row.is_bare
-                                        && crate::worktree::canonical_or_original(&row.path)
-                                            == canonical
-                                        && canonical
-                                            != crate::worktree::canonical_or_original(&repo)
+                let mut owned: Vec<_> = owned.into_iter().collect();
+                owned.sort_by_key(|repo| Some(repo) != preferred.as_ref());
+                let mut nearest: Option<PathBuf> = None;
+                let mut probe_failure = None;
+                for repo in owned {
+                    let rows = match crate::worktree::list_existing_worktrees(&repo) {
+                        Ok(rows) => rows,
+                        Err(_) => {
+                            probe_failure.get_or_insert_with(|| {
+                                ApiFailure::from(crate::worktree::CheckoutUnreachable {
+                                    path: canonical.clone(),
+                                    repo: Some(repo.clone()),
+                                    possible_unmounted_mount_point: None,
                                 })
                             });
-                        if registered {
-                            return Ok(KillTarget {
-                                workspace_idx: None,
-                                repo_root: repo,
-                                checkout: canonical,
+                            continue;
+                        }
+                    };
+                    for row in rows.into_iter().filter(|row| !row.is_bare) {
+                        let root = crate::worktree::canonical_or_original(&row.path);
+                        if root == canonical {
+                            if root == repo {
+                                return Err(ApiFailure::new(
+                                    "not_linked_worktree",
+                                    "path is the repo's main checkout, not a linked worktree",
+                                ));
+                            }
+                            let workspace_idx = self.state.workspaces.iter().position(|ws| {
+                                ws.worktree_space_here().is_some_and(|space| {
+                                    space.is_linked_worktree
+                                        && crate::worktree::canonical_or_original(
+                                            &space.checkout_path,
+                                        ) == root
+                                        && crate::worktree::canonical_or_original(&space.repo_root)
+                                            == repo
+                                })
                             });
+                            return Ok(KillTarget {
+                                workspace_idx,
+                                repo_root: repo,
+                                checkout: root,
+                            });
+                        }
+                        if canonical.starts_with(&root)
+                            && nearest.as_ref().is_none_or(|current| {
+                                root.components().count() > current.components().count()
+                            })
+                        {
+                            nearest = Some(root);
                         }
                     }
                 }
-                let space = readable.ok_or_else(|| {
-                    // No readable checkout and no remembered repo verified its
-                    // registration. Do not guess a repo for a destructive verb.
-                    ApiFailure::new(
-                        "not_git_worktree",
-                        "path is not a readable Git work tree; kill it through its workspace",
-                    )
-                })?;
-                if !space.is_linked_worktree {
-                    return Err(ApiFailure::new(
-                        "not_linked_worktree",
-                        "path is the repo's main checkout, not a linked worktree",
-                    ));
+                if let Some(failure) = probe_failure {
+                    return Err(failure);
                 }
-                Ok(KillTarget {
-                    workspace_idx: None,
-                    repo_root: crate::worktree::main_root_from_common_dir(Path::new(&space.key)),
-                    checkout: space.repo_root,
+                // ADR-0029 §4: an explicit retarget is required; force cannot
+                // turn an enclosing registered checkout into the requested root.
+                Err(ApiFailure {
+                    code: crate::api::error_code::ErrorCode::WorktreePathNotRoot.as_str(),
+                    message: "path must be an exact registered linked-worktree root of an open or remembered repository; retarget explicitly or open its owning repository".into(),
+                    data: Some(serde_json::json!({"path":canonical,
+                        "nearest_enclosing_worktree":nearest})),
                 })
             }
         }
@@ -5326,7 +5348,7 @@ mod tests {
     }
 
     #[test]
-    fn healthy_kill_path_skips_remembered_repository_git_invocations() {
+    fn healthy_kill_path_verifies_registration_without_scanning_other_repositories() {
         let repo = create_committed_repo("healthy-path-repo");
         let checkout = unreachable_fixture_path("healthy-path-checkout");
         run_git(
@@ -5341,6 +5363,10 @@ mod tests {
             ],
         );
         let mut app = app_with_parent(&repo);
+        let other = create_committed_repo("healthy-path-other-repo");
+        let mut other_workspace = Workspace::test_new("other");
+        other_workspace.identity_cwd = other.clone();
+        app.state.workspaces.push(other_workspace);
         let logs = crate::logging::capture_logs(|| {
             let target = app
                 .resolve_kill_target(&WorktreeKillParams {
@@ -5355,11 +5381,12 @@ mod tests {
             .filter(|line| line.contains("process.exec") && line.contains("worktree list"))
             .count();
         assert_eq!(
-            list_calls, 0,
-            "healthy checkout must not scan remembered repos: {logs}"
+            list_calls, 1,
+            "healthy checkout needs exactly one registration query: {logs}"
         );
         std::fs::remove_dir_all(checkout).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
     }
 
     #[test]
@@ -5394,6 +5421,118 @@ mod tests {
         assert_eq!(failure.code, "worktree_checkout_unreachable");
         assert!(parent.join(".git").is_file());
         std::fs::remove_dir_all(parent).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+    fn exact_root_fixture(label: &str) -> (PathBuf, PathBuf, App) {
+        let repo = create_committed_repo(label);
+        let checkout = unreachable_fixture_path(&format!("{label}-checkout"));
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree/exact-root",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let app = app_with_parent(&repo);
+        (repo, checkout, app)
+    }
+
+    fn assert_nonroot_kill_refused(app: &mut App, path: &Path, enclosing: Option<&Path>) {
+        let response = app.handle_api_request(Request {
+            id: "nonroot".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                path: Some(path.to_string_lossy().into_owned()),
+                force: true,
+                keep_branch: true,
+                keep_processes: true,
+                ..Default::default()
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["error"]["code"], "worktree_path_not_root",
+            "{response}"
+        );
+        assert_eq!(
+            response["error"]["data"]["path"],
+            path.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            response["error"]["data"]["nearest_enclosing_worktree"],
+            serde_json::to_value(enclosing).unwrap()
+        );
+    }
+
+    #[test]
+    fn kill_plain_subdirectory_refuses_without_removing_enclosing_checkout() {
+        let (repo, checkout, mut app) = exact_root_fixture("plain-subdirectory");
+        let sub = checkout.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_nonroot_kill_refused(&mut app, &sub, Some(&checkout));
+        assert!(checkout.join(".git").is_file());
+        assert!(sub.is_dir());
+        assert!(crate::worktree::list_existing_worktrees(&repo)
+            .unwrap()
+            .iter()
+            .any(|row| row.path == checkout));
+        std::fs::remove_dir_all(checkout).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn kill_unremembered_unreadable_nested_checkout_refuses_without_removing_parent() {
+        let (repo, checkout, mut app) = exact_root_fixture("unremembered-nested");
+        let other = create_committed_repo("unremembered-nested-owner");
+        let sub = checkout.join("sub");
+        run_git(
+            &other,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree/unremembered",
+                sub.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        std::fs::remove_file(sub.join(".git")).unwrap();
+        assert_nonroot_kill_refused(&mut app, &sub, Some(&checkout));
+        assert!(checkout.join(".git").is_file());
+        assert!(sub.is_dir());
+        assert!(crate::worktree::list_existing_worktrees(&other)
+            .unwrap()
+            .iter()
+            .any(|row| row.path == sub));
+        std::fs::remove_dir_all(checkout).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn kill_readable_checkout_of_unowned_repository_is_refused() {
+        let (repo, checkout, mut app) = exact_root_fixture("unowned-readable");
+        let other = create_committed_repo("unowned-readable-owner");
+        let unowned = unreachable_fixture_path("unowned-readable-checkout");
+        run_git(
+            &other,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree/unowned",
+                unowned.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        assert_nonroot_kill_refused(&mut app, &unowned, None);
+        assert!(unowned.join(".git").is_file());
+        std::fs::remove_dir_all(unowned).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
+        std::fs::remove_dir_all(checkout).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
     }
 }
