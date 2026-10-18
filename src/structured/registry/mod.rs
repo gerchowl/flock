@@ -46,6 +46,7 @@ pub struct Record {
 /// The only runtime represented by a pane-free registry record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum StructuredRuntime {
     /// A process whose authoritative input is a session stream.
     Structured,
@@ -54,6 +55,8 @@ pub enum StructuredRuntime {
 /// Admission/update failures leave every existing entry untouched.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegistryError {
+    /// Unconfirmed ownership must be recovered or cleared before another launch.
+    RecoveryRequired,
     /// Identity, session, harness or supplied name is invalid.
     InvalidRecord,
     /// Identity, name or native session already belongs to another entry.
@@ -186,6 +189,9 @@ impl Registry {
             .get_mut(agent_id)
             .filter(|entry| entry.generation == current)
             .ok_or(RegistryError::StaleGeneration)?;
+        if entry.projection.update.state.lifecycle == Lifecycle::Unknown {
+            return Err(RegistryError::RecoveryRequired);
+        }
         let generation = self
             .generation
             .checked_add(1)

@@ -275,7 +275,7 @@ struct McpConfig {
 
 /// Pinned MCP executable and explicit socket of the server owning the lease.
 /// Never resolved through the model's PATH or inherited FLOCK_* variables.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionMcp {
     binary: PathBuf,
     socket: PathBuf,
@@ -472,19 +472,21 @@ impl LaunchProfile {
 
     /// Install only flock into this session's private MCP config (ADR-0036 §1/§1a).
     /// A reservation is mandatory. Identity is kernel-attested ancestry after the
-    /// runtime binds the Claude PID and birth, never a serialized agent id/token.
+    /// runtime binds the Claude PID and birth. The credential reaches only the
+    /// MCP child via the generated private config, never Claude's launch env.
     /// Call before spawn; the same session guard owns the rotated file's lifetime.
     pub(crate) fn register_flock_mcp(
         &self,
         lease: Option<&super::lease::Lease>,
         endpoint: &SessionMcp,
     ) -> Result<(), LaunchError> {
-        if !lease.is_some_and(|lease| lease.matches_session(&self.session_id)) {
-            return Err(LaunchError::McpLeaseRequired);
-        }
+        let lease = lease
+            .filter(|lease| lease.matches_session(&self.session_id))
+            .ok_or(LaunchError::McpLeaseRequired)?;
         let registration = serde_json::json!({"mcpServers":{"flock":{
-            "type":"stdio", "command":endpoint.binary, "args":["mcp","serve"],
-            "env":{"FLOCK_SOCKET_PATH":endpoint.socket}
+            "type":"stdio", "command":endpoint.binary, "args":["mcp","serve","--structured"],
+            "env":{"FLOCK_SOCKET_PATH":endpoint.socket,
+                "FLOCK_MCP_LEASE_CREDENTIAL":lease.credential()}
         }}});
         let next = self.directory.write("mcp.next.json", &registration)?;
         fs::rename(next, self.directory.path().join("mcp.json"))?;

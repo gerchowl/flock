@@ -24,6 +24,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "remote",
     "session",
     "security",
+    "sessions",
     "slots",
     "spawn",
     "structured",
@@ -471,18 +472,24 @@ fn load_live_config_from_table(
     if let Some(value) = table.get("onboarding") {
         match value.clone().try_into::<Option<bool>>() {
             Ok(onboarding) => config.onboarding = onboarding,
-            Err(err) => diagnostics.push(format!(
-                "invalid onboarding setting: {err}; keeping current onboarding state"
-            )),
+            Err(err) => {
+                invalid_sections.push("onboarding".into());
+                diagnostics.push(format!(
+                    "invalid onboarding setting: {err}; keeping current onboarding state"
+                ));
+            }
         }
     }
 
     if let Some(value) = table.get("name") {
         match value.clone().try_into::<String>() {
             Ok(name) => config.name = name,
-            Err(err) => diagnostics.push(format!(
-                "invalid name setting: {err}; keeping current node name"
-            )),
+            Err(err) => {
+                invalid_sections.push("name".into());
+                diagnostics.push(format!(
+                    "invalid name setting: {err}; keeping current node name"
+                ));
+            }
         }
     }
 
@@ -495,6 +502,7 @@ fn load_live_config_from_table(
         match value.clone().try_into::<String>() {
             Ok(icon) => config.icon = Some(icon),
             Err(err) => {
+                invalid_sections.push("icon".into());
                 diagnostics.push(format!("invalid icon setting: {err}; keeping current icon"))
             }
         }
@@ -507,9 +515,12 @@ fn load_live_config_from_table(
     if let Some(value) = table.get("thermal_command") {
         match value.clone().try_into::<String>() {
             Ok(command) => config.thermal_command = Some(command),
-            Err(err) => diagnostics.push(format!(
-                "invalid thermal_command setting: {err}; keeping current thermal command"
-            )),
+            Err(err) => {
+                invalid_sections.push("thermal_command".into());
+                diagnostics.push(format!(
+                    "invalid thermal_command setting: {err}; keeping current thermal command"
+                ));
+            }
         }
     }
 
@@ -519,9 +530,12 @@ fn load_live_config_from_table(
     if let Some(value) = table.get("gpu_command") {
         match value.clone().try_into::<String>() {
             Ok(command) => config.gpu_command = Some(command),
-            Err(err) => diagnostics.push(format!(
-                "invalid gpu_command setting: {err}; keeping current gpu command"
-            )),
+            Err(err) => {
+                invalid_sections.push("gpu_command".into());
+                diagnostics.push(format!(
+                    "invalid gpu_command setting: {err}; keeping current gpu command"
+                ));
+            }
         }
     }
 
@@ -732,6 +746,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.channels = section,
+    );
+    load_live_section(
+        &table,
+        "sessions",
+        "sessions config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.sessions = section,
     );
     // #397: canonicalise the declared agent names and merge them over the
     // compiled default, so a fleet declaring one agent does not un-declare the
@@ -1883,5 +1905,44 @@ mod spoke_config_tests {
             vec!["unknown msg.future_setting setting ignored"]
         );
         assert!(loaded.invalid_sections.is_empty());
+    }
+}
+#[cfg(test)]
+mod blob_storage_tests {
+    use super::*;
+    #[test]
+    fn live_loader_reports_invalid_sessions_stall_policy() {
+        for value in [0, 4999, 3_600_001] {
+            let loaded =
+                load_live_config_from_str(&format!("[sessions]\nstall_ms = {value}\n")).unwrap();
+            assert_eq!(loaded.invalid_sections, ["sessions"]);
+            assert!(loaded
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("invalid sessions config") && d.contains("sessions.stall_ms")));
+        }
+        for value in [5000, 3_600_000] {
+            let loaded =
+                load_live_config_from_str(&format!("[sessions]\nstall_ms = {value}\n")).unwrap();
+            assert!(loaded.invalid_sections.is_empty());
+            assert_eq!(loaded.config.sessions.stall_ms, value);
+        }
+        assert_eq!(
+            load_live_config_from_str("")
+                .unwrap()
+                .config
+                .sessions
+                .stall_ms,
+            120_000
+        );
+    }
+
+    #[test]
+    fn live_loader_applies_sessions_threshold_and_defaults() {
+        let default = load_live_config_from_str("").unwrap();
+        assert_eq!(default.config.sessions.blob_min_bytes, 2048);
+        let loaded = load_live_config_from_str("[sessions]\nblob_min_bytes = 17\n").unwrap();
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        assert_eq!(loaded.config.sessions.blob_min_bytes, 17);
     }
 }

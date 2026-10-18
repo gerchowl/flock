@@ -5,9 +5,9 @@ description: Configure Flock keybindings, themes, sidebar behavior, notification
 
 Flock works without a config file. Add one when you want custom keys, themes, sidebar settings, notifications, or advanced behavior.
 
-## Structured launch policy (preparation only)
+## Structured launch policy
 
-The structured Claude launch profile is being built in stages. This release adds preparation and validation only (#1437); it does not start structured processes or add a start flag. Process supervision follows in #1438. Lease-based caller identity (#1426) must land before #1439 enables structured start.
+Structured Claude sessions use the public CLI/socket and narrowed MCP start paths. The launch profile, process supervision and lease-based caller identity follow ADR-0036 §1/§1a. See the CLI reference for the pane-free start/read/stop contracts.
 
 The file-only policy defaults to `run_as = "flk-agent"`. Preparation in that mode fails with `structured_needs_agent_user` until the dedicated-user launcher in #1208 is available, even if a user with that name already exists. An explicit operator-mode policy is accepted and emits a warning on every preparation:
 
@@ -24,7 +24,7 @@ Preparation requires a canonical absolute Claude binary path and a successful `-
 
 The harness profile is persistent: in operator mode `CLAUDE_CONFIG_DIR` is `<flk state>/structured/claude/<profile>`, with `profile = "default"` unless configured otherwise. Profile names use only ASCII letters, digits, hyphens and underscores. The directory is created with mode `0700` if missing; existing directories with another owner or mode, and symlinks, are refused. Sessions never delete this profile, so transcripts remain available for resume, hot reload and forks. It is separate from the operator's normal Claude profile. Once #1208 enables the dedicated user, its profiles belong under `~flk-agent/.flk/claude/<profile>`.
 
-A separate random `0700` per-session directory holds flock's generated `0600` JSON files. Settings contain only `permissions.defaultMode = "default"` and empty `allow` and `deny` lists; MCP config contains an empty `mcpServers` map; isolated flock MCP registration is tracked in #1441. The profile explicitly passes stream-json input/output, `--restricted`, `--permission-mode default` and `--permission-prompt-tool stdio`. Session persistence is enabled for later resume support. The environment allowlist contains only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL` and `TMPDIR` when provided, plus the persistent private `CLAUDE_CONFIG_DIR` and dedicated token. The runtime must apply it with `env_clear()`.
+A separate random `0700` per-session directory holds flock's generated `0600` JSON files. Settings contain only `permissions.defaultMode = "default"` and empty `allow` and `deny` lists; MCP config contains one pinned flock server with the session-scoped lease credential (#1441/#1734). That credential stays in this private config and the immutable MCP client context; it never reaches the Claude launch environment. The profile explicitly passes stream-json input/output, `--restricted`, `--permission-mode default` and `--permission-prompt-tool stdio`. Session persistence is enabled for later resume support. The environment allowlist contains only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL` and `TMPDIR` when provided, plus the persistent private `CLAUDE_CONFIG_DIR` and dedicated token. The runtime applies it with `env_clear()`.
 
 Permission requests will only be streamed by #1438 and remain open until S6 supplies answers. The deny carrier for deferred questions belongs to S6b and is not a launch setting. The session-directory guard removes only generated settings/MCP files and their temporary directory on drop, including unwinding; the runtime must retain it until descendants have exited. The persistent harness profile is retained. Abrupt termination such as SIGKILL or a filesystem failure can prevent cleanup, and removal errors are logged.
 
@@ -1100,3 +1100,49 @@ survey, trust, login, or update settings.
 The goal supervisor tracked in #573 is not implemented in this checkout, so this
 restart lifecycle does not yet re-arm or re-inject a Flock goal. Stable agent
 identity and spawning-supervisor routing are retained for that integration.
+
+
+### Structured session observations
+
+```toml
+[sessions]
+stall_ms = 120000
+```
+
+`stall_ms` is optional and defaults to 120000 milliseconds (2 minutes). Valid
+values are 5000 through 3600000 milliseconds, inclusive. Other values, including
+zero, produce a config validation error through the sessions table loader;
+invalid reloads retain the previous table settings and report the failure.
+There is no disabled value, and values are never clamped.
+
+A stall reports accepted or started input with no stdout progress and no open
+control request or tool call. It leaves the phase unchanged and never kills or
+retries a process. Provider retries and rate-limit backoff can cause tens of
+seconds of silence, so the default avoids reporting those as stalls. A
+long-running tool is never a stall while its tool call is open. Public
+structured start remains gated until the final #1843 routing slice.
+
+
+## Reload policy outcomes
+
+`flk --json server reload-config` returns `sections`, a list of changed sections
+with a typed `status`: `applied`, `restart_required` or `invalid`. Rejected known sections
+are always listed, even if their rejected value matches the running default.
+Configuration values and credentials are not echoed in this list. Other valid
+sections can apply when one section is invalid; the overall result is `partial`.
+
+Valid `[structured]` and `[fleet]` changes apply immediately to **new admissions**.
+This includes structured run identity, token-file selection and profile, plus
+fleet spawn opt-in, depth, fanout and capacity limits. Already admitted sessions,
+including pending launches, retain their admitted policy. Lowering a limit below
+the running count refuses new starts until the count drops, without eviction or
+retroactive authorization changes. Invalid sections keep their running policy.
+The default dedicated-user launch boundary remains enforced after reload.
+
+Sections with startup-owned consumers report `restart_required`: `checks`,
+`client`, `gpu_command`, `icon`, `msg`, `name`, `security`, `sessions`, `spawn`, `systemone`,
+`thermal_command`, `title`, and `web`. A section can have a live reader while
+another consumer still requires restart; repeated reloads retain that outcome
+until the process restarts. In particular, socket account policy
+never changes on reload, and existing worker storage policy remains fixed
+(the `[sessions]` follow-up is #1975). These outcomes replace silent omissions.
