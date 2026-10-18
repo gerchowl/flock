@@ -408,4 +408,4 @@ fn capture_locked<R: parking_lot::lock_api::RawMutex>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::structured::workers::queue) mod tests;

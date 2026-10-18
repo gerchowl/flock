@@ -10,7 +10,7 @@ use std::{
     os::{fd::OwnedFd, unix::net::UnixStream},
     time::{Duration, Instant},
 };
-fn root() -> SessionConfigDir {
+pub(in crate::structured::workers::queue) fn root() -> SessionConfigDir {
     SessionConfigDir::create(&std::env::temp_dir()).unwrap()
 }
 fn item(n: u32) -> Item {
@@ -19,7 +19,7 @@ fn item(n: u32) -> Item {
     item.state = State::Held;
     item
 }
-fn journal(root: &SessionConfigDir, n: u32) -> Journal {
+pub(in crate::structured::workers::queue) fn journal(root: &SessionConfigDir, n: u32) -> Journal {
     let mut j = Journal::open(root.path(), "publication-fixture").unwrap();
     for i in 0..n {
         j.append(Change::Upsert {
@@ -38,7 +38,7 @@ fn update(cut: Cut) -> Update {
         cut: Some(cut),
     }
 }
-fn pages(reader: &mut Reader) -> Vec<Page> {
+pub(in crate::structured::workers::queue) fn pages(reader: &mut Reader) -> Vec<Page> {
     let mut result = vec![];
     for _ in 0..1000 {
         let page = reader.page();
@@ -49,7 +49,7 @@ fn pages(reader: &mut Reader) -> Vec<Page> {
     }
     panic!("bounded in-memory replay did not finish");
 }
-fn sequences(pages: &[Page]) -> Vec<u64> {
+pub(in crate::structured::workers::queue) fn sequences(pages: &[Page]) -> Vec<u64> {
     pages
         .iter()
         .filter_map(|p| {
@@ -662,7 +662,7 @@ fn queue_provider_status_only_publish_never_copies_the_retained_snapshot() {
 fn queue_provider_late_capture_has_synced_before_end_at_every_registration_unlock() {
     let root = root();
     let mut j = journal(&root, 2);
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     publisher.finish(|| j.subscription().map_err(Into::into), None);
     assert!(matches!(reader.page(), Page::Pending));
@@ -699,7 +699,7 @@ fn queue_provider_late_capture_has_synced_before_end_at_every_registration_unloc
 fn queue_provider_high_water_advances_even_without_a_record_packet() {
     let root = root();
     let j = journal(&root, 0);
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     publisher.publish(&update(Cut {
         gap: None,
         records: vec![],
