@@ -797,7 +797,10 @@ mod tests {
         let agent_id = terminal.agent_id.clone();
         let session = terminal.persisted_agent_session.clone();
         let snapshot = crate::persist::capture(
-            &app.state.structured_agents,
+            crate::persist::RegistryCapture {
+                registry: &app.state.structured_agents,
+                now_ms: Some(42),
+            },
             &app.state.workspaces,
             &app.state.terminals,
             &app.terminal_runtimes,

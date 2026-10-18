@@ -20,22 +20,22 @@ use super::state::{Input, SessionState, StateSink, Update};
 use crate::api::agent_state::{AgentState, Lifecycle};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// DEAD records older than thirty days since first observation are pruned on save.
 pub const RETAINED_DEAD_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-/// At most 256 DEAD records survive a save, newest first; FORWARD is unbounded.
+/// At most 256 DEAD records survive a save, keeping the newest; FORWARD is unbounded.
 pub const RETAINED_DEAD_MAX: usize = 256;
 
 /// Retained data never supplies runtime or operator authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetainedKind {
-    /// An unknown runtime/harness may belong to a newer binary; never auto-prune it.
+    /// Any unusable object other than an exact duplicate; never auto-prune across versions.
     Forward,
-    /// A supported-format invalid record or shadowed duplicate.
+    /// A non-object JSON element or exact canonical duplicate of an earlier record.
     Dead,
 }
 /// Retained-record metadata, without exposing the preserved payload.
@@ -412,14 +412,21 @@ impl<'de> Deserialize<'de> for Registry {
             registry.unparsed = Some(raw);
             return Ok(registry);
         };
+        let mut seen = BTreeSet::new();
         for (index, raw) in records.into_iter().enumerate() {
-            let reason = match serde_json::from_value::<Record>(raw.clone()) {
-                Ok(record) => match registry.register_raw(record, raw.clone()) {
-                    Ok(_) => continue,
-                    Err(RegistryError::Conflict) => "duplicate",
-                    Err(_) => "invalid_record",
-                },
-                Err(_) => "unsupported_shape",
+            let duplicate = !seen.insert(retention::digest(&raw));
+            let dead = !raw.is_object() || duplicate;
+            let reason = if dead {
+                "non_object_or_exact_duplicate"
+            } else {
+                match serde_json::from_value::<Record>(raw.clone()) {
+                    Ok(record) => match registry.register_raw(record, raw.clone()) {
+                        Ok(_) => continue,
+                        Err(RegistryError::Conflict) => "duplicate",
+                        Err(_) => "invalid_record",
+                    },
+                    Err(_) => "unsupported_shape",
+                }
             };
             tracing::warn!(
                 index,
@@ -428,7 +435,7 @@ impl<'de> Deserialize<'de> for Registry {
             );
             registry
                 .retained
-                .insert(registry.preserved.len(), retention::Retained::new(&raw));
+                .insert(registry.preserved.len(), retention::Retained::new(dead));
             registry.preserved.push(Some(raw));
         }
         Ok(registry)
