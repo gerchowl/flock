@@ -11,6 +11,7 @@ pub(super) struct Recorder<'a> {
     uncertain: &'a AtomicBool,
     cancel: &'a AtomicBool,
     controls: &'a ControlPlane,
+    storage: (&'a super::super::blobs::BlobStore, usize),
 }
 impl<'a> Recorder<'a> {
     pub fn new(
@@ -22,6 +23,7 @@ impl<'a> Recorder<'a> {
         uncertain: &'a AtomicBool,
         cancel: &'a AtomicBool,
         controls: &'a ControlPlane,
+        storage: (&'a super::super::blobs::BlobStore, usize),
     ) -> Self {
         Self {
             file,
@@ -32,6 +34,7 @@ impl<'a> Recorder<'a> {
             uncertain,
             cancel,
             controls,
+            storage,
         }
     }
     fn record(
@@ -51,12 +54,24 @@ impl<'a> Recorder<'a> {
             self.uncertain,
             synthetic,
             grant_request_id,
+            self.storage,
         )
     }
     fn audit(&mut self, value: &Value) -> io::Result<Received> {
         let mut raw = encode(value)?;
         raw.pop();
         self.record(&raw, raw.len() as u64, true, None)
+    }
+    /// Drain a host admission before recording any later stdout evidence.
+    pub fn accepted(&mut self) -> io::Result<()> {
+        while let Ok(accepted) = self.controls.accepted.try_recv() {
+            let mut event = self.audit(&serde_json::json!({
+                "type": "flk_input_accepted", "at_ms": accepted.at_ms,
+            }))?;
+            event.accepted = Some(accepted);
+            publish(event, self.tx, self.cancel)?;
+        }
+        Ok(())
     }
     pub fn command(&mut self, command: Command) -> io::Result<()> {
         match command {
@@ -102,6 +117,7 @@ impl<'a> Recorder<'a> {
         count: u64,
         metadata: metadata::Line,
     ) -> io::Result<()> {
+        self.accepted()?;
         let mut open = None;
         let mut pending_answer = None;
         let mut closings = Vec::new();

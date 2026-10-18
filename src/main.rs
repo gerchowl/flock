@@ -468,6 +468,9 @@ fn main() {
 
 fn run() -> io::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.len() == 2 && raw_args[1] == platform::client_token_lock::WORKER_ARG {
+        return platform::client_token_lock::worker();
+    }
     let args = match session::configure_from_args(&raw_args) {
         Ok(args) => args,
         Err(err) => {
@@ -781,7 +784,13 @@ fn run() -> io::Result<()> {
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub =
         api::EventHub::with_persistence(crate::session::data_dir().join("event-log.jsonl"));
-    let _api_server = match api::start_server_for_mode(api_tx, event_hub.clone(), false) {
+    let runtime_config = app::AppRuntimeConfig::for_config(&loaded_config.config);
+    let _api_server = match api::start_server_for_mode(
+        api_tx,
+        event_hub.clone(),
+        false,
+        runtime_config.uid_policy.clone(),
+    ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             eprintln!("error: flk is already running");
@@ -854,12 +863,13 @@ fn run() -> io::Result<()> {
             std::io::stdout().flush()?;
         }
 
-        let mut app = app::App::new(
+        let mut app = app::App::new_with_runtime_config(
             config,
             true, // no_session — monolithic mode never saves/restores sessions
             config_diagnostic,
             api_rx,
             event_hub,
+            runtime_config,
         );
         let result = match app.initialize_mesh_mail(Some(&_api_server)) {
             Ok(()) => app.run(&mut terminal).await,
