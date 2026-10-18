@@ -339,14 +339,16 @@ impl Transport {
     }
 
     /// Audit a host cancellation, result or interrupt without inventing a decision.
-    /// `None` closes all open ids; token authorization precedes every lookup.
+    /// A targeted close must carry the original `(request_id, request_seq)` from
+    /// the snapshot, not a freshly resolved ID. Closed/unknown handles are refused
+    /// like decide. `None` closes the current turn; authorization precedes lookup.
     pub fn close_permissions(
         &self,
         principal: &Principal<'_>,
-        id: Option<&str>,
+        request: Option<(&str, u64)>,
         reason: permissions::CloseReason,
     ) -> Result<(), ErrorCode> {
-        self.input.close_permissions(principal, id, reason)
+        self.input.close_permissions(principal, request, reason)
     }
 
     /// Open `(request_id, request_seq)` handles; contention fails closed rather
@@ -433,7 +435,7 @@ impl InputHandle {
     pub(super) fn close_permissions(
         &self,
         principal: &Principal<'_>,
-        id: Option<&str>,
+        request: Option<(&str, u64)>,
         reason: permissions::CloseReason,
     ) -> Result<(), ErrorCode> {
         principal.decision_subject()?;
@@ -441,7 +443,7 @@ impl InputHandle {
             return Err(ErrorCode::AgentNotFound);
         }
         let mut book = self.permissions.try_lock().ok_or(ErrorCode::SessionBusy)?;
-        let closings = book.close(id, reason)?;
+        let closings = book.close(request, reason)?;
         if closings.is_empty() {
             return Ok(());
         }

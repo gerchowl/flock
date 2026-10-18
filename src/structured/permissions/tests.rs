@@ -226,7 +226,10 @@ fn cancelled_grant_reservation_cannot_install_a_grant_after_its_close() {
         )
         .unwrap();
     let closing = b
-        .close(Some("request-example"), CloseReason::Cancelled)
+        .close(
+            Some(("request-example", answer.request_seq)),
+            CloseReason::Cancelled,
+        )
         .unwrap();
     for close in closing {
         b.closed(&close.id, close.request_seq);
@@ -507,4 +510,52 @@ fn queued_answer_for_an_evicted_handle_cannot_mutate_its_replacement() {
     b.written(current);
     assert!(b.grants.is_empty());
     assert!(!b.blocked());
+}
+
+#[test]
+fn stale_close_cannot_retire_a_reused_request_id() {
+    let mut b = book();
+    let stale = args(&b, "request-example", Decision::Deny);
+    b.closed(&stale.request_id, stale.request_seq);
+    assert_eq!(
+        b.close(
+            Some((&stale.request_id, stale.request_seq)),
+            CloseReason::Interrupted
+        )
+        .err(),
+        Some(ErrorCode::PermissionRequestClosed)
+    );
+    assert_eq!(
+        b.close(
+            Some(("never-seen", stale.request_seq)),
+            CloseReason::Interrupted
+        )
+        .err(),
+        Some(ErrorCode::PermissionRequestUnknown)
+    );
+    for n in 0..CLOSED_PERMISSION_REQUEST_WINDOW {
+        let id = format!("retired-{n}");
+        b.observe(&id, request()).unwrap();
+        b.closed(&id, sequence(&b, &id));
+    }
+    let open = b.observe("request-example", request()).unwrap();
+    let current = args(&b, "request-example", Decision::Deny);
+    assert!(current.request_seq > stale.request_seq);
+    assert_eq!(
+        b.close(
+            Some((&stale.request_id, stale.request_seq)),
+            CloseReason::Interrupted
+        )
+        .err(),
+        Some(ErrorCode::PermissionRequestUnknown)
+    );
+    let answer = b.prepare(&token(), &current).unwrap();
+    let closings = b
+        .close(
+            Some((&answer.id, answer.request_seq)),
+            CloseReason::Interrupted,
+        )
+        .unwrap();
+    assert_eq!(closings.len(), 1);
+    assert_eq!(closings[0].audit["request_seq"], open["request_seq"]);
 }

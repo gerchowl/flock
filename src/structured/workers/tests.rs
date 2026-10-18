@@ -302,12 +302,16 @@ async fn real_stdout_targets_only_its_record_and_book_close_clears_attention_wit
     a.human(&mut registry, &mut workers, &notify, now).await;
     assert!(registry.get(&b.id).unwrap().1.update.needs_human.is_empty());
     let before = registry.get(&a.id).unwrap().1.update.clone();
-    let id = before.needs_human[0].0.clone();
+    let (id, request_seq) = before.permission_requests[0].clone();
     let principal = Principal::Token(permissions::auth::fixture("fixture-operator", true));
     workers
         .runtime(&a.id, a.generation)
         .unwrap()
-        .close_permissions(&principal, Some(&id), CloseReason::Interrupted)
+        .close_permissions(
+            &principal,
+            Some((&id, request_seq)),
+            CloseReason::Interrupted,
+        )
         .unwrap();
     wait(&notify, || {
         workers.poll(&mut registry, now, 1000);

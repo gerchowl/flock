@@ -178,7 +178,7 @@ impl<'a> Recorder<'a> {
                         .controls
                         .book
                         .lock()
-                        .close(Some(&event.request_id), CloseReason::Cancelled)
+                        .cancel_from_harness(&event.request_id)
                     {
                         Ok(closed) => closings = closed,
                         // Repeated or unrelated cancels do not invent audit facts.

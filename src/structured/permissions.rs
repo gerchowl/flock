@@ -424,28 +424,38 @@ impl Book {
             self.open.remove(&answer.id);
         }
     }
+    /// ADR-0036 §10b: a targeted host close carries the originally surfaced
+    /// handle, like an answer. Never resolve a stale caller's ID to a new handle.
+    /// None retires the current turn's requests, not a previously observed one.
     pub fn close(
         &mut self,
-        id: Option<&str>,
+        request: Option<(&str, u64)>,
         reason: CloseReason,
     ) -> Result<Vec<Closing>, ErrorCode> {
-        if let Some(id) = id {
-            let missing = if self.open.contains_key(id)
-                || self.closed_ids.values().any(|closed| closed == id)
-            {
-                ErrorCode::PermissionRequestClosed
-            } else {
-                ErrorCode::PermissionRequestUnknown
-            };
-            if !self
-                .open
-                .get(id)
-                .is_some_and(|r| matches!(r.stage, Stage::Open | Stage::Reserved))
-            {
+        if let Some((id, request_seq)) = request {
+            let missing = self.missing(id, request_seq);
+            if !self.open.get(id).is_some_and(|r| {
+                r.request_seq == request_seq && matches!(r.stage, Stage::Open | Stage::Reserved)
+            }) {
                 return Err(missing);
             }
         }
-        Ok(self.closing(id, reason, false))
+        Ok(self.closing(request.map(|(id, _)| id), reason, false))
+    }
+    /// Only the stdout owner handles the CLI's ID-only cancellation. Resolve its
+    /// current book handle while holding the same lock, including reserved answers.
+    pub fn cancel_from_harness(&mut self, id: &str) -> Result<Vec<Closing>, ErrorCode> {
+        let request_seq = self
+            .open
+            .get(id)
+            .map(|r| r.request_seq)
+            .or_else(|| {
+                self.closed_ids
+                    .iter()
+                    .find_map(|(seq, closed)| (closed == id).then_some(*seq))
+            })
+            .ok_or(ErrorCode::PermissionRequestUnknown)?;
+        self.close(Some((id, request_seq)), CloseReason::Cancelled)
     }
     pub fn terminal(&mut self) -> Vec<Closing> {
         self.closing(None, CloseReason::Ended, true)

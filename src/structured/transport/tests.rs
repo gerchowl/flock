@@ -1234,11 +1234,11 @@ fn second_held_input_is_a_typed_refusal_without_writing_either_input() {
 
 fn close_permission(
     transport: &Transport,
-    id: Option<&str>,
+    request: Option<(&str, u64)>,
     reason: permissions::CloseReason,
 ) -> Result<(), ErrorCode> {
     wait(transport, || {
-        match transport.close_permissions(&owner(), id, reason) {
+        match transport.close_permissions(&owner(), request, reason) {
             Err(ErrorCode::SessionBusy) => None,
             result => Some(result),
         }
@@ -1259,7 +1259,7 @@ fn host_closures_audit_cancel_result_and_interrupt_without_sending_decisions() {
             receive(&transport);
             receive(&transport);
         }
-        close_permission(&transport, Some("request-a"), reason).unwrap();
+        close_permission(&transport, Some(("request-a", 1)), reason).unwrap();
         let close: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
         assert_eq!(close["reason"], serde_json::to_value(reason).unwrap());
         assert!(close.get("decision").is_none());
@@ -1372,7 +1372,7 @@ fn a_cancelled_reservation_cannot_deliver_a_stale_control_response() {
     let bytes = encode(&stale.response).unwrap();
     close_permission(
         &transport,
-        Some("cancelled-request"),
+        Some(("cancelled-request", 1)),
         permissions::CloseReason::Cancelled,
     )
     .unwrap();
@@ -1508,9 +1508,13 @@ fn refused_close_restores_both_open_and_reserved_requests() {
             &decide("reserved", permissions::Decision::Deny, 1),
         )
         .unwrap();
-    for id in ["open", "reserved"] {
+    for (id, request_seq) in [("open", 2), ("reserved", 1)] {
         assert_eq!(
-            handle.close_permissions(&owner(), Some(id), permissions::CloseReason::Cancelled),
+            handle.close_permissions(
+                &owner(),
+                Some((id, request_seq)),
+                permissions::CloseReason::Cancelled
+            ),
             Err(ErrorCode::SessionBusy)
         );
     }

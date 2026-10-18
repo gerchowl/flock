@@ -1810,8 +1810,14 @@ P16 and P17 have no source in the stream today and are not promised;
   durable stream record before being surfaced. Exhaustion fails closed without
   wrapping. The open audit, authenticated stdout envelope and S4 snapshot carry
   `(request_id, request_seq)`. `AgentDecide` requires both; only an exact live
-  pair can reserve an answer or a session grant. S7 slice 5 must carry the
-  sequence end to end in its request display, command and decision routing.
+  pair can reserve an answer or a session grant. A host close targeting one
+  request also requires this exact pair and uses the same closed/unknown
+  classification; an old handle cannot close a reused ID's new request. A bulk
+  turn close still retires the current turn's requests. The stdout owner resolves
+  the CLI's ID-only cancellation to its current book entry under the same lock:
+  this is a harness fact, not a host close capability. S7 slice 5 (#1831) must
+  still carry the sequence end to end in its request display, command and decision
+  routing; that client integration is not implemented by this close API change.
   `CLOSED_PERMISSION_REQUEST_WINDOW = 1024` retains closed sequences with their
   request IDs in FIFO order of durable closure, including capacity denials.
   A decide for a retained closed pair gets `permission_request_closed`; an

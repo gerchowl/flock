@@ -142,9 +142,23 @@ mod tests {
             }
         }
         assert!(serde_json::from_value::<AgentDecide>(json!({
-            "agent":"fixture-agent","request_id":"request-one","decision":"pass"
+            "agent":"fixture-agent","request_id":"request-one","request_seq":1,"decision":"pass"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn permission_decide_without_request_seq_is_rejected() {
+        for decision in ["allow_once", "allow_always", "deny"] {
+            let mut value =
+                json!({"agent":"fixture-agent", "request_id":"request-one", "decision":decision});
+            assert!(
+                serde_json::from_value::<AgentDecide>(value.clone()).is_err(),
+                "{decision} requires the flk-issued sequence"
+            );
+            value["request_seq"] = json!(1);
+            assert!(serde_json::from_value::<AgentDecide>(value).is_ok());
+        }
     }
 
     #[test]
