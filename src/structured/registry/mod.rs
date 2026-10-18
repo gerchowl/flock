@@ -356,6 +356,21 @@ impl Registry {
             .collect()
     }
 
+    /// Recognize reserved legacy names in durable metadata, including entries
+    /// retained inactive under ADR-0028 §3a. Inspect only direct known fields:
+    /// unknown collection layouts are never recursively interpreted as records.
+    pub(crate) fn legacy_self_target(&self, target: &str) -> bool {
+        self.preserved
+            .iter()
+            .flatten()
+            .chain(self.unparsed.iter())
+            .any(|raw| {
+                raw.get("name").and_then(Value::as_str) == Some("self")
+                    && (target == "self"
+                        || raw.get("agent_id").and_then(Value::as_str) == Some(target))
+            })
+    }
+
     /// Cold metadata copy for persistence/handoff, never a clone of live state.
     pub fn snapshot(&self) -> Self {
         Self {

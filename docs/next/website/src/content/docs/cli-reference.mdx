@@ -1067,9 +1067,19 @@ placement and `unattended: true` are refused for structured starts. The name
 `self` is reserved on both `agent.start` and `agent.spawn`. A legacy structured
 record named `self` returns `structured_legacy_name_reserved` (retry
 `after_human`, exit 1), including when addressed by id. Rename or remove the
-saved record before retrying; with the server stopped, update its name or remove
-its entry in the session snapshot, keeping a backup. No automatic rename or
-history deletion occurs. Stdio permission decisions and
+saved record before retrying. `agent rename` currently addresses PTY terminals,
+not structured records. With the server stopped, back up the state directory's
+`session.json`. In its `structured_agents` array, find the entry by `agent_id`
+and change only `name` to a unique, non-reserved name (or remove only that entry).
+Keep `agent_id`, `session_id`, `lineage` and all other entries and fields intact.
+Restart, then use `flk agent start --runtime structured --name <record-id>` as
+the operator. Renaming keeps the native history and original lineage; removing
+the entry removes its Flock registration, not the native transcript. Inactive
+records with unsupported fields also receive the reserved-name refusal when
+their direct `name`/`agent_id` metadata is recognizable. Renaming does not make
+an unsupported record resumable. For an unknown collection layout, restore a
+snapshot understood by this version rather than guessing its structure. No
+automatic rename or history deletion occurs. Stdio permission decisions and
 richer question routing remain ADR-0036 S6 work (#1307).
 
 The server attests the caller and enforces spawn opt-in, pause, depth, fanout and

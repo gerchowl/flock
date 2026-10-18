@@ -707,16 +707,6 @@ fn endpoint_warning_has_a_closed_path_free_reason() {
 /// admitted ancestry rather than taking the operator's root exemption.
 #[tokio::test]
 async fn app_operator_resume_preserves_record_and_lease_lineage() {
-    operator_resume_preserves_lineage(false).await;
-}
-
-/// The real session snapshot is the only lineage source in this fresh App.
-#[tokio::test]
-async fn cold_restore_operator_resume_preserves_lineage_and_enforces_fanout() {
-    operator_resume_preserves_lineage(true).await;
-}
-
-async fn operator_resume_preserves_lineage(cold: bool) {
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
     fixture.app.state.config.fleet.agent_spawn_enabled = true;
@@ -793,60 +783,7 @@ async fn operator_resume_preserves_lineage(cold: bool) {
     for name in ["model.pid", "validated"] {
         fs::remove_file(fixture.fixture.root.path().join(name)).unwrap();
     }
-    if cold {
-        fixture.app.no_session = false;
-        fixture.app.save_session_now();
-        let snapshot = crate::persist::load().expect("saved structured registry");
-        assert_eq!(snapshot.structured_agents.records(), vec![record.clone()]);
-        let config = fixture.app.state.config.clone();
-        let policy = fixture.app.runtime_config.uid_policy.clone();
-        fixture
-            .app
-            .structured_workers
-            .shutdown(&mut fixture.app.state.structured_agents)
-            .unwrap();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let hub = crate::api::EventHub::default();
-        let restored = App::new(&config, false, None, rx, hub.clone());
-        let old = std::mem::replace(&mut fixture.app, restored);
-        drop(old);
-        fixture.server.take().unwrap().finish_for_test();
-        let server = crate::api::server::start_server_with_capabilities(
-            tx,
-            hub,
-            Some(crate::api::schema::ServerCapabilities {
-                structured_agents: true,
-                live_handoff: false,
-                pane_input_write_ack: false,
-                node_id: None,
-                clone_detection_warning: None,
-                agent_start_label: true,
-                agent_questions: true,
-            }),
-            policy.clone(),
-        )
-        .unwrap();
-        fixture.app.runtime_config.uid_policy = policy;
-        fixture.app.initialize_mesh_mail(Some(&server)).unwrap();
-        fixture.server = Some(server);
-        assert_eq!(
-            fixture.app.state.structured_agents.records(),
-            vec![record.clone()]
-        );
-        assert!(fixture
-            .app
-            .structured_workers
-            .runtime(&id, generation)
-            .is_none());
-        assert!(fixture
-            .app
-            .session_leases
-            .admitted_identities()
-            .unwrap()
-            .is_empty());
-        // Operator resume is exempt even when current policy allows no children.
-        fixture.app.state.config.fleet.max_spawn_fanout = 0;
-    }
+
     let notify = fixture.app.render_notify.clone();
     let resume = serde_json::from_value(
         json!({"name":"lineage-child", "runtime":"structured", "argv":["claude"]}),
@@ -901,28 +838,216 @@ async fn operator_resume_preserves_lineage(cold: bool) {
             .get(&id),
         Some(&Some("original-parent".into()))
     );
-    if cold {
-        fixture.app.state.config.fleet.max_spawn_fanout = 1;
-        let params = serde_json::from_value(json!({
-            "name":"next-child", "runtime":"structured", "argv":["claude"],
-            "cwd":fixture.fixture.root.path().join("project"), "model":"fixture-worker-model"
-        }))
+}
+
+/// The real session snapshot is the only lineage source in this fresh App.
+#[tokio::test]
+async fn cold_restore_operator_resume_preserves_lineage_and_enforces_fanout() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    fixture.app.state.config.fleet.agent_spawn_enabled = true;
+    fixture.app.state.config.fleet.max_spawn_depth = 4;
+    let params = serde_json::from_value(json!({"name":"lineage-child", "runtime":"structured", "argv":["claude"], "cwd":fixture.fixture.root.path().join("project"), "model":"fixture-worker-model"})).unwrap();
+    fixture
+        .app
+        .start_structured(
+            params,
+            &SpawnCaller::Structured {
+                agent_id: Some("original-parent".into()),
+                depth: 2,
+            },
+        )
         .unwrap();
-        assert_eq!(
+    let record = fixture.app.state.structured_agents.records().pop().unwrap();
+    assert_eq!(
+        record.lineage,
+        Some(crate::structured::registry::Lineage {
+            parent: Some("original-parent".into()),
+            depth: 3
+        })
+    );
+    let id = record.agent_id.clone();
+    let generation = fixture.app.state.structured_agents.get(&id).unwrap().2;
+    let notify = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        assert!(
             fixture
                 .app
-                .start_structured(
-                    params,
-                    &SpawnCaller::Structured {
-                        agent_id: Some("original-parent".into()),
-                        depth: 2,
-                    }
-                )
-                .unwrap_err(),
-            ErrorCode::AtFanoutLimit
+                .structured_workers
+                .report(&id, generation)
+                .is_none(),
+            "launch failed"
         );
-        assert_eq!(fixture.app.state.structured_agents.records().len(), 1);
+        fixture
+            .app
+            .structured_workers
+            .runtime(&id, generation)
+            .is_some()
+            && fixture.fixture.root.path().join("validated").is_file()
+    })
+    .await;
+    let stopped = fixture
+        .request(Method::AgentStop(crate::api::schema::AgentTarget {
+            target: id.clone(),
+        }))
+        .await;
+    assert!(stopped.get("error").is_none(), "{stopped}");
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        fixture
+            .app
+            .structured_workers
+            .report(&id, generation)
+            .is_some()
+    })
+    .await;
+    crate::structured::workers::tests::join_reported(
+        &mut fixture.app.structured_workers,
+        &id,
+        generation,
+    )
+    .await;
+    for name in ["model.pid", "validated"] {
+        fs::remove_file(fixture.fixture.root.path().join(name)).unwrap();
     }
+
+    fixture.app.no_session = false;
+    fixture.app.save_session_now();
+    let snapshot = crate::persist::load().expect("saved structured registry");
+    assert_eq!(snapshot.structured_agents.records(), vec![record.clone()]);
+    let config = fixture.app.state.config.clone();
+    let policy = fixture.app.runtime_config.uid_policy.clone();
+    fixture
+        .app
+        .structured_workers
+        .shutdown(&mut fixture.app.state.structured_agents)
+        .unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let hub = crate::api::EventHub::default();
+    let restored = App::new(&config, false, None, rx, hub.clone());
+    let old = std::mem::replace(&mut fixture.app, restored);
+    drop(old);
+    fixture.server.take().unwrap().finish_for_test();
+    let server = crate::api::server::start_server_with_capabilities(
+        tx,
+        hub,
+        Some(crate::api::schema::ServerCapabilities {
+            structured_agents: true,
+            live_handoff: false,
+            pane_input_write_ack: false,
+            node_id: None,
+            clone_detection_warning: None,
+            agent_start_label: true,
+            agent_questions: true,
+        }),
+        policy.clone(),
+    )
+    .unwrap();
+    fixture.app.runtime_config.uid_policy = policy;
+    fixture.app.initialize_mesh_mail(Some(&server)).unwrap();
+    fixture.server = Some(server);
+    assert_eq!(
+        fixture.app.state.structured_agents.records(),
+        vec![record.clone()]
+    );
+    assert!(fixture
+        .app
+        .structured_workers
+        .runtime(&id, generation)
+        .is_none());
+    assert!(fixture
+        .app
+        .session_leases
+        .admitted_identities()
+        .unwrap()
+        .is_empty());
+    // Operator resume is exempt even when current policy allows no children.
+    fixture.app.state.config.fleet.max_spawn_fanout = 0;
+
+    let notify = fixture.app.render_notify.clone();
+    let resume = serde_json::from_value(
+        json!({"name":"lineage-child", "runtime":"structured", "argv":["claude"]}),
+    )
+    .unwrap();
+    let resumed = fixture.request(Method::AgentStart(resume)).await;
+    assert_eq!(resumed["result"]["agent"]["agent_id"], id, "{resumed}");
+    let generation = fixture.app.state.structured_agents.get(&id).unwrap().2;
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        assert!(
+            fixture
+                .app
+                .structured_workers
+                .report(&id, generation)
+                .is_none(),
+            "resume failed"
+        );
+        fixture
+            .app
+            .structured_workers
+            .runtime(&id, generation)
+            .is_some()
+            && fixture.fixture.root.path().join("validated").is_file()
+    })
+    .await;
+    assert_eq!(
+        fixture.app.state.structured_agents.get(&id).unwrap().0,
+        &record
+    );
+    let pid = fs::read_to_string(fixture.fixture.root.path().join("model.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        fixture.app.session_leases.caller(Some(pid)),
+        crate::structured::lease::Caller::Agent {
+            agent: id.clone(),
+            depth: 3
+        }
+    );
+    assert_eq!(
+        fixture
+            .app
+            .session_leases
+            .admitted_identities()
+            .unwrap()
+            .get(&id),
+        Some(&Some("original-parent".into()))
+    );
+
+    fixture.app.state.config.fleet.max_spawn_fanout = 1;
+    let params = serde_json::from_value(json!({
+        "name":"next-child", "runtime":"structured", "argv":["claude"],
+        "cwd":fixture.fixture.root.path().join("project"), "model":"fixture-worker-model"
+    }))
+    .unwrap();
+    assert_eq!(
+        fixture
+            .app
+            .start_structured(
+                params,
+                &SpawnCaller::Structured {
+                    agent_id: Some("original-parent".into()),
+                    depth: 2,
+                }
+            )
+            .unwrap_err(),
+        ErrorCode::AtFanoutLimit
+    );
+    assert_eq!(fixture.app.state.structured_agents.records().len(), 1);
 }
 
 #[tokio::test]
@@ -1051,4 +1176,130 @@ async fn legacy_self_record_has_typed_actionable_recovery_refusal() {
     }
     assert_eq!(fixture.app.state.structured_agents.records().len(), 1);
     assert!(!fixture.fixture.root.path().join("version.pid").exists());
+}
+
+/// Metadata remains recognizable without interpreting an unsupported payload.
+#[tokio::test]
+async fn preserved_legacy_self_refuses_by_name_and_id_without_losing_raw_data() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    let raw = json!({"runtime":"future-runtime", "agent_id":"preserved-self", "name":"self", "future":{"untouched":true}});
+    for payload in [json!([raw.clone()]), raw] {
+        fixture.app.state.structured_agents = serde_json::from_value(payload.clone()).unwrap();
+        assert!(fixture.app.state.structured_agents.records().is_empty());
+        for name in ["self", "preserved-self"] {
+            let params = serde_json::from_value(
+                json!({"name":name,"runtime":"structured","argv":["claude"]}),
+            )
+            .unwrap();
+            let response = fixture.request(Method::AgentStart(params)).await;
+            assert_eq!(
+                response["error"]["code"], "structured_legacy_name_reserved",
+                "{response}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&fixture.app.state.structured_agents).unwrap(),
+            payload
+        );
+        assert!(fixture
+            .app
+            .session_leases
+            .admitted_identities()
+            .unwrap()
+            .is_empty());
+        assert!(!fixture.fixture.root.path().join("version.pid").exists());
+    }
+}
+
+/// Exercise the documented offline edit on the real snapshot, then resume from
+/// its disk metadata. Unknown sibling data must survive the edit and next save.
+#[tokio::test]
+async fn offline_legacy_name_recovery_preserves_history_lineage_and_unknown_siblings() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("s4-accepted-silent", 5000);
+    let sibling = json!({"runtime":"future-runtime", "agent_id":"future-sibling", "name":"future", "future":{"untouched":true}});
+    let legacy = json!({"runtime":"structured", "agent_id":"recover-self", "name":"self", "harness":"claude", "session_id":"00000000-0000-4000-8000-000000002096", "cwd":fixture.fixture.root.path().join("project"), "model":"fixture-worker-model", "lineage":{"parent":"original-parent", "depth":3}});
+    fixture.app.state.structured_agents =
+        serde_json::from_value(json!([legacy.clone(), sibling.clone()])).unwrap();
+    fixture.app.no_session = false;
+    fixture.app.save_session_now();
+    fixture
+        .app
+        .structured_workers
+        .shutdown(&mut fixture.app.state.structured_agents)
+        .unwrap();
+    fixture.server.take().unwrap().finish_for_test();
+    let path = crate::session::data_dir().join("session.json");
+    let backup = path.with_extension("json.backup");
+    fs::copy(&path, &backup).unwrap();
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let records = saved["structured_agents"].as_array_mut().unwrap();
+    let record = records
+        .iter_mut()
+        .find(|record| record["agent_id"] == "recover-self")
+        .unwrap();
+    record["name"] = json!("recovered-child");
+    fs::write(&path, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(backup).unwrap()).unwrap()["structured_agents"],
+        json!([legacy.clone(), sibling.clone()])
+    );
+    let config = fixture.app.state.config.clone();
+    let policy = fixture.app.runtime_config.uid_policy.clone();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let hub = crate::api::EventHub::default();
+    fixture.app = App::new(&config, false, None, rx, hub.clone());
+    let server =
+        crate::api::server::start_server_with_capabilities(tx, hub, None, policy.clone()).unwrap();
+    fixture.app.runtime_config.uid_policy = policy;
+    fixture.app.initialize_mesh_mail(Some(&server)).unwrap();
+    fixture.server = Some(server);
+    let params = serde_json::from_value(
+        json!({"name":"recover-self", "runtime":"structured", "argv":["claude"]}),
+    )
+    .unwrap();
+    let response = fixture.request(Method::AgentStart(params)).await;
+    assert_eq!(
+        response["result"]["agent"]["agent_id"], "recover-self",
+        "{response}"
+    );
+    let generation = fixture
+        .app
+        .state
+        .structured_agents
+        .get("recover-self")
+        .unwrap()
+        .2;
+    let notify = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        assert!(
+            fixture
+                .app
+                .structured_workers
+                .report("recover-self", generation)
+                .is_none(),
+            "resume failed"
+        );
+        fixture
+            .app
+            .structured_workers
+            .runtime("recover-self", generation)
+            .is_some()
+            && fixture.fixture.root.path().join("validated").is_file()
+    })
+    .await;
+    let mut expected = legacy;
+    expected["name"] = json!("recovered-child");
+    fixture.app.save_session_now();
+    let restored = crate::persist::load().unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored.structured_agents).unwrap(),
+        json!([expected, sibling])
+    );
 }
