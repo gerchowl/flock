@@ -1766,3 +1766,120 @@ fn custody_round1_replacement_owner_bypasses_long_backoff_immediately() {
         r.stop().await;
     });
 }
+
+fn pin_relay_origin() {
+    let origin = NodeIdentity::fixture([41; 32]);
+    let pin = crate::mesh::store::IdentityPin {
+        node_id: origin.node_id(),
+        public_key: origin.public_key().to_vec(),
+    };
+    with_store(|s| {
+        s.put_pin_from(
+            crate::mesh::store::PinSource::Inbound,
+            "inbound.example",
+            &pin,
+        )
+        .and_then(|_| s.put_pin("configured.example", &pin))
+        .map_err(|e| e.to_string())
+    })
+    .unwrap();
+}
+
+#[test]
+fn relay_origin_presentation_uses_configured_name_and_separate_node_attribution() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2551).await;
+        let d = mail(&r);
+        pin_relay_origin();
+        let rx = request(&mut r, d.clone());
+        assert!(answer(&mut r, &rx).await["result"]["item_id"].is_string());
+        assert_eq!(
+            r.app
+                .mailboxes
+                .reply_meta(&d.envelope.correlation_id)
+                .unwrap()
+                .from_host
+                .as_deref(),
+            Some("configured.example")
+        );
+        r.until(|r| !r.inputs().is_empty()).await;
+        let id = r.inputs()[0]["input"]["uuid"].clone();
+        r.control(json!({"op":"lifecycle","state":"started","uuid":id}));
+        r.until(|r| !r.facts().is_empty()).await;
+        assert_frame(&r, &d);
+        r.stop().await;
+    });
+}
+
+#[test]
+fn relay_origin_presentation_unknown_name_retains_only_explicit_node_claim() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2552).await;
+        let d = mail(&r);
+        let rx = request(&mut r, d.clone());
+        assert!(answer(&mut r, &rx).await["result"]["item_id"].is_string());
+        assert_eq!(
+            r.app
+                .mailboxes
+                .reply_meta(&d.envelope.correlation_id)
+                .unwrap()
+                .from_host,
+            None
+        );
+        r.until(|r| !r.inputs().is_empty()).await;
+        let id = r.inputs()[0]["input"]["uuid"].clone();
+        r.control(json!({"op":"lifecycle","state":"started","uuid":id}));
+        r.until(|r| !r.facts().is_empty()).await;
+        assert_frame(&r, &d);
+        r.stop().await;
+    });
+}
+
+#[test]
+fn relay_origin_presentation_positive_proof_recovery_resolves_name() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2553).await;
+        let d = mail(&r);
+        pin_relay_origin();
+        with_store(|s| {
+            let session = &r
+                .app
+                .state
+                .structured_agents
+                .get(&r.case.id)
+                .unwrap()
+                .0
+                .session_id;
+            s.accept_bound_delivery(
+                &d,
+                (&r.case.id, session),
+                false,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let (ticket, ack) = r.app.admit_queue_custody(&d.envelope).unwrap();
+        r.until(|_| ticket.committed.try_recv().is_ok_and(|x| x.is_ok()))
+            .await;
+        drop(ack);
+        r.app.retry_queue_custody(
+            d.envelope.clone(),
+            crate::api::error_code::ErrorCode::InputWriteUnknown,
+        );
+        assert_eq!(
+            r.app
+                .mailboxes
+                .reply_meta(&d.envelope.correlation_id)
+                .unwrap()
+                .from_host
+                .as_deref(),
+            Some("configured.example")
+        );
+        r.until(|r| !r.inputs().is_empty()).await;
+        r.stop().await;
+    });
+}
