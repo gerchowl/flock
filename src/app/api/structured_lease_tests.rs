@@ -135,6 +135,7 @@ async fn fake_claude_calls(mcp: bool) {
     );
     let location = StreamLocation {
         data_dir: root.clone(),
+        storage: Default::default(),
         agent: AGENT.into(),
         session: SESSION.into(),
     };
@@ -207,10 +208,8 @@ async fn fake_claude_calls(mcp: bool) {
         .unwrap();
     let mut attributed = true;
     for _ in 0..request_count {
-        let msg = tokio::time::timeout(Duration::from_secs(10), app.api_rx.recv())
-            .await
-            .expect("bounded socket dispatch")
-            .expect("request");
+        // Scoped authentication probes precede effects on each fresh connection.
+        let msg = super::scoped_mcp_tests::next_effect(&mut app).await;
         let root_pid: u32 = std::fs::read_to_string(root.join("model.pid"))
             .unwrap()
             .parse()
@@ -347,6 +346,7 @@ async fn queued_socket_requests_with_reused_birth_never_become_operator() {
         let peer_birth = Some(birth.wrapping_add(1));
         let (respond_to, response) = mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "stale".into(),
                 method: Method::OwnerPolicyAdopt(OwnerPolicyParams {
@@ -390,6 +390,7 @@ async fn recovery_parked_requests_preserve_original_peer_birth() {
         },
         Some(pid),
         Some(Some(birth.wrapping_add(1))),
+        None,
         None,
         respond_to,
     );
@@ -580,5 +581,115 @@ async fn self_exclusion_reads_and_self_message_refusals_keep_unproven_candidates
             response["error"]["code"], "self_message_forbidden",
             "{response}"
         );
+    }
+}
+
+#[tokio::test]
+async fn scoped_queued_and_parked_requests_refuse_after_release() {
+    use crate::api::scoped::tests::live_scope;
+    for parked in [false, true] {
+        let (leases, lease, scope, peer) = live_scope();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.session_leases = leases;
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: peer.uid.unwrap(),
+            dedicated: Ok(None).into(),
+        };
+        let request = crate::api::schema::Request {
+            id: "queued-scope".into(),
+            method: crate::api::schema::Method::ServerStop(
+                crate::api::schema::EmptyParams::default(),
+            ),
+        };
+        let (respond_to, response) = std::sync::mpsc::channel();
+        if parked {
+            app.park_until_mesh_recovered(
+                request,
+                peer.pid,
+                Some(peer.birth),
+                Some(peer.uid),
+                Some(scope),
+                respond_to,
+            );
+            drop(lease);
+            app.replay_recovery_parked();
+        } else {
+            drop(lease);
+            app.handle_api_request_message(crate::api::ApiRequestMessage {
+                request,
+                respond_to,
+                peer_pid: peer.pid,
+                peer_birth: peer.birth,
+                peer_uid: peer.uid,
+                scope: Some(scope),
+            });
+        }
+        let result: serde_json::Value = serde_json::from_str(
+            &response
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["error"]["code"], "not_authorized");
+        assert!(!app.state.should_quit);
+        assert!(app.current_api_scope.is_none());
+    }
+}
+
+#[tokio::test]
+async fn scoped_live_agent_does_not_become_operator_and_legacy_uid_policy_is_unchanged() {
+    use crate::api::scoped::tests::live_scope;
+    for (scoped, dedicated) in [(true, false), (false, false), (false, true)] {
+        let (leases, _lease, scope, peer) = live_scope();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        if scoped {
+            app.session_leases = leases;
+        }
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: if dedicated {
+                peer.uid.unwrap().wrapping_add(1)
+            } else {
+                peer.uid.unwrap()
+            },
+            dedicated: Ok(if dedicated { peer.uid } else { None }).into(),
+        };
+        let (respond_to, response) = std::sync::mpsc::channel();
+        app.handle_api_request_message(crate::api::ApiRequestMessage {
+            request: crate::api::schema::Request {
+                id: "boundary".into(),
+                method: crate::api::schema::Method::ServerStop(
+                    crate::api::schema::EmptyParams::default(),
+                ),
+            },
+            respond_to,
+            peer_pid: peer.pid,
+            peer_birth: peer.birth,
+            peer_uid: peer.uid,
+            scope: if scoped { Some(scope) } else { None },
+        });
+        let reply: serde_json::Value = serde_json::from_str(
+            &response
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(app.state.should_quit, !scoped && !dedicated, "{reply}");
+        if scoped || dedicated {
+            assert_eq!(reply["error"]["code"], "operator_only");
+        }
     }
 }

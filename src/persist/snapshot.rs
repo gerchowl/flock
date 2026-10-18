@@ -1013,6 +1013,7 @@ mod tests {
             session_id: "fixture-session".into(),
             cwd: std::env::temp_dir().join("registry-fixture"),
             model: Some("fixture-model".into()),
+            lineage: None,
         };
         state.structured_agents.register(record.clone()).unwrap();
         let captured = capture_from_state(&state);
@@ -1077,6 +1078,7 @@ mod tests {
             session_id: "fixture-session".into(),
             cwd: root.path().to_owned(),
             model: None,
+            lineage: None,
         };
         state.structured_agents.register(record.clone()).unwrap();
         let mut json = serde_json::to_value(capture_from_state(&state)).unwrap();
