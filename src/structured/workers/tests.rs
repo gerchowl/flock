@@ -186,6 +186,7 @@ impl Case {
                 events_closed: false,
                 stall_after: STALL,
                 queue_state: None,
+                queue_seq: 0,
                 thread: Some(std::thread::spawn(|| {})),
             },
         );
@@ -653,6 +654,7 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
             events_closed: false,
             stall_after: STALL,
             queue_state: None,
+            queue_seq: 0,
             thread: Some(std::thread::spawn(|| {})),
         },
     );

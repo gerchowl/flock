@@ -148,9 +148,10 @@ The ADR-0036 §4 owner decisions in #1820 and #1922 separate three cases:
    the raw unknown history.
 
    The journal policy from [#1954](https://github.com/gerchowl/flock/issues/1954)
-   is enforced by the worker owner in
-   [#1955](https://github.com/gerchowl/flock/issues/1955), closing the production
-   integration requirement of [#1928](https://github.com/gerchowl/flock/issues/1928).
+   is wired into the worker owner by
+   [#1955](https://github.com/gerchowl/flock/issues/1955). Production enforcement
+   requires the launch path in [#1843](https://github.com/gerchowl/flock/issues/1843);
+   [#1928](https://github.com/gerchowl/flock/issues/1928) stays open until then.
    Every worker opens the journal with `Journal::open_with_policy` using
    `[sessions] queue_rewrite_bytes`, a positive byte count with named default
    `DEFAULT_QUEUE_REWRITE_BYTES` of 8 MiB (8,388,608 bytes). Zero is rejected.

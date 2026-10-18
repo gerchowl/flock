@@ -17,13 +17,13 @@ pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
         println!("usage: {USAGE}");
         return Ok(exit::SUCCESS);
     }
-    let Some(method) = parse(args) else {
+    let Some((method, show_token)) = parse(args) else {
         return Ok(output::failure(InvalidParams, USAGE, exit::USAGE));
     };
     if matches!(method, Method::ClientTokenAdd(_))
         && !std::io::stdout().is_terminal()
         && !output::json()
-        && !args.iter().any(|s| s == "--show-token")
+        && !show_token
     {
         return Ok(output::failure(InvalidParams, "token add requires terminal stdout; use --json or --show-token to disclose the bearer to redirected output", exit::USAGE));
     }
@@ -51,9 +51,10 @@ pub(super) fn run(args: &[String]) -> std::io::Result<i32> {
     }
     Ok(exit::SUCCESS)
 }
-fn parse(args: &[String]) -> Option<Method> {
+fn parse(args: &[String]) -> Option<(Method, bool)> {
     let args: Vec<_> = args.iter().map(String::as_str).collect();
-    Some(match args.as_slice() {
+    let mut show_token = false;
+    let method = match args.as_slice() {
         ["open"] | ["open", "--print"] => Method::ClientOpen(EmptyParams {}),
         ["token", "list"] => Method::ClientTokenList(EmptyParams {}),
         ["token", "rm", name] => Method::ClientTokenRemove(RemoveParams {
@@ -65,8 +66,11 @@ fn parse(args: &[String]) -> Option<Method> {
             entry: Some((*entry).into()),
         }),
         ["token", "add", name, "--scopes", scopes, tail @ ..]
-            if !scopes.is_empty() && (tail.is_empty() || tail == ["--show-token"]) =>
+            if !name.starts_with('-')
+                && !scopes.is_empty()
+                && (tail.is_empty() || tail == ["--show-token"]) =>
         {
+            show_token = !tail.is_empty();
             Method::ClientTokenAdd(AddParams {
                 name: (*name).into(),
                 scopes: scopes
@@ -77,7 +81,8 @@ fn parse(args: &[String]) -> Option<Method> {
             })
         }
         _ => return None,
-    })
+    };
+    Some((method, show_token))
 }
 
 #[cfg(test)]
@@ -85,8 +90,10 @@ mod tests {
     use super::*;
     #[test]
     fn strict_operator_cli_parses_exact_scopes_and_exclusive_revocation_targets() {
-        let parse =
-            |args: &[&str]| super::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let parse = |args: &[&str]| {
+            super::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .map(|(method, _)| method)
+        };
         assert!(matches!(
             parse(&["open", "--print"]),
             Some(Method::ClientOpen(_))
@@ -108,6 +115,8 @@ mod tests {
             "--show-token"
         ])
         .is_none());
+        assert!(parse(&["token", "add", "--show-token", "--scopes", "read"]).is_none());
+        assert!(parse(&["token", "add", "-phone", "--scopes", "read", "--show-token"]).is_none());
         assert!(parse(&["token", "add", "phone", "--scopes", "operator"]).is_none());
         assert!(parse(&["token", "rm", "phone", "--entry", "aa"]).is_none());
         assert!(parse(&["open", "--print", "http://example.test"]).is_none());

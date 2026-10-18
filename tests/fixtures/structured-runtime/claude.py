@@ -122,6 +122,12 @@ if mode.startswith("queue"):
                     sys.exit(7)
                 if request["op"] == "event":
                     emit(request["event"])
+                elif request["op"] == "burst":
+                    events = request["events"]
+                    sys.stdout.write("".join(json.dumps(e) + "\n" for e in events))
+                    sys.stdout.flush()
+                    if request.get("exit"):
+                        sys.exit(7)
                 elif request["op"] == "lifecycle":
                     event = dict(find("command_lifecycle"))
                     event["state"] = request["state"]
@@ -171,6 +177,11 @@ if not line:
     sys.exit(0)
 assert json.loads(line)["type"] == "user", "private user envelope seam"
 (root / "input-received").write_text("input")
+# S4-only mode: no stdout evidence after accepting the user envelope.
+# Keep this mode separate from queue delivery fixture scenarios.
+if mode == "s4-accepted-silent":
+    sys.stdin.read()
+    sys.exit(0)
 emit(find("system", "hook_response"))
 init = json.loads((root / "restricted-init.json").read_text())
 if mode in ("init-oversize", "init-invalid-utf8"):
