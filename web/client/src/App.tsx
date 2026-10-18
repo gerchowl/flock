@@ -30,6 +30,8 @@ import { createWireFleet } from "./wire/fleet";
 import { captureCode, type CodePage } from "./capture-code";
 import { EXCHANGE_FAILED, RUN_CLIENT_OPEN, createTokenStore, exchangeCode, type ExchangeRequest, type SessionLike } from "./wire/token";
 import { createWireTransport } from "./wire/transport";
+import { ConnectionBar } from "./workbench/ConnectionBar";
+import type { Sender } from "./workbench/Composer";
 import { SAMPLE_INBOX } from "./workbench/inbox";
 import { SAMPLE_AGENTS } from "./workbench/samples";
 import { Workbench } from "./workbench/Workbench";
@@ -70,6 +72,7 @@ function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element
         fleet={fleet}
         transport={transport}
         inbox={SAMPLE_INBOX}
+        sender={null}
         layout={layout}
         saveLayout={(next) => store.save(next)}
         status={() => notice}
@@ -103,6 +106,14 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const [status, setStatus] = createSignal<string>(describe());
   const refresh = (): void => void setStatus(describe());
   onCleanup(connection.onChange(refresh));
+  const [revision, setRevision] = createSignal(0);
+  onCleanup(connection.onChange(() => setRevision(revision() + 1)));
+  const sender: Sender = {
+    commands: () => (revision(), connection.commands()),
+    // `submit` sends the message, not only types it (`AgentSendParams`; S7a's agent-send script).
+    send: (agent, text) => connection.command("agent.send", { target: agent, text, submit: true }),
+    blocked: () => (revision(), connection.principal === null ? "Sending opens once the server has welcomed this client." : null),
+  };
   onCleanup(connection.onTransition((state) => state === "NeedsToken" && tokens.clear()));
   let disposed = false;
   onCleanup(() => {
@@ -163,6 +174,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const transport = createWireTransport(connection);
   return (
     <>
+      <ConnectionBar connection={connection} revision={revision} />
       <Show when={linkNotice()}>
         {(message) => (
           <div class="notice" role="status" data-testid="exchange-notice">
@@ -177,6 +189,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
         fleet={fleet}
         transport={transport}
         inbox={[]}
+        sender={sender}
         layout={layout}
         saveLayout={(next) => store.save(next)}
         status={() => [notice, status()].filter((part) => part !== null).join(" · ")}

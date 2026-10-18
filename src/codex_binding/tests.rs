@@ -115,6 +115,7 @@ fn first_failure_is_diagnosed_fallback_and_rejected_callbacks_stay_revoked() {
     let mut o = Ownership::default();
     for reason in [
         Failure::Path,
+        Failure::HardLink,
         Failure::Metadata,
         Failure::Writer,
         Failure::Version,
@@ -139,6 +140,7 @@ fn failed_rebind_never_erases_launch_trust_even_across_failed_claims() {
     let old = bind(&mut b, &mut o, &f);
     for reason in [
         Failure::Path,
+        Failure::HardLink,
         Failure::Metadata,
         Failure::Writer,
         Failure::Version,
@@ -404,9 +406,43 @@ fn symlink_escape_and_non_regular_sources_are_rejected_without_blocking() {
 #[test]
 fn anchored_open_rejects_symlink_components_and_parent_traversal() {
     let f = Fixture::new();
+    std::fs::copy(&f.path, f.root.join("outside")).unwrap();
     std::os::unix::fs::symlink(&f.root, f.home.join("linked-directory")).unwrap();
     for relative in ["linked-directory/outside", "../outside", "sessions", ""] {
-        assert!(platform::structured::open_regular_beneath(&f.home, Path::new(relative)).is_err());
+        assert!(
+            platform::structured::open_regular_beneath(&f.home, Path::new(relative)).is_err(),
+            "accepted forbidden component path: {relative}"
+        );
+    }
+}
+
+#[test]
+fn hard_linked_transcripts_inside_and_outside_launch_home_are_refused() {
+    for outside_home in [false, true] {
+        let f = Fixture::new();
+        let mut binding = Binding::new(owner("pane"));
+        let key = begin(&mut binding);
+        assert!(f.validate(&key).is_ok(), "single-link transcript is valid");
+        let alias = if outside_home {
+            f.root.join("outside.jsonl")
+        } else {
+            f.home.join("sessions/alias.jsonl")
+        };
+        std::fs::hard_link(&f.path, &alias).unwrap();
+        assert_eq!(f.validate(&key).unwrap_err(), Failure::HardLink);
+        let mut owners = Ownership::default();
+        assert_eq!(
+            binding
+                .finish(&key, f.validate(&key), &mut owners)
+                .unwrap_err(),
+            Failure::HardLink
+        );
+        assert_eq!(
+            binding.decision(&owners),
+            Decision::BindingValidationFailed(Failure::HardLink)
+        );
+        std::fs::remove_file(alias).unwrap();
+        assert!(f.validate(&key).is_ok(), "single remaining link is valid");
     }
 }
 
