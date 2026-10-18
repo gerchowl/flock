@@ -118,6 +118,10 @@ impl Fixture {
             notified.as_mut().enable();
             self.dirty.store(false, Ordering::Release);
             let text = self.runtime().visible_text();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "producer did not emit {marker}: {text:?}"
+            );
             if text.contains(marker) {
                 return;
             }
