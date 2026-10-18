@@ -151,7 +151,14 @@ impl Owner {
                         workers
                             .install_retained(registry, &id, generation, source.clone())
                             .map_err(|error| {
-                                io::Error::new(io::ErrorKind::Interrupted, error.as_str())
+                                io::Error::new(
+                                    if error == crate::api::error_code::ErrorCode::SessionBusy {
+                                        io::ErrorKind::WouldBlock
+                                    } else {
+                                        io::ErrorKind::Interrupted
+                                    },
+                                    error.as_str(),
+                                )
                             })?;
                         Ok(source)
                     })();
