@@ -255,7 +255,8 @@ impl fmt::Display for BoundedError {
 ///
 /// - 60 s: creates / kills / closes / `AgentStart` — a write that may block
 ///   on filesystem work the operator sees.
-/// - 10 s: raw input and guarded submit. The shared client reserves reply
+/// - Raw input: 10 s. Guarded submit: server wait bound plus probe/reply margins.
+///   The shared client reserves reply
 ///   time and selects a shorter raw-write deadline (ADR-0028 §5a).
 /// - 2 s: every poll, get, and list.
 fn cap_for(method: &Method) -> Duration {
@@ -265,13 +266,13 @@ fn cap_for(method: &Method) -> Duration {
         | Method::WorkspaceCreate(_)
         | Method::WorkspaceClose(_)
         | Method::AgentStart(_) => Duration::from_secs(60),
+        Method::PaneSubmit(_) => crate::api::client::SUBMIT_CAP,
         Method::PaneSendInput(_)
         | Method::PaneSendKeys(_)
         | Method::PaneSendText(_)
         | Method::PaneWriteInput(_)
         | Method::PaneWriteKeys(_)
-        | Method::PaneWriteText(_)
-        | Method::PaneSubmit(_) => Duration::from_secs(10),
+        | Method::PaneWriteText(_) => Duration::from_secs(10),
         _ => REQUEST_TIMEOUT,
     }
 }
@@ -2875,7 +2876,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         Ok(cursor) => cursor,
         Err(reason) => return Ok(failed(&entry, false, Some(&reason))),
     };
-    let mut submitted_at_ms = now_ms();
+    let submitted_at_ms = now_ms();
     entry.round = 1;
     entry.submitted_at_ms = submitted_at_ms;
     entry.cursor = cursor.clone();
@@ -2895,68 +2896,10 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     // whole point of capturing it last is that it is the cursor of the turn
     // this submit starts. The submit is bounded (W2); a server that goes
     // quiet mid-type does not hang start.
-    let submit_started = Instant::now();
-    let submitted = submit_brief(&pane_id, &sentence, None)
-        .map(|()| false)
-        .or_else(|reason| match reason {
-            // A Codex still starting up can swallow the paste: its composer stays
-            // empty and no turn begins (#828). One guarded resubmit, only once
-            // that has held for the whole start-watch window.
-            SubmitFailure::Unconfirmed(_) if harness.resubmit_lost_brief => {
-                recover_lost_brief(&entry, &sentence, flags.settle_ms, submit_started, reason)
-            }
-            other => Err(other),
-        });
-    if let Ok(true) = submitted {
-        submitted_at_ms = now_ms();
-        entry.submitted_at_ms = submitted_at_ms;
-        if let Err(err) = write_entry(&entry) {
-            eprintln!("delegate {name}: the registry could not record the resubmit: {err}");
-        }
+    if let Some(code) = submit_start_brief(&mut entry, &sentence, &cleanup, &flags, harness) {
+        return Ok(code);
     }
-    if let Err(reason) = submitted {
-        if matches!(reason, SubmitFailure::Gone) {
-            return Ok(emit_submit_gone(&entry, flags.json));
-        }
-        if harness.confirm_submit && matches!(reason, SubmitFailure::Unconfirmed(_)) {
-            let reason = format!(
-                "delegate {name}: brief submission could not be confirmed: {reason}. \
-                 Workspace kept for inspection; use `flk delegate reap {name}` to remove it"
-            );
-            eprintln!("{reason}");
-            let text = read_pane_tail(&pane_id).unwrap_or_default();
-            if let Some(block) = tail_block(name, &text) {
-                eprint!("{block}");
-            }
-            if flags.json {
-                emit_start_failed(&entry, Some(&reason), true, &text);
-            }
-            return Ok(1);
-        }
-        if matches!(reason, SubmitFailure::Refused(_)) {
-            // Refused before anything was typed: no round ran, so a kept
-            // delegate's next `send` is round 1.
-            entry.round = 0;
-            entry.submitted_at_ms = 0;
-        }
-        let rolled_back = undo_start(
-            &entry,
-            &cleanup,
-            true,
-            &flags,
-            Some(&format!(
-                "delegate {name}: the brief was not submitted: {reason}"
-            )),
-            None,
-        );
-        return Ok(match &reason {
-            // Nothing typed and rolled back: nothing the caller can see
-            // persists, so it is a refusal (#1025). A kept delegate, or one
-            // whose rollback failed, persists and stays a failure.
-            SubmitFailure::Refused(error) if rolled_back => super::refusal_exit(&error.code),
-            _ => crate::cli::exit::FAILURE,
-        });
-    }
+    let submitted_at_ms = entry.submitted_at_ms;
 
     if !flags.await_result {
         emit_submit(&entry, flags.json);
@@ -3015,6 +2958,83 @@ fn fail_started(
 ) -> i32 {
     undo_start(entry, cleanup, written, flags, reason, screen);
     1
+}
+
+/// Submit a persisted start round and retain its state whenever effects are uncertain.
+fn submit_start_brief(
+    entry: &mut Entry,
+    sentence: &str,
+    cleanup: &Cleanup,
+    flags: &StartFlags,
+    harness: &HarnessSpec,
+) -> Option<i32> {
+    let name = entry.name.clone();
+    let pane_id = entry.pane_id.clone();
+    let submit_started = Instant::now();
+    let submitted = submit_brief(&pane_id, sentence, None)
+        .map(|()| false)
+        .or_else(|reason| match reason {
+            // A Codex still starting up can swallow the paste: its composer stays
+            // empty and no turn begins (#828). One guarded resubmit, only once
+            // that has held for the whole start-watch window.
+            SubmitFailure::Unconfirmed(SubmitUncertainty::Observation(_))
+                if harness.resubmit_lost_brief =>
+            {
+                recover_lost_brief(entry, sentence, flags.settle_ms, submit_started, reason)
+            }
+            other => Err(other),
+        });
+    if let Ok(true) = submitted {
+        entry.submitted_at_ms = now_ms();
+        if let Err(err) = write_entry(entry) {
+            eprintln!("delegate {name}: the registry could not record the resubmit: {err}");
+        }
+    }
+    if let Err(reason) = submitted {
+        if matches!(reason, SubmitFailure::Gone) {
+            return Some(emit_submit_gone(entry, flags.json));
+        }
+        if harness.confirm_submit && matches!(reason, SubmitFailure::Unconfirmed(_)) {
+            let reason = format!(
+                "delegate {name}: brief submission could not be confirmed: {reason}. \
+                 Workspace kept for inspection; use `flk delegate reap {name}` to remove it"
+            );
+            eprintln!("{reason}");
+            let text = read_pane_tail(&pane_id).unwrap_or_default();
+            if let Some(block) = tail_block(&name, &text) {
+                eprint!("{block}");
+            }
+            if flags.json {
+                emit_start_failed(entry, Some(&reason), true, &text);
+            }
+            return Some(1);
+        }
+        if matches!(reason, SubmitFailure::Refused(_)) {
+            // Refused before anything was typed: no round ran, so a kept
+            // delegate's next `send` is round 1.
+            entry.round = 0;
+            entry.submitted_at_ms = 0;
+        }
+        let rolled_back = undo_start(
+            entry,
+            cleanup,
+            true,
+            flags,
+            Some(&format!(
+                "delegate {name}: the brief was not submitted: {reason}"
+            )),
+            None,
+        );
+        return Some(match &reason {
+            // Nothing typed and rolled back: nothing the caller can see
+            // persists, so it is a refusal (#1025). A kept delegate, or one
+            // whose rollback failed, persists and stays a failure.
+            SubmitFailure::Refused(error) if rolled_back => super::refusal_exit(&error.code),
+            _ => crate::cli::exit::FAILURE,
+        });
+    }
+
+    None
 }
 
 /// [`fail_started`], saying whether it rolled back cleanly, so nothing the
@@ -3163,7 +3183,7 @@ fn rollback(cleanup: &Cleanup) -> bool {
 }
 
 /// Submit through the server's composer guard and bounded confirmation loop.
-/// The 10 s request cap and caller deadline also bound a stalled transport.
+/// The server-derived submit cap and caller deadline also bound a stalled transport.
 fn submit_brief(pane_id: &str, text: &str, deadline: Option<Instant>) -> Result<(), SubmitFailure> {
     bounded_submit(
         Method::PaneSubmit(PaneSubmitParams {
@@ -3212,17 +3232,38 @@ fn composer_state(screen: &str, sentence: &str) -> Composer {
 enum SubmitFailure {
     /// The server refused before typing anything.
     Refused(ServerError),
-    Unconfirmed(String),
+    Unconfirmed(SubmitUncertainty),
     /// The pane exited before the harness took the brief: the harness died at
     /// launch or on the brief, so no round is running (#817).
     Gone,
+}
+
+/// A final server observation may support the existing startup recovery.
+/// A failed or unknown write never authorizes replay of the brief.
+#[derive(Debug)]
+enum SubmitUncertainty {
+    Observation(String),
+    WriteEffect(ServerError),
+}
+impl From<String> for SubmitUncertainty {
+    fn from(reason: String) -> Self {
+        Self::Observation(reason)
+    }
+}
+impl fmt::Display for SubmitUncertainty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observation(reason) => f.write_str(reason),
+            Self::WriteEffect(error) => write!(f, "{error}"),
+        }
+    }
 }
 
 impl fmt::Display for SubmitFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused(error) => write!(f, "{error}"),
-            Self::Unconfirmed(reason) => f.write_str(reason),
+            Self::Unconfirmed(reason) => write!(f, "{reason}"),
             Self::Gone => f.write_str("the agent exited before it accepted the brief"),
         }
     }
@@ -3404,8 +3445,12 @@ fn recover_lost_brief_with(
 fn bounded_submit(method: Method, deadline: Option<Instant>) -> Result<(), SubmitFailure> {
     match bounded(method, deadline) {
         Ok(response) => submit_outcome(&response),
-        Err(BoundedError::TimedOut) => Err(SubmitFailure::Unconfirmed("timed out".to_string())),
-        Err(BoundedError::Transport(err)) => Err(SubmitFailure::Unconfirmed(err.to_string())),
+        Err(BoundedError::TimedOut) => {
+            Err(SubmitFailure::Unconfirmed("timed out".to_string().into()))
+        }
+        Err(BoundedError::Transport(err)) => {
+            Err(SubmitFailure::Unconfirmed(err.to_string().into()))
+        }
     }
 }
 
@@ -3420,7 +3465,19 @@ fn submit_outcome(response: &serde_json::Value) -> Result<(), SubmitFailure> {
         if error.get("code") == Some(&pane_gone) {
             return Err(SubmitFailure::Gone);
         }
-        return Err(SubmitFailure::Refused(parse_server_error(error)));
+        let error = parse_server_error(error);
+        if matches!(
+            crate::api::error_code::ErrorCode::from_code(&error.code),
+            Some(
+                crate::api::error_code::ErrorCode::InputWriteUnknown
+                    | crate::api::error_code::ErrorCode::InputWriteFailed
+            )
+        ) {
+            return Err(SubmitFailure::Unconfirmed(SubmitUncertainty::WriteEffect(
+                error,
+            )));
+        }
+        return Err(SubmitFailure::Refused(error));
     }
     if response.pointer("/result/outcome") == Some(&serde_json::json!("abandoned"))
         && response.pointer("/result/reason") == Some(&pane_gone)
@@ -3433,10 +3490,13 @@ fn submit_outcome(response: &serde_json::Value) -> Result<(), SubmitFailure> {
             .and_then(serde_json::Value::as_str),
         Some("accepted" | "observed_accepted")
     ) {
-        return Err(SubmitFailure::Unconfirmed(format!(
-            "submission unconfirmed: {}",
-            response.get("result").unwrap_or(&serde_json::Value::Null)
-        )));
+        return Err(SubmitFailure::Unconfirmed(
+            format!(
+                "submission unconfirmed: {}",
+                response.get("result").unwrap_or(&serde_json::Value::Null)
+            )
+            .into(),
+        ));
     }
     Ok(())
 }
@@ -3939,6 +3999,45 @@ fn delegate_wait_for_ready(
     }
 }
 
+/// Submit a persisted send round without rolling uncertainty back to the prior round.
+fn submit_send_brief(entry: &Entry, original: &Entry, sentence: &str, json: bool) -> Option<i32> {
+    let name = &entry.name;
+    if let Err(reason) = submit_brief(&entry.pane_id, sentence, None) {
+        if matches!(reason, SubmitFailure::Gone) {
+            // The round never started, so the record goes back to the last one
+            // that did, which is what `status` and `reap` then answer from.
+            if let Err(err) = write_entry(original) {
+                eprintln!("delegate {name}: the registry could not be restored: {err}");
+            }
+            return Some(emit_submit_gone(original, json));
+        }
+        if matches!(reason, SubmitFailure::Unconfirmed(_)) {
+            return Some(fail(format!("delegate {name}: brief submission could not be confirmed: {reason}. Workspace kept for inspection; `flk delegate wait {name}` observes a later turn")));
+        }
+        // The server refused before typing, so the whole entry goes back, and a
+        // write-back that itself fails is said rather than swallowed: a
+        // registry that now claims a round nobody is running is worse than
+        // the failed send that caused it.
+        if let Err(err) = write_entry(original) {
+            eprintln!(
+                "delegate {name}: the brief was not submitted and the registry could not be \
+                 restored: {err}"
+            );
+            return Some(fail(format!(
+                "delegate {name}: the brief was not submitted: {reason}"
+            )));
+        }
+        eprintln!("delegate {name}: the brief was not submitted: {reason}");
+        return Some(match &reason {
+            // Nothing typed and the registry restored: nothing changed (#1025).
+            SubmitFailure::Refused(error) => super::refusal_exit(&error.code),
+            _ => crate::cli::exit::FAILURE,
+        });
+    }
+
+    None
+}
+
 // ------------------------------------------------------------------- send
 
 fn delegate_send(args: &[String]) -> io::Result<i32> {
@@ -4023,37 +4122,8 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         )));
     }
 
-    if let Err(reason) = submit_brief(&entry.pane_id, &sentence, None) {
-        if matches!(reason, SubmitFailure::Gone) {
-            // The round never started, so the record goes back to the last one
-            // that did, which is what `status` and `reap` then answer from.
-            if let Err(err) = write_entry(&original) {
-                eprintln!("delegate {name}: the registry could not be restored: {err}");
-            }
-            return Ok(emit_submit_gone(&original, flags.json));
-        }
-        if matches!(reason, SubmitFailure::Unconfirmed(_)) {
-            return Ok(fail(format!("delegate {name}: brief submission could not be confirmed: {reason}. Workspace kept for inspection; `flk delegate wait {name}` observes a later turn")));
-        }
-        // The server refused before typing, so the whole entry goes back, and a
-        // write-back that itself fails is said rather than swallowed: a
-        // registry that now claims a round nobody is running is worse than
-        // the failed send that caused it.
-        if let Err(err) = write_entry(&original) {
-            eprintln!(
-                "delegate {name}: the brief was not submitted and the registry could not be \
-                 restored: {err}"
-            );
-            return Ok(fail(format!(
-                "delegate {name}: the brief was not submitted: {reason}"
-            )));
-        }
-        eprintln!("delegate {name}: the brief was not submitted: {reason}");
-        return Ok(match &reason {
-            // Nothing typed and the registry restored: nothing changed (#1025).
-            SubmitFailure::Refused(error) => super::refusal_exit(&error.code),
-            _ => crate::cli::exit::FAILURE,
-        });
+    if let Some(code) = submit_send_brief(&entry, &original, &sentence, flags.json) {
+        return Ok(code);
     }
 
     if !flags.await_result {

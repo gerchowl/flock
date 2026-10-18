@@ -6,6 +6,18 @@ use serde_json::{json, Value};
 /// Default bounded client wait. Raw writes reserve a reply margin within it.
 pub(crate) const CAP: Duration = Duration::from_secs(10);
 const REPLY_MARGIN: Duration = Duration::from_secs(1);
+/// Guarded submit reserves the server's complete wait bound, one second for
+/// capability admission and one for the final reply: 11470 ms in this build.
+pub(crate) const SUBMIT_CAP: Duration =
+    crate::app::guarded_submit::SUBMIT_WAIT_BOUND.saturating_add(REPLY_MARGIN.saturating_mul(2));
+
+pub(super) fn cap(method: &Method) -> Duration {
+    if matches!(method, Method::PaneSubmit(_)) {
+        SUBMIT_CAP
+    } else {
+        CAP
+    }
+}
 
 pub(super) fn requires(method: &Method) -> bool {
     matches!(
@@ -41,7 +53,7 @@ fn bind(request: &Request, remaining: Duration) -> Result<Request, Value> {
         )
     };
     if matches!(bound.method, Method::PaneSubmit(_)) {
-        if remaining <= crate::app::guarded_submit::INJECTION_LEASE + REPLY_MARGIN {
+        if remaining <= crate::app::guarded_submit::SUBMIT_WAIT_BOUND + REPLY_MARGIN {
             return Err(invalid());
         }
         return Ok(bound);

@@ -12,6 +12,7 @@ use crate::api::schema::{
 };
 
 mod input_write;
+pub(crate) use input_write::SUBMIT_CAP;
 
 const MIN_ALLOCATION_PREVIEW_PROTOCOL: u32 = 26;
 
@@ -65,7 +66,7 @@ impl ApiClient {
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
         if input_write::requires(&request.method) {
-            return input_write::call(self, request, input_write::CAP, None);
+            return input_write::call(self, request, input_write::cap(&request.method), None);
         }
         self.check_allocation_preview_protocol(request, None)?;
         if let Some(refusal) = super::compatibility::refuse_skew(self, request) {

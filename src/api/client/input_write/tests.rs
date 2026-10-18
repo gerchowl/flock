@@ -120,7 +120,8 @@ fn shorter_caller_budget_reserves_a_strict_reply_margin() {
 fn guarded_submit_keeps_its_server_budget_and_refuses_short_callers() {
     let request: Request = serde_json::from_value(json!({"id":"guarded","method":"pane.submit", "params":{"pane_id":"p_fixture","text":"hello"}})).unwrap();
     assert!(bind(&request, Duration::from_secs(8)).is_err());
-    assert_eq!(bind(&request, CAP).unwrap().method, request.method);
+    assert!(bind(&request, CAP).is_err());
+    assert_eq!(bind(&request, SUBMIT_CAP).unwrap().method, request.method);
     let peer = ScriptedApi::new(vec![("ping", Some(ping(true)))]);
     let result = peer
         .client()
