@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod peer_uid_tests;
 #[cfg(test)]
+mod scoped_mcp_tests;
+#[cfg(test)]
 mod structured_lease_tests;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
