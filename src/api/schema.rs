@@ -187,6 +187,9 @@ pub enum Method {
     PaneWriteText(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]
     PaneSendKeys(PaneSendKeysParams),
+    /// Explicit retry/fork, refused unless the pane currently shows the Codex lock.
+    #[serde(rename = "pane.resolve_codex_lock")]
+    PaneResolveCodexLock(PaneResolveCodexLockParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
     #[serde(rename = "pane.write_keys")]
@@ -498,6 +501,7 @@ impl Method {
             | Self::PaneSendText(_)
             | Self::PaneWriteText(_)
             | Self::PaneSendKeys(_)
+            | Self::PaneResolveCodexLock(_)
             | Self::PaneSendInput(_)
             | Self::PaneWriteKeys(_)
             | Self::PaneWriteInput(_)
@@ -2014,6 +2018,35 @@ pub struct PaneSendKeysParams {
     pub write_timeout_ms: Option<serde_json::Value>,
     pub pane_id: String,
     pub keys: Vec<String>,
+}
+
+/// An operator's explicit choice on Codex's conversation-lock screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexLockChoice {
+    /// Continue the existing conversation in this pane.
+    Retry,
+    /// Fork the conversation in this pane.
+    Fork,
+}
+
+/// Maximum explicit lock confirmation and post-write settle window (60 seconds).
+pub(crate) const CODEX_LOCK_SETTLE_MS: u64 = 60_000;
+
+/// A single guarded key, never an automatic reply or a submitted brief.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneResolveCodexLockParams {
+    /// Same validated write budget as `pane.send_keys`; absent means 10000 ms.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
+    /// The pane whose live screen must still show the lock before writing.
+    pub pane_id: String,
+    /// Exactly one `r` or `f`, without Enter.
+    pub choice: CodexLockChoice,
 }
 
 /// `pane.arm_self_compact` params.
@@ -3856,7 +3889,8 @@ pub struct AgentInfo {
     /// false, and an older server never sends it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub settled_with_background_shells: bool,
-    /// Provider-limit wait or `resume_failed` while a retained identity is offline.
+    /// Live Codex lock, provider-limit wait, or `resume_failed` for an offline identity.
+    /// A live lock diagnosis can precede the cached agent-status update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub blocked_reason: Option<String>,

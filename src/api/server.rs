@@ -563,6 +563,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneWriteText(_) => "pane.write_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
+        Method::PaneResolveCodexLock(_) => "pane.resolve_codex_lock",
         Method::PaneWriteKeys(_) => "pane.write_keys",
         Method::PaneWriteInput(_) => "pane.write_input",
         Method::PaneSendInput(_) => "pane.send_input",

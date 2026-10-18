@@ -30,7 +30,8 @@ state?: AgentState,
  */
 settled_with_background_shells?: boolean,
 /**
- * Provider-limit wait or `resume_failed` while a retained identity is offline.
+ * Live Codex lock, provider-limit wait, or `resume_failed` for an offline identity.
+ * A live lock diagnosis can precede the cached agent-status update.
  */
 blocked_reason?: string,
 /**

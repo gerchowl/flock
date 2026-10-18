@@ -1326,6 +1326,14 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        // Supply live lock evidence in the poll's existing record, even if
+        // its cached agent status has not caught up with the PTY repaint.
+        let codex_lock = pane.agent.as_deref() == Some("codex")
+            && self
+                .lookup_runtime(ws_idx, pane_id)
+                .is_some_and(|(runtime, _)| {
+                    crate::detect::codex_conversation_locked(&runtime.detection_text())
+                });
         let provider_wait = (pane.agent_status == crate::api::schema::AgentStatus::Blocked)
             .then_some(terminal.provider_limit.as_ref())
             .flatten();
@@ -1347,7 +1355,13 @@ impl App {
                 .agent_state_of_at(ws_idx, pane_id, now)
                 .map(|(_, state)| state),
             agent_status: pane.agent_status,
-            blocked_reason: if terminal.resume_failed {
+            blocked_reason: if codex_lock {
+                Some(
+                    crate::api::error_code::ErrorCode::CodexConversationLocked
+                        .as_str()
+                        .into(),
+                )
+            } else if terminal.resume_failed {
                 Some("resume_failed".into())
             } else {
                 provider_wait.as_ref().map(|_| "provider_limit".into())

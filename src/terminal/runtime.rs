@@ -292,6 +292,16 @@ impl TerminalRuntime {
         self.0.visible_ansi()
     }
 
+    /// Recheck and track one guarded choice, including deferred write evidence.
+    pub(crate) fn try_resolve_codex_lock_at(
+        &self,
+        bytes: Bytes,
+        deadline: std::time::Instant,
+        now: std::time::Instant,
+    ) -> Result<crate::pty::write_receipt::WriteReceipt, &'static str> {
+        self.0.try_resolve_codex_lock_at(bytes, deadline, now)
+    }
+
     pub fn detection_text(&self) -> String {
         self.0.detection_text()
     }

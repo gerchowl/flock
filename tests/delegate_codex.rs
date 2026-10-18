@@ -154,6 +154,8 @@ fn start_server_with_rows(rows: u16) -> Server {
 
 fn request(server: &Server, json: &str) -> serde_json::Value {
     let mut stream = UnixStream::connect(&server.socket).unwrap();
+    stream.set_read_timeout(Some(WITHIN)).unwrap();
+    stream.set_write_timeout(Some(WITHIN)).unwrap();
     stream.write_all(json.as_bytes()).unwrap();
     stream.write_all(b"\n").unwrap();
     stream.flush().unwrap();
@@ -1545,3 +1547,412 @@ mod hint_1581;
 mod narrow_1315;
 #[path = "delegate_codex/wrap_slack_1141.rs"]
 mod wrap_slack_1141;
+
+#[test]
+fn codex_conversation_lock_is_named_mid_life() {
+    let server = start_server_with_rows(40);
+    operator_workspace(&server);
+    let b = brief(&server, "lock.md", "do it\n");
+    let mut child = start_codex(&server, "locked", &b, &[]);
+    let pane = make_ready(&server, "locked");
+    wait_typed(&server, 1);
+    assert_eq!(exited_within(&mut child, WITHIN).unwrap().code(), Some(0));
+    let _ = finish(child);
+    fs::write(
+        server.base.join("screen"),
+        include_str!("fixtures/codex/conversation-locked.txt"),
+    )
+    .unwrap();
+    let deadline = Instant::now() + WITHIN;
+    let captured = loop {
+        let out = cli(
+            &server,
+            &[
+                "pane", "read", &pane, "--source", "recent", "--format", "text",
+            ],
+        );
+        let screen = stdout(&out);
+        if screen.contains("press R to continue here") {
+            break screen;
+        }
+        assert!(agent_get(&server, "locked").is_some());
+        assert!(
+            Instant::now() < deadline,
+            "lock fixture did not paint: {screen}"
+        );
+        thread::yield_now();
+    };
+    assert_eq!(
+        agent_get(&server, "locked").unwrap()["blocked_reason"],
+        "codex_conversation_locked"
+    );
+    loop {
+        let out = cli(&server, &["delegate", "status", "locked", "--json"]);
+        let status = stdout_json(&out);
+        if status["startup_dialog"] == "codex_conversation_locked" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lock not named: {status}; captured pane: {captured}"
+        );
+        thread::yield_now();
+    }
+    let out = cli(
+        &server,
+        &[
+            "delegate",
+            "wait",
+            "locked",
+            "--settle",
+            SETTLE,
+            "--timeout",
+            "5000",
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(6), "{}", stderr(&out));
+    assert_eq!(
+        stdout_json(&out)["startup_dialog"],
+        "codex_conversation_locked"
+    );
+    let before = typed(&server);
+    let out = cli(
+        &server,
+        &["delegate", "send", "locked", "--brief", &b, "--json"],
+    );
+    assert_eq!(out.status.code(), Some(6), "{}", stderr(&out));
+    assert_eq!(
+        stdout_json(&out)["error"]["code"],
+        "codex_conversation_locked"
+    );
+    assert_eq!(
+        stdout_json(&out)["error"]["data"]["choices"],
+        serde_json::json!(["retry", "fork"])
+    );
+    assert_eq!(typed(&server), before);
+}
+
+fn start_locked_codex(stay: bool) -> Server {
+    let server = start_server_with_rows(40);
+    operator_workspace(&server);
+    fs::write(
+        server.base.join("screen"),
+        include_str!("fixtures/codex/conversation-locked.txt"),
+    )
+    .unwrap();
+    fs::create_dir_all(server.base.join("raw")).unwrap();
+    let script = server.base.join("raw/codex");
+    fs::write(&script, include_str!("fixtures/codex/lock-harness.py")).unwrap();
+    fs::write(
+        bin_dir(&server.base).join("codex"),
+        format!("#!/bin/sh\nexec python3 '{}'\n", script.display()),
+    )
+    .unwrap();
+    if stay {
+        fs::write(server.base.join("stay-locked"), "").unwrap();
+    }
+    let b = brief(&server, "locked.md", "do it\n");
+    let mut child = start_codex(
+        &server,
+        "locked",
+        &b,
+        &["--json", "--ready-timeout", "20000"],
+    );
+    let status = exited_within(&mut child, WITHIN);
+    let out = finish(child);
+    assert_eq!(status.and_then(|s| s.code()), Some(6), "{}", stderr(&out));
+    assert_eq!(
+        stdout_json(&out)["startup_dialog"],
+        "codex_conversation_locked"
+    );
+    assert_eq!(stdout_json(&out)["round"], 0);
+    assert_eq!(fs::read(server.base.join("startup-input")).unwrap(), b"");
+    server
+}
+
+fn assert_lock_choice(choice: &str, expected: &[u8]) {
+    let server = start_locked_codex(false);
+    let pane = delegate_pane(&server, "locked");
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "send",
+            "locked",
+            "--resolve-lock",
+            choice,
+            "--json",
+            "--ready-timeout",
+            "5000",
+        ],
+    );
+    let status = exited_within(&mut child, WITHIN);
+    let out = finish(child);
+    assert_eq!(status.and_then(|s| s.code()), Some(0), "{}", stderr(&out));
+    assert!(out.status.success(), "{}", stderr(&out));
+    let result = stdout_json(&out);
+    assert_eq!(result["outcome"], "lock_resolved");
+    assert!(
+        result
+            .get("lock_resolution")
+            .is_some_and(serde_json::Value::is_null),
+        "{result}"
+    );
+    assert!(
+        result
+            .get("startup_dialog")
+            .is_some_and(serde_json::Value::is_null),
+        "{result}"
+    );
+    assert_eq!(result["round"], 0);
+    assert_eq!(
+        fs::read(server.base.join("startup-input")).unwrap(),
+        expected
+    );
+    let status = cli(&server, &["delegate", "status", "locked", "--json"]);
+    assert_eq!(
+        stdout_json(&status)["lock_resolution"],
+        result["lock_resolution"]
+    );
+    let refused = cli(
+        &server,
+        &[
+            "delegate",
+            "send",
+            "locked",
+            "--resolve-lock",
+            choice,
+            "--json",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(10), "{}", stderr(&refused));
+    assert_eq!(stdout_json(&refused)["error"]["code"], "agent_not_ready");
+    assert!(stdout_json(&refused)["error"]["data"].is_null());
+    // The owner guard also refuses stale clients, independently of CLI preflight.
+    let refused = request(&server, &serde_json::json!({"id":"stale", "method":"pane.resolve_codex_lock", "params":{"pane_id":pane,"choice":choice}}).to_string());
+    assert_eq!(refused["error"]["code"], "agent_not_ready");
+    assert_eq!(
+        fs::read(server.base.join("startup-input")).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn codex_lock_retry_sends_only_r_and_refuses_when_unlocked() {
+    assert_lock_choice("retry", b"r");
+}
+
+#[test]
+fn codex_lock_fork_sends_only_f_and_refuses_when_unlocked() {
+    assert_lock_choice("fork", b"f");
+}
+
+#[test]
+fn codex_lock_silent_producer_fails_confirmation_without_resending() {
+    let server = start_locked_codex(true);
+    let mut child = cli_spawn(
+        &server,
+        &[
+            "delegate",
+            "send",
+            "locked",
+            "--resolve-lock",
+            "retry",
+            "--json",
+            "--ready-timeout",
+            "1000",
+        ],
+    );
+    let status = exited_within(&mut child, WITHIN);
+    let out = finish(child);
+    assert_eq!(status.and_then(|s| s.code()), Some(8), "{}", stderr(&out));
+    assert_eq!(stdout_json(&out)["error"]["code"], "codex_lock_unconfirmed");
+    assert_eq!(fs::read(server.base.join("startup-input")).unwrap(), b"r");
+    let status = cli(&server, &["delegate", "status", "locked", "--json"]);
+    assert_eq!(stdout_json(&status)["lock_resolution"]["confirmed"], false);
+    assert_eq!(
+        stdout_json(&status)["startup_dialog"],
+        "codex_conversation_locked"
+    );
+}
+
+fn locked_registry(server: &Server) -> PathBuf {
+    walk(&server.base.join("state"))
+        .into_iter()
+        .find(|path| path.file_name().is_some_and(|name| name == "locked.json"))
+        .unwrap()
+}
+
+#[test]
+fn codex_lock_refusal_without_codex_has_no_claimed_dialog() {
+    let server = start_locked_codex(false);
+    let path = locked_registry(&server);
+    let mut entry: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    entry["harness"] = serde_json::json!("claude");
+    fs::write(path, serde_json::to_vec(&entry).unwrap()).unwrap();
+    let out = cli(
+        &server,
+        &[
+            "delegate",
+            "send",
+            "locked",
+            "--resolve-lock",
+            "retry",
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(10), "{}", stderr(&out));
+    let error = stdout_json(&out);
+    assert_eq!(error["error"]["code"], "agent_not_ready");
+    assert!(error["error"]["data"].is_null(), "{error}");
+    assert_eq!(fs::read(server.base.join("startup-input")).unwrap(), b"");
+}
+
+#[test]
+fn codex_lock_status_clears_an_obsolete_registry_intent() {
+    let server = start_locked_codex(false);
+    let path = locked_registry(&server);
+    let mut entry: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    entry["lock_resolution"] =
+        serde_json::json!({"choice":"retry","confirmed":false,"chosen_at_ms":1});
+    fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
+    let pane = delegate_pane(&server, "locked");
+    request(&server, &serde_json::json!({"id":"unlock","method":"pane.send_text","params":{"pane_id":pane,"text":"u","raw":true}}).to_string());
+    let deadline = Instant::now() + WITHIN;
+    loop {
+        let out = cli(&server, &["delegate", "status", "locked", "--json"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        if stdout_json(&out)["lock_resolution"].is_null() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lock metadata outlived the screen"
+        );
+    }
+    let entry: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert!(entry.get("lock_resolution").is_none(), "{entry}");
+}
+
+#[test]
+fn codex_lock_new_round_drops_prior_intent() {
+    let server = start_server();
+    operator_workspace(&server);
+    let b = brief(&server, "first.md", "first\n");
+    let mut child = start_codex(&server, "d1", &b, &["--json"]);
+    let pane = make_ready(&server, "d1");
+    assert_eq!(exited_within(&mut child, WITHIN).unwrap().code(), Some(0));
+    finish(child);
+    play_turn(&server, &pane, "DONE: first");
+    let path = walk(&server.base.join("state"))
+        .into_iter()
+        .find(|path| path.file_name().is_some_and(|name| name == "d1.json"))
+        .unwrap();
+    let mut entry: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    entry["lock_resolution"] =
+        serde_json::json!({"choice":"fork","confirmed":false,"chosen_at_ms":1});
+    fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
+    let b = brief(&server, "next.md", "next\n");
+    let out = cli(
+        &server,
+        &["delegate", "send", "d1", "--brief", &b, "--json"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let entry: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(entry["round"], 2);
+    assert!(entry.get("lock_resolution").is_none(), "{entry}");
+}
+
+#[test]
+fn codex_lock_raw_socket_callers_cannot_both_write_before_repaint() {
+    let server = start_locked_codex(true);
+    let pane = delegate_pane(&server, "locked");
+    let params = serde_json::json!({"pane_id":pane,"choice":"retry"});
+    let first = request(
+        &server,
+        &serde_json::json!({"id":"first","method":"pane.resolve_codex_lock","params":params})
+            .to_string(),
+    );
+    assert!(first.get("result").is_some(), "{first}");
+    let second = request(
+        &server,
+        &serde_json::json!({"id":"second","method":"pane.resolve_codex_lock","params":params})
+            .to_string(),
+    );
+    assert_eq!(second["error"]["code"], "injection_pending", "{second}");
+    let deadline = Instant::now() + WITHIN;
+    loop {
+        let bytes = fs::read(server.base.join("startup-input")).unwrap();
+        if !bytes.is_empty() {
+            assert_eq!(bytes, b"r");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture did not consume the single key"
+        );
+    }
+}
+
+#[test]
+fn codex_lock_wait_clears_observed_unlocked_intent_in_outcome() {
+    assert_wait_unlock_metadata(false);
+}
+
+#[test]
+fn codex_lock_wait_reports_typed_contention_instead_of_outcome() {
+    assert_wait_unlock_metadata(true);
+}
+
+fn assert_wait_unlock_metadata(contended: bool) {
+    let server = start_locked_codex(false);
+    let path = locked_registry(&server);
+    let mut entry: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    entry["lock_resolution"] =
+        serde_json::json!({"choice":"retry","confirmed":false,"chosen_at_ms":1});
+    fs::write(&path, serde_json::to_vec(&entry).unwrap()).unwrap();
+    let pane = delegate_pane(&server, "locked");
+    request(&server, &serde_json::json!({"id":"unlock","method":"pane.send_text","params":{"pane_id":pane,"text":"u","raw":true}}).to_string());
+    let deadline = Instant::now() + WITHIN;
+    loop {
+        let screen = request(&server, &serde_json::json!({"id":"screen","method":"pane.read","params":{"pane_id":pane,"source":"detection","format":"text"}}).to_string());
+        if screen["result"]["read"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Ask Codex")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "fixture never unlocked");
+    }
+    let _writer = contended.then(|| {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        file.try_lock().unwrap();
+        file
+    });
+    let mut child = cli_spawn(
+        &server,
+        &["delegate", "wait", "locked", "--json", "--timeout", "1000"],
+    );
+    assert!(exited_within(&mut child, WITHIN).is_some());
+    let out = finish(child);
+    if contended {
+        assert_eq!(out.status.code(), Some(10), "{}", stderr(&out));
+        let error = stdout_json(&out);
+        assert_eq!(error["error"]["code"], "injection_pending");
+        assert!(error.get("outcome").is_none());
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(stored.get("lock_resolution").is_some());
+        return;
+    }
+    let out = stdout_json(&out);
+    assert!(out.get("outcome").is_some(), "{out}");
+    assert!(out["lock_resolution"].is_null(), "{out}");
+    let entry: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert!(entry.get("lock_resolution").is_none());
+}

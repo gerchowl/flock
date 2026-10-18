@@ -239,6 +239,7 @@ impl App {
                 deadline,
                 operator_interrupt,
                 paste: Some(paste),
+                codex_lock: false,
             },
         )
     }
