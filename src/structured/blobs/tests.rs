@@ -32,7 +32,7 @@ fn hashes_round_trip_and_stat_without_interpreting_content() {
             preview: "abc".into()
         }
     );
-    assert_eq!(store.get(ABC).unwrap(), b"abc");
+    assert_eq!(store.get(ABC, 3).unwrap(), b"abc");
     assert_eq!(store.stat(ABC).unwrap(), 3);
     assert_eq!(names(&root), [ABC]);
     assert_eq!(
@@ -89,15 +89,15 @@ fn invalid_addresses_missing_corruption_and_symlinks_are_distinct() {
         &"g".repeat(64),
         &"A".repeat(64),
     ] {
-        assert!(matches!(store.get(hash), Err(BlobError::InvalidHash)));
+        assert!(matches!(store.get(hash, 3), Err(BlobError::InvalidHash)));
         assert!(matches!(store.stat(hash), Err(BlobError::InvalidHash)));
     }
-    assert!(matches!(store.get(ABC), Err(BlobError::Missing)));
+    assert!(matches!(store.get(ABC, 3), Err(BlobError::Missing)));
     assert!(matches!(store.stat(ABC), Err(BlobError::Missing)));
     store.put(&b"abc"[..], 3).unwrap();
     let path = root.path().join("blobs").join(ABC);
     fs::write(&path, b"bad").unwrap();
-    assert!(matches!(store.get(ABC), Err(BlobError::Corrupt)));
+    assert!(matches!(store.get(ABC, 3), Err(BlobError::Corrupt)));
     assert!(matches!(store.put(&b"abc"[..], 3), Err(BlobError::Corrupt)));
     assert_eq!(
         fs::read(&path).unwrap(),
@@ -110,7 +110,7 @@ fn invalid_addresses_missing_corruption_and_symlinks_are_distinct() {
     fs::write(&outside, b"abc").unwrap();
     fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
     symlink(&outside, &path).unwrap();
-    assert!(matches!(store.get(ABC), Err(BlobError::UnsafePath)));
+    assert!(matches!(store.get(ABC, 3), Err(BlobError::UnsafePath)));
     assert!(matches!(store.stat(ABC), Err(BlobError::UnsafePath)));
     fs::remove_file(path).unwrap();
     fs::remove_dir(root.path().join("blobs")).unwrap();
@@ -200,7 +200,7 @@ fn publication_is_atomic_for_concurrent_verified_readers() {
         fs::read(root.path().join("blobs").join(&temporary[0])).unwrap(),
         b"a"
     );
-    assert!(matches!(store.get(ABC), Err(BlobError::Missing)));
+    assert!(matches!(store.get(ABC, 3), Err(BlobError::Missing)));
     release_tx.send(()).unwrap();
     assert_eq!(
         result_rx
@@ -211,7 +211,7 @@ fn publication_is_atomic_for_concurrent_verified_readers() {
         ABC
     );
     worker.join().unwrap();
-    assert_eq!(store.get(ABC).unwrap(), b"abc");
+    assert_eq!(store.get(ABC, 3).unwrap(), b"abc");
 }
 #[test]
 fn private_creation_restores_owner_access_under_restrictive_umask() {
@@ -229,7 +229,7 @@ fn private_creation_restores_owner_access_under_restrictive_umask() {
     let _mask = Mask(unsafe { libc::umask(0o777) });
     let store = BlobStore::open(root.path()).unwrap();
     let reference = store.put(&b"abc"[..], 3).unwrap();
-    assert_eq!(store.get(&reference.blob).unwrap(), b"abc");
+    assert_eq!(store.get(&reference.blob, reference.size).unwrap(), b"abc");
     assert_eq!(
         fs::metadata(root.path().join("blobs").join(ABC))
             .unwrap()
@@ -267,7 +267,10 @@ fn threshold_boundary_and_complete_content_references_resolve() {
                 assert_eq!(reference.size, bytes as u64);
                 assert!(reference.preview.chars().count() <= 80);
                 assert_eq!(
-                    serde_json::from_slice::<Value>(&store.get(&reference.blob).unwrap()).unwrap(),
+                    serde_json::from_slice::<Value>(
+                        &store.get(&reference.blob, reference.size).unwrap()
+                    )
+                    .unwrap(),
                     original
                 );
             }
@@ -299,7 +302,7 @@ fn unsafe_namespace_and_file_permissions_fail_without_repair() {
     store.put(&b"abc"[..], 3).unwrap();
     let path = root.path().join("blobs").join(ABC);
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(matches!(store.get(ABC), Err(BlobError::UnsafePath)));
+    assert!(matches!(store.get(ABC, 3), Err(BlobError::UnsafePath)));
     assert!(matches!(store.stat(ABC), Err(BlobError::UnsafePath)));
     assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o644);
     fs::set_permissions(root.path().join("blobs"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -311,4 +314,53 @@ fn unsafe_namespace_and_file_permissions_fail_without_repair() {
         fs::metadata(root.path().join("blobs")).unwrap().mode() & 0o777,
         0o755
     );
+}
+
+#[test]
+fn read_cap_accepts_exact_and_empty_content_and_refuses_smaller_budgets() {
+    let (_root, store) = setup();
+    store.put(&b"abc"[..], 3).unwrap();
+    assert_eq!(store.get(ABC, 3).unwrap(), b"abc");
+    assert_eq!(store.get(ABC, u64::MAX).unwrap(), b"abc");
+    let empty = store.put(&b""[..], 0).unwrap();
+    assert_eq!(store.get(&empty.blob, 0).unwrap(), b"");
+    for cap in [0, 2] {
+        assert!(matches!(store.get(ABC, cap), Err(BlobError::TooLarge)));
+    }
+}
+
+#[test]
+fn read_cap_stats_before_reading_or_hashing_oversized_content() {
+    let (root, store) = setup();
+    store.put(&b"abc"[..], 3).unwrap();
+    fs::write(
+        root.path().join("blobs").join(ABC),
+        b"corrupt oversized object",
+    )
+    .unwrap();
+    let result = store.get_after_stat(ABC, 2, |_| {
+        panic!("oversized metadata must be refused before the read boundary")
+    });
+    assert!(matches!(result, Err(BlobError::TooLarge)));
+}
+
+#[test]
+fn read_cap_bounds_growth_after_stat_to_one_detection_byte() {
+    use std::cell::RefCell;
+    use std::io::Seek;
+    let (root, store) = setup();
+    store.put(&b"abc"[..], 3).unwrap();
+    let observed = RefCell::new(None);
+    let result = store.get_after_stat(ABC, 3, |file| {
+        *observed.borrow_mut() = Some(file.try_clone().unwrap());
+        fs::OpenOptions::new()
+            .append(true)
+            .open(root.path().join("blobs").join(ABC))
+            .unwrap()
+            .write_all(b"growth beyond the cap")
+            .unwrap();
+    });
+    assert!(matches!(result, Err(BlobError::TooLarge)));
+    // Duplicated descriptors share the offset, exposing exactly how much was read.
+    assert_eq!(observed.into_inner().unwrap().stream_position().unwrap(), 4);
 }

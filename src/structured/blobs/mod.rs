@@ -5,6 +5,7 @@ use crate::platform::blobs::Directory;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
@@ -33,9 +34,9 @@ pub enum BlobError {
     Missing,
     /// Stored bytes do not match their address.
     Corrupt,
-    /// A put exceeded its caller-supplied byte cap.
+    /// A read or put exceeded its caller-supplied byte cap.
     TooLarge,
-    /// An underlying read, write, rename or sync failed.
+    /// An underlying metadata, read, write, rename or sync operation failed.
     Io(io::Error),
 }
 impl std::fmt::Display for BlobError {
@@ -105,15 +106,34 @@ impl BlobStore {
             .metadata()?
             .len())
     }
-    /// Read and verify content, distinguishing absence from hash corruption.
-    pub fn get(&self, hash: &str) -> Result<Vec<u8>, BlobError> {
+    /// Read at most `max_bytes` of verified content, distinguishing absence from
+    /// hash corruption. Oversized metadata is refused before reading or allocating
+    /// content. A bounded read also detects growth after stat, consuming at most
+    /// one extra byte. Size refusal precedes digest verification.
+    pub fn get(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BlobError> {
+        self.get_after_stat(hash, max_bytes, |_| {})
+    }
+    // Test seam: the callback observes the opened descriptor after stat, before reading.
+    // Production supplies an empty closure.
+    fn get_after_stat(
+        &self,
+        hash: &str,
+        max_bytes: u64,
+        after_stat: impl FnOnce(&File),
+    ) -> Result<Vec<u8>, BlobError> {
         Self::check(hash)?;
+        let file = self.0.file(hash, false).map_err(Self::lookup_error)?;
+        if file.metadata()?.len() > max_bytes {
+            return Err(BlobError::TooLarge);
+        }
+        after_stat(&file);
         let mut bytes = Vec::new();
-        self.0
-            .file(hash, false)
-            .map_err(Self::lookup_error)?
+        file.take(max_bytes.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(BlobError::Io)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(BlobError::TooLarge);
+        }
         if Sha256::digest(&bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -157,7 +177,7 @@ impl BlobStore {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
-            match self.get(&blob) {
+            match self.get(&blob, max_bytes) {
                 Ok(_) => self.0.sync()?,
                 Err(BlobError::Missing) => self.0.rename(&name, &blob)?,
                 Err(error) => return Err(error),
