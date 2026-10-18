@@ -585,6 +585,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
         Method::EventsRead(_) => "events.read",
+        Method::SessionRetainedList(_) => "session.retained.list",
+        Method::SessionRetainedPurge(_) => "session.retained.purge",
         Method::ClientTokenAdd(_) => "client.token.add",
         Method::ClientTokenRemove(_) => "client.token.rm",
         Method::ClientTokenList(_) => "client.token.list",

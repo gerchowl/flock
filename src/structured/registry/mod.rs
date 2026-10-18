@@ -30,7 +30,7 @@ pub const RETAINED_DEAD_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 6
 pub const RETAINED_DEAD_MAX: usize = 256;
 
 /// Retained data never supplies runtime or operator authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetainedKind {
     /// Any unusable object other than an exact duplicate; never auto-prune across versions.
@@ -39,7 +39,7 @@ pub enum RetainedKind {
     Dead,
 }
 /// Retained-record metadata, without exposing the preserved payload.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedInfo {
     /// Position in the serialized structured_agents array.
     pub slot: usize,
@@ -91,6 +91,19 @@ pub enum RegistryError {
     StaleGeneration,
     /// The generation counter cannot allocate another launch safely.
     GenerationExhausted,
+}
+
+impl RegistryError {
+    /// Stable diagnostic cause, independent of human-readable error wording.
+    fn retained_cause(&self) -> &'static str {
+        match self {
+            Self::InvalidRecord => "invalid_record",
+            Self::UnsupportedCollectionShape => "unsupported_collection_shape",
+            Self::Conflict => "conflict",
+            Self::StaleGeneration => "stale_generation",
+            Self::GenerationExhausted => "generation_exhausted",
+        }
+    }
 }
 
 impl std::fmt::Display for RegistryError {
@@ -416,21 +429,28 @@ impl<'de> Deserialize<'de> for Registry {
         for (index, raw) in records.into_iter().enumerate() {
             let duplicate = !seen.insert(retention::digest(&raw));
             let dead = !raw.is_object() || duplicate;
-            let reason = if dead {
-                "non_object_or_exact_duplicate"
+            let mut detail = String::new();
+            let cause = if !raw.is_object() {
+                "non_object"
+            } else if duplicate {
+                "exact_duplicate"
             } else {
                 match serde_json::from_value::<Record>(raw.clone()) {
                     Ok(record) => match registry.register_raw(record, raw.clone()) {
                         Ok(_) => continue,
-                        Err(RegistryError::Conflict) => "duplicate",
-                        Err(_) => "invalid_record",
+                        Err(error) => {
+                            detail = error.to_string();
+                            error.retained_cause()
+                        }
                     },
                     Err(_) => "unsupported_shape",
                 }
             };
             tracing::warn!(
                 index,
-                reason,
+                class = if dead { "DEAD" } else { "FORWARD" },
+                cause,
+                detail = detail.as_str(),
                 "structured record skipped; raw data retained inactive"
             );
             registry

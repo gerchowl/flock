@@ -35,9 +35,7 @@ impl App {
         match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(elapsed) => {
                 let now_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
-                self.state
-                    .structured_agents
-                    .prepare_retained_save(now_ms, true);
+                self.state.structured_agents.prepare_retained_save(now_ms);
                 Some(now_ms)
             }
             Err(error) => {
@@ -45,6 +43,36 @@ impl App {
                 None
             }
         }
+    }
+
+    /// Capture session metadata without running retention maintenance or changing live state.
+    pub(crate) fn capture_session_snapshot(
+        &self,
+        registry: &crate::structured::registry::Registry,
+        retained_at_ms: Option<u64>,
+    ) -> crate::persist::SessionSnapshot {
+        let mut snap = crate::persist::capture(
+            crate::persist::RegistryCapture {
+                registry,
+                now_ms: retained_at_ms,
+            },
+            &self.state.workspaces,
+            &self.state.terminals,
+            &self.terminal_runtimes,
+            self.state.active,
+            self.state.selected,
+            self.state.panel_scopes(),
+            self.state.sidebar_width,
+            self.state.sidebar_section_split,
+            self.state.collapsed_space_keys.clone(),
+            self.state
+                .pane_id_aliases
+                .iter()
+                .map(|(old, pane)| (*old, pane.raw()))
+                .collect(),
+        );
+        snap.issue_draft = self.state.issue_draft_snapshot();
+        snap
     }
 
     pub(crate) fn save_session_now(&mut self) {
@@ -57,27 +85,7 @@ impl App {
         if self.state.workspaces.is_empty() && self.state.structured_agents.is_empty() {
             crate::persist::clear();
         } else {
-            let mut snap = crate::persist::capture(
-                crate::persist::RegistryCapture {
-                    registry: &self.state.structured_agents,
-                    now_ms: retained_at_ms,
-                },
-                &self.state.workspaces,
-                &self.state.terminals,
-                &self.terminal_runtimes,
-                self.state.active,
-                self.state.selected,
-                self.state.panel_scopes(),
-                self.state.sidebar_width,
-                self.state.sidebar_section_split,
-                self.state.collapsed_space_keys.clone(),
-                self.state
-                    .pane_id_aliases
-                    .iter()
-                    .map(|(old, pane)| (*old, pane.raw()))
-                    .collect(),
-            );
-            snap.issue_draft = self.state.issue_draft_snapshot();
+            let snap = self.capture_session_snapshot(&self.state.structured_agents, retained_at_ms);
             let history = self.persist_pane_history.then(|| {
                 crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
             });

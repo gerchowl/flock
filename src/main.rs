@@ -582,6 +582,7 @@ fn run() -> io::Result<()> {
         println!("       flk client <token|open> ...");
         println!("       flk owner policy <show|adopt> ...");
         println!("       flk session <subcommand> ...");
+        println!("       flk doctor [--json]");
         println!("       flk integration <subcommand> ...");
         println!("       flk report bug [--file <path>] [--open]");
         println!("       flk web [--bind <addr>] (requires the `web` feature)");
@@ -592,6 +593,10 @@ fn run() -> io::Result<()> {
             (
                 "flk status [server|client]",
                 "Show local client and running server status",
+            ),
+            (
+                "flk doctor [--json]",
+                "Inspect retained structured records (operator)",
             ),
             ("flk update", "Download and install the latest version"),
             (
