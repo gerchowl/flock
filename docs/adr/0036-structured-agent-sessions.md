@@ -1267,7 +1267,10 @@ the client silently drops late frames for it. Re-subscribe with a fresh ID from
 the applied cursor, never `skipped_to`; no `unsub` is needed for the closed ID.
 A snapshot gap uses §4's inline checkpoint; no snapshot gap may omit `snapshot_to`.
 A history gap on `agent/<id>` or `events` leaves an explicit missing-range marker
-and continues from `to+1`, without implying complete history.
+and continues from `to+1`, without implying complete history. A persisted known
+payload that no longer parses follows that same inline history-gap path over
+its original sequence; it does not close the socket or retry the same bad
+payload on reconnect.
 
 `terminal/<pane>` is a **snapshot stream**, not history-only. Its snapshot
 contains the complete terminal frame and rendering state for that pane; keep its
@@ -1310,6 +1313,7 @@ the wire enum; implementation registers any new API error codes where needed):
 | --- | --- |
 | `cursor_ahead` | Stored cursor exceeds the stream head. Clear only that stream's entities, cursor and resync marker, then re-subscribe with a fresh ID without `after` through bootstrap; do not silently clamp. |
 | `operator_only` | Subscription requires the operator principal. Show refusal and stop that subscription until the principal changes; other streams stay up. |
+| `invalid_agent` | Unsafe or reserved stored agent namespace. Retry class `never`: select a valid subject rather than retrying unchanged. |
 | `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
 | `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
 | `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
@@ -1433,7 +1437,8 @@ is chosen because it does not rely on portable filesystem-watch delivery. Its
 limit is explicit: deletion alone does not proactively close a read-only idle
 socket; the next cmd or reconnect detects it. Read scopes are checked at sub
 registration (`subfail scope`), not continuously on existing subscriptions;
-shrinking read scope alone does not terminate those subscriptions.
+shrinking read scope alone does not terminate those subscriptions (continuous
+enforcement is tracked in #2042).
 Revocation prevents subsequent admission, not cancellation of an already admitted command; report its outcome
 through the journal and existing state rather than implying it was rolled back.
 

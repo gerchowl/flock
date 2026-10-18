@@ -20,9 +20,8 @@ Credentials, raw frames and their parse errors do not enter diagnostics.
 `welcome` carries the wire version, server version, verified opaque principal,
 random server epoch and 24-hour idempotency-window metadata. The epoch is fresh
 per core and never resets durable cursors. A newer client receives the server's
-wire version and no command capability. This transport-only slice advertises no
-capabilities to any client; subscriptions and command dispatch arrive in their
-already assigned later slices. Binary frames and other non-protocol post-hello
+wire version and no command capability. No command capabilities are advertised; agent-history subscriptions are
+described below, and command dispatch remains assigned to later slices. Binary frames and other non-protocol post-hello
 data operations are policy violations and close with 1008.
 There is no command admission, structured start or claim of durable journaling.
 
@@ -141,14 +140,16 @@ and the handoff manifest described above.
 
 ADR-0036 §5a's owner bridge is crate-private and has a tested consumer that
 recovers real session JSONL and delivers it through the verified socket writer.
-WebSocket subscription registration follows in part 4b of #1830.
+WebSocket subscription registration uses that bridge as described below.
 
 Each bridge has a 32-request mailbox and services at most 32 requests per owner
 turn. Full admission fails with `WouldBlock`; losing the owner fails with
 `BrokenPipe`. The owner captures the registry generation and stored namespace. Unsupported
-stored path components are unavailable subjects and never reach filesystem recovery.
+stored path components receive `invalid_agent` (retry `never`), distinct from an
+unknown subject, and never reach filesystem recovery.
 Cold recovery defers with `WouldBlock` while a worker is preparing or cleanup
-authority remains unconfirmed. An installed canonical source remains readable.
+authority is explicitly retained. Once finished and joined, a worker without a
+report permits cold recovery. An installed canonical source remains readable.
 Retained recovery runs off the async executor, with at most four blocking jobs
 per bridge. A cancelled waiter keeps its I/O slot until that job returns,
 including when the job is still queued. A blocked filesystem can occupy those
@@ -174,13 +175,17 @@ late frames for closed IDs as required by §5a.
 registry owner. Each connection remembers every used ID, including refusals,
 unsubscribe and lag. Reuse closes the old registration and receives
 `sub_id_reused`. Missing subjects and ahead cursors receive `unknown_stream`
-and `cursor_ahead`. Scope failure receives `scope`; genuine revocation closes
+and `cursor_ahead`. Unsafe or reserved namespaces receive `invalid_agent`, not
+`unknown_stream`. Scope failure receives `scope`; genuine revocation closes
 4403. Storage, worker or resource unavailability closes 1001, preserving the
 client's token for reconnection.
 
 Each ID owns one cut registered atomically with its captured head. Durable
 records and inline history gaps precede exactly one `synced` barrier; subsequent
-records are live. Legacy provenance gaps continue through later records. Unknown
+records are live. Legacy provenance gaps continue through later records. A known
+stored payload that no longer parses emits an inline history `gap` over its
+original sequence and continues to later records and the barrier. This records
+missing history without reconnect loops or closing sibling IDs. Unknown
 wrappers retain the original raw line and observed harness shape, and known
 payloads retain their projected blob references. Partial deltas are absent from
 durable history. A normal producer end drains already committed records.
@@ -190,7 +195,9 @@ queued or in-flight delivery per cut. IDs are at most 128 bytes and stream names
 256 bytes. Exceeding these budgets closes 1001. The shared writer's data queue
 holds eight deliveries, separately from its four priority messages. Page work
 runs outside the executor with at most 32 running/queued jobs across connections;
-cancellation holds capacity until its blocking operation returns. Owner admission
+at most 128 bounded active cuts can wait for a page slot, cancellably. Once a
+job acquires a slot, cancellation holds capacity until its blocking operation
+returns. Exhausted page capacity waits rather than closing sibling cuts. Owner admission
 retains its existing 32-message mailbox and four recovery jobs. History retains
 at most 16 records/256 KiB per cut, plus one record and a 32 KiB read page.
 
@@ -213,3 +220,11 @@ cannot be recalled, so clients drop late frames for closed IDs. A frame for an
 ID never opened on that connection remains a protocol error. A stalled cut has
 no second Runtime receiver and cannot monopolize its siblings' queue slots or
 heartbeat priority between writes.
+
+Read scope is rechecked at subscription registration, not continuously for live
+cuts. Token storage exposes no external scope-change notification. Shrinking
+read scope alone leaves existing cuts active until unsubscribe or disconnect;
+new subscriptions refuse with `scope`. Explicit revocation fan-out closes 4403
+and tears down all cuts for that principal. A storage edit alone is detected at
+next admission or reconnect. Continuous read-scope enforcement is tracked in
+#2042; this limit matches ADR-0036 §5a.

@@ -621,7 +621,6 @@ fn invalid_stored_subject_is_distinct_from_unknown_stream() {
         case.server.finish().await;
     });
 }
-
 #[test]
 fn finished_worker_without_a_report_is_cold_recovered_by_sub() {
     runtime(async {
@@ -651,6 +650,118 @@ fn finished_worker_without_a_report_is_cold_recovered_by_sub() {
         assert_eq!(case.frame(&mut socket).await["seq"], 1);
         assert_eq!(case.frame(&mut socket).await["t"], "synced");
         assert!(case.workers.history(&case.registry, &worker.id).is_some());
+        case.server.finish().await;
+    });
+}
+#[test]
+fn invalid_known_payload_is_an_inline_gap_without_losing_siblings() {
+    runtime(async {
+        let mut invalid = record(1);
+        invalid.raw = "no longer a session event".into();
+        let mut case = Case::new(vec![invalid, record(2)]).await;
+        let mut socket = case.open().await;
+        case.sub(&mut socket, "sibling", Some(1)).await;
+        assert_eq!(case.frame(&mut socket).await["seq"], 2);
+        assert_eq!(case.frame(&mut socket).await["t"], "synced");
+        case.sub(&mut socket, "bad", None).await;
+        assert_eq!(
+            case.frame(&mut socket).await,
+            json!({"t":"gap","sub_id":"bad","from":1,"to":1})
+        );
+        assert_eq!(case.frame(&mut socket).await["seq"], 2);
+        assert_eq!(case.frame(&mut socket).await["t"], "synced");
+        let mut invalid_live = record(3);
+        invalid_live.raw = "invalid live payload".into();
+        case.stored.append(invalid_live);
+        for _ in 0..2 {
+            let gap = case.frame(&mut socket).await;
+            assert_eq!(gap["t"], "gap");
+            assert_eq!(gap["from"], 3);
+            assert_eq!(gap["to"], 3);
+        }
+        case.stored.append(record(4));
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let frame = case.frame(&mut socket).await;
+            assert_eq!(frame["seq"], 4);
+            ids.push(frame["sub_id"].as_str().unwrap().to_owned());
+        }
+        ids.sort();
+        assert_eq!(ids, ["bad", "sibling"]);
+        case.server.finish().await;
+    });
+}
+#[test]
+fn page_capacity_wait_is_cancellable_and_does_not_close_siblings() {
+    runtime(async {
+        use super::super::subscriptions::{replay, IO};
+        let mut case = Case::new(vec![record(1)]).await;
+        let mut socket = case.open().await;
+        case.sub(&mut socket, "sibling", Some(1)).await;
+        assert_eq!(case.frame(&mut socket).await["t"], "synced");
+        let slots = within(IO.acquire_many(32)).await.unwrap();
+        let (data, mut queued) = mpsc::channel(1);
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hints = Arc::default();
+        let owner = case.server.core.shared.histories.clone();
+        let mut pending = Box::pin(replay(
+            &owner,
+            &data,
+            &active,
+            &hints,
+            "waiting",
+            "agent/fixture-agent",
+            None,
+        ));
+        assert!(pending.as_mut().now_or_never().is_none());
+        Arc::get_mut(&mut case.server.core).unwrap().service(
+            &case.registry,
+            &mut case.workers,
+            case.server._root.path(),
+        );
+        assert!(
+            pending.as_mut().now_or_never().is_none(),
+            "capacity exhaustion must wait, not close the socket"
+        );
+        drop(pending);
+        assert!(queued.try_recv().is_err());
+        drop(slots);
+        case.stored.append(record(2));
+        assert_eq!(case.frame(&mut socket).await["seq"], 2);
+        case.sub(&mut socket, "after-capacity", Some(1)).await;
+        assert_eq!(case.frame(&mut socket).await["seq"], 2);
+        assert_eq!(case.frame(&mut socket).await["t"], "synced");
+        case.server.finish().await;
+    });
+}
+
+#[test]
+fn explicit_revocation_ends_all_live_cuts_for_the_principal() {
+    runtime(async {
+        let mut case = Case::new(vec![]).await;
+        let mut socket = case.open().await;
+        for id in ["one", "two"] {
+            case.sub(&mut socket, id, None).await;
+            assert_eq!(case.frame(&mut socket).await["t"], "synced");
+        }
+        let session = case
+            .server
+            .core
+            .shared
+            .clients
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .session
+            .clone();
+        case.server.core.revoke(&session);
+        assert!(matches!(
+            socket.receive().await,
+            Received::Close(AUTH_REVOKED_CLOSE)
+        ));
+        case.stored.append(record(1));
         case.server.finish().await;
     });
 }

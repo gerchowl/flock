@@ -11,13 +11,13 @@ const ACTIVE: usize = 8;
 /// Lifetime identity budget. Exhaustion ends the socket without forgetting IDs.
 const IDS: usize = 1024;
 /// Global queued/running page jobs. Cancelled waiters retain their job's permit.
-static IO: Semaphore = Semaphore::const_new(32);
-struct Hint {
+pub(super) static IO: Semaphore = Semaphore::const_new(32);
+pub(super) struct Hint {
     cursor: u64,
     checkpoint: Resume,
     identity: Arc<Notify>,
 }
-type Hints = Arc<Mutex<HashMap<String, Hint>>>;
+pub(super) type Hints = Arc<Mutex<HashMap<String, Hint>>>;
 struct Subscription {
     live: Arc<AtomicBool>,
     task: JoinHandle<()>,
@@ -154,7 +154,7 @@ async fn deliver(
     }
     rx.await == Ok(true)
 }
-async fn replay(
+pub(super) async fn replay(
     owner: &owner::Client,
     data: &mpsc::Sender<Delivery>,
     live: &Arc<AtomicBool>,
@@ -194,7 +194,7 @@ async fn replay(
         let notified = wake.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let permit = IO.try_acquire().map_err(|_| None)?;
+        let permit = IO.acquire().await.map_err(|_| None)?;
         let (next, item) = tokio::task::spawn_blocking(move || {
             let item = cut.page();
             drop(permit);
@@ -208,7 +208,7 @@ async fn replay(
             Item::Record(record) => {
                 cursor = record.seq;
                 let ev = if record.known == Some(false) {
-                    WireEvent::Unknown(UnknownEvent {
+                    Some(WireEvent::Unknown(UnknownEvent {
                         r#type: UnknownTag::Unknown,
                         raw: record.raw.clone(),
                         shape: record
@@ -217,18 +217,26 @@ async fn replay(
                             .ok_or(SubfailCode::UnknownStream)?
                             .0
                             .clone(),
-                    })
+                    }))
                 } else {
-                    WireEvent::Session(Box::new(
-                        serde_json::from_str(&record.raw).map_err(|_| None)?,
-                    ))
+                    serde_json::from_str(&record.raw)
+                        .ok()
+                        .map(|event| WireEvent::Session(Box::new(event)))
                 };
-                ServerFrame::Ev {
-                    sub_id: id.into(),
-                    stream: stream.into(),
-                    seq: Some(cursor),
-                    ts_ms: u64::try_from(record.received_at_ms).map_err(|_| None)?,
-                    ev,
+                match ev {
+                    Some(ev) => ServerFrame::Ev {
+                        sub_id: id.into(),
+                        stream: stream.into(),
+                        seq: Some(cursor),
+                        ts_ms: u64::try_from(record.received_at_ms).map_err(|_| None)?,
+                        ev,
+                    },
+                    None => ServerFrame::Gap {
+                        sub_id: id.into(),
+                        from: cursor,
+                        to: cursor,
+                        snapshot_to: None,
+                    },
                 }
             }
             Item::Gap { from, to, .. } => {
@@ -244,18 +252,10 @@ async fn replay(
                 sub_id: id.into(),
                 seq,
             },
-            Item::Lagged(skipped_to) => {
-                let _ = deliver(
-                    data,
-                    live,
-                    ServerFrame::Lagged {
-                        sub_id: id.into(),
-                        skipped_to,
-                    },
-                )
-                .await;
-                return Ok(());
-            }
+            Item::Lagged(skipped_to) => ServerFrame::Lagged {
+                sub_id: id.into(),
+                skipped_to,
+            },
             Item::End => return Ok(()),
             Item::Pending => {
                 notified.await;
@@ -266,19 +266,16 @@ async fn replay(
                 continue;
             }
         };
-        if !super::output::fits(&frame) {
-            let _ = deliver(
-                data,
-                live,
-                ServerFrame::Lagged {
-                    sub_id: id.into(),
-                    skipped_to: cursor,
-                },
-            )
-            .await;
-            return Ok(());
-        }
-        if !deliver(data, live, frame).await {
+        let frame = if super::output::fits(&frame) {
+            frame
+        } else {
+            ServerFrame::Lagged {
+                sub_id: id.into(),
+                skipped_to: cursor,
+            }
+        };
+        let ended = matches!(frame, ServerFrame::Lagged { .. });
+        if !deliver(data, live, frame).await || ended {
             return Ok(());
         }
         if let Some(checkpoint) = cut.checkpoint() {
