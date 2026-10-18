@@ -1,23 +1,18 @@
 use std::path::{Path, PathBuf};
 
+use super::probe;
+use crate::health::GitRefreshErrorKind as Error;
 use crate::workspace::WorkspaceGitStatusSnapshot;
+use std::time::Instant;
 
 use super::{
     config::{read_branch_config, upstream_full_ref},
     discovery::{
-        canonicalize_best_effort_path, git_branch, git_ref_storage_is_reftable,
-        git_rev_parse_verify, git_space_metadata, git_symbolic_head_full, git_worktree_info,
-        read_ref_oid, GitWorktreeInfo,
+        canonicalize_best_effort_path, git_ref_storage_is_reftable, git_rev_parse_verify,
+        git_space_metadata, git_symbolic_head_full, git_worktree_info, read_ref_oid,
+        GitWorktreeInfo,
     },
 };
-
-/// Wall-clock bound on a git status subprocess.
-///
-/// This feeds the sidebar refresh, which runs every 1500ms. An unbounded `git`
-/// on a stale network mount leaves `git_refresh_in_flight` set forever: the
-/// sidebar's ahead/behind counts freeze at their last values with no timeout
-/// and no watchdog, and nothing reports that they stopped updating.
-const GIT_STATUS_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitStatusCacheEntry {
@@ -57,20 +52,69 @@ pub fn git_status_cache_key(cwd: &Path) -> Option<PathBuf> {
     git_worktree_info(cwd).map(|info| canonicalize_best_effort_path(&info.repo_root))
 }
 
-pub fn git_status_snapshot_for_cwd(
+/// Optional-ref absence is remembered only within one owned refresh round.
+/// Linked checkouts share ref names through their common directory, but HEAD
+/// belongs to one worktree. Errors and positive OIDs are never memoized here.
+/// A ref created during the round is observed on the next round.
+#[derive(Default)]
+pub(crate) struct GitRefreshRound {
+    absent: std::collections::HashSet<(PathBuf, String)>,
+}
+
+impl GitRefreshRound {
+    fn revision(
+        &mut self,
+        info: &GitWorktreeInfo,
+        revision: &str,
+        deadline: Instant,
+    ) -> Result<Option<String>, Error> {
+        let directory = if revision == "HEAD" {
+            &info.git_dir
+        } else {
+            &info.git_common_dir
+        };
+        let key = (
+            canonicalize_best_effort_path(directory),
+            revision.to_owned(),
+        );
+        if self.absent.contains(&key) {
+            return Ok(None);
+        }
+        let oid = git_rev_parse_verify(&info.repo_root, revision, deadline)?;
+        if oid.is_none() {
+            self.absent.insert(key);
+        }
+        Ok(oid)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn git_status_snapshot_for_cwd(
     cwd: &Path,
     cached: Option<&GitStatusCacheEntry>,
-) -> (WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>) {
+    deadline: Instant,
+) -> Result<(WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>), Error> {
+    git_status_snapshot_in_round(cwd, cached, deadline, &mut GitRefreshRound::default())
+}
+
+/// Read one snapshot without caching a failed command. Every git subprocess
+/// shares the round deadline as well as its own ten-second ceiling.
+pub(crate) fn git_status_snapshot_in_round(
+    cwd: &Path,
+    cached: Option<&GitStatusCacheEntry>,
+    deadline: Instant,
+    round: &mut GitRefreshRound,
+) -> Result<(WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>), Error> {
     let space = git_space_metadata(cwd);
-    let Some(fingerprint) = git_status_fingerprint(cwd) else {
-        return (
+    let Some(fingerprint) = git_status_fingerprint_in_round(cwd, deadline, round)? else {
+        return Ok((
             WorkspaceGitStatusSnapshot {
-                branch: git_branch(cwd),
+                branch: super::discovery::git_branch_with_deadline(cwd, deadline)?,
                 ahead_behind: None,
                 space,
             },
             None,
-        );
+        ));
     };
     let branch = fingerprint.branch_name().map(str::to_string);
 
@@ -80,47 +124,71 @@ pub fn git_status_snapshot_for_cwd(
             ahead_behind: cached.snapshot.ahead_behind,
             space,
         };
-        return (
+        return Ok((
             snapshot.clone(),
             Some(GitStatusCacheEntry {
                 fingerprint,
                 snapshot,
             }),
-        );
+        ));
     }
 
     let ahead_behind = fingerprint
         .head_oid()
         .zip(fingerprint.upstream_oid())
-        .and_then(|(head_oid, upstream_oid)| git_ahead_behind_between(cwd, head_oid, upstream_oid));
+        .map(|(head_oid, upstream_oid)| {
+            git_ahead_behind_between(cwd, head_oid, upstream_oid, deadline)
+        })
+        .transpose()?;
     let snapshot = WorkspaceGitStatusSnapshot {
         branch,
         ahead_behind,
         space,
     };
-    (
+    Ok((
         snapshot.clone(),
         Some(GitStatusCacheEntry {
             fingerprint,
             snapshot,
         }),
-    )
+    ))
 }
 
-pub(super) fn git_status_fingerprint(cwd: &Path) -> Option<GitStatusFingerprint> {
-    let info = git_worktree_info(cwd)?;
-    let head = read_head_identity(&info)?;
+#[cfg(test)]
+pub(super) fn git_status_fingerprint(
+    cwd: &Path,
+    deadline: Instant,
+) -> Result<Option<GitStatusFingerprint>, Error> {
+    git_status_fingerprint_in_round(cwd, deadline, &mut GitRefreshRound::default())
+}
+
+fn git_status_fingerprint_in_round(
+    cwd: &Path,
+    deadline: Instant,
+    round: &mut GitRefreshRound,
+) -> Result<Option<GitStatusFingerprint>, Error> {
+    if Instant::now() >= deadline {
+        return Err(Error::Timeout);
+    }
+    let Some(info) = git_worktree_info(cwd) else {
+        return Ok(None);
+    };
+    let Some(head) = read_head_identity(&info, deadline, round)? else {
+        return Ok(None);
+    };
     let upstream = match &head {
-        GitHeadIdentity::Branch { short_name, .. } => read_upstream_identity(&info, short_name),
+        GitHeadIdentity::Branch { short_name, .. } => {
+            read_upstream_identity(&info, short_name, deadline, round)?
+        }
         GitHeadIdentity::Detached { .. } => None,
     };
 
-    Some(GitStatusFingerprint {
+    Ok(Some(GitStatusFingerprint {
         git_dir: canonicalize_best_effort_path(&info.git_dir),
         git_common_dir: canonicalize_best_effort_path(&info.git_common_dir),
         head,
         upstream,
-    })
+    }))
 }
 
 impl GitStatusFingerprint {
@@ -145,26 +213,28 @@ impl GitStatusFingerprint {
     }
 }
 
-fn read_head_identity(info: &GitWorktreeInfo) -> Option<GitHeadIdentity> {
-    if git_ref_storage_is_reftable(&info.git_common_dir) {
-        return read_head_identity_from_git(info);
+fn read_head_identity(
+    info: &GitWorktreeInfo,
+    deadline: Instant,
+    round: &mut GitRefreshRound,
+) -> Result<Option<GitHeadIdentity>, Error> {
+    if !git_ref_storage_is_reftable(&info.git_common_dir) {
+        return Ok(read_head_identity_from_files(info));
     }
-
-    read_head_identity_from_files(info)
-}
-
-fn read_head_identity_from_git(info: &GitWorktreeInfo) -> Option<GitHeadIdentity> {
-    if let Some(full_ref) = git_symbolic_head_full(&info.repo_root) {
-        let short_name = full_ref.strip_prefix("refs/heads/")?.to_string();
-        let oid = git_rev_parse_verify(&info.repo_root, &full_ref);
-        return Some(GitHeadIdentity::Branch {
+    if let Some(full_ref) = git_symbolic_head_full(&info.repo_root, deadline)? {
+        let Some(short_name) = full_ref.strip_prefix("refs/heads/").map(str::to_owned) else {
+            return Ok(None);
+        };
+        let oid = round.revision(info, &full_ref, deadline)?;
+        return Ok(Some(GitHeadIdentity::Branch {
             full_ref,
             short_name,
             oid,
-        });
+        }));
     }
-
-    git_rev_parse_verify(&info.repo_root, "HEAD").map(|oid| GitHeadIdentity::Detached { oid })
+    Ok(round
+        .revision(info, "HEAD", deadline)?
+        .map(|oid| GitHeadIdentity::Detached { oid }))
 }
 
 fn read_head_identity_from_files(info: &GitWorktreeInfo) -> Option<GitHeadIdentity> {
@@ -185,20 +255,29 @@ fn read_head_identity_from_files(info: &GitWorktreeInfo) -> Option<GitHeadIdenti
     })
 }
 
-fn read_upstream_identity(info: &GitWorktreeInfo, branch: &str) -> Option<GitUpstreamIdentity> {
-    let config = read_branch_config(info, branch)?;
-    let full_ref = upstream_full_ref(&config)?;
+fn read_upstream_identity(
+    info: &GitWorktreeInfo,
+    branch: &str,
+    deadline: Instant,
+    round: &mut GitRefreshRound,
+) -> Result<Option<GitUpstreamIdentity>, Error> {
+    let Some(config) = read_branch_config(info, branch) else {
+        return Ok(None);
+    };
+    let Some(full_ref) = upstream_full_ref(&config) else {
+        return Ok(None);
+    };
     let oid = if git_ref_storage_is_reftable(&info.git_common_dir) {
-        git_rev_parse_verify(&info.repo_root, &full_ref)
+        round.revision(info, &full_ref, deadline)?
     } else {
         read_ref_oid(&info.git_common_dir, &full_ref)
     };
-    Some(GitUpstreamIdentity {
+    Ok(Some(GitUpstreamIdentity {
         remote: config.remote,
         merge_ref: config.merge_ref,
         full_ref,
         oid,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -226,34 +305,33 @@ fn git_ahead_behind_between(
     cwd: &Path,
     head_oid: &str,
     upstream_oid: &str,
-) -> Option<(usize, usize)> {
+    deadline: Instant,
+) -> Result<(usize, usize), Error> {
     let range = format!("{head_oid}...{upstream_oid}");
-    let output = crate::process::TracedCommand::new("git", "git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["rev-list", "--left-right", "--count", &range])
-        .output_traced_with_timeout(GIT_STATUS_EXEC_TIMEOUT)
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    parse_git_ahead_behind_output(&stdout)
+    let stdout = probe::text(
+        cwd,
+        &["rev-list", "--left-right", "--count", &range],
+        None,
+        deadline,
+    )?
+    .ok_or(Error::GitOutput)?;
+    parse_git_ahead_behind_output(&stdout).ok_or(Error::GitOutput)
 }
 
 fn parse_git_ahead_behind_output(stdout: &str) -> Option<(usize, usize)> {
     let mut parts = stdout.split_whitespace();
     let ahead = parts.next()?.parse().ok()?;
     let behind = parts.next()?.parse().ok()?;
-    Some((ahead, behind))
+    parts.next().is_none().then_some((ahead, behind))
 }
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Tests exec real git to prime fixtures — TracedCommand polices product code (logging redesign PR-3).
 mod tests {
     use super::*;
+    fn deadline() -> Instant {
+        Instant::now() + std::time::Duration::from_secs(60)
+    }
     use crate::workspace::git::test_support::{run_git, temp_test_dir, write_fake_tracked_repo};
 
     #[test]
@@ -272,7 +350,7 @@ mod tests {
     fn git_status_reuses_cached_ahead_behind_when_fingerprint_matches() {
         let root = temp_test_dir("cache-hit");
         write_fake_tracked_repo(&root);
-        let fingerprint = git_status_fingerprint(&root).unwrap();
+        let fingerprint = git_status_fingerprint(&root, deadline()).unwrap().unwrap();
         let cached = GitStatusCacheEntry {
             fingerprint,
             snapshot: WorkspaceGitStatusSnapshot {
@@ -282,7 +360,8 @@ mod tests {
             },
         };
 
-        let (snapshot, update) = git_status_snapshot_for_cwd(&root, Some(&cached));
+        let (snapshot, update) =
+            git_status_snapshot_for_cwd(&root, Some(&cached), deadline()).unwrap();
 
         assert_eq!(snapshot.branch.as_deref(), Some("main"));
         assert_eq!(snapshot.ahead_behind, Some((2, 1)));
@@ -295,7 +374,7 @@ mod tests {
     fn git_status_does_not_reuse_cache_when_branch_changes_at_same_oid() {
         let root = temp_test_dir("branch-switch");
         write_fake_tracked_repo(&root);
-        let fingerprint = git_status_fingerprint(&root).unwrap();
+        let fingerprint = git_status_fingerprint(&root, deadline()).unwrap().unwrap();
         let cached = GitStatusCacheEntry {
             fingerprint,
             snapshot: WorkspaceGitStatusSnapshot {
@@ -316,10 +395,14 @@ mod tests {
         )
         .unwrap();
 
-        let (snapshot, _) = git_status_snapshot_for_cwd(&root, Some(&cached));
-
-        assert_eq!(snapshot.branch.as_deref(), Some("feature"));
-        assert_eq!(snapshot.ahead_behind, None);
+        let fingerprint = git_status_fingerprint(&root, deadline()).unwrap().unwrap();
+        assert_eq!(fingerprint.branch_name(), Some("feature"));
+        // The changed fingerprint must run git rather than reuse the cached
+        // counts. Fixture OIDs are deliberately absent from the object store.
+        assert_eq!(
+            git_status_snapshot_for_cwd(&root, Some(&cached), deadline()),
+            Err(Error::GitExit)
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -328,7 +411,7 @@ mod tests {
     fn git_status_clears_ahead_behind_when_upstream_is_unset() {
         let root = temp_test_dir("upstream-unset");
         write_fake_tracked_repo(&root);
-        let fingerprint = git_status_fingerprint(&root).unwrap();
+        let fingerprint = git_status_fingerprint(&root, deadline()).unwrap().unwrap();
         let cached = GitStatusCacheEntry {
             fingerprint,
             snapshot: WorkspaceGitStatusSnapshot {
@@ -339,7 +422,7 @@ mod tests {
         };
         std::fs::write(root.join(".git/config"), "").unwrap();
 
-        let (snapshot, _) = git_status_snapshot_for_cwd(&root, Some(&cached));
+        let (snapshot, _) = git_status_snapshot_for_cwd(&root, Some(&cached), deadline()).unwrap();
 
         assert_eq!(snapshot.branch.as_deref(), Some("main"));
         assert_eq!(snapshot.ahead_behind, None);
@@ -358,7 +441,7 @@ mod tests {
         )
         .unwrap();
 
-        let fingerprint = git_status_fingerprint(&root).unwrap();
+        let fingerprint = git_status_fingerprint(&root, deadline()).unwrap().unwrap();
 
         assert_eq!(
             fingerprint.upstream.unwrap().oid.as_deref(),
@@ -401,6 +484,77 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    fn branch_error_fixture(detached: bool) {
+        use crate::workspace::git::test_support::CountingGit;
+        let root = crate::test_support::TempDir::socket();
+        if !crate::workspace::git::test_support::init_reftable(root.path()) {
+            return;
+        }
+        run_git(
+            root.path(),
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        if detached {
+            run_git(root.path(), &["checkout", "--detach", "-q"]);
+        } else {
+            run_git(root.path(), &["symbolic-ref", "HEAD", "refs/tags/fixture"]);
+        }
+        let fault = if detached {
+            "if [ \"$3\" = symbolic-ref ]; then exit 128; fi"
+        } else {
+            "if [ \"$3\" = symbolic-ref ] && [ \"$5\" = --short ]; then exit 128; fi"
+        };
+        let counter = CountingGit::scripted(fault);
+        assert_eq!(
+            git_status_snapshot_for_cwd(root.path(), None, deadline()),
+            Err(Error::GitExit)
+        );
+        drop(counter);
+        let (snapshot, cache) = git_status_snapshot_for_cwd(root.path(), None, deadline()).unwrap();
+        assert_eq!(
+            snapshot.branch.as_deref(),
+            if detached { None } else { Some("fixture") }
+        );
+        assert_eq!(cache.is_some(), detached);
+    }
+
+    #[test]
+    fn git2100_symbolic_head_outside_heads_preserves_typed_fallback_error() {
+        branch_error_fixture(false);
+    }
+
+    #[test]
+    fn git2100_detached_head_preserves_typed_probe_error() {
+        branch_error_fixture(true);
+    }
+
+    #[test]
+    fn git2034_non_branch_reftable_head_keeps_legacy_branch_fallback() {
+        let root = crate::test_support::TempDir::socket();
+        if !crate::workspace::git::test_support::init_reftable(root.path()) {
+            return;
+        }
+        run_git(
+            root.path(),
+            &["symbolic-ref", "HEAD", "refs/tags/unborn-fixture"],
+        );
+        let expected = super::super::discovery::git_branch(root.path());
+        assert_eq!(expected.as_deref(), Some("unborn-fixture"));
+        let (snapshot, cache) = git_status_snapshot_for_cwd(root.path(), None, deadline()).unwrap();
+        assert_eq!(snapshot.branch, expected);
+        assert!(snapshot.ahead_behind.is_none());
+        assert!(cache.is_none());
+    }
+
     #[test]
     fn git_status_fingerprint_reads_reftable_branch_identity() {
         let root = temp_test_dir("reftable-fingerprint");
@@ -418,14 +572,14 @@ mod tests {
         run_git(&root, &["config", "user.name", "Flock Test"]);
         run_git(&root, &["commit", "--allow-empty", "-m", "initial"]);
 
-        let fingerprint = git_status_fingerprint(&root).unwrap();
+        let fingerprint = git_status_fingerprint(&root, deadline()).unwrap().unwrap();
 
         assert_eq!(
             fingerprint.head,
             GitHeadIdentity::Branch {
                 full_ref: "refs/heads/main".into(),
                 short_name: "main".into(),
-                oid: git_rev_parse_verify(&root, "HEAD"),
+                oid: git_rev_parse_verify(&root, "HEAD", deadline()).unwrap(),
             }
         );
 
@@ -448,11 +602,12 @@ mod tests {
         run_git(&repo, &["remote", "add", "origin", &remote_arg]);
         run_git(&repo, &["push", "-u", "origin", "main"]);
 
-        let (initial, cache_entry) = git_status_snapshot_for_cwd(&repo, None);
+        let (initial, cache_entry) = git_status_snapshot_for_cwd(&repo, None, deadline()).unwrap();
         assert_eq!(initial.ahead_behind, Some((0, 0)));
         run_git(&repo, &["commit", "--allow-empty", "-m", "ahead"]);
 
-        let (updated, _) = git_status_snapshot_for_cwd(&repo, cache_entry.as_ref());
+        let (updated, _) =
+            git_status_snapshot_for_cwd(&repo, cache_entry.as_ref(), deadline()).unwrap();
 
         assert_eq!(updated.branch.as_deref(), Some("main"));
         assert_eq!(updated.ahead_behind, Some((1, 0)));

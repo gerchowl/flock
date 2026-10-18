@@ -1,9 +1,18 @@
 use super::config::*;
 use crate::workspace::git::{
     discovery::git_worktree_info,
-    status::git_status_fingerprint,
     test_support::{temp_test_dir, write_fake_tracked_repo},
 };
+
+// Configuration cases keep their original assertions, but command failures
+// must fail the fixture rather than masquerade as missing branch metadata.
+fn git_status_fingerprint(cwd: &std::path::Path) -> Option<super::status::GitStatusFingerprint> {
+    super::status::git_status_fingerprint(
+        cwd,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+    )
+    .expect("fixture git probe failed")
+}
 
 #[test]
 fn git_status_fingerprint_honors_remote_fetch_refspec() {

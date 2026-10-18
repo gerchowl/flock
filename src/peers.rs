@@ -2318,6 +2318,20 @@ mod tests {
     }
 
     #[test]
+    fn peer_decoder_tolerates_idle_and_unknown_future_poller_values() {
+        for status in ["idle", "future_status"] {
+            let raw = serde_json::json!({"id":"summary", "result":{
+                "host":"fixture.example", "workspaces":[],
+                "pollers":{"git_refresh":{"status":status,"reason":"future_reason"}}
+            }});
+            let summary = parse_summary_response(&raw.to_string(), 7).unwrap();
+            assert_eq!(summary.host, "fixture.example");
+            assert_eq!(summary.latency_ms, 7);
+        }
+        assert_eq!(crate::mesh::hello::VERSION, 5);
+    }
+
+    #[test]
     fn parse_summary_response_reads_envelope() {
         let stdout = r#"
 Last login: whatever banner

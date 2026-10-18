@@ -79,6 +79,56 @@ flk status client
 
 Server status includes the API socket listener’s accept-error count, latest error, and `stopped` flag. Transient accept failures retry with exponential backoff from 50 ms to 2 s, reset on a successful accept. Invalid listener descriptors stop immediately; unclassified errors stop after five consecutive failures. Failure runs log on onset and recovery rather than on every attempt. Diagnostics remain until that listener is replaced. With `--json`, these are under `server.api_listener` (or `api_listener` for `status server --json`). Older servers report no listener diagnostics. A stopped listener cannot accept new status requests; its terminal error is also recorded in the server log.
 
+`flk peers summary` includes `pollers.git_refresh`. It reports `idle` with
+`reason: "no_viewer"`, `"no_workspaces"` or `"no_eligible_workspaces"` when its
+viewer/workspace gate is closed. Idle does not reset past errors or invent a new
+success timestamp. Old results alone are `degraded` with `"awaiting_refresh"`;
+`broken` requires a real failure or a round beyond its existing 60-second bound,
+and carries a typed `last_error` (including `"round_stalled"`). An in-flight
+stalled round remains visible even after the last viewer leaves. Status remains
+an open string; the optional reason is additive on mesh v5, and unknown future
+reasons decode as `unknown`.
+
+Git subprocesses have a 10-second ceiling within the 60-second round deadline.
+`last_error` is one of `timeout`, `git_io`, `git_exit`, `git_output`,
+`worker_panic`, `worker_spawn` or `round_stalled`. Failed probes do not replace
+the last valid cached status. A stalled worker retains ownership until it
+returns, so no replacement worker accumulates behind a blocked filesystem call.
+Restore access to that checkout's filesystem to let it finish; while it remains
+blocked, its rising in-flight age and typed error explain why git refresh cannot
+recover yet. Worker panics and spawn failures are reported as broken; subsequent
+rounds use the existing cadence. No command output or paths appear in the error
+code.
+
+Repository failures are counted separately. A completed round with both healthy
+and failed checkouts reports `degraded` and includes `repositories`: each row has a
+ASCII-escaped checkout basename (`repo`), `workspace_ids`, its own `consecutive_failures` and a
+typed `last_error`. The poller's `last_error` shows a worker error, or the first
+listed repository error when the worker completed a partial round. No absolute
+paths or git stderr are included. Workspace IDs
+disambiguate identical basenames. Other checkouts keep refreshing, while failed
+workspaces display their last known values with `[git stale]`. Repair the named
+checkout; its next successful refresh clears its streak and stale marker.
+An entirely failed round still increments the global failure count and does not
+stamp success. Worker panics, spawn failures and stuck rounds retain their
+round-level failures.
+
+Refreshes rotate their starting repository after each completed round. With a
+stable set of N repositories and K probes started per round, every repository
+starts within ceil(N/K) rounds, provided K is nonzero. Three consecutive rounds
+without admission show repository `status: starved`, a
+`consecutive_not_started` count, and poller `status: degraded` with
+`reason: starved`. This does not increment failure counts or add `[git stale]`.
+The next admission clears starvation; a failed probe remains a separate failure.
+The in-memory admission history resets on server restart.
+
+A repository not started before the shared deadline is not refreshed this round:
+its cached values stay unchanged, with no new failure or stale marker. Only its
+own failed or timed-out probe earns a failure. Moving or removing a workspace's
+cwd clears the old cwd's stale marker. Branch-discovery errors, including the
+reftable branch-only fallback, are typed failures rather than a successful
+unknown branch. A healthy detached HEAD still has no branch name.
+
 ## Peer enrollment
 
 `flk peers` and `flk status` show each peer's name, pin direction, short node

@@ -288,6 +288,8 @@ pub enum AppEvent {
     },
     /// Background git status refresh completed for workspaces.
     GitStatusRefreshed {
+        failures: Vec<crate::app::git_repository_health::RepositoryFailure>,
+        error: Option<crate::health::GitRefreshErrorKind>,
         results: Vec<WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
     },

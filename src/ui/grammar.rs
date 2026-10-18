@@ -70,12 +70,13 @@ pub(crate) fn local_member_label(
     ws: &Workspace,
     terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
 ) -> String {
-    member_label_moded(
+    let label = member_label_moded(
         app.server_label,
         crate::app::configured_node_icon().as_deref(),
         &local_server_name(),
         &local_member_target(app, ws, terminal_runtimes),
-    )
+    );
+    git_freshness_label(ws, label)
 }
 
 /// The project identity label for a space row: `owner/repo` derived from the
@@ -108,10 +109,11 @@ pub(crate) fn leader_label(
     ws: &Workspace,
     terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
 ) -> String {
-    match ws.project_key() {
+    let label = match ws.project_key() {
         Some(key) => project_identity_label(key),
         None => ws.display_name_from(&app.terminals, terminal_runtimes),
-    }
+    };
+    git_freshness_label(ws, label)
 }
 
 /// The label for a SOLO local row — a project's lone local checkout, with no
@@ -314,6 +316,15 @@ pub(crate) fn agent_location_label(
     }
     // Server alone overflows: middle-truncate the row the ladder reduced to.
     crate::terminal::middle_truncate_chars(&render(&[], target), max_width)
+}
+
+/// Keep last known values visible, explicitly marked until a successful probe.
+fn git_freshness_label(ws: &Workspace, label: String) -> String {
+    if ws.git_status_stale {
+        format!("[git stale] {label}")
+    } else {
+        label
+    }
 }
 
 #[cfg(test)]
