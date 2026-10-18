@@ -309,15 +309,16 @@ impl Workers {
             .ok_or(ErrorCode::AgentNotFound)?
             .queue_enqueue(request)
     }
-    /// Generation-fenced source lookup; this never opens or reads a file.
+    /// Warm or recovered generation source; this never performs filesystem work.
+    /// Until a cold recovery is installed, absence is queue_mode_unsupported.
     pub(crate) fn queue_source(
         &self,
         registry: &Registry,
         id: &str,
         generation: u64,
-    ) -> Option<queue::publication::Source> {
+    ) -> Result<queue::publication::Source, ErrorCode> {
         if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
-            return None;
+            return Err(ErrorCode::AgentNotFound);
         }
         self.runtime(id, generation)
             .and_then(Runtime::queue_source)
@@ -327,23 +328,27 @@ impl Workers {
                     .filter(|(g, _)| *g == generation)
                     .map(|(_, source)| source.clone())
             })
+            .ok_or(ErrorCode::QueueModeUnsupported)
     }
-    /// Install an I/O worker's cold source only if no newer owner won the epoch.
+    /// Install only a matching namespace/epoch with no live or unconfirmed owner.
     pub(crate) fn install_queue_source(
         &mut self,
         registry: &Registry,
         id: &str,
         generation: u64,
         source: queue::publication::Source,
-    ) -> bool {
-        if registry.get(id).is_none_or(|(_, _, g)| g != generation)
-            || self.entries.contains_key(id)
-            || !source.belongs_to(id)
-        {
-            return false;
+    ) -> Result<(), ErrorCode> {
+        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        if self.entries.contains_key(id) {
+            return Err(ErrorCode::SessionBusy);
+        }
+        if !source.belongs_to(id) {
+            return Err(ErrorCode::InvalidRequest);
         }
         self.retained_queues.insert(id.into(), (generation, source));
-        true
+        Ok(())
     }
     /// Consume an immutable completion/cut from the current generation only.
     /// Terminal cuts remain available after exit; drain before relaunch/removal.

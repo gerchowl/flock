@@ -11,6 +11,7 @@ use crate::structured::{
     transport::{InputHandle, Received},
 };
 pub(crate) mod publication;
+pub(crate) mod recovery;
 use std::{cell::RefCell, io, num::NonZeroU64, path::Path, sync::mpsc};
 
 /// S4 projection after reducing every session record through this sequence.

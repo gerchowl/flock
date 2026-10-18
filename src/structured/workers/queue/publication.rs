@@ -133,7 +133,11 @@ impl Source {
     /// Blocking recovery for an I/O worker only, never the server loop. The
     /// exclusive journal lease rejects a concurrent writer. This source is ended
     /// at its recovered cut; install must recheck the registry generation.
-    pub fn open_retained(data: &Path, agent: &str) -> Result<Self, Failure> {
+    pub(super) fn open_retained(
+        data: &Path,
+        agent: &str,
+        _policy: RewritePolicy,
+    ) -> Result<Self, Failure> {
         let mut journal = Journal::open(data, agent)?;
         let result = journal.subscription();
         let (publisher, source) = Publisher::new(agent, journal.replay(0)?);
