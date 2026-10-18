@@ -1,5 +1,6 @@
 //! Agent identity text policy (ADR-0014 §4, #317). Reject at ingress, escape at display.
 use crate::api::{error_code::ErrorCode, schema::ErrorBody};
+use finl_unicode::categories::CharacterCategories;
 use std::borrow::Cow;
 
 /// Maximum Unicode scalar values in an agent name, before whitespace trimming.
@@ -7,11 +8,15 @@ use std::borrow::Cow;
 pub const MAX_CHARS: usize = 64;
 /// Public refusal text deliberately contains no rejected input.
 pub const POLICY: &str =
-    "agent names allow at most 64 characters, without controls, line breaks or bidi formatting";
+    "agent names allow at most 64 characters, without controls, line breaks or Unicode format characters (ZWJ is allowed)";
 
+// Unicode Cf is broader than bidi controls. ZWJ supports emoji sequences.
+// variation selectors are marks, not Cf, and remain permitted. Reject the
+// entire tag block too, including its currently unassigned positions.
 fn unsafe_char(c: char) -> bool {
     c.is_control()
-        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        || (c.is_format() && c != '\u{200d}')
+        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{e0000}'..='\u{e007f}')
 }
 
 /// Validate raw text before trimming, so trailing newlines cannot disappear.
@@ -60,12 +65,16 @@ pub fn display(name: &str) -> Cow<'_, str> {
         return Cow::Borrowed(name);
     }
     let mut safe = String::new();
-    for c in name.chars().take(MAX_CHARS) {
+    let truncated = name.chars().count() > MAX_CHARS;
+    for c in name.chars().take(MAX_CHARS - usize::from(truncated)) {
         if unsafe_char(c) {
             safe.extend(c.escape_unicode());
         } else {
             safe.push(c);
         }
+    }
+    if truncated {
+        safe.push('…');
     }
     Cow::Owned(safe)
 }
@@ -81,6 +90,16 @@ mod tests {
         assert_eq!(validate("   "), Ok(""));
         assert_eq!(display(&name), Cow::Borrowed(name.as_str()));
     }
+    #[test]
+    fn security_label_legacy_truncation_is_visible() {
+        let label = "界".repeat(MAX_CHARS + 1);
+        let shown = display(&label);
+        assert!(shown.ends_with('…'));
+        assert!(shown.chars().count() <= MAX_CHARS);
+        assert!(validate("reviewer\u{200b}").is_err());
+        assert!(validate("reviewer\u{200d}\u{fe0f}").is_ok());
+    }
+
     #[test]
     fn security_agent_name_display_escapes_rather_than_emitting_control_data() {
         assert_eq!(display("agent\u{1b}[2J"), "agent\\u{1b}[2J");

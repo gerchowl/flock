@@ -659,6 +659,11 @@ impl TerminalState {
         seq: Option<u64>,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
+        if super::agent_name::validate(&agent_label).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return None;
+        }
+
         if !self.accept_hook_report(&source, seq) {
             return None;
         }
@@ -831,6 +836,11 @@ impl TerminalState {
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
+        if super::agent_name::validate(&session.agent).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return;
+        }
+
         self.persisted_agent_session = Some(session);
         self.codex_session_start = None;
         self.session_ref_hook_confirmed = false;
@@ -925,6 +935,11 @@ impl TerminalState {
         seq: Option<u64>,
         session_start_source: Option<String>,
     ) -> Option<TerminalStateMutation> {
+        if super::agent_name::validate(&agent_label).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return None;
+        }
+
         self.header_reserved = true;
         let session_ref = session_ref?;
         if !self.accept_hook_report(&source, seq) {
@@ -1363,9 +1378,14 @@ impl TerminalState {
         }
     }
 
-    pub fn set_manual_label(&mut self, label: String) {
-        let label = label.trim().to_string();
+    /// Validate manual identity labels before trimming; refusal preserves the old label.
+    pub fn set_manual_label(
+        &mut self,
+        label: String,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        let label = super::agent_name::validate(&label)?.to_string();
         self.manual_label = (!label.is_empty()).then_some(label);
+        Ok(())
     }
 
     pub fn clear_manual_label(&mut self) {
@@ -3232,14 +3252,14 @@ mod tests {
         assert_eq!(terminal.border_label(false), None);
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
 
-        terminal.set_manual_label(" reviewer ".into());
+        terminal.set_manual_label(" reviewer ".into()).unwrap();
         assert_eq!(terminal.border_label(false).as_deref(), Some("reviewer"));
         assert_eq!(terminal.border_label(true).as_deref(), Some("reviewer"));
 
-        terminal.set_manual_label("   ".into());
+        terminal.set_manual_label("   ".into()).unwrap();
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
 
-        terminal.set_manual_label("reviewer".into());
+        terminal.set_manual_label("reviewer".into()).unwrap();
         terminal.clear_manual_label();
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
     }

@@ -497,11 +497,10 @@ fn restore_tab(
         };
 
         let saved_name = saved_pane.and_then(|p| p.agent_name.clone());
-        let saved_label = saved_pane.and_then(|p| p.label.clone()).filter(|label| {
-            !saved_name.as_deref().is_some_and(|name| {
-                name == label && crate::terminal::agent_name::validate(name).is_err()
-            })
-        });
+        let saved_label = crate::terminal::agent_name::received(
+            saved_pane.and_then(|p| p.label.clone()),
+            "manual_label_restore",
+        );
         let saved_agent_name = crate::terminal::agent_name::received(saved_name, "session_restore");
         // #332: a restored agent keeps the run id it was spawned under. Its
         // commits keep their `Agent-Run:` trailers across a restart either
@@ -582,7 +581,9 @@ fn restore_tab(
             terminal.last_prompt = saved_last_prompt.clone();
             terminal.header_reserved = saved_header_reserved;
             if let Some(label) = saved_label {
-                terminal.set_manual_label(label);
+                if terminal.set_manual_label(label).is_err() {
+                    crate::logging::agent_name_dropped("manual_label_restore");
+                }
             }
             if let Some(agent_name) = saved_agent_name {
                 if terminal.set_agent_name(agent_name).is_err() {
@@ -664,7 +665,9 @@ fn restore_tab(
                     }
                 }
                 if let Some(label) = saved_label {
-                    terminal.set_manual_label(label);
+                    if terminal.set_manual_label(label).is_err() {
+                        crate::logging::agent_name_dropped("manual_label_restore");
+                    }
                 }
                 if let Some(agent_name) = saved_agent_name {
                     if terminal.set_agent_name(agent_name).is_err() {
@@ -1670,6 +1673,45 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "unsafe restore cases: {failures:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_label_restore_drops_unmirrored_manual_label() {
+        for (case, label) in crate::test_support::hostile_agent_names() {
+            let (mut snapshot, _) = snapshot_with_saved_pane_history();
+            let pane = snapshot.workspaces[0].tabs[0]
+                .panes
+                .values_mut()
+                .next()
+                .unwrap();
+            pane.label = Some(label.clone());
+            assert!(pane.agent_name.is_none());
+            let (events, _rx) = mpsc::channel(64);
+            let shell = crate::test_support::no_op_program();
+            let mut retained = false;
+            let logs = crate::logging::capture_logs(|| {
+                let (_, terminals, mut runtimes) = restore(
+                    &snapshot,
+                    None,
+                    5,
+                    40,
+                    4096,
+                    &shell,
+                    crate::config::ShellModeConfig::NonLogin,
+                    false,
+                    events,
+                    Arc::new(Notify::new()),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                retained = terminals.values().any(|t| t.manual_label.is_some());
+                for (_, runtime) in runtimes.drain() {
+                    runtime.shutdown();
+                }
+            });
+            assert!(!retained, "manual label retained: {case}");
+            assert!(logs.contains("invalid_agent_name"));
+            assert!(!logs.contains(&label));
+        }
     }
 
     fn snapshot_with_saved_pane_history() -> (SessionSnapshot, SessionHistorySnapshot) {

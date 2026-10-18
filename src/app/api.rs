@@ -1055,7 +1055,10 @@ impl App {
                 data: crate::api::schema::EventData::PaneAgentDetected {
                     pane_id: pane_id.clone(),
                     workspace_id: workspace_id.clone(),
-                    agent: update.agent_label.clone(),
+                    agent: crate::terminal::agent_name::received(
+                        update.agent_label.clone(),
+                        "gui_event",
+                    ),
                 },
             });
         }
@@ -1090,7 +1093,10 @@ impl App {
                     pane_id,
                     workspace_id,
                     agent_status,
-                    agent: update.agent_label.clone(),
+                    agent: crate::terminal::agent_name::received(
+                        update.agent_label.clone(),
+                        "gui_event",
+                    ),
                     title: presentation.title,
                     display_agent: presentation.display_agent,
                     custom_status: presentation.custom_status,

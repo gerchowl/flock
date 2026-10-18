@@ -150,7 +150,9 @@ impl App {
                 terminal
                     .set_agent_name(name.clone())
                     .map_err(|_| AgentRenameError::InvalidName)?;
-                terminal.set_manual_label(name);
+                terminal
+                    .set_manual_label(name)
+                    .map_err(|_| AgentRenameError::InvalidName)?;
             }
             None => terminal.clear_agent_name(),
         }
@@ -852,7 +854,9 @@ impl App {
         terminal
             .set_agent_name(name.clone())
             .map_err(|_| AgentStartError::InvalidName)?;
-        terminal.set_manual_label(name);
+        terminal
+            .set_manual_label(name)
+            .map_err(|_| AgentStartError::InvalidName)?;
         self.state.mark_session_dirty();
 
         let agent = self

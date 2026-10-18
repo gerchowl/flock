@@ -553,9 +553,12 @@ impl App {
         let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        match params.label.map(|label| label.trim().to_string()) {
-            Some(label) if !label.is_empty() => terminal.set_manual_label(label),
-            _ => terminal.clear_manual_label(),
+        if let Some(label) = params.label {
+            if terminal.set_manual_label(label).is_err() {
+                return invalid_agent(id);
+            }
+        } else {
+            terminal.clear_manual_label();
         }
         self.state.mark_session_dirty();
         let pane = self.pane_info(ws_idx, pane_id).unwrap();
@@ -823,6 +826,13 @@ impl App {
         let raw_state_labels_set = !params.state_labels.is_empty();
         let ttl = params.ttl_ms.map(std::time::Duration::from_millis);
         let title = normalize_presentation_text(params.title);
+        if params
+            .display_agent
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            return invalid_agent(id);
+        }
         let display_agent = normalize_presentation_text(params.display_agent);
         let custom_status = normalize_custom_status(params.custom_status);
         let applies_to_source = match params.applies_to_source {
@@ -1473,7 +1483,11 @@ fn pane_not_found(id: String, pane_id: &str) -> String {
 }
 
 fn invalid_agent(id: String) -> String {
-    encode_error(id, "invalid_agent", "agent label must not be empty")
+    encode_error(
+        id,
+        crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+        crate::terminal::agent_name::POLICY,
+    )
 }
 
 #[cfg(test)]
@@ -2523,6 +2537,74 @@ mod tests {
         assert_eq!(app.state.request_remove_linked_worktree, None);
         assert!(app.state.workspaces.is_empty());
     }
+    #[tokio::test]
+    async fn security_label_report_api_and_pane_rename_refuse_before_changes() {
+        let mut failures = Vec::new();
+        for method in ["pane.report_agent", "pane.rename", "pane.report_metadata"] {
+            for (case, label) in crate::test_support::hostile_agent_names() {
+                let (mut app, id, public) = app_with_terminal();
+                let params = if method == "pane.rename" {
+                    serde_json::json!({"pane_id":public,"label":label})
+                } else if method == "pane.report_metadata" {
+                    serde_json::json!({"pane_id":public,"source":"custom:fixture","display_agent":label})
+                } else {
+                    serde_json::json!({"pane_id":public,"source":"custom:fixture","agent":label,"state":"working"})
+                };
+                let request = serde_json::from_value(
+                    serde_json::json!({"id":"security-label","method":method,"params":params}),
+                )
+                .unwrap();
+                let response: serde_json::Value =
+                    serde_json::from_str(&app.handle_api_request(request)).unwrap();
+                if response["error"]["code"] != "invalid_agent_name" {
+                    failures.push((method, case));
+                }
+                if response["error"]["code"] == "invalid_agent_name" {
+                    assert!(app.state.terminals[&id].effective_agent_label().is_none());
+                    assert!(app.state.terminals[&id].manual_label.is_none());
+                }
+            }
+        }
+        assert!(failures.is_empty(), "unrefused labels: {failures:?}");
+    }
+
+    #[tokio::test]
+    async fn security_label_internal_hook_drops_before_agent_json_and_gui_events() {
+        for label in ["agent\u{9d}52;c;Zml4dHVyZQ==\u{9c}", "agent\u{202e}other"] {
+            let (mut app, id, public) = app_with_terminal();
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            app.handle_internal_event(crate::events::AppEvent::HookStateReported {
+                pane_id,
+                source: "custom:fixture".into(),
+                agent_label: label.into(),
+                state: crate::detect::AgentState::Working,
+                message: None,
+                custom_status: None,
+                seq: Some(1),
+                session_ref: None,
+            });
+            for (method, params) in [
+                ("agent.list", serde_json::json!({})),
+                ("agent.get", serde_json::json!({"target":public})),
+            ] {
+                let request = serde_json::from_value(
+                    serde_json::json!({"id":"security-label","method":method,"params":params}),
+                )
+                .unwrap();
+                let response = app.handle_api_request(request);
+                assert!(!response.contains(label), "unsafe agent JSON: {method}");
+            }
+            for (_, event) in app.event_hub.events_after(0) {
+                if let crate::api::schema::EventData::PaneAgentStatusChanged { agent, .. } =
+                    &event.data
+                {
+                    assert_ne!(agent.as_deref(), Some(label));
+                }
+            }
+            assert!(app.state.terminals[&id].effective_agent_label().is_none());
+        }
+    }
+
     /// App with one workspace whose root pane has a live TerminalState.
     /// Returns the app, the terminal id, and the public pane id.
     fn app_with_terminal() -> (App, crate::terminal::TerminalId, String) {
