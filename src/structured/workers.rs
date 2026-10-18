@@ -284,10 +284,10 @@ impl Workers {
         let (_, _, current) = registry.get(id)?;
         (*generation == current).then_some(source)
     }
-    /// Cold recovery requires a quiescent producer and confirmed cleanup.
+    /// Cold recovery requires a joined producer without retained cleanup authority.
     /// Existing canonical history remains readable while a worker is active.
-    /// A finished worker without a report has no confirmed cleanup evidence and
-    /// remains busy. Only a report confirming released authority permits recovery.
+    /// A finished worker without a report can recover once its thread is joined.
+    /// An explicit report retaining authority still defers recovery.
     pub(crate) fn history_recovery_allowed(&self, id: &str) -> bool {
         self.entries.get(id).is_none_or(|worker| {
             worker.finished
@@ -295,7 +295,7 @@ impl Workers {
                 && worker
                     .report
                     .as_ref()
-                    .is_some_and(|report| !report.authority_retained)
+                    .is_none_or(|report| !report.authority_retained)
         })
     }
     /// Install a closed-file source recovered on an I/O worker. A changed epoch,

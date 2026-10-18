@@ -621,3 +621,36 @@ fn invalid_stored_subject_is_distinct_from_unknown_stream() {
         case.server.finish().await;
     });
 }
+
+#[test]
+fn finished_worker_without_a_report_is_cold_recovered_by_sub() {
+    runtime(async {
+        let mut case = Case::new(vec![]).await;
+        let worker = crate::structured::workers::tests::Case::uncertain(
+            &mut case.registry,
+            &mut case.workers,
+            433,
+            &case.server.wake,
+        )
+        .await;
+        worker.forget_report(&mut case.workers);
+        let record = case.registry.get(&worker.id).unwrap().0;
+        let sessions = case.server._root.path().join("sessions");
+        crate::platform::structured::ensure_private_dir(&sessions).unwrap();
+        let dir = sessions.join(&record.agent_id);
+        crate::platform::structured::ensure_private_dir(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", record.session_id));
+        use std::io::Write;
+        let mut file = crate::platform::structured::create_private_file(&path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&self::record(1)).unwrap()).unwrap();
+        file.sync_all().unwrap();
+        let mut socket = case.open().await;
+        socket
+            .send(json!({"t":"sub","sub_id":"recovered","stream":format!("agent/{}",worker.id)}))
+            .await;
+        assert_eq!(case.frame(&mut socket).await["seq"], 1);
+        assert_eq!(case.frame(&mut socket).await["t"], "synced");
+        assert!(case.workers.history(&case.registry, &worker.id).is_some());
+        case.server.finish().await;
+    });
+}

@@ -189,6 +189,11 @@ impl Case {
         .await;
         case
     }
+    pub(crate) fn forget_report(&self, workers: &mut Workers) {
+        let worker = workers.entries.get_mut(&self.id).unwrap();
+        assert!(worker.finished && worker.thread.is_none());
+        worker.report = None;
+    }
     pub fn submit(&self, workers: &Workers) {
         workers.runtime(&self.id, self.generation).unwrap().try_submit(&json!({"type":"user","message":{"role":"user","content":"fixture turn"},"parent_tool_use_id":null,"session_id":""})).unwrap();
     }
@@ -970,7 +975,7 @@ async fn registry_stream_owner_preserves_history_without_competing_with_state_si
 }
 
 #[tokio::test]
-async fn finished_without_report_has_no_evidence_licensing_recovery() {
+async fn finished_without_report_allows_retained_recovery() {
     let wake = Arc::new(Notify::new());
     let mut registry = Registry::default();
     let mut workers = Workers::new(wake.clone());
@@ -978,5 +983,5 @@ async fn finished_without_report_has_no_evidence_licensing_recovery() {
     let worker = workers.entries.get_mut(&case.id).unwrap();
     assert!(worker.finished && worker.thread.is_none());
     worker.report = None;
-    assert!(!workers.history_recovery_allowed(&case.id));
+    assert!(workers.history_recovery_allowed(&case.id));
 }
