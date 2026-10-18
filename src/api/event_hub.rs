@@ -210,9 +210,13 @@ fn highest_seq_best_effort(path: &Path) -> u64 {
 /// live handoff keeps the log instead of quarantining it. A KNOWN kind that
 /// fails to parse is real corruption and is not skipped.
 fn unknown_kind_seq(line: &str) -> Option<u64> {
+    unknown_kind_seq_as::<EventKind>(line)
+}
+// The reader's vocabulary is explicit so compatibility witnesses use this fallback.
+fn unknown_kind_seq_as<K: serde::de::DeserializeOwned>(line: &str) -> Option<u64> {
     let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
     let kind = value.pointer("/envelope/event")?;
-    if !kind.is_string() || serde_json::from_value::<EventKind>(kind.clone()).is_ok() {
+    if !kind.is_string() || serde_json::from_value::<K>(kind.clone()).is_ok() {
         return None;
     }
     value.get("seq")?.as_u64()
@@ -240,7 +244,15 @@ fn read_log_file(path: &Path) -> Result<(Vec<PersistedEvent>, u64), String> {
         }
         let complete = line.ends_with('\n');
         match serde_json::from_str::<PersistedEvent>(line.trim_end()) {
-            Ok(event) => events.push(event),
+            Ok(event) => {
+                if matches!(&event.envelope.data, crate::api::schema::EventData::QueueItemState(fact) if !fact.known())
+                {
+                    tracing::warn!(seq = event.seq, "skipping unknown queue lifecycle state");
+                    skipped_seq = skipped_seq.max(event.seq);
+                } else {
+                    events.push(event);
+                }
+            }
             Err(err) if !complete => {
                 // Torn tail from a crash mid-write: drop it, keep the prefix.
                 crate::logging::event_log_torn_tail(&path.display().to_string());
@@ -738,7 +750,7 @@ mod tests {
     use crate::api::schema::EventData;
     use std::sync::{Arc, Mutex};
 
-    fn temp_log(name: &str) -> PathBuf {
+    pub(super) fn temp_log(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
@@ -771,7 +783,7 @@ mod tests {
         }
     }
 
-    fn cleanup(path: &Path) {
+    pub(super) fn cleanup(path: &Path) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
@@ -1743,5 +1755,82 @@ mod tests {
         let restarted = EventHub::with_persistence(path.clone());
         assert_eq!(restarted.current_sequence(), 4);
         cleanup(&path);
+    }
+}
+
+#[cfg(test)]
+mod queue_state_tests {
+    use super::*;
+    use crate::api::schema::EventData;
+    use serde_json::json;
+    fn event(to: &str) -> EventEnvelope {
+        serde_json::from_value(json!({"event":"queue_item_state", "data":{
+            "type":"queue_item_state", "agent":"queue-fixture", "item_id":"item-fixture",
+            "producer":"human", "from":"queued", "to":to,
+            "stream":"queue/queue-fixture", "stream_seq":7
+        }}))
+        .unwrap()
+    }
+    #[test]
+    fn queue_global_fact_has_the_shape_an_old_reader_skips() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldKind {
+            WorkspaceCreated,
+        }
+        let fact = event("delivered");
+        assert!(fact.event.is_persisted());
+        let line = serde_json::to_string(&PersistedEvent {
+            seq: 11,
+            ts_ms: 1,
+            envelope: fact.clone(),
+        })
+        .unwrap();
+        assert_eq!(unknown_kind_seq_as::<OldKind>(&line), Some(11));
+        assert_eq!(unknown_kind_seq(&line), None);
+        assert_eq!(
+            serde_json::from_str::<PersistedEvent>(&line)
+                .unwrap()
+                .envelope,
+            fact
+        );
+    }
+    #[test]
+    fn queue_global_unknown_state_is_skipped_without_losing_cursors_or_other_events() {
+        let path = super::tests::temp_log("queue-unknown-state");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(event("delivered"));
+        drop(hub);
+        let mut line = serde_json::to_value(PersistedEvent {
+            seq: 2,
+            ts_ms: 1,
+            envelope: event("done"),
+        })
+        .unwrap();
+        line["envelope"]["data"]["to"] = json!("future_state");
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{line}"
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let hub = EventHub::with_persistence(path.clone());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        hub.push(event("done"));
+        let events = hub.persisted_events_after(0);
+        assert_eq!(
+            events.iter().map(|(seq, _, _)| *seq).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert!(events
+            .iter()
+            .all(|(_, _, e)| matches!(&e.data, EventData::QueueItemState(f) if f.known())));
+        hub.push(event("held"));
+        assert_eq!(hub.current_sequence(), 4);
+        assert!(!path.with_file_name("event-log.corrupt.jsonl").exists());
+        super::tests::cleanup(&path);
     }
 }

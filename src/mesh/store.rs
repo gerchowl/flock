@@ -602,6 +602,38 @@ impl<D: DiskSpace> Store<D> {
         )
     }
 
+    /// Accept a delivered or collected inbox with its native recipient binding.
+    /// `collected` records the existing collection acknowledgement in the same cut.
+    pub fn accept_bound_delivery(
+        &mut self,
+        delivery: &crate::mesh::delivery::Deliver,
+        recipient: (&str, &str),
+        collected: bool,
+        wall_ms: i64,
+    ) -> Result<Accepted> {
+        self.accept_inner(
+            &delivery.envelope,
+            delivery.remaining_ms,
+            Admission::Inbox,
+            wall_ms,
+            collected,
+            Some((delivery.hops_left, &delivery.visited, "")),
+            Some(recipient),
+        )
+    }
+
+    /// Read the native binding committed with custody, never a signed pane claim.
+    pub fn recipient_binding(&self, key: &MessageKey) -> Result<Option<(String, String)>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT agent,session FROM local_recipients WHERE origin=?1 AND id=?2",
+                params![key.origin_node, key.message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     // Admission atomically binds immutable mail, transport state, and collection debt.
     #[allow(clippy::too_many_arguments)]
     fn accept_inner(
@@ -799,6 +831,8 @@ impl<D: DiskSpace> Store<D> {
         self.finish_with_detail(key, outcome, None, wall_ms)
     }
 
+    /// Refuse pending custody or an own-node unread inbox admission. Actual reads
+    /// and remote-origin inbox deliveries cannot be changed to a refusal.
     pub fn refuse(&mut self, key: &MessageKey, reason: &str, wall_ms: i64) -> Result<()> {
         self.finish_with_detail(
             key,
@@ -830,6 +864,9 @@ impl<D: DiskSpace> Store<D> {
             return Ok(());
         }
         let valid = match outcome {
+            Outcome::Refused if state == "inbox" && key.origin_node == self.local_node => {
+                inbox.is_some_and(|deadline| deadline > now)
+            }
             Outcome::Read => state == "inbox" && inbox.is_some_and(|d| d > now),
             Outcome::InboxExpired => state == "inbox" && inbox.is_some_and(|d| d <= now),
             Outcome::Expired => {

@@ -146,7 +146,7 @@ pub(super) fn mint_correlation_id() -> String {
 /// ([`App::apply_blocking_budget`]), so nobody can be silenced by someone
 /// else exhausting it. The key space is therefore bounded by the panes on
 /// this server, plus one.
-fn blocking_budget_key(attested_agent: Option<&str>, from_pane: Option<&str>) -> String {
+pub(super) fn blocking_budget_key(attested_agent: Option<&str>, from_pane: Option<&str>) -> String {
     match (attested_agent, from_pane) {
         (Some(agent), _) => agent.to_string(),
         (None, Some(pane)) => format!("pane/{pane}"),
@@ -189,11 +189,11 @@ pub(crate) struct WakeSuppression {
     pub muted_until_ms: Option<u64>,
 }
 
-/// `msg.send` / `msg.reply` / `msg.list` (#175 M1). Messages are queued per
-/// recipient pane and delivered at the recipient's next settled turn
-/// boundary — never mid-turn (§8.3). Sender identity is stamped from API
-/// process ancestry and is routing/audit metadata only (P3): no code path
-/// in this module branches on WHO sent a message, only on WHERE it goes.
+/// `msg.send` / `msg.reply` / `msg.list` (#175 M1). Terminal mailboxes
+/// deliver at a settled turn boundary, using ancestry stamps for routing and
+/// audit (P3). Structured recipients enter the shared durable queue through
+/// the authenticated local adapter, which derives producer authority separately
+/// from client-supplied routing metadata (ADR-0036 §3/S5).
 impl App {
     pub(super) fn handle_msg_send(&mut self, id: String, params: MsgSendParams) -> String {
         if self.lease_caller() == crate::structured::lease::Caller::Uncertain {
@@ -233,22 +233,31 @@ impl App {
                 Ok(false) => (),
             }
         }
-        let resolved = match self.resolve_message_target(&params.to) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                return error.encode(id, !params.to.is_well_formed_agent_id());
+        let structured = if let MessageTarget::Agent { agent } = &params.to {
+            match self.structured_send_target(agent) {
+                Ok(target) => target,
+                Err(code) => return encode_error(id, code.as_str(), "ambiguous message target"),
+            }
+        } else {
+            None
+        };
+        let (to_ws_idx, to_pane_id, to_pane) = if let Some((agent, _)) = &structured {
+            (None, None, agent.clone())
+        } else {
+            match self.resolve_message_target(&params.to) {
+                Ok(ResolvedTarget::Local(ws, pane)) => {
+                    let Some(public) = self.public_pane_id(ws, pane) else {
+                        return encode_error(id, "internal_error", "target pane has no public id");
+                    };
+                    (Some(ws), Some(pane), public)
+                }
+                Ok(ResolvedTarget::Remote(location)) => {
+                    return self.relay_message_to_host(id, &location, &body, params)
+                }
+                Err(error) => return error.encode(id, !params.to.is_well_formed_agent_id()),
             }
         };
-        let (to_ws_idx, to_pane_id) = match resolved {
-            ResolvedTarget::Local(ws_idx, pane_id) => (ws_idx, pane_id),
-            ResolvedTarget::Remote(location) => {
-                return self.relay_message_to_host(id, &location, &body, params)
-            }
-        };
-        let Some(to_pane) = self.public_pane_id(to_ws_idx, to_pane_id) else {
-            return encode_error(id, "internal_error", "target pane has no public id");
-        };
-        let to_repo = self.workspace_repo_label(to_ws_idx);
+        let to_repo = to_ws_idx.and_then(|ws| self.workspace_repo_label(ws));
 
         // Sender stamp: process ancestry of the API peer, an empty claim so
         // ancestry is the only evidence (P3 — routing, never authorization).
@@ -274,7 +283,7 @@ impl App {
 
         let possible_sender = self.caller_pane_candidate();
         if from_pane.as_deref() == Some(to_pane.as_str())
-            || possible_sender == Some((to_ws_idx, to_pane_id))
+            || possible_sender.is_some() && possible_sender == to_ws_idx.zip(to_pane_id)
         {
             return encode_error(id, "self_message_forbidden", "a pane cannot message itself");
         }
@@ -322,6 +331,9 @@ impl App {
             intent: applied_intent,
         };
 
+        if let Some((target, _)) = structured {
+            return self.local_structured_message(id, target, message, warnings, None);
+        }
         self.queue_message_tiered(id, message, warnings, &blocking_key)
     }
 
@@ -439,9 +451,14 @@ impl App {
                 format!("no message with correlation id {}", params.correlation_id),
             );
         };
-        let local = from_host
-            .as_deref()
-            .is_none_or(|host| host == crate::app::short_host_name());
+        let local = key.as_ref().map_or_else(
+            || {
+                from_host
+                    .as_deref()
+                    .is_none_or(|host| host == crate::app::short_host_name())
+            },
+            |key| self.node_id.as_deref() == Some(key.origin_node.as_str()),
+        );
         if !local && self.node_id.is_none() {
             return encode_error(
                 id,
@@ -486,6 +503,23 @@ impl App {
             delivery_attempts: 0,
             intent,
         };
+        if local {
+            if let Some(target) = from_agent.as_ref() {
+                match self.structured_send_target(target) {
+                    Ok(Some((target, _))) => {
+                        return self.local_structured_message(
+                            id,
+                            target,
+                            message,
+                            downgrade.into_iter().map(str::to_owned).collect(),
+                            key,
+                        )
+                    }
+                    Err(code) => return encode_error(id, code.as_str(), "ambiguous reply target"),
+                    Ok(None) => (),
+                }
+            }
+        }
         let result = if local {
             self.local_reply(key.as_ref(), from_pane, from_agent, enqueued, message)
         } else if let Some(key) = &key {
@@ -517,6 +551,7 @@ impl App {
                 encode_success(
                     id,
                     ResponseResult::MsgQueued {
+                        item_id: None,
                         message_key: answer_key,
                         correlation_id: reply_correlation_id,
                         state: state.into(),
@@ -1180,6 +1215,7 @@ impl App {
             return encode_success(
                 id,
                 ResponseResult::MsgQueued {
+                    item_id: None,
                     message_key: Some(mesh.envelope.key),
                     correlation_id,
                     state: "queued".into(),
@@ -1464,6 +1500,7 @@ impl App {
                 encode_success(
                     id,
                     ResponseResult::MsgQueued {
+                        item_id: None,
                         message_key: message_key.clone(),
                         correlation_id,
                         state: "queued".into(),
@@ -1476,6 +1513,7 @@ impl App {
             EnqueueOutcome::Duplicate => encode_success(
                 id,
                 ResponseResult::MsgQueued {
+                    item_id: None,
                     message_key: message_key.clone(),
                     correlation_id,
                     state: "duplicate".into(),
@@ -1902,6 +1940,7 @@ mod tests {
         let response = basic_send(&mut app, "c-1", "hello beta");
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         let ResponseResult::MsgQueued {
+            item_id: None,
             correlation_id,
             state,
             ..
@@ -3334,7 +3373,10 @@ mod tests {
             app.handle_msg_relay_completed(crate::app::message_relay::RelayCompletion {
                 send: attempts.pop().unwrap(),
                 result: if succeeds {
-                    Ok(true)
+                    Ok(crate::mesh::delivery::Acknowledged {
+                        delivered: true,
+                        item_id: None,
+                    })
                 } else {
                     Err(crate::peers::PeerMessageFailure::Unreachable(
                         "timeout".into(),

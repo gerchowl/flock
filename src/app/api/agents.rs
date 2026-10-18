@@ -677,6 +677,11 @@ impl App {
     }
 
     pub(super) fn handle_agent_send(&mut self, id: String, params: AgentSendParams) -> String {
+        match self.structured_send_target(&params.target) {
+            Ok(Some(_)) => return self.handle_structured_send(id, params),
+            Err(code) => return encode_error(id, code.as_str(), "agent target is ambiguous"),
+            Ok(None) => (),
+        }
         if params.submit && params.write_timeout_ms.is_some() {
             return encode_error(
                 id,

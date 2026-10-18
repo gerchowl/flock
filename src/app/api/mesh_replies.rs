@@ -571,7 +571,7 @@ impl App {
         }
         for answer in answers.deliveries {
             if let Err(reason) =
-                self.import_mesh_answer(&query.request, &answer, Some(&completion.peer.name))
+                self.import_mesh_answer(&query.request, &answer, Some(&completion.peer.name), None)
             {
                 crate::logging::mesh_custody_failed(
                     "collect",
@@ -609,16 +609,40 @@ impl App {
         }
     }
 
+    /// Verify retained return capability again before recovery can admit an answer.
+    pub(super) fn verified_mesh_answer(
+        &self,
+        request: &MessageKey,
+        answer: &Envelope,
+    ) -> Result<crate::mesh::store::Record, String> {
+        with_store(|store| {
+            let original = store
+                .get(request)
+                .map_err(|e| e.to_string())?
+                .ok_or(UNAVAILABLE)?;
+            if self.node_id.as_deref() != Some(request.origin_node.as_str())
+                || answer.key.origin_node != original.envelope.return_binding.recipient_node
+                || answer.request_key.as_ref() != Some(request)
+                || answer.target_agent != original.envelope.sender
+                || answer.in_reply_to.as_deref() != Some(original.envelope.correlation_id.as_str())
+                || answer.return_binding.request != answer.key
+                || self.node_id.as_deref() != Some(answer.return_binding.recipient_node.as_str())
+                || answer.return_binding.collection_token
+                    != original.envelope.return_binding.collection_token
+            {
+                return Err("invalid reply binding".into());
+            }
+            Ok(original)
+        })
+    }
+
     pub(super) fn import_mesh_answer(
         &mut self,
         request: &MessageKey,
         delivery: &Deliver,
         collecting_peer: Option<&str>,
+        response_id: Option<String>,
     ) -> Result<(), String> {
-        let origin = self
-            .node_id
-            .as_deref()
-            .ok_or("mesh node identity unavailable")?;
         let answer = &delivery.envelope;
         crate::mesh::sign::verify(answer).map_err(|_| "invalid_signature")?;
         let sender_host = with_store(|store| {
@@ -629,31 +653,23 @@ impl App {
         if !self.state.config.msg.accepts_origin(sender_host.as_deref()) {
             return Err("msg_not_allowed".into());
         }
-        let original = with_store(|store| {
-            let original = store
-                .get(request)
-                .map_err(|e| e.to_string())?
-                .ok_or(UNAVAILABLE)?;
-            if request.origin_node != origin
-                || answer.key.origin_node != original.envelope.return_binding.recipient_node
-                || answer.request_key.as_ref() != Some(request)
-                || answer.target_agent != original.envelope.sender
-                || answer.in_reply_to.as_deref() != Some(original.envelope.correlation_id.as_str())
-                || answer.return_binding.request != answer.key
-                || answer.return_binding.recipient_node != origin
-                || answer.return_binding.collection_token
-                    != original.envelope.return_binding.collection_token
-            {
-                return Err("invalid reply binding".into());
-            }
-            Ok(original)
-        })?;
+        let original = self.verified_mesh_answer(request, answer)?;
         let mut data = payload(answer)?;
         if data.message.correlation_id != answer.correlation_id
             || data.message.in_reply_to != answer.in_reply_to
             || data.message.from_agent.as_deref().unwrap_or_default() != answer.sender
         {
             return Err("inconsistent mesh answer".into());
+        }
+        if self
+            .state
+            .structured_agents
+            .get(&answer.target_agent)
+            .is_some()
+        {
+            return self
+                .accept_structured_relay(delivery, collecting_peer.is_some(), response_id)
+                .map(|_| ());
         }
         data.message.to_pane = self
             .locate_agent(&original.envelope.sender)
@@ -742,12 +758,12 @@ mod tests {
             remaining_ms: CUSTODY_TTL_MS,
         };
         assert_eq!(
-            app.import_mesh_answer(&original.key, &delivery, None),
+            app.import_mesh_answer(&original.key, &delivery, None, None),
             Err("invalid reply binding".into())
         );
         delivery.envelope.body.push(0);
         assert_eq!(
-            app.import_mesh_answer(&original.key, &delivery, Some("hub.example")),
+            app.import_mesh_answer(&original.key, &delivery, Some("hub.example"), None),
             Err("invalid_signature".into())
         );
         delivery.envelope.body.pop();
@@ -757,7 +773,7 @@ mod tests {
             original.return_binding.collection_token;
         crate::mesh::sign::seal(&mut delivery.envelope, &signer);
         let error = app
-            .import_mesh_answer(&original.key, &delivery, Some("hub.example"))
+            .import_mesh_answer(&original.key, &delivery, Some("hub.example"), None)
             .unwrap_err();
         assert_ne!(error, "invalid reply binding");
         assert_ne!(error, "invalid_signature");
