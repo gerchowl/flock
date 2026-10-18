@@ -1611,7 +1611,10 @@ that the existing implementation already enforces these rules.
 scopes on **every cmd**, before claiming an idempotency key, returning a cached
 ack or dispatching a verb; cached hello authorization is insufficient. Serialize
 this authorization/admission boundary with operator revocation, so a command
-cannot be newly admitted after revocation. On detection of a removed/replaced
+cannot be newly admitted after revocation. Each admission or management operation
+explicitly unlocks its owned file description at scope exit, including completion
+or cancellation of lock-helper transfers. An inherited pre-exec descriptor in a
+child cannot extend that critical section. On detection of a removed/replaced
 token, return an error ack for the triggering cmd with `code:"auth_revoked"`
 before closing **all sockets for that token with 4403**; clients enter NeedsToken.
 Order that ack before the close on the triggering socket, without waiting for
