@@ -89,17 +89,22 @@ impl Runtime {
         self.transport.agent_decide(principal, args)
     }
     /// Audit a host cancellation/result/interrupt without sending a tool decision.
-    /// The caller must carry an authenticated operate-token capability.
+    /// The caller must carry an authenticated operate-token capability. A targeted
+    /// close carries the original `(request_id, request_seq)` from the snapshot.
+    /// `None` closes the current turn. A stale pair returns
+    /// `permission_request_closed` or `permission_request_unknown`, like decide.
     pub fn close_permissions(
         &self,
         principal: &super::permissions::Principal<'_>,
-        id: Option<&str>,
+        request: Option<(&str, u64)>,
         reason: super::permissions::CloseReason,
     ) -> Result<(), crate::api::error_code::ErrorCode> {
-        self.transport.close_permissions(principal, id, reason)
+        self.transport.close_permissions(principal, request, reason)
     }
-    /// Current permission ids for S4 attention; a busy snapshot fails closed.
-    pub fn waiting_on_human(&self) -> Result<Vec<String>, crate::api::error_code::ErrorCode> {
+    /// Current `(request_id, request_seq)` handles for operator decisions; a busy snapshot fails closed.
+    pub fn waiting_on_human(
+        &self,
+    ) -> Result<Vec<(String, u64)>, crate::api::error_code::ErrorCode> {
         self.transport.waiting_on_human()
     }
     /// Poll persisted events. Empty is not EOF; monitor the owning worker result too.

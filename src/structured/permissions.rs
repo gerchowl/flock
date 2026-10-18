@@ -2,8 +2,17 @@
 //! Caller identity is trusted dispatcher context, never command JSON. Only an
 //! authenticated operator token may decide; socket UID and agent ancestry alone
 //! grant nothing. A new transport owns a new book, including on resume.
-//! At most [`MAX_OPEN`] concurrent requests and 1024 lifetime IDs are accepted. Invalid or
-//! repeated harness IDs stop the transport rather than risk miscorrelation.
+//! There is no lifetime request limit (ADR-0036 S6). Keep at most
+//! [`MAX_OPEN_PERMISSION_REQUESTS`] live/in-flight requests in full. Excess
+//! requests receive an audited `permission_request_limit` deny, not a session stop.
+//! Capacity refusals write a closed audit without a matching open record.
+//! Retain the last [`CLOSED_PERMISSION_REQUEST_WINDOW`] durably closed handles in
+//! FIFO order. Every decision must match the flk-issued `(request_id, request_seq)`
+//! pair. Retained closed pairs return `permission_request_closed`; evicted or
+//! never-seen pairs return `permission_request_unknown` (both retry never).
+//! Invalid IDs, or duplicates still live or retained, stop the transport rather
+//! than risk miscorrelation. Reusing an evicted harness ID is safe because its
+//! new sequence cannot match an old decision. Sequence exhaustion fails closed.
 //! The stream owner audits terminal closes before clearing runtime state.
 //! Audits and responses share the transport byte cap; an audit failure cancels
 //! delivery. Admission success reserves a decision, not its eventual delivery.
@@ -12,14 +21,20 @@
 //! [`MAX_GRANTS`] bounds distinct exact grants, including pending grants.
 pub mod auth;
 
-pub(super) const MAX_OPEN: usize = 16;
+/// Maximum live permission requests, including reserved answers awaiting their
+/// durable close and completed stdin write. The harness normally blocks per
+/// request; excess requests are denied individually without consuming a slot.
+pub const MAX_OPEN_PERMISSION_REQUESTS: usize = 16;
+/// Number of closed handles retained in closure order, independently of live slots
+/// and session grants. Beyond this FIFO window, late decisions are unknown.
+pub const CLOSED_PERMISSION_REQUEST_WINDOW: usize = 1024;
 pub(super) const MAX_GRANTS: usize = 16;
 
 use super::claude::ToolRequest;
 use crate::api::error_code::ErrorCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Server-authenticated caller context; deliberately not deserializable.
 pub enum Principal<'a> {
@@ -61,8 +76,13 @@ pub enum Decision {
 pub struct AgentDecide {
     /// Agent whose live runtime receives this decision.
     pub agent: String,
-    /// Exact currently open harness request id.
+    /// Exact harness request ID, matched together with `request_seq`. Retained
+    /// closed pairs return `permission_request_closed`; evicted or never-seen pairs return
+    /// `permission_request_unknown`, as bounded by [`CLOSED_PERMISSION_REQUEST_WINDOW`].
     pub request_id: String,
+    /// Required flk-issued sequence from the open record, never a harness field.
+    /// Strictly increasing within this session, including across runtime resumes.
+    pub request_seq: u64,
     /// One of the three permission decisions.
     pub decision: Decision,
     /// Optional reason, carried verbatim in a deny response and audit.
@@ -93,10 +113,12 @@ enum Stage {
 }
 #[derive(Clone)]
 struct Grant {
+    request_seq: u64,
     subject: String,
     request_id: String,
 }
 pub(super) struct Open {
+    request_seq: u64,
     request: ToolRequest,
     stage: Stage,
     automatic: bool,
@@ -104,12 +126,14 @@ pub(super) struct Open {
 }
 pub(super) struct Answer {
     pub id: String,
+    pub request_seq: u64,
     pub response: Value,
     pub audit: Value,
     grant: Option<(String, Grant)>,
 }
 pub(super) struct Closing {
     pub id: String,
+    pub request_seq: u64,
     pub audit: Value,
     prior: Stage,
 }
@@ -117,11 +141,13 @@ pub(super) struct Book {
     agent: String,
     active: bool,
     open: BTreeMap<String, Open>,
-    seen: BTreeSet<String>,
+    closed_ids: BTreeMap<u64, String>,
+    closed_fifo: VecDeque<u64>,
+    last_request_seq: u64,
     grants: BTreeMap<String, Grant>,
 }
-pub(super) fn open_record(id: &str, request: &ToolRequest) -> Value {
-    json!({"type":"flk_permission_request","state":"open","request_id":id,"request":request})
+pub(super) fn open_record(id: &str, request_seq: u64, request: &ToolRequest) -> Value {
+    json!({"type":"flk_permission_request","state":"open","request_id":id,"request_seq":request_seq,"request":request})
 }
 
 impl Book {
@@ -130,24 +156,46 @@ impl Book {
             agent,
             active: true,
             open: BTreeMap::new(),
-            seen: BTreeSet::new(),
+            closed_ids: BTreeMap::new(),
+            last_request_seq: 0,
+            closed_fifo: VecDeque::new(),
             grants: BTreeMap::new(),
         }
+    }
+    // The durable stream cursor bounds every issued handle. Seed before stdout
+    // admission on resume so an old runtime's decision cannot match a new one.
+    pub fn resume_after(&mut self, stream_seq: u64) {
+        self.last_request_seq = self.last_request_seq.max(stream_seq);
+    }
+    fn next_request_seq(&mut self) -> Result<u64, ErrorCode> {
+        self.last_request_seq = self
+            .last_request_seq
+            .checked_add(1)
+            .ok_or(ErrorCode::InvalidRequest)?;
+        Ok(self.last_request_seq)
     }
     pub fn blocked(&self) -> bool {
         !self.active || !self.open.is_empty()
     }
-    pub fn waiting(&self) -> Vec<String> {
+    pub fn waiting(&self) -> Vec<(String, u64)> {
         self.open
             .iter()
             .filter(|(_, r)| r.stage != Stage::Closed && !r.automatic)
-            .map(|(id, _)| id.clone())
+            .map(|(id, r)| (id.clone(), r.request_seq))
             .collect()
     }
     // Called only after the stream owner has persisted terminal closes. An I/O
     // failure is reported by that owner; shutdown cannot promise failed fsyncs.
     pub fn end(&mut self) {
         self.active = false;
+        for (id, request_seq) in self
+            .open
+            .iter()
+            .map(|(id, r)| (id.clone(), r.request_seq))
+            .collect::<Vec<_>>()
+        {
+            self.remember_closed(&id, request_seq);
+        }
         self.open.clear();
         self.grants.clear();
     }
@@ -155,23 +203,26 @@ impl Book {
         if !self.active
             || id.is_empty()
             || id.len() > 256
-            || self.seen.contains(id)
-            || self.open.len() >= MAX_OPEN
-            || self.seen.len() >= 1024
+            || self.open.contains_key(id)
+            || self.closed_ids.values().any(|closed| closed == id)
         {
             return Err(ErrorCode::InvalidRequest);
         }
-        let audit = open_record(id, &request);
+        if self.open.len() >= MAX_OPEN_PERMISSION_REQUESTS {
+            return Err(ErrorCode::PermissionRequestLimit);
+        }
+        let request_seq = self.next_request_seq()?;
+        let audit = open_record(id, request_seq, &request);
         self.open.insert(
             id.into(),
             Open {
+                request_seq,
                 request,
                 stage: Stage::Open,
                 automatic: false,
                 grant: None,
             },
         );
-        self.seen.insert(id.into());
         Ok(audit)
     }
     pub fn automatic(&mut self, id: &str) -> Result<Option<Answer>, ErrorCode> {
@@ -184,6 +235,10 @@ impl Book {
             .map(|grant| {
                 let mut answer = self.answer(
                     id,
+                    self.open
+                        .get(id)
+                        .ok_or(ErrorCode::PermissionRequestUnknown)?
+                        .request_seq,
                     Decision::AllowOnce,
                     None,
                     &grant.subject,
@@ -193,13 +248,22 @@ impl Book {
                     open.automatic = true;
                 }
                 answer.audit["grant_request_id"] = json!(grant.request_id);
+                answer.audit["grant_request_seq"] = json!(grant.request_seq);
                 Ok(answer)
             })
             .transpose()
     }
 
-    fn missing(&self, id: &str) -> ErrorCode {
-        if self.seen.contains(id) {
+    fn missing(&self, id: &str, request_seq: u64) -> ErrorCode {
+        if self
+            .open
+            .get(id)
+            .is_some_and(|r| r.request_seq == request_seq)
+            || self
+                .closed_ids
+                .get(&request_seq)
+                .is_some_and(|closed| closed == id)
+        {
             ErrorCode::PermissionRequestClosed
         } else {
             ErrorCode::PermissionRequestUnknown
@@ -216,6 +280,7 @@ impl Book {
         }
         self.answer(
             &args.request_id,
+            args.request_seq,
             args.decision,
             args.message.as_deref(),
             subject,
@@ -225,16 +290,17 @@ impl Book {
     fn answer(
         &mut self,
         id: &str,
+        request_seq: u64,
         decision: Decision,
         message: Option<&str>,
         subject: &str,
         source: &str,
     ) -> Result<Answer, ErrorCode> {
-        let missing = self.missing(id);
+        let missing = self.missing(id, request_seq);
         let open = self
             .open
             .get(id)
-            .filter(|r| r.stage == Stage::Open && self.active)
+            .filter(|r| r.request_seq == request_seq && r.stage == Stage::Open && self.active)
             .ok_or(missing)?;
         let mut grant = None;
         let mut ignored_suggestions = None;
@@ -270,6 +336,7 @@ impl Book {
                 grant = Some((
                     k,
                     Grant {
+                        request_seq,
                         subject: subject.into(),
                         request_id: id.into(),
                     },
@@ -280,12 +347,13 @@ impl Book {
         let open = self.open.get_mut(id).ok_or(missing)?;
         open.grant = grant.as_ref().map(|(key, _)| key.clone());
         open.stage = Stage::Reserved;
-        let mut audit = json!({"type":"flk_permission_request","state":"closed","request_id":id,"decision":decision,"message":message,"principal":subject,"source":source});
+        let mut audit = json!({"type":"flk_permission_request","state":"closed","request_id":id,"request_seq":request_seq,"decision":decision,"message":message,"principal":subject,"source":source});
         if let Some(ignored) = ignored_suggestions {
             audit["ignored_suggestions"] = ignored;
         }
         Ok(Answer {
             id: id.into(),
+            request_seq,
             response: json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":response}}),
             audit,
             grant,
@@ -298,13 +366,23 @@ impl Book {
     ) -> Result<(Value, Answer), ErrorCode> {
         let open = self.observe(id, request)?;
         let code = ErrorCode::PermissionRequestTooLarge.as_str();
-        let mut answer = self.answer(id, Decision::Deny, Some(code), "flk", "limit")?;
+        let request_seq = self
+            .open
+            .get(id)
+            .ok_or(ErrorCode::PermissionRequestUnknown)?
+            .request_seq;
+        let mut answer =
+            self.answer(id, request_seq, Decision::Deny, Some(code), "flk", "limit")?;
         answer.audit["reason"] = json!(code);
         answer.audit["error_code"] = json!(code);
         Ok((open, answer))
     }
-    pub fn aborted(&mut self, id: &str) {
-        if let Some(open) = self.open.get_mut(id).filter(|r| r.stage == Stage::Reserved) {
+    pub fn aborted(&mut self, id: &str, request_seq: u64) {
+        if let Some(open) = self
+            .open
+            .get_mut(id)
+            .filter(|r| r.request_seq == request_seq && r.stage == Stage::Reserved)
+        {
             open.stage = Stage::Open;
             open.automatic = false;
             open.grant = None;
@@ -312,11 +390,11 @@ impl Book {
     }
     // Once claimed by the stream writer, a decision cannot be replaced by a
     // concurrently queued close during its fsync. Before that claim, cancel wins.
-    pub fn begin_answer(&mut self, id: &str) -> bool {
+    pub fn begin_answer(&mut self, id: &str, request_seq: u64) -> bool {
         if let Some(open) = self
             .open
             .get_mut(id)
-            .filter(|r| r.stage == Stage::Reserved && self.active)
+            .filter(|r| r.request_seq == request_seq && r.stage == Stage::Reserved && self.active)
         {
             open.stage = Stage::Auditing;
             true
@@ -325,37 +403,59 @@ impl Book {
         }
     }
     pub fn audited(&mut self, answer: &Answer) {
-        if let Some(open) = self
-            .open
-            .get_mut(&answer.id)
-            .filter(|r| r.stage == Stage::Auditing && self.active)
-        {
-            open.stage = Stage::Closed;
-            open.grant = None;
-            if let Some((key, grant)) = &answer.grant {
-                self.grants.insert(key.clone(), grant.clone());
-            }
+        let Some(open) = self.open.get_mut(&answer.id).filter(|r| {
+            r.request_seq == answer.request_seq && r.stage == Stage::Auditing && self.active
+        }) else {
+            return;
+        };
+        open.stage = Stage::Closed;
+        open.grant = None;
+        if let Some((key, grant)) = &answer.grant {
+            self.grants.insert(key.clone(), grant.clone());
         }
+        self.remember_closed(&answer.id, answer.request_seq);
     }
     pub fn written(&mut self, answer: Answer) {
-        self.open.remove(&answer.id);
+        if self
+            .open
+            .get(&answer.id)
+            .is_some_and(|r| r.request_seq == answer.request_seq)
+        {
+            self.open.remove(&answer.id);
+        }
     }
+    /// ADR-0036 §10b: a targeted host close carries the originally surfaced
+    /// handle, like an answer. Never resolve a stale caller's ID to a new handle.
+    /// None retires the current turn's requests, not a previously observed one.
     pub fn close(
         &mut self,
-        id: Option<&str>,
+        request: Option<(&str, u64)>,
         reason: CloseReason,
     ) -> Result<Vec<Closing>, ErrorCode> {
-        if let Some(id) = id {
-            let missing = self.missing(id);
-            if !self
-                .open
-                .get(id)
-                .is_some_and(|r| matches!(r.stage, Stage::Open | Stage::Reserved))
-            {
+        if let Some((id, request_seq)) = request {
+            let missing = self.missing(id, request_seq);
+            if !self.open.get(id).is_some_and(|r| {
+                r.request_seq == request_seq && matches!(r.stage, Stage::Open | Stage::Reserved)
+            }) {
                 return Err(missing);
             }
         }
-        Ok(self.closing(id, reason, false))
+        Ok(self.closing(request.map(|(id, _)| id), reason, false))
+    }
+    /// Only the stdout owner handles the CLI's ID-only cancellation. Resolve its
+    /// current book handle while holding the same lock, including reserved answers.
+    pub fn cancel_from_harness(&mut self, id: &str) -> Result<Vec<Closing>, ErrorCode> {
+        let request_seq = self
+            .open
+            .get(id)
+            .map(|r| r.request_seq)
+            .or_else(|| {
+                self.closed_ids
+                    .iter()
+                    .find_map(|(seq, closed)| (closed == id).then_some(*seq))
+            })
+            .ok_or(ErrorCode::PermissionRequestUnknown)?;
+        self.close(Some((id, request_seq)), CloseReason::Cancelled)
     }
     pub fn terminal(&mut self) -> Vec<Closing> {
         self.closing(None, CloseReason::Ended, true)
@@ -365,18 +465,53 @@ impl Book {
             && (terminal || matches!(r.stage,Stage::Open|Stage::Reserved)))
             .map(|(id,r)| {
                 let prior=r.stage;r.stage=Stage::Closing;
-                Closing {id:id.clone(),prior,audit:json!({"type":"flk_permission_request","state":"closed","request_id":id,"reason":reason})}
+                Closing {id:id.clone(),request_seq:r.request_seq,prior,audit:json!({"type":"flk_permission_request","state":"closed","request_id":id,"request_seq":r.request_seq,"reason":reason})}
             }).collect()
     }
     pub fn close_aborted(&mut self, closings: &[Closing]) {
         for close in closings {
-            if let Some(open) = self.open.get_mut(&close.id) {
+            if let Some(open) = self
+                .open
+                .get_mut(&close.id)
+                .filter(|r| r.request_seq == close.request_seq)
+            {
                 open.stage = close.prior;
             }
         }
     }
-    pub fn closed(&mut self, id: &str) {
-        self.open.remove(id);
+    pub fn closed(&mut self, id: &str, request_seq: u64) {
+        if self
+            .open
+            .get(id)
+            .is_some_and(|r| r.request_seq == request_seq)
+        {
+            self.open.remove(id);
+        }
+        self.remember_closed(id, request_seq);
+    }
+    fn remember_closed(&mut self, id: &str, request_seq: u64) {
+        if self.closed_ids.insert(request_seq, id.into()).is_none() {
+            self.closed_fifo.push_back(request_seq);
+            if self.closed_fifo.len() > CLOSED_PERMISSION_REQUEST_WINDOW {
+                if let Some(evicted) = self.closed_fifo.pop_front() {
+                    self.closed_ids.remove(&evicted);
+                }
+            }
+        }
+    }
+    // Called only after observe rejected a valid, uncorrelated ID at capacity.
+    // No live slot or grant is reserved; the stream owner durably closes the ID.
+    pub fn capacity_refusal(&mut self, id: &str) -> Result<Answer, ErrorCode> {
+        let request_seq = self.next_request_seq()?;
+        let code = ErrorCode::PermissionRequestLimit.as_str();
+        crate::logging::structured_permission_request_refused(&self.agent, id, request_seq, code);
+        Ok(Answer {
+            id: id.into(),
+            request_seq,
+            response: json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{"behavior":"deny","message":code}}}),
+            audit: json!({"type":"flk_permission_request","state":"closed","request_id":id,"request_seq":request_seq,"decision":"deny","message":code,"principal":"flk","source":"limit","reason":code,"error_code":code}),
+            grant: None,
+        })
     }
 }
 

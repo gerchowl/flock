@@ -50,6 +50,23 @@ pub(crate) fn structured_stream_repaired(bytes_dropped: u64) {
     );
 }
 
+/// Report a single capacity refusal without recording tool input or prompts.
+pub(crate) fn structured_permission_request_refused(
+    agent: &str,
+    request_id: &str,
+    request_seq: u64,
+    error_code: &str,
+) {
+    tracing::warn!(
+        event = "structured.permission.refused",
+        agent_id = agent,
+        request_id,
+        request_seq,
+        error_code,
+        "permission request denied at open-request capacity"
+    );
+}
+
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),
