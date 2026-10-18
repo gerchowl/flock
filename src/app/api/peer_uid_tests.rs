@@ -242,6 +242,7 @@ sys.stdin.read()
                 None,
                 &std::sync::Mutex::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             )
             .unwrap();
         }

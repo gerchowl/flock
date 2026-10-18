@@ -1588,6 +1588,7 @@ impl HeadlessServer {
                 pane_input_write_ack: false,
             }),
             self.client_wire_health.clone(),
+            self.app.runtime_config.uid_policy.clone(),
         )?;
 
         let client_path = client_socket_path();
@@ -4229,7 +4230,12 @@ pub fn run_server() -> io::Result<()> {
     event_hub.set_read_max_wait_ms(loaded_config.config.events.read_max_wait_ms);
 
     // Start the JSON API socket server.
-    let _api_server = match api::start_server(api_tx.clone(), event_hub.clone()) {
+    let runtime_config = app::AppRuntimeConfig::for_config(&loaded_config.config);
+    let _api_server = match api::start_server(
+        api_tx.clone(),
+        event_hub.clone(),
+        runtime_config.uid_policy.clone(),
+    ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             eprintln!("error: flk server is already running");
@@ -4248,12 +4254,13 @@ pub fn run_server() -> io::Result<()> {
 
     let result = rt.block_on(async {
         // Create the App (with AppState, event channels, etc.).
-        let mut app = app::App::new(
+        let mut app = app::App::new_with_runtime_config(
             &loaded_config.config,
             no_session,
             config::config_diagnostic_summary(&loaded_config.diagnostics),
             api_rx,
             event_hub,
+            runtime_config,
         );
 
         // The server runs headless — disable local notification side effects.
@@ -4378,7 +4385,11 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         }
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
-        let api_server = api::start_server(api_tx.clone(), event_hub.clone())?;
+        let api_server = api::start_server(
+            api_tx.clone(),
+            event_hub.clone(),
+            app.runtime_config.uid_policy.clone(),
+        )?;
         let mut server = HeadlessServer::new(
             app,
             &loaded_config.diagnostics,
