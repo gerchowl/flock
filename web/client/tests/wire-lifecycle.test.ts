@@ -28,6 +28,7 @@ describe("transient handshake loss retains credentials", () => {
     test(`Hello + close ${code} reconnects with the same token`, () => {
       const h = new Harness();
       REACH["Hello"]?.(h);
+      h.step(step({ step: "expect_connect", within_ms: 10_000 }));
       h.net.current().serverClose(code, "transport ended");
       expect(h.connection.state).toBe("Reconnecting");
       h.step(step({ step: "expect_connect", not_before_ms: 250, within_ms: 500 }));
