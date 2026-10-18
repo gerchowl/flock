@@ -68,6 +68,12 @@ pub(crate) fn client_exchange_failed(
     tracing::warn!(event = "client.exchange.internal_failure", subsystem = "structured_client", reason, io_kind = ?io_kind, "browser credential exchange unavailable");
 }
 
+/// Report secondary listener cleanup errors without replacing the primary server failure.
+#[cfg(feature = "web")]
+pub(crate) fn client_listener_shutdown_failed(error: &std::io::Error) {
+    tracing::warn!(event = "client.listener.shutdown_failed", subsystem = "structured_client", kind = ?error.kind(), errno = ?error.raw_os_error(), "client listener cleanup failed after server failure");
+}
+
 /// Report accept failures with typed classes and errno, never request contents.
 #[cfg(feature = "web")]
 pub(crate) fn client_accept_failed(
