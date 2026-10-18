@@ -61,12 +61,17 @@ impl App {
         &mut self,
         msg: crate::api::ApiRequestMessage,
     ) -> bool {
+        if self.respond_scope_probe(&msg) {
+            return false;
+        }
         let previous_mode = self.state.mode;
         let changed = crate::api::request_changes_ui(&msg.request);
+        self.current_api_scope = msg.scope;
         self.current_api_peer_pid = msg.peer_pid;
         self.current_api_peer_birth = Some(msg.peer_birth);
         self.current_api_peer_uid = Some(msg.peer_uid);
         let response = self.handle_api_request(msg.request);
+        self.current_api_scope = None;
         self.current_api_peer_pid = None;
         self.current_api_peer_birth = None;
         self.current_api_peer_uid = None;
