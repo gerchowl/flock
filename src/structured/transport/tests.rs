@@ -40,15 +40,23 @@ fn wait<T>(transport: &Transport, mut poll: impl FnMut() -> Option<T>) -> T {
 
 fn receive(transport: &Transport) -> Received {
     let deadline = Instant::now() + Duration::from_secs(10);
-    transport
-        .output
-        .recv_timeout(Duration::from_secs(10))
-        .unwrap_or_else(|error| {
-            let completion = transport
-                .completion
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()));
-            panic!("missing stdout record: {error}; worker: {completion:?}")
-        })
+    loop {
+        let received = transport
+            .output
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|error| {
+                let completion = transport
+                    .completion
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+                panic!("missing stdout record: {error}; worker: {completion:?}")
+            });
+        if !matches!(
+            received.state_input(),
+            Some(crate::structured::state::Input::Accepted { .. })
+        ) {
+            return received;
+        }
+    }
 }
 
 fn worker_done(transport: &Transport, reader: bool) -> io::Result<()> {
@@ -110,7 +118,12 @@ fn permission_request_has_durable_open_record() {
     assert_eq!(value["type"], "flk_permission_request");
     assert_eq!(value["state"], "open");
     assert_eq!(value["request_id"], "permission-example");
-    assert_eq!(records(&root).len(), 2);
+    let stream = records(&root);
+    assert_eq!(stream.len(), 3);
+    assert_eq!(
+        serde_json::from_str::<Value>(&stream[0].raw).unwrap()["type"],
+        "flk_input_accepted"
+    );
 }
 
 fn records(root: &SessionConfigDir) -> Vec<StreamRecord> {
@@ -804,13 +817,13 @@ fn permission_decisions_are_audited_before_control_stdin_and_keep_turn_busy() {
         let audit = records(&root);
         assert_eq!(
             audit.iter().map(|r| r.seq).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![1, 2, 3, 4]
         );
-        let closed: Value = serde_json::from_str(&audit[2].raw).unwrap();
+        let closed: Value = serde_json::from_str(&audit[3].raw).unwrap();
         assert_eq!(closed["state"], "closed");
         assert_eq!(closed["decision"], serde_json::to_value(decision).unwrap());
         assert_eq!(closed["principal"], "fixture-client");
-        assert_eq!(audit[2].origin, RecordOrigin::Flk);
+        assert_eq!(audit[3].origin, RecordOrigin::Flk);
         assert_eq!(response["type"], "control_response");
         assert_eq!(response["response"]["request_id"], "request-example");
         assert_eq!(response["response"]["subtype"], "success");
@@ -827,7 +840,7 @@ fn permission_decisions_are_audited_before_control_stdin_and_keep_turn_busy() {
             );
         }
         let published = receive(&transport).record;
-        assert_eq!(published.seq, 3);
+        assert_eq!(published.seq, 4);
         assert!(
             transport.input_inflight(),
             "a permission answer is not a result"
@@ -946,7 +959,10 @@ fn already_queued_user_input_waits_for_the_control_response() {
         .input
         .as_ref()
         .unwrap()
-        .try_send(Input::User(encode(&user("queued")).unwrap()))
+        .try_send(Input::User(UserInput {
+            bytes: encode(&user("queued")).unwrap(),
+            admitted: Arc::new(AtomicBool::new(true)),
+        }))
         .unwrap_or_else(|_| panic!("queue admission"));
     call_decide(
         &transport,
@@ -1046,6 +1062,7 @@ fn failed_decision_audit_never_enqueues_a_control_response() {
     let (input, rx) = mpsc::sync_channel(4);
     let (_decisions, decisions) = mpsc::sync_channel(4);
     let plane = ControlPlane {
+        accepted: mpsc::sync_channel(1).1,
         book: Arc::new(parking_lot::Mutex::new(book)),
         input,
         decisions,
@@ -1195,7 +1212,10 @@ fn second_held_input_is_a_typed_refusal_without_writing_either_input() {
             .input
             .as_ref()
             .unwrap()
-            .try_send(Input::User(encode(&user(text)).unwrap()))
+            .try_send(Input::User(UserInput {
+                bytes: encode(&user(text)).unwrap(),
+                admitted: Arc::new(AtomicBool::new(true)),
+            }))
             .unwrap_or_else(|_| panic!("fixture input queue"));
     }
     let error = worker_done(&transport, false).unwrap_err();
@@ -1609,6 +1629,7 @@ fn session_grant_matches_canonical_input_but_other_input_and_tools_prompt() {
             persisted: true,
             record,
             event,
+            accepted: None,
         };
         if let Some(input) = received.state_input() {
             let update = projection.reduce(input, now, 1000, Duration::from_secs(30));
@@ -1863,6 +1884,7 @@ fn every_book_close_immediately_clears_s4_needs_human() {
                 persisted: true,
                 record,
                 event,
+                accepted: None,
             }
         } else {
             receive(&transport)
@@ -2213,6 +2235,42 @@ fn oversized_and_invalid_utf8_partial_summaries_never_enter_durable_stream() {
     drop(stdout);
     reader_done(&transport).unwrap();
     assert!(records(&root).is_empty());
+}
+
+#[test]
+fn admission_replay_is_skipped_and_stdout_cannot_forge_acceptance() {
+    for origin in [RecordOrigin::Flk, RecordOrigin::Claude] {
+        let record = StreamRecord {
+            seq: 1,
+            received_at_ms: 1000,
+            origin,
+            result_subtype: None,
+            permission_grant_request_id: None,
+            raw: serde_json::json!({"type":"flk_input_accepted", "at_ms":1000}).to_string(),
+        };
+        let event = SessionEvent::parse(&record.raw, "2.1.296");
+        let received = Received {
+            persisted: true,
+            record,
+            event,
+            accepted: None,
+        };
+        if origin == RecordOrigin::Flk {
+            assert!(
+                received.state_input().is_none(),
+                "replay has no launch clock"
+            );
+        } else {
+            let input = received.state_input().expect("stdout is progress");
+            assert!(matches!(&input, crate::structured::state::Input::Event(_)));
+            let now = Instant::now();
+            let mut reducer = crate::structured::state::SessionState::new("fixture-agent".into());
+            assert!(reducer
+                .reduce(input, now, 1000, Duration::from_secs(1))
+                .observe_at
+                .is_none());
+        }
+    }
 }
 
 #[test]

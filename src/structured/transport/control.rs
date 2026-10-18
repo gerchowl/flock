@@ -62,6 +62,17 @@ impl<'a> Recorder<'a> {
         raw.pop();
         self.record(&raw, raw.len() as u64, true, None)
     }
+    /// Drain a host admission before recording any later stdout evidence.
+    pub fn accepted(&mut self) -> io::Result<()> {
+        while let Ok(accepted) = self.controls.accepted.try_recv() {
+            let mut event = self.audit(&serde_json::json!({
+                "type": "flk_input_accepted", "at_ms": accepted.at_ms,
+            }))?;
+            event.accepted = Some(accepted);
+            publish(event, self.tx, self.cancel)?;
+        }
+        Ok(())
+    }
     pub fn command(&mut self, command: Command) -> io::Result<()> {
         match command {
             Command::Decide(control) => self.answer(control),
@@ -106,6 +117,7 @@ impl<'a> Recorder<'a> {
         count: u64,
         metadata: metadata::Line,
     ) -> io::Result<()> {
+        self.accepted()?;
         let mut open = None;
         let mut pending_answer = None;
         let mut closings = Vec::new();
