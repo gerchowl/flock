@@ -27,12 +27,21 @@ pub struct Deliver {
     pub visited: Vec<String>,
 }
 
-/// Push one delivery. A terminal refusal may carry the recipient's signed
-/// receipt for the origin (#872).
+/// Durable transport acceptance and the recipient's optional committed queue ID.
+/// Keeping both in one value prevents intermediate relays from dropping the ID.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Acknowledged {
+    /// True for inbox import, false for transferred custody.
+    pub delivered: bool,
+    /// Present only after the destination queue owner committed admission.
+    pub item_id: Option<String>,
+}
+
+/// Push one delivery, retaining any signed terminal refusal receipt (#872).
 pub(crate) fn send(
     peer: &crate::config::PeerConfig,
     delivery: &Deliver,
-) -> (Result<bool, PeerMessageFailure>, Option<Envelope>) {
+) -> (Result<Acknowledged, PeerMessageFailure>, Option<Envelope>) {
     let mut receipt = None;
     let result = push(peer, delivery, &mut receipt);
     (result, receipt)
@@ -42,7 +51,7 @@ fn push(
     peer: &crate::config::PeerConfig,
     delivery: &Deliver,
     receipt: &mut Option<Envelope>,
-) -> Result<bool, PeerMessageFailure> {
+) -> Result<Acknowledged, PeerMessageFailure> {
     let mut delivery = delivery.clone();
     super::hello::with_store(|store| {
         if store.clock().map_err(|e| e.to_string())?.paused {
@@ -72,10 +81,15 @@ fn push(
         }
         return Err(failure);
     }
-    let result = &response["result"];
+    acknowledgement(&response["result"], &delivery.envelope.key)
+}
+
+fn acknowledgement(
+    result: &serde_json::Value,
+    key: &super::key::MessageKey,
+) -> Result<Acknowledged, PeerMessageFailure> {
     if result["message_key"]
-        != serde_json::to_value(&delivery.envelope.key)
-            .map_err(|e| PeerMessageFailure::Refused(e.to_string()))?
+        != serde_json::to_value(key).map_err(|e| PeerMessageFailure::Refused(e.to_string()))?
         || !matches!(
             result["state"].as_str(),
             Some("delivered" | "duplicate" | "custody")
@@ -85,7 +99,19 @@ fn push(
             "mesh peer did not acknowledge durable inbox import".into(),
         ));
     }
-    Ok(result["state"] != "custody")
+    let id = match result.get("item_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(id)) if *id == key.lifecycle_id() => Some(id.clone()),
+        _ => {
+            return Err(PeerMessageFailure::Unreachable(
+                "invalid queue lifecycle acknowledgement".into(),
+            ))
+        }
+    };
+    Ok(Acknowledged {
+        delivered: result["state"] != "custody",
+        item_id: id,
+    })
 }
 
 fn delivery_failure(error: &serde_json::Value) -> PeerMessageFailure {
@@ -177,6 +203,29 @@ pub(crate) fn body(key: Option<&super::key::MessageKey>, legacy: &str) -> Option
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queue_lifecycle_acknowledgement_is_bound_to_complete_message_key() {
+        let key = crate::mesh::sign::tests::signed().key;
+        let mut ack =
+            serde_json::json!({"message_key":key,"state":"delivered","item_id":key.lifecycle_id()});
+        assert_eq!(
+            super::acknowledgement(&ack, &key).unwrap(),
+            super::Acknowledged {
+                delivered: true,
+                item_id: Some(key.lifecycle_id())
+            }
+        );
+        ack["item_id"] = serde_json::json!("00000000-0000-4000-8000-000000000001");
+        assert!(super::acknowledgement(&ack, &key).is_err());
+        ack["item_id"] = serde_json::Value::Null;
+        assert_eq!(
+            super::acknowledgement(&ack, &key).unwrap(),
+            super::Acknowledged {
+                delivered: true,
+                item_id: None
+            }
+        );
+    }
     #[test]
     fn origin_budget_honors_debug_test_override() {
         let (_lock, _scrub) = crate::config::test_config_env_guard();

@@ -2,6 +2,8 @@
 mod peer_uid_tests;
 #[cfg(test)]
 mod structured_lease_tests;
+#[cfg(test)]
+mod structured_relay_tests;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -34,6 +36,7 @@ mod revert;
 mod spawn;
 pub(crate) mod structured_messages;
 pub(crate) mod structured_queue;
+mod structured_relay;
 mod tabs;
 pub(crate) mod workspaces;
 mod worktrees;

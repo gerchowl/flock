@@ -16,6 +16,13 @@ pub enum Producer {
     Human,
     /// Sending agent identity.
     Agent(String),
+    /// Sender assertion vouched for by a verified node, carrying no local authority.
+    NodeAsserted {
+        /// Sender asserted by the signing node, possibly a claim on that node.
+        sender: String,
+        /// Verified signing node identity, independent of the forwarding hop.
+        origin: String,
+    },
     /// Authenticated channel binding and user.
     Channel {
         /// Configured binding identity.
@@ -134,6 +141,7 @@ impl<'de> Deserialize<'de> for Producer {
         enum Known {
             Human,
             Agent(String),
+            NodeAsserted { sender: String, origin: String },
             Channel { binding: String, user: String },
             System(String),
             Fork(String),
@@ -141,13 +149,17 @@ impl<'de> Deserialize<'de> for Producer {
         let value = Value::deserialize(deserializer)?;
         let name = variant_name(&value)
             .ok_or_else(|| serde::de::Error::custom("queue producer requires a variant name"))?;
-        if !matches!(name, "human" | "agent" | "channel" | "system" | "fork") {
+        if !matches!(
+            name,
+            "human" | "agent" | "node_asserted" | "channel" | "system" | "fork"
+        ) {
             return Ok(Self::Unknown(value));
         }
         let known = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(match known {
             Known::Human => Self::Human,
             Known::Agent(id) => Self::Agent(id),
+            Known::NodeAsserted { sender, origin } => Self::NodeAsserted { sender, origin },
             Known::Channel { binding, user } => Self::Channel { binding, user },
             Known::System(source) => Self::System(source),
             Known::Fork(id) => Self::Fork(id),
@@ -329,5 +341,20 @@ impl Change {
             items.insert(*position, *item.clone());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn node_asserted_origin_is_typed_and_malformed_known_payload_is_refused() {
+        let raw = serde_json::json!({"node_asserted":{"sender":"human","origin":"origin.example"}});
+        let producer: super::Producer = serde_json::from_value(raw.clone()).unwrap();
+        assert!(matches!(producer, super::Producer::NodeAsserted { .. }));
+        assert_eq!(serde_json::to_value(producer).unwrap(), raw);
+        assert!(serde_json::from_value::<super::Producer>(
+            serde_json::json!({"node_asserted":{"origin":42,"sender":"a"}})
+        )
+        .is_err());
     }
 }

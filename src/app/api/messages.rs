@@ -451,9 +451,14 @@ impl App {
                 format!("no message with correlation id {}", params.correlation_id),
             );
         };
-        let local = from_host
-            .as_deref()
-            .is_none_or(|host| host == crate::app::short_host_name());
+        let local = key.as_ref().map_or_else(
+            || {
+                from_host
+                    .as_deref()
+                    .is_none_or(|host| host == crate::app::short_host_name())
+            },
+            |key| self.node_id.as_deref() == Some(key.origin_node.as_str()),
+        );
         if !local && self.node_id.is_none() {
             return encode_error(
                 id,
@@ -3368,7 +3373,10 @@ mod tests {
             app.handle_msg_relay_completed(crate::app::message_relay::RelayCompletion {
                 send: attempts.pop().unwrap(),
                 result: if succeeds {
-                    Ok(true)
+                    Ok(crate::mesh::delivery::Acknowledged {
+                        delivered: true,
+                        item_id: None,
+                    })
                 } else {
                     Err(crate::peers::PeerMessageFailure::Unreachable(
                         "timeout".into(),

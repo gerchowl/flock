@@ -874,7 +874,14 @@ fn assert_missing_variant_name(raw: Value) {
 
 #[test]
 fn object_form_known_producers_reject_numeric_payloads() {
-    for tag in ["human", "agent", "channel", "system", "fork"] {
+    for tag in [
+        "human",
+        "agent",
+        "node_asserted",
+        "channel",
+        "system",
+        "fork",
+    ] {
         assert_corrupt_item_read_only("producer", json!({tag:42}));
     }
 }
@@ -991,7 +998,7 @@ fn unstamped_v1_gains_a_version_stamp_on_checkpoint() {
     assert_eq!(fs::read(root.path()).unwrap(), before);
     journal.checkpoint().unwrap();
     let header: Value = serde_json::from_slice(&root.identity_prefix()).unwrap();
-    assert_eq!(header["format_version"], 2);
+    assert_eq!(header["format_version"], FORMAT_VERSION);
 }
 
 #[test]
