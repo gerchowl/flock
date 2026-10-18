@@ -140,6 +140,7 @@ mod tests {
             session_id: "fixture-session".into(),
             cwd: root.path().to_path_buf(),
             model: Some("fixture-model".into()),
+            lineage: None,
         };
         app.state
             .structured_agents

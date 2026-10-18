@@ -578,6 +578,15 @@ fn relay_refusal(request: &str) -> Option<(String, &'static str, String)> {
         .unwrap_or_default()
         .to_string();
     let method = parsed.get("method").and_then(|method| method.as_str())?;
+    if matches!(method, "agent.start" | "agent.spawn")
+        && parsed.pointer("/params/runtime").and_then(|v| v.as_str()) == Some("structured")
+    {
+        return Some((
+            id,
+            "operator_only",
+            "structured starts require local caller attribution".into(),
+        ));
+    }
     STREAMING_METHODS.contains(&method).then(|| {
         (
             id,
@@ -1358,5 +1367,18 @@ mod tests {
         assert!(parse_logs_args(&args(&["--lines"])).is_err());
         assert!(parse_logs_args(&args(&["--lines", "abc"])).is_err());
         assert!(parse_logs_args(&args(&["--bogus"])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod structured_relay_tests {
+    #[test]
+    fn structured_start_and_spawn_cannot_cross_a_mesh_relay() {
+        for method in ["agent.start", "agent.spawn"] {
+            let request = serde_json::json!({"id":"resume", "method":method, "params":{"runtime":"structured", "name":"existing"}}).to_string();
+            let (_, code, _) =
+                super::relay_refusal(&request).expect("structured relay must refuse");
+            assert_eq!(code, "operator_only");
+        }
     }
 }

@@ -68,11 +68,25 @@ pub struct Record {
     pub cwd: PathBuf,
     /// Requested model, absent when the provider selects its default.
     pub model: Option<String>,
+    /// Admission ancestry. Missing legacy metadata is unknown, resumed as a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<Lineage>,
+}
+
+/// Persisted admission ancestry, independent of a process or lease generation.
+/// A root has no parent and depth zero. A child stores its own depth, not its parent's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lineage {
+    /// Original parent identity, absent only for a root.
+    pub parent: Option<String>,
+    /// Original distance from the admission root.
+    pub depth: u32,
 }
 
 /// The only runtime represented by a pane-free registry record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum StructuredRuntime {
     /// A process whose authoritative input is a session stream.
     Structured,
@@ -81,6 +95,8 @@ pub enum StructuredRuntime {
 /// Admission/update failures leave every existing entry untouched.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegistryError {
+    /// Unconfirmed ownership must be recovered or cleared before another launch.
+    RecoveryRequired,
     /// Identity, session, harness or supplied name is invalid.
     InvalidRecord,
     /// Unknown collection layout: back up session.json and follow the session-state repair guide.
@@ -197,7 +213,16 @@ impl Registry {
         if self.unparsed.is_some() {
             return Err(RegistryError::UnsupportedCollectionShape);
         }
-        if record.agent_id.is_empty()
+        if record
+            .lineage
+            .as_ref()
+            .is_some_and(|lineage| match &lineage.parent {
+                None => lineage.depth != 0,
+                Some(parent) => {
+                    parent.is_empty() || parent == &record.agent_id || lineage.depth == 0
+                }
+            })
+            || record.agent_id.is_empty()
             || record.session_id.is_empty()
             || record.harness != "claude"
             || record.name.as_ref().is_some_and(|name| name.is_empty())
@@ -236,6 +261,9 @@ impl Registry {
             .get_mut(agent_id)
             .filter(|entry| entry.generation == current)
             .ok_or(RegistryError::StaleGeneration)?;
+        if entry.projection.update.state.lifecycle == Lifecycle::Unknown {
+            return Err(RegistryError::RecoveryRequired);
+        }
         let generation = self
             .generation
             .checked_add(1)
@@ -326,6 +354,21 @@ impl Registry {
             .values()
             .map(|entry| entry.record.clone())
             .collect()
+    }
+
+    /// Recognize reserved legacy names in durable metadata, including entries
+    /// retained inactive under ADR-0028 §3a. Inspect only direct known fields:
+    /// unknown collection layouts are never recursively interpreted as records.
+    pub(crate) fn legacy_self_target(&self, target: &str) -> bool {
+        self.preserved
+            .iter()
+            .flatten()
+            .chain(self.unparsed.iter())
+            .any(|raw| {
+                raw.get("name").and_then(Value::as_str) == Some("self")
+                    && (target == "self"
+                        || raw.get("agent_id").and_then(Value::as_str) == Some(target))
+            })
     }
 
     /// Cold metadata copy for persistence/handoff, never a clone of live state.
