@@ -117,7 +117,7 @@ impl Runtime {
         &self,
         key: &crate::mesh::key::MessageKey,
     ) -> Option<bool> {
-        Some(self.queue.as_ref()?.custody_committed(key))
+        self.queue.as_ref()?.custody_committed(key)
     }
     pub(super) fn queue_update(&self) -> Option<super::workers::queue::Update> {
         self.queue.as_ref()?.update()

@@ -323,7 +323,8 @@ impl Workers {
             .queue_enqueue(request)
     }
     /// Positive proof from the sole journal owner, including keys loaded on reopen.
-    /// No runtime means unknown, never proof that a committed key is absent.
+    /// In-flight admission, opaque state or unavailable ownership is unknown,
+    /// never proof that a committed key is absent.
     pub(crate) fn queue_custody_committed(
         &self,
         id: &str,

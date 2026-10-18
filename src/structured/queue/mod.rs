@@ -225,6 +225,11 @@ impl Journal {
     pub fn items(&self) -> &[Item] {
         &self.items
     }
+    /// Whether the retained items can prove absence of a committed item.
+    /// Opaque records, read-only state and uncertain writes prevent that proof.
+    pub(crate) fn complete_items(&self) -> bool {
+        !self.future && !self.poisoned && self.read_only().is_none()
+    }
     /// Committed encoded size for the worker's configured rewrite threshold.
     pub fn bytes(&self) -> io::Result<u64> {
         self.healthy()?;

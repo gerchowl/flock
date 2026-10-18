@@ -21,8 +21,27 @@ use std::{
 };
 /// Fixed notification bound, separate from one peek and the terminal fact tail.
 pub(crate) const COMPLETION_CAPACITY: usize = 4;
-type CommittedCustody =
-    Arc<parking_lot::Mutex<std::collections::HashSet<crate::mesh::key::MessageKey>>>;
+type CommittedCustody = Arc<parking_lot::Mutex<CustodyIndex>>;
+struct CustodyIndex {
+    committed: std::collections::HashSet<crate::mesh::key::MessageKey>,
+    pending: std::collections::HashMap<crate::mesh::key::MessageKey, usize>,
+    uncertain: bool,
+}
+impl CustodyIndex {
+    fn finish(&mut self, key: crate::mesh::key::MessageKey, committed: bool, complete: bool) {
+        let remove = self.pending.get_mut(&key).is_some_and(|count| {
+            *count -= 1;
+            *count == 0
+        });
+        if remove {
+            self.pending.remove(&key);
+        }
+        self.uncertain |= !complete;
+        if committed {
+            self.committed.insert(key);
+        }
+    }
+}
 
 fn custody_key(item: &Item) -> Option<crate::mesh::key::MessageKey> {
     let key: crate::mesh::key::MessageKey =
@@ -77,16 +96,34 @@ pub(in crate::structured) struct Client {
     committed_custody: CommittedCustody,
 }
 impl Client {
-    pub fn custody_committed(&self, key: &crate::mesh::key::MessageKey) -> bool {
-        self.committed_custody.lock().contains(key)
+    pub fn custody_committed(&self, key: &crate::mesh::key::MessageKey) -> Option<bool> {
+        let index = self.committed_custody.lock();
+        if index.committed.contains(key) {
+            Some(true)
+        } else if index.uncertain || index.pending.contains_key(key) {
+            None
+        } else {
+            Some(false)
+        }
     }
     /// Full returns session_busy; disconnection returns agent_not_found. Success
     /// accepts only the buffer slot; the completion acknowledges durability.
     pub fn enqueue(&self, request: Request) -> Result<(), ErrorCode> {
-        self.requests.try_send(request).map_err(|e| match e {
+        let key = custody_key(&request.item);
+        let mut index = self.committed_custody.lock();
+        if let Some(key) = &key {
+            *index.pending.entry(key.clone()).or_default() += 1;
+        }
+        let result = self.requests.try_send(request).map_err(|e| match e {
             mpsc::TrySendError::Full(_) => ErrorCode::SessionBusy,
             mpsc::TrySendError::Disconnected(_) => ErrorCode::AgentNotFound,
-        })
+        });
+        if result.is_err() {
+            if let Some(key) = key {
+                index.finish(key, false, true);
+            }
+        }
+        result
     }
     pub fn state(&self, state: Snapshot) -> bool {
         self.states.try_send(state).is_ok()
@@ -170,14 +207,16 @@ impl Service {
         // Same four-completion bound as the session stream; no unbounded spool.
         let (updates, rx) = mpsc::sync_channel(COMPLETION_CAPACITY);
         let final_facts = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let committed_custody = Arc::new(parking_lot::Mutex::new(
-            scheduler
+        let committed_custody = Arc::new(parking_lot::Mutex::new(CustodyIndex {
+            committed: scheduler
                 .journal()
                 .items()
                 .iter()
                 .filter_map(custody_key)
                 .collect(),
-        ));
+            pending: Default::default(),
+            uncertain: !scheduler.journal().complete_items(),
+        }));
         Ok((
             Self {
                 publisher,
@@ -279,10 +318,12 @@ impl Service {
                         .enqueue(request.item, request.principal, request.gate)
                 })
             };
-            if result.is_ok() {
-                if let Some(key) = key {
-                    self.committed_custody.lock().insert(key);
-                }
+            if let Some(key) = key {
+                self.committed_custody.lock().finish(
+                    key,
+                    result.is_ok(),
+                    self.scheduler.journal().complete_items(),
+                );
             }
             (id, result)
         });
@@ -362,6 +403,7 @@ impl Service {
             .as_ref()
             .err()
             .map(|e| (e.code, e.source.as_ref().map(|s| (s.kind(), s.to_string()))));
+        self.committed_custody.lock().uncertain |= !self.scheduler.journal().complete_items();
         let facts = self.scheduler.take_facts();
         let changed = !facts.is_empty()
             || self.initial
