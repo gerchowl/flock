@@ -21,7 +21,11 @@ const IDENTITY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 struct IdentityBusy;
 impl std::fmt::Display for IdentityBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("mesh identity is busy; retry after the competing operation finishes")
+        write!(
+            f,
+            "{}: mesh identity is busy; retry after the competing operation finishes",
+            crate::api::error_code::ErrorCode::SessionBusy
+        )
     }
 }
 impl std::error::Error for IdentityBusy {
