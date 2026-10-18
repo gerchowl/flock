@@ -95,6 +95,7 @@ struct Server {
     task: tokio::task::JoinHandle<()>,
     clock: TestClock,
     _root: crate::structured::launch::SessionConfigDir,
+    wake: Arc<tokio::sync::Notify>,
 }
 impl Server {
     async fn new() -> Self {
@@ -117,8 +118,13 @@ impl Server {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         let clock = TestClock::new();
-        let core =
-            Core::with_clock(TokenStore::open(root.path()).unwrap(), wrap(clock.clone())).unwrap();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let core = Core::with_clock(
+            TokenStore::open(root.path()).unwrap(),
+            wrap(clock.clone()),
+            wake.clone(),
+        )
+        .unwrap();
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind = socket.local_addr().unwrap();
         let router = core.router();
@@ -131,6 +137,7 @@ impl Server {
             task,
             clock,
             _root: root,
+            wake,
         }
     }
     async fn finish(mut self) {
@@ -833,12 +840,16 @@ fn normal_constructor_opens_the_store_once_and_reports_startup_failure() {
     runtime(async {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
-        let core = Core::new(root.path().into()).await.unwrap();
+        let core = Core::new(root.path().into(), Arc::new(tokio::sync::Notify::new()))
+            .await
+            .unwrap();
         assert_eq!(core.shared.slots.available_permits(), 16);
         core.shutdown().await.unwrap();
         let file = root.path().join("not-directory");
         fs::write(&file, b"fixture").unwrap();
-        assert!(Core::new(file).await.is_err());
+        assert!(Core::new(file, Arc::new(tokio::sync::Notify::new()))
+            .await
+            .is_err());
     });
 }
 
@@ -1128,3 +1139,22 @@ fn owner_lookup_replay_consumes_real_storage_and_the_verified_socket_writer() {
         server.finish().await;
     });
 }
+#[test]
+fn subscriptions_are_accepted_on_the_actual_socket() {
+    runtime(async {
+        let server = Server::new().await;
+        let mut socket = Socket::open(&server).await;
+        socket.hello(1, &"a".repeat(64)).await;
+        socket
+            .send(json!({"t":"sub","sub_id":"s1","stream":"unknown"}))
+            .await;
+        let Received::Text(frame) = socket.receive().await else {
+            panic!("sub must receive a typed refusal, not a socket close")
+        };
+        assert_eq!(frame["t"], "subfail");
+        assert_eq!(frame["code"], "unknown_stream");
+        server.finish().await;
+    });
+}
+
+mod subscriptions;

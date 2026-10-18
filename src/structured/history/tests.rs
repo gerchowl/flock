@@ -22,13 +22,13 @@ fn record(seq: u64, raw: Value) -> StreamRecord {
         raw: raw.to_string(),
     }
 }
-struct Fixture {
+pub(crate) struct Fixture {
     _root: SessionConfigDir,
-    file: File,
-    source: History,
+    pub(crate) file: File,
+    pub(crate) source: History,
 }
 impl Fixture {
-    fn new(records: Vec<StreamRecord>) -> Self {
+    pub(crate) fn new(records: Vec<StreamRecord>) -> Self {
         let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let sessions = root.path().join("sessions");
         crate::platform::structured::ensure_private_dir(&sessions).unwrap();
@@ -42,6 +42,7 @@ impl Fixture {
         }
         file.sync_all().unwrap();
         let source = History::default();
+        source.bind("fixture-agent", "history");
         source
             .initialize(
                 &file,
@@ -55,7 +56,7 @@ impl Fixture {
             source,
         }
     }
-    fn append(&mut self, record: StreamRecord) {
+    pub(crate) fn append(&mut self, record: StreamRecord) {
         let bytes = serde_json::to_vec(&record).unwrap();
         self.file.write_all(&bytes).unwrap();
         self.file.write_all(b"\n").unwrap();

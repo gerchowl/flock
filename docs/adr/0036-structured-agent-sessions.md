@@ -1500,6 +1500,24 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | Ack timeout and delayed original | Missing ack marks only that cmd uncertain; no same-socket resend or teardown. A late current-socket ack resolves it. After reconnect, deliver resume-only lookup before buffered original: show unknown outcome while the original may later execute once; never manufacture a new ID. Verify retry:later remains harmless with resume_only. |
 | Mobile suspend and remote outage | Foreground invalidates old socket and resumes. Local heartbeat does not clear remote stale state; cross-node cmd still refuses under VERSION 5. |
 
+#### S7-min agent subscription resource bounds (§5a implementation)
+
+The agent subscription implementation uses at most eight active cuts and 1024
+lifetime-used IDs per connection. IDs are limited to 128 bytes and stream names
+to 256 bytes; exceeding these caps closes 1001. Each cut has one outstanding
+writer delivery, with per-ID cancellation fencing and flush acknowledgement.
+History page work has 32 global I/O slots; abandoned work retains its slot until
+it returns. Storage/resource failures close 1001, distinct from authorization
+refusals. Current read scope is rechecked before owner lookup.
+
+An encoded agent event above the 65,536-byte message cap closes that subscription
+with `lagged`, without truncation, silent cursor advancement or sibling failure.
+Resuming from the applied cursor encounters that event again while it remains
+retained. The retained History limits, inline gaps, persisted provenance and
+single replay barrier remain authoritative. Exact-cursor offset hints are bounded
+and source-fenced; stale hints are discarded and cursor paging is used instead.
+
+
 ### 6. One schema, generated TypeScript
 
 The Rust types are the schema: the session event enum (§8), the wire

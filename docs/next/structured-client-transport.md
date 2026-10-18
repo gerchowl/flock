@@ -167,3 +167,49 @@ priority between writes. A successful acknowledgement means the frame flushed;
 a closed acknowledgement channel means the writer failed. A write already
 started before the fence closes cannot be recalled, so clients still discard
 late frames for closed IDs as required by §5a.
+
+### Agent history subscriptions (ADR-0036 §5a)
+
+`sub agent/<id>` checks the token's current read scope before consulting the
+registry owner. Each connection remembers every used ID, including refusals,
+unsubscribe and lag. Reuse closes the old registration and receives
+`sub_id_reused`. Missing subjects and ahead cursors receive `unknown_stream`
+and `cursor_ahead`. Scope failure receives `scope`; genuine revocation closes
+4403. Storage, worker or resource unavailability closes 1001, preserving the
+client's token for reconnection.
+
+Each ID owns one cut registered atomically with its captured head. Durable
+records and inline history gaps precede exactly one `synced` barrier; subsequent
+records are live. Legacy provenance gaps continue through later records. Unknown
+wrappers retain the original raw line and observed harness shape, and known
+payloads retain their projected blob references. Partial deltas are absent from
+durable history. A normal producer end drains already committed records.
+
+There are at most eight active cuts per connection, 1024 lifetime IDs, and one
+queued or in-flight delivery per cut. IDs are at most 128 bytes and stream names
+256 bytes. Exceeding these budgets closes 1001. The shared writer's data queue
+holds eight deliveries, separately from its four priority messages. Page work
+runs outside the executor with at most 32 running/queued jobs across connections;
+cancellation holds capacity until its blocking operation returns. Owner admission
+retains its existing 32-message mailbox and four recovery jobs. History retains
+at most 16 records/256 KiB per cut, plus one record and a 32 KiB read page.
+
+An event whose encoded frame exceeds 65,536 bytes emits `lagged` and closes only
+that ID; it never truncates the payload or kills a sibling. A single stored
+record above 256 KiB lags all existing cuts, including caught-up cuts. Lag can
+win before the barrier. `skipped_to` is diagnostic, never an applied cursor.
+A fresh ID resumes from the client's applied cursor: if the oversized record
+is still ahead of that cursor, it lags again rather than silently skipping it.
+The server caches up to eight last-flushed cursor/offset hints per connection.
+It pins the source notification identity alongside each opaque hint. It uses a
+hint only for that exact requested cursor and source; hints that
+no longer match the canonical source are discarded in favour of cursor paging.
+Flush acknowledgements never advance the client's applied cursor. A resume without
+an exact cached hint scans incrementally from the file beginning; no durable
+offset index is maintained.
+
+Unsubscribe cancels the cut and fences queued output. A write already started
+cannot be recalled, so clients drop late frames for closed IDs. A frame for an
+ID never opened on that connection remains a protocol error. A stalled cut has
+no second Runtime receiver and cannot monopolize its siblings' queue slots or
+heartbeat priority between writes.
