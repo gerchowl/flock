@@ -733,10 +733,22 @@ mod tests {
         assert_eq!(app.terminal_runtimes.len(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn operator_retry_by_terminal_id_rechecks_failed_plan_and_starts_after_repair() {
+        // capture_logs uses a thread-local subscriber, so keep this test current-thread.
         // ADR-0028 §1/§3: failed plans retain their identity for explicit retry.
-        let mut app = test_app();
+        struct RuntimeCleanup(App);
+
+        impl Drop for RuntimeCleanup {
+            fn drop(&mut self) {
+                for (_, runtime) in self.0.terminal_runtimes.drain() {
+                    runtime.shutdown();
+                }
+            }
+        }
+
+        let mut cleanup = RuntimeCleanup(test_app());
+        let app = &mut cleanup.0;
         app.state.default_shell = "/bin/sh".into();
         app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
         let workspace = crate::workspace::Workspace::test_new("operator-retry");
@@ -801,10 +813,6 @@ mod tests {
                 .blocked_reason,
             None
         );
-        app.terminal_runtimes
-            .remove(&terminal_id)
-            .unwrap()
-            .shutdown();
     }
 
     #[tokio::test]
