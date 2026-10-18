@@ -415,6 +415,7 @@ pub(crate) fn codex_clipped_model_footer(line: &str, cols: u16) -> bool {
 }
 
 /// Whether this screen is Claude Code's folder-trust dialog and nothing else.
+/// This is the plain variant; permission pre-approval has its own named seam.
 ///
 /// The public seam for the `delegate` readiness gate (#612): a caller that has
 /// read a pane's bottom buffer asks the DETECTOR rather than carrying its own
@@ -424,6 +425,12 @@ pub(crate) fn codex_clipped_model_footer(line: &str, cols: u16) -> bool {
 /// the dialog's text is quoted in scrollback.
 pub fn claude_waiting_on_folder_trust(screen_content: &str) -> bool {
     agents::claude_code::has_folder_trust_dialog(screen_content)
+        && !agents::claude_code::has_folder_trust_with_permissions_dialog(screen_content)
+}
+
+/// Folder trust that also pre-approves tools: an operator must decide (#1116).
+pub fn claude_waiting_on_folder_trust_with_permissions(screen_content: &str) -> bool {
+    agents::claude_code::has_folder_trust_with_permissions_dialog(screen_content)
 }
 
 /// The live Codex hook-review dialog, shared with delegate readiness.

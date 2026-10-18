@@ -852,3 +852,44 @@ fn keep_on_failure_is_a_start_flag() {
         assert!(parse_flags(verb, &args(&["d1", "--keep-on-failure"])).is_err());
     }
 }
+
+#[test]
+fn retained_block_directory_sync_failure_is_typed_and_keeps_a_complete_entry() {
+    let dir = crate::test_support::TempDir::socket();
+    let path = dir.path().join("retained.json");
+    let mut entry = entry_for("retained");
+    entry.round = 0;
+    entry.harness = "claude".into();
+    let saved = save_startup_block_at(&entry, &path, |parent| {
+        assert_eq!(parent, dir.path());
+        let published: Entry = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            published, entry,
+            "the rename publishes the complete entry before directory sync"
+        );
+        Err(io::ErrorKind::PermissionDenied.into())
+    });
+    assert_eq!(
+        saved.as_ref().unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let dialog = validate_harness(Some("claude"))
+        .unwrap()
+        .startup_dialogs
+        .iter()
+        .find(|dialog| dialog.keep_on_start)
+        .unwrap();
+    crate::cli::output::set(crate::cli::output::Format::Json);
+    let code = emit_startup_block(&entry, dialog, true, saved);
+    assert_eq!(code, crate::api::error_code::ErrorCode::WriteFailed.exit());
+    assert!(
+        crate::cli::output::envelope_pending(),
+        "durability failure has a typed envelope"
+    );
+    crate::cli::output::set(crate::cli::output::Format::Default);
+    assert_eq!(
+        serde_json::from_slice::<Entry>(&std::fs::read(&path).unwrap()).unwrap(),
+        entry
+    );
+    assert!(!dir.path().join(".retained.json.tmp").exists());
+}
