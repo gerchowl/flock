@@ -177,6 +177,17 @@ pub(crate) struct AppRuntimeConfig {
     pub(crate) uid_policy: crate::structured::identity::UidPolicy,
 }
 
+impl AppRuntimeConfig {
+    /// Capture one server's launch-time identity policy before starting listeners.
+    pub(crate) fn for_config(config: &Config) -> Self {
+        let mut runtime = Self::default();
+        if config.security.agent_account == crate::config::model::AgentAccount::None {
+            runtime.uid_policy.dedicated = Ok(None).into();
+        }
+        runtime
+    }
+}
+
 pub struct App {
     pub(crate) runtime_config: AppRuntimeConfig,
     /// Shared, in-memory one-time browser handoffs, never persisted across restart.
@@ -535,7 +546,7 @@ impl App {
             config_diagnostic,
             api_rx,
             event_hub,
-            AppRuntimeConfig::default(),
+            AppRuntimeConfig::for_config(config),
         )
     }
 

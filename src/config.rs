@@ -140,6 +140,9 @@ impl Config {
 
     pub fn collect_diagnostics(&self) -> Vec<String> {
         let (prefix_diag, _, keybind_diags, _) = self.validated_keybinds();
+        let account_warning = (self.security.agent_account == model::AgentAccount::None
+            && self.structured.run_as == crate::structured::launch::RunAs::Agent)
+            .then_some("security.agent_account = \"none\" with structured.run_as = \"flk-agent\": agents using a dedicated UID are Unknown (read-only); enable dedicated-account recognition or use structured.run_as = \"operator\"".to_owned());
         prefix_diag
             .into_iter()
             .chain(keybind_diags)
@@ -147,6 +150,7 @@ impl Config {
             .chain(self.ui.idle.diagnostics())
             .chain(self.gossip.diagnostics())
             .chain(self.checks.diagnostics())
+            .chain(account_warning)
             .collect()
     }
 
@@ -176,6 +180,25 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_account_launch_mismatch_warns_only_for_unrecognized_dedicated_launch() {
+        for account in ["flk-agent", "none"] {
+            for run_as in ["flk-agent", "operator"] {
+                let config: Config = toml::from_str(&format!(
+                    "[security]\nagent_account = '{account}'\n[structured]\nrun_as = '{run_as}'\n"
+                ))
+                .unwrap();
+                let diagnostics = config.collect_diagnostics();
+                let expected = if account == "none" && run_as == "flk-agent" {
+                    vec!["security.agent_account = \"none\" with structured.run_as = \"flk-agent\": agents using a dedicated UID are Unknown (read-only); enable dedicated-account recognition or use structured.run_as = \"operator\"".to_owned()]
+                } else {
+                    vec![]
+                };
+                assert_eq!(diagnostics, expected, "account={account}, run_as={run_as}");
+            }
+        }
+    }
 
     #[test]
     fn local_keybindings_profile_includes_defaults_and_excludes_commands() {
