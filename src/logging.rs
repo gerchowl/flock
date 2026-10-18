@@ -3004,12 +3004,12 @@ pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
 }
 
 // --- agent-resume family (logging redesign PR-6) ---------------------------
-// The three deferred agent-resume paths (empty argv, shell spawn failure,
-// send-command failure) all reach tracing with %terminal_id / %plan.agent /
-// %err. TerminalId is Display-shaped; the facade takes a shaped &str so no
-// other module carries the raw Display fmt. Level stays WARN — a failed
-// resume drops the pane back to its non-resumed state, which is surfaced
-// to the user via the terminal.
+// The three deferred launch failures are empty argv, shell spawn failure and
+// command send failure. They retain the plan and set resume_failed, suppressing
+// automatic retries in this server. Agent info reports blocked_reason=resume_failed.
+// An explicit operator retry makes one new attempt. All three paths log WARN
+// through the facade with shaped terminal and agent strings. Only spawn and send
+// failures include an err field.
 
 pub(crate) fn agent_resume_empty_argv(pane: u32, terminal: &str, agent: &str) {
     tracing::warn!(
