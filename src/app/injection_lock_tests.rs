@@ -73,6 +73,8 @@ fn lock_rig_with(
         api_rx,
         crate::api::EventHub::default(),
     );
+    app.current_api_peer_pid = Some(std::process::id());
+    app.current_api_peer_birth = Some(crate::platform::process_start_time(std::process::id()));
     let sender = crate::workspace::Workspace::test_new("alpha");
     let mut recipient = crate::workspace::Workspace::test_new("beta");
     let focused = recipient.focused_pane_id().expect("pane");

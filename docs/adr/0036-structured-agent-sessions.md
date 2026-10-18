@@ -331,10 +331,10 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   Recognition is independent of `structured.run_as`: opting into operator-mode
   launch does not disable it. With recognition enabled, a pending or failed
   directory lookup classifies socket callers as `Unknown`, including callers
-  with the server UID: reads remain available but operator mutations, including
-  server stop, are refused. A resolved dedicated UID distinct from the server
-  UID permits the server UID to proceed to the existing ancestry checks; a
-  resolved absent account does too. A dedicated UID equal to the server UID
+  with the server UID: the health/capability ping remains available, but
+  directory reads and target-bearing calls are refused before resolution. A
+  resolved dedicated UID distinct from the server UID permits the server UID
+  to proceed to the existing ancestry checks; a resolved absent account does too. A dedicated UID equal to the server UID
   is a §1a misconfiguration, never operator authority. Report
   `agent_account_uid_collision` once in the log and retain the typed diagnostic
   in server status until restart. Each server owns its account cache and
@@ -344,10 +344,13 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   The server never starts the dedicated-account NSS lookup, and callers with
   its own UID immediately pass the UID boundary. Lease, pane, birth and relay
   checks still apply: known same-UID agents remain non-operator. Other or missing
-  UIDs remain unknown/read-only. This opt-in avoids the default directory-service
-  availability cost but gives up recognizing anonymous/detached callers as
-  `flk-agent` by UID. It cannot provide a dedicated-account isolation boundary;
+  UIDs remain unknown, without directory or target access. This opt-in avoids
+  the default directory-service availability cost but gives up recognizing
+  anonymous/detached callers as `flk-agent` by UID. It cannot provide a dedicated-account isolation boundary;
   same-UID callers without lease/pane ancestry remain cooperative under #1177.
+  A recognized server UID passes the UID boundary for directory reads, including
+  shell panes; this is a cooperative model, not isolation from other processes
+  running as that UID. Operator-only and send-principal checks still apply.
   Changing the setting requires a server restart; reload keeps the active policy
   and reports that requirement.
 
@@ -357,8 +360,24 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   is that agent: it is the `msg.send` sender and the `agent:<id>` producer
   of §3, exactly as a pane id attributes a `pty` agent today (ADR-0008,
   with ADR-0026's authenticated origin). A `flk-agent` caller that reaches
-  no lease and no pane is an anonymous agent: it may read, and every send is
-  refused with `msg_not_allowed`.
+  no lease and no pane is an anonymous agent. Unattested callers (unknown or
+  missing UID, or a dedicated UID without agent ancestry) may only use the
+  untargeted `ping` for health/capabilities. `agent.list`, `agent.get` and all
+  directory/target-bearing calls receive the same `not_authorized` refusal,
+  including message, code and absent target metadata, before any lookup.
+  Socket read fast paths enforce the same boundary before cursor or target
+  validation. Dedicated-UID reads use an in-process App admission check that
+  cannot be forged through wire JSON; an unavailable App fails closed with the
+  existing response timeout. Subscription probes/polls and held output reads
+  retain the captured socket credentials. Recognized server-UID reads use the
+  same-UID cooperative rule.
+  Retry safety never grants read authority. Server and client-token lifecycle
+  operations retain their `operator_only` refusal.
+  `agent.send` verifies an operator or attributed agent principal before deciding
+  whether the target is structured or terminal. An unconfirmed same-UID caller
+  gets the same refusal for existing, missing and ambiguous targets. Only callers
+  authorised to resolve receive `agent_not_found`, `agent_target_ambiguous` or
+  candidate metadata. PID-reuse hardening is tracked separately in #2138.
 - **WebSocket clients always present a token** (§5). Loopback is not an
   identity: the operator's own browser is a client with an `operator`-scoped
   token that only the local operator can mint over the unix socket, and the

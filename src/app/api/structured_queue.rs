@@ -235,7 +235,13 @@ impl App {
         self.structured_sends.waiting.insert(key, waiter);
         Ok(Ticket { item_id, committed })
     }
-    pub(super) fn handle_structured_send(&mut self, id: String, params: AgentSendParams) -> String {
+    /// The dispatcher verifies `principal` before resolving any target.
+    pub(super) fn handle_structured_send(
+        &mut self,
+        id: String,
+        params: AgentSendParams,
+        principal: &Principal<'_>,
+    ) -> String {
         if !params.submit {
             return encode_error(
                 id,
@@ -250,23 +256,6 @@ impl App {
                 "terminal-only options",
             );
         }
-        let operator = self.caller_is_local_operator();
-        let caller = self.spawn_caller();
-        let principal = match &caller {
-            super::SpawnCaller::Operator { .. } if operator => Principal::Operator,
-            super::SpawnCaller::Agent { agent_id, .. }
-            | super::SpawnCaller::Structured {
-                agent_id: Some(agent_id),
-                ..
-            } => Principal::Agent(agent_id),
-            _ => {
-                return encode_error(
-                    id,
-                    ErrorCode::NotAuthorized.as_str(),
-                    "caller identity is unconfirmed",
-                )
-            }
-        };
         match self.structured_send(
             SendParams {
                 target: params.target,
@@ -274,7 +263,7 @@ impl App {
                 submit: params.submit,
                 item_id: params.item_id,
             },
-            &principal,
+            principal,
         ) {
             Ok(ticket) => {
                 self.structured_sends.staged = Some(Staged(id, ticket));

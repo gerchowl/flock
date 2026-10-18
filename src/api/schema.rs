@@ -256,6 +256,10 @@ pub enum Method {
     /// In-process only: the held `events.read` returned.
     #[serde(skip)]
     WaitRelease(String),
+    /// In-process only: admit a socket read fast path before any target lookup.
+    /// UID and ancestry checks run in the App. Never accepted from wire JSON.
+    #[serde(skip)]
+    AuthorizeRead,
     /// ADR-0035 §1: bind a repo to its resident owner. Operator verb.
     #[serde(rename = "owner.bind")]
     OwnerBind(OwnerBindParams),
@@ -448,7 +452,8 @@ impl Method {
             | Self::DigestRender(_)
             | Self::FleetStatus(_)
             | Self::WaitHold(..)
-            | Self::WaitRelease(_) => false,
+            | Self::WaitRelease(_)
+            | Self::AuthorizeRead => false,
             Self::NotificationShow(_)
             | Self::NotificationAck(_)
             | Self::WorkspaceCreate(_)

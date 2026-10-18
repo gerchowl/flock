@@ -56,17 +56,17 @@ fn response(app: &mut App, request: Request) -> serde_json::Value {
     serde_json::from_str(&app.handle_api_request_after_internal_events_drained(request)).unwrap()
 }
 #[tokio::test]
-async fn anonymous_dedicated_and_unknown_uid_callers_can_read_but_not_send_or_operate() {
+async fn unattested_uid_callers_cannot_read_directories_send_or_operate() {
     for uid in [Some(42), Some(99), None] {
         let mut app = fixture(uid);
         assert!(!app.caller_is_local_operator());
         assert_eq!(
             response(&mut app, owner())["error"]["code"],
-            "operator_only"
+            "not_authorized"
         );
         assert_eq!(
             response(&mut app, send())["error"]["code"],
-            "msg_not_allowed"
+            "not_authorized"
         );
         let raw = Request {
             id: "raw".into(),
@@ -77,30 +77,33 @@ async fn anonymous_dedicated_and_unknown_uid_callers_can_read_but_not_send_or_op
                 write_timeout_ms: None,
             }),
         };
-        assert_eq!(response(&mut app, raw)["error"]["code"], "msg_not_allowed");
+        assert_eq!(response(&mut app, raw)["error"]["code"], "not_authorized");
         let close = Request {
             id: "close".into(),
             method: Method::PaneClose(PaneTarget {
                 pane_id: "fixture-pane".into(),
             }),
         };
-        assert_eq!(response(&mut app, close)["error"]["code"], "operator_only");
+        assert_eq!(response(&mut app, close)["error"]["code"], "not_authorized");
 
-        assert!(response(&mut app, read()).get("result").is_some());
+        assert_eq!(
+            response(&mut app, read())["error"]["code"],
+            "not_authorized"
+        );
     }
     let mut app = fixture(Some(7));
     assert!(app.caller_is_local_operator());
     app.current_api_peer_pid = None;
     assert_eq!(
         response(&mut app, owner())["error"]["code"],
-        "operator_only"
+        "not_authorized"
     );
     app.current_api_peer_pid = Some(std::process::id());
     app.runtime_config.uid_policy.dedicated = Err(()).into();
     assert!(!app.caller_is_local_operator());
     assert_eq!(
         response(&mut app, send())["error"]["code"],
-        "msg_not_allowed"
+        "not_authorized"
     );
 }
 fn pane(app: &mut App, agent: bool) {
@@ -132,12 +135,20 @@ async fn uid_boundary_preserves_trusted_pty_agents_without_operator_authority() 
         ));
         assert!(app.attested_sender_agent().is_some());
         assert!(!app.caller_is_local_operator());
+        let admitted = response(
+            &mut app,
+            Request {
+                id: "read-admission".into(),
+                method: Method::AuthorizeRead,
+            },
+        );
+        assert!(admitted.get("result").is_some(), "{admitted}");
     }
     let mut app = fixture(Some(42));
     pane(&mut app, false);
     assert_eq!(
         response(&mut app, owner())["error"]["code"],
-        "operator_only"
+        "not_authorized"
     );
 }
 #[tokio::test]
@@ -154,7 +165,7 @@ async fn recovery_replay_preserves_uid_and_restores_the_outer_context() {
     app.replay_recovery_parked();
     let reply: serde_json::Value =
         serde_json::from_str(&rx.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
-    assert_eq!(reply["error"]["code"], "operator_only");
+    assert_eq!(reply["error"]["code"], "not_authorized");
     assert_eq!(app.current_api_peer_uid, Some(Some(7)));
 }
 
@@ -261,9 +272,9 @@ sys.stdin.read()
     drop(child);
     output.join().unwrap();
     let replies: serde_json::Value = serde_json::from_str(&result.unwrap().unwrap()).unwrap();
-    assert_eq!(replies[0]["error"]["code"], "operator_only", "{replies}");
-    assert_eq!(replies[1]["error"]["code"], "msg_not_allowed", "{replies}");
-    assert!(replies[2].get("result").is_some(), "{replies}");
+    assert_eq!(replies[0]["error"]["code"], "not_authorized", "{replies}");
+    assert_eq!(replies[1]["error"]["code"], "not_authorized", "{replies}");
+    assert_eq!(replies[2]["error"]["code"], "not_authorized", "{replies}");
     assert_eq!(app.current_api_peer_uid, None);
 }
 
@@ -293,13 +304,16 @@ async fn unknown_uid_cannot_use_even_proven_pane_evidence_as_authority() {
         assert!(!app.caller_is_local_operator());
         assert_eq!(
             response(&mut app, send())["error"]["code"],
-            "msg_not_allowed"
+            "not_authorized"
         );
         assert_eq!(
             response(&mut app, owner())["error"]["code"],
-            "operator_only"
+            "not_authorized"
         );
-        assert!(response(&mut app, read()).get("result").is_some());
+        assert_eq!(
+            response(&mut app, read())["error"]["code"],
+            "not_authorized"
+        );
     }
 }
 #[tokio::test]
@@ -376,6 +390,10 @@ fn operator_dispatch_refuses_unknown_socket_birth_with_empty_leases() {
     assert!(app.session_leases.is_empty());
     let response = dispatched_send(&mut app, "agent_worker_2077", Some(7), None);
     assert_eq!(response["error"]["code"], "not_authorized", "{response}");
+    for target in ["missing.example", "shared"] {
+        let reply = dispatched_send(&mut app, target, Some(7), None);
+        assert_eq!(reply["error"], response["error"], "{reply}");
+    }
 }
 #[test]
 fn operator_dispatch_requires_current_matching_socket_birth() {
@@ -424,4 +442,118 @@ fn operator_dispatch_from_a_shell_pane_is_not_an_operator_surface() {
     let birth = crate::platform::process_start_time(std::process::id());
     let response = dispatched_send(&mut app, "agent_worker_2077", Some(7), birth);
     assert_eq!(response["error"]["code"], "not_authorized");
+}
+
+fn authority_dispatch(app: &mut App, method: Method, uid: Option<u32>) -> serde_json::Value {
+    authority_dispatch_pid(app, method, uid, std::process::id())
+}
+fn authority_dispatch_pid(
+    app: &mut App,
+    method: Method,
+    uid: Option<u32>,
+    pid: u32,
+) -> serde_json::Value {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.handle_api_request_message(crate::api::ApiRequestMessage {
+        request: Request {
+            id: "authority-order".into(),
+            method,
+        },
+        respond_to: tx,
+        peer_pid: Some(pid),
+        peer_birth: crate::platform::process_start_time(pid),
+        peer_uid: uid,
+    });
+    serde_json::from_str(&rx.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap()
+}
+fn authority_send(target: &str) -> Method {
+    Method::AgentSend(
+        serde_json::from_value(serde_json::json!({
+            "target": target, "text": "fixture", "submit": true
+        }))
+        .unwrap(),
+    )
+}
+#[test]
+fn unattested_directory_dispatch_refuses_before_target_lookup() {
+    for uid in [Some(99), None, Some(42)] {
+        let mut app = fixture(uid);
+        structured_recipient(&mut app);
+        let terminal = collision_shell(&mut app);
+        let expected = authority_dispatch(&mut app, authority_send("agent_worker_2077"), uid);
+        assert_eq!(expected["error"]["code"], "not_authorized");
+        for method in [
+            Method::AgentList(EmptyParams {}),
+            Method::WorkspaceList(EmptyParams {}),
+            Method::AuthorizeRead,
+            Method::AgentGet(AgentTarget {
+                target: terminal.clone(),
+            }),
+            Method::AgentGet(AgentTarget {
+                target: "missing.example".into(),
+            }),
+            Method::PaneGet(PaneTarget {
+                pane_id: terminal.clone(),
+            }),
+            Method::HandoffList(HandoffListParams {
+                target: Some("shared".into()),
+                limit: None,
+            }),
+            authority_send("shared"),
+            authority_send("missing.example"),
+        ] {
+            let reply = authority_dispatch(&mut app, method, uid);
+            assert_eq!(reply["error"], expected["error"], "uid={uid:?}: {reply}");
+        }
+    }
+    // Same-UID directory reads remain cooperative even inside a shell pane.
+    let mut app = fixture(Some(7));
+    let terminal = collision_shell(&mut app);
+    assert!(!app.caller_is_local_operator());
+    for method in [
+        Method::AgentList(EmptyParams {}),
+        Method::AgentGet(AgentTarget { target: terminal }),
+    ] {
+        assert!(authority_dispatch(&mut app, method, Some(7))
+            .get("result")
+            .is_some());
+    }
+}
+#[tokio::test]
+async fn send_authority_precedes_resolution_and_preserves_authorised_errors() {
+    let mut app = fixture(Some(7));
+    structured_recipient(&mut app);
+    let terminal = collision_shell(&mut app);
+    let expected = authority_dispatch(&mut app, authority_send("agent_worker_2077"), Some(7));
+    assert_eq!(expected["error"]["code"], "not_authorized");
+    for target in ["missing.example", "shared", terminal.as_str()] {
+        let reply = authority_dispatch(&mut app, authority_send(target), Some(7));
+        assert_eq!(reply["error"], expected["error"], "{target}: {reply}");
+    }
+    for agent in [false, true] {
+        let mut app = fixture(Some(7));
+        structured_recipient(&mut app);
+        collision_shell(&mut app);
+        if agent {
+            let terminal = app.state.terminals.values_mut().next().unwrap();
+            terminal.launch_argv = Some(vec!["claude".into()]);
+            let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+            crate::test_support::attest_pane_caller(&mut app, pane);
+            app.current_api_peer_birth = Some(
+                app.current_api_peer_pid
+                    .and_then(crate::platform::process_start_time),
+            );
+        } else {
+            app.test_pane_child_pids.clear();
+        }
+        assert_eq!(app.caller_is_local_operator(), !agent);
+        let pid = app.current_api_peer_pid.unwrap();
+        for (target, code) in [
+            ("missing.example", "agent_not_found"),
+            ("shared", "agent_target_ambiguous"),
+        ] {
+            let reply = authority_dispatch_pid(&mut app, authority_send(target), Some(7), pid);
+            assert_eq!(reply["error"]["code"], code, "agent={agent}: {reply}");
+        }
+    }
 }

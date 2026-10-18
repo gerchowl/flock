@@ -361,7 +361,7 @@ async fn queued_socket_requests_with_reused_birth_never_become_operator() {
         });
         let response: serde_json::Value =
             serde_json::from_str(&response.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
-        assert_eq!(response["error"]["code"], "operator_only", "{response}");
+        assert_eq!(response["error"]["code"], "not_authorized", "{response}");
     }
     assert!(app.current_api_peer_birth.is_none());
 }

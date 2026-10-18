@@ -133,8 +133,9 @@ impl UidPolicy {
 }
 
 impl UidPolicy {
-    /// ADR-0036 §1a: anonymous/unknown UIDs may read, but cannot bypass the
-    /// boundary through raw terminal sends or other state-changing methods.
+    /// ADR-0036 §1a: unattested callers have no target or agent-directory access.
+    /// Only the untargeted health/capability ping remains available. Retry safety
+    /// grants no authority; future methods fail closed until admission is decided.
     pub fn refusal(
         &self,
         uid: Option<u32>,
@@ -148,45 +149,24 @@ impl UidPolicy {
             Principal::Agent if attributed => return None,
             _ => (),
         }
-        // is_retry_safe promises reads/previews only. Inbox consumption and
-        // cursor/wait lifecycle are reads too, but intentionally not retried.
-        if method.is_retry_safe()
-            || matches!(
-                method,
-                ChannelHello(_)
-                    | WaitPark(_)
-                    | MsgRead(_)
-                    | MsgWaitReply(_)
-                    | EventsSubscribe(_)
-                    | EventsWait(_)
-                    | EventsRead(_)
-                    | WaitHold(_, _)
-                    | WaitRelease(_)
-                    | PaneWaitForOutput(_)
-                    | PaneStashShow(_)
-            )
-        {
+        if matches!(method, Ping(_)) {
             return None;
         }
+
         Some(
             if matches!(
                 method,
-                MsgSend(_)
-                    | MsgReply(_)
-                    | MsgWake(_)
-                    | AgentSend(_)
-                    | PaneSendText(_)
-                    | PaneWriteText(_)
-                    | PaneWriteKeys(_)
-                    | PaneWriteInput(_)
-                    | PaneSendInput(_)
-                    | PaneSendKeys(_)
-                    | PaneSubmit(_)
-                    | PaneStashRestore(_)
+                ServerStop(_)
+                    | ServerReloadConfig(_)
+                    | ServerLiveHandoff(_)
+                    | ClientTokenAdd(_)
+                    | ClientTokenRemove(_)
+                    | ClientTokenList(_)
+                    | ClientOpen(_)
             ) {
-                ErrorCode::MsgNotAllowed
-            } else {
                 ErrorCode::OperatorOnly
+            } else {
+                ErrorCode::NotAuthorized
             },
         )
     }
@@ -343,7 +323,11 @@ mod tests {
         } else {
             assert!(stop.get("result").is_some(), "{stop}");
         }
-        assert!(read.get("result").is_some(), "{read}");
+        if recognition {
+            assert_eq!(read["error"]["code"], "not_authorized", "{read}");
+        } else {
+            assert!(read.get("result").is_some(), "{read}");
+        }
         assert_eq!(quit, !recognition);
         assert!(
             lookup_entered.try_recv().is_err(),
@@ -412,7 +396,14 @@ mod tests {
         let read = Method::WorkspaceList(EmptyParams {});
         let stop = Method::ServerStop(EmptyParams {});
         for uid in [Some(42), Some(99), None] {
-            assert_eq!(policy.refusal(uid, false, &read), None);
+            assert_eq!(
+                policy.refusal(uid, false, &read),
+                Some(ErrorCode::NotAuthorized)
+            );
+            assert_eq!(
+                policy.refusal(uid, false, &Method::Ping(PingParams::default())),
+                None
+            );
             assert_eq!(
                 policy.refusal(uid, false, &stop),
                 Some(ErrorCode::OperatorOnly)
@@ -438,7 +429,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(
                     policy.refusal(uid, false, &request.method),
-                    Some(ErrorCode::MsgNotAllowed),
+                    Some(ErrorCode::NotAuthorized),
                     "{method}"
                 );
             }

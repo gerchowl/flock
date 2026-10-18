@@ -1426,7 +1426,14 @@ impl App {
             };
             let attributed = self.runtime_config.uid_policy.classify(uid)
                 == crate::structured::identity::Principal::Agent
-                && self.lease_caller() != crate::structured::lease::Caller::Uncertain;
+                && matches!(
+                    self.spawn_caller(),
+                    spawn::SpawnCaller::Agent { .. }
+                        | spawn::SpawnCaller::Structured {
+                            agent_id: Some(_),
+                            ..
+                        }
+                );
             self.runtime_config
                 .uid_policy
                 .refusal(uid, attributed, &request.method)
@@ -1605,6 +1612,10 @@ impl App {
                 return self.handle_wait_hold(request.id, predicate, hold_ms)
             }
             Method::WaitRelease(wait_id) => return self.handle_wait_release(request.id, &wait_id),
+            Method::AuthorizeRead => SuccessResponse {
+                id: request.id,
+                result: ResponseResult::Ok {},
+            },
             Method::OwnerBind(params) => return self.handle_owner_bind(request.id, params),
             Method::OwnerUnbind(params) => return self.handle_owner_unbind(request.id, params),
             Method::OwnerList(_) => return self.handle_owner_list(request.id),
