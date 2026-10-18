@@ -12,6 +12,37 @@ use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 
+fn with_json_output<T>(run: impl FnOnce() -> T) -> T {
+    struct ResetOnDrop;
+    impl Drop for ResetOnDrop {
+        fn drop(&mut self) {
+            crate::cli::output::set(crate::cli::output::Format::Default);
+        }
+    }
+    crate::cli::output::set(crate::cli::output::Format::Json);
+    let _reset = ResetOnDrop;
+    run()
+}
+
+#[test]
+fn retained_block_json_output_resets_during_unwind() {
+    let failed = std::panic::catch_unwind(|| {
+        with_json_output(|| {
+            let response = json!({"error": {"code": "write_failed", "message": "fixture failure"}});
+            crate::cli::output::error(
+                &response,
+                crate::api::error_code::ErrorCode::WriteFailed.exit(),
+            );
+            assert!(crate::cli::output::json());
+            assert!(crate::cli::output::envelope_pending());
+            panic!("fixture panic before normal output reset");
+        })
+    });
+    assert!(failed.is_err());
+    assert!(!crate::cli::output::json());
+    assert!(!crate::cli::output::envelope_pending());
+}
+
 // ---------- fixtures ---------------------------------------------------------
 
 fn start_flags_worktree(branch: &str) -> StartFlags {
@@ -879,17 +910,59 @@ fn retained_block_directory_sync_failure_is_typed_and_keeps_a_complete_entry() {
         .iter()
         .find(|dialog| dialog.keep_on_start)
         .unwrap();
-    crate::cli::output::set(crate::cli::output::Format::Json);
-    let code = emit_startup_block(&entry, dialog, true, saved);
-    assert_eq!(code, crate::api::error_code::ErrorCode::WriteFailed.exit());
-    assert!(
-        crate::cli::output::envelope_pending(),
-        "durability failure has a typed envelope"
-    );
-    crate::cli::output::set(crate::cli::output::Format::Default);
+    with_json_output(|| {
+        let code = emit_startup_block(&entry, dialog, true, saved);
+        assert_eq!(code, crate::api::error_code::ErrorCode::WriteFailed.exit());
+        assert!(
+            crate::cli::output::envelope_pending(),
+            "durability failure has a typed envelope"
+        );
+    });
     assert_eq!(
         serde_json::from_slice::<Entry>(&std::fs::read(&path).unwrap()).unwrap(),
         entry
     );
     assert!(!dir.path().join(".retained.json.tmp").exists());
+}
+
+#[test]
+fn retained_block_write_failure_keeps_prior_regular_file_untouched() {
+    let dir = crate::test_support::TempDir::socket();
+    let path = dir.path().join("retained.json");
+    let mut prior = entry_for("retained");
+    prior.round = 7;
+    let prior_bytes = serde_json::to_vec_pretty(&prior).unwrap();
+    std::fs::write(&path, &prior_bytes).unwrap();
+    assert!(path.is_file());
+    // A directory at the temporary path refuses the write deterministically,
+    // including when the test process can bypass filesystem permissions.
+    let temp = dir.path().join(".retained.json.tmp");
+    std::fs::create_dir(&temp).unwrap();
+    let mut entry = prior.clone();
+    entry.round = 0;
+    let saved = save_startup_block_at(&entry, &path, |_| {
+        panic!("failed temporary write must not reach directory sync")
+    });
+    assert!(saved.is_err());
+    let dialog = validate_harness(Some("claude"))
+        .unwrap()
+        .startup_dialogs
+        .iter()
+        .find(|dialog| dialog.keep_on_start)
+        .unwrap();
+    with_json_output(|| {
+        assert_eq!(
+            emit_startup_block(&entry, dialog, true, saved),
+            crate::api::error_code::ErrorCode::WriteFailed.exit()
+        );
+        assert!(crate::cli::output::envelope_pending());
+    });
+    assert!(path.is_file());
+    assert_eq!(std::fs::read(&path).unwrap(), prior_bytes);
+    assert_eq!(
+        serde_json::from_slice::<Entry>(&std::fs::read(&path).unwrap()).unwrap(),
+        prior
+    );
+    assert!(temp.is_dir());
+    assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
 }

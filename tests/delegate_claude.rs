@@ -1384,6 +1384,65 @@ fn permission_trust_registry_failure_is_typed_and_retains_pane_without_partial_e
     }
 }
 
+// typed.log has no append notification. Keep the sibling polling cadence
+// and the existing fail ceiling; screen waits use pane.output_matched.
+fn poll_retained_fixture(deadline: Instant) {
+    thread::sleep(
+        Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+    );
+}
+
+fn retained_output_watch(
+    server: &Server,
+    pane: &str,
+    source: &str,
+    pattern: serde_json::Value,
+) -> (support::composer::Composer, UnixStream) {
+    let mut watch = support::composer::Composer::watch_within(&server.socket, WITHIN).unwrap();
+    let mut events = UnixStream::connect(&server.socket).unwrap();
+    writeln!(
+        events,
+        "{}",
+        serde_json::json!({
+            "id":"retained-output", "method":"events.subscribe",
+            "params":{"subscriptions":[{"type":"pane.output_matched", "pane_id":pane,
+                "source":source, "match":pattern}]}
+        })
+    )
+    .unwrap();
+    let ack: serde_json::Value = serde_json::from_str(
+        &watch
+            .event_line(&mut events, pane, "output subscription")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ack["id"], "retained-output");
+    assert_eq!(ack["result"]["type"], "subscription_started", "{ack}");
+    (watch, events)
+}
+
+fn retained_output(
+    watch: &mut support::composer::Composer,
+    events: &mut UnixStream,
+    pane: &str,
+    ready: impl Fn(&str) -> bool,
+) -> String {
+    loop {
+        let event: serde_json::Value = serde_json::from_str(
+            &watch
+                .event_line(events, pane, "retained fixture output")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(event["event"], "pane.output_matched", "{event}");
+        assert_eq!(event["data"]["pane_id"], pane, "{event}");
+        let text = event["data"]["read"]["text"].as_str().unwrap();
+        if ready(text) {
+            return text.to_owned();
+        }
+    }
+}
+
 fn assert_permission_trust_start(screen: &str, case: RetainedBlockCase) {
     let server = start_server();
     operator_workspace(&server);
@@ -1425,26 +1484,16 @@ fn assert_permission_trust_start(screen: &str, case: RetainedBlockCase) {
     } else {
         None
     };
+    let (mut watch, mut events) = retained_output_watch(
+        &server,
+        &pane,
+        "recent",
+        serde_json::json!({"type":"substring", "value":"pre-approves"}),
+    );
     fs::write(server.base.join("screen"), screen).unwrap();
-    let deadline = Instant::now() + WITHIN;
-    let captured = loop {
-        let out = cli(
-            &server,
-            &[
-                "pane", "read", &pane, "--source", "recent", "--format", "text",
-            ],
-        );
-        let screen = String::from_utf8_lossy(&out.stdout).into_owned();
-        if screen.contains("pre-approves") {
-            break screen;
-        }
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "delegate exited before painting: {screen}"
-        );
-        assert!(Instant::now() < deadline, "fixture did not paint: {screen}");
-        thread::yield_now();
-    };
+    let captured = retained_output(&mut watch, &mut events, &pane, |text| {
+        text.contains("pre-approves")
+    });
     let status = exited_within(&mut child, WITHIN);
     let out = finish(child);
     if let Some(path) = refused_entry {
@@ -1510,38 +1559,22 @@ fn assert_permission_trust_start(screen: &str, case: RetainedBlockCase) {
         let answered = cli(&server, &["pane", "send-keys", &pane, "Down", "Enter"]);
         assert!(answered.status.success(), "{}", stderr(&answered));
         assert_eq!(wait_typed(&server, 1), vec!["\u{1b}[B".to_string()]);
+        let (mut watch, mut events) = retained_output_watch(
+            &server,
+            &pane,
+            "detection",
+            serde_json::json!({"type":"regex", "value":r"(?m)^[ \t]*❯[ \t]*$"}),
+        );
         report_session(&server, &pane);
         report(&server, &pane, "idle");
         // SessionStart may publish idle before the renderer paints its prompt.
         // Gate on the live screen too, so send cannot race that producer.
-        let deadline = Instant::now() + WITHIN;
-        loop {
-            let shown = request(
-                &server,
-                &serde_json::json!({
-                    "id": "operator-ready", "method": "pane.read",
-                    "params": {"pane_id": pane, "source": "detection", "format": "text"},
-                })
-                .to_string(),
-            );
-            let text = shown["result"]["read"]["text"].as_str().unwrap_or("");
-            if text.contains(&"─".repeat(48))
+        retained_output(&mut watch, &mut events, &pane, |text| {
+            text.contains(&"─".repeat(48))
                 && text.lines().any(|line| line.trim() == "❯")
                 && !text.contains("pre-approves")
                 && !text.contains("Crunching")
-            {
-                break;
-            }
-            assert!(
-                agent_get(&server, "permissions").is_some(),
-                "fixture exited: {shown}"
-            );
-            assert!(
-                Instant::now() < deadline,
-                "operator answer never reached the prompt: {shown}"
-            );
-            thread::yield_now();
-        }
+        });
         // The existing operator-input guard still applies after a manual key.
         // Observe the fixture's normal quiet condition before the one send.
         let settled = cli(
@@ -1595,7 +1628,7 @@ fn assert_permission_trust_start(screen: &str, case: RetainedBlockCase) {
                 Instant::now() < deadline,
                 "send never reached the live fixture: {lines:?}"
             );
-            thread::yield_now();
+            poll_retained_fixture(deadline);
         };
         assert_eq!(lines, vec!["\u{1b}[B".to_string(), expected_line(&next)]);
         assert!(
