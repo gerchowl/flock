@@ -5015,6 +5015,20 @@ pub(crate) fn client_token_entry_unsafe(entry: &str) {
     );
 }
 
+/// A content anchor no longer resolves, so copying refuses rather than retargets.
+pub(crate) fn selection_content_unavailable(pane_closed: bool) {
+    tracing::debug!(
+        event = "selection.copy_refused",
+        subsystem = "selection",
+        reason = if pane_closed {
+            "pane_closed"
+        } else {
+            "content_unavailable"
+        },
+        "selected content is no longer available"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
