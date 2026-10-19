@@ -315,6 +315,8 @@ pub struct App {
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
+    /// Last dispatch gate; summaries read it without probing the filesystem.
+    pub(crate) git_refresh_idle: Option<crate::api::schema::PollerReason>,
     /// An issue-guard fetch is running off-loop (#302).
     pub(crate) issue_guard_fetch_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
@@ -1025,6 +1027,7 @@ impl App {
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             git_refresh_in_flight: false,
+            git_refresh_idle: None,
             issue_guard_fetch_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_status_cache: HashMap::new(),

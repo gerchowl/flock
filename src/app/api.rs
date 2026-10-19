@@ -3312,18 +3312,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_never_succeeded_git_refresh_reads_broken_not_ok() {
-        // The empty-poller-must-not-render-healthy rule (#300). A brand-new
-        // server hasn't refreshed yet — the answer to "when did it last
-        // succeed?" is unknown, and the status is Broken.
+    async fn git_refresh_without_a_viewer_is_idle_even_after_eight_hours() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+        app.state.app_client_attached = false;
+        app.git_refresh_health
+            .mark_success(Instant::now() - Duration::from_secs(29_656));
+        let row = &peers_summary_pollers(&mut app)["git_refresh"];
+        assert_eq!(row["status"], "idle");
+        assert_eq!(row["reason"], "no_viewer");
+        assert_eq!(row["consecutive_failures"], 0);
+        assert_eq!(row["in_flight"], false);
+        assert_eq!(row["skipped_rounds"], 0);
+    }
+
+    #[tokio::test]
+    async fn git_refresh_without_workspaces_has_its_own_idle_reason() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+        let row = &peers_summary_pollers(&mut app)["git_refresh"];
+        assert_eq!(row["status"], "idle");
+        assert_eq!(row["reason"], "no_workspaces");
+    }
+
+    #[tokio::test]
+    async fn git_refresh_without_an_eligible_cwd_reports_its_gate() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+        let mut workspace = crate::workspace::Workspace::test_new("no-git-cwd");
+        workspace.identity_cwd.clear();
+        workspace.tabs.clear();
+        app.state.workspaces.push(workspace);
+        app.start_git_status_refresh_if_due(Instant::now());
+        let row = &peers_summary_pollers(&mut app)["git_refresh"];
+        assert_eq!(row["status"], "idle");
+        assert_eq!(row["reason"], "no_eligible_workspaces");
+        assert_eq!(row["in_flight"], false);
+    }
+
+    #[tokio::test]
+    async fn a_never_succeeded_gated_git_refresh_reads_idle() {
+        // #1722: no workspace is an idle gate, not evidence of a failed round.
+        // Preserve unknown freshness instead of inventing a successful refresh.
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let config = crate::config::Config::default();
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
         let pollers = peers_summary_pollers(&mut app);
         assert_eq!(
-            pollers["git_refresh"]["status"], "broken",
-            "a poller that has never succeeded must not render as healthy: {pollers}"
+            pollers["git_refresh"]["status"], "idle",
+            "an empty poller must identify its idle gate: {pollers}"
         );
         assert!(
             pollers["git_refresh"]["last_success_age_secs"].is_null(),
@@ -3363,6 +3401,9 @@ mod tests {
         let config = crate::config::Config::default();
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("git-health"));
         let now = std::time::Instant::now();
         app.git_refresh_health
             .mark_success(now - std::time::Duration::from_secs(5));
@@ -3380,6 +3421,35 @@ mod tests {
             pollers["git_refresh"]["last_error"], "timeout",
             "the classified error kind is on the wire, never a free-text message: {pollers}"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_git_refresh_without_failure_is_pending_not_broken() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("git-health"));
+        app.git_refresh_health
+            .mark_success(Instant::now() - Duration::from_secs(29_656));
+        let row = &peers_summary_pollers(&mut app)["git_refresh"];
+        assert_eq!(row["status"], "degraded");
+        assert_eq!(row["reason"], "awaiting_refresh");
+        assert!(row["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn stuck_git_refresh_is_broken_with_a_typed_error_even_without_viewers() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+        app.state.app_client_attached = false;
+        app.git_refresh_health.mark_success(Instant::now());
+        app.git_refresh_health
+            .mark_started(Instant::now() - Duration::from_secs(61));
+        let row = &peers_summary_pollers(&mut app)["git_refresh"];
+        assert_eq!(row["status"], "broken");
+        assert_eq!(row["last_error"], "round_stalled");
+        assert!(row["reason"].is_null());
     }
 
     #[tokio::test]
