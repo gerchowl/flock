@@ -861,3 +861,10 @@ fn unknown_producer_tag_preserves_its_uninterpreted_payload() {
 }
 
 mod admission;
+
+// Replace only this test-owned journal handle; its real backing file stays intact.
+pub(crate) fn fail_writes(journal: &mut Journal) -> UnixStream {
+    let (file, peer) = socket_file();
+    journal.file = file;
+    peer
+}
