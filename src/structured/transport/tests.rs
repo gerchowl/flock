@@ -2471,6 +2471,38 @@ fn admission_replay_is_skipped_and_stdout_cannot_forge_acceptance() {
 }
 
 #[test]
+fn corrupt_blob_is_repaired_while_the_session_keeps_streaming() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut stdout, _input) = start(&root);
+    let block = serde_json::json!({"type":"thinking","thinking":"x".repeat(3000)});
+    let bytes = serde_json::to_vec(&block).unwrap();
+    let store = super::super::blobs::BlobStore::open(root.path()).unwrap();
+    let reference = store.put(bytes.as_slice(), bytes.len() as u64).unwrap();
+    fs::write(root.path().join("blobs").join(&reference.blob), b"damaged").unwrap();
+    let raw = serde_json::json!({"type":"assistant","message":{"content":[block]}}).to_string();
+    writeln!(stdout, "{raw}").unwrap();
+    writeln!(stdout, "{}", user("after repair")).unwrap();
+    // EOF makes reader success or failure observable without waiting for absent output.
+    drop(stdout);
+    reader_done(&transport).expect("a repaired blob must not kill the stream reader");
+    let first = receive(&transport);
+    assert_eq!(first.record.raw, raw);
+    assert!(first.persisted);
+    assert_eq!(first.record.seq, 1);
+    let second = receive(&transport);
+    assert_eq!(
+        serde_json::from_str::<Value>(&second.record.raw).unwrap(),
+        user("after repair")
+    );
+    assert_eq!(second.record.seq, 2);
+    let stored = records(&root);
+    assert_eq!(stored.len(), 2);
+    let projected: Value = serde_json::from_str(&stored[0].raw).unwrap();
+    assert_eq!(projected["message"]["content"][0]["blob"], reference.blob);
+    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+}
+
+#[test]
 fn disconnected_acceptance_observer_requests_stop_without_admitting_bytes() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let (transport, _stdout, _input) = start(&root);
