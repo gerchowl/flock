@@ -1739,6 +1739,17 @@ pub(crate) fn client_conn_hello_read_failed(client_id: u64, err: &str) {
     );
 }
 
+/// A terminal observer exhausted its no-progress write deadline.
+pub(crate) fn client_conn_write_stalled(client_id: u64) {
+    tracing::warn!(
+        event = "client_conn.write_stalled",
+        subsystem = "client_conn",
+        outcome = "disconnected",
+        client_id,
+        "observer disconnected after exhausting its socket write progress deadline"
+    );
+}
+
 pub(crate) fn client_conn_write_failed(err: &str) {
     tracing::debug!(
         event = "client_conn.write",
@@ -5456,6 +5467,17 @@ mod tests {
         assert!(hello.contains("stage=\"read_hello\""), "{hello}");
         assert!(hello.contains("client_id=11"), "{hello}");
         assert!(hello.contains("DEBUG"), "{hello}");
+    }
+
+    #[test]
+    fn stalled_observer_log_is_typed_and_connection_scoped() {
+        let log = capture_logs(|| client_conn_write_stalled(42));
+        assert!(log.contains("event=\"client_conn.write_stalled\""), "{log}");
+        assert!(log.contains("outcome=\"disconnected\""), "{log}");
+        assert!(log.contains("client_id=42"), "{log}");
+        assert!(log.contains("WARN"), "{log}");
+        assert!(!log.contains("host="), "{log}");
+        assert!(!log.contains("path="), "{log}");
     }
 
     #[test]
