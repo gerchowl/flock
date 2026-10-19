@@ -2307,6 +2307,7 @@ fn handoff_import_stalled_peer_exits_within_deadline() {
     command
         .args(["server", "--handoff-import"])
         .arg(&socket)
+        // Compatibility with an exporter that was already running before #301.
         .arg("stalled-peer-token")
         .envs(support::environment::isolated_env(
             &base.join("config"),
@@ -2366,7 +2367,7 @@ fn handoff_ready_importer_survives_commit_after_startup_deadline() {
     command
         .args(["server", "--handoff-import"])
         .arg(&socket)
-        .arg("late-commit-token")
+        .env("FLOCK_HANDOFF_TOKEN", "late-commit-token")
         .envs(support::environment::isolated_env(
             &base.join("config"),
             &base.join("runtime"),
@@ -2566,14 +2567,17 @@ fn assert_failed_fd_transfer_keeps_old_server(close_reader: bool) {
         fs::write(
             &importer,
             r#"import json
+import os
 from pathlib import Path
 import socket
 import sys
 
+assert len(sys.argv) == 4, "handoff credential must use the environment"
+token = os.environ.pop("FLOCK_HANDOFF_TOKEN")
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
     peer.settimeout(30)
     peer.connect(sys.argv[3])
-    peer.sendall((sys.argv[4] + "\n").encode())
+    peer.sendall((token + "\n").encode())
     manifest = json.loads(peer.makefile("rb").readline())
     assert len(manifest["panes"]) == 150, manifest
     peer.shutdown(socket.SHUT_RD)
