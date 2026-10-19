@@ -59,6 +59,14 @@ Ctrl-click opens pane links when your terminal sends the modified click to Flock
 
 Press `prefix+[` to enter copy mode for the focused pane. Use `h/j/k/l`, `w/b/e`, and `{`/`}` to move, `v` or Space to start a selection, `y` or Enter to copy it, and `q` or Esc to leave without copying.
 
+Pane selections follow the selected content while output scrolls and when the
+pane resizes, including soft-wrap reflow. Copy reads the retained content when
+you release or copy; it is not a frozen text snapshot. If the selected lines
+were evicted from scrollback or reset, Flock shows “Cannot copy selection” and
+leaves the clipboard unchanged. Copying also refuses while a different terminal
+screen is active. Selections are not preserved across restart or live handoff.
+
+
 ## Manage named sessions
 
 Named sessions are separate Flock server namespaces. Use them when you want fully separate runtime state.
