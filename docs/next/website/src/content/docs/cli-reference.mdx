@@ -79,6 +79,17 @@ flk status client
 
 Server status includes the API socket listener’s accept-error count, latest error, and `stopped` flag. Transient accept failures retry with exponential backoff from 50 ms to 2 s, reset on a successful accept. Invalid listener descriptors stop immediately; unclassified errors stop after five consecutive failures. Failure runs log on onset and recovery rather than on every attempt. Diagnostics remain until that listener is replaced. With `--json`, these are under `server.api_listener` (or `api_listener` for `status server --json`). Older servers report no listener diagnostics. A stopped listener cannot accept new status requests; its terminal error is also recorded in the server log.
 
+`flk peers summary` includes `pollers.git_refresh`. It reports `idle` with
+`reason: "no_viewer"`, `"no_workspaces"` or `"no_eligible_workspaces"` when its
+viewer/workspace gate is closed. Idle does not reset past errors or invent a new
+success timestamp. Old results alone are `degraded` with `"awaiting_refresh"`;
+`broken` requires a real failure or a round beyond its existing 60-second bound,
+and carries a typed `last_error` (including `"round_stalled"`). An in-flight
+stalled round remains visible even after the last viewer leaves. Status remains
+an open string; the optional reason is additive on mesh v5, and unknown future
+reasons decode as `unknown`. Worker/command failure accounting is completed by
+the second [#1722](https://github.com/gerchowl/flock/issues/1722) slice.
+
 ## Peer enrollment
 
 `flk peers` and `flk status` show each peer's name, pin direction, short node

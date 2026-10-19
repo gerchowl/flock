@@ -573,6 +573,7 @@ impl HeadlessServer {
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
     ) -> io::Result<Self> {
+        app.state.app_client_attached = false;
         app.initialize_mesh_mail(api_server.as_ref())
             .map_err(io::Error::other)?;
         let client_path = client_socket_path();
@@ -1701,6 +1702,7 @@ impl HeadlessServer {
                 }
             }
         }
+        self.app.state.app_client_attached = self.has_app_client();
         if was_foreground {
             self.promote_latest_remaining_client()
         } else {
@@ -2452,6 +2454,7 @@ impl HeadlessServer {
         client.render_state.reset_baseline();
         client.last_activity = stamp;
         let was_foreground = self.foreground_client_id == Some(client_id);
+        self.app.state.app_client_attached = self.has_app_client();
         if was_foreground {
             self.promote_latest_remaining_client();
         }
@@ -2547,6 +2550,7 @@ impl HeadlessServer {
                     // Last attach wins; an empty/absent theme changes nothing.
                     self.app.set_host_terminal_theme(host_theme);
                 }
+                self.app.state.app_client_attached = self.has_app_client();
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
                 }
@@ -3805,6 +3809,7 @@ impl HeadlessServer {
     /// clients render, so a session probe that only ran in the monolithic loop
     /// would never see the fault that only the server can have.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
+        self.app.state.app_client_attached = self.has_app_client();
         self.app.input_writes.service_due(now);
         let structured_changed = self.app.service_structured_workers(now);
         self.app.start_ready_pastes();
@@ -6255,6 +6260,31 @@ next_tab = ""
             reason,
             Some("terminal attach failed: terminal term_missing not found".to_owned())
         );
+    }
+
+    #[test]
+    fn headless_no_viewer_gate_reaches_the_summary_as_idle() {
+        let mut server = test_headless_server();
+        server
+            .app
+            .state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("git-health"));
+        server
+            .app
+            .git_refresh_health
+            .mark_success(Instant::now() - Duration::from_secs(29_656));
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+        assert!(!server.app.git_refresh_in_flight);
+        let response = server.app.handle_api_request(crate::api::schema::Request {
+            id: "idle-health".into(),
+            method: crate::api::schema::Method::PeersSummary(crate::api::schema::EmptyParams {}),
+        });
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let row = &value["result"]["pollers"]["git_refresh"];
+        assert_eq!(row["status"], "idle");
+        assert_eq!(row["reason"], "no_viewer");
+        assert_eq!(row["consecutive_failures"], 0);
     }
 
     fn app_client_marks_git_refresh_due_on_first_attach(render_encoding: RenderEncoding) {
