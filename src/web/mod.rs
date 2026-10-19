@@ -21,6 +21,9 @@
 
 pub(crate) mod client_exchange;
 pub(crate) mod store_io;
+// The listener slice mounts this independently tested protocol core.
+#[allow(dead_code)]
+pub(crate) mod wire;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
