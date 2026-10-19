@@ -4380,6 +4380,56 @@ mod tests {
     }
 
     #[test]
+    fn server_identity1076_protocol_32_client_handles_protocol_31_refusal() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let hello: ClientMessage = protocol::read_message(&mut server, MAX_FRAME_SIZE).unwrap();
+            assert!(matches!(hello, ClientMessage::Hello { version: 32, .. }));
+            protocol::write_message(
+                &mut server,
+                &ServerMessage::Welcome {
+                    version: 31,
+                    encoding: RenderEncoding::SemanticFrame,
+                    error: Some("incompatible protocol".into()),
+                },
+            )
+            .unwrap();
+        });
+        let error = do_handshake(
+            &mut client,
+            80,
+            24,
+            0,
+            0,
+            RenderEncoding::SemanticFrame,
+            false,
+            None,
+            None,
+        )
+        .unwrap_err();
+        worker.join().unwrap();
+        assert!(matches!(
+            &error,
+            ClientError::HandshakeRejected { version: 31, .. }
+        ));
+        let error = AttachAttemptError::Handshake(error);
+        let mut retry = HandoffRetry::default();
+        assert!(
+            !retry.should_retry(&error, Duration::ZERO),
+            "skew cannot start a handoff"
+        );
+        assert!(retry.should_retry(&refusal_handshake_error(), Duration::ZERO));
+        assert!(
+            retry.should_retry(&error, Duration::ZERO),
+            "old-server refusal stays recoverable during handoff"
+        );
+    }
+
+    #[test]
     fn live_handoff_refusals_are_recognized_in_both_phases() {
         assert!(refusal_session_error().is_live_handoff_refusal());
         assert!(refusal_handshake_error().is_live_handoff_refusal());
@@ -4702,6 +4752,7 @@ mod tests {
         let fleet = protocol::FleetSnapshot {
             origin: "hopper".to_string(),
             peers: vec![protocol::FleetPeer {
+                node_id: None,
                 name: "kiln".to_string(),
                 ssh_target: "operator@kiln".to_string(),
                 host: Some("kiln".to_string()),

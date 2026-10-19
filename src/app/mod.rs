@@ -804,6 +804,9 @@ impl App {
             adopt_external_worktrees: config.worktrees.adopt_external,
             branch_pivot_message: config.worktrees.branch_pivot_message.clone(),
             peers: config.peers.clone(),
+            server_nodes: Default::default(),
+            server_paths: Default::default(),
+            server_node: None,
             peer_summaries: config
                 .peers
                 .iter()
