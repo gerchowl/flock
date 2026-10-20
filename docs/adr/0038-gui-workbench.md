@@ -319,7 +319,7 @@ The **progress deadline** runs while a stream waits for `synced` or for a snapsh
 - **Storage: `sessionStorage`, decided here.** An `operate`-scoped token is the operator's identity, so it is kept no longer than the tab that received it. `sessionStorage` survives a reload, which the reconnect, the outbox and a dev reload need, but not closing the tab. Each tab needs its own `flk client open`.
   - Rejected: memory only, because every reload would need a new `flk client open` and the outbox could not resume.
   - Rejected: `localStorage`, because it keeps the identity on disk with no end, shares it across tabs, and survives the browser closing.
-  - What remains is script running in the page, which can read `sessionStorage`. The enforcing Content-Security-Policy on the served page (`script-src 'self'`, no inline or eval; #1875) is the control for that, so the client never needs inline scripts. Bootstrap configuration comes from an external script or from `welcome`.
+  - What remains is script running in the page, which can read `sessionStorage`. The enforcing Content-Security-Policy on the served page (`script-src 'self'`, no inline or eval; #1875) is the control for that, so the client never needs inline scripts. The browser shell needs no bootstrap configuration: with no config global it derives same-origin defaults (`serverUrl` is `location.origin`, the socket is `ws://` or `wss://<host>/v1/ws`), and the server serves no config script. An external config script is only for the Tauri shell.
 - **NeedsToken** clears the stored token, as above. A Tauri shell keeps its token in the platform keystore instead (§6).
 
 **The store.**
