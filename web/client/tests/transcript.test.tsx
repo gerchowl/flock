@@ -103,9 +103,10 @@ describe("Transcript", () => {
     observer?.reset?.();
     expect(currents).toEqual([false, true, false]);
     // Sent while the stream replays again: its cursor (1) is not the stream's.
-    composer.sent("a", "c1");
+    const after = composer.cursor("a");
+    expect(after).toBeNull();
     observer?.entry(said(2, "hello"));
-    expect([...composer.echoed("a", [{ cmdId: "c1", text: "hello" }])]).toEqual([]);
+    expect([...composer.echoed("a", [{ cmdId: "c1", text: "hello", after }])]).toEqual([]);
   });
 
   test("a failed subscription is shown, not swallowed", async () => {
