@@ -75,6 +75,7 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() && UnixStream::connect(path).is_ok() {
+            support::sandboxes::record_socket(path);
             return;
         }
         thread::sleep(Duration::from_millis(25));
@@ -112,6 +113,7 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
 /// schedule — see the `serial-pty` group and the retries in
 /// `.config/nextest.toml`.
 fn test_lock() -> MutexGuard<'static, ()> {
+    support::sandboxes::sweep_once();
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
@@ -157,6 +159,9 @@ fn spawn_server(
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
+    if let Some(pid) = child.process_id() {
+        support::sandboxes::record_spawn(pid, config_home, runtime_dir);
+    }
     drop(pair.slave);
 
     SpawnedFlock {
@@ -310,12 +315,17 @@ fn run_cli(socket_path: &Path, args: &[&str]) -> std::process::Output {
 }
 
 fn process_exists(pid: u32) -> bool {
-    let result = unsafe { libc::kill(pid as i32, 0) };
-    if result == 0 {
-        true
-    } else {
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
+    support::process_lifetime::pid_alive(pid)
+}
+
+fn assert_durable_server_record(base: &Path, pid: u32) {
+    let record: support::sandboxes::ServerRecord = serde_json::from_slice(
+        &fs::read(base.join(format!(".server-{pid}.json"))).expect("durable server identity"),
+    )
+    .unwrap();
+    assert_eq!(record.pid, pid);
+    assert!(record.start_time.is_some());
+    assert!(record.matches(base));
 }
 
 fn read_json_line(stream: UnixStream) -> Value {
@@ -402,6 +412,9 @@ fn auto_detect_daemon_is_reaped_by_the_runtime_dir_sweep() {
          test proves nothing"
     );
 
+    for pid in &daemon_pids {
+        assert_durable_server_record(&base, *pid);
+    }
     cleanup_spawned_flock(flock, base);
 
     // `terminate_pid` escalates SIGTERM to SIGKILL and then waits, but a
@@ -487,10 +500,18 @@ fn auto_detect_server_running_attaches_directly() {
 
     // Start a server explicitly.
     let server = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    assert!(base
+        .join(format!(
+            ".server-{}.json",
+            server.child.process_id().unwrap()
+        ))
+        .is_file());
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
     let server_pid = server.child.process_id().expect("server should have PID");
+
+    assert_durable_server_record(&base, server_pid);
 
     // Verify server is running.
     assert!(process_exists(server_pid), "server should be running");
@@ -806,6 +827,9 @@ fn auto_detect_default_socket_path_from_config_dir() {
     support::environment::assert_pty_isolated(&cmd);
     let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
+    if let Some(pid) = child.process_id() {
+        support::sandboxes::record_spawn(pid, &config_home, &runtime_dir);
+    }
     drop(pair.slave);
     let server = SpawnedFlock {
         _master: pair.master,

@@ -10,8 +10,10 @@ identity check runs before dispatch and again before accepting a result.
 
 The worker has single-slot request, result and coalesced notification channels,
 with only one outstanding unit. Full/disconnected channels fail without a
-blocking send. `tick` is nonblocking. `wait` is optional for an off-render
-controller and uses the remaining dispatch budget, not a new wait deadline.
+blocking send. Both `tick` and `poll_wake` are nonblocking. A wake is a coalesced
+scheduling hint; controllers still call tick at next_due without a wake to check
+health/disconnection. Blocking receive helpers exist only in the fixture module,
+with bounded waits for real producer evidence; there is no production wait API.
 Failed work clears cached evidence and rejects the pending claim or invalidates
 the trusted source. Writer exit also releases the known ownership claim. Stale
 callbacks cannot reject a replacement claim or restore retired/revoked evidence.
@@ -30,8 +32,10 @@ scheduling and the preceding EOF pause. Smaller work budgets increase this
 latency proportionally. There is no constant-time EOF promise and no total-file
 size ceiling. A continuously growing history may remain catching up.
 
-WORK_TIMEOUT is five seconds for each dispatched unit, including notification
-and controller delivery. It is not a five-second pass deadline or a lifecycle
+WORK_TIMEOUT diagnoses a dispatched unit with no queued reply after five
+seconds. Delivery checks the queue first: a delayed controller consumes ready
+work instead of falsely marking it stalled. Capability and local writer checks
+still precede acceptance. This is not a five-second pass deadline or a lifecycle
 silence lease: successful prefix chunks and empty EOF checks count as flk work
 progress. Long histories can take many healthy units. The controller supplies
 monotonic time; progress/EOF timestamps mark delivery, while lifecycle boundary
@@ -56,7 +60,12 @@ Tests use 7/13-byte work units, private local files, a genuinely owned scripted
 shell writer and supplied monotonic clocks. They cover multi-step trust admission,
 EOF versus prefix progress, quiet working/idle after hours, a missing end,
 source mutation, writer exit/start mismatch, dead/disconnected readers, an alive
-silent producer, queue backpressure, bounded notification failure and shutdown.
+silent producer, queue backpressure and bounded shutdown. Late-tick regressions
+wait for actual publication before advancing the supplied controller clock past
+the work deadline, covering both admission progress and bound evidence. A separate
+regression calls the nonblocking wake poll with a live but silent channel. Its
+consumer has a bounded failure ceiling, and the producer is disconnected on failure
+to unblock even an injected blocking implementation before cleanup.
 A silent-producer transport fixture holds real request/result channels open on
 an owned thread until explicitly released; start/stop acknowledgements have a
 five-second failure ceiling. There are no sleeps, retries or product test hooks.

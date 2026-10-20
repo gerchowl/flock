@@ -39,6 +39,9 @@ function mount(view: () => ReturnType<typeof App>): HTMLElement {
   return root;
 }
 
+/** The generated `AgentState` a real fleet row carries (ADR-0028 §3a). */
+const workingState = { turn: "working", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} };
+
 const $ = (root: ParentNode, id: string): Element | null => root.querySelector(`[data-testid="${id}"]`);
 const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAll(`[data-testid="${id}"]`)];
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
@@ -109,7 +112,7 @@ describe("wire mode", () => {
     h.step(step({ step: "open" }));
     h.step(step({ step: "send", frame: WELCOME }));
     const sub = sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string };
-    const row = { id: "atlas", label: "atlas", state: "working", activity: "Reading the ADR", waiting_on_human: [] };
+    const row = { id: "atlas", label: "atlas", state: workingState, activity: "Reading the ADR", waiting_on_human: [] };
     h.step(step({ step: "send", frame: { t: "gap", sub_id: sub.sub_id, from: 1, to: 0, snapshot_to: 1 } }));
     h.step(step({ step: "send", frame: { t: "ev", sub_id: sub.sub_id, stream: "fleet", seq: 1, ts_ms: 0, ev: { type: "fleet.upsert", row } } }));
     expect($$(root, "agent-row").map((agent) => agent.textContent)).toEqual(["atlasReading the ADR"]);
@@ -329,7 +332,7 @@ describe("phone", () => {
     send(WELCOME);
     const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
     send({ t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: 1 });
-    send({ t: "ev", sub_id: fleet, stream: "fleet", seq: 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id: "atlas", label: "atlas", state: "working", waiting_on_human: [] } } });
+    send({ t: "ev", sub_id: fleet, stream: "fleet", seq: 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id: "atlas", label: "atlas", state: workingState, waiting_on_human: [] } } });
     send({ t: "synced", sub_id: fleet, seq: 1 });
     expect($(root, "phone")).not.toBeNull();
     const backButton = (): HTMLButtonElement | undefined => [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"));
@@ -745,7 +748,7 @@ describe("wire mode, one transport per connection", () => {
     const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
     const ids = ["atlas", "kite", "ember"];
     send(h, { t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: ids.length });
-    ids.forEach((id, i) => send(h, { t: "ev", sub_id: fleet, stream: "fleet", seq: i + 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id, label: id, state: "working", waiting_on_human: [] } } }));
+    ids.forEach((id, i) => send(h, { t: "ev", sub_id: fleet, stream: "fleet", seq: i + 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id, label: id, state: workingState, waiting_on_human: [] } } }));
     send(h, { t: "synced", sub_id: fleet, seq: ids.length });
     return { h, root };
   }
