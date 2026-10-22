@@ -3,9 +3,11 @@
  *
  * @module
  */
-import { For, Show, createUniqueId, type JSX } from "solid-js";
+import { For, Show, createEffect, createUniqueId, type JSX } from "solid-js";
 
 import type { AgentRow } from "../fleet";
+import type { Sender } from "./Composer";
+import { PermissionActions, createDecideUi, type DecideUi } from "./decide";
 import { sortInbox, type InboxCard } from "./inbox";
 import { PHASE_LABELS, StatusMark, markFor } from "./marks";
 
@@ -45,7 +47,7 @@ export function AgentRowButton(props: { readonly row: AgentRow; readonly focused
 }
 
 /** The inbox's cards, blocking first. */
-export function InboxCards(props: { readonly cards: readonly InboxCard[]; readonly source: "replay" | "live" }): JSX.Element {
+export function InboxCards(props: { readonly cards: readonly InboxCard[]; readonly source: "replay" | "live"; readonly sender: Sender | null }): JSX.Element {
   const note = (): string | null =>
     props.source === "live"
       ? props.cards.length === 0
@@ -54,6 +56,21 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
       : props.cards.length === 0
         ? "The live inbox arrives with G5 (#1597)."
         : "Sample cards: the live inbox arrives with G5 (#1597).";
+  // A card is rebuilt on every record, so what the person typed lives here, by request.
+  const uis = new Map<string, DecideUi>();
+  const uiFor = (card: InboxCard): DecideUi => {
+    const key = `${card.agent}\u0000${card.id}`;
+    const found = uis.get(key);
+    if (found !== undefined) return found;
+    const fresh = createDecideUi();
+    uis.set(key, fresh);
+    return fresh;
+  };
+  // No state leaks: an entry goes when its request closes or is delisted.
+  createEffect(() => {
+    const live = new Set(props.cards.map((card) => `${card.agent}\u0000${card.id}`));
+    for (const key of [...uis.keys()]) if (!live.has(key)) uis.delete(key);
+  });
   return (
     <>
       <Show when={note()}>{(text) => <p class="inbox__note">{text()}</p>}</Show>
@@ -73,13 +90,22 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
               </p>
             </Show>
             <Show when={card.choices.length > 0}>
-              <div class="card__choices">
-                <For each={card.choices}>{(choice) => <Waits label={choice} reasonId={reason} />}</For>
-                <Waits label="Edit…" reasonId={reason} />
-              </div>
-              <p id={reason} class="waits__reason">
-                Answering waits for {card.waitsFor}.
-              </p>
+              <Show
+                when={card.waitsFor === undefined}
+                fallback={
+                  <>
+                    <div class="card__choices">
+                      <For each={card.choices}>{(choice) => <Waits label={choice} reasonId={reason} />}</For>
+                      <Waits label="Edit…" reasonId={reason} />
+                    </div>
+                    <p id={reason} class="waits__reason">
+                      Answering waits for {card.waitsFor}.
+                    </p>
+                  </>
+                }
+              >
+                <PermissionActions card={card} sender={props.sender} ui={uiFor(card)} />
+              </Show>
             </Show>
           </article>
           );

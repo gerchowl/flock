@@ -3,7 +3,9 @@
  * (#2224). The shape is the generated {@link PermissionRecord}; the server
  * sends it as a known session event. A record that does not match fails
  * visibly instead of being dropped: {@link permissionRecord} names what is
- * wrong, and the inbox shows it.
+ * wrong, and the inbox shows it. The guard does not check the optional
+ * `grant_request_id`, `grant_request_seq` and `ignored_suggestions` fields, and
+ * no card reads them.
  *
  * @module
  */
