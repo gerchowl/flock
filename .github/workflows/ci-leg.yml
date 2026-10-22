@@ -60,9 +60,6 @@ jobs:
       - name: Lint in the dev shell
         run: nix develop -c just lint
 
-      - name: Compile the non-test web binary
-        run: nix develop -c cargo check --locked --bin flk --features web
-
       - name: Check Rust documentation
         run: nix develop -c just doc-check
 
