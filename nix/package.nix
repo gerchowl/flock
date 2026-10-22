@@ -19,11 +19,14 @@
   buildChannel ? null,
   buildId ? null,
   buildCommit ? null,
-  # Build the `web` cargo feature (the `flk web` xterm bridge, gerchowl/flock#131).
-  # Off by default so the standard build stays lean (no axum/rust-embed); the
-  # flake exposes a `flock-web` package with this on. The binary is still
-  # `bin/flk` — the feature only adds the `web` subcommand.
+  # Build the `web` feature: terminal bridge and structured GUI bundle router.
+  # Off by default so the standard build stays lean (no axum/rust-embed).
+  # The flake exposes `flock-web` with this on, still installing `bin/flk`.
+  # The server listener mounts the GUI router separately (#1828).
   withWeb ? false,
+  # Prebuilt Vite dist supplied by packages.<system>.flock-client (#1731).
+  # Direct package callers may omit it and receive the typed HTTP refusal.
+  guiDist ? null,
 }:
 
 let
@@ -102,6 +105,9 @@ rustPlatform.buildRustPackage {
     LIBGHOSTTY_VT_SIMD = "true";
     LIBGHOSTTY_VT_ZIG_SYSTEM_DIR = zigDeps;
     ZIG = lib.getExe zig_0_15;
+  }
+  // lib.optionalAttrs (withWeb && guiDist != null) {
+    FLOCK_GUI_DIST = guiDist;
   }
   // lib.optionalAttrs (buildChannel != null) {
     FLOCK_BUILD_CHANNEL = buildChannel;

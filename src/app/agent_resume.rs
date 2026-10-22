@@ -157,6 +157,9 @@ impl App {
         pane_infos
     }
 
+    /// Make one explicit retry by terminal ID, bypassing automatic `resume_failed`
+    /// suppression (ADR-0028 §1/§3). Failure keeps the plan and returns `false`.
+    /// A successful launch clears the failure flag and pending plan.
     pub(crate) fn start_pending_agent_resume_for_terminal(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
@@ -220,6 +223,11 @@ impl App {
         }
 
         let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
+            // ADR-0028 §1/§3: retain the plan, but suppress automatic retries
+            // after a launch failure, including a command that cannot launch.
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.resume_failed = true;
+            }
             crate::logging::agent_resume_empty_argv(
                 pane_id.raw(),
                 &terminal_id.to_string(),
@@ -680,7 +688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_resume_argv_remains_eligible_without_a_failure_flag() {
+    async fn empty_resume_argv_fails_once_and_stops_automatic_retries() {
         let mut app = test_app();
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("empty-resume")];
         app.state.ensure_test_terminals();
@@ -698,13 +706,105 @@ mod tests {
             argv: Vec::new(),
             dedupe_key: "empty-resume".into(),
         });
+        let now = Instant::now();
+        app.sync_pending_agent_resume_deadline(now);
+        assert!(app.pending_agent_resume_deadline.is_some());
         let logs = crate::logging::capture_logs(|| {
             assert!(!app.start_pending_agent_resumes(true));
         });
         assert!(logs.contains("reason=\"empty_argv\""), "{logs}");
-        assert!(!app.state.terminals[&terminal_id].resume_failed);
-        assert!(app.has_pending_agent_resumes());
+        let logs = crate::logging::capture_logs(|| {
+            assert!(!app.start_pending_agent_resumes(true));
+        });
+        assert!(
+            !logs.contains("empty_argv"),
+            "an invalid deferred plan must not be retried on the next tick: {logs}"
+        );
+        assert!(app.state.terminals[&terminal_id].resume_failed);
+        assert!(
+            app.state.terminals[&terminal_id]
+                .pending_agent_resume_plan
+                .is_some(),
+            "keep the saved plan for explicit recovery"
+        );
+        assert!(!app.has_pending_agent_resumes());
+        app.sync_pending_agent_resume_deadline(now);
+        assert!(app.pending_agent_resume_deadline.is_none());
         assert_eq!(app.terminal_runtimes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn operator_retry_by_terminal_id_rechecks_failed_plan_and_starts_after_repair() {
+        // ADR-0028 §1/§3: failed plans retain their identity for explicit retry.
+        let mut app = test_app();
+        app.state.default_shell = "/bin/sh".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        let workspace = crate::workspace::Workspace::test_new("operator-retry");
+        let pane = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane).cloned().unwrap();
+        app.state.view.terminal_area = Rect::new(0, 0, 80, 24);
+        app.state.view.pane_infos = workspace.tabs[0].layout.panes(app.state.view.terminal_area);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("retry-agent".into());
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("retry-session").unwrap(),
+        });
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "codex".into(),
+            argv: Vec::new(),
+            dedupe_key: "operator-retry".into(),
+        });
+        assert!(!app.start_pending_agent_resumes(true));
+        assert!(app.state.terminals[&terminal_id].resume_failed);
+        let info = app.agent_info_for_target("retry-agent").unwrap();
+        assert_eq!(info.blocked_reason.as_deref(), Some("resume_failed"));
+        assert!(info.resumable);
+
+        let logs = crate::logging::capture_logs(|| {
+            assert!(!app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+        });
+        assert_eq!(logs.matches("reason=\"empty_argv\"").count(), 1, "{logs}");
+        assert!(app.state.terminals[&terminal_id].resume_failed);
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_some());
+        assert_eq!(app.terminal_runtimes.len(), 0);
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .pending_agent_resume_plan
+            .as_mut()
+            .unwrap()
+            .argv = vec!["/bin/sh".into(), "-c".into(), "read -r fixture".into()];
+        assert!(!app.start_pending_agent_resumes(true));
+        assert_eq!(
+            app.terminal_runtimes.len(),
+            0,
+            "repair alone does not enable automatic retry"
+        );
+        assert!(app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+        assert_eq!(app.terminal_runtimes.len(), 1);
+        assert!(!app.state.terminals[&terminal_id].resume_failed);
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none());
+        assert_eq!(
+            app.agent_info_for_target("retry-agent")
+                .unwrap()
+                .blocked_reason,
+            None
+        );
+        app.terminal_runtimes
+            .remove(&terminal_id)
+            .unwrap()
+            .shutdown();
     }
 
     #[tokio::test]
@@ -797,7 +897,10 @@ mod tests {
         let agent_id = terminal.agent_id.clone();
         let session = terminal.persisted_agent_session.clone();
         let snapshot = crate::persist::capture(
-            &app.state.structured_agents,
+            crate::persist::RegistryCapture {
+                registry: &app.state.structured_agents,
+                now_ms: Some(42),
+            },
             &app.state.workspaces,
             &app.state.terminals,
             &app.terminal_runtimes,

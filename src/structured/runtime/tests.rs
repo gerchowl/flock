@@ -80,6 +80,13 @@ impl Fixture {
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("fixture mode");
         path
     }
+    pub(crate) fn mcp(&self) -> SessionMcp {
+        SessionMcp::new(
+            &self.root.path().join("claude"),
+            &self.root.path().join("api.sock"),
+        )
+        .expect("owned fixture endpoint")
+    }
     pub(crate) fn profile(&self, mode: &str, version: &str) -> LaunchProfile {
         self.profile_at(mode, version, SESSION)
     }
@@ -145,6 +152,7 @@ impl Fixture {
         let state = self.root.path().to_owned();
         let location = StreamLocation {
             data_dir: state.clone(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: session.into(),
         };
@@ -154,8 +162,9 @@ impl Fixture {
             .leases
             .reserve("fixture-agent", &location.session, None)
             .expect("lease");
+        let mcp = self.mcp();
         let worker = std::thread::spawn(move || {
-            let result = run(&state, profile, lease, location, |runtime| {
+            let result = run(&state, profile, lease, location, mcp, |runtime| {
                 let _ = ready_tx.send(runtime);
             });
             let _ = result_tx.send(result);
@@ -205,7 +214,7 @@ struct Running {
     persistent: PathBuf,
 }
 impl Running {
-    fn receive(&self) -> Received {
+    fn receive_after_accepted(&self) -> Received {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let received = self
@@ -283,7 +292,7 @@ impl Drop for Running {
 fn natural_exit_with_stalled_consumer_confirms_io_and_cleans_up() {
     let fixture = Fixture::new();
     let mut running = fixture.launch("normal", "2.1.296").expect("launch");
-    running.receive();
+    running.receive_after_accepted();
     let root = fixture.identity("model.pid");
     running.submit();
     // Never consume subsequent notifications: four slots plus a pending record
@@ -310,11 +319,11 @@ fn natural_exit_with_stalled_consumer_confirms_io_and_cleans_up() {
 fn idle_session_submission_never_reports_collector_contention_as_busy() {
     let fixture = Fixture::new();
     let mut running = fixture.launch("idle-turns", "2.1.296").expect("launch");
-    running.receive();
+    running.receive_after_accepted();
     running.submit();
-    running.receive();
-    running.receive();
-    running.receive();
+    running.receive_after_accepted();
+    running.receive_after_accepted();
+    running.receive_after_accepted();
     let input = serde_json::json!({"type":"user","message":{"content":"next"}});
     for turn in 0..1000 {
         running
@@ -322,7 +331,7 @@ fn idle_session_submission_never_reports_collector_contention_as_busy() {
             .try_submit(&input)
             .unwrap_or_else(|error| panic!("idle turn {turn}: {error}"));
         assert!(matches!(
-            running.receive().event,
+            running.receive_after_accepted().event,
             super::super::claude::SessionEvent::Success(_)
         ));
     }
@@ -333,7 +342,7 @@ fn idle_session_submission_never_reports_collector_contention_as_busy() {
 fn assert_uninspectable_init_refused(mode: &str) {
     let fixture = Fixture::new();
     let mut running = fixture.launch(mode, "2.1.296").expect("launch");
-    running.receive();
+    running.receive_after_accepted();
     let root = fixture.identity("model.pid");
     running.submit();
     let exit = running.finish();
@@ -363,22 +372,22 @@ fn non_utf8_init_cannot_bypass_socket_refusal() {
 fn assert_later_loss_keeps_session_running(mode: &str) {
     let fixture = Fixture::new();
     let mut running = fixture.launch(mode, "2.1.296").expect("launch");
-    running.receive();
+    running.receive_after_accepted();
     let root = fixture.identity("model.pid");
     running.submit();
-    running.receive();
+    running.receive_after_accepted();
     assert!(matches!(
-        running.receive().event,
+        running.receive_after_accepted().event,
         super::super::claude::SessionEvent::Init(_)
     ));
-    let loss = running.receive();
+    let loss = running.receive_after_accepted();
     assert_eq!(loss.record.origin, RecordOrigin::Flk);
     assert!(matches!(
         loss.event,
         super::super::claude::SessionEvent::Unknown { .. }
     ));
     // The producer emits this after the loss, then remains alive on stdin.
-    running.receive();
+    running.receive_after_accepted();
     assert!(root.alive());
     assert_eq!(
         running
@@ -418,12 +427,12 @@ fn oversized_result_after_clean_init_accepts_the_next_runtime_turn() {
     let mut running = fixture
         .launch("later-lossy-result", "2.1.296")
         .expect("launch");
-    running.receive();
+    running.receive_after_accepted();
     let root = fixture.identity("model.pid");
     running.submit();
-    running.receive();
-    running.receive();
-    let loss = running.receive();
+    running.receive_after_accepted();
+    running.receive_after_accepted();
+    let loss = running.receive_after_accepted();
     assert_eq!(loss.record.origin, RecordOrigin::Flk);
     assert!(matches!(
         loss.event,
@@ -438,7 +447,7 @@ fn oversized_result_after_clean_init_accepts_the_next_runtime_turn() {
         .try_submit(&serde_json::json!({"type":"user","message":{"content":"next"}}))
         .expect("lossy result reopens runtime input");
     assert!(matches!(
-        running.receive().event,
+        running.receive_after_accepted().event,
         super::super::claude::SessionEvent::Success(_)
     ));
     assert!(root.alive());
@@ -456,7 +465,7 @@ fn later_inspectable_init_with_socket_is_still_refused() {
     let mut running = fixture
         .launch("later-init-socket", "2.1.296")
         .expect("launch");
-    running.receive();
+    running.receive_after_accepted();
     running.submit();
     let exit = running.finish();
     assert_eq!(exit.outcome, Outcome::Refused, "{exit:?}");
@@ -509,12 +518,12 @@ fn real_fake_launch_checks_env_argv_hooks_large_line_final_line_and_cleanup() {
     let fixture = Fixture::new();
     let mut running = fixture.launch("normal", "2.1.296").expect("launch");
     assert!(matches!(
-        running.receive().event,
+        running.receive_after_accepted().event,
         super::super::claude::SessionEvent::HookStarted(_)
     ));
     let root = fixture.identity("model.pid");
     running.submit();
-    let events: Vec<_> = (0..5).map(|_| running.receive()).collect();
+    let events: Vec<_> = (0..5).map(|_| running.receive_after_accepted()).collect();
     assert!(matches!(
         events[0].event,
         super::super::claude::SessionEvent::HookResponse(_)
@@ -567,9 +576,11 @@ fn failed_model_spawn_removes_armed_files_and_preserves_profile() {
             .expect("lease"),
         StreamLocation {
             data_dir: fixture.root.path().to_owned(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
+        fixture.mcp(),
         |_| panic!("failed spawn published a runtime"),
     )
     .expect_err("removed executable cannot spawn");
@@ -622,7 +633,7 @@ fn registry_refusal_prevents_first_input_including_null_malformed_and_links() {
         let fixture = Fixture::under(&long_parent);
         let mut running = fixture.launch(mode, "2.1.296").expect("launch");
         assert!(matches!(
-            running.receive().event,
+            running.receive_after_accepted().event,
             super::super::claude::SessionEvent::HookStarted(_)
         ));
         let root = fixture.identity("model.pid");
@@ -659,7 +670,7 @@ fn init_socket_presence_refuses_even_null_and_unmodelled_wrong_type() {
     ] {
         let fixture = Fixture::under(&long_parent);
         let mut running = fixture.launch(mode, "2.1.296").expect("launch");
-        running.receive();
+        running.receive_after_accepted();
         running.submit();
         let exit = running.finish();
         assert_eq!(exit.outcome, Outcome::Refused, "{mode}: {exit:?}");
@@ -683,11 +694,11 @@ fn natural_exit_distinguishes_idle_missing_result_and_unexplained_143() {
     ] {
         let fixture = Fixture::new();
         let mut running = fixture.launch(mode, "2.1.296").expect("launch");
-        running.receive();
+        running.receive_after_accepted();
         if active {
             running.submit();
-            running.receive();
-            running.receive();
+            running.receive_after_accepted();
+            running.receive_after_accepted();
         }
         let exit = running.finish();
         assert_eq!(exit.outcome, expected, "{mode}: {exit:?}");
@@ -701,11 +712,11 @@ fn natural_exit_distinguishes_idle_missing_result_and_unexplained_143() {
 fn requested_stop_precedes_interrupted_exit_one() {
     let fixture = Fixture::new();
     let mut running = fixture.launch("interrupt-1", "2.1.296").expect("launch");
-    running.receive();
+    running.receive_after_accepted();
     let root = fixture.identity("model.pid");
     running.submit();
-    running.receive();
-    running.receive();
+    running.receive_after_accepted();
+    running.receive_after_accepted();
     running.runtime.stop();
     let exit = running.finish();
     assert_eq!(exit.outcome, Outcome::Stopped, "{exit:?}");
@@ -719,7 +730,7 @@ fn requested_stop_precedes_interrupted_exit_one() {
 fn full_output_queue_does_not_block_stop_or_cleanup() {
     let fixture = Fixture::new();
     let mut running = fixture.launch("flood", "2.1.296").expect("launch");
-    running.receive();
+    running.receive_after_accepted();
     let root = fixture.identity("model.pid");
     running.submit();
     // More durable records than outward/pending capacity proves backpressure
@@ -744,7 +755,7 @@ fn full_output_queue_does_not_block_stop_or_cleanup() {
 fn blocked_stdin_does_not_block_server_stop() {
     let fixture = Fixture::new();
     let mut running = fixture.launch("no-read", "2.1.296").expect("launch");
-    running.receive();
+    running.receive_after_accepted();
     let root = fixture.identity("model.pid");
     running.offer(&serde_json::json!({"type":"user","message":{"content":"x".repeat(1_048_576)}}));
     running.wait(|| running.runtime.transport.input_inflight().then_some(()));
@@ -761,10 +772,10 @@ fn blocked_stdin_does_not_block_server_stop() {
 fn crash_reaps_previously_observed_detached_descendant() {
     let fixture = Fixture::new();
     let mut running = fixture.launch("tree", "2.1.296").expect("launch");
-    running.receive();
+    running.receive_after_accepted();
     running.submit();
     for _ in 0..3 {
-        running.receive();
+        running.receive_after_accepted();
     }
     let root = fixture.identity("model.pid");
     let detached = fixture.identity("grandchild.pid");
@@ -826,9 +837,11 @@ fn publication_panic_shuts_down_owned_process_and_retains_uncertain_files() {
             .expect("lease"),
         StreamLocation {
             data_dir: fixture.root.path().to_owned(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
+        fixture.mcp(),
         |_| panic!("owned publication failure"),
     )
     .expect("worker result");
@@ -852,7 +865,7 @@ fn lease_is_released_after_model_startup_failure() {
 fn lease_is_released_after_a_crash_with_confirmed_cleanup() {
     let fixture = Fixture::new();
     let mut running = fixture.launch("missing-result", "2.1.296").unwrap();
-    running.receive();
+    running.receive_after_accepted();
     running.submit();
     let exit = running.finish();
     assert_eq!(exit.outcome, Outcome::Crashed, "{exit:?}");
@@ -866,7 +879,7 @@ fn lease_is_released_after_a_crash_with_confirmed_cleanup() {
 fn lease_is_released_after_a_requested_stop_with_confirmed_cleanup() {
     let fixture = Fixture::new();
     let mut running = fixture.launch("normal", "2.1.296").unwrap();
-    running.receive();
+    running.receive_after_accepted();
     running.runtime.stop();
     let exit = running.finish();
     assert_eq!(exit.outcome, Outcome::Stopped, "{exit:?}");
@@ -887,9 +900,11 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
             lease,
             StreamLocation {
                 data_dir: fixture.root.path().to_owned(),
+                storage: Default::default(),
                 agent: "fixture-agent".into(),
                 session: session.into(),
             },
+            fixture.mcp(),
             |_| panic!("mismatched identity must never publish"),
         )
         .expect_err("mismatch");
@@ -899,6 +914,25 @@ fn lease_profile_and_stream_must_name_the_same_agent_and_session() {
         );
         assert!(fixture.leases.reserve(agent, session, None).is_ok());
     }
+}
+
+#[test]
+fn session_1441_fake_harness_receives_owned_flock_mcp_config() {
+    let fixture = Fixture::new();
+    let mut running = fixture.launch("mcp-config", "2.1.296").expect("launch");
+    running.submit();
+    let exit = running.finish();
+    assert_eq!(
+        exit.status.expect("reaped status").code(),
+        Some(0),
+        "{exit:?}"
+    );
+    let config: Value = serde_json::from_slice(
+        &fs::read(fixture.root.path().join("observed-mcp.json")).expect("observed MCP"),
+    )
+    .unwrap();
+    assert_eq!(config["mcpServers"].as_object().unwrap().len(), 1);
+    assert!(!running.generated.exists());
 }
 
 #[test]
@@ -960,7 +994,7 @@ fn scripted_stream_drives_session_state_through_the_keyed_sink() {
     .collect::<String>();
     fixture.file("state-events.jsonl", lines.as_bytes(), 0o600);
     let mut running = fixture.launch("state-reducer", "2.1.296").expect("launch");
-    running.receive();
+    running.receive_after_accepted();
     running.submit();
     let now = Instant::now();
     let mut reducer = SessionState::new("fixture-agent".into());
@@ -1043,13 +1077,14 @@ fn scripted_stream_drives_session_state_through_the_keyed_sink() {
     assert_eq!(running.finish().outcome, Outcome::Stopped);
 }
 
+mod queue;
 #[test]
 fn accepted_stdin_then_silent_harness_reports_stall_without_started() {
     use crate::structured::claude::SessionEvent;
     use crate::structured::state::{Input, SessionState};
     let fixture = Fixture::new();
     let mut running = fixture.launch("s4-accepted-silent", "2.1.296").unwrap();
-    let ready = running.receive();
+    let ready = running.receive_after_accepted();
     assert!(matches!(ready.event, SessionEvent::HookStarted(_)));
     running
         .runtime
@@ -1095,20 +1130,24 @@ fn accepted_stdin_then_silent_harness_reports_stall_without_started() {
 }
 
 #[test]
-fn cancelled_admission_requests_process_stop_not_just_pipe_closure() {
+fn io_completion_cancellation_does_not_turn_a_rejected_submit_into_stop() {
     let fixture = Fixture::new();
-    // This child ignores SIGTERM and does not read EOF, so closing the pipes
-    // cannot accidentally satisfy the bounded process cleanup assertion.
-    let mut running = fixture.launch("no-read", "2.1.296").unwrap();
-    running.receive();
+    let mut running = fixture.launch("normal", "2.1.296").unwrap();
+    running.receive_after_accepted();
     let child = fixture.identity("model.pid");
+    // Reproduce the cancel-without-stop window opened by the I/O time limit.
+    // Closing stdin lets this fixture exit naturally, without any stop intent.
     running.runtime.control.cancel();
     let error = running
         .runtime
         .try_submit(&serde_json::json!({"type":"user"}))
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-    assert_eq!(running.finish().outcome, Outcome::Stopped);
+    assert!(
+        !running.runtime.stop.requested(),
+        "I/O cancellation is not a stop"
+    );
+    assert_eq!(running.finish().outcome, Outcome::Exited);
     assert!(!child.alive());
 }
 
@@ -1154,6 +1193,7 @@ fn registry_launch_metadata_reaches_the_child_and_events_wake_the_owner() {
     let state = fixture.root.path().to_owned();
     let location = StreamLocation {
         data_dir: state.clone(),
+        storage: Default::default(),
         agent: "fixture-agent".into(),
         session: SESSION.into(),
     };
@@ -1165,12 +1205,14 @@ fn registry_launch_metadata_reaches_the_child_and_events_wake_the_owner() {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (result_tx, result_rx) = mpsc::sync_channel(1);
     let (wake_tx, wake_rx) = mpsc::sync_channel(1);
+    let mcp = fixture.mcp();
     let worker = std::thread::spawn(move || {
         let result = run_notified(
             &state,
             profile,
             lease,
             location,
+            mcp,
             |runtime| {
                 ready_tx.try_send(runtime).ok();
             },
