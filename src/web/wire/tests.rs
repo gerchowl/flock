@@ -1183,3 +1183,11 @@ fn failed_welcome_encode_drops_without_any_close_send() {
         assert!(received.try_recv().is_err());
     });
 }
+
+#[test]
+fn token_scope_refusal_closes_hello_with_4401() {
+    assert_eq!(
+        HandshakeFailure::from(TokenError::Scope).hello_code(),
+        Some(AUTH_REFUSED_CLOSE)
+    );
+}

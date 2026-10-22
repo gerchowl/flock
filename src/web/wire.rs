@@ -182,15 +182,15 @@ async fn authenticate(
         .await
         .ok_or(HandshakeFailure::Unavailable)?
     else {
-        return Err(HandshakeFailure::Revoked);
+        return Err(HandshakeFailure::Refused);
     };
     let ClientFrame::Hello {
         protocol,
         client: _,
         token: Some(token),
-    } = serde_json::from_str(&text).map_err(|_| HandshakeFailure::Revoked)?
+    } = serde_json::from_str(&text).map_err(|_| HandshakeFailure::Refused)?
     else {
-        return Err(HandshakeFailure::Revoked);
+        return Err(HandshakeFailure::Refused);
     };
     let token = Bearer(token);
     let session = verify(shared, end, token.clone()).await?;
@@ -198,12 +198,29 @@ async fn authenticate(
 }
 /// Handshake failures carry credential evidence separately from availability.
 enum HandshakeFailure {
-    /// A credential does not authenticate or its verified principal was revoked.
-    Revoked,
+    /// Malformed/tokenless hello, or a credential/authentication-scope refusal.
+    Refused,
     /// Verification capacity, store I/O or the original handshake deadline failed.
     Unavailable,
     /// Welcome encoding or socket delivery failed; no auth conclusion is possible.
     Transport,
+}
+impl From<TokenError> for HandshakeFailure {
+    fn from(error: TokenError) -> Self {
+        match error {
+            TokenError::Unauthorized | TokenError::Revoked | TokenError::Scope => Self::Refused,
+            TokenError::Busy | TokenError::Unsafe | TokenError::Io(_) => Self::Unavailable,
+        }
+    }
+}
+impl HandshakeFailure {
+    fn hello_code(self) -> Option<u16> {
+        match self {
+            Self::Refused => Some(AUTH_REFUSED_CLOSE),
+            Self::Unavailable => Some(GOING_AWAY_CLOSE),
+            Self::Transport => None,
+        }
+    }
 }
 async fn verify(shared: &Shared, end: Instant, token: Bearer) -> Result<Session, HandshakeFailure> {
     let store = shared.store.clone();
@@ -215,12 +232,7 @@ async fn verify(shared: &Shared, end: Instant, token: Bearer) -> Result<Session,
     .await
     .flatten()
     .ok_or(HandshakeFailure::Unavailable)?
-    .map_err(|error| match error {
-        TokenError::Unauthorized | TokenError::Revoked => HandshakeFailure::Revoked,
-        TokenError::Scope | TokenError::Busy | TokenError::Unsafe | TokenError::Io(_) => {
-            HandshakeFailure::Unavailable
-        }
-    })
+    .map_err(HandshakeFailure::from)
 }
 /// Complete the registered handshake under its original ADR-0036 §5a deadline.
 async fn finish_welcome<S: Sink<Message> + Unpin>(
@@ -242,12 +254,12 @@ async fn finish_welcome<S: Sink<Message> + Unpin>(
     };
     let accepted = tokio::select! { biased;
         _ = stop.changed() => return false,
-        _ = revoked.changed() => Err(HandshakeFailure::Revoked),
+        _ = revoked.changed() => Err(HandshakeFailure::Refused),
         sent = before(clock, end, ready) => sent.unwrap_or(Err(HandshakeFailure::Unavailable)),
     };
     let code = match accepted {
         Ok(()) => return true,
-        Err(HandshakeFailure::Revoked) => AUTH_REVOKED_CLOSE,
+        Err(HandshakeFailure::Refused) => AUTH_REVOKED_CLOSE,
         Err(HandshakeFailure::Unavailable) => GOING_AWAY_CLOSE,
         Err(HandshakeFailure::Transport) => return false,
     };
@@ -280,10 +292,8 @@ async fn connection(
     let (session, read_only, token) = match session {
         Ok(session) => session,
         Err(failure) => {
-            let code = match failure {
-                HandshakeFailure::Revoked => AUTH_REFUSED_CLOSE,
-                HandshakeFailure::Unavailable => GOING_AWAY_CLOSE,
-                HandshakeFailure::Transport => return,
+            let Some(code) = failure.hello_code() else {
+                return;
             };
             let _ = socket.send(close(code)).now_or_never();
             return;
@@ -327,7 +337,7 @@ async fn connection(
     let confirmed = async {
         let session = verify(&shared, end, token).await?;
         if session.info.principal != principal || *registered.borrow() {
-            return Err(HandshakeFailure::Revoked);
+            return Err(HandshakeFailure::Refused);
         }
         drop(hello);
         Ok(())

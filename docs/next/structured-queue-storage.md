@@ -134,17 +134,21 @@ The ADR-0036 §4 owner decisions in #1820 and #1922 separate three cases:
    checkpoint protection prevents discarding raw state. Once its worker requires
    a checkpoint, that refusal latches read-only `QueueJournalCorrupt` with reason
    `unknown_data_prevents_checkpoint`. All later mutations refuse through the
-   same guard and status, so failed rewrites cannot allow continued growth. The
-   location describes the last recovered cursor and the required checkpoint's
-   byte boundary. Known updates/removals cannot erase the raw unknown history.
+   same guard and status for that open handle. The location describes the last
+   recovered cursor and the file length at refusal, including any torn suffix;
+   it is not necessarily a record boundary. Known updates/removals cannot erase
+   the raw unknown history.
 
-   The worker owns the configured byte threshold and must check it before more
-   appends, including after reopening a journal; threshold execution/server
-   integration remains [#1803](https://github.com/gerchowl/flock/issues/1803).
-   The latch itself is in memory and does not append a marker or modify the
-   journal. Reopening does not bypass a still-required checkpoint. A
-   newer-stamped journal uses `QueueJournalNewer` read-only mode instead. There is no opaque checkpoint
-   passthrough and no inference of a version from unknown contents.
+   Same-version growth is not bounded yet: production checkpoint scheduling
+   remains [#1803](https://github.com/gerchowl/flock/issues/1803). That worker must
+   implement a named, documented size/record threshold as a constant, check it
+   before further appends and re-derive a refused checkpoint's typed read-only
+   latch after reopening. These requirements are tracked in
+   [#1928](https://github.com/gerchowl/flock/issues/1928). The latch is currently
+   in memory and does not append a marker or modify the journal; same-version
+   recovery alone does not re-establish it. A newer-stamped journal instead uses
+   `QueueJournalNewer` read-only mode. There is no opaque checkpoint passthrough
+   and no inference of a version from unknown contents.
 2. **Malformed known records are corruption.** A supported-version journal still
    loads, but opens read-only with `QueueJournalCorrupt { seq, offset, reason }`.
    The cursor is optional when it cannot be parsed; the byte offset always
