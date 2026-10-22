@@ -459,9 +459,26 @@ The pane defaults to the calling pane. Use `--pane <pane_id>` or a legacy leadin
 
 ## Agents
 
+Structured session records are listed separately as `structured_agents` in the
+JSON response. `get` and its `status` alias accept the registered agent id or a
+unique name. They return runtime, session identity, lifecycle, canonical state,
+and lease-binding evidence without inventing a pane. `stop` requests asynchronous
+cleanup for a structured session; poll `status` for the resulting lifecycle. Only
+the operator or owning agent may stop it. Stopping an Offline record is harmless.
+An Unknown record requires confirmed cleanup and explicit record recovery before
+restart (`structured_recovery_required`, retry `after_human`, exit 1).
+
+Pane-only operations on structured records, including attach, readiness and
+settled waits, return `runtime_unsupported` (retry `never`, exit 2). Use the
+structured state for observation instead. PTY records keep their existing fields.
+Public structured launch remains gated pending the final #1843 routing slice.
+
+
 ```bash
 flk agent list [--resumable]
 flk agent get <target>
+flk agent status <target>
+flk agent stop <structured-agent>
 flk agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]
 flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]
 flk agent result <target> [--max-chars N] [--offset N]

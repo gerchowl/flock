@@ -557,6 +557,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PeersCheckoutPrepare(_) => "peers.checkout_prepare",
         Method::AgentList(_) => "agent.list",
         Method::AgentGet(_) => "agent.get",
+        Method::AgentStop(_) => "agent.stop",
         Method::AgentRead(_) => "agent.read",
         Method::AgentHistory(_) => "agent.history",
         Method::AgentResult(_) => "agent.result",
