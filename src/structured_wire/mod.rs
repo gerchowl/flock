@@ -1,7 +1,7 @@
 //! Structured JSON wire contracts, separate from the terminal's framed protocol.
 //!
-//! ADR-0036 §4/§5/§5a governs these types. S7a is test-only until S7 installs
-//! an endpoint: no transport, authentication, timers or command execution lives here.
+//! ADR-0036 §4/§5/§5a governs these types. The web-feature transport core consumes
+//! these types; no authentication, timers or command execution lives in this module.
 //! Frames tolerate additive fields; unknown `t` tags are protocol errors, rather
 //! than session events. Only event payloads have §8's lossless unknown wrapper.
 //! All u64 wire numbers are JSON numbers, exact in JavaScript below 2^53.
@@ -11,8 +11,11 @@ use crate::structured::claude::KnownSessionEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(test)]
 pub(crate) mod fixture;
 mod minimal;
+// Later wire slices consume these exact payload re-exports.
+#[cfg_attr(feature = "web", allow(unused_imports))]
 pub use minimal::{
     AgentDecide, AgentDecideErrorCode, AgentDecideResult, FleetAgentRow, FleetDelta,
     PermissionDecision,
@@ -25,6 +28,8 @@ mod tests;
 /// Initial, unreleased structured wire version; independent of terminal/mesh versions.
 pub const WIRE_JSON_VERSION: u32 = 1;
 /// Per-attempt connect ceiling, including resolution and upgrade (ADR-0036 §5a).
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const CONNECT_DEADLINE_MS: u64 = 10_000;
 /// WebSocket-open to authenticated welcome ceiling, on both peers.
 pub const HANDSHAKE_DEADLINE_MS: u64 = 5_000;
@@ -33,18 +38,32 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 /// Missing valid frame/pong ceiling; unrelated streams do not renew progress.
 pub const LIVENESS_WINDOW_MS: u64 = 45_000;
 /// Subscription progress ceiling, independent of unrelated traffic.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const SUBSCRIPTION_DEADLINE_MS: u64 = 30_000;
 /// Command acknowledgement ceiling; expiry marks only that command uncertain.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const ACK_DEADLINE_MS: u64 = 30_000;
 /// First reconnect backoff ceiling, before equal jitter.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const BACKOFF_BASE_MS: u64 = 500;
 /// Exponential multiplier per unsuccessful attempt.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const BACKOFF_FACTOR: u32 = 2;
 /// Maximum reconnect backoff ceiling.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const BACKOFF_CAP_MS: u64 = 30_000;
 /// Equal jitter lower bound is the ceiling divided by this value.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const BACKOFF_JITTER_DIVISOR: u32 = 2;
 /// Continuous healthy interval before backoff resets.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const BACKOFF_RESET_MS: u64 = 60_000;
 /// Hello authentication refusal: hold outbox until a new token.
 pub const AUTH_REFUSED_CLOSE: u16 = 4401;
@@ -83,7 +102,7 @@ pub enum ClientFrame {
         /// ADR-0036 §5 stream path; an unknown/removed path gets unknown_stream.
         stream: String,
         /// JSON number; exact in JavaScript below 2^53.
-        /// Omitted for bootstrap and cursorless agent/<id>/live.
+        /// Omitted for bootstrap and cursorless `agent/<id>/live`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         after: Option<u64>,
@@ -129,18 +148,32 @@ pub enum SubfailCode {
 }
 
 /// Token removed/replaced; ack precedes close 4403. Registered when S7 emits it.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const AUTH_REVOKED: &str = "auth_revoked";
 /// Valid token lacks scope. Registered when S7 emits it.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const SCOPE: &str = "scope";
 /// Unsupported subscription path. Registered when S7 emits it.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const UNKNOWN_STREAM: &str = "unknown_stream";
 /// Cursor exceeds the stream head; clear it and bootstrap.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const CURSOR_AHEAD: &str = "cursor_ahead";
 /// Stream requires an operator principal.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const OPERATOR_ONLY: &str = "operator_only";
 /// Subscription identity was already used on the current connection.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const SUB_ID_REUSED: &str = "sub_id_reused";
 /// Original command effect remains uncertain; never dispatch a missing claim.
+// Client timers and later wire slices consume this contract constant.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub const SESSION_UNCONFIRMED: &str = "session_unconfirmed";
 
 /// ADR-0029 retry spellings; these do not override §5a's resume-only safety rule.
@@ -257,7 +290,7 @@ pub enum ServerFrame {
         /// Same stream identity supplied in sub.
         stream: String,
         /// JSON number; exact in JavaScript below 2^53.
-        /// Seq streams only; agent/<id>/live omits seq and never advances a cursor.
+        /// Seq streams only; `agent/<id>/live` omits seq and never advances a cursor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         seq: Option<u64>,

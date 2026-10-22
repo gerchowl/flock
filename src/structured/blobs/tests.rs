@@ -98,13 +98,6 @@ fn invalid_addresses_missing_corruption_and_symlinks_are_distinct() {
     let path = root.path().join("blobs").join(ABC);
     fs::write(&path, b"bad").unwrap();
     assert!(matches!(store.get(ABC, 3), Err(BlobError::Corrupt)));
-    assert!(matches!(store.put(&b"abc"[..], 3), Err(BlobError::Corrupt)));
-    assert_eq!(
-        fs::read(&path).unwrap(),
-        b"bad",
-        "corruption is never silently repaired"
-    );
-    assert_eq!(names(&root), [ABC]);
     fs::remove_file(&path).unwrap();
     let outside = root.path().join("outside");
     fs::write(&outside, b"abc").unwrap();
@@ -314,6 +307,125 @@ fn unsafe_namespace_and_file_permissions_fail_without_repair() {
         fs::metadata(root.path().join("blobs")).unwrap().mode() & 0o777,
         0o755
     );
+}
+
+std::thread_local! {
+    static CRASH_BEFORE_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn before_publish() {
+    CRASH_BEFORE_PUBLISH.with(|enabled| {
+        if enabled.get() {
+            // Exit without unwinding: model a process crash after the temp fsync.
+            std::process::exit(crate::cli::exit::SUCCESS);
+        }
+    });
+}
+
+#[derive(Clone, Default)]
+struct RepairLog(Arc<std::sync::Mutex<Vec<u8>>>);
+impl Write for RepairLog {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn corrupt_blob_is_repaired_by_put_and_records_one_structured_repair() {
+    let (root, store) = setup();
+    let reference = store.put(&b"abc"[..], 3).unwrap();
+    fs::write(root.path().join("blobs").join(ABC), b"bad").unwrap();
+    assert!(matches!(store.get(ABC, 3), Err(BlobError::Corrupt)));
+    let capture = RepairLog::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        assert_eq!(store.put(&b"abc"[..], 3).unwrap(), reference);
+        assert_eq!(store.put(&b"abc"[..], 3).unwrap(), reference);
+    });
+    assert_eq!(store.get(ABC, 3).unwrap(), b"abc");
+    assert_eq!(names(&root), [ABC]);
+    let bytes = capture.0.lock().unwrap().clone();
+    let events: Vec<Value> = String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "only the repaired put emits a repair event"
+    );
+    assert_eq!(events[0]["fields"]["event"], "structured.blob.repaired");
+    assert_eq!(events[0]["fields"]["blob"], ABC);
+    assert_eq!(events[0]["fields"]["size"], 3);
+    assert!(!events[0].to_string().contains("abc"));
+}
+
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // Executes only this test binary against its owned data root.
+async fn corrupt_blob_repair_crash_before_rename_preserves_old_and_synced_temp() {
+    const CHILD_ROOT: &str = "BLOB_REPAIR_CRASH_ROOT";
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let store = BlobStore::open(Path::new(&root)).unwrap();
+        CRASH_BEFORE_PUBLISH.with(|enabled| enabled.set(true));
+        store
+            .put(&b"abc"[..], 3)
+            .expect("repair reaches publication");
+        panic!("crash checkpoint was not reached");
+    }
+    let (root, store) = setup();
+    store.put(&b"abc"[..], 3).unwrap();
+    let old_path = root.path().join("blobs").join(ABC);
+    fs::write(&old_path, b"bad").unwrap();
+    let old_inode = fs::metadata(&old_path).unwrap().ino();
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "structured::blobs::tests::corrupt_blob_repair_crash_before_rename_preserves_old_and_synced_temp", "--nocapture"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path())
+        .env(CHILD_ROOT, root.path())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let status = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(status) => status.unwrap(),
+        Err(_) => {
+            child.kill().await.unwrap();
+            panic!("repair child did not exit at the publication checkpoint");
+        }
+    };
+    assert!(
+        status.success(),
+        "repair child failed before crash checkpoint: {status}"
+    );
+    assert_eq!(fs::metadata(&old_path).unwrap().ino(), old_inode);
+    assert_eq!(fs::read(&old_path).unwrap(), b"bad");
+    assert!(matches!(store.get(ABC, 3), Err(BlobError::Corrupt)));
+    let entries = names(&root);
+    assert_eq!(entries.len(), 2);
+    let temporary = entries
+        .iter()
+        .find(|name| name.starts_with(".tmp-"))
+        .unwrap();
+    assert_eq!(
+        fs::read(root.path().join("blobs").join(temporary)).unwrap(),
+        b"abc"
+    );
+    assert_eq!(store.put(&b"abc"[..], 3).unwrap().blob, ABC);
+    assert_eq!(store.get(ABC, 3).unwrap(), b"abc");
+    // Crash leftovers are not live writers' files and are left for coordinated cleanup (#1712).
+    assert_eq!(names(&root), entries);
 }
 
 #[test]

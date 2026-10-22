@@ -1077,6 +1077,7 @@ fn scripted_stream_drives_session_state_through_the_keyed_sink() {
     assert_eq!(running.finish().outcome, Outcome::Stopped);
 }
 
+mod queue;
 #[test]
 fn accepted_stdin_then_silent_harness_reports_stall_without_started() {
     use crate::structured::claude::SessionEvent;

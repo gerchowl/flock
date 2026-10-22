@@ -520,9 +520,9 @@ impl FleetSnapshotState {
     }
 
     /// Re-encode for the next leap, excluding the hop target itself (it
-    /// becomes the self row on the receiving end) and any entry matching the
-    /// origin — the home row owns that slot, so a hub that lists itself in
-    /// `[[peers]]` must not render twice. Ages are recomputed so time spent on
+    /// becomes the self row on the receiving end). Known self/home copies are
+    /// folded by node ID when received, never by their display names.
+    /// Ages are recomputed so time spent on
     /// this server keeps counting against freshness. Peer count is bounded:
     /// the snapshot rides an env var between attach legs, and an unbounded
     /// fleet could brush ARG_MAX and kill the leg spawn.
@@ -532,7 +532,7 @@ impl FleetSnapshotState {
             peers: self
                 .peers
                 .iter()
-                .filter(|peer| peer.ssh_target != exclude_ssh_target && peer.peer != self.origin)
+                .filter(|peer| peer.ssh_target != exclude_ssh_target)
                 .take(FLEET_SNAPSHOT_MAX_PEERS)
                 .map(peer_to_wire)
                 .collect(),
@@ -550,22 +550,25 @@ impl FleetSnapshotState {
     /// Drop pushed rows that claim to be this snapshot's ORIGIN (#424 review).
     ///
     /// The home row is refreshed only from the bound hub's own `hub_self`, see
-    /// [`Self::absorb_hub_self`]. Anything else naming the home machine is a
-    /// claim by whichever node the hub polled, keyed on a host it chose, so it
-    /// is neither absorbed into the home row nor stored as a second one.
+    /// [`Self::absorb_hub_self`]. Other claims to its known node ID are dropped.
+    /// Same-name nodes with other IDs and ID-less legacy observations remain
+    /// separate: a reported hostname never establishes home identity.
     pub fn without_origin_claims(
         &self,
         rows: Vec<crate::api::schema::RelayedFleetPeer>,
     ) -> Vec<crate::api::schema::RelayedFleetPeer> {
-        let origin_key = self.origin.to_ascii_lowercase();
+        let origin_node = self
+            .origin_summary
+            .as_ref()
+            .and_then(|peer| peer.node_id.as_deref());
         rows.into_iter()
-            .filter(|row| wire_row_identity(row) != origin_key)
+            .filter(|row| origin_node.is_none() || row.node_id.as_deref() != origin_node)
             .collect()
     }
 
     /// Refresh the carried origin from the hub's own row (#424). The caller has
-    /// already checked that the row names the hub bound to the relay AND that
-    /// this hub is the snapshot's origin.
+    /// already checked that the enrolled hub is the snapshot's origin by ID.
+    /// A home without a known identity cannot be refreshed by name alone.
     ///
     /// The origin summary is the only view a spoke has of the server the
     /// client came from, and it was stamped once, at switch time. A fresher
@@ -596,10 +599,10 @@ impl FleetSnapshotState {
     }
 }
 
-/// The identity a relayed row is stored under: its reported host, else its ssh
-/// target, lowercased. Exactly the relay cache key, so a row cannot match one
-/// machine here and be stored as another there. Unlike [`normalized_host_key`]
-/// nothing is stripped, because identity must not fold `a.lan` into `a.tailnet`.
+/// Legacy observation key: reported host, else SSH target, lowercased.
+/// Known nodes instead use their node ID in a disjoint private cache namespace.
+/// This key never binds a display name to a known node. Unlike
+/// [`normalized_host_key`], it preserves the complete domain spelling.
 pub fn wire_row_identity(row: &crate::api::schema::RelayedFleetPeer) -> String {
     row.host
         .as_deref()
@@ -750,10 +753,11 @@ pub fn relayed_entry_from_wire(
 /// it polls. Two copies of this loop would be two answers to "which reading of
 /// that host wins", and that drift is the defect the directory exists to stop.
 ///
-/// Loop prevention rides on the origin field: an entry whose origin is us (the
-/// one full cycle we could see — hub A polls hub B, B relayed A's own peers
-/// back) and an entry ABOUT us are both dropped. Freshest-wins across sources,
-/// on the LIVE age (origin's reading plus dwell here), so a source that has
+/// Legacy loop prevention uses the origin field and reported host. Known
+/// proven node copies are consolidated in AppState. Claims are cached per
+/// supplying edge, so an unproven claim cannot overwrite another source.
+/// Freshest-wins within each source on the LIVE age (origin's reading plus
+/// dwell here), so a source that has
 /// gone quiet cannot keep winning against one still polling. #392: a row whose
 /// ssh_target or proxy_jump this host refuses to dial is dropped and logged,
 /// and the rest still merges.
@@ -785,22 +789,28 @@ fn merge_relayed_rows(
     let self_host = crate::app::short_host_name();
     let self_host_lower = self_host.to_ascii_lowercase();
     for entry in entries {
-        if entry.origin.eq_ignore_ascii_case(&self_host) {
+        if entry.node_id.is_none() && entry.origin.eq_ignore_ascii_case(&self_host) {
             continue;
         }
-        let host_key = wire_row_identity(&entry);
-        // Identity is keyed before the row's names are cleaned, so a host
-        // carrying control bytes (`hopper\x07`) would slip past every exact
-        // comparison and then render as a second `hopper`. No real host has
-        // one: drop the row.
-        if host_key.chars().any(char::is_control) {
+        let legacy_key = wire_row_identity(&entry);
+        if legacy_key.chars().any(char::is_control)
+            || entry
+                .node_id
+                .as_deref()
+                .is_some_and(|id| id.chars().any(char::is_control))
+        {
             continue;
         }
-        if host_key == self_host_lower {
-            // Never store an entry about ourselves as a relayed row — the self
-            // row lives on the origin_summary path.
+        if entry.node_id.is_none() && legacy_key == self_host_lower {
             continue;
         }
+        // NUL cannot occur in a validated legacy key, so the namespaces cannot
+        // collide even when an advertised hostname imitates a node-key prefix.
+        let host_key = entry
+            .node_id
+            .as_ref()
+            .map(|id| format!("\0node:{via}:{id}"))
+            .unwrap_or(legacy_key);
         let Some(mut materialised) = relayed_entry_from_wire(entry) else {
             continue;
         };
@@ -845,6 +855,7 @@ pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
 /// waiting for real seconds to pass.
 pub fn peer_to_wire_at(now: Instant, peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
     crate::protocol::FleetPeer {
+        node_id: peer.node_id.clone(),
         name: peer.peer.clone(),
         ssh_target: peer.ssh_target.clone(),
         host: peer.host.clone(),
@@ -879,7 +890,7 @@ pub fn peer_to_wire_at(now: Instant, peer: &PeerSummaryState) -> crate::protocol
 /// receiver's dwell no longer cliffs a snapshot entry at `stale_after`.
 pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
     PeerSummaryState {
-        node_id: None,
+        node_id: peer.node_id,
         dial: Default::default(),
         stream_error: None,
         peer: peer.name,
@@ -2004,7 +2015,7 @@ mod tests {
     }
 
     #[test]
-    fn to_wire_dedups_origin_and_caps_peer_count() {
+    fn to_wire_preserves_legacy_names_excludes_destination_and_caps_count() {
         let mk = |name: &str| PeerSummaryState {
             node_id: None,
             dial: Default::default(),
@@ -2038,16 +2049,20 @@ mod tests {
         let wire = snapshot.to_wire("p0");
 
         assert!(
-            wire.peers.iter().all(|p| p.name != "hopper"),
-            "origin owns the home row"
-        );
-        assert!(
             wire.peers.iter().all(|p| p.name != "p0"),
             "hop target excluded"
         );
         assert!(
             wire.peers.len() <= FLEET_SNAPSHOT_MAX_PEERS,
             "env-var transport cap"
+        );
+        let mut names_only = snapshot;
+        names_only.peers = vec![mk("legacy-home.example")];
+        names_only.origin = "legacy-home.example".into();
+        assert_eq!(
+            names_only.to_wire("other.example").peers.len(),
+            1,
+            "a legacy display name cannot establish home identity"
         );
     }
 
@@ -2315,6 +2330,20 @@ mod tests {
         // A nested leap (pass-through) keeps the hub's own summary too.
         let nested = FleetSnapshotState::from_wire(back.to_wire("operator@kiln"));
         assert!(nested.origin_summary.is_some());
+    }
+
+    #[test]
+    fn peer_decoder_tolerates_idle_and_unknown_future_poller_values() {
+        for status in ["idle", "future_status"] {
+            let raw = serde_json::json!({"id":"summary", "result":{
+                "host":"fixture.example", "workspaces":[],
+                "pollers":{"git_refresh":{"status":status,"reason":"future_reason"}}
+            }});
+            let summary = parse_summary_response(&raw.to_string(), 7).unwrap();
+            assert_eq!(summary.host, "fixture.example");
+            assert_eq!(summary.latency_ms, 7);
+        }
+        assert_eq!(crate::mesh::hello::VERSION, 5);
     }
 
     #[test]
@@ -2644,6 +2673,7 @@ Last login: banner noise
         // age_secs, so the origin-honest staleness path applies even for
         // entries from an older peer — the 60s cliff dies for those too.
         let wire = crate::protocol::FleetPeer {
+            node_id: None,
             name: "old".into(),
             ssh_target: "operator@old".into(),
             host: Some("old".into()),
