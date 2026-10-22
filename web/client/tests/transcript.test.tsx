@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { render } from "solid-js/web";
 
+import { permissionLifecycle } from "../src/gen/FixtureExamples";
 import { App } from "../src/App";
 import type { Transport } from "../src/transport";
 import { FIXTURE_STREAM, createFixtureTransport } from "../src/transport/fixture";
@@ -103,9 +104,10 @@ describe("Transcript", () => {
     observer?.reset?.();
     expect(currents).toEqual([false, true, false]);
     // Sent while the stream replays again: its cursor (1) is not the stream's.
-    composer.sent("a", "c1");
+    const after = composer.cursor("a");
+    expect(after).toBeNull();
     observer?.entry(said(2, "hello"));
-    expect([...composer.echoed("a", [{ cmdId: "c1", text: "hello" }])]).toEqual([]);
+    expect([...composer.echoed("a", [{ cmdId: "c1", text: "hello", after }])]).toEqual([]);
   });
 
   test("a failed subscription is shown, not swallowed", async () => {
@@ -129,4 +131,15 @@ describe("App", () => {
     await Promise.resolve();
     expect(root.querySelectorAll('[data-testid="known-event"]').length).toBeGreaterThan(0);
   });
+});
+
+test("permission audit open and closed render as known transcript entries", async () => {
+  const lines = permissionLifecycle.filter((record) => "state" in record).map((record) => JSON.stringify(record)).join("\n");
+  const { transport, synced } = whenSynced(createFixtureTransport(lines));
+  const root = mount(() => <Transcript transport={transport} stream={FIXTURE_STREAM} source="replay" />);
+  await synced;
+  expect(root.querySelectorAll('[data-testid="known-event"]').length).toBe(2);
+  expect(root.querySelectorAll('[data-testid="unknown-event"]').length).toBe(0);
+  expect(root.textContent).toContain("Permission request · Bash");
+  expect(root.textContent).toContain("Permission request closed");
 });

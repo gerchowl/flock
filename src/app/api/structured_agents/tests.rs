@@ -153,7 +153,7 @@ async fn structured_pane_operations_refuse_and_cross_runtime_names_are_ambiguous
         );
     }
     let terminal = app.state.terminals.values_mut().next().unwrap();
-    terminal.agent_name = Some("fixture-agent".into());
+    terminal.set_agent_name("fixture-agent".into()).unwrap();
     for method in ["agent.get", "agent.status", "agent.stop", "agent.read"] {
         let result = request(&mut app, method, json!({"target":"fixture-agent"}));
         assert_eq!(

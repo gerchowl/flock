@@ -23,6 +23,24 @@ describe("auth refusal → NeedsToken from every state with a socket", () => {
   }
 });
 
+describe("transient handshake loss retains credentials", () => {
+  for (const code of [1001, 1006]) {
+    test(`Hello + close ${code} reconnects with the same token`, () => {
+      const h = new Harness();
+      REACH["Hello"]?.(h);
+      h.step(step({ step: "expect_connect", within_ms: 10_000 }));
+      h.net.current().serverClose(code, "transport ended");
+      expect(h.connection.state).toBe("Reconnecting");
+      h.step(step({ step: "expect_connect", not_before_ms: 250, within_ms: 500 }));
+      h.net.current().open();
+      expect(h.connection.state).toBe("Hello");
+      expect(JSON.parse(h.net.frames.at(-1)?.text ?? "null").token).toBe("fixture-token");
+      h.net.current().deliver(WELCOME);
+      expect(h.connection.state).toBe("Live");
+    });
+  }
+});
+
 describe("liveness", () => {
   test("each ping is answered at once; 45 s without a frame → Stale → Reconnecting", () => {
     const h = new Harness();
