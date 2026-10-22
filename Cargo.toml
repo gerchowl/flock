@@ -54,7 +54,8 @@ getrandom = "0.4"
 # Timed lease-table reads: short contention must not deny all API callers.
 parking_lot = "0.12"
 portable-pty = "0.9"
-rust-embed = { version = "8", optional = true }
+# Debug builds must exercise the same embedded bytes as release builds.
+rust-embed = { version = "8", optional = true, features = ["debug-embed", "deterministic-timestamps"] }
 png = "0.18"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 regex = "1"
@@ -69,6 +70,8 @@ toml = "1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 unicode-width = "0.2"
+# Reuse termwiz's locked Unicode 17 categories for identity-format validation.
+finl_unicode = "1.4"
 sysinfo = "0.39.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 toml_edit = "0.25.15"

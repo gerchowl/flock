@@ -127,7 +127,7 @@ fn scoped_socket_rejects_missing_and_wrong_credentials_before_a_fast_path() {
             _=>serde_json::json!({"request":{"id":"scope","method":"ping","params":{"unexpected":secret}},"credential":secret,"extra":true}),
         };
         let policy = app.runtime_config.uid_policy.clone();
-        let task=std::thread::spawn(move || crate::api::server::handle_connection(server,&tx,&EventHub::default(),&Arc::new(AtomicBool::new(true)),None,&Mutex::default(),&policy).unwrap());
+        let task=std::thread::spawn(move || crate::api::server::handle_connection(server,&tx,&EventHub::default(),&Arc::new(AtomicBool::new(true)),None,&Mutex::default(),&crate::api::client_listener::Health::default(),&policy).unwrap());
         writeln!(client,"{payload}").unwrap();
         if mode!="malformed" {
             let msg=tokio::time::timeout(Duration::from_secs(5),app.api_rx.recv()).await.unwrap().unwrap();
@@ -167,4 +167,13 @@ fn scoped_continuations_stop_after_revocation_and_context_is_restored() {
     .unwrap());
     drop(guard);
     assert!(Scope::current().is_none());
+}
+
+#[test]
+fn legacy_invalid_request_keeps_serde_detail_but_scoped_detail_is_redacted() {
+    let legacy = decode(r#"{"id":"x","method":"unknown-fixture-method","params":{}}"#)
+        .unwrap_err()
+        .unwrap();
+    assert!(legacy.to_string().contains("unknown-fixture-method"));
+    assert!(decode(r#"{"request":{"id":"x","method":"secret-canary","params":{}},"credential":"credential-canary"}"#).unwrap_err().is_none());
 }

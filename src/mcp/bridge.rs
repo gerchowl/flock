@@ -22,7 +22,7 @@ pub(super) trait FlockCall {
 }
 
 /// Production wire: talks to the local flock socket via [`ApiClient`].
-pub(super) struct LocalApi;
+pub(super) struct LocalApi(pub(super) ApiClient);
 
 impl FlockCall for LocalApi {
     fn call(&self, method: Method) -> Result<Value, ApiClientError> {
@@ -30,7 +30,7 @@ impl FlockCall for LocalApi {
             id: format!("mcp:{}", crate::mcp::next_call_seq()),
             method,
         };
-        ApiClient::local().request_value(&request)
+        self.0.request_value(&request)
     }
 }
 
@@ -382,7 +382,7 @@ mod tests {
         let pane_id = app.state.public_pane_id(0, pane).unwrap();
         let terminal_id = ws.tabs[0].panes[&pane].attached_terminal_id.clone();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.agent_name = Some("reviewer".into());
+        terminal.set_agent_name("reviewer".into()).unwrap();
         let agent_id = terminal.agent_id.to_string();
         let api = AppApi(RefCell::new(app));
         let unresolved_inbox = route(
@@ -450,7 +450,12 @@ mod tests {
                 .unwrap()
                 .attached_terminal_id
                 .clone();
-            app.state.terminals.get_mut(&other).unwrap().agent_name = Some("reviewer".into());
+            app.state
+                .terminals
+                .get_mut(&other)
+                .unwrap()
+                .set_agent_name("reviewer".into())
+                .unwrap();
         }
         for to in [
             json!("reviewer"),
