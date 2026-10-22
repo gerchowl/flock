@@ -37,6 +37,10 @@ pub struct ServerHandle {
     pub(crate) clone_detection_warning: Option<String>,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
+    /// Structured listener health owned by this server, shared with its lifecycle owner.
+    // The #1894 lifecycle owner reads this handle when the transport is mounted.
+    #[allow(dead_code)]
+    pub(crate) client_listener: crate::api::client_listener::Health,
 }
 
 impl Drop for ServerHandle {
@@ -110,6 +114,8 @@ pub(crate) fn start_server_with_capabilities(
     let clone_detection_warning = capabilities
         .as_ref()
         .and_then(|caps| caps.clone_detection_warning.clone());
+    let client_listener = crate::api::client_listener::Health::default();
+    let connection_status = client_listener.clone();
     let thread = std::thread::spawn(move || {
         let health = Arc::new(Mutex::new(crate::api::schema::ApiListenerHealth::default()));
         run_accept_loop(
@@ -122,6 +128,7 @@ pub(crate) fn start_server_with_capabilities(
                 let capabilities = capabilities.clone();
                 let connection_running = Arc::clone(&listener_running);
                 let health = Arc::clone(&health);
+                let client_listener = connection_status.clone();
                 let uid_policy = uid_policy.clone();
                 std::thread::spawn(move || {
                     if let Err(err) = handle_connection(
@@ -131,6 +138,7 @@ pub(crate) fn start_server_with_capabilities(
                         &connection_running,
                         capabilities,
                         &health,
+                        &client_listener,
                         &uid_policy,
                     ) {
                         crate::logging::api_connection_failed(&err.to_string());
@@ -148,6 +156,7 @@ pub(crate) fn start_server_with_capabilities(
         path,
         identity,
         running,
+        client_listener,
     })
 }
 
@@ -245,6 +254,7 @@ pub(crate) fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
+    client_listener: &crate::api::client_listener::Health,
     uid_policy: &crate::structured::identity::UidPolicy,
 ) -> std::io::Result<()> {
     let peer = crate::platform::peer::credentials(&stream);
@@ -430,6 +440,7 @@ pub(crate) fn handle_connection(
                 capabilities,
                 peer,
                 listener_health,
+                client_listener,
                 uid_policy,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
@@ -460,6 +471,7 @@ fn handle_request(
     capabilities: Option<ServerCapabilities>,
     peer: crate::platform::peer::Credentials,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
+    client_listener: &crate::api::client_listener::Health,
     uid_policy: &crate::structured::identity::UidPolicy,
 ) -> String {
     match request.method {
@@ -480,6 +492,7 @@ fn handle_request(
                 // exactly as long as the fault lasts.
                 session_health: Some(crate::health::confirmed()),
                 agent_account_diagnostic: uid_policy.account_diagnostic(),
+                client_listener: client_listener.status(),
                 api_listener: Some(
                     listener_health
                         .lock()
@@ -990,6 +1003,7 @@ mod tests {
                     &connection_running,
                     None,
                     &health,
+                    &crate::api::client_listener::Health::default(),
                     &Default::default(),
                 )
                 .unwrap();
@@ -1112,6 +1126,7 @@ mod tests {
                 None,
                 Default::default(),
                 &health,
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             );
             let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1343,6 +1358,7 @@ mod tests {
             None,
             crate::platform::peer::Credentials::default(),
             &Mutex::default(),
+            &crate::api::client_listener::Health::default(),
             &app.runtime_config.uid_policy,
         );
         let parsed: SuccessResponse = serde_json::from_str(&reply).unwrap();
@@ -1393,6 +1409,7 @@ mod tests {
                 None,
                 crate::platform::peer::Credentials::default(),
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &app.runtime_config.uid_policy,
             );
             let response: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1428,6 +1445,33 @@ mod tests {
     }
 
     #[test]
+    fn ping_reports_only_its_injected_server_listener_status() {
+        use crate::api::client_listener::{Health, Status};
+        let one = Health::default();
+        let two = Health::default();
+        one.publish(Status::Failed);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        for (health, expected) in [(&one, Some(Status::Failed)), (&two, None)] {
+            let reply = handle_request(
+                Request {
+                    id: "owned-status".into(),
+                    method: Method::Ping(crate::api::schema::PingParams::default()),
+                },
+                &tx,
+                None,
+                crate::platform::peer::Credentials::default(),
+                &Mutex::default(),
+                health,
+                &Default::default(),
+            );
+            let reply: SuccessResponse = serde_json::from_str(&reply).unwrap();
+            assert!(
+                matches!(reply.result,ResponseResult::Pong{client_listener,..} if client_listener==expected)
+            );
+        }
+    }
+
+    #[test]
     fn ping_request_returns_pong() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let response = handle_request(
@@ -1446,6 +1490,7 @@ mod tests {
             }),
             crate::platform::peer::Credentials::default(),
             &Mutex::default(),
+            &crate::api::client_listener::Health::default(),
             &Default::default(),
         );
 
@@ -1470,6 +1515,7 @@ mod tests {
                 None,
                 Default::default(),
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             )
         });
@@ -1546,6 +1592,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             );
             done_tx.send(result).unwrap();
@@ -1586,6 +1633,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             );
             done_tx.send(result).unwrap();
@@ -1667,6 +1715,7 @@ mod tests {
             &running,
             None,
             &Mutex::default(),
+            &crate::api::client_listener::Health::default(),
             &Default::default(),
         )
         .unwrap();
@@ -1766,6 +1815,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             )
         });
@@ -1826,6 +1876,7 @@ mod tests {
                     &stop,
                     None,
                     &Mutex::default(),
+                    &crate::api::client_listener::Health::default(),
                     &Default::default(),
                 )
             });
@@ -1891,6 +1942,7 @@ mod tests {
                 &stop,
                 None,
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             )
         });
@@ -1933,6 +1985,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             );
             done_tx.send(result).unwrap();

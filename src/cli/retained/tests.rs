@@ -99,6 +99,7 @@ async fn retained_doctor_socket_round_trip_reports_the_actual_registry() {
             &Arc::new(AtomicBool::new(true)),
             None,
             &Mutex::default(),
+            &crate::api::client_listener::Health::default(),
             &policy,
         )
         .unwrap();

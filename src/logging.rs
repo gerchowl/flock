@@ -52,6 +52,39 @@ pub(crate) fn structured_stream_repaired(bytes_dropped: u64) {
     );
 }
 
+/// Report accept failures with typed classes and errno, never request contents.
+#[cfg(feature = "web")]
+pub(crate) fn client_accept_failed(
+    error: &std::io::Error,
+    class: crate::platform::client_listener::AcceptFailure,
+) {
+    use crate::platform::client_listener::AcceptFailure;
+    let errno = error.raw_os_error();
+    let event = "client.listener.accept";
+    match class {
+        AcceptFailure::Connection => tracing::debug!(event, errno, ?class),
+        AcceptFailure::Resource | AcceptFailure::Unknown => tracing::warn!(event, errno, ?class),
+        AcceptFailure::Fatal => tracing::error!(event, errno, ?class),
+    }
+}
+
+/// Report skipped queue records with fixed reasons and optional cursors, never payloads.
+pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'static str) {
+    tracing::warn!(
+        event = "structured.queue.record_skipped",
+        sequence = ?sequence,
+        reason,
+        "skipped queue record; original journal retained"
+    );
+}
+
+/// Report the first corrupt queue record without exposing any input payload.
+pub(crate) fn structured_queue_corrupt(reason: &crate::structured::queue::QueueJournalCorrupt) {
+    tracing::warn!(event = "structured.queue.corrupt", sequence = ?reason.seq,
+        offset = reason.offset, reason = reason.reason,
+        "queue journal is read-only; operator recovery required");
+}
+
 /// Report a durable corrupt-blob replacement without exposing stored content.
 pub(crate) fn structured_blob_repaired(reference: &crate::structured::blobs::BlobRef) {
     tracing::warn!(
