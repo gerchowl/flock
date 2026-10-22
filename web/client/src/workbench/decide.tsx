@@ -16,8 +16,8 @@
  * seq changes, the card enters "Request changed — review it": every button
  * (and an open confirm) stays disabled until the person acknowledges with
  * "Review new request", and only then do the buttons bind to the new seq.
- * The same holds for a request id that closes and comes back: the inbox remembers
- * closed ids for the view (`InboxCards`), and a returning id starts unacknowledged.
+ * The same holds for a request id that closes and comes back: the Workbench remembers
+ * closed ids for the session (its lifetime, across view switches; `createClosedIds`), and a returning id starts unacknowledged.
  * The server does not promise ids stay unique forever: it rejects an id that is
  * still open or in its last 1024 closed handles, but "reusing an evicted harness ID
  * is safe because its new sequence cannot match an old decision", and a new

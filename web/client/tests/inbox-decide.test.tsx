@@ -127,6 +127,28 @@ describe("answering a prompt", () => {
     expect(cmds(app)[0]?.args).toMatchObject({ request_id: "r1", request_seq: 50 });
   });
 
+  for (const closeWhileAway of [false, true]) {
+    test(`a closed id that reopens after leaving the phone Inbox tab still needs review (closed ${closeWhileAway ? "while away" : "before leaving"})`, () => {
+      const app = prompt("phone");
+      const tab = (label: string): HTMLButtonElement => {
+        const found = [...app.root.querySelectorAll<HTMLButtonElement>(".tabbar button")].find((b) => b.textContent?.startsWith(label));
+        if (found === undefined) throw new Error(`no ${label} tab`);
+        return found;
+      };
+      if (!closeWhileAway) app.close("atlas", "r1");
+      tab("Agents").click();
+      expect(cards(app.root)).toHaveLength(0);
+      if (closeWhileAway) app.close("atlas", "r1");
+      app.event("atlas", "r1", "Bash", { command: "rm -rf build" }, 50);
+      tab("Inbox").click();
+      expect(cards(app.root)).toHaveLength(1);
+      expect(status(app)).toBe("Request changed — review it.");
+      for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
+      button(app, "Review new request").click();
+      expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
+    });
+  }
+
   test("a caught send error covers the status only until the status changes", () => {
     const app = prompt();
     const connection = app.h.connection as unknown as { command: (...args: unknown[]) => string };
