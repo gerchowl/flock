@@ -106,8 +106,12 @@ pub(super) fn render_float_overlay(
 
     // Host text selection over the float, painted with the same style layout
     // panes use (keyed to the float's pane id, offset to the overlay rect).
+    let selection = app
+        .selection
+        .as_ref()
+        .and_then(|selection| rt.resolve_selection(selection));
     super::panes::render_selection_highlight(
-        &app.selection,
+        &selection,
         frame,
         float.pane_id,
         inner,

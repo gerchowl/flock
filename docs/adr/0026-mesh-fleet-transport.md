@@ -324,6 +324,26 @@ query is relayed through a chain of hubs, and replies are not replicated to
 speculative future hubs. Without a route to a surviving custodian, mail
 remains held until a path appears or its TTL expires.
 
+**Clarification (#1754): collector assignment and offer history.** A held row's
+`next_hop` selects its current collector; it is not an immutable hub assignment.
+An outbound `mesh.collect` request can offer the row only to that hub, and
+collection revalidates the recipient's route before leasing an offer. A route
+pass can clear an obsolete assignment and assign the same held copy to another reachable hub. Lease expiry alone
+does not authorize another hub. Signed adverts describe the current local
+view, so independent withdrawals in a diamond can temporarily leave a valid
+alternate path through the other hub. A later advert can withdraw that path.
+Silence is not withdrawal, and gating one hub's poll does not gate another.
+
+For a held outbound row, `collect_attempts` counts leased offers, including
+offers whose response or acknowledgement never arrives. It does not count
+successful imports and is not scoped to a hub or route generation. Clearing or replacing
+an assignment preserves this history. Consequently, a row can be unrouted
+with a nonzero offer count, and a subsequent stale-hop rejection must preserve
+that count without adding another offer. A zero-count assertion requires an
+interleaving that excludes every earlier eligible collector; local route
+absence by itself supplies no such proof. Custody remains held until durable
+acknowledgement or a terminal outcome, under the origin/custody contract above.
+
 A spoke with no outbound edges signals pending work with `mesh.wake` on the
 hub-opened edge. The hub pulls neighbor-addressed custody with
 `mesh.collect` and pushes mail toward the spoke with `mesh.deliver`.

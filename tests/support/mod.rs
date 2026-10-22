@@ -14,8 +14,10 @@ pub mod composer;
 pub mod fleet;
 pub mod json_api;
 pub mod paths;
+pub mod process_lifetime;
 pub mod process_table;
 pub mod readiness;
+pub mod sandboxes;
 pub mod scripted;
 pub mod server_startup;
 pub mod socket_dir;
@@ -165,9 +167,11 @@ pub fn wait_for_socket(path: &Path, timeout: Duration) {
 /// The handoff importers server `old_pid` spawned inside the sandbox rooted at
 /// `config_home` (#1261).
 ///
-/// An importer runs `flk server --handoff-import <socket> <token>`, where the
-/// socket is `<config dir>/flock-handoff-<old pid>.sock` and the config dir is
-/// under the sandbox's `XDG_CONFIG_HOME`. The file name alone is not enough:
+/// An importer runs `flk server --handoff-import <socket>`, with its token in the
+/// environment. Its socket is `<config dir>/flock-handoff-<old pid>.sock`;
+/// the config dir is under the sandbox's `XDG_CONFIG_HOME`. Legacy exporters
+/// append the token positionally, which does not affect this lookup.
+/// The file name alone is not enough:
 /// pids are reused, so a test server can share its pid with the server an
 /// operator's live importer was spawned by, and a global `pgrep -f` on the file
 /// name would hand the live server to this harness's cleanup kill. The socket
