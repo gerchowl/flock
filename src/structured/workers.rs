@@ -43,10 +43,10 @@ pub struct Launch {
     pub leases: SessionLeases,
     /// Durable stream/supervision directory.
     pub state: PathBuf,
+    /// Caller-supplied `[sessions]` storage policy, captured for this launch.
+    pub storage: super::blobs::StorageConfig,
     /// Pinned flock executable and owning server socket for this session.
     pub mcp: SessionMcp,
-    /// Loaded session storage policy, supplied by the authenticated launch caller.
-    pub storage: super::blobs::StorageConfig,
     /// Caller-supplied sessions stall policy, with no guessed default.
     pub stall_after: Duration,
     /// Optional authenticated delegation lineage.
@@ -120,6 +120,7 @@ impl Worker {
 /// discard confirmed completions, while uncertain ownership remains recoverable.
 pub struct Workers {
     entries: BTreeMap<String, Worker>,
+    history: BTreeMap<String, (u64, super::history::History)>,
     pending: BTreeMap<String, Option<String>>,
     #[cfg(test)]
     before_reserve: Option<mpsc::Receiver<()>>,
@@ -139,6 +140,7 @@ impl Workers {
             wakes,
             shutdown_result: None,
             entries: BTreeMap::new(),
+            history: BTreeMap::new(),
             pending: BTreeMap::new(),
             #[cfg(test)]
             before_reserve: None,
@@ -160,8 +162,8 @@ impl Workers {
             generation: current,
             leases,
             state,
-            mcp,
             storage,
+            mcp,
             stall_after,
             lineage,
             admission,
@@ -325,6 +327,34 @@ impl Workers {
             .filter(|w| w.generation == generation && !w.finished)
             .and_then(|w| w.runtime.as_ref())
     }
+    /// Registry-fenced stored stream, retained after runtime exit. This handle
+    /// lives with runtime ownership, never inside the pure registry/AppState.
+    pub fn history(&self, registry: &Registry, id: &str) -> Option<&super::history::History> {
+        let (generation, source) = self.history.get(id)?;
+        let (_, _, current) = registry.get(id)?;
+        (*generation == current).then_some(source)
+    }
+    /// Install a closed-file source recovered on an I/O worker. A changed epoch,
+    /// active producer or already installed source refuses stale recovery.
+    pub fn install_retained(
+        &mut self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+        source: super::history::History,
+    ) -> Result<(), ErrorCode> {
+        if registry.get(id).is_none_or(|(record, _, g)| {
+            g != generation || !source.belongs_to(&record.agent_id, &record.session_id)
+        }) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        if self.history(registry, id).is_some() || self.entries.get(id).is_some_and(|w| !w.finished)
+        {
+            return Err(ErrorCode::SessionBusy);
+        }
+        self.history.insert(id.into(), (generation, source));
+        Ok(())
+    }
     /// Latch cancellation without blocking on preparation, process or I/O cleanup.
     pub fn stop(&self, id: &str, generation: u64) -> bool {
         let Some(worker) = self.entries.get(id).filter(|w| w.generation == generation) else {
@@ -363,6 +393,8 @@ impl Workers {
                         self.pending.remove(id);
                     }
                     Ok(Message::Ready(runtime)) => {
+                        self.history
+                            .insert(id.clone(), (worker.generation, runtime.history.clone()));
                         if worker.stop.requested() {
                             runtime.stop();
                         }
@@ -453,6 +485,9 @@ impl Workers {
                 changed = true;
             }
         }
+        self.history.retain(|id, (generation, _)| {
+            registry.get(id).is_some_and(|(_, _, g)| g == *generation)
+        });
         // Removed records need no completed handle; uncertain ownership must survive.
         self.entries.retain(|id, worker| {
             worker.join_finished();

@@ -364,6 +364,20 @@ impl App {
         self.last_pane_click = None;
         if let Err(err) = crate::platform::open_url(&url) {
             crate::logging::pane_open_url_failed(&url, &err.to_string());
+            let previous_toast = self.state.toast.clone();
+            self.state.toast = Some(crate::app::state::ToastNotification {
+                kind: crate::app::state::ToastKind::NeedsAttention,
+                title: if matches!(&err, crate::platform::OpenUrlError::Refused(_)) {
+                    "link blocked"
+                } else {
+                    "link not opened"
+                }
+                .into(),
+                context: err.to_string(),
+                position: None,
+                target: None,
+            });
+            self.sync_toast_deadline(previous_toast);
         }
         true
     }
@@ -646,7 +660,10 @@ fn numbered_lines_bytes(count: usize) -> Vec<u8> {
 fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
     let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
     crate::persist::capture(
-        &state.structured_agents,
+        crate::persist::RegistryCapture {
+            registry: &state.structured_agents,
+            now_ms: Some(42),
+        },
         &state.workspaces,
         &state.terminals,
         &terminal_runtimes,

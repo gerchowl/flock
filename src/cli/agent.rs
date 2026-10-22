@@ -239,6 +239,12 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
+    if crate::terminal::agent_name::validate(name).is_err() {
+        return super::print_response(
+            &serde_json::json!({"ok": false, "error": crate::terminal::agent_name::refusal()}),
+        );
+    }
+
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
         eprintln!("usage: {AGENT_START_USAGE}");
         return Ok(2);
@@ -999,6 +1005,12 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     } else {
         Some(args[1..].join(" "))
     };
+
+    if crate::terminal::agent_name::validate(name.as_deref().unwrap_or_default()).is_err() {
+        return super::print_response(
+            &serde_json::json!({"ok": false, "error": crate::terminal::agent_name::refusal()}),
+        );
+    }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:rename".into(),

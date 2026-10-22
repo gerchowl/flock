@@ -165,6 +165,17 @@ impl App {
             );
         }
 
+        if params
+            .name
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            return encode_error(
+                id,
+                crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+                crate::terminal::agent_name::POLICY,
+            );
+        }
         let Some(kind) = AgentKind::parse(params.agent.trim()) else {
             return encode_error_with_data(
                 id,
@@ -341,7 +352,13 @@ impl App {
             .map(str::trim)
             .filter(|n| !n.is_empty())
         {
-            self.set_spawned_agent_name(ws_idx, pane_id, name);
+            if self.set_spawned_agent_name(ws_idx, pane_id, name).is_err() {
+                return encode_error(
+                    id,
+                    crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+                    crate::terminal::agent_name::POLICY,
+                );
+            }
         }
 
         let Some(agent) = self.agent_info(ws_idx, pane_id) else {
@@ -581,7 +598,7 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
         name: &str,
-    ) {
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
         let terminal_id = self
             .state
             .workspaces
@@ -589,8 +606,9 @@ impl App {
             .and_then(|ws| ws.pane_state(pane_id))
             .map(|pane| pane.attached_terminal_id.clone());
         if let Some(terminal) = terminal_id.and_then(|tid| self.state.terminals.get_mut(&tid)) {
-            terminal.set_agent_name(name.to_string());
+            terminal.set_agent_name(name.to_string())?;
         }
+        Ok(())
     }
 
     /// Resolve a [`SpawnLocation`] to an OPEN workspace index.
