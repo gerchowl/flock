@@ -4,9 +4,19 @@
 //! modules don't scatter `#[cfg]` branches through product logic.
 
 pub(crate) mod client_listener;
+mod url;
+pub use url::{open_url, validate_url, OpenUrlError};
+
 pub(crate) mod peer;
 pub(crate) mod received_fd;
 pub(crate) mod structured;
+
+/// A same-device observation is only a possible unmounted-mount hint, not proof.
+pub(crate) fn same_device_as_parent(path: &std::path::Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = path.parent()?;
+    Some(std::fs::metadata(path).ok()?.dev() == std::fs::metadata(parent).ok()?.dev())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
@@ -251,5 +261,9 @@ mod tests {
     }
 }
 
+pub(crate) mod blobs;
 pub(crate) mod client_token_lock;
 pub(crate) mod client_tokens;
+
+#[cfg(test)]
+pub(crate) mod socket_test_support;

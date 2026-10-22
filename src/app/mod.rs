@@ -143,8 +143,9 @@ impl PaneClickState {
 }
 
 /// Socket attribution preserved across recovery continuations.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ApiCaller {
+    scope: Option<crate::api::scoped::Scope>,
     pid: Option<u32>,
     birth: Option<Option<u64>>,
     uid: Option<Option<u32>>,
@@ -176,6 +177,28 @@ pub(crate) struct AppRuntimeConfig {
     pub(crate) uid_policy: crate::structured::identity::UidPolicy,
 }
 
+impl AppRuntimeConfig {
+    /// Capture one server's launch-time identity policy before starting listeners.
+    pub(crate) fn for_config(config: &Config) -> Self {
+        Self::for_config_with_uid_policy(config, Default::default())
+    }
+
+    /// Select account policy from injected dependencies before cloning for listeners.
+    pub(crate) fn for_config_with_uid_policy(
+        config: &Config,
+        mut uid_policy: crate::structured::identity::UidPolicy,
+    ) -> Self {
+        // Absence is explicit policy, never an inference from a pending lookup.
+        if config.security.agent_account == crate::config::model::AgentAccount::None {
+            uid_policy.dedicated = Ok(None).into();
+        }
+        Self {
+            merge_gate: Default::default(),
+            uid_policy,
+        }
+    }
+}
+
 pub struct App {
     pub(crate) runtime_config: AppRuntimeConfig,
     /// Shared, in-memory one-time browser handoffs, never persisted across restart.
@@ -186,6 +209,8 @@ pub struct App {
     /// Peer PID of the API request currently being handled; lets pane
     /// reports resolve by process ancestry when env pane-ids are stale.
     pub(crate) current_api_peer_pid: Option<u32>,
+    /// Revocable scoped admission, preserved across queues and continuations.
+    pub(crate) current_api_scope: Option<crate::api::scoped::Scope>,
     /// Internal call, captured socket birth, or captured-but-unavailable birth.
     pub(crate) current_api_peer_birth: Option<Option<u64>>,
     /// Internal call, captured UID, or captured-but-unavailable UID.
@@ -290,6 +315,8 @@ pub struct App {
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
+    /// Last dispatch gate; summaries read it without probing the filesystem.
+    pub(crate) git_refresh_idle: Option<crate::api::schema::PollerReason>,
     /// An issue-guard fetch is running off-loop (#302).
     pub(crate) issue_guard_fetch_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
@@ -532,24 +559,22 @@ impl App {
             config_diagnostic,
             api_rx,
             event_hub,
-            AppRuntimeConfig::default(),
+            AppRuntimeConfig::for_config(config),
         )
     }
 
     /// Construct an app with explicit process dependencies. Missing executables
     /// retain the merge gate's normal failure classification, without fallback.
+    /// Select account policy with `AppRuntimeConfig::for_config` or its injected
+    /// variant before cloning it for the API listener; this preserves that cache.
     pub(crate) fn new_with_runtime_config(
         config: &Config,
         no_session: bool,
         config_diagnostic: Option<String>,
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
-        mut runtime_config: AppRuntimeConfig,
+        runtime_config: AppRuntimeConfig,
     ) -> Self {
-        // Absence is explicit policy, never an inference from a pending lookup.
-        if config.security.agent_account == crate::config::model::AgentAccount::None {
-            runtime_config.uid_policy.dedicated = Ok(None).into();
-        }
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
         crate::channels::issue_tokens(&config.channels, &short_host_name());
@@ -779,6 +804,9 @@ impl App {
             adopt_external_worktrees: config.worktrees.adopt_external,
             branch_pivot_message: config.worktrees.branch_pivot_message.clone(),
             peers: config.peers.clone(),
+            server_nodes: Default::default(),
+            server_paths: Default::default(),
+            server_node: None,
             peer_summaries: config
                 .peers
                 .iter()
@@ -993,6 +1021,7 @@ impl App {
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
             current_api_peer_pid: None,
+            current_api_scope: None,
             current_api_peer_birth: None,
             current_api_peer_uid: None,
             session_leases: Default::default(),
@@ -1001,6 +1030,7 @@ impl App {
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             git_refresh_in_flight: false,
+            git_refresh_idle: None,
             issue_guard_fetch_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_status_cache: HashMap::new(),
@@ -1279,11 +1309,13 @@ impl App {
         peer_pid: Option<u32>,
         peer_birth: Option<Option<u64>>,
         peer_uid: Option<Option<u32>>,
+        scope: Option<crate::api::scoped::Scope>,
         respond_to: std::sync::mpsc::Sender<String>,
     ) {
         self.recovery_parked.push(ParkedApiRequest {
             request,
             caller: ApiCaller {
+                scope,
                 pid: peer_pid,
                 birth: peer_birth,
                 uid: peer_uid,
@@ -1316,7 +1348,9 @@ impl App {
             self.current_api_peer_birth,
             self.current_api_peer_uid,
         );
+        let scope = self.current_api_scope.take();
         for parked in std::mem::take(&mut self.recovery_parked) {
+            self.current_api_scope = parked.caller.scope;
             self.current_api_peer_pid = parked.caller.pid;
             self.current_api_peer_birth = parked.caller.birth;
             self.current_api_peer_uid = parked.caller.uid;
@@ -1328,6 +1362,7 @@ impl App {
             self.current_api_peer_birth,
             self.current_api_peer_uid,
         ) = caller;
+        self.current_api_scope = scope;
     }
 
     #[cfg(unix)]
@@ -1342,7 +1377,8 @@ impl App {
             crate::handoff_runtime::ImportedHandoffRuntime,
         >,
     ) -> io::Result<Self> {
-        let structured_agents = snapshot.structured_agents.snapshot();
+        let mut structured_agents = snapshot.structured_agents.snapshot();
+        structured_agents.restore_retained_stamps(&snapshot.structured_retention);
         // Self::new restores attempt evidence once, including interrupted submissions.
         let mut app = Self::new(config, true, config_diagnostic, api_rx, event_hub);
         let (workspaces, terminals, runtimes) = crate::persist::restore_handoff(

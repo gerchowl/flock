@@ -79,6 +79,17 @@ flk status client
 
 Server status includes the API socket listener’s accept-error count, latest error, and `stopped` flag. Transient accept failures retry with exponential backoff from 50 ms to 2 s, reset on a successful accept. Invalid listener descriptors stop immediately; unclassified errors stop after five consecutive failures. Failure runs log on onset and recovery rather than on every attempt. Diagnostics remain until that listener is replaced. With `--json`, these are under `server.api_listener` (or `api_listener` for `status server --json`). Older servers report no listener diagnostics. A stopped listener cannot accept new status requests; its terminal error is also recorded in the server log.
 
+`flk peers summary` includes `pollers.git_refresh`. It reports `idle` with
+`reason: "no_viewer"`, `"no_workspaces"` or `"no_eligible_workspaces"` when its
+viewer/workspace gate is closed. Idle does not reset past errors or invent a new
+success timestamp. Old results alone are `degraded` with `"awaiting_refresh"`;
+`broken` requires a real failure or a round beyond its existing 60-second bound,
+and carries a typed `last_error` (including `"round_stalled"`). An in-flight
+stalled round remains visible even after the last viewer leaves. Status remains
+an open string; the optional reason is additive on mesh v5, and unknown future
+reasons decode as `unknown`. Worker/command failure accounting is completed by
+the second [#1722](https://github.com/gerchowl/flock/issues/1722) slice.
+
 ## Peer enrollment
 
 `flk peers` and `flk status` show each peer's name, pin direction, short node
@@ -298,6 +309,15 @@ Allocation commands (`worktree create`, `agent fork`, `agent start`, `workspace 
 Worktrees are normal Flock workspaces with Git checkout provenance. `worktree create` creates a Git worktree checkout, opens it as a workspace, and groups it with the parent repo workspace. Without `--path`, Flock creates the checkout under `<worktrees.directory>/<repo>/<branch-slug>`. `--base` is refreshed from its remote first, exactly as `delegate start --base` does (below), and the ref and commit used are printed on stderr (`base origin/dev (<sha>)`). The TUI's new-worktree dialog refreshes its base the same way. The refresh happens in the CLI and the TUI's worker, never in the server: a raw socket `worktree.create` uses its `base` as written (see the socket API).
 
 `workspace close` closes Flock state only. `worktree remove` is the explicit checkout deletion path; it runs `git worktree remove`, never deletes the branch, and requires `--force` when Git refuses a dirty checkout.
+
+A registered checkout directory that is present but has no valid `.git` link
+back to this repository's worktree admin entry is refused with
+`worktree_checkout_unreachable` (exit 10, retry `after_human`). `--force` cannot
+override it. The TUI kill dialog gives the same recovery: remount and retry, or,
+if the checkout is really gone, remove the directory yourself and retry. Flock
+never runs `git worktree prune` during removal or kill: pruning is repo-wide
+and can unlink other checkouts that are only temporarily absent. A completely
+absent directory still permits Git to remove that single registration.
 
 `worktree list` prints a table ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. `AGE` is the last commit on the branch — deliberately not the directory's mtime, which a build that rewrites `target/` makes meaningless. `--scan` adds a `VERDICT` column (`merged`, `not_merged`, `open_pr`, `unknown`, `protected`; `unknown` is a gate that timed out or a `gh` that could not answer, with the reason on the next line) resolved through the same gate `worktree kill` runs, so a squash-merged branch reads `merged` here exactly as it does there; it is opt-in because it costs local Git plus a `gh` call per checkout. Absence of a verdict means "not scanned", never "not merged". `--json` prints the raw response, where the fields are `last_commit_at` and `kill_verdict`.
 
@@ -821,6 +841,18 @@ Speaks the Model Context Protocol over stdio: newline-delimited JSON-RPC 2.0 on 
 
 The server advertises two capabilities: `tools` (the closed table below) and `resources` (handed-over files). It claims no `subscribe`/`listChanged` sub-capability, because it pushes no resource notifications.
 
+### Structured session registration
+
+The structured runtime prepares its own private `--mcp-config` with exactly one MCP server named flock: an absolute pinned flk executable running `mcp serve`, with the owning server's explicit `FLOCK_SOCKET_PATH`. It does not install or edit the operator's MCP profile. The JSON contains no setup-token, operator credentials or trusted agent-id hint. Under ADR-0036 §1/§1a, the MCP child inherits the live Claude process ancestry; the server checks the reserved session's PID and birth time to attribute calls to that agent. A missing, mismatched or already released reservation refuses registration with `structured_mcp_lease_required` (exit 2, retry `never`), before any server is added.
+
+Missing or relative executable paths and relative socket paths fail preparation. Private-file I/O errors propagate without falling back to operator config. Registration does not assert that the harness connected successfully; MCP process startup and tool failures remain harness/tool failures.
+
+The config is mode 0600 inside a fresh mode 0700 session directory. Rotation replaces only that session's MCP file. Unstarted or failed-spawn sessions remove it; running sessions retain it until supervision confirms descendant cleanup. Unconfirmed cleanup retains files and the lease for investigation. The persistent harness transcript profile remains available for resume.
+
+The available tools are the closed table below, subject to the same per-tool policy as socket calls. Messaging and `flock_delegate_list` with `architect: "self"` use the attested structured agent identity. Operator-only owner/policy writes have no MCP tool and refuse as `not_exposed_via_mcp`; direct socket attempts from the same leased ancestry still refuse with `operator_only` (exit 13). Tools requiring a pane, including pane-based restart, self-compaction and wait parking, do not acquire a pane from this registration and can refuse with `no_caller_pane` or their existing tool-specific refusal.
+
+This wires the internal runtime; public structured starts remain gated by #1439. It does not pre-allow tools or answer permission requests: stdio permissions and richer MCP question handling remain the S6 work in ADR-0036 (#1307). The default dedicated-user launch is still refused until #1208; explicit operator-mode sessions retain operator-uid filesystem access, and process detachment remains a limit until uid enforcement (#1629).
+
 ### Addressing across hosts
 
 A pane id names a placement on **one** server, so it cannot address anything on another machine. An `agent_id` can: it is fleet-global and restart-stable (ADR-0008), and it is what `flock_agent_list`'s `fleet` rows report alongside the `host` the agent lives on and a `local` flag.
@@ -844,7 +876,7 @@ Replies need no addressing: `flock_msg_reply` carries the incoming `correlation_
 
 Each hop verifies the origin signature and evaluates `[msg] allow_from` against that origin's configured name, never the forwarding hub. An origin without a configured name matches only `"*"`. Forwarders persist custody before acknowledging and delete their body copy after transfer. The origin retains its copy until final receipt or expiry. Requests carry a visited-node list and a hop budget of eight; loops and exhausted budgets retain upstream custody until routing changes. Fleet pause freezes custody and its TTL. Multi-hop answers and receipts are separate mesh work.
 
-The tool table is closed and intentionally read-mostly. Mutating verbs (`pane.close`, `worktree.remove`/`create`, `agent.start`/`rename`/`focus`, raw pane `send_*`, `server.*`, `notification.*`, `integration.*`) are not exposed and refuse with JSON-RPC code `-32000` and `data.refusal = "not_exposed_via_mcp"`. Modelled flock refusals (`unsupported_for_agent`, `no_agent_session`, `transcript_not_found`, …) propagate through the same code with the flock error code in `data.refusal`.
+The tool table is closed and intentionally read-mostly. Mutating verbs (`pane.close`, `worktree.remove`/`create`, `agent.rename`/`focus`, `agent.start`, raw pane `send_*`, `server.*`, `notification.*`, `integration.*`) are not exposed and refuse with JSON-RPC code `-32000` and `data.refusal = "not_exposed_via_mcp"`. Modelled flock refusals (`unsupported_for_agent`, `no_agent_session`, `transcript_not_found`, …) propagate through the same code with the flock error code in `data.refusal`.
 
 Exposed tools:
 
