@@ -167,9 +167,11 @@ pub fn wait_for_socket(path: &Path, timeout: Duration) {
 /// The handoff importers server `old_pid` spawned inside the sandbox rooted at
 /// `config_home` (#1261).
 ///
-/// An importer runs `flk server --handoff-import <socket> <token>`, where the
-/// socket is `<config dir>/flock-handoff-<old pid>.sock` and the config dir is
-/// under the sandbox's `XDG_CONFIG_HOME`. The file name alone is not enough:
+/// An importer runs `flk server --handoff-import <socket>`, with its token in the
+/// environment. Its socket is `<config dir>/flock-handoff-<old pid>.sock`;
+/// the config dir is under the sandbox's `XDG_CONFIG_HOME`. Legacy exporters
+/// append the token positionally, which does not affect this lookup.
+/// The file name alone is not enough:
 /// pids are reused, so a test server can share its pid with the server an
 /// operator's live importer was spawned by, and a global `pgrep -f` on the file
 /// name would hand the live server to this harness's cleanup kill. The socket
@@ -255,7 +257,7 @@ pub fn frame_message(payload: &[u8]) -> Vec<u8> {
 /// means a protocol bump touches one line rather than the dozen call sites
 /// that used to hardcode the number — which is how a bump used to fail a
 /// terminal-size test for reasons that had nothing to do with terminal sizes.
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// The live-handoff refusal notice a server sends a connecting client while a
 /// live update is in flight (#38). A client that reads it opens its retry
