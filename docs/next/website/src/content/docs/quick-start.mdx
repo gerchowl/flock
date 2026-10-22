@@ -53,7 +53,7 @@ Flock is mouse-native. You can click panes, tabs, workspaces, and agents; drag b
 
 If you configure `ui.right_click_passthrough_modifier`, that modifier plus right-click sends right-click, hold, and drag gestures to mouse-reporting pane apps.
 
-Ctrl-click opens pane links when your terminal sends the modified click to Flock. This works for OSC 8 hyperlinks and visible `http://` or `https://` URLs. The portable terminal-native fallback is Shift-Ctrl-click on Linux or Shift-Cmd-click on macOS.
+Ctrl-click opens pane links when your terminal sends the modified click to Flock. Flock opens only HTTP/HTTPS links without raw whitespace or control characters; rejected links show a non-fatal notice. This works for OSC 8 hyperlinks and visible `http://` or `https://` URLs. The portable terminal-native fallback is Shift-Ctrl-click on Linux or Shift-Cmd-click on macOS.
 
 ## Copy from the keyboard
 
