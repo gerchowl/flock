@@ -5,8 +5,8 @@
  * - **fixture** replays the recorded session as the `fixture` agent, with
  *   sample rows and inbox cards, under the replay badge (the owner preview);
  * - **wire** connects to the configured server (G3a, #1747). Its agent list
- *   is fleet-lite (#1746); the inbox stays empty until G5 (#1597). Its
- *   token is, in order: one exchanged for the fragment's one-time code, the
+ *   is fleet-lite (#1746); its inbox lists the open permission prompts (#1749).
+ *   Its token is, in order: one exchanged for the fragment's one-time code, the
  *   one this tab already holds in `sessionStorage`, or the shell's (Tauri).
  *   With none it waits in NeedsToken (ADR-0038 §3, `src/wire/token.ts`).
  *
