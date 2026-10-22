@@ -64,6 +64,8 @@ pub struct Runtime {
     control: StopHandle,
     events: mpsc::Receiver<Received>,
     queue: Option<super::workers::queue::Client>,
+    /// Stored publication handle for the registry runtime owner.
+    pub(super) history: super::history::History,
 }
 impl Runtime {
     /// Offer a bounded user envelope only while idle; WouldBlock never waits.
@@ -338,6 +340,7 @@ pub(crate) fn run_controlled(
             ))
         }
     };
+    let history = transport.history.clone();
     let control = transport.stop_handle();
     let input = transport.input_handle();
     let (events_tx, events) = mpsc::sync_channel(4);
@@ -374,6 +377,7 @@ pub(crate) fn run_controlled(
     }
     let publication_failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ready(Runtime {
+            history,
             transport: input,
             stop: stop.clone(),
             control: control.clone(),

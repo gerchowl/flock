@@ -5224,3 +5224,4 @@ fn custody_completion_transport_refusal_cannot_revoke_own_inbox() {
     store.finish(&mail.key, Outcome::Read, 3).unwrap();
     assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "read");
 }
+mod diamond;

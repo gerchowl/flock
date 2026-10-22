@@ -121,6 +121,7 @@ pub struct Workers {
     recovery_slot: Option<(String, std::sync::Weak<()>)>,
     retained_queues: BTreeMap<String, (u64, queue::publication::Source)>,
     entries: BTreeMap<String, Worker>,
+    history: BTreeMap<String, (u64, super::history::History)>,
     notify: Arc<Notify>,
     // Coalesced wake for teardown while the async server loop is quiescent.
     wake: mpsc::SyncSender<()>,
@@ -139,6 +140,7 @@ impl Workers {
             recovery_slot: None,
             retained_queues: BTreeMap::new(),
             entries: BTreeMap::new(),
+            history: BTreeMap::new(),
             notify,
         }
     }
@@ -370,6 +372,34 @@ impl Workers {
             })
             .collect()
     }
+    /// Registry-fenced stored stream, retained after runtime exit. This handle
+    /// lives with runtime ownership, never inside the pure registry/AppState.
+    pub fn history(&self, registry: &Registry, id: &str) -> Option<&super::history::History> {
+        let (generation, source) = self.history.get(id)?;
+        let (_, _, current) = registry.get(id)?;
+        (*generation == current).then_some(source)
+    }
+    /// Install a closed-file source recovered on an I/O worker. A changed epoch,
+    /// active producer or already installed source refuses stale recovery.
+    pub fn install_retained(
+        &mut self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+        source: super::history::History,
+    ) -> Result<(), ErrorCode> {
+        if registry.get(id).is_none_or(|(record, _, g)| {
+            g != generation || !source.belongs_to(&record.agent_id, &record.session_id)
+        }) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        if self.history(registry, id).is_some() || self.entries.get(id).is_some_and(|w| !w.finished)
+        {
+            return Err(ErrorCode::SessionBusy);
+        }
+        self.history.insert(id.into(), (generation, source));
+        Ok(())
+    }
     /// Latch cancellation without blocking on preparation, process or I/O cleanup.
     pub fn stop(&self, id: &str, generation: u64) -> bool {
         let Some(worker) = self.entries.get(id).filter(|w| w.generation == generation) else {
@@ -408,6 +438,8 @@ impl Workers {
                 }
                 match worker.messages.try_recv() {
                     Ok(Message::Ready(runtime)) => {
+                        self.history
+                            .insert(id.clone(), (worker.generation, runtime.history.clone()));
                         if worker.stop.requested() {
                             runtime.stop();
                         }
@@ -511,6 +543,9 @@ impl Workers {
                 changed = true;
             }
         }
+        self.history.retain(|id, (generation, _)| {
+            registry.get(id).is_some_and(|(_, _, g)| g == *generation)
+        });
         // Keep committed completions after metadata removal; uncertain ownership survives.
         self.entries.retain(|id, worker| {
             worker.join_finished();

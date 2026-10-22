@@ -3331,6 +3331,7 @@ impl AppState {
 
         // Copy the token and keep its selection visible as short-lived feedback.
         let mut selection = Selection::range(pane_id, viewport_row, start_col, end_col, metrics);
+        rt.pin_selection(&mut selection, None);
         if !selection.finish() {
             return false;
         }
@@ -3372,7 +3373,8 @@ impl AppState {
             .into_iter()
             .find(|((x, y), _, _)| *x == screen_col && *y == screen_row)
         {
-            return safe_web_url(&uri).map(str::to_owned);
+            // The opener validates OSC8 targets and reports refusals to the operator.
+            return Some(uri);
         }
 
         let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
@@ -3405,6 +3407,7 @@ impl AppState {
         // rendered lines, not the PTY grid — the panel isn't a runtime
         // surface. Resolve to the pane's TerminalState + PaneInfo and hand
         // off to the panes helper that mirrors the renderer's geometry.
+        let mut pane_closed = false;
         let text = if sel.source == crate::selection::SelectionSource::PromptPanel {
             let info = self.pane_info_by_id(sel.pane_id).cloned();
             let terminal_id = self
@@ -3425,20 +3428,32 @@ impl AppState {
                 .visible_float_for_active_workspace()
                 .filter(|float| float.pane_id == sel.pane_id)
                 .map(|float| float.terminal_id.clone());
-            match float_terminal {
-                Some(terminal_id) => terminal_runtimes
-                    .get(&terminal_id)
-                    .and_then(|rt| rt.extract_selection(&sel)),
-                None => self
-                    .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id)
-                    .and_then(|rt| rt.extract_selection(&sel)),
-            }
+            let runtime = match float_terminal {
+                Some(terminal_id) => terminal_runtimes.get(&terminal_id),
+                None => self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id),
+            };
+            pane_closed = runtime.is_none();
+            runtime.and_then(|rt| rt.extract_selection(&sel))
         };
         if let Some(text) = text {
             if !text.is_empty() {
                 self.request_clipboard_write = Some(text.into_bytes());
                 info!("copied selection to clipboard");
             }
+        } else if sel.content_revision.is_some() {
+            crate::logging::selection_content_unavailable(pane_closed);
+            self.toast = Some(ToastNotification {
+                kind: ToastKind::NeedsAttention,
+                title: "Cannot copy selection".into(),
+                context: if pane_closed {
+                    "Selected pane closed"
+                } else {
+                    "Selected content was evicted, erased or is unavailable"
+                }
+                .into(),
+                position: None,
+                target: None,
+            });
         }
 
         self.clear_selection();
