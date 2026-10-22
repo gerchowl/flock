@@ -1383,11 +1383,13 @@ policy does not retry a condition assertion or declare a command successful.
 WS close **4401** means auth refused during hello; **4403** means token revoked
 mid-session. Both enter NeedsToken, holding the outbox without reconnecting until
 a new token arrives. These codes differ from protocol failures (visible error,
-capped reconnect) and network loss (reconnect). A verified socket whose
-post-registration token recheck misses the handshake deadline or loses its store
-worker closes with **1001**, preserving the credential for reconnect. A failed
-welcome send drops the transport without attempting an auth close; it cannot
-establish revocation. Only a credential that no longer authenticates, a changed verified principal,
+capped reconnect) and network loss (reconnect). During initial hello and the
+post-registration recheck, a handshake deadline miss, unavailable token-store
+worker, store I/O failure or unsafe storage closes with **1001**, preserving the
+credential for reconnect. Unsafe storage is not evidence that a bearer is invalid.
+Only an unauthorized or revoked credential justifies **4401** during hello.
+A failed welcome encode or send drops the transport without attempting another
+close send; it cannot establish revocation. Only a credential that no longer authenticates, a changed verified principal,
 or a revocation signal justifies **4403** after registration.
 Frames for a closed subscription ID are silently dropped. A frame for an ID
 never opened on the current connection is a protocol error, not a closed-ID case.
