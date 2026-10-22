@@ -241,6 +241,7 @@ impl ApiClient {
                 session_health,
                 api_listener,
                 agent_account_diagnostic,
+                ..
             } => Ok(crate::api::RuntimeStatus {
                 version: Some(version),
                 protocol: Some(protocol),
