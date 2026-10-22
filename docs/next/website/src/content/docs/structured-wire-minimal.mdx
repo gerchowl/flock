@@ -81,10 +81,19 @@ carries `request: ToolRequest`, from which the client renders the tool summary.
 A close carries `decision`, nullable `message`, `principal` and `source`, or a
 closed reason enum. Capacity refusals use `permission_request_limit` and may
 have no preceding open. Other reasons include `ended`, `cancelled`, `result`,
-`interrupted`, `permission_request_too_large`, and `session_ended` (restart
-recovery, #2236). Existing closed JSON is preserved apart from `request_seq`.
+`interrupted`, `permission_request_too_large`, and `session_ended` (a prior
+runtime left an unmatched open). Existing closed JSON is preserved apart from `request_seq`.
 
 The `permission-decision` fixture shows open, `agent.decide` acknowledgement,
 then closed. The ack acknowledges admission; remove the card when the durable
 closed event arrives. Future or incompatible record shapes use the existing
 unknown-event wrapper, preserving their original payload.
+
+On session start or resume, the owner closes unmatched permission records with
+`session_ended` before processing new control requests, including interrupted
+automatic approvals. The closes use normal durable audit ordering; an I/O
+failure stops the owner. Repeated starts add no duplicate close. Old permission
+slots and exact grants are not restored. Legacy opens without `request_seq`
+use their durable stream position for the recovery close; an old close without
+a handle matches by ID. Unknown records remain untouched, and invalid permission
+headers are logged and preserved rather than failing the entire recovery scan.

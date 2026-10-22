@@ -546,6 +546,97 @@ impl Book {
     }
 }
 
+/// Minimal, forward-compatible recovery projection of host-owned permission audits.
+/// Keep only handles, not tool inputs. Legacy opens use their durable position
+/// as the handle; an unsequenced legacy close retires that request ID.
+#[derive(Default)]
+pub(super) struct Orphaned {
+    open: BTreeMap<String, BTreeSet<u64>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AuditState {
+    Open,
+    Closed,
+}
+
+#[derive(Deserialize)]
+struct AuditHeader {
+    request_id: String,
+    #[serde(default)]
+    request_seq: Option<u64>,
+    state: AuditState,
+}
+
+impl Orphaned {
+    /// Project stable lifecycle fields without interpreting newer close metadata.
+    /// Unknown kinds/states and invalid headers never fail the whole stream load.
+    pub fn observe(&mut self, record: &super::transport::StreamRecord) {
+        if record.origin != super::transport::RecordOrigin::Flk {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&record.raw) else {
+            return;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("flk_permission_request") {
+            return;
+        }
+        let has_sequence = value.get("request_seq").is_some();
+        let header = serde_json::from_value::<AuditHeader>(value);
+        let Ok(header) = header else {
+            crate::logging::structured_permission_recovery_skipped(record.seq);
+            return;
+        };
+        let handle = header.request_seq.unwrap_or(record.seq);
+        if header.request_id.is_empty()
+            || header.request_id.len() > 256
+            || (has_sequence && header.request_seq.is_none())
+            || handle == 0
+            || handle > record.seq
+        {
+            crate::logging::structured_permission_recovery_skipped(record.seq);
+            return;
+        }
+        match header.state {
+            AuditState::Open => {
+                self.open
+                    .entry(header.request_id)
+                    .or_default()
+                    .insert(handle);
+            }
+            AuditState::Closed => {
+                if let Some(seq) = header.request_seq {
+                    if let Some(handles) = self.open.get_mut(&header.request_id) {
+                        handles.remove(&seq);
+                        if handles.is_empty() {
+                            self.open.remove(&header.request_id);
+                        }
+                    }
+                } else {
+                    self.open.remove(&header.request_id);
+                }
+            }
+        }
+    }
+    /// Close unmatched handles without resurrecting old slots or session grants.
+    pub fn into_closes(self) -> impl Iterator<Item = PermissionRecord> {
+        self.open.into_iter().flat_map(|(id, handles)| {
+            handles.into_iter().map(move |seq| {
+                PermissionRecord::new(
+                    &id,
+                    seq,
+                    PermissionState::Closed {
+                        outcome: PermissionClose::Reason {
+                            reason: CloseReason::SessionEnded,
+                        },
+                    },
+                )
+            })
+        })
+    }
+}
+
 fn key(request: &ToolRequest) -> String {
     let mut input = Value::Object(request.input.clone());
     input.sort_all_objects();
