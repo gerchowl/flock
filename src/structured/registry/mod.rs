@@ -14,13 +14,40 @@
 //! authority. Metadata admission cannot replace an unknown collection format.
 #![deny(missing_docs)]
 
+mod retention;
+
 use super::state::{Input, SessionState, StateSink, Update};
 use crate::api::agent_state::{AgentState, Lifecycle};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// DEAD records older than thirty days since first observation are pruned on save.
+pub const RETAINED_DEAD_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// At most 256 DEAD records survive a save, keeping the newest; FORWARD is unbounded.
+pub const RETAINED_DEAD_MAX: usize = 256;
+
+/// Retained data never supplies runtime or operator authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetainedKind {
+    /// Any unusable object other than an exact duplicate; never auto-prune across versions.
+    Forward,
+    /// A non-object JSON element or exact canonical duplicate of an earlier record.
+    Dead,
+}
+/// Retained-record metadata, without exposing the preserved payload.
+#[derive(Debug, Serialize)]
+pub struct RetainedInfo {
+    /// Position in the serialized structured_agents array.
+    pub slot: usize,
+    /// Rollback protection category.
+    pub kind: RetainedKind,
+    /// First save observation, absent until the next save stamps the record.
+    pub first_seen_ms: Option<u64>,
+}
 
 /// Durable structured identity. The runtime tag cannot describe a PTY record.
 /// This typed record writes no credentials, process ids, attention, ages or lease
@@ -56,6 +83,8 @@ pub enum StructuredRuntime {
 pub enum RegistryError {
     /// Identity, session, harness or supplied name is invalid.
     InvalidRecord,
+    /// Unknown collection layout: back up session.json and follow the session-state repair guide.
+    UnsupportedCollectionShape,
     /// Identity, name or native session already belongs to another entry.
     Conflict,
     /// No such identity or the worker belongs to an older launch.
@@ -63,6 +92,16 @@ pub enum RegistryError {
     /// The generation counter cannot allocate another launch safely.
     GenerationExhausted,
 }
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedCollectionShape => f.write_str("structured_agents is not an array; back up session.json and follow the session-state repair guide"),
+            _ => write!(f, "{self:?}"),
+        }
+    }
+}
+impl std::error::Error for RegistryError {}
 
 /// Latest S4 publication, including in-process needs-human and deadline facts.
 /// It intentionally carries no authority to act as the recorded agent.
@@ -98,6 +137,7 @@ impl Entry {
                 state,
                 phase_changed: None,
                 needs_human: Vec::new(),
+                permission_requests: Vec::new(),
                 stalled_since_ms: None,
                 observe_at: None,
             },
@@ -120,12 +160,18 @@ pub struct Registry {
     generation: u64,
     preserved: Vec<Option<Value>>,
     unparsed: Option<Value>,
+    retained: BTreeMap<usize, retention::Retained>,
+    retention_extra: Vec<Value>,
+    retention_opaque: Option<Value>,
 }
 impl Registry {
     /// Whether there is nothing durable, including inactive retained records.
     /// Unknown-only sessions must survive the application's empty-session cleanup.
     pub fn is_empty(&self) -> bool {
-        self.preserved.iter().all(Option::is_none) && self.unparsed.is_none()
+        self.preserved.iter().all(Option::is_none)
+            && self.unparsed.is_none()
+            && self.retention_extra.is_empty()
+            && self.retention_opaque.is_none()
     }
 
     /// Admit a record before a worker exists. It starts offline, without authority.
@@ -133,6 +179,9 @@ impl Registry {
     /// Duplicate identity/name/session and unsupported harnesses are refused.
     /// Retained names are reserved too, without interpreting unknown runtime data.
     pub fn register(&mut self, record: Record) -> Result<u64, RegistryError> {
+        if self.unparsed.is_some() {
+            return Err(RegistryError::UnsupportedCollectionShape);
+        }
         if record.name.as_deref().is_some_and(|name| {
             self.preserved
                 .iter()
@@ -146,8 +195,18 @@ impl Registry {
     }
 
     fn register_raw(&mut self, record: Record, raw: Value) -> Result<u64, RegistryError> {
-        if self.unparsed.is_some()
-            || record.agent_id.is_empty()
+        if self.unparsed.is_some() {
+            return Err(RegistryError::UnsupportedCollectionShape);
+        }
+        if record
+            .name
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            crate::logging::agent_name_dropped("registry");
+            return Err(RegistryError::InvalidRecord);
+        }
+        if record.agent_id.is_empty()
             || record.session_id.is_empty()
             || record.harness != "claude"
             || record.name.as_ref().is_some_and(|name| name.is_empty())
@@ -243,6 +302,7 @@ impl Registry {
         let record = entry.record;
         let mut slots = vec![0; self.preserved.len()];
         let mut compact = Vec::new();
+        let mut retained = BTreeMap::new();
         for (slot, raw) in self.preserved.drain(..).enumerate() {
             let Some(raw) = raw else { continue };
             let conflicts =
@@ -255,6 +315,9 @@ impl Registry {
                         }));
             if slot != entry.slot && !conflicts {
                 slots[slot] = compact.len();
+                if let Some(metadata) = self.retained.remove(&slot) {
+                    retained.insert(compact.len(), metadata);
+                }
                 compact.push(Some(raw));
             }
         }
@@ -262,6 +325,7 @@ impl Registry {
             entry.slot = slots[entry.slot];
         }
         self.preserved = compact;
+        self.retained = retained;
         Ok(record)
     }
 
@@ -289,6 +353,9 @@ impl Registry {
             generation: self.generation,
             preserved: self.preserved.clone(),
             unparsed: self.unparsed.clone(),
+            retained: self.retained.clone(),
+            retention_extra: self.retention_extra.clone(),
+            retention_opaque: self.retention_opaque.clone(),
         }
     }
 
@@ -354,20 +421,30 @@ impl<'de> Deserialize<'de> for Registry {
             registry.unparsed = Some(raw);
             return Ok(registry);
         };
+        let mut seen = BTreeSet::new();
         for (index, raw) in records.into_iter().enumerate() {
-            let reason = match serde_json::from_value::<Record>(raw.clone()) {
-                Ok(record) => match registry.register_raw(record, raw.clone()) {
-                    Ok(_) => continue,
-                    Err(RegistryError::Conflict) => "duplicate",
-                    Err(_) => "invalid_record",
-                },
-                Err(_) => "unsupported_shape",
+            let duplicate = !seen.insert(retention::digest(&raw));
+            let dead = !raw.is_object() || duplicate;
+            let reason = if dead {
+                "non_object_or_exact_duplicate"
+            } else {
+                match serde_json::from_value::<Record>(raw.clone()) {
+                    Ok(record) => match registry.register_raw(record, raw.clone()) {
+                        Ok(_) => continue,
+                        Err(RegistryError::Conflict) => "duplicate",
+                        Err(_) => "invalid_record",
+                    },
+                    Err(_) => "unsupported_shape",
+                }
             };
             tracing::warn!(
                 index,
                 reason,
                 "structured record skipped; raw data retained inactive"
             );
+            registry
+                .retained
+                .insert(registry.preserved.len(), retention::Retained::new(dead));
             registry.preserved.push(Some(raw));
         }
         Ok(registry)
@@ -376,3 +453,6 @@ impl<'de> Deserialize<'de> for Registry {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod retention_tests;

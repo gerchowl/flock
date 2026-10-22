@@ -14,19 +14,23 @@
  * expands on demand, and all but the last {@link VISIBLE_TURNS} turns fold
  * into one "N earlier turns" control.
  *
+ * Replay is linear (#1782): each entry is folded into the last turn as it
+ * arrives ({@link foldEntry}), and only the unfolded turns are read to
+ * render, so a long history costs O(1) per entry, not a regroup of it all.
+ *
  * Known limits, left to ADR-0036's S9a and S18 (tracked in #1307): no
  * virtualisation, no in-flight streaming block; stream deltas are listed as
  * their own rows.
  *
  * @module
  */
-import { ErrorBoundary, For, Match, Show, Switch, createMemo, createSignal, onCleanup, type JSX } from "solid-js";
-import { createStore } from "solid-js/store";
+import { ErrorBoundary, For, Match, Show, Switch, createSignal, onCleanup, type JSX } from "solid-js";
+import { createStore, produce, reconcile } from "solid-js/store";
 
 import type { JsonValue } from "../gen/serde_json/JsonValue";
 import type { KnownSessionEvent } from "../gen/KnownSessionEvent";
 import type { SessionEntry, SessionStream, Transport, TransportFailure } from "../transport";
-import { groupTurns, type ToolRun, type Turns } from "./turns";
+import { emptyFold, foldAll, foldEntry, type ToolRun, type TurnFold } from "./turns";
 import { UnknownBlock } from "./UnknownBlock";
 
 /**
@@ -76,6 +80,8 @@ function json(value: JsonValue | undefined): string {
 /** A one-line label from the catalogue discriminators. */
 function label(event: KnownSessionEvent): string {
   switch (event.type) {
+    case "flk_permission_request":
+      return event.state === "open" ? `Permission request · ${event.request.tool_name}` : "Permission request closed";
     case "assistant":
       return "Assistant";
     case "user":
@@ -126,7 +132,7 @@ function ToolRunLine(props: { readonly run: ToolRun }): JSX.Element {
 }
 
 /** One content block of an API message. */
-function ContentBlock(props: { readonly block: JsonValue; readonly turns: Turns }): JSX.Element {
+function ContentBlock(props: { readonly block: JsonValue; readonly turns: TurnFold }): JSX.Element {
   const block = props.block;
   if (typeof block !== "object" || block === null || Array.isArray(block)) {
     throw new Error("content block is not an object");
@@ -136,15 +142,15 @@ function ContentBlock(props: { readonly block: JsonValue; readonly turns: Turns 
       return <p class="text">{String(block["text"] ?? "")}</p>;
     case "tool_use": {
       const id = block["id"];
-      const run = typeof id === "string" ? props.turns.runs.get(id) : undefined;
-      if (typeof id === "string" && run !== undefined) return <ToolRunLine run={props.turns.runs.get(id) ?? run} />;
+      const run = typeof id === "string" ? props.turns.runs[id] : undefined;
+      if (typeof id === "string" && run !== undefined) return <ToolRunLine run={props.turns.runs[id] ?? run} />;
       return <Collapsed title={`Tool · ${String(block["name"] ?? "?")}`} body={json(block["input"])} />;
     }
     case "tool_result": {
       const content = block["content"];
       const title = block["is_error"] === true ? "Tool result · error" : "Tool result";
       return (
-        <Show when={!props.turns.absorbed.has(String(block["tool_use_id"]))}>
+        <Show when={props.turns.absorbed[String(block["tool_use_id"])] !== true}>
           <Collapsed title={title} body={typeof content === "string" ? content : json(content)} />
         </Show>
       );
@@ -157,14 +163,14 @@ function ContentBlock(props: { readonly block: JsonValue; readonly turns: Turns 
 }
 
 /** An API message's content: a string or an array of blocks. */
-function MessageContent(props: { readonly message: { readonly [key: string]: JsonValue }; readonly turns: Turns }): JSX.Element {
+function MessageContent(props: { readonly message: { readonly [key: string]: JsonValue }; readonly turns: TurnFold }): JSX.Element {
   const content = props.message["content"];
   if (typeof content === "string") return <p class="text">{content}</p>;
   if (!Array.isArray(content)) throw new Error("message content is neither text nor blocks");
   return <For each={content}>{(block) => <ContentBlock block={block} turns={props.turns} />}</For>;
 }
 
-function KnownEvent(props: { readonly event: KnownSessionEvent; readonly turns: Turns }): JSX.Element {
+function KnownEvent(props: { readonly event: KnownSessionEvent; readonly turns: TurnFold }): JSX.Element {
   const event = props.event;
   return (
     <article class={`event event--${event.type}`} data-testid="known-event">
@@ -180,7 +186,7 @@ function KnownEvent(props: { readonly event: KnownSessionEvent; readonly turns: 
   );
 }
 
-function Entry(props: { readonly entry: SessionEntry; readonly turns: Turns }): JSX.Element {
+function Entry(props: { readonly entry: SessionEntry; readonly turns: TurnFold }): JSX.Element {
   const entry = props.entry;
   if (entry.kind === "unknown") return <UnknownBlock input={entry.unknown} />;
   if (entry.kind === "gap") {
@@ -199,15 +205,28 @@ function Entry(props: { readonly entry: SessionEntry; readonly turns: Turns }): 
 
 /** Renders a session stream from its first entry, as the transport delivers it. */
 export function Transcript(props: TranscriptProps): JSX.Element {
-  const [entries, setEntries] = createStore<SessionEntry[]>([]);
+  // Every entry, for the rare regroup; the store holds the turns the view reads.
+  const entries: SessionEntry[] = [];
+  const [count, setCount] = createSignal(0);
+  const [turns, setTurns] = createStore<TurnFold>(emptyFold());
   const [progress, setProgress] = createSignal<Progress>({ phase: "replaying" });
   props.onCurrent?.(false);
   const subscription = props.transport.subscribe(props.stream, null, {
     entry: (entry) => {
-      setEntries(entries.length, entry);
+      entries.push(entry);
+      setCount(entries.length);
+      let regroup = false;
+      setTurns(produce((fold) => void (regroup = !foldEntry(fold, entry))));
+      if (regroup) setTurns(reconcile(foldAll(entries), { key: "key" }));
       props.onEntry?.(entry.seq, userText(entry));
     },
-    reset: () => setEntries([]),
+    reset: () => {
+      entries.length = 0;
+      setCount(0);
+      setTurns(emptyFold());
+      // Entries restart from the stream's first retained seq: replaying again, not Current.
+      props.onCurrent?.(false);
+    },
     synced: () => {
       setProgress({ phase: "synced" });
       props.onCurrent?.(true);
@@ -219,11 +238,8 @@ export function Transcript(props: TranscriptProps): JSX.Element {
     const current = progress();
     return current.phase === "failed" ? current.failure : undefined;
   };
-  const turns = createMemo(() => groupTurns(entries));
   const [unfolded, setUnfolded] = createSignal(false);
-  const folded = (): number => (unfolded() ? 0 : Math.max(0, turns().turns.length - VISIBLE_TURNS));
-  // Keyed by each turn's first seq, so appends keep mounted turns (and an open tool run) as they are.
-  const keys = createMemo(() => turns().turns.map((turn) => turn.key));
+  const folded = (): number => (unfolded() ? 0 : Math.max(0, turns.turns.length - VISIBLE_TURNS));
   return (
     <section class="transcript" aria-label="Transcript">
       <Show when={folded() > 0}>
@@ -231,10 +247,11 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           {folded()} earlier {folded() === 1 ? "turn" : "turns"}
         </button>
       </Show>
-      <For each={keys().slice(folded())}>
-        {(key) => (
+      {/* Only the unfolded turns are read. A turn keeps its identity as it grows, so appends keep it (and an open tool run) mounted. */}
+      <For each={turns.turns.slice(folded())}>
+        {(turn) => (
           <div class="turn" data-testid="turn">
-            <For each={turns().byKey.get(key)?.entries ?? []}>{(entry) => <Entry entry={entry} turns={turns()} />}</For>
+            <For each={turn.entries}>{(entry) => <Entry entry={entry} turns={turns} />}</For>
           </div>
         )}
       </For>
@@ -244,7 +261,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
         </Match>
         <Match when={progress().phase === "synced"}>
           <p class="transcript__status" data-testid="transcript-synced">
-            {WORDING[props.source].synced(entries.length)}
+            {WORDING[props.source].synced(count())}
           </p>
         </Match>
       </Switch>

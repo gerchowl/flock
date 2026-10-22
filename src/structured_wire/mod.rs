@@ -14,11 +14,16 @@ use serde_json::Value;
 #[cfg(test)]
 pub(crate) mod fixture;
 mod minimal;
+mod permission;
 // Later wire slices consume these exact payload re-exports.
 #[cfg_attr(feature = "web", allow(unused_imports))]
 pub use minimal::{
     AgentDecide, AgentDecideErrorCode, AgentDecideResult, FleetAgentRow, FleetDelta,
     PermissionDecision,
+};
+pub use permission::{
+    IgnoredPermissionReason, IgnoredPermissionSuggestions, PermissionAnswer, PermissionClose,
+    PermissionCloseReason, PermissionRecord, PermissionState,
 };
 #[cfg(test)]
 mod review_tests;

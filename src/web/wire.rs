@@ -358,4 +358,4 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     }
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
