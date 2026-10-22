@@ -80,6 +80,8 @@ function json(value: JsonValue | undefined): string {
 /** A one-line label from the catalogue discriminators. */
 function label(event: KnownSessionEvent): string {
   switch (event.type) {
+    case "flk_permission_request":
+      return event.state === "open" ? `Permission request · ${event.request.tool_name}` : "Permission request closed";
     case "assistant":
       return "Assistant";
     case "user":
