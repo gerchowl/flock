@@ -53,11 +53,19 @@ Flock is mouse-native. You can click panes, tabs, workspaces, and agents; drag b
 
 If you configure `ui.right_click_passthrough_modifier`, that modifier plus right-click sends right-click, hold, and drag gestures to mouse-reporting pane apps.
 
-Ctrl-click opens pane links when your terminal sends the modified click to Flock. This works for OSC 8 hyperlinks and visible `http://` or `https://` URLs. The portable terminal-native fallback is Shift-Ctrl-click on Linux or Shift-Cmd-click on macOS.
+Ctrl-click opens pane links when your terminal sends the modified click to Flock. Flock opens only HTTP/HTTPS links without raw whitespace or control characters; rejected links show a non-fatal notice. This works for OSC 8 hyperlinks and visible `http://` or `https://` URLs. The portable terminal-native fallback is Shift-Ctrl-click on Linux or Shift-Cmd-click on macOS.
 
 ## Copy from the keyboard
 
 Press `prefix+[` to enter copy mode for the focused pane. Use `h/j/k/l`, `w/b/e`, and `{`/`}` to move, `v` or Space to start a selection, `y` or Enter to copy it, and `q` or Esc to leave without copying.
+
+Pane selections follow the selected content while output scrolls and when the
+pane resizes, including soft-wrap reflow. Copy reads the retained content when
+you release or copy; it is not a frozen text snapshot. If the selected lines
+were evicted from scrollback or reset, Flock shows “Cannot copy selection” and
+leaves the clipboard unchanged. Copying also refuses while a different terminal
+screen is active. Selections are not preserved across restart or live handoff.
+
 
 ## Manage named sessions
 
