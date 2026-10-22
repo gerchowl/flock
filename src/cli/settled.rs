@@ -1296,6 +1296,19 @@ fn resolve_initial(
         if value.get("error").is_some() {
             return Err(InitialFailure::Refused(value.to_string()));
         }
+        if value
+            .pointer("/result/agent/runtime")
+            .and_then(serde_json::Value::as_str)
+            == Some("structured")
+        {
+            return Err(InitialFailure::Refused(
+                serde_json::json!({"error": {
+                    "code": crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),
+                    "message": "settled wait requires a PTY placement"
+                }})
+                .to_string(),
+            ));
+        }
         return initial_record(&value, target)
             .ok_or_else(|| InitialFailure::Unusable("response did not include the record".into()));
     }
@@ -2544,6 +2557,30 @@ mod tests {
     /// The same resolve, inside its budget: an error is still the server's own
     /// refusal, reported with its words, and the latch has NOT been tripped —
     /// so a later interruption still gets to say so once.
+    #[test]
+    fn structured_initial_record_refuses_pane_only_settled_wait() {
+        let mut requests = Scripted::new(
+            vec![Ok(response(
+                r#"{"result":{"agent":{"runtime":"structured"}}}"#,
+            ))],
+            Duration::ZERO,
+        );
+        let mut interrupted = Interrupted::new(Some(UNREACHABLE_LIMIT));
+        match resolve_initial(
+            &mut requests,
+            InitialTarget::Agent("fixture"),
+            None,
+            "agent wait",
+            &mut interrupted,
+        ) {
+            Err(InitialFailure::Refused(raw)) => {
+                let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(value["error"]["code"], "runtime_unsupported");
+            }
+            other => panic!("structured wait must refuse explicitly: {other:?}"),
+        }
+    }
+
     #[test]
     fn an_early_error_at_the_initial_resolve_is_the_servers_refusal() {
         let mut requests = Scripted::new(

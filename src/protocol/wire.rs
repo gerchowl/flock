@@ -375,7 +375,7 @@ impl From<crate::api::schema::PeerAgentSummary> for FleetAgent {
         Self {
             agent_id: agent.agent_id,
             pane_id: agent.pane_id,
-            agent: agent.agent,
+            agent: crate::terminal::agent_name::received(agent.agent, "mesh"),
             status: agent.status,
         }
     }
@@ -390,7 +390,7 @@ impl From<crate::api::schema::PeerWorkspaceSummary> for FleetWorkspace {
             project_label: ws.project_label,
             branch: ws.branch,
             is_linked_worktree: ws.is_linked_worktree,
-            agent: ws.agent,
+            agent: crate::terminal::agent_name::received(ws.agent, "mesh"),
             status: ws.status,
             status_age_secs: ws.status_age_secs,
             activity: ws.activity,
@@ -404,7 +404,7 @@ impl From<FleetAgent> for crate::api::schema::PeerAgentSummary {
         Self {
             agent_id: agent.agent_id,
             pane_id: agent.pane_id,
-            agent: agent.agent,
+            agent: crate::terminal::agent_name::received(agent.agent, "mesh"),
             status: agent.status,
         }
     }
@@ -419,7 +419,7 @@ impl From<FleetWorkspace> for crate::api::schema::PeerWorkspaceSummary {
             project_label: ws.project_label,
             branch: ws.branch,
             is_linked_worktree: ws.is_linked_worktree,
-            agent: ws.agent,
+            agent: crate::terminal::agent_name::received(ws.agent, "mesh"),
             status: ws.status,
             status_age_secs: ws.status_age_secs,
             activity: ws.activity,
@@ -1110,6 +1110,53 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     // ---- Round-trip: ClientMessage ----
+
+    #[test]
+    fn security_agent_name_binary_wire_keeps_layout_but_drops_bad_names() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let raw = FleetAgent {
+                agent_id: "agent-fixture".into(),
+                pane_id: "pane-fixture".into(),
+                agent: Some(name),
+                status: crate::api::schema::AgentStatus::Idle,
+            };
+            let bytes = bincode::serde::encode_to_vec(&raw, bincode::config::standard()).unwrap();
+            let (decoded, _): (FleetAgent, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            let summary: crate::api::schema::PeerAgentSummary = decoded.into();
+            if summary.agent.is_some() {
+                failures.push(case);
+            }
+            let workspace = FleetWorkspace {
+                id: "workspace-fixture".into(),
+                workspace: "fixture".into(),
+                project_key: None,
+                project_label: None,
+                branch: None,
+                is_linked_worktree: false,
+                agent: raw.agent.clone(),
+                status: crate::api::schema::AgentStatus::Idle,
+                status_age_secs: None,
+                activity: None,
+                agents: vec![raw],
+            };
+            let bytes =
+                bincode::serde::encode_to_vec(&workspace, bincode::config::standard()).unwrap();
+            let (decoded, _): (FleetWorkspace, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            let workspace: crate::api::schema::PeerWorkspaceSummary = decoded.into();
+            if workspace.agent.is_some() || workspace.agents[0].agent.is_some() {
+                failures.push(case);
+            }
+            assert_eq!(summary.agent_id, "agent-fixture");
+        }
+        assert!(
+            failures.is_empty(),
+            "retained wire name cases: {failures:?}"
+        );
+        assert_eq!(crate::mesh::hello::VERSION, 5);
+    }
 
     #[test]
     fn client_hello_roundtrip() {

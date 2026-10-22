@@ -70,6 +70,8 @@ toml = "1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 unicode-width = "0.2"
+# Reuse termwiz's locked Unicode 17 categories for identity-format validation.
+finl_unicode = "1.4"
 sysinfo = "0.39.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 toml_edit = "0.25.15"
@@ -83,8 +85,8 @@ tokio = { version = "1", features = ["net", "io-util", "process"] }
 # Count SQLite VM operations in store complexity regression tests.
 rusqlite = { version = "0.40.2", features = ["hooks"] }
 
-# Parse adapter declarations for the optional-field coverage drift test.
-syn = { version = "2", features = ["full"] }
+# Parse adapter declarations and CLI match patterns for coverage drift tests.
+syn = { version = "2", features = ["full", "visit"] }
 
 [build-dependencies]
 # Use SDK declarations for Darwin kinfo_proc rather than copying its ABI.

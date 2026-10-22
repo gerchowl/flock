@@ -1,5 +1,6 @@
 pub mod agent_state;
 pub mod client;
+pub(crate) mod client_listener;
 pub mod client_tokens;
 pub(crate) mod compatibility;
 pub(crate) mod error_code;
@@ -11,6 +12,7 @@ pub mod schema;
 pub(crate) mod scoped;
 pub(crate) mod server;
 mod status;
+pub mod structured_agent;
 mod subscriptions;
 mod wait;
 pub mod wait_predicate;

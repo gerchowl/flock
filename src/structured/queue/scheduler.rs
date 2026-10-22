@@ -19,8 +19,9 @@ pub(crate) enum PendingCause {
     /// An accepted batch still needs its real result; runtime exit/restart also
     /// ends the wait, holding unresolved items instead of resending them.
     AwaitingResult,
-    /// A malformed known record requires operator recovery, never a retry or
-    /// automatic journal rewrite. State is inspectable only until recovery.
+    /// A malformed known record or unknown data preventing a required checkpoint
+    /// require operator recovery, never a retry or automatic journal rewrite.
+    /// State is inspectable only until recovery.
     QueueJournalCorrupt(QueueJournalCorrupt),
     /// Journal downgrade refused. Only upgrading to a compatible writer permits
     /// mutations; a real harness result or a queue retry cannot recover it.
