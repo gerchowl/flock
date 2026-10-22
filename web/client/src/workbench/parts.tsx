@@ -45,27 +45,42 @@ export function AgentRowButton(props: { readonly row: AgentRow; readonly focused
 }
 
 /** The inbox's cards, blocking first. */
-export function InboxCards(props: { readonly cards: readonly InboxCard[] }): JSX.Element {
+export function InboxCards(props: { readonly cards: readonly InboxCard[]; readonly source: "replay" | "live" }): JSX.Element {
+  const note = (): string | null =>
+    props.source === "live"
+      ? props.cards.length === 0
+        ? "No open permission prompts."
+        : null
+      : props.cards.length === 0
+        ? "The live inbox arrives with G5 (#1597)."
+        : "Sample cards: the live inbox arrives with G5 (#1597).";
   return (
     <>
-      <p class="inbox__note">{props.cards.length === 0 ? "The live inbox arrives with G5 (#1597)." : "Sample cards: the live inbox arrives with G5 (#1597)."}</p>
+      <Show when={note()}>{(text) => <p class="inbox__note">{text()}</p>}</Show>
       <For each={sortInbox(props.cards)}>
         {(card) => {
           const reason = createUniqueId();
           return (
-          <article class="card" classList={{ "card--blocking": card.blocking }} data-testid="inbox-card">
+          <article class="card" classList={{ "card--blocking": card.blocking }} data-testid="inbox-card" data-request-seq={card.requestSeq}>
             <p class="card__meta">
-              {card.kind === "permission" ? "Permission" : "Question"} · {card.agent}
+              {card.kind === "permission" ? "Permission" : "Question"} · {card.agentLabel}
             </p>
             <h3 class="card__title">{card.title}</h3>
             <p class="card__detail">{card.detail}</p>
-            <div class="card__choices">
-              <For each={card.choices}>{(choice) => <Waits label={choice} reasonId={reason} />}</For>
-              <Waits label="Edit…" reasonId={reason} />
-            </div>
-            <p id={reason} class="waits__reason">
-              Answering waits for the inbox stream (G5 #1597).
-            </p>
+            <Show when={card.stale}>
+              <p class="card__stale" data-testid="inbox-stale">
+                This agent's history has a gap; this may be out of date.
+              </p>
+            </Show>
+            <Show when={card.choices.length > 0}>
+              <div class="card__choices">
+                <For each={card.choices}>{(choice) => <Waits label={choice} reasonId={reason} />}</For>
+                <Waits label="Edit…" reasonId={reason} />
+              </div>
+              <p id={reason} class="waits__reason">
+                Answering waits for {card.waitsFor}.
+              </p>
+            </Show>
           </article>
           );
         }}

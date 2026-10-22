@@ -11,6 +11,7 @@ import { For, Match, Show, Switch, createSignal, createUniqueId, onCleanup, type
 import type { AgentRow } from "../fleet";
 import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
+import { Composer, type ComposerState, type Sender } from "./Composer";
 import type { InboxCard } from "./inbox";
 import { AgentRowButton, AgentTitle, InboxCards, Waits } from "./parts";
 
@@ -29,6 +30,8 @@ export type PhoneProps = {
   readonly transport: Transport;
   readonly source: TranscriptSource;
   readonly inbox: readonly InboxCard[];
+  readonly sender: Sender | null;
+  readonly composer: ComposerState;
 };
 
 type Tab = "inbox" | "agents";
@@ -37,10 +40,9 @@ type Tab = "inbox" | "agents";
 export function PhoneWorkbench(props: PhoneProps): JSX.Element {
   const [tab, setTab] = createSignal<Tab>("inbox");
   const [onAgent, setOnAgent] = createSignal(false);
-  const blocked = (): number => props.inbox.filter((card) => card.blocking).length;
-  // Live mode has no inbox source until G5 and shows no cards, so the headline counts nothing.
-  const headline = (): string =>
-    props.source === "live" ? "Your inbox arrives with G5 (#1597)." : blocked() === 0 ? "Nothing is blocked on you." : `${blocked()} blocked on you.`;
+  // The same count as the sidebar badge: what the server lists as waiting on a human.
+  const blocked = (): number => props.rows().reduce((sum, row) => sum + row.waitingOnHuman.length, 0);
+  const headline = (): string => (blocked() === 0 ? "Nothing is blocked on you." : `${blocked()} blocked on you.`);
   /*
    * The agent screen is a history entry, so the system back gesture returns
    * to the tab it came from instead of leaving the app. `pushState` without
@@ -93,7 +95,7 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
                 <p class="phone__headline" data-testid="inbox-headline">
                   {headline()}
                 </p>
-                <InboxCards cards={props.inbox} />
+                <InboxCards cards={props.inbox} source={props.source} />
               </Match>
               <Match when={tab() === "agents"}>
                 <h1 class="phone__title">Agents</h1>
@@ -127,8 +129,15 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
               <span id={terminal}>Terminal waits for the terminal tile.</span>
             </p>
             <div class="phone__body">
-              <Transcript transport={props.transport} stream={`agent/${agent}`} source={props.source} />
+              <Transcript
+                transport={props.transport}
+                stream={`agent/${agent}`}
+                source={props.source}
+                onEntry={(seq, text) => props.composer.observe(agent, seq, text)}
+                onCurrent={(current) => props.composer.current(agent, current)}
+              />
             </div>
+            <Composer agent={agent} row={props.row()} sender={props.sender} state={props.composer} />
           </main>
           );
         }}

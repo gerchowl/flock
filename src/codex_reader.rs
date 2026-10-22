@@ -1,10 +1,11 @@
 //! Verified incremental rollout bytes for ADR-0028 §1a (#1855).
 //!
 //! This is a file/cursor foundation, not runtime lifecycle authority. Read on a
-//! supervised worker (#1857); prepare resume/fork segments before trust admission
+//! supervised worker (`segment::worker::Worker`); prepare resume/fork segments before trust admission
 //! (#1856). A successful empty EOF never changes a turn or renews a lease.
 use std::io::{Read, Seek, SeekFrom};
 use std::time::Instant;
+use std::{fs::File, path::Path};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -13,11 +14,12 @@ use crate::codex_binding::Validated;
 use crate::codex_rollout::{verify_record, Reason, Reducer};
 use crate::platform::structured::{rollout_identity, FileIdentity};
 
-/// Explicit memory/work budgets. Overflow is degradation, never truncated history
-/// or forgotten turn IDs. Runtime policy chooses these before opening a reader.
+/// Per-step I/O and per-record/turn memory budgets, never a total-file cap.
+/// A finite history can span arbitrarily many steps. Record/turn overflow still
+/// degrades explicitly; history and remembered IDs are never silently evicted.
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
-    pub file_bytes: usize,
+    pub work_bytes: usize,
     pub record_bytes: usize,
     pub turn_ids: usize,
 }
@@ -56,8 +58,11 @@ pub(crate) struct Update {
     pub bytes: Vec<u8>,
     pub from: u64,
     pub checkpoint: Checkpoint,
-    /// Successful EOF observation, even when no bytes were appended.
-    pub eof_at: Instant,
+    /// Successful EOF observation, even when no bytes were appended. None means
+    /// bounded work is still in progress and must never be reported as EOF.
+    pub eof_at: Option<Instant>,
+    /// Bytes scanned this step, including prefix verification, not model activity.
+    pub scanned: usize,
 }
 
 /// Owns the same descriptor returned by binding validation. Never searches by
@@ -65,80 +70,154 @@ pub(crate) struct Update {
 /// reconstruction needs a new independently verified binding/segment.
 pub(crate) struct Reader {
     validated: Validated,
-    limits: Limits,
-    cursor: Checkpoint,
-    initialized: bool,
+    scan: Scan,
     failure: Option<Reason>,
 }
 impl Reader {
-    /// Accept an opened binding candidate, before it grants lifecycle authority.
+    /// Accept the original opened candidate, before lifecycle trust admission.
     pub fn new(validated: Validated, limits: Limits) -> Result<Self, Reason> {
-        let identity = rollout_identity(&validated.file, &validated.path)
-            .map_err(|_| Reason::SourceDiscontinuity)?;
+        let scan = Scan::new(&validated.file, &validated.path, limits)?;
         Ok(Self {
             validated,
-            limits,
+            scan,
+            failure: None,
+        })
+    }
+    /// One bounded work unit. Empty bytes without EOF mean verification progress,
+    /// never idle. The next call continues the same hash pass, not a prefix reread.
+    pub fn poll(&mut self, now: Instant) -> Result<Update, Reason> {
+        self.records(now, |_, _, _| {})
+    }
+    fn records(
+        &mut self,
+        now: Instant,
+        mut emit: impl FnMut(&Value, &[u8], u64),
+    ) -> Result<Update, Reason> {
+        if let Some(reason) = self.failure {
+            return Err(reason);
+        }
+        let thread = self.validated.key().thread.clone();
+        let mut metadata_matches = true;
+        let result = self
+            .scan
+            .step(
+                &mut self.validated.file,
+                &self.validated.path,
+                now,
+                |record, bytes, begin| {
+                    if begin == 0 {
+                        metadata_matches = record["payload"]["id"].as_str() == Some(&thread)
+                            && record["payload"]["cli_version"].as_str()
+                                == Some(&self.validated.metadata_version);
+                    }
+                    emit(record, bytes, begin);
+                },
+            )
+            .and_then(|update| {
+                if metadata_matches {
+                    Ok(update)
+                } else {
+                    Err(Reason::SourceDiscontinuity)
+                }
+            });
+        if let Err(reason) = result {
+            self.failure = Some(reason);
+        }
+        result
+    }
+}
+
+/// One hash pass continues across work units: compare the old prefix digest at
+/// its exact offset, then extend that same hasher through new bytes up to EOF.
+/// No result may establish authority while that prefix comparison is pending.
+struct Pass {
+    hash: Sha256,
+    offset: u64,
+    verified: bool,
+}
+struct Scan {
+    cursor: Checkpoint,
+    limits: Limits,
+    pass: Option<Pass>,
+}
+impl Scan {
+    fn new(file: &File, path: &Path, limits: Limits) -> Result<Self, Reason> {
+        if limits.work_bytes == 0 {
+            return Err(Reason::CapacityExceeded);
+        }
+        Ok(Self {
             cursor: Checkpoint {
-                identity,
+                identity: rollout_identity(file, path).map_err(|_| Reason::SourceDiscontinuity)?,
                 read_offset: 0,
                 complete_offset: 0,
                 partial: Vec::new(),
                 digest: Sha256::digest([]).into(),
                 next_ordinal: None,
             },
-            initialized: false,
-            failure: None,
+            limits,
+            pass: None,
         })
     }
-
-    /// Verify the entire consumed prefix before returning new bytes. I/O and
-    /// retained bytes are bounded by Limits; this deliberately rereads the prefix
-    /// so equal-length edits cannot pass as append-only activity. No age lease.
-    pub fn poll(&mut self, now: Instant) -> Result<Update, Reason> {
-        if let Some(reason) = self.failure {
-            return Err(reason);
-        }
-        let result = self.read(now);
-        if let Err(reason) = result {
-            self.failure = Some(reason);
-        }
-        result
-    }
-    fn read(&mut self, now: Instant) -> Result<Update, Reason> {
-        let valid_identity = || {
-            rollout_identity(&self.validated.file, &self.validated.path)
-                .map_err(|_| Reason::SourceDiscontinuity)
-        };
-        if valid_identity()? != self.cursor.identity {
-            return Err(Reason::SourceDiscontinuity);
-        }
-        let file = &mut self.validated.file;
-        file.seek(SeekFrom::Start(0))
+    fn step(
+        &mut self,
+        file: &mut File,
+        path: &Path,
+        now: Instant,
+        mut emit: impl FnMut(&Value, &[u8], u64),
+    ) -> Result<Update, Reason> {
+        self.check(file, path)?;
+        let mut pass = self.pass.take().unwrap_or(Pass {
+            hash: Sha256::new(),
+            offset: 0,
+            verified: false,
+        });
+        file.seek(SeekFrom::Start(pass.offset))
             .map_err(|_| Reason::SourceDiscontinuity)?;
+        let from = self.cursor.read_offset;
         let mut bytes = Vec::new();
-        file.take((self.limits.file_bytes as u64).saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|_| Reason::SourceDiscontinuity)?;
-        if bytes.len() > self.limits.file_bytes {
-            return Err(Reason::CapacityExceeded);
+        let mut scanned = 0;
+        let mut eof = false;
+        let mut buffer = [0; 8192];
+        while scanned < self.limits.work_bytes {
+            if !pass.verified && pass.offset == self.cursor.read_offset {
+                if pass.hash.clone().finalize()[..] != self.cursor.digest {
+                    return Err(Reason::SourceDiscontinuity);
+                }
+                pass.verified = true;
+            }
+            let mut size = buffer.len().min(self.limits.work_bytes - scanned);
+            if !pass.verified {
+                size = size.min((self.cursor.read_offset - pass.offset).min(size as u64) as usize);
+            }
+            let n = file
+                .read(&mut buffer[..size])
+                .map_err(|_| Reason::SourceDiscontinuity)?;
+            if n == 0 {
+                if !pass.verified {
+                    return Err(Reason::SourceDiscontinuity);
+                }
+                eof = true;
+                break;
+            }
+            pass.hash.update(&buffer[..n]);
+            pass.offset += n as u64;
+            scanned += n;
+            if pass.verified {
+                bytes.extend_from_slice(&buffer[..n]);
+            }
         }
-        if rollout_identity(&self.validated.file, &self.validated.path)
+        self.check(file, path)?;
+        if file
+            .metadata()
             .map_err(|_| Reason::SourceDiscontinuity)?
-            != self.cursor.identity
+            .len()
+            < pass.offset
         {
             return Err(Reason::SourceDiscontinuity);
         }
-        let from = self.cursor.read_offset as usize;
-        if bytes.len() < from || Sha256::digest(&bytes[..from])[..] != self.cursor.digest {
-            return Err(Reason::SourceDiscontinuity);
-        }
-        for fragment in bytes[from..].split_inclusive(|byte| *byte == b'\n') {
-            let complete = fragment.last() == Some(&b'\n');
-            let data = if complete {
-                &fragment[..fragment.len() - 1]
-            } else {
-                fragment
-            };
+        for fragment in bytes.split_inclusive(|b| *b == b'\n') {
+            let complete = fragment.ends_with(b"\n");
+            let data = &fragment[..fragment.len() - usize::from(complete)];
             if data.len()
                 > self
                     .limits
@@ -153,32 +232,44 @@ impl Reader {
             }
             let record: Value = serde_json::from_slice(&self.cursor.partial)
                 .map_err(|_| Reason::MalformedRecord)?;
-            if !self.initialized {
+            if self.cursor.complete_offset == 0 {
                 if record["type"] != "session_meta"
-                    || record["payload"]["id"].as_str() != Some(&self.validated.key().thread)
-                    || record["payload"]["cli_version"].as_str()
-                        != Some(&self.validated.metadata_version)
+                    || record["payload"]["id"].as_str().is_none_or(str::is_empty)
                 {
                     return Err(Reason::SourceDiscontinuity);
                 }
                 self.cursor.next_ordinal = first_ordinal(&record)?;
-                self.initialized = true;
             }
             verify_record(&record, &mut self.cursor.next_ordinal)?;
+            emit(&record, &self.cursor.partial, self.cursor.complete_offset);
             self.cursor.complete_offset += self.cursor.partial.len() as u64 + 1;
             self.cursor.partial.clear();
         }
-        if !self.initialized {
+        if eof && self.cursor.complete_offset == 0 {
             return Err(Reason::SourceDiscontinuity);
         }
-        self.cursor.read_offset = bytes.len() as u64;
-        self.cursor.digest = Sha256::digest(&bytes).into();
+        if pass.verified {
+            self.cursor.read_offset = pass.offset;
+            self.cursor.digest = pass.hash.clone().finalize().into();
+        }
+        if !eof {
+            self.pass = Some(pass);
+        }
         Ok(Update {
-            bytes: bytes[from..].to_vec(),
-            from: from as u64,
+            bytes,
+            from,
             checkpoint: self.cursor.clone(),
-            eof_at: now,
+            eof_at: eof.then_some(now),
+            scanned,
         })
+    }
+    fn check(&self, file: &File, path: &Path) -> Result<(), Reason> {
+        if rollout_identity(file, path).map_err(|_| Reason::SourceDiscontinuity)?
+            != self.cursor.identity
+        {
+            return Err(Reason::SourceDiscontinuity);
+        }
+        Ok(())
     }
 }
 

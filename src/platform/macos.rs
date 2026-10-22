@@ -463,8 +463,9 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     )
 }
 
-pub fn open_url(url: &str) -> std::io::Result<()> {
+pub(super) fn open_validated_url(url: &str) -> std::io::Result<()> {
     crate::process::TracedCommand::new("open", "platform")
+        .arg("--")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -873,24 +874,36 @@ pub fn process_name(pid: u32) -> Option<String> {
 
 /// The parent process id, or `None` once the process is gone.
 pub fn process_parent_id(pid: u32) -> Option<u32> {
-    process_facts(pid).map(|(parent, _)| parent)
+    process_facts(pid, false).map(|(parent, _)| parent)
 }
 
 /// When the process started, in microseconds since the epoch. Together with
 /// the pid it names ONE process: a reused pid has a later start time.
 pub fn process_start_time(pid: u32) -> Option<u64> {
-    process_facts(pid).map(|(_, birth)| birth)
+    process_facts(pid, false).map(|(_, birth)| birth)
+}
+
+/// One kernel snapshot of a living process; zombies never authorize admission.
+pub fn live_process_facts(pid: u32) -> Option<(u32, u64)> {
+    process_facts(pid, true)
 }
 
 // KERN_PROC_PID exposes parent and birth across UIDs, including login/launchd.
-fn process_facts(pid: u32) -> Option<(u32, u64)> {
+fn process_facts(pid: u32, live_only: bool) -> Option<(u32, u64)> {
     unsafe extern "C" {
-        fn flock_process_facts(pid: libc::c_int, parent: *mut u32, birth: *mut u64) -> libc::c_int;
+        fn flock_process_facts(
+            pid: libc::c_int,
+            parent: *mut u32,
+            birth: *mut u64,
+            live_only: libc::c_int,
+        ) -> libc::c_int;
     }
     let pid = libc::c_int::try_from(pid).ok()?;
     let (mut parent, mut birth) = (0, 0);
+    let live_only = i32::from(live_only);
     // SAFETY: the SDK-compiled helper writes only the two live output scalars.
-    (unsafe { flock_process_facts(pid, &mut parent, &mut birth) } == 1).then_some((parent, birth))
+    (unsafe { flock_process_facts(pid, &mut parent, &mut birth, live_only) } == 1)
+        .then_some((parent, birth))
 }
 
 /// Every live process id. Darwin has no `/proc`, so this is `proc_listallpids`

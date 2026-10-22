@@ -1573,7 +1573,7 @@ impl App {
                                 .terminals
                                 .get(&pane_state.attached_terminal_id)
                                 .is_some_and(|terminal| {
-                                    terminal.agent_name.as_deref() == Some(pane.as_str())
+                                    terminal.agent_name() == Some(pane.as_str())
                                         || terminal.effective_agent_label() == Some(pane.as_str())
                                 });
                             if public_matches || agent_matches {
@@ -2097,6 +2097,7 @@ mod tests {
         let recovery = hold_recovery(&mut replacement);
         let (respond_to, responses) = std::sync::mpsc::channel();
         replacement.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "reply".into(),
                 method: Method::MsgReply(MsgReplyParams {
@@ -2129,6 +2130,7 @@ mod tests {
     fn park(app: &mut crate::app::App, method: Method) -> std::sync::mpsc::Receiver<String> {
         let (respond_to, responses) = std::sync::mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "parked".into(),
                 method,
@@ -2283,6 +2285,7 @@ mod tests {
             .unwrap();
         let (respond_to, responses) = std::sync::mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "completed".into(),
                 method: fyi_send(&app, "after-recovery"),
