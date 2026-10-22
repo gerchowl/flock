@@ -71,6 +71,7 @@ impl Case {
             generation,
             leases: leases.clone(),
             state: fixture.root.path().to_owned(),
+            storage: Default::default(),
             mcp: fixture.mcp(),
             stall_after: STALL,
             lineage: None,
@@ -836,6 +837,87 @@ fn drop_after_failed_shutdown_does_not_wait_a_second_time() {
     worker.join().unwrap();
     dropper.join().unwrap();
     result.expect("Drop must not repeat the full teardown after its deadline");
+}
+
+#[test]
+fn restored_unknown_refuses_before_profile_preparation_and_preserves_epoch() {
+    let mut registry = Registry::default();
+    let mut workers = Workers::new(Arc::new(Notify::new()));
+    let (case, launch, _) = Case::prepare(&mut registry, 901, "state-reducer", vec![]);
+    registry.restore_handoff_unknown(std::slice::from_ref(&case.id));
+    let (_, projection, generation) = registry.get(&case.id).unwrap();
+    let before = format!("{:?}", projection.update);
+    let error = workers
+        .start(&mut registry, launch, |_| {
+            panic!("Unknown must refuse before preparation")
+        })
+        .unwrap_err();
+    assert_eq!(
+        error,
+        crate::api::error_code::ErrorCode::StructuredRecoveryRequired
+    );
+    let (_, after, epoch) = registry.get(&case.id).unwrap();
+    assert_eq!(epoch, generation);
+    assert_eq!(format!("{:?}", after.update), before);
+    assert!(workers.runtime(&case.id, epoch).is_none());
+    assert!(!case.leases.is_reserved(&case.session).unwrap());
+}
+
+#[tokio::test]
+async fn registry_worker_launch_uses_configured_blob_threshold() {
+    let (mut registry, mut workers, notify, now) = owner();
+    let config: crate::config::Config =
+        toml::from_str("[sessions]\nblob_min_bytes = 64\n").unwrap();
+    let block = json!({"type":"thinking", "thinking":"x".repeat(256)});
+    let bytes = serde_json::to_vec(&block).unwrap();
+    assert!(bytes.len() > config.sessions.blob_min_bytes);
+    assert!(bytes.len() < 2048);
+    let message = json!({"type":"assistant", "message":{"role":"assistant", "content":[block]}});
+    let (mut case, mut launch, factory) = Case::prepare(
+        &mut registry,
+        1919,
+        "worker-exit-ok",
+        vec![message, event("result")],
+    );
+    launch.storage = super::super::blobs::StorageConfig {
+        blob_min_bytes: config.sessions.blob_min_bytes,
+    };
+    case.generation = workers.start(&mut registry, launch, factory).unwrap();
+    case.ready(&mut registry, &mut workers, &notify, now).await;
+    case.submit(&workers);
+    wait(&notify, || {
+        workers.poll(&mut registry, now, 1000);
+        workers.report(&case.id, case.generation).is_some()
+    })
+    .await;
+    let report = workers.report(&case.id, case.generation).unwrap();
+    assert_eq!(report.result.as_ref().unwrap().outcome, Outcome::Exited);
+    assert!(!report.authority_retained);
+    assert!(workers.entries[&case.id].thread.is_none());
+    let stream = fs::read_to_string(
+        case.fixture
+            .root
+            .path()
+            .join("sessions")
+            .join(&case.id)
+            .join(format!("{}.jsonl", case.session)),
+    )
+    .unwrap();
+    let stored = stream
+        .lines()
+        .map(|line| {
+            let envelope: Value = serde_json::from_str(line).unwrap();
+            serde_json::from_str::<Value>(envelope["raw"].as_str().unwrap()).unwrap()
+        })
+        .find(|value| value["type"] == "assistant")
+        .expect("worker persisted assistant");
+    let reference: crate::structured::blobs::BlobRef =
+        serde_json::from_value(stored["message"]["content"][0].clone())
+            .expect("configured threshold must project this block");
+    let store = crate::structured::blobs::BlobStore::open(case.fixture.root.path()).unwrap();
+    assert_eq!(reference.size, bytes.len() as u64);
+    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), block);
 }
 
 #[tokio::test]

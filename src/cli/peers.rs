@@ -578,6 +578,19 @@ fn relay_refusal(request: &str) -> Option<(String, &'static str, String)> {
         .unwrap_or_default()
         .to_string();
     let method = parsed.get("method").and_then(|method| method.as_str())?;
+    if matches!(method, "agent.rename" | "agent.start" | "agent.spawn")
+        && parsed
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+    {
+        return Some((
+            id,
+            "invalid_agent_name",
+            crate::terminal::agent_name::POLICY.into(),
+        ));
+    }
     STREAMING_METHODS.contains(&method).then(|| {
         (
             id,
@@ -1038,6 +1051,20 @@ fn print_peers_help() {
 #[cfg(test)]
 mod tests {
     use super::PushDebounce;
+
+    #[test]
+    fn security_agent_name_relay_refuses_before_forwarding() {
+        let mut failures = Vec::new();
+        for method in ["agent.rename", "agent.start", "agent.spawn"] {
+            for (case, name) in crate::test_support::hostile_agent_names() {
+                let request = serde_json::json!({"id":"name-relay","method":method,"params":{"target":"agent-fixture","name":name}}).to_string();
+                if relay_refusal(&request).map(|(_, code, _)| code) != Some("invalid_agent_name") {
+                    failures.push((method, case));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "forwarded hostile names: {failures:?}");
+    }
 
     #[test]
     fn wake_subscription_retry_is_bounded_and_logs_once_per_outage() {

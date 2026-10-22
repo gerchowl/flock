@@ -18,7 +18,8 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 
     match subcommand {
         "list" => agent_list(&args[1..]),
-        "get" => agent_get(&args[1..]),
+        "get" | "status" => agent_get(&args[1..]),
+        "stop" => agent_stop(&args[1..]),
         "read" => agent_read(&args[1..]),
         "history" => agent_history(&args[1..]),
         "result" => agent_result(&args[1..]),
@@ -223,6 +224,12 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         eprintln!("usage: {AGENT_START_USAGE}");
         return Ok(2);
     };
+
+    if crate::terminal::agent_name::validate(name).is_err() {
+        return super::print_response(
+            &serde_json::json!({"ok": false, "error": crate::terminal::agent_name::refusal()}),
+        );
+    }
 
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
         eprintln!("usage: {AGENT_START_USAGE}");
@@ -704,6 +711,19 @@ fn agent_get(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn agent_stop(args: &[String]) -> std::io::Result<i32> {
+    let [target] = args else {
+        eprintln!("usage: flk agent stop <structured-agent>");
+        return Ok(super::exit::USAGE);
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:stop".into(),
+        method: Method::AgentStop(AgentTarget {
+            target: target.clone(),
+        }),
+    })?)
+}
+
 fn agent_focus(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!("usage: flk agent focus <target>");
@@ -926,12 +946,22 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn resolve_agent_target(target: &str, request_id: &str) -> std::io::Result<serde_json::Value> {
-    super::send_request(&Request {
+    let response = super::send_request(&Request {
         id: request_id.into(),
         method: Method::AgentGet(AgentTarget {
             target: target.to_owned(),
         }),
-    })
+    })?;
+    if response
+        .pointer("/result/agent/runtime")
+        .and_then(serde_json::Value::as_str)
+        == Some("structured")
+    {
+        return Ok(
+            serde_json::json!({"id":request_id,"error":{"code":crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),"message":"this operation requires a PTY placement"}}),
+        );
+    }
+    Ok(response)
 }
 
 fn agent_rename(args: &[String]) -> std::io::Result<i32> {
@@ -948,6 +978,12 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     } else {
         Some(args[1..].join(" "))
     };
+
+    if crate::terminal::agent_name::validate(name.as_deref().unwrap_or_default()).is_err() {
+        return super::print_response(
+            &serde_json::json!({"ok": false, "error": crate::terminal::agent_name::refusal()}),
+        );
+    }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:rename".into(),
@@ -1192,7 +1228,8 @@ fn agent_result(args: &[String]) -> std::io::Result<i32> {
 fn print_agent_help() {
     eprintln!("flk agent commands:");
     eprintln!("  flk agent list [--resumable]");
-    eprintln!("  flk agent get <target>");
+    eprintln!("  flk agent get|status <target>");
+    eprintln!("  flk agent stop <structured-agent>");
     eprintln!("  flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  {AGENT_HISTORY_USAGE}");
     eprintln!("  {AGENT_RESULT_USAGE}");

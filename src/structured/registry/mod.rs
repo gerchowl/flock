@@ -73,6 +73,7 @@ pub struct Record {
 /// The only runtime represented by a pane-free registry record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum StructuredRuntime {
     /// A process whose authoritative input is a session stream.
     Structured,
@@ -81,6 +82,8 @@ pub enum StructuredRuntime {
 /// Admission/update failures leave every existing entry untouched.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegistryError {
+    /// Unconfirmed ownership must be recovered or cleared before another launch.
+    RecoveryRequired,
     /// Identity, session, harness or supplied name is invalid.
     InvalidRecord,
     /// Unknown collection layout: back up session.json and follow the session-state repair guide.
@@ -137,6 +140,7 @@ impl Entry {
                 state,
                 phase_changed: None,
                 needs_human: Vec::new(),
+                permission_requests: Vec::new(),
                 stalled_since_ms: None,
                 observe_at: None,
             },
@@ -197,6 +201,14 @@ impl Registry {
         if self.unparsed.is_some() {
             return Err(RegistryError::UnsupportedCollectionShape);
         }
+        if record
+            .name
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            crate::logging::agent_name_dropped("registry");
+            return Err(RegistryError::InvalidRecord);
+        }
         if record.agent_id.is_empty()
             || record.session_id.is_empty()
             || record.harness != "claude"
@@ -236,6 +248,9 @@ impl Registry {
             .get_mut(agent_id)
             .filter(|entry| entry.generation == current)
             .ok_or(RegistryError::StaleGeneration)?;
+        if entry.projection.update.state.lifecycle == Lifecycle::Unknown {
+            return Err(RegistryError::RecoveryRequired);
+        }
         let generation = self
             .generation
             .checked_add(1)

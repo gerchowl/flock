@@ -309,7 +309,16 @@ fn actual_s6_open_request_blocks_with_stale_s4_idle_and_cancel_releases_it() {
         Turn::Idle,
         "S4 has not consumed the open event yet"
     );
-    assert_eq!(run.running.runtime.waiting_on_human().unwrap(), ["permit"]);
+    assert_eq!(
+        run.running
+            .runtime
+            .waiting_on_human()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        ["permit"]
+    );
     let before = run.q().journal().replay(0).unwrap().through;
     assert!(run.offer().unwrap().is_none());
     assert_eq!(run.q().journal().replay(0).unwrap().through, before);
@@ -880,15 +889,30 @@ fn cancelled_without_result_reports_pending_until_real_result_or_exit() {
 
 #[test]
 fn newer_journal_status_survives_scheduler_open_and_every_runtime_mutation_is_refused() {
-    readonly_runtime(false);
+    readonly_runtime("newer");
 }
 
 #[test]
 fn corrupt_journal_status_survives_scheduler_open_and_every_runtime_mutation_is_refused() {
-    readonly_runtime(true);
+    readonly_runtime("corrupt");
 }
 
-fn readonly_runtime(corrupt: bool) {
+#[test]
+fn invalid_header_reports_typed_read_only_scheduler_status() {
+    readonly_runtime("header");
+}
+
+#[test]
+fn legacy_unknown_reports_typed_read_only_scheduler_status() {
+    readonly_runtime("legacy");
+}
+
+#[test]
+fn required_checkpoint_reports_typed_read_only_scheduler_status() {
+    readonly_runtime("checkpoint");
+}
+
+fn readonly_runtime(mode: &str) {
     let mut run = QueueRun::mode("queue-silent");
     run.send(1, Producer::Human);
     run.offer().unwrap().unwrap();
@@ -902,41 +926,60 @@ fn readonly_runtime(corrupt: bool) {
     let old = fs::read(&path).unwrap();
     let mut lines = old.split_inclusive(|b| *b == b'\n');
     let mut header: Value = serde_json::from_slice(lines.next().unwrap()).unwrap();
-    if !corrupt {
-        header["format_version"] = json!(999);
+    match mode {
+        "newer" => header["format_version"] = json!(999),
+        "header" => header["format_version"] = Value::Null,
+        "legacy" => {
+            header.as_object_mut().unwrap().remove("format_version");
+        }
+        "corrupt" | "checkpoint" => (),
+        _ => panic!("unexpected fixture mode"),
     }
     let mut bytes = serde_json::to_vec(&header).unwrap();
     bytes.push(b'\n');
     bytes.extend(lines.flatten());
     let offset = bytes.len() as u64;
-    if corrupt {
+    if mode == "corrupt" {
         bytes.extend(b"{\"seq\":3,\"kind\":\"upsert\",\"item\":42}\ntorn tail");
+    } else if matches!(mode, "legacy" | "checkpoint") {
+        bytes.extend(b"{\"seq\":3,\"kind\":\"future\"}\n");
     }
     fs::write(&path, &bytes).unwrap();
-    let admission = Admission::new(
-        Journal::open(run.fixture.root.path(), "fixture-agent").unwrap(),
-        MAX_BATCH,
-    )
-    .unwrap();
+    let mut journal = Journal::open(run.fixture.root.path(), "fixture-agent").unwrap();
+    if mode == "checkpoint" {
+        assert!(journal.read_only().is_none());
+        assert!(journal.checkpoint().is_err());
+    }
+    let admission = Admission::new(journal, MAX_BATCH).unwrap();
     let mut scheduler = Scheduler::new(admission).unwrap();
     let status = scheduler.status(&run.running.runtime).unwrap();
-    let code = if corrupt {
+    let code = if mode != "newer" {
         ErrorCode::QueueJournalCorrupt
     } else {
         ErrorCode::QueueJournalNewer
     };
-    if corrupt {
+    if mode != "newer" {
+        let (seq, offset, reason) = match mode {
+            "corrupt" => (Some(3), offset, "malformed_known_record"),
+            "header" => (None, 0, "invalid_format_version"),
+            "legacy" | "checkpoint" => (
+                Some(3),
+                bytes.len() as u64,
+                "unknown_data_prevents_checkpoint",
+            ),
+            _ => panic!("unexpected fixture mode"),
+        };
         assert_eq!(
             status.cause,
             PendingCause::QueueJournalCorrupt(crate::structured::queue::QueueJournalCorrupt {
-                seq: Some(3),
+                seq,
                 offset,
-                reason: "malformed_known_record"
+                reason
             })
         );
         assert_eq!(
-            serde_json::to_value(&status).unwrap()["cause"]["queue_journal_corrupt"]["offset"],
-            offset
+            serde_json::to_value(&status).unwrap()["cause"]["queue_journal_corrupt"]["reason"],
+            reason
         );
     } else {
         assert_eq!(

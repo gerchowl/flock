@@ -34,6 +34,7 @@ pub(crate) mod peers;
 pub(super) mod responses;
 mod revert;
 mod spawn;
+mod structured_agents;
 mod tabs;
 pub(crate) mod workspaces;
 mod worktrees;
@@ -1057,7 +1058,10 @@ impl App {
                 data: crate::api::schema::EventData::PaneAgentDetected {
                     pane_id: pane_id.clone(),
                     workspace_id: workspace_id.clone(),
-                    agent: update.agent_label.clone(),
+                    agent: crate::terminal::agent_name::received(
+                        update.agent_label.clone(),
+                        "gui_event",
+                    ),
                 },
             });
         }
@@ -1092,7 +1096,10 @@ impl App {
                     pane_id,
                     workspace_id,
                     agent_status,
-                    agent: update.agent_label.clone(),
+                    agent: crate::terminal::agent_name::received(
+                        update.agent_label.clone(),
+                        "gui_event",
+                    ),
                     title: presentation.title,
                     display_agent: presentation.display_agent,
                     custom_status: presentation.custom_status,
@@ -1587,6 +1594,7 @@ impl App {
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
+            Method::AgentStop(target) => return self.handle_structured_stop(request.id, target),
             Method::AgentFocus(target) => return self.handle_agent_focus(request.id, target),
             Method::AgentRename(params) => return self.handle_agent_rename(request.id, params),
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
@@ -2355,7 +2363,7 @@ mod tests {
         terminal.detected_agent = Some(Agent::Claude);
         // Exactly what `flock_agent_start` does when the calling model supplies
         // one: `agent_name` outranks the detected harness in `pane_details`.
-        terminal.set_agent_name("researcher".into());
+        terminal.set_agent_name("researcher".into()).unwrap();
         terminal.state = AgentState::Working;
 
         let response = app.handle_peers_summary("req_peers".into());
@@ -2398,7 +2406,8 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_agent_name("researcher".into());
+            .set_agent_name("researcher".into())
+            .unwrap();
 
         let response = app.handle_peers_summary("req_peers".into());
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -3000,7 +3009,7 @@ mod tests {
             .get_mut(&terminal_id)
             .expect("test terminal should exist");
         terminal.respawn_shell_on_exit = true;
-        terminal.set_agent_name("codex".into());
+        terminal.set_agent_name("codex".into()).unwrap();
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),
@@ -3021,7 +3030,7 @@ mod tests {
             .expect("terminal should survive respawn");
         assert!(!terminal.respawn_shell_on_exit);
         assert!(terminal.persisted_agent_session.is_none());
-        assert!(terminal.agent_name.is_none());
+        assert!(terminal.agent_name().is_none());
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();

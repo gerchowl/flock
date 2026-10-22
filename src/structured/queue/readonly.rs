@@ -21,13 +21,16 @@ impl std::fmt::Display for QueueJournalNewer {
 }
 impl std::error::Error for QueueJournalNewer {}
 
-/// A supported-format record is corrupt. Only an operator can recover it.
+/// A supported journal is corrupt or unknown data prevent a required rewrite.
+/// Only operator recovery can restore writes; neither reason permits retries.
 /// Payload text is excluded from the reason so diagnostics cannot expose input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct QueueJournalCorrupt {
-    /// Cursor of the bad record, when its sequence is readable.
+    /// Cursor of the bad record when readable, or the last recovered cursor
+    /// when unknown data block a required checkpoint.
     pub seq: Option<u64>,
-    /// Byte offset of the first bad record or incomplete snapshot boundary.
+    /// Byte offset of the first bad record, incomplete snapshot or required
+    /// checkpoint boundary when unknown data prevent rewriting.
     pub offset: u64,
     /// Stable diagnostic identifier, never an untrusted payload or parser message.
     pub reason: &'static str,
