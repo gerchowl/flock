@@ -640,7 +640,7 @@ impl App {
                 let peer = self.state.peer_summaries.get(peer_idx)?;
                 let ssh_target = peer.ssh_target.clone();
                 let target = ws_idx.and_then(|ws_idx| peer.workspaces.get(ws_idx));
-                let label = switch_label(peer.display_name(), target);
+                let label = switch_label(&self.state.server_peer_name(peer), target);
                 let focus_workspace = focus_target(target);
                 let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
                 Some(PreparedServerSwitch {
@@ -657,7 +657,7 @@ impl App {
                 let entry = self.state.fleet_snapshot.as_ref()?.peers.get(entry_idx)?;
                 let ssh_target = entry.ssh_target.clone();
                 let target = ws_idx.and_then(|ws_idx| entry.workspaces.get(ws_idx));
-                let label = switch_label(entry.display_name(), target);
+                let label = switch_label(&self.state.server_peer_name(entry), target);
                 let focus_workspace = focus_target(target);
                 // Gossip v3 (#101 part 3): the snapshot entry was stamped by
                 // the hub that emitted it — use its ProxyJump identity so the
@@ -684,7 +684,7 @@ impl App {
                 }
                 let entry = &relayed.peer;
                 let ssh_target = entry.ssh_target.clone();
-                let name = entry.host.clone().unwrap_or_else(|| entry.peer.clone());
+                let name = self.state.server_peer_name(entry);
                 let target = ws_idx.and_then(|ws_idx| entry.workspaces.get(ws_idx));
                 let label = switch_label(&name, target);
                 let focus_workspace = focus_target(target);
@@ -702,7 +702,13 @@ impl App {
                 // Land home (the spoke has no ssh route to the hub) with the
                 // selected origin workspace as the post-attach focus target.
                 let snapshot = self.state.fleet_snapshot.as_ref()?;
-                let origin = snapshot.origin.clone();
+                let origin = self.state.server_claim_name(
+                    &snapshot.origin,
+                    snapshot
+                        .origin_summary
+                        .as_ref()
+                        .and_then(|peer| peer.node_id.as_deref()),
+                );
                 let ws = snapshot.origin_summary.as_ref()?.workspaces.get(ws_idx)?;
                 let focus_workspace = (!ws.id.is_empty()).then(|| ws.id.clone());
                 let label = format!("{origin}:{}", ws.workspace);
@@ -715,7 +721,14 @@ impl App {
                 })
             }
             PeerSwitchRequest::Home => {
-                let origin = self.state.fleet_snapshot.as_ref()?.origin.clone();
+                let snapshot = self.state.fleet_snapshot.as_ref()?;
+                let origin = self.state.server_claim_name(
+                    &snapshot.origin,
+                    snapshot
+                        .origin_summary
+                        .as_ref()
+                        .and_then(|peer| peer.node_id.as_deref()),
+                );
                 Some(PreparedServerSwitch {
                     ssh_target: crate::protocol::HOME_SWITCH_TARGET.to_string(),
                     label: format!("{origin} (home)"),
@@ -763,7 +776,7 @@ impl App {
         let ssh_target = carried.ssh_target.clone();
         let proxy_jump = carried.proxy_jump.clone();
         let target = ws_idx.and_then(|ws_idx| pushed.workspaces.get(ws_idx));
-        let label = switch_label(carried.display_name(), target);
+        let label = switch_label(&self.state.server_peer_name(carried), target);
         let focus_workspace = focus_target(target);
         let fleet = Some(self.outgoing_fleet_snapshot(&ssh_target));
         Some(PreparedServerSwitch {

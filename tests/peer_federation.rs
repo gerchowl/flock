@@ -28,40 +28,6 @@ use support::{
 const VARIANT_FRAME: u32 = 1;
 const VARIANT_SWITCH_SERVER: u32 = 9;
 
-/// The origin host label the binary pins at slot 0, computed the same way as
-/// `app::api::peers::short_host_name` (macOS `scutil` LocalHostName, else the
-/// `hostname` base). Keeps the home-row assertion portable across dev machines
-/// and CI runners — it was previously hardcoded to one machine's own hostname.
-fn local_short_host() -> String {
-    if let Ok(name) = std::env::var("FLOCK_HOST_NAME") {
-        let name = name.trim();
-        if !name.is_empty() {
-            return name.to_string();
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(out) = std::process::Command::new("/usr/sbin/scutil")
-            .args(["--get", "LocalHostName"])
-            .output()
-        {
-            if out.status.success() {
-                let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !name.is_empty() {
-                    return name;
-                }
-            }
-        }
-    }
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|h| h.trim().split('.').next().unwrap_or("").to_string())
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 fn unique_test_dir() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -739,19 +705,14 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
             .expect("spoke handshake should complete");
     assert!(error.is_none(), "spoke handshake rejected: {error:?}");
 
-    // The spoke renders the carried fleet in one frame: the pinned home
-    // row plus the carried (render-only) ghost row. Post-#84 the home row
-    // carries no arrow or suffix -- its pinned slot-0 position is the label,
-    // so the FIRST band row naming the origin is home.
+    // Carried names are unverified and may be escaped or truncated. Select
+    // the reserved Home affordance, never infer the endpoint from a name.
     let rows = wait_for_frame_matching(&mut stream_b, &["ghost"], Duration::from_secs(30))
         .expect("snapshot peer should render on the spoke");
-    let host = local_short_host();
     let home_row = rows
         .iter()
-        // The row leads with the fixed 2-cell server-icon slot (#164, blank
-        // here — no icon configured), so match the host after trimming it.
-        .position(|row| row.trim_start().starts_with(host.as_str()))
-        .expect("home (origin) row present in slot 0");
+        .position(|row| row.contains('\u{f02dc}'))
+        .expect("home (origin) row carries its Home affordance");
 
     // --- #66: the hub's OWN workspace (alpha) folds into the spoke's spaces
     // list as a remote-only project row. Clicking it lands HOME (the spoke

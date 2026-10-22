@@ -204,6 +204,85 @@ launder a disallowed origin. Forwarding preserves the authenticated origin
 binding end to end, and an unknown/unbound origin cannot borrow a hub's
 name.
 
+### Peer names in presentation
+
+Configured names and locally pinned/enrolled bindings are authoritative;
+reported node IDs and carried snapshot names are claims. One shared
+claimed-name presentation function owns comparison and escaping. Comparison
+first removes format, bidi, control, default-ignorable and whitespace scalars.
+One function returns two keys for each claim and each configured/pinned alias:
+`K1 = skeleton(fold(x))`, and `K2 = fold(skeleton(x))`, repeating the latter
+composition until its fixed point. Two names collide exactly when their K1
+keys match OR their K2 keys match. Here `fold` is full Unicode casefolding and
+`skeleton` is the UTS #39 confusable skeleton. Two keys are necessary because
+folding and skeletons do not commute: fold-first catches `I`/`i`, while
+skeleton-first preserves `I`/`l`, `1`/`l` and `kiIn`/`kiln`. Reapplying a
+fold-first composition cannot recover the capital I already folded away.
+A further skeleton-first pass is sometimes necessary: `M` first becomes `m`,
+then `rn`. Normalization performs at most eight further skeleton-first steps,
+returning its last value if future data fails to converge by that backstop.
+Fast deterministic cases and a nonconverging-step test run normally. The
+exhaustive Unicode-scalar audit is ignored by default and run explicitly when
+updating normalization dependencies; it checks the data with a bounded reference,
+without running the production fixed-point loop.
+The maintained
+[`unicode-security`](https://docs.rs/unicode-security/0.1.2/unicode_security/)
+0.1.2 implementation supplies the skeleton and default-ignorable properties;
+`caseless` 0.2.2 supplies full casefolding and `unicode-general-category` 1.1.0
+supplies format categories. These dependencies pass the existing cargo-deny
+license and advisory policy without exceptions. No local confusables table is
+used. These keys are local comparison forms, never display text, persisted
+metadata, or routing keys.
+
+On collision the claimed alias is hidden behind its escaped short node ID;
+otherwise the name is escaped. Every claim carries `[unverified]`, including
+empty names and short-ID fallbacks. Format/bidi/control/default-ignorable
+scalars and whitespace render as visible Unicode escapes; only a single
+interior ASCII space between visible non-whitespace scalars remains literal.
+Literal backslashes are escaped too. Truncation reserves the badge and cuts
+the remaining name/context by terminal cells. Below twelve cells the compact
+badge is `?`; with zero cells no name or badge can render. Icon modes cannot
+replace the badge. Narrow rows may drop ornaments or project context to retain
+this trust cue.
+
+The rule applies to servers (including carried Origin), spaces, agents,
+navigator rows and details, filter headers, checkout and switch notices, and
+fleet-directory/CLI and message/wait host labels. Locally configured rows keep
+their configured name even before a pin exists. A carried Home observation is
+still an unproven claim even when its asserted node ID matches a local pin;
+its Home badge remains as a deliberate UX trade-off. Only proof from that
+observation's source permits a trusted name. Stored owner hints from earlier
+versions pass the same function on read. New owner records preserve the raw
+observation separately from display, preventing repeated badge/escape growth.
+Agent locations keep the raw reported `host` separate from `display_host`.
+Message API `to_host` and persisted mesh payload host metadata use the raw
+observation; fleet directory labels and message/wait notices use presentation.
+For direct delivery (`via: None`), message-status details first resolve the raw
+destination through local delivery route bindings. Exact configured alias/dial-target
+keys on that route, or exact pinned aliases bound to the same node as that route,
+use the trusted local alias. Hub-carried delivery (`via: Some`) always uses
+claimed-name presentation: the recorded event carries no destination owner node
+proof, and a hub's route binding proves only the hop. A claimed destination cannot
+borrow that hub's alias, even when its raw name exactly matches the route.
+Empty keys, lookalikes, case variants and unrelated route claims never gain trust
+through the Unicode comparison keys. Unresolved destinations, including older
+events without a matching local binding, use escaped, badged presentation.
+When alias-collision protection hides a name and no owner identity is available,
+the label is `[unverified] unknown destination`, rather than a bare badge. This
+keeps the destination visible without rendering an unproven configured alias.
+The raw destination metadata remains unchanged.
+None of this rewrites cache keys, identity proofs, policy bindings or dial
+targets. Wire summaries remain observations, not authority to borrow aliases.
+
+An unproven row with a node ID has the badge `unverified`; an ID-less legacy
+row has `legacy/unverified`. Neither badge grants identity or routing trust.
+A hub-pushed observation claiming the carried origin's node ID is annotated
+as an `unverified home claim` under the Origin row instead of taking another
+server slot. This is a presentation association, not deduplication or proof:
+its independent observation and workspaces remain available, and the Home
+switch still uses the reserved local target. ID-less rows remain separate;
+name similarity never establishes this association.
+
 `flk fleet pause` freezes custody completely on the paused node: no new send
 acceptance, retry, forwarding, collection/import, inbox delivery or expiry.
 Return an explicit paused refusal to incoming custody attempts and leave the

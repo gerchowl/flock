@@ -27,7 +27,7 @@ impl crate::app::App {
         let Some(peer) = self.state.peers.get(peer_idx).cloned() else {
             return;
         };
-        let host = summary.display_name().to_string();
+        let host = self.state.server_peer_name(summary);
         let Some(remote) = summary.workspaces.get(ws_idx) else {
             return;
         };

@@ -885,7 +885,12 @@ impl AppState {
         let mut rows = Vec::new();
         for (peer_ref, peer) in self.visible_remote_peers() {
             for (peer_ws_idx, summary) in peer.workspaces.iter().enumerate() {
-                let label = crate::ui::grammar::solo_remote_label(self.server_label, peer, summary);
+                let label = crate::ui::grammar::solo_remote_label(
+                    self.server_label,
+                    peer,
+                    summary,
+                    &self.server_peer_host(peer),
+                );
                 let (status, seen) = crate::ui::status::remote_state(summary.status);
                 let activity = summary.activity.clone().unwrap_or_default();
                 let search_text = format!("{label} {activity}").to_lowercase();
@@ -5815,7 +5820,10 @@ mod tests {
             })
             .expect("fleet-wide navigator should surface the peer workspace");
         // Same self-contained grammar the sidebar shows: `owner/repo · host:branch`.
-        assert_eq!(remote.label, "gerchowl/flock \u{00b7} atlas:main");
+        assert_eq!(
+            remote.label,
+            "gerchowl/flock \u{00b7} [unverified] atlas:main"
+        );
         assert_eq!(remote.status, AgentState::Working);
     }
 

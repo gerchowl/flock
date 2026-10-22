@@ -22,8 +22,12 @@ pub(crate) struct AgentLocation {
     pub(crate) agent_id: String,
     pub(crate) node: Option<String>,
     pub(crate) live: bool,
-    /// Short host name of the server the agent lives on.
+    /// Raw reported machine label for protocol metadata and persistence.
+    /// A claim, never an identity binding or a routing key.
     pub(crate) host: String,
+    /// Viewer-safe label, including escaping and an unverified badge.
+    /// Only presentation sinks use this field.
+    pub(crate) display_host: String,
     /// Public pane id **on that host**. Meaningless anywhere else.
     pub(crate) pane_id: String,
     /// `true` when the agent is on this server — i.e. reachable without the
@@ -102,11 +106,16 @@ impl App {
                 None
             }
         };
+        let display_host = route.clone().unwrap_or_else(|| {
+            self.state
+                .server_claim_name(&owner.name, Some(&owner.node_id))
+        });
         Some(AgentLocation {
             agent_id: agent_id.into(),
             node: Some(owner.node_id),
             live: false,
-            host: route.clone().unwrap_or(owner.name),
+            host: owner.name,
+            display_host,
             pane_id: String::new(),
             local: false,
             direct: route.is_some(),
@@ -164,11 +173,13 @@ impl App {
                     if terminal.agent_id.to_string() != agent_id {
                         continue;
                     }
+                    let host = crate::app::short_host_name();
                     return Some(AgentLocation {
                         node: self.node_id.clone(),
                         live: true,
                         agent_id: agent_id.to_string(),
-                        host: crate::app::short_host_name(),
+                        display_host: host.clone(),
+                        host,
                         pane_id: self.state.public_pane_id(ws_idx, *pane_id)?,
                         local: true,
                         route: None,
@@ -210,7 +221,7 @@ impl App {
                 .node_id
                 .as_deref()
                 .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
-            let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
+            let display_host = self.state.server_peer_host(peer);
             let route = Some(peer.peer.clone());
             for ws in &peer.workspaces {
                 for agent in &ws.agents {
@@ -219,7 +230,8 @@ impl App {
                             node: peer.node_id.clone(),
                             live,
                             agent_id: agent.agent_id.clone(),
-                            host: host.clone(),
+                            host: peer.host.clone().unwrap_or_else(|| peer.peer.clone()),
+                            display_host: display_host.clone(),
                             pane_id: agent.pane_id.clone(),
                             local: false,
                             route: route.clone(),
@@ -237,7 +249,7 @@ impl App {
                 .node_id
                 .as_deref()
                 .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
-            let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
+            let display_host = self.state.server_peer_host(peer);
             for ws in &peer.workspaces {
                 for agent in &ws.agents {
                     entries.push(FleetAgentEntry {
@@ -245,7 +257,8 @@ impl App {
                             node: peer.node_id.clone(),
                             live,
                             agent_id: agent.agent_id.clone(),
-                            host: host.clone(),
+                            host: peer.host.clone().unwrap_or_else(|| peer.peer.clone()),
+                            display_host: display_host.clone(),
                             pane_id: agent.pane_id.clone(),
                             local: false,
                             // A relayed entry is reachable only via the peer
@@ -309,7 +322,7 @@ impl App {
             }
             rows.push(crate::api::schema::FleetAgentInfo {
                 agent_id: entry.location.agent_id,
-                host: entry.location.host,
+                host: entry.location.display_host,
                 pane_id: entry.location.pane_id,
                 local: false,
                 route: entry.location.route,
@@ -329,6 +342,73 @@ impl App {
 mod tests {
     use crate::api::schema::{AgentStatus, PeerAgentSummary, PeerWorkspaceSummary};
     use crate::app::App;
+
+    #[test]
+    fn security2166_directory_and_notices_cannot_claim_a_configured_alias() {
+        let mut app = test_app();
+        app.state.peers.push(crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        let mut spoof = peer_with_agent(
+            "node-trusted.example",
+            "node-trusted.example",
+            "agent_remote_1",
+        );
+        spoof.node_id = Some("claimed-node".into());
+        app.state.relayed_fleet_cache.insert(
+            "claim".into(),
+            crate::peers::RelayedEntry {
+                peer: spoof,
+                via: Some("node-hub.example".into()),
+                hub_pushed: true,
+            },
+        );
+        let rows = app.collect_fleet_agents(&[]);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].host.contains("node-trusted.example"),
+            "{}",
+            rows[0].host
+        );
+        assert!(rows[0].host.contains("unverified"));
+        let location = app.locate_agent("agent_remote_1").unwrap();
+        assert_eq!(location.display_host, rows[0].host);
+        assert_eq!(location.host, "node-trusted.example");
+        assert_eq!(location.node.as_deref(), Some("claimed-node"));
+        assert_eq!(location.route.as_deref(), Some("node-hub.example"));
+    }
+
+    #[test]
+    fn security2166_r2_owner_observations_are_not_persisted_as_rendered_labels() {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app();
+        app.state.peers.push(crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        let agent = "11111111-1111-4111-8111-111111111111";
+        let mut peer = peer_with_agent("node-trusted.example", "node-trusted.example", agent);
+        peer.node_id = Some(crate::mesh::identity::NodeIdentity::fixture([18; 32]).node_id());
+        app.state.relayed_fleet_cache.insert(
+            "claim".into(),
+            crate::peers::RelayedEntry {
+                peer,
+                via: Some("node-hub.example".into()),
+                hub_pushed: true,
+            },
+        );
+        let display = app.locate_agent(agent).unwrap().display_host;
+        app.note_mesh_owners();
+        let owner =
+            crate::mesh::runtime_store::read(|store| store.owner(agent).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(owner.name, "node-trusted.example");
+        app.state.relayed_fleet_cache.clear();
+        assert_eq!(app.locate_agent(agent).unwrap().display_host, display);
+    }
 
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -400,6 +480,7 @@ mod tests {
             .expect("remote agent resolves");
         assert!(!found.local);
         assert_eq!(found.host, "kiln-dev");
+        assert_eq!(found.display_host, "[unverified] kiln-dev");
         assert_eq!(found.pane_id, "w1:p1");
     }
 
@@ -413,7 +494,8 @@ mod tests {
         app.state.peer_summaries = vec![peer_with_agent("kiln", "bastion", "agent_bastion_1")];
 
         let found = app.locate_agent("agent_bastion_1").expect("resolves");
-        assert_eq!(found.host, "bastion", "where the agent is");
+        assert_eq!(found.host, "bastion", "reported machine label");
+        assert_eq!(found.display_host, "[unverified] bastion");
         assert_eq!(
             found.route.as_deref(),
             Some("kiln"),
@@ -513,7 +595,7 @@ mod tests {
             !remote.local,
             "a peer's agent is not addressable by pane id"
         );
-        assert_eq!(remote.host, "bastion", "where it is");
+        assert_eq!(remote.host, "[unverified] bastion", "where it is");
         assert_eq!(
             remote.route.as_deref(),
             Some("kiln"),

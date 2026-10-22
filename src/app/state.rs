@@ -2883,13 +2883,66 @@ impl AppState {
             })
     }
 
-    /// Prefer the locally bound name; advertised names are presentation only.
+    /// Render a claimed name through the shared escaped, badged presentation
+    /// and UTS #39 alias-skeleton policy (ADR-0026, origin policy).
+    pub(crate) fn server_claim_name(&self, name: &str, node: Option<&str>) -> String {
+        crate::peer_name::claimed(
+            name,
+            node,
+            self.peers
+                .iter()
+                .map(|peer| peer.name.as_str())
+                .chain(self.server_nodes.keys().map(String::as_str)),
+        )
+    }
+
+    /// Resolve direct delivery presentation through exact local route keys.
+    /// Hub events carry no destination node proof, so their names remain claims.
+    /// An unresolved alias has a visible label even when collision protection hides it.
+    pub(crate) fn server_delivery_name(
+        &self,
+        host: &str,
+        route: &str,
+        via: Option<&str>,
+    ) -> String {
+        let unverified = || {
+            let label = self.server_claim_name(host, None);
+            if label == crate::peer_name::BADGE {
+                format!("{label} unknown destination")
+            } else {
+                label
+            }
+        };
+        if via.is_some() || host.is_empty() || route.is_empty() {
+            return unverified();
+        }
+        let configured = self
+            .peers
+            .iter()
+            .find(|peer| peer.name == route || peer.ssh == route);
+        if let Some(peer) = configured.filter(|peer| host == peer.name || host == peer.ssh) {
+            return peer.name.clone();
+        }
+        let route_node = self
+            .server_nodes
+            .get(route)
+            .or_else(|| configured.and_then(|peer| self.server_nodes.get(&peer.name)));
+        if let Some(node) = self
+            .server_nodes
+            .get(host)
+            .filter(|node| Some(*node) == route_node)
+        {
+            return self.server_node_name(node).unwrap_or(host).to_string();
+        }
+        unverified()
+    }
+
+    /// Prefer a proven binding or the locally configured source name. All
+    /// other names pass the same alias-collision rule on every UI surface.
     pub(crate) fn server_peer_name(&self, peer: &crate::peers::PeerSummaryState) -> String {
         if let Some(node) = self.server_peer_node(peer) {
-            if self.peer_summaries.iter().any(|p| std::ptr::eq(p, peer)) {
-                if let Some(name) = self.server_node_name(node).filter(|name| !name.is_empty()) {
-                    return name.to_string();
-                }
+            if let Some(name) = self.server_node_name(node).filter(|name| !name.is_empty()) {
+                return name.to_string();
             }
             if peer.display_name().is_empty() {
                 return node
@@ -2898,15 +2951,46 @@ impl AppState {
                     .flat_map(char::escape_default)
                     .collect();
             }
+            return peer.display_name().to_string();
         }
-        if peer.display_name().is_empty() {
-            peer.node_id
-                .as_deref()
-                .map(|id| id.chars().take(8).flat_map(char::escape_default).collect())
-                .unwrap_or_else(|| "legacy/unverified".to_string())
-        } else {
-            peer.display_name().to_string()
+        if self.peer_summaries.iter().any(|p| std::ptr::eq(p, peer)) {
+            if let Some(config) = self.peers.iter().find(|config| config.name == peer.peer) {
+                return config.name.clone();
+            }
         }
+        self.server_claim_name(peer.display_name(), peer.node_id.as_deref())
+    }
+
+    /// Directory host text is presentation, separate from the owner node and
+    /// next-hop route. Apply the same alias protection to reported hostnames.
+    pub(crate) fn server_peer_host(&self, peer: &crate::peers::PeerSummaryState) -> String {
+        if self.peer_summaries.iter().any(|p| std::ptr::eq(p, peer))
+            && self.peers.iter().any(|config| config.name == peer.peer)
+        {
+            return self.server_peer_name(peer);
+        }
+        let host = peer.host.as_deref().unwrap_or(&peer.peer);
+        if let Some(node) = self.server_peer_node(peer) {
+            return self.server_node_name(node).unwrap_or(host).to_string();
+        }
+        self.server_claim_name(host, peer.node_id.as_deref())
+    }
+
+    /// A hub-pushed observation asserting the carried origin's node identity.
+    /// Annotating it under Home does not authenticate or merge its data; its
+    /// workspaces and independent source remain available in `remote_peers`.
+    pub(crate) fn server_home_claim(&self, peer: &crate::peers::PeerSummaryState) -> bool {
+        let origin_node = self
+            .fleet_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.origin_summary.as_ref())
+            .and_then(|origin| origin.node_id.as_deref());
+        origin_node.is_some()
+            && peer.node_id.as_deref() == origin_node
+            && self
+                .relayed_fleet_cache
+                .values()
+                .any(|entry| entry.hub_pushed && std::ptr::eq(&entry.peer, peer))
     }
 
     /// Drop relay-cache rows that have aged out of usefulness (#101).
