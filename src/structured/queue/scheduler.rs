@@ -45,7 +45,9 @@ pub(crate) enum PendingCause {
 /// Status of an accepted batch or a candidate refused without any stdin write.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Pending {
-    /// Accepted/refused batch UUID, or none when no candidate was formed.
+    /// Accepted batch UUID or the candidate UUID at refusal time; none when no
+    /// candidate was formed. A refusal ID is historical, not the current head:
+    /// later edits, removal, cancellation or admission do not update it.
     pub batch_id: Option<String>,
     /// Reservation/first-refusal time, or observation time for an S4/S6 gate.
     /// Zero for journal read-only refusal, which has no reservation clock.
@@ -113,14 +115,28 @@ impl Scheduler {
     pub fn enqueue(&mut self, item: Item, principal: Principal, gate: Gate) -> Result<(), Failure> {
         self.admission.enqueue(item, principal, gate)
     }
+    pub(in crate::structured) fn take_facts(
+        &mut self,
+    ) -> Vec<crate::api::queue_event::QueueItemState> {
+        self.admission.take_facts()
+    }
     /// Committed state and owned replay cuts for serialized publication.
     pub fn journal(&self) -> &Journal {
         self.admission.journal()
     }
     /// Current journal/accepted-turn blocker or unconfirmed refused candidate. Status and
-    /// deliver report the same cause/time. No status observation writes a record;
+    /// deliver report the same cause/time. A refused candidate retains its ID
+    /// and time from that attempt until a real result or runtime exit clears it
+    /// (ADR-0036 §3). It does not identify the current queue head or batch.
+    /// No status observation writes a record.
     /// S4/S6 gates and no-eligible-input are reported by deliver when unreserved.
     pub fn status(&self, runtime: &Runtime) -> Option<Pending> {
+        self.status_on(runtime.input_handle())
+    }
+    pub(in crate::structured) fn status_on(
+        &self,
+        runtime: &crate::structured::transport::InputHandle,
+    ) -> Option<Pending> {
         if let Some(reason) = self.journal().read_only() {
             return Some(Pending {
                 batch_id: None,
@@ -158,8 +174,16 @@ impl Scheduler {
         state: &AgentState,
         now_ms: u64,
     ) -> Result<Offer, Failure> {
+        self.deliver_on(runtime.input_handle(), state, now_ms)
+    }
+    pub(in crate::structured) fn deliver_on(
+        &mut self,
+        runtime: &crate::structured::transport::InputHandle,
+        state: &AgentState,
+        now_ms: u64,
+    ) -> Result<Offer, Failure> {
         self.journal().writable()?;
-        if let Some(pending) = self.status(runtime) {
+        if let Some(pending) = self.status_on(runtime) {
             return Ok(Offer::Pending(pending));
         }
         let open = runtime
@@ -233,6 +257,14 @@ impl Scheduler {
         self.virgin = false;
         Ok(Offer::Submitted { batch_id: batch.id })
     }
+    /// Capture a bootstrapped subscription under this sole writer's ownership.
+    pub(crate) fn subscription(&mut self) -> Result<super::Cut, Failure> {
+        self.admission.subscription()
+    }
+    /// Check configured rewrite policy under the scheduler's sole write ownership.
+    pub(crate) fn checkpoint_if_required(&mut self) -> Result<Option<super::Cut>, Failure> {
+        self.admission.checkpoint_if_required()
+    }
     fn members(&self) -> Vec<Item> {
         self.admission
             .journal()
@@ -296,19 +328,7 @@ impl Scheduler {
                 }
             }
         }
-        let result = match event {
-            SessionEvent::Success(e) => e
-                .parent_tool_use_id
-                .as_ref()
-                .and_then(Option::as_ref)
-                .is_none(),
-            SessionEvent::ExecutionError(e) => e
-                .parent_tool_use_id
-                .as_ref()
-                .and_then(Option::as_ref)
-                .is_none(),
-            _ => false,
-        };
+        let result = ends_turn(event);
         if result {
             let mut items = self.members();
             for item in &mut items {
@@ -333,5 +353,22 @@ impl Scheduler {
         self.refused = None;
         self.virgin = false;
         Ok(())
+    }
+}
+
+/// Only known top-level results establish the next S4 coverage boundary.
+pub(in crate::structured) fn ends_turn(event: &SessionEvent) -> bool {
+    match event {
+        SessionEvent::Success(e) => e
+            .parent_tool_use_id
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_none(),
+        SessionEvent::ExecutionError(e) => e
+            .parent_tool_use_id
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_none(),
+        _ => false,
     }
 }

@@ -74,12 +74,30 @@ impl Case {
             storage: Default::default(),
             mcp: fixture.mcp(),
             stall_after: STALL,
+            queue_rewrite_bytes: crate::config::Config::default()
+                .sessions
+                .queue_rewrite_bytes,
             lineage: None,
         };
-        let f = fixture.clone();
-        let authority = leases.clone();
+        let case = Self {
+            fixture,
+            id,
+            session,
+            generation,
+            leases,
+        };
+        let factory = case.factory(mode, events);
+        (case, launch, factory)
+    }
+    fn factory(
+        &self,
+        mode: &str,
+        events: Vec<Value>,
+    ) -> impl FnOnce(&Record) -> Result<LaunchProfile, LaunchError> + Send + 'static {
+        let f = self.fixture.clone();
+        let authority = self.leases.clone();
         let mode = mode.to_owned();
-        let factory = move |record: &Record| {
+        move |record: &Record| {
             assert!(
                 authority.is_reserved(&record.session_id).unwrap(),
                 "reserve precedes profile factory"
@@ -110,18 +128,7 @@ impl Case {
                 0o600,
             );
             Ok(profile)
-        };
-        (
-            Self {
-                fixture,
-                id,
-                session,
-                generation,
-                leases,
-            },
-            launch,
-            factory,
-        )
+        }
     }
     pub(crate) fn assert_shutdown(&self, registry: &Registry, workers: &Workers) {
         assert!(workers.entries[&self.id].thread.is_none(), "worker joined");
@@ -180,6 +187,8 @@ impl Case {
                 finished: false,
                 events_closed: false,
                 stall_after: STALL,
+                queue_state: None,
+                queue_seq: 0,
                 thread: Some(std::thread::spawn(|| {})),
             },
         );
@@ -191,7 +200,17 @@ impl Case {
         case
     }
     pub fn submit(&self, workers: &Workers) {
-        workers.runtime(&self.id, self.generation).unwrap().try_submit(&json!({"type":"user","message":{"role":"user","content":"fixture turn"},"parent_tool_use_id":null,"session_id":""})).unwrap();
+        let mut item = crate::structured::queue::tests::item(&self.session);
+        item.body = "fixture turn".into();
+        workers
+            .runtime(&self.id, self.generation)
+            .unwrap()
+            .queue_enqueue(super::queue::Request {
+                item,
+                principal: crate::structured::queue::admission::Principal::Operator,
+                gate: crate::structured::queue::admission::Gate::Send,
+            })
+            .unwrap();
     }
     pub async fn ready(
         &self,
@@ -382,9 +401,23 @@ async fn explicit_stop_closes_open_request_and_releases_only_after_completion() 
     assert!(workers.runtime(&a.id, a.generation).is_none());
     registry.remove(&a.id, a.generation).unwrap();
     workers.poll(&mut registry, now, 1000);
+    let hub = crate::api::EventHub::default();
+    crate::app::queue_events::QueueEvents::default().poll(
+        &workers,
+        &registry,
+        &hub,
+        &mut Default::default(),
+    );
+    assert!(
+        hub.events_after(0)
+            .iter()
+            .any(|(_, event)| event.event == crate::api::schema::EventKind::QueueItemState),
+        "committed exit fact must precede retirement"
+    );
+    workers.poll(&mut registry, now, 1000);
     assert!(
         !workers.entries.contains_key(&a.id),
-        "removed agents cannot accumulate completed workers"
+        "removed agents cannot accumulate completed workers after their facts drain"
     );
 }
 
@@ -636,6 +669,8 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
             finished: false,
             events_closed: false,
             stall_after: STALL,
+            queue_state: None,
+            queue_seq: 0,
             thread: Some(std::thread::spawn(|| {})),
         },
     );
@@ -839,6 +874,13 @@ fn drop_after_failed_shutdown_does_not_wait_a_second_time() {
     result.expect("Drop must not repeat the full teardown after its deadline");
 }
 
+mod queue;
+
+mod recovery;
+
+pub(crate) mod global;
+
+mod send;
 #[tokio::test]
 async fn registry_worker_launch_uses_configured_blob_threshold() {
     let (mut registry, mut workers, notify, now) = owner();
@@ -855,7 +897,9 @@ async fn registry_worker_launch_uses_configured_blob_threshold() {
         "worker-exit-ok",
         vec![message, event("result")],
     );
-    launch.storage = config.sessions;
+    launch.storage = super::super::blobs::StorageConfig {
+        blob_min_bytes: config.sessions.blob_min_bytes,
+    };
     case.generation = workers.start(&mut registry, launch, factory).unwrap();
     case.ready(&mut registry, &mut workers, &notify, now).await;
     case.submit(&workers);

@@ -1,4 +1,9 @@
 //! Durable queue data, independent of scheduling and runtime (ADR-0036 §3).
+//!
+//! Unknown payloads retain parsed `serde_json::Value` data (ADR-0028 §3a), not
+//! exact bytes. Serialization normalizes whitespace and escapes; object keys
+//! sort without `serde_json`'s `preserve_order` feature. Unknown data prevent
+//! journal rewrites (#1820/#1922), preserving the original complete records.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -11,6 +16,13 @@ pub enum Producer {
     Human,
     /// Sending agent identity.
     Agent(String),
+    /// Sender assertion vouched for by a verified node, carrying no local authority.
+    NodeAsserted {
+        /// Sender asserted by the signing node, possibly a claim on that node.
+        sender: String,
+        /// Verified signing node identity, independent of the forwarding hop.
+        origin: String,
+    },
     /// Authenticated channel binding and user.
     Channel {
         /// Configured binding identity.
@@ -22,7 +34,8 @@ pub enum Producer {
     System(String),
     /// Returning fork identity.
     Fork(String),
-    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future name and parsed JSON payload retained for positional replay (ADR-0028 §3a).
+    // Serialization only. Deserialize is hand-written; do not derive it.
     #[serde(untagged)]
     Unknown(Value),
 }
@@ -49,7 +62,8 @@ pub enum Kind {
     Command,
     /// Input after an anchored command's result.
     Continuation,
-    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future name and parsed JSON payload retained for positional replay (ADR-0028 §3a).
+    // Serialization only. Deserialize is hand-written; do not derive it.
     #[serde(untagged)]
     Unknown(Value),
 }
@@ -74,7 +88,8 @@ pub enum State {
     Dropped,
     /// Permanently refused by formation, with a registered refusal reason.
     Failed,
-    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future name and parsed JSON payload retained for positional replay (ADR-0028 §3a).
+    // Serialization only. Deserialize is hand-written; do not derive it.
     #[serde(untagged)]
     Unknown(Value),
 }
@@ -87,7 +102,8 @@ pub enum Priority {
     Normal,
     /// Before normal items at the same delivery point.
     Urgent,
-    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future name and parsed JSON payload retained for positional replay (ADR-0028 §3a).
+    // Serialization only. Deserialize is hand-written; do not derive it.
     #[serde(untagged)]
     Unknown(Value),
 }
@@ -102,7 +118,8 @@ pub enum Delivery {
     Steer,
     /// Explicit future interrupt mode.
     Interrupt,
-    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future name and parsed JSON payload retained for positional replay (ADR-0028 §3a).
+    // Serialization only. Deserialize is hand-written; do not derive it.
     #[serde(untagged)]
     Unknown(Value),
 }
@@ -124,6 +141,7 @@ impl<'de> Deserialize<'de> for Producer {
         enum Known {
             Human,
             Agent(String),
+            NodeAsserted { sender: String, origin: String },
             Channel { binding: String, user: String },
             System(String),
             Fork(String),
@@ -131,13 +149,17 @@ impl<'de> Deserialize<'de> for Producer {
         let value = Value::deserialize(deserializer)?;
         let name = variant_name(&value)
             .ok_or_else(|| serde::de::Error::custom("queue producer requires a variant name"))?;
-        if !matches!(name, "human" | "agent" | "channel" | "system" | "fork") {
+        if !matches!(
+            name,
+            "human" | "agent" | "node_asserted" | "channel" | "system" | "fork"
+        ) {
             return Ok(Self::Unknown(value));
         }
         let known = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(match known {
             Known::Human => Self::Human,
             Known::Agent(id) => Self::Agent(id),
+            Known::NodeAsserted { sender, origin } => Self::NodeAsserted { sender, origin },
             Known::Channel { binding, user } => Self::Channel { binding, user },
             Known::System(source) => Self::System(source),
             Known::Fork(id) => Self::Fork(id),
@@ -183,7 +205,7 @@ deserialize_named_enum!(Delivery { AtIdle => "at_idle", Steer => "steer", Interr
 /// optional fields across an older writer's checkpoint without interpreting them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
-    /// Server-minted message UUID.
+    /// Canonical lifecycle UUID, stable across admission retries.
     pub item_id: String,
     /// Trusted origin.
     pub producer: Producer,
@@ -319,5 +341,20 @@ impl Change {
             items.insert(*position, *item.clone());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn node_asserted_origin_is_typed_and_malformed_known_payload_is_refused() {
+        let raw = serde_json::json!({"node_asserted":{"sender":"human","origin":"origin.example"}});
+        let producer: super::Producer = serde_json::from_value(raw.clone()).unwrap();
+        assert!(matches!(producer, super::Producer::NodeAsserted { .. }));
+        assert_eq!(serde_json::to_value(producer).unwrap(), raw);
+        assert!(serde_json::from_value::<super::Producer>(
+            serde_json::json!({"node_asserted":{"origin":42,"sender":"a"}})
+        )
+        .is_err());
     }
 }

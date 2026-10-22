@@ -1,7 +1,10 @@
 //! Custody is committed before projecting mail or acknowledging a held edge.
 use super::messages::{now_ms, ResolvedTarget};
 use super::responses::{encode_error, encode_success};
-use crate::api::schema::{EventData, EventEnvelope, EventKind, MessageTarget, ResponseResult};
+use crate::api::{
+    error_code::ErrorCode,
+    schema::{EventData, EventEnvelope, EventKind, MessageTarget, ResponseResult},
+};
 use crate::app::{mailboxes::PendingMessage, message_relay::RelaySend, App};
 use crate::mesh::{
     delivery::Deliver,
@@ -121,6 +124,7 @@ impl App {
         if self.fleet_pause.paused {
             return Err("fleet_paused".into());
         }
+        let attested = self.attested_sender_agent();
         let origin = self
             .node_id
             .as_deref()
@@ -141,6 +145,15 @@ impl App {
             .ok_or("missing recipient")?;
         envelope.target_agent = agent.clone();
         envelope.target_session = session.clone();
+        if attested.is_some() && attested.as_deref() == message.from_agent.as_deref() {
+            let identity =
+                crate::mesh::identity::NodeIdentity::existing().map_err(|e| e.to_string())?;
+            if identity.node_id() != origin {
+                return Err("identity_unknown".into());
+            }
+            crate::mesh::sign::seal(&mut envelope, &identity);
+        }
+
         with_store(|store| {
             store
                 .accept_local(&envelope, CUSTODY_TTL_MS, &agent, &session, now_ms() as i64)
@@ -152,10 +165,18 @@ impl App {
     }
 
     pub(super) fn handle_mesh_deliver(&mut self, id: String, delivery: Deliver) -> String {
-        match self.import_mesh_mail(&delivery) {
+        match self.import_mesh_mail(&delivery, &id) {
+            Ok(_) if self.structured_sends.staged.is_some() => String::new(),
             Ok((accepted, delivered)) => encode_success(
                 id,
                 ResponseResult::MsgQueued {
+                    item_id: (delivered
+                        && self
+                            .state
+                            .structured_agents
+                            .get(&delivery.envelope.target_agent)
+                            .is_some())
+                    .then(|| delivery.envelope.key.lifecycle_id()),
                     message_key: Some(delivery.envelope.key),
                     correlation_id: delivery.envelope.correlation_id,
                     state: if !delivered {
@@ -172,8 +193,30 @@ impl App {
                 },
             ),
             Err(reason) => {
+                if let Some(
+                    code @ (ErrorCode::QueueSourceCold
+                    | ErrorCode::SessionBusy
+                    | ErrorCode::InputWriteUnknown),
+                ) = ErrorCode::from_code(&reason)
+                {
+                    return super::responses::encode_error_with_data(
+                        id,
+                        code.as_str(),
+                        reason,
+                        serde_json::json!({"message_key":delivery.envelope.key,"item_id":delivery.envelope.key.lifecycle_id()}),
+                    );
+                }
                 let code = if reason == "origin_mismatch" {
                     "origin_mismatch"
+                } else if self
+                    .state
+                    .structured_agents
+                    .get(&delivery.envelope.target_agent)
+                    .is_some()
+                    && ErrorCode::from_code(&reason).is_some()
+                {
+                    ErrorCode::from_code(&reason)
+                        .map_or("mesh_delivery_refused", |code| code.as_str())
                 } else if reason == super::mesh_replies::UNAVAILABLE {
                     "reply_unavailable"
                 } else {
@@ -192,7 +235,11 @@ impl App {
         }
     }
 
-    fn import_mesh_mail(&mut self, delivery: &Deliver) -> Result<(Accepted, bool), String> {
+    fn import_mesh_mail(
+        &mut self,
+        delivery: &Deliver,
+        id: &str,
+    ) -> Result<(Accepted, bool), String> {
         if self.fleet_pause.paused {
             return Err("fleet_paused".into());
         }
@@ -206,13 +253,22 @@ impl App {
             .filter(|edge| edge.state == "pinned")
             .ok_or("mesh edge is not enrolled")?;
         let upstream = edge.node_id.clone().ok_or("mesh edge is not enrolled")?;
-        self.import_attested_mesh_mail(delivery, &upstream)
+        self.import_relay_mail(delivery, &upstream, Some(id.to_owned()))
     }
 
     pub(super) fn import_attested_mesh_mail(
         &mut self,
         delivery: &Deliver,
         upstream: &str,
+    ) -> Result<(Accepted, bool), String> {
+        self.import_relay_mail(delivery, upstream, None)
+    }
+
+    fn import_relay_mail(
+        &mut self,
+        delivery: &Deliver,
+        upstream: &str,
+        response_id: Option<String>,
     ) -> Result<(Accepted, bool), String> {
         let sender_host = self.check_mesh_import(delivery, upstream)?;
         let envelope = &delivery.envelope;
@@ -225,11 +281,12 @@ impl App {
             return self.import_mesh_receipt(envelope);
         }
         if let Some(request) = &envelope.request_key {
-            self.import_mesh_answer(request, delivery, None)?;
+            self.import_mesh_answer(request, delivery, None, response_id)?;
             return Ok((Accepted::New, true));
         }
         let mut data = payload(envelope).map_err(|_| "invalid_envelope")?;
         if data.message.correlation_id != envelope.correlation_id
+            || data.message.in_reply_to != envelope.in_reply_to
             || data.message.from_agent.as_deref().unwrap_or_default() != envelope.sender
             || envelope.return_binding.request != envelope.key
         {
@@ -237,6 +294,14 @@ impl App {
         }
         if self.node_id.as_deref() != Some(envelope.return_binding.recipient_node.as_str()) {
             return self.accept_forwarded_request(delivery);
+        }
+        if self
+            .state
+            .structured_agents
+            .get(&envelope.target_agent)
+            .is_some()
+        {
+            return self.accept_structured_relay(delivery, false, response_id);
         }
         let duplicate = with_store(|store| {
             let Some(record) = store.get(&envelope.key).map_err(|e| e.to_string())? else {
@@ -313,9 +378,13 @@ impl App {
     pub(super) fn complete_mesh_send(
         &mut self,
         send: RelaySend,
-        mut result: Result<bool, crate::peers::PeerMessageFailure>,
+        result: Result<crate::mesh::delivery::Acknowledged, crate::peers::PeerMessageFailure>,
         receipt: Option<Envelope>,
     ) {
+        let (mut result, item_id) = match result {
+            Ok(ack) => (Ok(ack.delivered), ack.item_id),
+            Err(error) => (Err(error), None),
+        };
         let delivery = &send.mesh;
         let mut warnings = Vec::new();
         if result
@@ -471,6 +540,7 @@ impl App {
             let _ = respond_to.send(encode_success(
                 send.id,
                 ResponseResult::MsgQueued {
+                    item_id: (state == "delivered").then_some(item_id).flatten(),
                     message_key: Some(delivery.envelope.key.clone()),
                     correlation_id: send.correlation_id,
                     state: state.into(),
@@ -586,6 +656,48 @@ impl App {
             {
                 continue;
             }
+            let known_terminal = self
+                .state
+                .terminals
+                .values()
+                .any(|t| t.agent_id.to_string() == record.target);
+            // Legacy public-pane records without a native session remain legacy.
+            // Placement-free targets and bound native identities require the fence.
+            // Legacy pane targets with no native binding or session retain the
+            // legacy projection, even if their target_agent resembles a native id.
+            let native_shape = crate::terminal::AgentId::is_well_formed(&record.message.to_pane)
+                || (crate::terminal::AgentId::is_well_formed(&record.target)
+                    && (record
+                        .binding
+                        .as_ref()
+                        .is_some_and(|(_, session)| !session.is_empty())
+                        || !record.envelope.target_session.is_empty())
+                    && !known_terminal);
+            if self.state.structured_agents.get(&record.target).is_some() || native_shape {
+                if let Err(code) = self.verified_queue_custody(&record.envelope) {
+                    if matches!(code, ErrorCode::MsgNotAllowed | ErrorCode::RecipientGone)
+                        || matches!(
+                            code.retry(),
+                            crate::cli::exit::Retry::Later
+                                | crate::cli::exit::Retry::AfterInspecting
+                        )
+                    {
+                        self.retry_queue_custody(record.envelope, code);
+                    } else {
+                        crate::logging::mesh_custody_failed("structured-restore", code.as_str());
+                        if !record.settled {
+                            self.publish_queue_refusal(&record.envelope, code);
+                        }
+                    }
+                    continue;
+                }
+                if !record.settled {
+                    self.structured_sends.recovering.push(record.envelope);
+                } else {
+                    self.mailboxes.record_delivered(&record.message);
+                }
+                continue;
+            }
             if !record.target.is_empty() {
                 if let Some(location) = self.locate_agent(&record.target).filter(|l| l.local) {
                     record.message.to_pane = location.pane_id;
@@ -594,12 +706,13 @@ impl App {
             if record.message.to_pane.is_empty() {
                 continue;
             }
-            if record.read {
+            if record.settled {
                 self.mailboxes.record_delivered(&record.message);
             } else {
                 self.mailboxes.enqueue(record.message);
             }
         }
+        self.finish_structured_messages(true, std::time::Instant::now());
         self.sync_blocking_mail();
     }
 
@@ -1142,7 +1255,9 @@ mod tests {
 pub(crate) struct RecoveredMessage {
     message: PendingMessage,
     target: String,
-    read: bool,
+    settled: bool,
+    envelope: Envelope,
+    binding: Option<(String, String)>,
 }
 
 /// Load and decode on the recovery worker, projecting only on the app loop.
@@ -1262,13 +1377,18 @@ pub(crate) fn load_mesh_mail(
                 target.clone_from(agent);
             }
         }
-        data.message.message_key = Some(record.envelope.key);
+        data.message.message_key = Some(record.envelope.key.clone());
         data.message.enqueued_at_ms =
             now_ms().saturating_sub((record.mailbox_ttl_ms - record.remaining_ms).max(0) as u64);
         loaded.push(RecoveredMessage {
             message: data.message,
             target,
-            read: record.state == "read",
+            settled: matches!(record.state.as_str(), "read" | "delivered"),
+            binding: with_store(|s| {
+                s.recipient_binding(&record.envelope.key)
+                    .map_err(|e| e.to_string())
+            })?,
+            envelope: record.envelope,
         });
     }
     Ok(loaded)
