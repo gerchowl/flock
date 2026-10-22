@@ -140,7 +140,8 @@ export type StreamStatus = { readonly stream: string; readonly state: StreamStat
 /** What the connection was created with. */
 export type ConnectionOptions = {
   readonly url: string;
-  readonly token: string;
+  /** The token for `hello`; null connects straight into NeedsToken. */
+  readonly token: string | null;
   readonly client: WireClient;
   readonly clock: Clock;
   readonly sockets: SocketFactory;

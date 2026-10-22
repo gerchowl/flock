@@ -39,6 +39,27 @@ fn wait<T>(transport: &Transport, mut poll: impl FnMut() -> Option<T>) -> T {
 }
 
 fn receive(transport: &Transport) -> Received {
+    transport
+        .output
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|error| {
+            panic!(
+                "missing record: {error}; worker: {:?}",
+                transport.completion.try_recv()
+            )
+        })
+}
+
+fn accepted(transport: &Transport) {
+    let fact = receive(transport);
+    assert!(matches!(
+        fact.state_input(),
+        Some(crate::structured::state::Input::Accepted { .. })
+    ));
+    assert_eq!(fact.record.origin, RecordOrigin::Flk);
+}
+
+fn receive_after_accepted(transport: &Transport) -> Received {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let received = transport
@@ -111,6 +132,7 @@ fn permission_request_has_durable_open_record() {
         "type":"control_request", "request_id":"permission-example",
         "request":{"subtype":"can_use_tool", "tool_name":"Bash", "tool_use_id":"tool-example", "input":{"command":"true"}}
     })).unwrap();
+    accepted(&transport);
     assert_eq!(receive(&transport).record.origin, RecordOrigin::Claude);
     let open = receive(&transport).record;
     assert_eq!(open.origin, RecordOrigin::Flk);
@@ -160,7 +182,7 @@ fn fixture_lines_reach_s1_and_durable_stream_including_final_line() {
         .expect("fixture stdout");
     drop(stdout);
     for (index, raw) in lines.iter().enumerate() {
-        let received = receive(&transport);
+        let received = receive_after_accepted(&transport);
         assert_eq!(received.record.seq, index as u64 + 1);
         assert_eq!(received.record.raw, *raw);
         assert_eq!(received.event, SessionEvent::parse(raw, "2.1.296"));
@@ -187,15 +209,15 @@ fn large_lines_oversize_unknown_and_invalid_utf8_are_explicit() {
             .expect("oversize");
         stdout.write_all(b"\n\xff\xfe").expect("invalid final UTF8");
     });
-    let event = receive(&transport);
+    let event = receive_after_accepted(&transport);
     assert!(matches!(event.event, SessionEvent::Assistant(_)));
     assert_eq!(event.record.raw, expected);
-    let event = receive(&transport);
+    let event = receive_after_accepted(&transport);
     assert!(matches!(event.event, SessionEvent::Unknown { .. }));
     let summary: Value = serde_json::from_str(&event.record.raw).expect("summary");
     assert_eq!(summary["type"], "flk_oversize");
     assert_eq!(summary["bytes"], MAX_LINE_BYTES + 99);
-    let event = receive(&transport);
+    let event = receive_after_accepted(&transport);
     assert!(matches!(event.event, SessionEvent::Unknown { .. }));
     let summary: Value = serde_json::from_str(&event.record.raw).expect("summary");
     assert_eq!(summary["type"], "flk_invalid_utf8");
@@ -238,7 +260,7 @@ fn lossy_result_prefix_reopens_gate_without_claiming_turn_success() {
             stdout.write_all(&raw).expect("lossy result");
             stdout
         });
-        let received = receive(&transport);
+        let received = receive_after_accepted(&transport);
         assert_eq!(received.record.origin, RecordOrigin::Flk);
         assert_eq!(
             serde_json::from_str::<Value>(&received.record.raw).expect("loss summary")["turn_end"],
@@ -262,7 +284,7 @@ fn lossy_result_prefix_reopens_gate_without_claiming_turn_success() {
         stdout
             .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n")
             .expect("final result");
-        receive(&transport);
+        receive_after_accepted(&transport);
         drop(stdout);
         reader_done(&transport).expect("EOF");
     }
@@ -295,7 +317,7 @@ fn lossy_header_never_mistakes_nested_or_truncated_types_for_result() {
             stdout.write_all(b"\"}\n").expect("line end");
             stdout
         });
-        let loss = receive(&transport);
+        let loss = receive_after_accepted(&transport);
         assert_eq!(
             serde_json::from_str::<Value>(&loss.record.raw).expect("summary")["turn_end"],
             expected
@@ -312,7 +334,7 @@ fn lossy_header_never_mistakes_nested_or_truncated_types_for_result() {
         stdout
             .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n")
             .expect("real boundary");
-        receive(&transport);
+        receive_after_accepted(&transport);
         transport
             .try_submit(&user("safe next"))
             .expect("confirmed next turn");
@@ -338,7 +360,7 @@ fn indeterminate_loss_reports_named_turn_state_until_a_real_result() {
         stdout.write_all(b"\n").expect("line end");
         stdout
     });
-    receive(&transport);
+    receive_after_accepted(&transport);
     let error = transport
         .try_submit(&user("unsafe retry"))
         .expect_err("unknown boundary");
@@ -348,7 +370,7 @@ fn indeterminate_loss_reports_named_turn_state_until_a_real_result() {
     stdout
         .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n")
         .expect("confirmed boundary");
-    receive(&transport);
+    receive_after_accepted(&transport);
     transport
         .try_submit(&user("confirmed next"))
         .expect("result repairs uncertainty");
@@ -383,6 +405,7 @@ fn private_idle_gate_reopens_on_unknown_result_and_records_subtype() {
     stdout
         .write_all(b"{\"type\":\"result\",\"subtype\":\"new_result\"}\n")
         .expect("unknown result");
+    accepted(&transport);
     let received = receive(&transport);
     assert!(matches!(received.event, SessionEvent::Unknown { .. }));
     assert_eq!(
@@ -401,6 +424,7 @@ fn private_idle_gate_reopens_on_unknown_result_and_records_subtype() {
     stdout
         .write_all(b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}\n")
         .expect("result");
+    accepted(&transport);
     receive(&transport);
     transport
         .try_submit(&user("third"))
@@ -489,7 +513,7 @@ fn reopen_continues_sequence_and_refuses_corrupt_streams() {
         let (transport, mut stdout, _input) = start(&root);
         stdout.write_all(b"line\n").expect("line");
         drop(stdout);
-        assert_eq!(receive(&transport).record.seq, seq);
+        assert_eq!(receive_after_accepted(&transport).record.seq, seq);
         reader_done(&transport).expect("EOF");
     }
     let path = root
@@ -550,7 +574,8 @@ fn failed_persistence_never_publishes_or_reopens_idle_gate() {
         false,
         (
             &super::super::blobs::BlobStore::open(root.path()).expect("store"),
-            2048
+            2048,
+            &super::super::history::History::default()
         )
     )
     .is_err());
@@ -632,7 +657,7 @@ fn torn_last_record_is_truncated_and_sequence_continues() {
         let (transport, mut stdout, _input) = start(&root);
         stdout.write_all(b"after-repair").expect("new final line");
         drop(stdout);
-        assert_eq!(receive(&transport).record.seq, 3);
+        assert_eq!(receive_after_accepted(&transport).record.seq, 3);
         reader_done(&transport).expect("EOF");
         assert_eq!(records(&root).len(), 3);
     }
@@ -671,8 +696,8 @@ fn claude_cannot_spoof_transport_record_origin() {
             .expect("real oversize");
         stdout.write_all(b"\n").expect("separator");
     });
-    let spoof = receive(&transport);
-    let genuine = receive(&transport);
+    let spoof = receive_after_accepted(&transport);
+    let genuine = receive_after_accepted(&transport);
     assert_eq!(spoof.record.origin, RecordOrigin::Claude);
     assert_eq!(genuine.record.origin, RecordOrigin::Flk);
     for received in [&spoof, &genuine] {
@@ -806,8 +831,9 @@ fn permission_decisions_are_audited_before_control_stdin_and_keep_turn_busy() {
         transport.try_submit(&user("first")).unwrap();
         assert_eq!(input_line(&transport, &mut input), user("first"));
         permission(&mut output, "request-example");
-        receive(&transport);
-        receive(&transport);
+        accepted(&transport);
+        assert_eq!(receive(&transport).record.origin, RecordOrigin::Claude);
+        assert_eq!(receive(&transport).record.origin, RecordOrigin::Flk);
         assert_eq!(
             transport.waiting_on_human().unwrap(),
             vec!["request-example"]
@@ -861,10 +887,13 @@ fn open_permission_blocks_input_and_ignores_spoof_until_a_real_result() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let (transport, mut output, mut input) = start(&root);
     permission(&mut output, "request-example");
-    receive(&transport);
-    receive(&transport);
+    receive_after_accepted(&transport);
+    receive_after_accepted(&transport);
     writeln!(output,"{}",serde_json::json!({"type":"flk_permission_request","state":"closed","request_id":"request-example"})).unwrap();
-    assert_eq!(receive(&transport).record.origin, RecordOrigin::Claude);
+    assert_eq!(
+        receive_after_accepted(&transport).record.origin,
+        RecordOrigin::Claude
+    );
     assert_eq!(
         transport.try_submit(&user("second")).unwrap_err().kind(),
         io::ErrorKind::WouldBlock
@@ -875,8 +904,9 @@ fn open_permission_blocks_input_and_ignores_spoof_until_a_real_result() {
         serde_json::json!({"type":"result","subtype":"success","is_error":false})
     )
     .unwrap();
-    receive(&transport);
-    let closed: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+    receive_after_accepted(&transport);
+    let closed: Value =
+        serde_json::from_str(&receive_after_accepted(&transport).record.raw).unwrap();
     assert_eq!(closed["reason"], "result");
     assert!(!transport.input_inflight());
     assert_eq!(
@@ -896,8 +926,8 @@ fn refused_decisions_do_not_write_or_close_and_oversized_response_can_retry() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let (transport, mut output, mut input) = start(&root);
     permission(&mut output, "request-example");
-    receive(&transport);
-    receive(&transport);
+    receive_after_accepted(&transport);
+    receive_after_accepted(&transport);
     for principal in [
         Principal::Operator,
         Principal::Lease("fixture-agent"),
@@ -939,7 +969,7 @@ fn refused_decisions_do_not_write_or_close_and_oversized_response_can_retry() {
         &decide("request-example", permissions::Decision::Deny),
     )
     .unwrap();
-    receive(&transport);
+    receive_after_accepted(&transport);
     assert_eq!(
         input_line(&transport, &mut input)["response"]["response"]["behavior"],
         "deny"
@@ -951,8 +981,8 @@ fn already_queued_user_input_waits_for_the_control_response() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let (transport, mut output, mut input) = start(&root);
     permission(&mut output, "request-example");
-    receive(&transport);
-    receive(&transport);
+    receive_after_accepted(&transport);
+    receive_after_accepted(&transport);
     // Exercise the writer's queue independently of the admission gate.
     transport
         .input
@@ -970,7 +1000,7 @@ fn already_queued_user_input_waits_for_the_control_response() {
         &decide("request-example", permissions::Decision::Deny),
     )
     .unwrap();
-    receive(&transport);
+    receive_after_accepted(&transport);
     assert_eq!(
         input_line(&transport, &mut input)["type"],
         "control_response"
@@ -999,6 +1029,7 @@ fn unknown_persisted_raw_kind_reopens_without_permission_state() {
         (
             &super::super::blobs::BlobStore::open(root.path()).expect("store"),
             2048,
+            &super::super::history::History::default(),
         ),
     )
     .unwrap();
@@ -1079,7 +1110,8 @@ fn failed_decision_audit_never_enqueues_a_control_response() {
         &plane,
         (
             &super::super::blobs::BlobStore::open(root.path()).expect("store"),
-            2048
+            2048,
+            &super::super::history::History::default()
         ),
     )
     .command(Command::Decide(control))
@@ -1121,8 +1153,8 @@ fn eof_closes_every_open_permission_in_the_durable_replay() {
     let (transport, mut output, _input) = start(&root);
     for id in ["request-a", "request-b"] {
         permission(&mut output, id);
-        receive(&transport);
-        receive(&transport);
+        receive_after_accepted(&transport);
+        receive_after_accepted(&transport);
     }
     drop(output);
     reader_done(&transport).unwrap();
@@ -1204,8 +1236,8 @@ fn second_held_input_is_a_typed_refusal_without_writing_either_input() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let (transport, mut output, mut input) = start(&root);
     permission(&mut output, "request-example");
-    receive(&transport);
-    receive(&transport);
+    receive_after_accepted(&transport);
+    receive_after_accepted(&transport);
     for text in ["first", "second"] {
         transport
             .input
@@ -1255,11 +1287,12 @@ fn host_closures_audit_cancel_result_and_interrupt_without_sending_decisions() {
         let (transport, mut output, mut input) = start(&root);
         for id in ["request-a", "request-b"] {
             permission(&mut output, id);
-            receive(&transport);
-            receive(&transport);
+            receive_after_accepted(&transport);
+            receive_after_accepted(&transport);
         }
         close_permission(&transport, Some("request-a"), reason).unwrap();
-        let close: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+        let close: Value =
+            serde_json::from_str(&receive_after_accepted(&transport).record.raw).unwrap();
         assert_eq!(close["reason"], serde_json::to_value(reason).unwrap());
         assert!(close.get("decision").is_none());
         assert_eq!(
@@ -1272,7 +1305,7 @@ fn host_closures_audit_cancel_result_and_interrupt_without_sending_decisions() {
         );
         assert_eq!(transport.waiting_on_human().unwrap(), vec!["request-b"]);
         close_permission(&transport, None, permissions::CloseReason::Interrupted).unwrap();
-        receive(&transport);
+        receive_after_accepted(&transport);
         assert!(replay_open_permissions(&root).is_empty());
         private_fs::set_nonblocking(&input).unwrap();
         assert_eq!(
@@ -1288,8 +1321,8 @@ fn harness_cancel_closes_only_its_request_and_never_sends_a_decision() {
     let (transport, mut output, mut input) = start(&root);
     for id in ["request-a", "request-b"] {
         permission(&mut output, id);
-        receive(&transport);
-        receive(&transport);
+        receive_after_accepted(&transport);
+        receive_after_accepted(&transport);
     }
     writeln!(
         output,
@@ -1300,10 +1333,11 @@ fn harness_cancel_closes_only_its_request_and_never_sends_a_decision() {
     )
     .unwrap();
     assert!(matches!(
-        receive(&transport).event,
+        receive_after_accepted(&transport).event,
         SessionEvent::ControlCancel(_)
     ));
-    let close: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+    let close: Value =
+        serde_json::from_str(&receive_after_accepted(&transport).record.raw).unwrap();
     assert_eq!(close["state"], "closed");
     assert_eq!(close["request_id"], "request-a");
     assert_eq!(close["reason"], "cancelled");
@@ -1328,7 +1362,7 @@ fn harness_cancel_closes_only_its_request_and_never_sends_a_decision() {
         )
         .unwrap();
         assert!(matches!(
-            receive(&transport).event,
+            receive_after_accepted(&transport).event,
             SessionEvent::ControlCancel(_)
         ));
     }
@@ -1338,7 +1372,8 @@ fn harness_cancel_closes_only_its_request_and_never_sends_a_decision() {
         &decide("request-b", permissions::Decision::Deny),
     )
     .unwrap();
-    let close: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+    let close: Value =
+        serde_json::from_str(&receive_after_accepted(&transport).record.raw).unwrap();
     assert_eq!(close["request_id"], "request-b");
     // The following answer is a causal barrier: no cancelled answer preceded it.
     assert_eq!(
@@ -1353,8 +1388,8 @@ fn a_cancelled_reservation_cannot_deliver_a_stale_control_response() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let (transport, mut output, mut input) = start(&root);
     permission(&mut output, "cancelled-request");
-    receive(&transport);
-    receive(&transport);
+    receive_after_accepted(&transport);
+    receive_after_accepted(&transport);
     let stale = transport
         .input
         .permissions
@@ -1371,7 +1406,7 @@ fn a_cancelled_reservation_cannot_deliver_a_stale_control_response() {
         permissions::CloseReason::Cancelled,
     )
     .unwrap();
-    receive(&transport);
+    receive_after_accepted(&transport);
     transport
         .input
         .decisions
@@ -1381,15 +1416,15 @@ fn a_cancelled_reservation_cannot_deliver_a_stale_control_response() {
         }))
         .unwrap_or_else(|_| panic!("stale command admission"));
     permission(&mut output, "next-request");
-    receive(&transport);
-    receive(&transport);
+    receive_after_accepted(&transport);
+    receive_after_accepted(&transport);
     call_decide(
         &transport,
         &owner(),
         &decide("next-request", permissions::Decision::Deny),
     )
     .unwrap();
-    receive(&transport);
+    receive_after_accepted(&transport);
     assert_eq!(
         input_line(&transport, &mut input)["response"]["request_id"],
         "next-request"
@@ -1402,18 +1437,19 @@ fn nested_result_preserves_permissions_but_top_level_error_retires_them() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let (transport, mut output, _input) = start(&root);
     permission(&mut output, "request-example");
-    receive(&transport);
-    receive(&transport);
+    receive_after_accepted(&transport);
+    receive_after_accepted(&transport);
     writeln!(output,"{}",serde_json::json!({"type":"result","subtype":"success","is_error":false,"parent_tool_use_id":"parent-tool"})).unwrap();
-    receive(&transport);
+    receive_after_accepted(&transport);
     assert_eq!(
         transport.waiting_on_human().unwrap(),
         vec!["request-example"]
     );
     writeln!(output,"{}",serde_json::json!({"type":"result","subtype":"error_during_execution","is_error":true,"errors":[]})).unwrap();
-    receive(&transport);
+    receive_after_accepted(&transport);
     assert_eq!(
-        serde_json::from_str::<Value>(&receive(&transport).record.raw).unwrap()["reason"],
+        serde_json::from_str::<Value>(&receive_after_accepted(&transport).record.raw).unwrap()
+            ["reason"],
         "result"
     );
     assert!(replay_open_permissions(&root).is_empty());
@@ -1436,8 +1472,9 @@ fn oversized_permission_is_denied_with_bounded_audit_and_runtime_continues() {
             writeln!(output, "{raw}").unwrap();
             output
         });
-        assert!(receive(&transport).record.raw.len() <= MAX_LINE_BYTES);
-        let open: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+        assert!(receive_after_accepted(&transport).record.raw.len() <= MAX_LINE_BYTES);
+        let open: Value =
+            serde_json::from_str(&receive_after_accepted(&transport).record.raw).unwrap();
         assert_eq!(open["state"], "open");
         assert_eq!(open["request"]["input"]["truncated"], true);
         assert_eq!(open["request"]["input"]["wire_bytes"], target as u64);
@@ -1448,7 +1485,8 @@ fn oversized_permission_is_denied_with_bounded_audit_and_runtime_continues() {
                 .len(),
             64
         );
-        let closed: Value = serde_json::from_str(&receive(&transport).record.raw).unwrap();
+        let closed: Value =
+            serde_json::from_str(&receive_after_accepted(&transport).record.raw).unwrap();
         assert_eq!(closed["decision"], "deny");
         assert_eq!(
             closed["error_code"],
@@ -1463,15 +1501,15 @@ fn oversized_permission_is_denied_with_bounded_audit_and_runtime_continues() {
         );
         let mut output = producer.join().unwrap();
         permission(&mut output, "next-request");
-        receive(&transport);
-        receive(&transport);
+        receive_after_accepted(&transport);
+        receive_after_accepted(&transport);
         call_decide(
             &transport,
             &owner(),
             &decide("next-request", permissions::Decision::AllowOnce),
         )
         .unwrap();
-        receive(&transport);
+        receive_after_accepted(&transport);
         assert_eq!(
             input_line(&transport, &mut input)["response"]["request_id"],
             "next-request"
@@ -1568,7 +1606,7 @@ fn session_grant_matches_canonical_input_but_other_input_and_tools_prompt() {
     let reordered =
         serde_json::from_str(r#"{"items":[1,2],"options":{"a":1,"b":2},"z":0}"#).unwrap();
     grant_request(&mut output, "match", "Bash", reordered, None);
-    let automatic_request = receive(&transport);
+    let automatic_request = receive_after_accepted(&transport);
     let mut live_projection = crate::structured::state::SessionState::new("fixture-agent".into());
     let update = live_projection.reduce(
         automatic_request.state_input().unwrap(),
@@ -1580,8 +1618,8 @@ fn session_grant_matches_canonical_input_but_other_input_and_tools_prompt() {
         update.needs_human.is_empty(),
         "an automatic request must never publish needs-human at its raw record"
     );
-    assert!(receive(&transport).state_input().is_none());
-    let automatic = receive(&transport).record;
+    assert!(receive_after_accepted(&transport).state_input().is_none());
+    let automatic = receive_after_accepted(&transport).record;
     let audit: Value = serde_json::from_str(&automatic.raw).unwrap();
     assert_eq!(audit["state"], "closed");
     assert_eq!(audit["source"], "session_grant");
@@ -1706,7 +1744,8 @@ fn session_grant_absent_null_and_empty_suggestions_use_exact_fallback() {
         );
         opened(&transport);
         assert_eq!(
-            serde_json::from_str::<Value>(&receive(&transport).record.raw).unwrap()["source"],
+            serde_json::from_str::<Value>(&receive_after_accepted(&transport).record.raw).unwrap()
+                ["source"],
             "session_grant"
         );
         assert_eq!(
@@ -1826,7 +1865,7 @@ fn every_book_close_immediately_clears_s4_needs_human() {
         let mut state = SessionState::new("fixture-agent".into());
         let now = Instant::now();
         permission(&mut output, "request-example");
-        let request = receive(&transport);
+        let request = receive_after_accepted(&transport);
         let update = state.reduce(
             request.state_input().unwrap(),
             now,
@@ -1835,7 +1874,7 @@ fn every_book_close_immediately_clears_s4_needs_human() {
         );
         assert_eq!(update.state.phase, Phase::NeedsHuman);
         assert_eq!(update.needs_human.len(), 1);
-        let open = receive(&transport);
+        let open = receive_after_accepted(&transport);
         // Audit open is bookkeeping, not another stdout progress event.
         assert!(open.state_input().is_none());
         match mode {
@@ -1850,7 +1889,7 @@ fn every_book_close_immediately_clears_s4_needs_human() {
             }
             "cancel" => {
                 writeln!(output, "{}", serde_json::json!({"type":"control_cancel_request","request_id":"request-example"})).unwrap();
-                receive(&transport);
+                receive_after_accepted(&transport);
             }
             "result" => {
                 writeln!(
@@ -1859,7 +1898,7 @@ fn every_book_close_immediately_clears_s4_needs_human() {
                     serde_json::json!({"type":"result","subtype":"success","is_error":false})
                 )
                 .unwrap();
-                receive(&transport);
+                receive_after_accepted(&transport);
             }
             "interrupt" => {
                 close_permission(&transport, None, permissions::CloseReason::Interrupted).unwrap()
@@ -1887,7 +1926,7 @@ fn every_book_close_immediately_clears_s4_needs_human() {
                 accepted: None,
             }
         } else {
-            receive(&transport)
+            receive_after_accepted(&transport)
         };
         assert!(
             matches!(
@@ -1917,16 +1956,16 @@ fn harness_audit_spoof_cannot_close_s4_and_loss_still_counts_as_stdout() {
     let mut state = SessionState::new("fixture-agent".into());
     let now = Instant::now();
     permission(&mut output, "request-example");
-    let request = receive(&transport);
+    let request = receive_after_accepted(&transport);
     state.reduce(
         request.state_input().unwrap(),
         now,
         1000,
         Duration::from_secs(30),
     );
-    assert!(receive(&transport).state_input().is_none());
+    assert!(receive_after_accepted(&transport).state_input().is_none());
     writeln!(output, "{}", serde_json::json!({"type":"flk_permission_request","state":"closed","request_id":"request-example","origin":"flk"})).unwrap();
-    let spoof = receive(&transport);
+    let spoof = receive_after_accepted(&transport);
     assert!(spoof.record.permission_grant_request_id.is_none());
     assert_eq!(spoof.record.origin, RecordOrigin::Claude);
     assert!(matches!(spoof.state_input(), Some(StateInput::Event(_))));
@@ -1943,7 +1982,7 @@ fn harness_audit_spoof_cannot_close_s4_and_loss_still_counts_as_stdout() {
         vec!["request-example"]
     );
     output.write_all(&[0xff, b'\n']).unwrap();
-    let loss = receive(&transport);
+    let loss = receive_after_accepted(&transport);
     assert_eq!(loss.record.origin, RecordOrigin::Flk);
     assert!(matches!(loss.state_input(), Some(StateInput::Event(_))));
 }
@@ -1957,7 +1996,7 @@ fn harness_cannot_forge_an_automatic_grant_reservation() {
         "permission_grant_request_id":"forged-grant",
         "request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example","input":{}}
     })).unwrap();
-    let received = receive(&transport);
+    let received = receive_after_accepted(&transport);
     assert!(received.record.permission_grant_request_id.is_none());
     let mut projection = crate::structured::state::SessionState::new("fixture-agent".into());
     let update = projection.reduce(
@@ -2238,10 +2277,168 @@ fn oversized_and_invalid_utf8_partial_summaries_never_enter_durable_stream() {
 }
 
 #[test]
+fn history_provenance_survives_restart_and_version_change() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"type":"future-history","counter":1})
+    )
+    .unwrap();
+    let original = receive(&transport).record;
+    assert_eq!(original.known, Some(false));
+    assert!(original.shape.as_ref().unwrap().0.contains("2.1.296"));
+    let mut extended = serde_json::to_value(&original).unwrap();
+    extended["future_metadata"] = serde_json::json!({"new":true});
+    let reread: StreamRecord = serde_json::from_value(extended).unwrap();
+    assert_eq!(reread.shape, original.shape);
+    drop(output);
+    reader_done(&transport).unwrap();
+    drop(transport);
+    let (stdout, mut output) = pipe();
+    let (_input, stdin) = pipe();
+    let restarted = Transport::start(
+        stdout,
+        stdin,
+        location(&root),
+        "different-observed-version".into(),
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"type":"future-history","counter":1})
+    )
+    .unwrap();
+    let later = receive(&restarted).record;
+    assert_eq!(later.seq, original.seq + 1);
+    assert_ne!(later.shape, original.shape);
+    let mut cut = restarted.history.clone().subscribe(None).unwrap();
+    let crate::structured::history::Item::Record(replayed) = cut.page().unwrap() else {
+        panic!("old record")
+    };
+    assert_eq!(replayed.seq, original.seq);
+    assert_eq!(replayed.known, original.known);
+    assert_eq!(replayed.shape, original.shape);
+    drop(output);
+    reader_done(&restarted).unwrap();
+}
+
+#[test]
+fn history_and_state_receiver_share_permission_audits_but_not_partial_deltas() {
+    use crate::structured::history::Item;
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    let delta = include_str!("../../../tests/fixtures/claude-session/events.jsonl")
+        .lines()
+        .find(|line| line.contains("stream_event"))
+        .unwrap();
+    writeln!(output, "{delta}").unwrap();
+    assert!(!receive(&transport).persisted);
+    let mut cut = transport.history.clone().subscribe(None).unwrap();
+    assert!(matches!(cut.page().unwrap(), Item::Synced(0)));
+    writeln!(output,"{}",serde_json::json!({"type":"control_request","request_id":"history-permission",
+        "request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example","input":{"command":"true"}}})).unwrap();
+    let request = receive(&transport);
+    let open = receive(&transport);
+    assert!(matches!(request.event, SessionEvent::CanUseTool(_)));
+    assert!(open.state_input().is_none());
+    drop(output);
+    reader_done(&transport).unwrap();
+    let closed = receive(&transport);
+    assert!(matches!(
+        closed.state_input(),
+        Some(crate::structured::state::Input::ControlAnswered(
+            "history-permission"
+        ))
+    ));
+    let mut states = Vec::new();
+    for expected in 1..=3 {
+        let Item::Record(record) = cut.page().unwrap() else {
+            panic!("stored permission record")
+        };
+        assert_eq!(record.seq, expected);
+        let value: Value = serde_json::from_str(&record.raw).unwrap();
+        if value["type"] == "flk_permission_request" {
+            states.push(value["state"].as_str().unwrap().to_owned());
+        }
+    }
+    assert_eq!(states, vec!["open", "closed"]);
+    assert!(matches!(cut.page().unwrap(), Item::End));
+    assert_eq!(records(&root).len(), 3);
+}
+
+#[test]
+fn history_live_publication_uses_persisted_blob_projection() {
+    use crate::structured::history::Item;
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"type":"user","message":{}})
+    )
+    .unwrap();
+    receive(&transport);
+    let mut cut = transport.history.clone().subscribe(Some(1)).unwrap();
+    assert!(matches!(cut.page().unwrap(), Item::Synced(1)));
+    let content = "large result".repeat(400);
+    let input = serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-example","content":content}]}});
+    writeln!(output, "{input}").unwrap();
+    let live = receive(&transport);
+    assert_eq!(
+        serde_json::from_str::<Value>(&live.record.raw).unwrap(),
+        input
+    );
+    let Item::Record(stored) = cut.page().unwrap() else {
+        panic!("durable live continuation")
+    };
+    assert_eq!(stored.seq, 2);
+    assert_eq!(stored.known, Some(true));
+    let projected: Value = serde_json::from_str(&stored.raw).unwrap();
+    assert!(projected["message"]["content"][0]["blob"].is_string());
+    assert!(projected["message"]["content"][0].get("content").is_none());
+    assert_eq!(stored.raw, records(&root)[1].raw);
+    drop(output);
+    reader_done(&transport).unwrap();
+}
+
+#[test]
+fn history_partial_deltas_never_advance_a_durable_barrier() {
+    use crate::structured::history::Item;
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, _input) = start(&root);
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"type":"user","message":{}})
+    )
+    .unwrap();
+    receive(&transport);
+    let mut cut = transport.history.clone().subscribe(Some(1)).unwrap();
+    assert!(matches!(cut.page().unwrap(), Item::Synced(1)));
+    let delta = include_str!("../../../tests/fixtures/claude-session/events.jsonl")
+        .lines()
+        .find(|line| line.contains("stream_event"))
+        .unwrap();
+    writeln!(output, "{delta}").unwrap();
+    assert!(!receive(&transport).persisted);
+    assert!(matches!(cut.page().unwrap(), Item::Pending));
+    let mut fresh = transport.history.clone().subscribe(Some(1)).unwrap();
+    assert!(matches!(fresh.page().unwrap(), Item::Synced(1)));
+    assert_eq!(records(&root).len(), 1);
+    drop(output);
+    reader_done(&transport).unwrap();
+}
+
+#[test]
 fn admission_replay_is_skipped_and_stdout_cannot_forge_acceptance() {
     for origin in [RecordOrigin::Flk, RecordOrigin::Claude] {
         let record = StreamRecord {
             seq: 1,
+            known: None,
+            shape: None,
             received_at_ms: 1000,
             origin,
             result_subtype: None,
@@ -2271,4 +2468,54 @@ fn admission_replay_is_skipped_and_stdout_cannot_forge_acceptance() {
                 .is_none());
         }
     }
+}
+
+#[test]
+fn corrupt_blob_is_repaired_while_the_session_keeps_streaming() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut stdout, _input) = start(&root);
+    let block = serde_json::json!({"type":"thinking","thinking":"x".repeat(3000)});
+    let bytes = serde_json::to_vec(&block).unwrap();
+    let store = super::super::blobs::BlobStore::open(root.path()).unwrap();
+    let reference = store.put(bytes.as_slice(), bytes.len() as u64).unwrap();
+    fs::write(root.path().join("blobs").join(&reference.blob), b"damaged").unwrap();
+    let raw = serde_json::json!({"type":"assistant","message":{"content":[block]}}).to_string();
+    writeln!(stdout, "{raw}").unwrap();
+    writeln!(stdout, "{}", user("after repair")).unwrap();
+    // EOF makes reader success or failure observable without waiting for absent output.
+    drop(stdout);
+    reader_done(&transport).expect("a repaired blob must not kill the stream reader");
+    let first = receive(&transport);
+    assert_eq!(first.record.raw, raw);
+    assert!(first.persisted);
+    assert_eq!(first.record.seq, 1);
+    let second = receive(&transport);
+    assert_eq!(
+        serde_json::from_str::<Value>(&second.record.raw).unwrap(),
+        user("after repair")
+    );
+    assert_eq!(second.record.seq, 2);
+    let stored = records(&root);
+    assert_eq!(stored.len(), 2);
+    let projected: Value = serde_json::from_str(&stored[0].raw).unwrap();
+    assert_eq!(projected["message"]["content"][0]["blob"], reference.blob);
+    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+}
+
+#[test]
+fn disconnected_acceptance_observer_requests_stop_without_admitting_bytes() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, _stdout, _input) = start(&root);
+    let mut handle = transport.input_handle();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    drop(receiver);
+    handle.accepted = sender;
+    let stop = crate::structured::supervision::StopRequest::default();
+    let error = handle
+        .try_submit_observed(&user("first"), || stop.request())
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert!(stop.requested());
+    assert!(handle.cancel.load(Ordering::Acquire));
+    assert!(!handle.input_inflight());
 }
