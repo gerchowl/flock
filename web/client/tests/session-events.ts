@@ -30,7 +30,11 @@ function assertNever(value: never): never {
 // narrowing back to the containing envelope.
 function narrow(event: KnownSessionEvent): void {
   switch (event.type) {
-    case "assistant": event satisfies Assistant; break;
+    case "assistant":
+      event satisfies Assistant;
+      // Flattened extras must not widen the assistant's absent-only subtype (§6).
+      event.subtype satisfies undefined;
+      break;
     case "user": event satisfies import("../src/gen/User").User; break;
     case "command_lifecycle": event satisfies import("../src/gen/CommandLifecycle").CommandLifecycle; break;
     case "rate_limit_event": event satisfies import("../src/gen/RateLimit").RateLimit; break;
@@ -68,10 +72,26 @@ function narrow(event: KnownSessionEvent): void {
           // @ts-expect-error Stop cannot be assigned to start.
           event.event satisfies MessageStart["event"];
           break;
-        case "content_block_start": event.event satisfies ContentBlockStart["event"]; break;
-        case "content_block_delta": event.event satisfies ContentBlockDelta["event"]; break;
-        case "content_block_stop": event.event satisfies ContentBlockStop["event"]; break;
-        case "message_delta": event.event satisfies MessageDelta["event"]; break;
+        case "content_block_start":
+          event.event satisfies ContentBlockStart["event"];
+          // @ts-expect-error A different stream branch cannot acquire this tag.
+          event.event.type satisfies "message_stop";
+          break;
+        case "content_block_delta":
+          event.event satisfies ContentBlockDelta["event"];
+          // @ts-expect-error A different stream branch cannot acquire this tag.
+          event.event.type satisfies "message_stop";
+          break;
+        case "content_block_stop":
+          event.event satisfies ContentBlockStop["event"];
+          // @ts-expect-error A different stream branch cannot acquire this tag.
+          event.event.type satisfies "message_stop";
+          break;
+        case "message_delta":
+          event.event satisfies MessageDelta["event"];
+          // @ts-expect-error A different stream branch cannot acquire this tag.
+          event.event.type satisfies "message_stop";
+          break;
         default: assertNever(event.event);
       }
       break;
@@ -93,3 +113,30 @@ function narrow(event: KnownSessionEvent): void {
     default: assertNever(event);
   }
 }
+
+// Every parser-absent subtype rejects strings and explicit null in generated TS.
+type AbsentSubtype = Extract<KnownSessionEvent, {
+  type: "assistant" | "user" | "command_lifecycle" | "rate_limit_event"
+}>;
+declare const absent: AbsentSubtype;
+absent.subtype satisfies undefined;
+declare const baseAssistant: import("../src/gen/Assistant").Assistant;
+// @ts-expect-error The parser requires omission, including for this variant.
+const subtypeAssistant: typeof baseAssistant = { ...baseAssistant, subtype: "future" };
+// @ts-expect-error Explicit null is not absence.
+const nullSubtypeAssistant: typeof baseAssistant = { ...baseAssistant, subtype: null };
+declare const baseUser: import("../src/gen/User").User;
+// @ts-expect-error The parser requires omission, including for this variant.
+const subtypeUser: typeof baseUser = { ...baseUser, subtype: "future" };
+// @ts-expect-error Explicit null is not absence.
+const nullSubtypeUser: typeof baseUser = { ...baseUser, subtype: null };
+declare const baseCommandLifecycle: import("../src/gen/CommandLifecycle").CommandLifecycle;
+// @ts-expect-error The parser requires omission, including for this variant.
+const subtypeCommandLifecycle: typeof baseCommandLifecycle = { ...baseCommandLifecycle, subtype: "future" };
+// @ts-expect-error Explicit null is not absence.
+const nullSubtypeCommandLifecycle: typeof baseCommandLifecycle = { ...baseCommandLifecycle, subtype: null };
+declare const baseRateLimit: import("../src/gen/RateLimit").RateLimit;
+// @ts-expect-error The parser requires omission, including for this variant.
+const subtypeRateLimit: typeof baseRateLimit = { ...baseRateLimit, subtype: "future" };
+// @ts-expect-error Explicit null is not absence.
+const nullSubtypeRateLimit: typeof baseRateLimit = { ...baseRateLimit, subtype: null };
