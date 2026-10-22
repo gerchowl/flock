@@ -309,7 +309,16 @@ fn actual_s6_open_request_blocks_with_stale_s4_idle_and_cancel_releases_it() {
         Turn::Idle,
         "S4 has not consumed the open event yet"
     );
-    assert_eq!(run.running.runtime.waiting_on_human().unwrap(), ["permit"]);
+    assert_eq!(
+        run.running
+            .runtime
+            .waiting_on_human()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        ["permit"]
+    );
     let before = run.q().journal().replay(0).unwrap().through;
     assert!(run.offer().unwrap().is_none());
     assert_eq!(run.q().journal().replay(0).unwrap().through, before);
