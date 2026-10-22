@@ -1729,6 +1729,7 @@ impl App {
 
         let command =
             crate::worktree::build_worktree_remove_command(&remove.repo_root, &remove.path, force);
+        let repo_root = remove.repo_root.clone();
         crate::logging::worktree_remove_started(
             &remove.workspace_id.to_string(),
             &remove.path.display().to_string(),
@@ -1746,7 +1747,9 @@ impl App {
                 &path,
                 &crate::worktree::processes::protected_pids(None),
             );
-            let result = crate::worktree::run_worktree_command(&command);
+            let result = crate::worktree::check_worktree_remove(&repo_root, &path)
+                .map_err(|error| error.to_string())
+                .and_then(|()| crate::worktree::run_worktree_command(&command));
             let _ =
                 event_tx.blocking_send(AppEvent::WorktreeRemoveFinished(WorktreeRemoveResult {
                     workspace_id,
