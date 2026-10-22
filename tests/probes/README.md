@@ -51,22 +51,51 @@ that describe the bug — is the point of the format.
 
 Before starting a server, the auto-detect test suite sweeps the same sandbox
 namespace. Live owner PIDs are kept. For dead owners, durable `.server-*.json`
-records must prove the current server's executable, `server` argument, sandbox
-HOME and state directory, and start time when recorded. The argv must be the
-fixture's exact server invocation, rather than a client command containing the
-word `server`. Identity is rechecked
-before a signal; native exit notifications impose a finite cleanup ceiling.
+records must prove the recorded native birth time, exact launch argv, and sandbox
+HOME and state directory. Both the birth time and the complete argv are required.
+They survive replacement of a rebuilt executable: neither canonicalizing the
+current binary nor matching Linux's deleted-executable marker authorizes a
+signal. A record whose PID belongs to a process outside that sandbox is refused,
+even if that process has the expected argv and birth time. Older or incomplete
+records without the required proof are retained and logged.
+
+The argv must be the fixture's exact server invocation, rather than a client
+command containing the word `server`. Direct spawns record the known launch
+invocation, since a freshly forked child can still expose inherited argv before
+exec. Detached discovery excludes the declared client PID and records only an
+exact server invocation while the test owns the sandbox. The Python wrapper
+records native birth time at spawn, using Linux process facts or Darwin's public
+`proc_bsdinfo` ABI; the Rust tests check parity with the native Rust reading.
+
+Identity is rechecked before SIGTERM and again before SIGKILL. SIGTERM gets the
+shared `TERM_GRACE` constant (two seconds) to close owned PTYs; escalation has the
+existing five-second exit ceiling. Kernel exit notifications bound both waits.
+Linux signals through the same pidfd registered before verification. Darwin
+kqueue tracks exit but does not provide an atomic signal handle: exit, reaping
+and PID reassignment would all have to happen between the final birth check and
+`kill`, with no userspace wait in that syscall-sized gap. This residual reuse
+window is negligible for the private fixtures, but is not a pidfd guarantee.
 Unproven identities, incomplete records, unavailable inspection and timeouts are
 logged and retain the sandbox. There are no pattern-based signals in this sweep.
 Concurrent sweepers use a nonblocking per-sandbox lock. Copied binaries disappear
-only with their recovered sandbox.
+only with their recovered sandbox. Live owner PIDs, including dead owners whose
+PID has been reassigned to a live process, are retained.
 
-Only newly recorded sandboxes are recoverable automatically: historical
-sandboxes without records are retained, as are dead-owner PIDs reused by a live
-process. The copied probe server is recorded by the wrapper; direct and detached
+The copied probe server is recorded by the wrapper; direct and detached
 auto-detect servers are recorded by shared test support. Rust tests in
-`tests/sandbox_sweep.rs` exercise the actual wrapper and recovery with real
-isolated servers, including a wrong-PID refusal, so the proof runs in CI.
+`tests/sandbox_sweep.rs` exercise the actual wrapper, replacement binaries,
+identity refusals, graceful termination and escalation with real owned processes.
+The stage reader rejects EOF and unexpected output and fails within 30 seconds
+if a producer remains alive but silent, including after a partial line.
+
+## Python in CI
+
+Both supported CI legs (`ubuntu-latest` and `macos-15`) use
+[ci-leg.yml](../../.github/workflows/ci-leg.yml). Its test job runs
+`python3 scripts/nextest_version.py` before installing nextest, then uses Python
+again for shard selection and reports. Python is therefore a prerequisite before
+any Rust shard can run; these tests need no interpreter-availability skip. Local checks likewise require Python. A missing interpreter is an
+explicit setup failure rather than an unnoticed loss of the Rust crash proof.
 
 ## Socket-driven measurement scripts
 

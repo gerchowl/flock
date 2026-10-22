@@ -137,6 +137,7 @@ impl Entry {
                 state,
                 phase_changed: None,
                 needs_human: Vec::new(),
+                permission_requests: Vec::new(),
                 stalled_since_ms: None,
                 observe_at: None,
             },
@@ -196,6 +197,14 @@ impl Registry {
     fn register_raw(&mut self, record: Record, raw: Value) -> Result<u64, RegistryError> {
         if self.unparsed.is_some() {
             return Err(RegistryError::UnsupportedCollectionShape);
+        }
+        if record
+            .name
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            crate::logging::agent_name_dropped("registry");
+            return Err(RegistryError::InvalidRecord);
         }
         if record.agent_id.is_empty()
             || record.session_id.is_empty()

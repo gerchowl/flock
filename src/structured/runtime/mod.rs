@@ -103,8 +103,10 @@ impl Runtime {
     ) -> Result<(), crate::api::error_code::ErrorCode> {
         self.transport.close_permissions(principal, id, reason)
     }
-    /// Current permission ids for S4 attention; a busy snapshot fails closed.
-    pub fn waiting_on_human(&self) -> Result<Vec<String>, crate::api::error_code::ErrorCode> {
+    /// Current `(request_id, request_seq)` handles for operator decisions; a busy snapshot fails closed.
+    pub fn waiting_on_human(
+        &self,
+    ) -> Result<Vec<(String, u64)>, crate::api::error_code::ErrorCode> {
         self.transport.waiting_on_human()
     }
     /// Poll complete events and live-only partial deltas. Empty is not EOF; monitor the owning worker result too.

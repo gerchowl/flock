@@ -8442,7 +8442,8 @@ mod tests {
         app.terminals
             .get_mut(&first_terminal_id)
             .unwrap()
-            .set_agent_name("planner".into());
+            .set_agent_name("planner".into())
+            .unwrap();
         app.active = Some(0);
         app.selected = 0;
         app.set_agent_panel_scope(AgentPanelScope::AllWorkspaces);
@@ -9664,7 +9665,8 @@ mod tests {
         app.terminals
             .get_mut(&tid)
             .unwrap()
-            .set_agent_name("researcher".to_string());
+            .set_agent_name("researcher".to_string())
+            .unwrap();
 
         let (_, row) = agents_band_rows(&app);
         assert!(
@@ -9816,7 +9818,8 @@ mod tests {
         app.terminals
             .get_mut(&tid)
             .unwrap()
-            .set_agent_name("researcher".into());
+            .set_agent_name("researcher".into())
+            .unwrap();
 
         let (_, agent_row) = agents_band_rows(&app);
         let space_rows = space_and_member_rows(&mut app, Rect::new(0, 0, 44, 40));
@@ -9857,7 +9860,8 @@ mod tests {
         app.terminals
             .get_mut(&tid)
             .unwrap()
-            .set_agent_name("researcher".into());
+            .set_agent_name("researcher".into())
+            .unwrap();
         app.agent_aliases
             .insert("researcher".to_string(), "codex".to_string());
         app.config.ui.agents_agent_label = AgentLabelConfig::Symbol;
