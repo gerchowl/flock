@@ -57,8 +57,9 @@ calls do not rewrite the journal or retry the offer before its real result or
 exit. This Pending's batch ID and time describe the candidate at refusal time
 (ADR-0036 §3), not the current queue head or a newly formed batch. Later admission,
 edits, cancellation or removal do not refresh that historical ID. A real result
-or runtime exit clears it; the next accepted batch has its own ID and time. Other offer errors hold the candidate with input_write_failed
-and the source error. Uncertain journal I/O stops the operation before success;
+or runtime exit clears it; the next accepted batch has its own ID and time.
+Other offer errors hold the candidate with input_write_failed and the source
+error. Uncertain journal I/O stops the operation before success;
 reopen under the lease instead of blind retry. Process exit without a result
 holds every unresolved member with no_result, including a completed lifecycle
 whose result never arrived. Cancellation remains terminal. A fresh scheduler
