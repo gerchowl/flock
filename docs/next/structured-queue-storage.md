@@ -83,7 +83,12 @@ Before appending to an older format, the writer checkpoints it into its own
 format, so no newer-format record can enter a journal with an older stamp.
 Sequence and encoded-size validation include the snapshot's sequences and happen
 before this upgrade. Callers publish `replay(previous_cursor)` after an append,
-so an upgrade's gap/snapshot is published together with the new record. An older journal containing opaque records still cannot be checkpointed or upgraded automatically.
+so an upgrade's gap/snapshot is published together with the new record. An
+older journal containing opaque records cannot be checkpointed or upgraded
+automatically. It opens read-only as `QueueJournalCorrupt`, with reason
+`unknown_data_prevents_checkpoint`, before admission or runtime recovery can
+attempt a write. It never reports the uncertain `input_write_unknown` code for
+this deterministic refusal.
 
 **Bump the format version for every new record kind, new top-level field or
 new enum variant name.** A writer may append or checkpoint only when the
@@ -109,12 +114,14 @@ Server publication remains the separate #1803 slice.
 
 This forbids serving a valid newer journal with an older writer. Unknown
 records cannot be passed through a checkpoint: their interleaving semantics
-cannot be reconstructed by an older reader. A present stamp whose value is not a positive integer is invalid, and identity mismatches remain namespace corruption;
-these header failures refuse open rather than invent a writable version.
+cannot be reconstructed by an older reader. A present stamp whose value is not
+a positive integer opens read-only as typed `QueueJournalCorrupt`; it never
+invents a writable version. Identity mismatches remain namespace violations
+that refuse open.
 
 ## Unknown data, corruption and torn tails
 
-The ADR-0036 §4 owner clarification for #1820 separates three cases:
+The ADR-0036 §4 owner decisions in #1820 and #1922 separate three cases:
 
 1. **Unknown data are forward compatibility.** Unknown kinds are logged and
    skipped when folding state; their cursors, raw replay and original bytes are
@@ -124,8 +131,19 @@ The ADR-0036 §4 owner clarification for #1820 separates three cases:
    This preserves positions for later known updates/removals without executing
    unknown semantics. A same-version journal remains writable for known inputs
    (unknown contents imply a hand-edit or writer bug), while its existing
-   checkpoint protection prevents discarding raw state. A newer-stamped journal
-   uses `QueueJournalNewer` read-only mode instead. There is no opaque checkpoint
+   checkpoint protection prevents discarding raw state. Once its worker requires
+   a checkpoint, that refusal latches read-only `QueueJournalCorrupt` with reason
+   `unknown_data_prevents_checkpoint`. All later mutations refuse through the
+   same guard and status, so failed rewrites cannot allow continued growth. The
+   location describes the last recovered cursor and the required checkpoint's
+   byte boundary. Known updates/removals cannot erase the raw unknown history.
+
+   The worker owns the configured byte threshold and must check it before more
+   appends, including after reopening a journal; threshold execution/server
+   integration remains [#1803](https://github.com/gerchowl/flock/issues/1803).
+   The latch itself is in memory and does not append a marker or modify the
+   journal. Reopening does not bypass a still-required checkpoint. A
+   newer-stamped journal uses `QueueJournalNewer` read-only mode instead. There is no opaque checkpoint
    passthrough and no inference of a version from unknown contents.
 2. **Malformed known records are corruption.** A supported-version journal still
    loads, but opens read-only with `QueueJournalCorrupt { seq, offset, reason }`.
@@ -134,8 +152,11 @@ The ADR-0036 §4 owner clarification for #1820 separates three cases:
    without input payload text. Recovery stops folding at that record: it never
    skips a corrupted enqueue or delivery-state transition and then serves later
    state. Known enum names with invalid payloads remain errors, never `Unknown`.
-   Invalid JSON, invalid known changes and structural sequence/checkpoint damage
-   also fail closed this way. All mutations and checkpoints return the registered
+   A complete header with an invalid `format_version` (zero, non-integer,
+   string, null or a missing JSON value) is also known-record corruption at byte
+   zero. An absent key remains a valid unstamped v1 header; it is distinct from
+   a stamped header with an invalid value. Invalid JSON, invalid known changes
+   and structural sequence/checkpoint damage also fail closed this way. All mutations and checkpoints return the registered
    `queue_journal_corrupt` refusal, including empty replacements and idempotent
    admission. Original bytes, subsequent records, torn suffixes and temporary
    replacement files remain unchanged. Inspection/status are available, but the
@@ -150,8 +171,10 @@ The ADR-0036 §4 owner clarification for #1820 separates three cases:
    is repaired as described above. Newer or corrupt read-only journals are never
    repaired. The pre-existing 2 MiB fail-ceiling still refuses an oversized torn
    line rather than repairing it. A complete oversized supported record opens
-   read-only as corrupt. Recovery sync failures and unverified identity/version
+   read-only as corrupt. Recovery sync failures and missing/mismatched identity
    bootstrap failures still refuse open; they cannot invent a trusted journal.
+   Invalid complete JSON, including a damaged stamped header, is inspectable
+   read-only; an unterminated first line retains the existing crash repair.
 
 Persistence remains fsync of the temporary file, rename, then fsync of the
 directory. Disk operations are blocking worker operations and must never run
