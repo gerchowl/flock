@@ -126,6 +126,9 @@ impl BlobStore {
     }
     /// Hash precisely the bytes read and written, atomically publishing only a
     /// complete, synced object. Cap failures clean up the private temporary file.
+    /// An existing corrupt object is repaired with the verified new bytes and a
+    /// structured repair event after the directory sync. Unsafe entries and I/O
+    /// failures still fail explicitly; reads continue to report corruption.
     /// Concurrent identical puts may replace an identical inode, never partial data.
     pub fn put(&self, mut reader: impl Read, max_bytes: u64) -> Result<BlobRef, BlobError> {
         let mut entropy = [0; 16];
@@ -157,16 +160,21 @@ impl BlobStore {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
-            match self.get(&blob) {
-                Ok(_) => self.0.sync()?,
-                Err(BlobError::Missing) => self.0.rename(&name, &blob)?,
-                Err(error) => return Err(error),
-            }
-            Ok(BlobRef {
+            let reference = BlobRef {
                 blob,
                 size,
                 preview: String::from_utf8_lossy(&preview).chars().take(80).collect(),
-            })
+            };
+            match self.get(&reference.blob) {
+                Ok(_) => self.0.sync()?,
+                Err(BlobError::Missing) => self.publish(&name, &reference.blob)?,
+                Err(BlobError::Corrupt) => {
+                    self.publish(&name, &reference.blob)?;
+                    crate::logging::structured_blob_repaired(&reference);
+                }
+                Err(error) => return Err(error),
+            }
+            Ok(reference)
         })();
         // A successful rename consumed the name. Every other path removes it.
         match self.0.remove(&name) {
@@ -175,6 +183,12 @@ impl BlobStore {
             Err(error) => return Err(BlobError::Io(error)),
         }
         result
+    }
+    fn publish(&self, temporary: &str, blob: &str) -> Result<(), BlobError> {
+        #[cfg(test)]
+        tests::before_publish();
+        self.0.rename(temporary, blob)?;
+        Ok(())
     }
     /// Project only complete tool-result, attachment, image/document and thinking
     /// blocks. Small/unrelated lines preserve exact spelling. Partial SSE events

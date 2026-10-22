@@ -28,8 +28,12 @@ impl LeaseCredential {
                 .0
                 .bytes()
                 .zip(other.0.bytes())
-                .fold(0, |diff, (a, b)| diff | (a ^ b))
-                == 0
+                // Opaque accumulation prevents optimizer replacement with an
+                // early-exit comparison. Encoded length is public wire shape.
+                .fold(0, |diff, (a, b)| {
+                    std::hint::black_box(diff | std::hint::black_box(a ^ b))
+                })
+                == std::hint::black_box(0)
     }
 }
 
@@ -58,7 +62,6 @@ impl Generation {
 
 impl Lease {
     /// Provision only through the generated private MCP config in slice B (#1734).
-    #[cfg_attr(not(test), allow(dead_code))] // Provisioning is slice B of #1734.
     pub(crate) fn credential(&self) -> LeaseCredential {
         self.generation.credential.clone()
     }
@@ -67,6 +70,15 @@ impl Lease {
         self.generation.revoke();
     }
 }
+/// Scoped admission failures requiring refusal rather than snapshot fallback.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ScopedRefusal {
+    /// The registry is busy. App dispatch must never wait for it.
+    RegistryContended,
+    /// More than sixteen process facts would be needed to attest ancestry.
+    AncestryBudget,
+}
+
 impl SessionLeases {
     /// Verify every admission from captured kernel credentials, never caller ids.
     pub(crate) fn scoped_caller(
@@ -75,56 +87,68 @@ impl SessionLeases {
         peer: platform::peer::Credentials,
     ) -> Caller {
         self.scoped_with(credential, peer, platform::live_process_facts)
+            .unwrap_or(Caller::Uncertain)
     }
     fn scoped_with(
         &self,
         credential: Option<&LeaseCredential>,
         peer: platform::peer::Credentials,
         mut read: impl FnMut(u32) -> Option<(u32, u64)>,
-    ) -> Caller {
+    ) -> Result<Caller, ScopedRefusal> {
         let (Some(credential), Some(mut pid), Some(peer_birth), Some(_)) =
             (credential, peer.pid, peer.birth, peer.uid)
         else {
-            return Caller::Uncertain;
+            return Ok(Caller::Uncertain);
         };
         // Unlike ancestry's compatibility snapshot, scoped auth must never use a
         // stale view after registry contention or generation replacement.
-        let entry = self.0.try_lock_for(LOCK_LIMIT).and_then(|entries| {
-            entries
-                .values()
-                .find(|e| e.generation.live() && e.generation.credential.matches(credential))
-                .cloned()
-        });
+        let entry = self
+            .0
+            .try_lock()
+            .ok_or(ScopedRefusal::RegistryContended)?
+            .values()
+            .find(|e| e.generation.live() && e.generation.credential.matches(credential))
+            .cloned();
         let Some(entry) = entry else {
-            return Caller::Uncertain;
+            return Ok(Caller::Uncertain);
         };
         let Some(root) = entry.process else {
-            return Caller::Uncertain;
+            return Ok(Caller::Uncertain);
         };
         let mut seen = BTreeSet::new();
-        for _ in 0..128 {
+        for _ in 0..16 {
             if pid <= 1 || !seen.insert(pid) {
-                return Caller::Uncertain;
+                return Ok(Caller::Uncertain);
             }
             let Some((parent, birth)) = read(pid) else {
-                return Caller::Uncertain;
+                return Ok(Caller::Uncertain);
             };
             if Some(pid) == peer.pid && birth != peer_birth {
-                return Caller::Uncertain;
+                return Ok(Caller::Uncertain);
             }
             if pid == root.pid {
-                return if birth == root.birth && entry.generation.live() {
+                return Ok(if birth == root.birth && entry.generation.live() {
                     Caller::Agent {
                         agent: entry.agent,
                         depth: entry.depth,
                     }
                 } else {
                     Caller::Uncertain
-                };
+                });
             }
             pid = parent;
         }
-        Caller::Uncertain
+        Err(ScopedRefusal::AncestryBudget)
+    }
+    #[cfg(test)]
+    fn scoped_for_test(
+        &self,
+        credential: Option<&LeaseCredential>,
+        peer: platform::peer::Credentials,
+        read: impl FnMut(u32) -> Option<(u32, u64)>,
+    ) -> Caller {
+        self.scoped_with(credential, peer, read)
+            .unwrap_or(Caller::Uncertain)
     }
 }
 

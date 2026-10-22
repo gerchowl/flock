@@ -145,45 +145,7 @@ impl UpdateChannel {
     }
 }
 
-#[derive(Debug, Clone)]
-struct AssetRef {
-    url: String,
-    sha256: Option<String>,
-}
-
-impl<'de> Deserialize<'de> for AssetRef {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        match value {
-            serde_json::Value::String(url) if !url.trim().is_empty() => Ok(Self {
-                url: url.trim().to_string(),
-                sha256: None,
-            }),
-            serde_json::Value::Object(mut object) => {
-                let url = object
-                    .remove("url")
-                    .and_then(|value| value.as_str().map(str::to_string))
-                    .ok_or_else(|| serde::de::Error::custom("asset object is missing url"))?;
-                let sha256 = object
-                    .remove("sha256")
-                    .and_then(|value| value.as_str().map(str::to_string));
-                if url.trim().is_empty() {
-                    return Err(serde::de::Error::custom("asset url must not be empty"));
-                }
-                Ok(Self {
-                    url: url.trim().to_string(),
-                    sha256: sha256.filter(|value| !value.trim().is_empty()),
-                })
-            }
-            _ => Err(serde::de::Error::custom(
-                "asset must be a URL string or object with url",
-            )),
-        }
-    }
-}
+use crate::checksum::AssetRef;
 
 #[derive(Deserialize)]
 struct UpdateManifest {
@@ -606,13 +568,13 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         return Err("download failed".into());
     }
 
+    if let Err(e) = crate::checksum::verify_asset(&tmp_path, release.sha256.as_deref()) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "downloaded update checksum verification failed: {e}"
+        ));
+    }
     if let Some(expected) = &release.sha256 {
-        if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!(
-                "downloaded update checksum verification failed: {e}"
-            ));
-        }
         crate::logging::update_checksum_verified(expected);
     }
 
@@ -3360,6 +3322,45 @@ mod tests {
             &installed_base,
             false
         ));
+    }
+
+    #[test]
+    fn stable_asset_shapes_and_checksum_mismatch_refuse_corrupt_download() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = env_lock().lock().unwrap();
+        let fixture = crate::test_support::TempDir::socket();
+        let curl = fixture.path().join("curl");
+        fs::write(&curl, b"#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\nif [ \"$1\" = -o ]; then shift; printf corrupt > \"$1\"; exit 0; fi\nshift\ndone\nexit 1\n").unwrap();
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+        let (os, arch) = platform_target();
+        let url = format!("{RELEASE_ASSET_URL_PREFIX}v99.0.0/flock-fixture");
+        for asset in [
+            serde_json::json!(&url),
+            serde_json::json!({"url":url, "sha256":"a".repeat(64)}),
+        ] {
+            let manifest: UpdateManifest = serde_json::from_value(serde_json::json!({
+                "version":"99.0.0", "notes":"fixture", "assets":{format!("{os}-{arch}"): asset.clone()}
+            })).unwrap();
+            let release = release_info_from_manifest(&manifest).unwrap().unwrap();
+            if asset.is_string() {
+                assert!(release.sha256.is_none());
+            } else {
+                assert_eq!(release.sha256.as_deref(), Some("a".repeat(64).as_str()));
+                let prior = std::env::var_os("PATH");
+                // Nextest isolates this test process, and env_lock serializes its fixtures.
+                unsafe {
+                    std::env::set_var("PATH", fixture.path());
+                }
+                let result = download_update(&release);
+                unsafe {
+                    match prior {
+                        Some(path) => std::env::set_var("PATH", path),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+                assert!(matches!(result, Err(error) if error.contains("sha256 mismatch")));
+            }
+        }
     }
 
     #[test]

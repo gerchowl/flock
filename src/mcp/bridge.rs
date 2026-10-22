@@ -22,7 +22,7 @@ pub(super) trait FlockCall {
 }
 
 /// Production wire: talks to the local flock socket via [`ApiClient`].
-pub(super) struct LocalApi;
+pub(super) struct LocalApi(pub(super) ApiClient);
 
 impl FlockCall for LocalApi {
     fn call(&self, method: Method) -> Result<Value, ApiClientError> {
@@ -30,7 +30,7 @@ impl FlockCall for LocalApi {
             id: format!("mcp:{}", crate::mcp::next_call_seq()),
             method,
         };
-        ApiClient::local().request_value(&request)
+        self.0.request_value(&request)
     }
 }
 
