@@ -180,6 +180,18 @@ flk server reload-config
 
 `live-handoff` moves every live pane to a new server process without stopping it, which is how an upgrade reaches a running session. The new server is the binary of the `flk` you ran, resolved through symlinks to its real path, and the importer must report that binary's version and protocol or the handoff rolls back and the old server keeps the panes. On a versioned install (Nix, or any `/store/<hash>-flock-<version>/bin/flk` layout) the old server's own path stays valid after an upgrade, so re-executing it would only restart the old version. When it finishes, the command prints both versions (`live handoff complete: server flk A -> flk B`) after the new server answers with the target version. It exits 1, rather than reporting success, when the new server is not the requested version, or when it is the same version the old server ran while the client is a different one. A client older than the running server (a stale `flk` earlier on `PATH`) refuses the default handoff instead of downgrading the server to itself, naming both versions and the client's path.
 
+Auto-detected daemons and handoff replacements use the same executable resolver.
+It resolves symlinks once before constructing each server launch, so the daemon's
+recorded executable and `argv[0]` use the canonical path even if the launch alias
+is later removed or repointed. If the current binary or an explicit `--import-exe`
+cannot be resolved to a regular file, startup refuses with
+`server_executable_unresolved` (`retry: after_inspecting`, exit 1). Restore the
+binary or select an existing target before retrying. There is no fallback to the
+alias, `PATH`, or the old server's image. A handoff refuses this condition before
+stopping structured workers or transferring panes. Resolution pins a pathname,
+not file contents: removal afterwards remains a spawn failure, and version and
+protocol checks still protect the handoff.
+
 The JSON socket API reports `server.live_handoff` failures with `error.code: "handoff_failed"` and a stable `error.data.kind`: `import_refused`, `broken_pipe`, `connection_reset`, `invalid_input`, or `other`. `error.message` remains diagnostic prose and must not be parsed to classify failures. `other` includes timeouts and unexpected control messages. `invalid_input` alone does not prove peer closure; a caller needs evidence of the operation and stage. Clients should treat unknown kinds as failures. The kind describes the cause, not whether ownership committed. Existing clients can ignore this additive field.
 
 `--import-exe <path>` hands off to another binary instead, and is the explicit way to choose an older one. A relative path is resolved against your current directory before it is sent. Without `--expected-version`, its version is read from `<path> --version`, and a binary that reports the version the server already runs is refused while your client is a different one. `--expected-version` and `--expected-protocol` pin the importer's identity explicitly.

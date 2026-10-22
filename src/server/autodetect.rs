@@ -11,7 +11,6 @@
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use tracing::info;
@@ -121,16 +120,12 @@ fn validate_running_server_compatibility() -> io::Result<()> {
 ///   socket overrides, etc.), except inherited socket overrides are cleared when
 ///   this CLI invocation explicitly selected a session.
 ///
-/// Returns the PID of the spawned server process.
+/// Returns the PID of the spawned server process. The executable is resolved
+/// before spawn. An unreadable, deleted or dangling target returns the typed
+/// `server_executable_unresolved` refusal without an alias fallback.
 pub fn spawn_server_daemon() -> io::Result<u32> {
-    let exe = std::env::current_exe().map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!("failed to determine flock executable path: {err}"),
-        )
-    })?;
-
-    crate::logging::server_daemon_spawning(&exe);
+    let exe = super::executable::resolve(None)?;
+    crate::logging::server_daemon_spawning(exe.as_path());
 
     let mut command = build_server_daemon_command(exe);
 
@@ -144,8 +139,8 @@ pub fn spawn_server_daemon() -> io::Result<u32> {
     Ok(pid)
 }
 
-fn build_server_daemon_command(exe: PathBuf) -> TracedCommand {
-    let mut command = TracedCommand::new(&exe, "server");
+fn build_server_daemon_command(exe: super::executable::Executable) -> TracedCommand {
+    let mut command = TracedCommand::new(exe.as_path(), "server");
     command
         .arg("server")
         // Create a new process group so the server survives the parent's exit
@@ -275,7 +270,7 @@ mod tests {
         ];
         crate::session::configure_from_args(&args).unwrap();
 
-        let command = build_server_daemon_command(PathBuf::from("/tmp/flock-test"));
+        let command = build_server_daemon_command(super::super::executable::resolve(None).unwrap());
         let envs: Vec<_> = command.get_envs().collect();
 
         assert!(envs.iter().any(|(key, value)| {
