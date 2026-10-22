@@ -5138,3 +5138,5 @@ fn route_generation_clears_a_withdrawn_recipient_while_its_hub_stays_adjacent() 
         .unwrap()
         .is_empty());
 }
+
+mod diamond;

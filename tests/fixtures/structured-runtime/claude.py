@@ -53,9 +53,11 @@ assert json.loads(settings.read_text()) == {"permissions": {"defaultMode": "defa
 registration = json.loads(mcp.read_text())
 assert set(registration["mcpServers"]) == {"flock"}, "missing session flock MCP"
 server = registration["mcpServers"]["flock"]
-assert server["type"] == "stdio" and server["args"] == ["mcp", "serve"]
+assert server["type"] == "stdio" and server["args"] == ["mcp", "serve", "--structured"]
 assert pathlib.Path(server["command"]).is_absolute(), "unpinned MCP executable"
-assert set(server["env"]) == {"FLOCK_SOCKET_PATH"}, "credential or identity in MCP env"
+assert set(server["env"]) == {"FLOCK_SOCKET_PATH", "FLOCK_MCP_LEASE_CREDENTIAL"}, "MCP env shape"
+assert "FLOCK_MCP_LEASE_CREDENTIAL" not in os.environ, "credential in Claude launch env"
+assert len(server["env"]["FLOCK_MCP_LEASE_CREDENTIAL"]) == 44, "lease credential shape"
 assert "fixture-token-not-a-credential" not in mcp.read_text(), "token in MCP JSON"
 (root / "observed-mcp.json").write_text(json.dumps(registration))
 assert stat.S_IMODE(settings.stat().st_mode) == 0o600
@@ -111,6 +113,64 @@ if mode.startswith("registry"):
         registry.write_text(json.dumps({"messagingSocketPath": None}))
 # Readiness is a fixture handshake, not a claim about real harness readiness.
 emit(find("system", "hook_started"))
+# An owned socket drives each stage; stdin is observed before lifecycle emission.
+if mode.startswith("queue"):
+    emit(json.loads((root / "restricted-init.json").read_text()))
+    with socket.socket(socket.AF_UNIX) as driver:
+        driver.connect(str(root / "queue.sock"))
+        control = driver.makefile("r")
+        current_uuid = None
+        count = 0
+        barrier = None
+        while True:
+            ready, _, _ = select.select([sys.stdin, driver], [], [])
+            if driver in ready:
+                request = control.readline()
+                if not request:
+                    sys.exit(0)
+                request = json.loads(request)
+                if request["op"] == "exit":
+                    sys.exit(7)
+                if request["op"] == "event":
+                    emit(request["event"])
+                elif request["op"] == "lifecycle":
+                    event = dict(find("command_lifecycle"))
+                    event["state"] = request["state"]
+                    event["command_uuid"] = request.get("uuid", current_uuid)
+                    emit(event)
+                elif request["op"] == "result":
+                    event = dict(find("result", "success"))
+                    if request.get("nested"):
+                        event["parent_tool_use_id"] = "child-tool"
+                    if request.get("unknown"):
+                        event["subtype"] = "future_result"
+                    emit(event)
+                elif request["op"] == "barrier":
+                    assert barrier is None, "only one fixture barrier at a time"
+                    barrier = request["after_count"]
+                elif request["op"] == "loss":
+                    sys.stdout.write("x" * (2 * 1024 * 1024 + 1) + "\n")
+                    sys.stdout.flush()
+                else:
+                    raise AssertionError("unexpected driver stage")
+            if sys.stdin in ready:
+                line = sys.stdin.readline()
+                if not line:
+                    sys.exit(0)
+                message = json.loads(line)
+                assert message["type"] == "user", "queue writes only user turns"
+                current_uuid = message["uuid"]
+                count += 1
+                content = message["message"]["content"]
+                native = len(content) == 1 and content[0]["text"].startswith("/")
+                if mode != "queue-silent":
+                    emit({"type": "fixture_input", "input": message,
+                          "executed_command": native, "count": count})
+            if barrier is not None and count >= barrier:
+                emit({"type": "fixture_barrier", "count": count})
+                barrier = None
+    sys.exit(0)
+
 if mode == "idle":
     sys.exit(0)
 if mode == "no-read":
