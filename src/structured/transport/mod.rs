@@ -58,6 +58,7 @@ struct UserInput {
 enum Input {
     User(UserInput),
     Decision(Control),
+    Refusal(Vec<u8>),
 }
 enum Command {
     Decide(Control),
@@ -133,6 +134,10 @@ pub struct StreamRecord {
     /// Retained on disk so replay cannot manufacture a transient human prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_grant_request_id: Option<String>,
+    /// Book-issued permission handle for this stdout request, never copied from
+    /// harness JSON. Older records lack a handle and cannot authorize decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_request_seq: Option<u64>,
     /// Exact line without its LF; synthetic summaries explicitly identify loss.
     pub raw: String,
 }
@@ -166,6 +171,14 @@ impl Received {
             && matches!(self.event, SessionEvent::CanUseTool(_))
         {
             return Some(super::state::Input::Progress);
+        }
+        if let Some(request_seq) = self.record.permission_request_seq {
+            if matches!(self.event, SessionEvent::CanUseTool(_)) {
+                return Some(super::state::Input::PermissionEvent(
+                    &self.event,
+                    request_seq,
+                ));
+            }
         }
         if self.record.origin == RecordOrigin::Flk {
             if let SessionEvent::Unknown { value, .. } = &self.event {
@@ -285,12 +298,13 @@ impl Transport {
         }
         private_fs::set_nonblocking(&stdout)?;
         private_fs::set_nonblocking(&stdin)?;
-        let (input, input_rx) = mpsc::sync_channel(permissions::MAX_OPEN + 1);
+        let (input, input_rx) = mpsc::sync_channel(permissions::MAX_OPEN_PERMISSION_REQUESTS + 1);
         let (decisions, decision_rx) = mpsc::sync_channel(4);
         let permissions = Arc::new(parking_lot::Mutex::new(Book::new(location.agent.clone())));
         // The busy gate permits one admission until stdout retires its turn.
         // The stdout owner drains these facts before handling each response.
-        let (accepted_tx, accepted) = mpsc::sync_channel(permissions::MAX_OPEN + 1);
+        let (accepted_tx, accepted) =
+            mpsc::sync_channel(permissions::MAX_OPEN_PERMISSION_REQUESTS + 1);
         let plane = ControlPlane {
             accepted,
             book: permissions.clone(),
@@ -409,8 +423,9 @@ impl Transport {
         self.input.close_permissions(principal, id, reason)
     }
 
-    /// Open permission ids; contention fails closed rather than claiming no wait.
-    pub fn waiting_on_human(&self) -> Result<Vec<String>, ErrorCode> {
+    /// Open `(request_id, request_seq)` handles; contention fails closed rather
+    /// than claiming no wait. Carry the surfaced pair unchanged into a decide.
+    pub fn waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
         self.input.waiting_on_human()
     }
 
@@ -452,7 +467,7 @@ impl Drop for Transport {
 }
 
 impl InputHandle {
-    pub(super) fn waiting_on_human(&self) -> Result<Vec<String>, ErrorCode> {
+    pub(super) fn waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
         Ok(self
             .permissions
             .try_lock()
@@ -473,17 +488,18 @@ impl InputHandle {
         let bytes = match encode(&answer.response) {
             Ok(bytes) => bytes,
             Err(_) => {
-                book.aborted(&answer.id);
+                book.aborted(&answer.id, answer.request_seq);
                 return Err(ErrorCode::InvalidParams);
             }
         };
         let id = answer.id.clone();
+        let request_seq = answer.request_seq;
         if self
             .decisions
             .try_send(Command::Decide(Control { answer, bytes }))
             .is_err()
         {
-            book.aborted(&id);
+            book.aborted(&id, request_seq);
             return Err(ErrorCode::SessionBusy);
         }
         Ok(())
@@ -680,6 +696,7 @@ fn write_inputs(
                     }
                     Input::User(input) => (input.bytes, None),
                     Input::Decision(control) => (control.bytes, Some(control.answer)),
+                    Input::Refusal(bytes) => (bytes, None),
                 };
                 if let Some(check) = before_first_write.take() {
                     check()?;
@@ -906,7 +923,7 @@ fn emit(
     storage: (&super::blobs::BlobStore, usize, &super::history::History),
 ) -> io::Result<()> {
     let received = persist(
-        file, seq, line, count, version, busy, uncertain, synthetic, None, storage,
+        file, seq, line, count, version, busy, uncertain, synthetic, None, None, storage,
     )?;
     publish(received, tx, cancel)
 }
@@ -921,6 +938,7 @@ fn persist(
     uncertain: &AtomicBool,
     synthetic: bool,
     grant_request_id: Option<&str>,
+    permission_request_seq: Option<u64>,
     storage: (&super::blobs::BlobStore, usize, &super::history::History),
 ) -> io::Result<Received> {
     let origin = if synthetic || count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err()
@@ -988,6 +1006,7 @@ fn persist(
         origin,
         result_subtype,
         permission_grant_request_id: grant_request_id.map(str::to_owned),
+        permission_request_seq,
         raw,
     };
     if let Some(raw) = stored_raw {
@@ -1018,11 +1037,7 @@ fn persist(
         accepted: None,
     })
 }
-fn publish(
-    mut received: Received,
-    tx: &mpsc::SyncSender<Received>,
-    cancel: &AtomicBool,
-) -> io::Result<()> {
+fn publish<T>(mut received: T, tx: &mpsc::SyncSender<T>, cancel: &AtomicBool) -> io::Result<()> {
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(cancelled());
