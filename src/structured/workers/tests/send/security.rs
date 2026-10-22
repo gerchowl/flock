@@ -20,6 +20,7 @@ pub(super) async fn socket_method(r: &mut AppQueue, method: Method) -> Value {
             &Arc::new(std::sync::atomic::AtomicBool::new(true)),
             None,
             &std::sync::Mutex::default(),
+            &crate::api::client_listener::Health::default(),
             &policy,
         )
         .unwrap();

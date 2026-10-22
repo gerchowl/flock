@@ -16,7 +16,7 @@ async fn within<T>(work: impl Future<Output = T>) -> T {
         .expect("transport producer stayed silent")
 }
 #[derive(Clone)]
-struct TestClock(Arc<ClockState>);
+pub(crate) struct TestClock(Arc<ClockState>);
 struct ClockState {
     base: Instant,
     elapsed: AtomicU64,
@@ -24,7 +24,7 @@ struct ClockState {
     deadlines: Mutex<Vec<Instant>>,
 }
 impl TestClock {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (signal, _) = watch::channel(0);
         Self(Arc::new(ClockState {
             base: Instant::now(),
@@ -33,11 +33,11 @@ impl TestClock {
             deadlines: Mutex::new(Vec::new()),
         }))
     }
-    fn advance(&self, ms: u64) {
+    pub(crate) fn advance(&self, ms: u64) {
         self.0.elapsed.fetch_add(ms, Ordering::SeqCst);
         self.0.signal.send_modify(|generation| *generation += 1);
     }
-    async fn deadline(&self, ms: u64) {
+    pub(crate) async fn deadline(&self, ms: u64) {
         self.deadline_count(ms, 1).await;
     }
     fn count(&self, ms: u64) -> usize {
@@ -445,6 +445,7 @@ fn sixteen_pending_hellos_bound_slots_and_shutdown_refuses_new_upgrades() {
 struct GateSink {
     gate: tokio::sync::oneshot::Receiver<()>,
     open: bool,
+    failed: bool,
     pending: Option<Message>,
     started: Option<tokio::sync::oneshot::Sender<()>>,
     flushed: mpsc::Sender<Message>,
@@ -468,10 +469,16 @@ impl futures_util::Sink<Message> for GateSink {
         Ok(())
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.failed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
         if !self.open {
             match Pin::new(&mut self.gate).poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(_)) => return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
+                Poll::Ready(Err(_)) => {
+                    self.failed = true;
+                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                }
                 Poll::Ready(Ok(())) => self.open = true,
             }
         }
@@ -506,6 +513,7 @@ fn gated_sink() -> SinkFixture {
         GateSink {
             gate,
             open: false,
+            failed: false,
             pending: None,
             started: Some(started),
             flushed,
@@ -946,4 +954,75 @@ async fn revoke_during_hello(at: u64, registered: usize) {
     ));
     assert_eq!(fired.load(Ordering::SeqCst), 1);
     server.finish().await;
+}
+
+#[test]
+fn registered_recheck_deadline_preserves_the_token_with_a_non_auth_close() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build().unwrap().block_on(async {
+            let action = Arc::new(Mutex::new(None));
+            let server = Server::with_clock(|clock| Arc::new(RevokeClock {
+                clock, calls: AtomicU64::new(0), at: 1, action: action.clone(),
+            })).await;
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let worker = Arc::new(Mutex::new(None));
+            let owned = worker.clone();
+            *action.lock().unwrap() = Some(Box::new(move || {
+                *owned.lock().unwrap() = Some(tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                }));
+            }));
+            let mut client = Socket::open(&server).await;
+            client.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
+            within(ready).await.unwrap();
+            server.clock.deadline_count(HANDSHAKE_DEADLINE_MS, 4).await;
+            assert_eq!(server.core.shared.clients.lock().unwrap().len(), 1);
+            server.clock.advance(HANDSHAKE_DEADLINE_MS);
+            let result = client.receive().await;
+            release.send(()).unwrap();
+            let worker = worker.lock().unwrap().take().unwrap();
+            within(worker).await.unwrap();
+            assert!(matches!(result, Received::Close(GOING_AWAY_CLOSE)), "{result:?}");
+            assert!(server.core.shared.store.authenticate(&Bearer("a".repeat(64))).is_ok());
+            server.finish().await;
+        });
+}
+
+#[test]
+fn failed_welcome_send_does_not_attempt_a_revocation_close() {
+    runtime(async {
+        let clock = TestClock::new();
+        let (mut sink, dead, _ready, mut received, _) = gated_sink();
+        drop(dead);
+        let (_stop, mut stopped) = watch::channel(false);
+        let (_revoke, mut revoked) = watch::channel(false);
+        let welcome = ServerFrame::Welcome {
+            protocol: WIRE_JSON_VERSION,
+            server_version: "fixture".into(),
+            capabilities: vec![],
+            principal: "fixture-principal".into(),
+            server_epoch: "fixture-epoch".into(),
+            idempotency_window_ms: IDEMPOTENCY_WINDOW_MS,
+        };
+        assert!(
+            !within(finish_welcome(
+                &mut sink,
+                &clock,
+                clock.now() + Duration::from_millis(HANDSHAKE_DEADLINE_MS),
+                async { Ok(()) },
+                welcome,
+                (&mut stopped, &mut revoked)
+            ))
+            .await
+        );
+        assert!(
+            matches!(sink.pending, Some(Message::Text(_))),
+            "failed send must drop the transport, without another send attempt"
+        );
+        assert!(received.try_recv().is_err());
+    });
 }
