@@ -31,7 +31,7 @@ pub(crate) fn structured_worker_shutdown_failed(error: &crate::structured::worke
         tracing::error!(
             event = "structured.worker.shutdown_failed",
             agent_id = agent_id.as_str(),
-            code = code.as_str(),
+            failure_code = code.as_str(),
             "structured worker cleanup failed"
         );
     }
@@ -128,6 +128,16 @@ pub(crate) fn structured_permission_request_refused(
     );
 }
 
+/// Report a durable corrupt-blob replacement without exposing stored content.
+pub(crate) fn structured_blob_repaired(reference: &crate::structured::blobs::BlobRef) {
+    tracing::warn!(
+        event = "structured.blob.repaired",
+        blob = reference.blob.as_str(),
+        size = reference.size,
+        "repaired corrupt stored blob"
+    );
+}
+
 pub(crate) fn init_file_logging(file_name: &str) {
     let Ok(make_writer) = RotatingFileMakeWriter::new(
         crate::session::data_dir(),
@@ -206,14 +216,61 @@ where
             tracing_subscriber::fmt::format::Writer::new(&mut text),
             event,
         )?;
-        let mut record: serde_json::Map<String, serde_json::Value> =
+        let mut record: InputJsonFields =
             serde_json::from_str(&text).map_err(|_| std::fmt::Error)?;
-        let metadata = record.remove("input_metadata").ok_or(std::fmt::Error)?;
-        let fields: serde_json::Map<String, serde_json::Value> =
+        let index = record
+            .0
+            .iter()
+            .position(|(key, _)| key == "input_metadata")
+            .ok_or(std::fmt::Error)?;
+        let metadata = record.0.remove(index).1;
+        let fields: InputJsonFields =
             serde_json::from_str(metadata.as_str().ok_or(std::fmt::Error)?)
                 .map_err(|_| std::fmt::Error)?;
-        record.extend(fields);
-        writeln!(writer, "{}", serde_json::Value::Object(record))
+        record.0.splice(index..index, fields.0);
+        writeln!(
+            writer,
+            "{}",
+            serde_json::to_string(&record).map_err(|_| std::fmt::Error)?
+        )
+    }
+}
+
+/// Preserve the formatter's field order while expanding sealed input metadata.
+/// This avoids changing serde_json's map representation for the whole binary.
+struct InputJsonFields(Vec<(String, serde_json::Value)>);
+
+impl<'de> serde::Deserialize<'de> for InputJsonFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = InputJsonFields;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an ordered JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut fields = Vec::new();
+                while let Some(field) = map.next_entry()? {
+                    fields.push(field);
+                }
+                Ok(InputJsonFields(fields))
+            }
+        }
+        deserializer.deserialize_map(Fields)
+    }
+}
+
+impl serde::Serialize for InputJsonFields {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in &self.0 {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
     }
 }
 
@@ -738,7 +795,7 @@ pub(crate) fn self_compact_armed(pane: &str, bytes: usize) {
         subsystem = "agent",
         outcome = "ok",
         pane,
-        bytes,
+        byte_count = bytes,
         "agent armed a self-compaction"
     );
 }
@@ -767,7 +824,7 @@ pub(crate) fn self_compact_continued(pane: &str, bytes: usize) {
         subsystem = "agent",
         outcome = "ok",
         pane,
-        bytes,
+        byte_count = bytes,
         "agent resumed on a compacted context with its own handoff prompt"
     );
 }
@@ -782,7 +839,7 @@ pub(crate) fn self_compact_completed(pane: &str, bytes: usize) {
         subsystem = "agent",
         outcome = "ok",
         pane,
-        bytes,
+        byte_count = bytes,
         "self-compaction finished"
     );
 }
@@ -1815,6 +1872,17 @@ pub(crate) fn client_conn_hello_read_failed(client_id: u64, err: &str) {
     );
 }
 
+/// A terminal observer exhausted its no-progress write deadline.
+pub(crate) fn client_conn_write_stalled(client_id: u64) {
+    tracing::warn!(
+        event = "client_conn.write_stalled",
+        subsystem = "client_conn",
+        outcome = "disconnected",
+        client_id,
+        "observer disconnected after exhausting its socket write progress deadline"
+    );
+}
+
 pub(crate) fn client_conn_write_failed(err: &str) {
     tracing::debug!(
         event = "client_conn.write",
@@ -2137,7 +2205,7 @@ pub(crate) fn client_clipboard_image_staged(client_id: u64, bytes: usize, path: 
         subsystem = "clipboard",
         outcome = "ok",
         client_id,
-        bytes,
+        byte_count = bytes,
         path,
         "staged client clipboard image"
     );
@@ -2150,7 +2218,7 @@ pub(crate) fn handoff_recorded(file_id: &str, extension: &str, bytes: usize) {
         outcome = "ok",
         file_id,
         extension,
-        bytes,
+        byte_count = bytes,
         "filed a handed-over file as an MCP resource"
     );
 }
@@ -2402,7 +2470,7 @@ pub(crate) fn raw_input_flushing_lone_escape(input_len: usize) {
         subsystem = "raw_input",
         outcome = "lone_escape",
         input_len,
-        "flushing lone escape after input timeout"
+        "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
     );
 }
 
@@ -3112,12 +3180,12 @@ pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
 }
 
 // --- agent-resume family (logging redesign PR-6) ---------------------------
-// The three deferred agent-resume paths (empty argv, shell spawn failure,
-// send-command failure) all reach tracing with %terminal_id / %plan.agent /
-// %err. TerminalId is Display-shaped; the facade takes a shaped &str so no
-// other module carries the raw Display fmt. Level stays WARN — a failed
-// resume drops the pane back to its non-resumed state, which is surfaced
-// to the user via the terminal.
+// The three deferred launch failures are empty argv, shell spawn failure and
+// command send failure. They retain the plan and set resume_failed, suppressing
+// automatic retries in this server. Agent info reports blocked_reason=resume_failed.
+// An explicit operator retry makes one new attempt. All three paths log WARN
+// through the facade with shaped terminal and agent strings. Only spawn and send
+// failures include an err field.
 
 pub(crate) fn agent_resume_empty_argv(pane: u32, terminal: &str, agent: &str) {
     tracing::warn!(
@@ -5033,6 +5101,20 @@ pub(crate) fn client_token_entry_unsafe(entry: &str) {
     );
 }
 
+/// A content anchor no longer resolves, so copying refuses rather than retargets.
+pub(crate) fn selection_content_unavailable(pane_closed: bool) {
+    tracing::debug!(
+        event = "selection.copy_refused",
+        subsystem = "selection",
+        reason = if pane_closed {
+            "pane_closed"
+        } else {
+            "content_unavailable"
+        },
+        "selected content is no longer available"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5535,6 +5617,17 @@ mod tests {
     }
 
     #[test]
+    fn stalled_observer_log_is_typed_and_connection_scoped() {
+        let log = capture_logs(|| client_conn_write_stalled(42));
+        assert!(log.contains("event=\"client_conn.write_stalled\""), "{log}");
+        assert!(log.contains("outcome=\"disconnected\""), "{log}");
+        assert!(log.contains("client_id=42"), "{log}");
+        assert!(log.contains("WARN"), "{log}");
+        assert!(!log.contains("host="), "{log}");
+        assert!(!log.contains("path="), "{log}");
+    }
+
+    #[test]
     fn client_conn_write_flush_read_split_by_stage() {
         let w = capture_logs(|| client_conn_write_failed("EPIPE"));
         assert!(w.contains("event=\"client_conn.write\""), "{w}");
@@ -5719,7 +5812,7 @@ mod tests {
             staged.contains("path=\"/tmp/flock-clip-7.png\""),
             "{staged}"
         );
-        assert!(staged.contains("bytes=4096"), "{staged}");
+        assert!(staged.contains("byte_count=4096"), "{staged}");
         assert!(staged.contains("INFO"), "{staged}");
 
         let fail = capture_logs(|| client_clipboard_image_stage_failed(7, "ENOSPC"));
@@ -5908,6 +6001,11 @@ mod tests {
                         if let crate::raw_input::RawInputEvent::Key(key) = event {
                             let event = crossterm::event::KeyEvent::new(key.code, key.modifiers);
                             terminal_key_empty_encoding(&event);
+                            terminal_key_intercept_action(&event, "ToggleFloat");
+                            terminal_key_intercept_command(&event, "edit config");
+                            terminal_key_page_intercept(&event.code, 3);
+                            terminal_key_modifier_only_dropped(&event);
+                            terminal_key_forward_ambiguous(&event, "legacy", text.len());
                         }
                     }
                     assert!(framer.flush_timeout().is_empty());
@@ -5921,6 +6019,23 @@ mod tests {
             out.contains("raw_input.parsed"),
             "input path must emit logs"
         );
+        for expected in [
+            "action",
+            "command",
+            "page_scroll",
+            "modifier_only",
+            "ambiguous",
+            "empty",
+        ] {
+            assert!(
+                out.contains(&format!("\"outcome\":\"{expected}\"")),
+                "missing wrapper: {expected}"
+            );
+        }
+        assert_private_input_json(&out, canary);
+    }
+
+    fn assert_private_input_json(out: &str, canary: &str) {
         for line in out.lines() {
             let record: serde_json::Value = serde_json::from_str(line).unwrap();
             for field in [
@@ -5950,6 +6065,100 @@ mod tests {
                 !line.contains("Char("),
                 "character debug escaped into telemetry"
             );
+        }
+    }
+
+    #[test]
+    fn drained_input_canary_never_reaches_logs() {
+        let canary = "DrainSecret1965🦩";
+        let out = capture_input_json(|| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(canary.len() + 32);
+            let mut buffer = format!("{canary}\x1b[200~{canary}\x1b[201~").into_bytes();
+            crate::raw_input::drain_buffer(&mut buffer, &tx);
+            assert!(buffer.is_empty());
+            for character in canary.chars() {
+                assert!(
+                    matches!(rx.try_recv().unwrap(), crate::raw_input::RawInputEvent::Key(key)
+                    if key.code == crossterm::event::KeyCode::Char(character))
+                );
+            }
+            assert!(
+                matches!(rx.try_recv().unwrap(), crate::raw_input::RawInputEvent::Paste(text) if text == canary)
+            );
+            assert!(rx.try_recv().is_err());
+        });
+        assert!(out.contains("raw_input.parsed"));
+        assert_private_input_json(&out, canary);
+    }
+
+    #[test]
+    fn input_json_keeps_default_envelope_order() {
+        let out = capture_input_json(|| {
+            tracing::info!(event = "format.reference", "reference formatter");
+            let _ = crate::raw_input::parse_raw_input_bytes_sync(b"x");
+        });
+        assert_eq!(out.lines().count(), 2);
+        for line in out.lines() {
+            assert!(line.starts_with("{\"timestamp\":"), "{line}");
+            assert!(
+                line.find("\"level\":").unwrap() < line.find("\"event\":").unwrap(),
+                "{line}"
+            );
+            assert!(
+                line.find("\"message\":").unwrap() < line.find("\"target\":").unwrap(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_input_diagnostics_survive_report_redaction() {
+        let out = capture_input_json(|| {
+            structured_worker_shutdown_failed(&crate::structured::workers::ShutdownError(vec![(
+                "worker-example".into(),
+                crate::api::error_code::ErrorCode::SessionBusy,
+            )]));
+            self_compact_armed("pane-example", 11);
+            self_compact_continued("pane-example", 12);
+            self_compact_completed("pane-example", 13);
+            client_clipboard_image_staged(1, 14, "image-example.png");
+            handoff_recorded("file-example", "png", 15);
+            let _ = crate::raw_input::parse_raw_input_bytes_sync(b"s");
+        });
+        let records = crate::report::redact::extract(
+            &out,
+            "fixture.log",
+            &crate::report::redact::Scrubber::new(None, None),
+        );
+        assert_eq!(records.len(), 7);
+        assert!(records[0]
+            .fields
+            .contains(&("failure_code".into(), "session_busy".into())));
+        for (record, count) in records[1..6].iter().zip(11..=15) {
+            assert!(
+                record
+                    .fields
+                    .contains(&("byte_count".into(), count.to_string())),
+                "{record:?}"
+            );
+        }
+        for record in records {
+            for (name, _) in record.fields {
+                assert!(![
+                    "bytes",
+                    "code",
+                    "input_len",
+                    "input_class",
+                    "key_class",
+                    "modifiers",
+                    "raw_bytes",
+                    "parsed",
+                    "key",
+                    "sequence",
+                    "encoded"
+                ]
+                .contains(&name.as_str()));
+            }
         }
     }
 
@@ -6020,6 +6229,12 @@ mod tests {
         assert!(out.contains("outcome=\"lone_escape\""), "{out}");
         assert!(out.contains("input_len=1"), "{out}");
         assert!(out.contains("WARN"), "lone-escape must WARN: {out}");
+        assert!(
+            out.contains(
+                "if this follows an alt chord or focus switch it may reach the pane as plain esc"
+            ),
+            "{out}"
+        );
     }
 
     #[test]

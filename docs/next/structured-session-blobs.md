@@ -20,8 +20,15 @@ pin the blob directory and reject symlinks, invalid addresses and unsafe entries
 Opening the namespace syncs its parent so a newly created directory is durable.
 Puts publish a synced temporary file by same-directory atomic rename and sync the
 directory, including deduplicated puts. A failed put removes only its own temporary
-file; corruption is reported rather than repaired. Read/write/sync failures remain
-explicit errors. A failed directory sync may leave a complete object published;
+file. If an existing object's bytes fail hash verification, the next put of the
+same content replaces it with the verified, synced temp file by atomic rename,
+then syncs the directory. Only after that sync does the typed logging helper emit
+`structured.blob.repaired` with `blob` (SHA-256) and `size` (bytes), never content.
+The transport continues streaming after a successful repair. A read still returns
+Corrupt for damaged content; unsafe entries and read/write/sync failures remain
+explicit errors. A crash before rename leaves the old entry and an owned temp
+file, never a partially overwritten blob. Crash-temp sweeping is tracked in #1824.
+A failed directory sync may leave a complete object published;
 retrying the same content verifies it and syncs the directory again.
 
 Projection applies only to complete assistant/user message content blocks, never

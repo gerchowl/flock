@@ -1279,6 +1279,11 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   infeasible. Keep the store bounded at 128 live codes and request bodies at
   1024 bytes. Cross-origin and non-loopback requests are refused, and neither
   codes nor tokens enter diagnostic logs.
+  The opener's URL argument is an explicit credential-in-argv exception:
+  `open`/`xdg-open` have no stdin or environment URL channel. The exchange code
+  is visible through `ps` for the opener's lifetime. Single use, the 60-second
+  TTL and fragment-only transport bound this known exposure; process logging
+  masks the code. This exception does not permit long-lived tokens in argv.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location
   (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.

@@ -294,6 +294,16 @@ describe("sub ids (ADR-0038 §3, sub ids and closed subs)", () => {
     expect(a).toEqual(["synced"]);
   });
 
+  test("the harness fails a client frame for a sub id never opened on its socket (ADR-0038 §3)", () => {
+    const h = new Harness();
+    live(h);
+    expect(() => h.net.current().send(JSON.stringify({ t: "unsub", sub_id: "s9" }))).toThrow("the client sent unsub for sub id s9, which it never opened on this socket");
+    expect(sentFrames(h).some((frame) => (frame as { t: string }).t === "unsub")).toBe(false);
+    const sub = h.connection.subscribe("agent/a", { event: () => undefined, gap: () => undefined, synced: () => undefined, snapshot: () => undefined, reset: () => undefined, refused: () => undefined });
+    sub.close();
+    expect(sentFrames(h).at(-1)).toEqual({ t: "unsub", sub_id: "s1" });
+  });
+
   test("a frame for a sub id never opened on this connection is a protocol error", () => {
     const h = new Harness();
     live(h);
@@ -369,18 +379,29 @@ describe("sub_id_reused (ADR-0036 §5a)", () => {
     expect(sentFrames(h).length).toBe(sent);
   });
 
-  test("is never re-subscribed: not on the same socket, nor after a reconnect", () => {
-    const { h } = refusedStream();
-    // Past the 30 s progress deadline, inside the 45 s liveness window.
+  test("is never re-subscribed, and no later sub takes its id: not on the same socket, nor after a reconnect", () => {
+    const h = new Harness();
+    live(h);
+    const transport = createWireTransport(h.connection);
+    const quiet = { entry: () => undefined, synced: () => undefined, failed: () => undefined };
+    const failures: string[] = [];
+    transport.subscribe("agent/a", null, { ...quiet, failed: (failure) => failures.push(failure.message) });
+    const refused = lastSub(h);
+    h.step(step({ step: "send", frame: { t: "subfail", sub_id: refused, code: "sub_id_reused", message: "already used" } }));
+    expect(failures).toEqual([`The server refused sub id ${refused} as already used on this connection, so this stream is not retried. Server: already used`]);
+    // Every re-sub path, on another stream: `lagged`, the progress deadline, a reconnect.
+    transport.subscribe("agent/b", null, quiet);
+    h.step(step({ step: "send", frame: { t: "lagged", sub_id: lastSub(h), skipped_to: 4 } }));
     h.clock.advanceTo(h.clock.now() + 31_000);
-    expect(subIds(h)).toEqual(["s1"]);
     h.step(step({ step: "drop" }));
     h.step(step({ step: "expect_connect", within_ms: 500, not_before_ms: 250 }));
     h.step(step({ step: "open" }));
     h.step(step({ step: "send", frame: WELCOME }));
-    expect(h.connection.state).toBe("Live");
-    expect(subIds(h)).toEqual(["s1"]);
-    expect(h.connection.streams().get("s1")?.state).toBe("Refused");
+    expect(h.connection.state).toBe("Syncing");
+    // One counter allocates every id, so none of the re-subs could take the refused one (#1840).
+    expect(subIds(h)).toEqual(["s1", "s2", "s3", "s4", "s4"]);
+    const subs = sentFrames(h).filter((frame) => (frame as { t: string }).t === "sub") as { stream: string }[];
+    expect(subs.filter((frame) => frame.stream === "agent/a")).toHaveLength(1);
   });
 });
 
