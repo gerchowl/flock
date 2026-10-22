@@ -49,7 +49,7 @@ impl App {
                 || self.state.terminals.values().any(|t| {
                     t.id.to_string() == target
                         || t.agent_id.to_string() == target
-                        || t.agent_name.as_deref() == Some(&target)
+                        || t.agent_name() == Some(target.as_str())
                         || t.effective_agent_label() == Some(target.as_str())
                 }))
         {

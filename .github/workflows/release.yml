@@ -136,11 +136,21 @@ jobs:
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/flk ${{ matrix.name }}
 
+      - name: Compute asset checksum
+        run: |
+          python3 - <<'PYTHON' | tee ${{ matrix.name }}.sha256
+          import hashlib, pathlib
+          path = pathlib.Path('${{ matrix.name }}')
+          print(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
+          PYTHON
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
 
   validate-release-inputs:
     runs-on: ubuntu-latest
@@ -180,6 +190,7 @@ jobs:
             flock-linux-aarch64/flock-linux-aarch64
             flock-macos-x86_64/flock-macos-x86_64
             flock-macos-aarch64/flock-macos-aarch64
+            flock-*/*.sha256
           body_path: RELEASE_NOTES.md
 
   close-released-issues:

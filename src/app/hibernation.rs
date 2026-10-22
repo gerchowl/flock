@@ -287,7 +287,7 @@ mod tests {
         // Some — the resume plan derives from persisted_agent_session, but
         // is_agent_terminal reads from these fields.
         terminal.launch_argv = Some(vec!["claude".into()]);
-        terminal.set_agent_name("claude".into());
+        terminal.set_agent_name("claude".into()).unwrap();
         (app, 0, pane_id)
     }
 
@@ -390,7 +390,7 @@ mod tests {
             app.state.ensure_test_terminals();
             app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 80, 24);
             let terminal = app.state.terminals.get_mut(&id).unwrap();
-            terminal.set_agent_name("opencode".into());
+            terminal.set_agent_name("opencode".into()).unwrap();
             terminal.set_detected_state(
                 Some(crate::detect::Agent::OpenCode),
                 crate::detect::AgentState::Idle,
@@ -430,7 +430,10 @@ mod tests {
             let failed_status = app.pane_info(0, pane_id).unwrap().agent_status;
             let failed_events = app.event_hub.events_after(sequence);
             let snapshot = crate::persist::capture(
-                &app.state.structured_agents,
+                crate::persist::RegistryCapture {
+                    registry: &app.state.structured_agents,
+                    now_ms: Some(42),
+                },
                 &app.state.workspaces,
                 &app.state.terminals,
                 &app.terminal_runtimes,

@@ -135,6 +135,7 @@ async fn fake_claude_calls(mcp: bool) {
     );
     let location = StreamLocation {
         data_dir: root.clone(),
+        storage: Default::default(),
         agent: AGENT.into(),
         session: SESSION.into(),
     };
@@ -146,7 +147,8 @@ async fn fake_claude_calls(mcp: bool) {
         // Derive it from this test artifact, never PATH or an installed binary.
         let executable = std::env::current_exe().unwrap();
         let binary = executable.parent().unwrap().parent().unwrap().join("flk");
-        crate::structured::launch::SessionMcp::new(&binary, &socket).unwrap()
+        crate::structured::launch::SessionMcp::new(&binary, &socket)
+            .expect("missing sibling flk binary from cargo/nextest all-target build")
     } else {
         fixture.mcp()
     };
@@ -197,6 +199,7 @@ async fn fake_claude_calls(mcp: bool) {
                 &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 None,
                 &std::sync::Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             )
             .unwrap();
@@ -207,10 +210,8 @@ async fn fake_claude_calls(mcp: bool) {
         .unwrap();
     let mut attributed = true;
     for _ in 0..request_count {
-        let msg = tokio::time::timeout(Duration::from_secs(10), app.api_rx.recv())
-            .await
-            .expect("bounded socket dispatch")
-            .expect("request");
+        // Scoped authentication probes precede effects on each fresh connection.
+        let msg = super::scoped_mcp_tests::next_effect(&mut app).await;
         let root_pid: u32 = std::fs::read_to_string(root.join("model.pid"))
             .unwrap()
             .parse()
