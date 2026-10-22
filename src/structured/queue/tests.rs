@@ -859,3 +859,12 @@ fn unknown_producer_tag_preserves_its_uninterpreted_payload() {
     assert_eq!(journal.replay(0).unwrap().records, [record]);
     assert!(journal.checkpoint().is_err());
 }
+
+mod admission;
+
+// Replace only this test-owned journal handle; its real backing file stays intact.
+pub(crate) fn fail_writes(journal: &mut Journal) -> UnixStream {
+    let (file, peer) = socket_file();
+    journal.file = file;
+    peer
+}

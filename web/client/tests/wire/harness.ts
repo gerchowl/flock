@@ -85,19 +85,29 @@ export class VirtualClock implements Clock {
   }
 }
 
-/** A scripted socket: records what the client sends and closes. */
+/**
+ * A scripted socket: records what the client sends and closes. Like the
+ * server, it holds the sub ids the client opened on it: a client frame for
+ * any other id is a protocol error (ADR-0038 §3), and fails the test there.
+ */
 export class FakeSocket implements SocketLike {
   onopen: (() => void) | null = null;
   onmessage: ((event: { readonly data: unknown }) => void) | null = null;
   onclose: ((event: { readonly code: number; readonly reason: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   readonly #net: FakeNetwork;
+  readonly #opened = new Set<string>();
 
   constructor(net: FakeNetwork) {
     this.#net = net;
   }
 
   send(text: string): void {
+    const frame = JSON.parse(text) as { readonly t?: unknown; readonly sub_id?: unknown };
+    if (typeof frame.sub_id === "string") {
+      if (frame.t === "sub") this.#opened.add(frame.sub_id);
+      else if (!this.#opened.has(frame.sub_id)) throw new Error(`the client sent ${String(frame.t)} for sub id ${frame.sub_id}, which it never opened on this socket`);
+    }
     this.#net.frames.push({ text, at: this.#net.clock.now() });
   }
 
