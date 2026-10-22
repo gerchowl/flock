@@ -1077,7 +1077,23 @@ The fsync-temp, rename, fsync-directory rule below is unchanged.
   `<data dir>/blobs/<sha256>` and the stored line keeps `{blob: sha256,
   size, preview}` in its place. Partial deltas (`stream_event`) are relayed
   live and not persisted; the complete `assistant` event that follows carries
-  the same content.
+  the same content. A corrupt object is repaired by a verified put. Only repairs
+  attempt serialization across stores/processes using an advisory directory lock;
+  first writes never lock, since racing Missing writers publish identical verified
+  bytes without repair events. Contended nonblocking acquisition backs off on
+  the supplied monotonic clock: sleep 1 ms, doubling thereafter and clipping each
+  request to the remaining 20 ms budget. Elapsed time bounds normal contention;
+  eight attempts only guard against a clock/sleeper that fails to advance.
+  Clock expiry reports `TimedOut`; attempt exhaustion reports `WouldBlock`.
+  The bounds apply to requested sleeps, not OS scheduling or filesystem latency.
+  On a lock error or exhaustion, one `structured.blob.repair_lock_unavailable`
+  warning names only the error kind
+  and blob hash, then publication proceeds without the lock. The current object
+  is reverified before rename; coordinated writers emit `structured.blob.repaired`
+  only when replacing corrupt bytes, after directory fsync, with hash and size,
+  never content. Fallback may duplicate that diagnostic but must not lose a blob
+  or stop the pump because locking failed. Other filesystem I/O failures remain
+  explicit. Direct filesystem mutations outside the lock are not coordinated.
 - **Rehydrate.** The native transcript Claude writes under the profile is a
   disposable working copy. A byte prefix of it (E11) is the only thing flk
   ever writes back, under a new session uuid, and only for a fork behind a
