@@ -32,6 +32,7 @@ mod owners;
 mod panes;
 pub(crate) mod peers;
 pub(super) mod responses;
+mod retained;
 mod revert;
 mod spawn;
 mod structured_agents;
@@ -1430,6 +1431,8 @@ impl App {
             Method::ServerStop(_)
                 | Method::ServerReloadConfig(_)
                 | Method::ServerLiveHandoff(_)
+                | Method::SessionRetainedList(_)
+                | Method::SessionRetainedPurge(_)
                 | Method::ClientTokenAdd(_)
                 | Method::ClientTokenRemove(_)
                 | Method::ClientTokenList(_)
@@ -1608,6 +1611,9 @@ impl App {
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
             Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
+            Method::SessionRetainedList(_) | Method::SessionRetainedPurge(_) => {
+                return self.handle_retained(request.id, request.method);
+            }
             Method::ClientTokenAdd(_)
             | Method::ClientTokenRemove(_)
             | Method::ClientTokenList(_)

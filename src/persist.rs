@@ -7,6 +7,7 @@ mod io;
 mod restore;
 mod snapshot;
 
+pub(crate) use self::io::save_metadata;
 pub use self::io::{clear, clear_history, load, load_history, save};
 pub use self::restore::restore;
 #[cfg(unix)]

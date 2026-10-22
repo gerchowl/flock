@@ -476,8 +476,24 @@ lease evidence or authority.
 A non-array `structured_agents` collection remains raw and inactive and refuses
 admission with typed `RegistryError::UnsupportedCollectionShape`, naming the
 session-state repair guide. Never discard the whole session because of a bad
-entry. The operator list/purge commands and doctor counts/hints are the separate
-second PR of #1853; they are not enabled by this policy/persistence slice.
+entry. `flk session retained list [--json]` lists kind, serialized slot and first-seen
+metadata, not opaque record payloads. `flk session retained purge (--dead | --all)
+[--older-than <dur>]` selects records explicitly; `--all` additionally requires
+`--yes`, validated by the server as well as the CLI. Durations use the existing
+`ms`, `s`, `m`, `h` units; age is strict and unstamped records do not match an age
+filter. Both API methods require the kernel/lease-classified operator principal;
+agent tokens alone grant no authority. `flk doctor [--json]` reports FORWARD/DEAD
+counts and a purge hint when FORWARD exists or DEAD exceeds half the cap.
+
+Purge commits an fsynced temporary snapshot, rename and directory sync before
+changing inactive records in the live registry; it never replaces active worker
+observations. A pre-replacement save failure returns a typed error and leaves
+live records unchanged. Its removed count includes normal save-time DEAD pruning.
+Age-filtered purges reclassify remaining copies, protecting the last unusable
+object as FORWARD before automatic maintenance.
+The server's explicit no-session mode remains memory-only. Unknown collection
+shapes refuse list/purge with typed `retained_collection_shape` and the offline
+repair guide; `--all --yes` cannot reinterpret an unknown collection layout.
 Both the temporary
 snapshot file before rename and its parent directory after rename are fsynced.
 A directory sync failure after successful replacement is logged as a durability

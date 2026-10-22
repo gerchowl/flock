@@ -237,6 +237,10 @@ pub enum Method {
     EventsWait(EventsWaitParams),
     #[serde(rename = "events.read")]
     EventsRead(EventsReadParams),
+    #[serde(rename = "session.retained.list")]
+    SessionRetainedList(EmptyParams),
+    #[serde(rename = "session.retained.purge")]
+    SessionRetainedPurge(super::retained::PurgeParams),
     #[serde(rename = "client.token.add")]
     ClientTokenAdd(super::client_tokens::AddParams),
     #[serde(rename = "client.token.rm")]
@@ -354,6 +358,7 @@ impl Method {
         matches!(
             self,
             Self::Ping(_)
+                | Self::SessionRetainedList(_)
                 | Self::NotificationList(_)
                 | Self::HandoffList(_)
                 | Self::HandoffRead(_)
@@ -403,6 +408,7 @@ impl Method {
             | Self::ServerStop(_)
             | Self::ServerLiveHandoff(_)
             | Self::ServerReloadConfig(_)
+            | Self::SessionRetainedList(_)
             | Self::NotificationList(_)
             | Self::HandoffList(_)
             | Self::HandoffRead(_)
@@ -487,6 +493,7 @@ impl Method {
             | Self::PaneSplit(_)
             | Self::PaneMove(_)
             | Self::PaneRename(_)
+            | Self::SessionRetainedPurge(_)
             | Self::ClientTokenAdd(_)
             | Self::ClientTokenRemove(_)
             | Self::ClientTokenList(_)
@@ -2979,6 +2986,13 @@ pub struct ApiListenerHealth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    Retained {
+        records: Vec<crate::structured::registry::RetainedInfo>,
+        forward: usize,
+        dead: usize,
+        removed: usize,
+        purge_hint: Option<String>,
+    },
     ClientTokenIssued {
         issued: super::client_tokens::Issued,
     },
