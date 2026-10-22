@@ -24,6 +24,21 @@ file. If an existing object's bytes fail hash verification, the next put of the
 same content replaces it with the verified, synced temp file by atomic rename,
 then syncs the directory. Only after that sync does the typed logging helper emit
 `structured.blob.repaired` with `blob` (SHA-256) and `size` (bytes), never content.
+Only corrupt-object repairs attempt an advisory lock on the pinned directory.
+First writes never lock: racing Missing writers rename identical verified bytes
+and emit no repair event. On contention, nonblocking acquisition sleeps on the
+supplied monotonic clock: 1 ms initially, doubling thereafter, with each request
+clipped to the remaining 20 ms budget. Normal contention is bounded by elapsed
+time; an eight-attempt cap only guards against a clock/sleeper that does not
+advance. `TimedOut` means the clock budget expired; `WouldBlock` means the attempt
+guard fired. Requested sleeps are bounded; filesystem and OS scheduling latency
+can exceed the budget. Unsupported locking, other lock errors, or exhaustion emit one
+`structured.blob.repair_lock_unavailable` warning carrying the error kind and
+blob hash, never content or OS error text. The put then proceeds without the lock,
+so these diagnostic-coordination failures cannot lose content or stop the pump.
+The current object is reverified before rename. Coordinated writers emit one
+repair event; fallback can emit duplicate repair diagnostics. Direct filesystem
+writes that do not take the lock are outside this coordination.
 The transport continues streaming after a successful repair. A read still returns
 Corrupt for damaged content; unsafe entries and read/write/sync failures remain
 explicit errors. A crash before rename leaves the old entry and an owned temp

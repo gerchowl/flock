@@ -19,6 +19,7 @@ fn record(seq: u64, raw: Value) -> StreamRecord {
         origin: RecordOrigin::Claude,
         result_subtype: None,
         permission_grant_request_id: None,
+        permission_request_seq: None,
         raw: raw.to_string(),
     }
 }

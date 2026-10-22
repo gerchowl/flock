@@ -137,6 +137,7 @@ impl Entry {
                 state,
                 phase_changed: None,
                 needs_human: Vec::new(),
+                permission_requests: Vec::new(),
                 stalled_since_ms: None,
                 observe_at: None,
             },

@@ -25,14 +25,29 @@ fn checked(result: i32) -> io::Result<i32> {
     }
 }
 
-/// Register before rechecking identity, then signal only the verified process.
-/// A timeout retains the sandbox instead of removing a running server's files.
-pub fn stop(pid: u32, verify: impl FnOnce() -> bool) -> io::Result<()> {
+/// Grace for SIGTERM to close the server's owned PTYs before escalation.
+pub const TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// Register before rechecking identity and before each signal. SIGTERM gets
+/// [`TERM_GRACE`], then SIGKILL gets a five-second failure ceiling. Timeouts or
+/// changed identities retain the sandbox instead of removing a running server's files.
+pub fn stop(pid: u32, mut verify: impl FnMut() -> bool) -> io::Result<()> {
     let exit = ExitWatch::new(pid)?;
     if !verify() {
         return Err(io::Error::other("server identity changed"));
     }
-    imp::signal(exit.0.as_raw_fd(), pid)?;
+    imp::signal(exit.0.as_raw_fd(), pid, libc::SIGTERM)?;
+    match exit.wait(TERM_GRACE) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+        Err(error) => return Err(error),
+    }
+    if !verify() {
+        return Err(io::Error::other(
+            "server identity changed before escalation",
+        ));
+    }
+    imp::signal(exit.0.as_raw_fd(), pid, libc::SIGKILL)?;
     exit.wait(Duration::from_secs(5))
 }
 
@@ -89,12 +104,12 @@ mod imp {
         let fd = checked(unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32)?;
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
-    pub fn signal(fd: i32, _pid: u32) -> io::Result<()> {
+    pub fn signal(fd: i32, _pid: u32, signal: i32) -> io::Result<()> {
         checked(unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
                 fd,
-                libc::SIGKILL,
+                signal,
                 std::ptr::null::<libc::siginfo_t>(),
                 0,
             )
@@ -130,7 +145,13 @@ mod imp {
         })?;
         Ok(fd)
     }
-    pub fn signal(_fd: i32, pid: u32) -> io::Result<()> {
-        checked(unsafe { libc::kill(pid as i32, libc::SIGKILL) }).map(|_| ())
+    pub fn signal(_fd: i32, pid: u32, signal: i32) -> io::Result<()> {
+        // Darwin kqueue observes the original process but cannot signal through
+        // that handle. Birth/argv/environment are checked immediately before
+        // kill, with no userspace wait in between. Reuse would require exit,
+        // reaping and reassignment of the same PID in this syscall-sized gap, negligible
+        // for these private fixture processes. Unlike Linux pidfds, this is not
+        // an atomic signal-to-identity guarantee.
+        checked(unsafe { libc::kill(pid as i32, signal) }).map(|_| ())
     }
 }
