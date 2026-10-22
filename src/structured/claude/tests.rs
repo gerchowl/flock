@@ -298,3 +298,29 @@ optional_null_tests! {
     tool_request_optional_fields_accept_null("CanUseTool", ["/request/display_name", "/request/description", "/request/permission_suggestions", "/request/requires_user_interaction"]);
     rate_limit_info_optional_fields_accept_null("RateLimit", ["/rate_limit_info/resetsAt", "/rate_limit_info/rateLimitType"]);
 }
+
+#[test]
+fn absent_only_subtypes_agree_with_the_known_wire_projection() {
+    for name in ["Assistant", "User", "CommandLifecycle", "RateLimit"] {
+        let line = FIXTURES
+            .lines()
+            .zip(VARIANTS.lines())
+            .find(|(_, variant)| *variant == name)
+            .unwrap()
+            .0;
+        let original: Value = serde_json::from_str(line).unwrap();
+        assert!(serde_json::from_value::<KnownSessionEvent>(original.clone()).is_ok());
+        for subtype in [Value::Null, json!("future")] {
+            let mut changed = original.clone();
+            changed["subtype"] = subtype;
+            let raw = serde_json::to_string(&changed).unwrap();
+            let event = SessionEvent::parse(&raw, "fixture");
+            assert!(matches!(event, SessionEvent::Unknown { .. }), "{name}");
+            assert_eq!(serde_json::to_string(&event).unwrap(), raw);
+            assert!(
+                serde_json::from_value::<KnownSessionEvent>(changed).is_err(),
+                "{name}"
+            );
+        }
+    }
+}

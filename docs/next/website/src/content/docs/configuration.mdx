@@ -381,7 +381,7 @@ A consequence worth stating: a name you gave an agent yourself — `flk agent st
 
 `[ui] agent_aliases` overrides the agent field, with one rule that differs by mode. An alias that **names a harness** (`agent_aliases = { researcher = "codex" }`) re-attributes the row to that harness, so a mislabelled agent can be corrected without editing anything else — that works in all three modes. An alias that is **anything else** is drawn as written in `shortcut` and `name`. In `symbol` the field is a single cell, so the alias has to fit one: a one-cell glyph (including a Nerd Font codepoint from a font you installed yourself) is drawn, and anything wider is ignored in favour of the built-in symbol, because a value that does not fit would push every column to the right of it out of alignment.
 
-`server_label` controls how a server is IDENTIFIED across the sidebar — the servers band, the spaces list's member rows, and the agents panel. `both` (the default) shows the server's self-declared icon glyph followed by its hostname, `icon` shows the glyph alone, and `name` shows the hostname alone. A node declares its own glyph with the top-level `icon` key (`icon = "laptop"`), which is gossiped to the fleet as a name and resolved to a glyph by whoever renders it, so every viewer draws it from its own font. A server that declares no icon, or one whose name the viewer does not recognise, falls back to its hostname in every mode. The setting is viewer-local: it changes how you read the fleet, not what any node reports.
+`server_label` controls how a server is IDENTIFIED across the sidebar — the servers band, the spaces list's member rows, and the agents panel. `both` (the default) shows the server's self-declared icon glyph followed by its hostname, `icon` shows the glyph alone, and `name` shows the hostname alone. A node declares its own glyph with the top-level `icon` key (`icon = "laptop"`), which is gossiped to the fleet as a name and resolved to a glyph by whoever renders it, so every viewer draws it from its own font. A server that declares no icon, or one whose name the viewer does not recognise, falls back to its hostname in every mode. The setting is viewer-local: it changes how you read the fleet, not what any node reports. In the servers band, every mode retains a readable name (or the short node ID). Rows merge only by node ID, using local pins or enrollment to bind configured aliases (configured aliases take precedence over inbound pin names); ID-less legacy observations stay separate and are marked `legacy/unverified`. Reported node IDs are claims: only a local pin or pinned enrollment proves identity. A relayed row can fold into a configured row only when its immediate enrolled source is that very node. Configured rows always retain their configured dial target and outrank relayed readings, including while offline. Other claims and snapshots stay separate and unverified; they cannot borrow pinned aliases. An ID-less home remains unverified until a fresh snapshot supplies its identity; a matching name cannot refresh it. The route badge shows a held direct edge or the learned next hop, never the peer that supplied gossip; `unrouted` means no current mesh path is known. Client snapshot protocol 32 preserves these node IDs and refuses older client/server builds through the existing version check. Mesh protocol 5 is unchanged.
 
 `confirm_close` controls whether closing a workspace asks for confirmation. `prompt_new_tab_name` controls whether new tabs ask for a label first.
 
@@ -460,8 +460,17 @@ it off with:
 enabled = false
 ```
 
-Disabled, Flock writes nothing at all: the window title stays whatever your
-shell last set it to.
+Both the server and the attaching client must enable titles. The server decides
+whether to publish its title, and the client reads its own local `[title]` config
+before writing it to the terminal. Set `enabled = false` locally to silence a
+remote attach, or on the server to prevent publishing to every client.
+
+A disabled client writes no title sequences, including on exit: it neither sets
+nor restores a title. Disabling it after a title was set leaves that title in
+place. The local setting is read at attach and refreshed by the existing client
+config reload request. If a title is unexpectedly absent, check both configs
+and terminal passthrough support. If disabling it on the server appears to have
+no effect, check that you edited the attached server's config and reloaded it.
 
 Inside tmux, the title only reaches the outer terminal if tmux is allowed to
 pass the sequence through:
@@ -471,8 +480,8 @@ set -g allow-passthrough on
 ```
 
 Without it tmux swallows the sequence and the window title is unchanged — the
-same as not publishing at all. The setting is read from the server you are
-attached to, so a remote attach follows the remote host's `[title]` section.
+same as not publishing at all. Allowing titles on one side cannot override the
+other side's veto.
 
 ## Sound
 
@@ -950,6 +959,14 @@ leased or pane agents still cannot act as the operator; other/missing UIDs
 remain read-only. This gives up dedicated-UID recognition of anonymous/detached
 agents. Same-UID callers without lease or pane ancestry cannot be distinguished
 from the operator (the cooperative limit tracked in #1177; ADR-0036 §1a).
+
+`flk config check` and startup diagnostics warn if `agent_account = "none"` is
+combined with `[structured] run_as = "flk-agent"`. A launched agent using a
+separate dedicated UID then remains `Unknown` (read-only). Set
+`security.agent_account = "flk-agent"` when using that launch identity, or
+explicitly select operator-mode launch when no dedicated account is used. The warning does not change authority.
+Account lookup and collision diagnostics belong to each server instance; its app
+and API listener share the same policy, and Ping never starts or waits for NSS.
 
 ## Environment variables
 

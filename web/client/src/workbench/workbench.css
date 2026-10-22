@@ -186,7 +186,8 @@
   cursor: pointer;
 }
 
-.action[aria-disabled="true"] {
+.action[aria-disabled="true"],
+.action:disabled {
   color: var(--muted);
   cursor: not-allowed;
 }
@@ -225,6 +226,13 @@
 .card__detail {
   margin: 0;
   color: var(--muted);
+}
+
+.card__stale {
+  margin: 0.25rem 0;
+  font-size: 0.8rem;
+  font-style: italic;
+  opacity: 0.8;
 }
 
 .card__title {
@@ -432,4 +440,153 @@
   color: var(--fg);
   font-weight: 700;
   box-shadow: inset 0 3px 0 var(--working);
+}
+
+.connection-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+  padding: 0.25rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.connection-bar__error {
+  color: var(--error);
+}
+
+.connection-bar__token {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.connection-bar__token input {
+  min-height: 44px;
+  padding: 0 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+}
+
+.connection-bar__toggle {
+  margin-left: auto;
+}
+
+/* The composer (ADR-0038 §2a), at the bottom of the focus pane and the phone's agent screen. */
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem 0.75rem;
+  border-top: 1px solid var(--border);
+}
+
+.composer__sent {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sent {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.sent__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sent__status {
+  flex: none;
+  color: var(--muted);
+}
+
+.sent--failed .sent__status,
+.sent--uncertain .sent__status,
+.sent--unknown_outcome .sent__status {
+  color: var(--error);
+}
+
+.composer__input {
+  min-height: 44px;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  resize: vertical;
+}
+
+.composer__footer {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.composer__mode {
+  color: var(--muted);
+}
+
+.composer__hint {
+  color: var(--muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+/* A keyboard shortcut means nothing on a touch screen. */
+.phone .composer__hint {
+  display: none;
+}
+
+.composer__footer .action {
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.action--primary:enabled {
+  border-color: var(--working);
+  background: var(--working);
+  color: var(--bg);
+}
+
+.decide {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.decide__message {
+  min-height: 44px;
+  padding: 0 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+}
+
+.decide__confirm p {
+  margin: 0;
+}
+
+.phone .decide__message {
+  min-height: 48px;
+}
+
+.decide__count {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
 }

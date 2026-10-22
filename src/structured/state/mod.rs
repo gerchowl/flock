@@ -27,9 +27,21 @@ use std::time::{Duration, Instant};
 
 /// Facts supplied by the stream owner, never inferred from screen text.
 pub enum Input<'a> {
+    /// The transport accepted a user envelope, not necessarily delivered it.
+    /// `at` and `at_ms` name the same acceptance instant on the caller's clocks.
+    /// This arms silence observation without claiming a working turn (ADR-0036 S4).
+    Accepted {
+        /// Monotonic admission time, before any harness response.
+        at: Instant,
+        /// Admission time in Unix milliseconds, used by a stall report.
+        at_ms: u64,
+    },
     /// Every stdout event, including unknown lines, counts as stream progress.
     /// Stream consumers must use `Received::state_input` to include host closes.
     Event(&'a SessionEvent),
+    /// A book-correlated stdout request with its flk-issued decision handle.
+    /// Only the transport adapter supplies this sequence, never harness JSON.
+    PermissionEvent(&'a SessionEvent, u64),
     /// Stdout progress whose tool request was already reserved by a grant.
     /// It never opens a needs-human entry.
     Progress,
@@ -55,7 +67,11 @@ pub struct Update {
     pub phase_changed: Option<(Phase, Phase)>,
     /// All currently open permission/question requests, in id order.
     pub needs_human: Vec<(String, HumanReason)>,
-    /// Last stdout's Unix ms, once per silent interval; no phase is changed.
+    /// Open book-issued `(request_id, request_seq)` handles for operator decisions.
+    /// S7 slice 5 must carry both fields unchanged end to end. Legacy stdout with
+    /// no authenticated sequence can request attention but cannot authorize a decide.
+    pub permission_requests: Vec<(String, u64)>,
+    /// Last stdout or accepted input's Unix ms, once per silent interval.
     pub stalled_since_ms: Option<u64>,
     /// Next monotonic observation boundary, if silence or settling needs one.
     pub observe_at: Option<Instant>,
@@ -76,11 +92,13 @@ pub struct SessionState {
     turn_since: Option<Instant>,
     lifecycle: Lifecycle,
     controls: BTreeMap<String, HumanReason>,
+    permission_requests: BTreeMap<String, u64>,
     tools: BTreeSet<String>,
     limit: Option<Option<u64>>,
     crashed: bool,
     started: bool,
-    stdout: Option<(Instant, u64)>,
+    progress: Option<(Instant, u64)>,
+    pending_input: bool,
     stalled: bool,
     phase: Phase,
     phase_since: Option<Instant>,
@@ -94,11 +112,13 @@ impl SessionState {
             turn_since: None,
             lifecycle: Lifecycle::Live,
             controls: BTreeMap::new(),
+            permission_requests: BTreeMap::new(),
             tools: BTreeSet::new(),
             limit: None,
             crashed: false,
             started: false,
-            stdout: None,
+            progress: None,
+            pending_input: false,
             stalled: false,
             phase: Phase::Unknown,
             phase_since: None,
@@ -132,19 +152,30 @@ impl SessionState {
         stall_after: Duration,
     ) -> Update {
         match input {
-            Input::Event(event) => {
-                self.stdout = Some((now, unix_ms));
+            Input::Accepted { at, at_ms } => {
+                self.pending_input = true;
+                self.progress = Some((at, at_ms));
+                self.stalled = false;
+            }
+            Input::Event(event) | Input::PermissionEvent(event, _) => {
+                self.progress = Some((now, unix_ms));
                 self.stalled = false;
                 self.event(event, now);
+                if let (Input::PermissionEvent(_, seq), SessionEvent::CanUseTool(e)) =
+                    (&input, event)
+                {
+                    self.permission_requests.insert(e.request_id.clone(), *seq);
+                }
             }
             Input::Progress => {
-                self.stdout = Some((now, unix_ms));
+                self.progress = Some((now, unix_ms));
                 self.stalled = false;
             }
             Input::ControlAnswered(id) => {
                 self.controls.remove(id);
             }
             Input::ProcessExited => {
+                self.pending_input = false;
                 self.crashed = self.started;
                 self.controls.clear();
                 self.tools.clear();
@@ -154,6 +185,8 @@ impl SessionState {
             }
             Input::Observe => (),
         }
+        self.permission_requests
+            .retain(|id, _| self.controls.contains_key(id));
         let attention = if let Some(reset) = self.limit {
             Attention::Blocked {
                 reason: BlockedReason::ProviderLimit,
@@ -203,9 +236,9 @@ impl SessionState {
             .filter(|_| self.lifecycle == Lifecycle::Live)
             .map(|at| millis(now.saturating_duration_since(at)));
         let stalled_since_ms = self
-            .stdout
+            .progress
             .filter(|(at, _)| {
-                self.started
+                (self.started || self.pending_input)
                     && !self.stalled
                     && !self.crashed
                     && self.lifecycle == Lifecycle::Live
@@ -216,9 +249,9 @@ impl SessionState {
             .map(|(_, unix)| unix);
         self.stalled |= stalled_since_ms.is_some();
         let stall_due = self
-            .stdout
+            .progress
             .filter(|_| {
-                self.started
+                (self.started || self.pending_input)
                     && !self.stalled
                     && !self.crashed
                     && self.lifecycle == Lifecycle::Live
@@ -242,6 +275,11 @@ impl SessionState {
                 .controls
                 .iter()
                 .map(|(id, reason)| (id.clone(), *reason))
+                .collect(),
+            permission_requests: self
+                .permission_requests
+                .iter()
+                .map(|(id, seq)| (id.clone(), *seq))
                 .collect(),
             stalled_since_ms,
             observe_at,
@@ -268,6 +306,7 @@ impl SessionState {
             self.limit = None;
         }
         self.turn = Turn::Working;
+        self.pending_input = false;
         self.started = true;
         self.crashed = false;
     }
@@ -309,6 +348,7 @@ impl SessionState {
                 self.result(now)
             }
             SessionEvent::CanUseTool(e) => {
+                self.permission_requests.remove(&e.request_id);
                 self.controls.insert(
                     e.request_id.clone(),
                     if e.request.tool_name == "AskUserQuestion" {
@@ -339,7 +379,6 @@ impl SessionState {
             SessionEvent::ControlCancel(e) => {
                 self.controls.remove(&e.request_id);
             }
-
             SessionEvent::ContentBlockStart(e) => self.tool_start(e.event.get("content_block")),
             SessionEvent::Assistant(e) => {
                 for block in e
@@ -378,6 +417,7 @@ impl SessionState {
         }
     }
     fn result(&mut self, now: Instant) {
+        self.pending_input = false;
         if self.turn != Turn::Idle {
             self.turn_since = Some(now);
         }

@@ -1,49 +1,14 @@
 //! Minimal GUI transport payloads specified by #1746 and ADR-0036 §2/§5a.
 
-use crate::api::agent_state::AgentState;
 use serde::{Deserialize, Serialize};
 
-/// Structured-agent row in the minimal fleet snapshot and its upsert deltas.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-pub struct FleetAgentRow {
-    /// Opaque structured-agent identity.
-    pub id: String,
-    /// User-visible agent label.
-    pub label: String,
-    /// Shared S4 axes and phase, read leniently per ADR-0028 §3a.
-    pub state: AgentState,
-    /// Current activity text, omitted when no activity is available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts", ts(optional))]
-    pub activity: Option<String>,
-    /// Open permission request identities, available on this agent's stream.
-    pub waiting_on_human: Vec<String>,
-}
-
-/// Closed payload vocabulary carried inside fleet stream ev frames.
-/// Snapshot rows are full upserts between gap and snapshot_to, followed by synced.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(tag = "type")]
-pub enum FleetDelta {
-    /// Insert or replace the complete structured-agent row.
-    #[serde(rename = "fleet.upsert")]
-    Upsert {
-        /// Full row, including its current open permission requests.
-        row: FleetAgentRow,
-    },
-    /// Remove an agent from the materialized fleet.
-    #[serde(rename = "fleet.remove")]
-    Remove {
-        /// Opaque identity of the removed agent.
-        id: String,
-    },
-}
+pub use crate::structured::fleet_lite::wire::{FleetAgentRow, FleetDelta};
 
 /// Successful agent.decide ack result, echoing the applied answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub struct AgentDecideResult {
     /// Harness request identity whose answer was applied.
     pub request_id: String,
@@ -56,6 +21,8 @@ pub struct AgentDecideResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub enum AgentDecideErrorCode {
     /// No permission request has this identity.
     PermissionRequestUnknown,
@@ -68,11 +35,17 @@ pub enum AgentDecideErrorCode {
 /// Arguments for a token-authenticated client's agent.decide command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub struct AgentDecide {
     /// Agent whose open permission request is being answered.
     pub agent: String,
     /// Harness request identity from the derived open-request record.
     pub request_id: String,
+    /// Required flk-issued handle from the open record, carried unchanged by S7
+    /// slice 5. JSON number, exact in JavaScript below 2^53 like stream cursors.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub request_seq: u64,
     /// Permission choice admitted by S6-MVP.
     pub decision: PermissionDecision,
     /// Optional explanation supplied with the answer.
@@ -81,18 +54,7 @@ pub struct AgentDecide {
     pub message: Option<String>,
 }
 
-/// Closed permission vocabulary shared by the client and S6-MVP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionDecision {
-    /// Permit only this request.
-    AllowOnce,
-    /// Permit this tool beyond the current request.
-    AllowAlways,
-    /// Refuse the request.
-    Deny,
-}
+pub use super::permission::PermissionDecision;
 
 #[cfg(test)]
 mod tests {
@@ -128,8 +90,7 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(decision).unwrap(), choice);
             for message in [None, Some("Operator explanation")] {
-                let mut value =
-                    json!({"agent":"fixture-agent","request_id":"request-one","decision":choice});
+                let mut value = json!({"agent":"fixture-agent","request_id":"request-one","request_seq":1,"decision":choice});
                 if let Some(message) = message {
                     value["message"] = json!(message);
                 }

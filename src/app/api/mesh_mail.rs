@@ -958,7 +958,7 @@ mod tests {
         let pane = app.state.workspaces[0].focused_pane_id().unwrap();
         let terminal_id = app.state.terminal_id_for_pane(0, pane).unwrap();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.set_agent_name("fixture".into());
+        terminal.set_agent_name("fixture".into()).unwrap();
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),

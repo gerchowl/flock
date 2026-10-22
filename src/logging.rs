@@ -1,3 +1,5 @@
+pub(crate) mod types;
+
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -29,7 +31,7 @@ pub(crate) fn structured_worker_shutdown_failed(error: &crate::structured::worke
         tracing::error!(
             event = "structured.worker.shutdown_failed",
             agent_id = agent_id.as_str(),
-            code = code.as_str(),
+            failure_code = code.as_str(),
             "structured worker cleanup failed"
         );
     }
@@ -50,6 +52,39 @@ pub(crate) fn structured_stream_repaired(bytes_dropped: u64) {
     );
 }
 
+/// Report a single capacity refusal without recording tool input or prompts.
+pub(crate) fn structured_permission_request_refused(
+    agent: &str,
+    request_id: &str,
+    request_seq: u64,
+    error_code: &str,
+) {
+    tracing::warn!(
+        event = "structured.permission.refused",
+        agent_id = agent,
+        request_id,
+        request_seq,
+        error_code,
+        "permission request denied at open-request capacity"
+    );
+}
+
+/// Report accept failures with typed classes and errno, never request contents.
+#[cfg(feature = "web")]
+pub(crate) fn client_accept_failed(
+    error: &std::io::Error,
+    class: crate::platform::client_listener::AcceptFailure,
+) {
+    use crate::platform::client_listener::AcceptFailure;
+    let errno = error.raw_os_error();
+    let event = "client.listener.accept";
+    match class {
+        AcceptFailure::Connection => tracing::debug!(event, errno, ?class),
+        AcceptFailure::Resource | AcceptFailure::Unknown => tracing::warn!(event, errno, ?class),
+        AcceptFailure::Fatal => tracing::error!(event, errno, ?class),
+    }
+}
+
 /// Report skipped queue records with fixed reasons and optional cursors, never payloads.
 pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'static str) {
     tracing::warn!(
@@ -68,6 +103,38 @@ pub(crate) fn structured_queue_corrupt(reason: &crate::structured::queue::QueueJ
         offset = reason.offset,
         reason = reason.reason,
         "queue journal is read-only; operator recovery required"
+    );
+}
+
+/// Report a durable corrupt-blob replacement without exposing stored content.
+pub(crate) fn structured_blob_repaired(reference: &crate::structured::blobs::BlobRef) {
+    tracing::warn!(
+        event = "structured.blob.repaired",
+        blob = reference.blob.as_str(),
+        size = reference.size,
+        "repaired corrupt stored blob"
+    );
+}
+
+/// Report degraded repair coordination without logging OS error text or content.
+pub(crate) fn structured_blob_repair_lock_unavailable(
+    reference: &crate::structured::blobs::BlobRef,
+    kind: io::ErrorKind,
+) {
+    tracing::warn!(
+        event = "structured.blob.repair_lock_unavailable",
+        blob = reference.blob.as_str(),
+        error_kind = ?kind,
+        "repair lock unavailable; publishing without coordination"
+    );
+}
+
+/// Report a malformed permission header without disclosing the stored payload.
+pub(crate) fn structured_permission_recovery_skipped(seq: u64) {
+    tracing::warn!(
+        event = "structured.permission.recovery_skipped",
+        seq,
+        "invalid permission recovery header skipped and preserved"
     );
 }
 
@@ -106,7 +173,105 @@ pub(crate) fn init_file_logging(file_name: &str) {
         .flatten_event(true)
         .with_current_span(false)
         .with_span_list(false)
+        .event_format(InputJsonFormat::default())
         .try_init();
+}
+
+/// Bridge typed input metadata into stable tracing's scalar-only field API.
+/// The JSON writer expands the sealed metadata into canonical top-level fields,
+/// preserving the modifiers object and omitting inapplicable fields (ADR-0039).
+struct InputJsonFormat(
+    tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Json>,
+);
+
+impl Default for InputJsonFormat {
+    fn default() -> Self {
+        Self(
+            tracing_subscriber::fmt::format()
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_span_list(false),
+        )
+    }
+}
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for InputJsonFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        if event.metadata().fields().field("input_metadata").is_none() {
+            return self.0.format_event(ctx, writer, event);
+        }
+        let mut text = String::new();
+        self.0.format_event(
+            ctx,
+            tracing_subscriber::fmt::format::Writer::new(&mut text),
+            event,
+        )?;
+        let mut record: InputJsonFields =
+            serde_json::from_str(&text).map_err(|_| std::fmt::Error)?;
+        let index = record
+            .0
+            .iter()
+            .position(|(key, _)| key == "input_metadata")
+            .ok_or(std::fmt::Error)?;
+        let metadata = record.0.remove(index).1;
+        let fields: InputJsonFields =
+            serde_json::from_str(metadata.as_str().ok_or(std::fmt::Error)?)
+                .map_err(|_| std::fmt::Error)?;
+        record.0.splice(index..index, fields.0);
+        writeln!(
+            writer,
+            "{}",
+            serde_json::to_string(&record).map_err(|_| std::fmt::Error)?
+        )
+    }
+}
+
+/// Preserve the formatter's field order while expanding sealed input metadata.
+/// This avoids changing serde_json's map representation for the whole binary.
+struct InputJsonFields(Vec<(String, serde_json::Value)>);
+
+impl<'de> serde::Deserialize<'de> for InputJsonFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = InputJsonFields;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an ordered JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut fields = Vec::new();
+                while let Some(field) = map.next_entry()? {
+                    fields.push(field);
+                }
+                Ok(InputJsonFields(fields))
+            }
+        }
+        deserializer.deserialize_map(Fields)
+    }
+}
+
+impl serde::Serialize for InputJsonFields {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in &self.0 {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
 }
 
 pub(crate) fn help_log_paths_summary() -> String {
@@ -630,7 +795,7 @@ pub(crate) fn self_compact_armed(pane: &str, bytes: usize) {
         subsystem = "agent",
         outcome = "ok",
         pane,
-        bytes,
+        byte_count = bytes,
         "agent armed a self-compaction"
     );
 }
@@ -659,7 +824,7 @@ pub(crate) fn self_compact_continued(pane: &str, bytes: usize) {
         subsystem = "agent",
         outcome = "ok",
         pane,
-        bytes,
+        byte_count = bytes,
         "agent resumed on a compacted context with its own handoff prompt"
     );
 }
@@ -674,7 +839,7 @@ pub(crate) fn self_compact_completed(pane: &str, bytes: usize) {
         subsystem = "agent",
         outcome = "ok",
         pane,
-        bytes,
+        byte_count = bytes,
         "self-compaction finished"
     );
 }
@@ -1707,6 +1872,17 @@ pub(crate) fn client_conn_hello_read_failed(client_id: u64, err: &str) {
     );
 }
 
+/// A terminal observer exhausted its no-progress write deadline.
+pub(crate) fn client_conn_write_stalled(client_id: u64) {
+    tracing::warn!(
+        event = "client_conn.write_stalled",
+        subsystem = "client_conn",
+        outcome = "disconnected",
+        client_id,
+        "observer disconnected after exhausting its socket write progress deadline"
+    );
+}
+
 pub(crate) fn client_conn_write_failed(err: &str) {
     tracing::debug!(
         event = "client_conn.write",
@@ -2029,7 +2205,7 @@ pub(crate) fn client_clipboard_image_staged(client_id: u64, bytes: usize, path: 
         subsystem = "clipboard",
         outcome = "ok",
         client_id,
-        bytes,
+        byte_count = bytes,
         path,
         "staged client clipboard image"
     );
@@ -2042,7 +2218,7 @@ pub(crate) fn handoff_recorded(file_id: &str, extension: &str, bytes: usize) {
         outcome = "ok",
         file_id,
         extension,
-        bytes,
+        byte_count = bytes,
         "filed a handed-over file as an MCP resource"
     );
 }
@@ -2277,88 +2453,67 @@ pub(crate) fn render_virtual_frame(cols: u16, rows: u16, foreground_client_id: O
 }
 
 // --- raw_input family (logging redesign PR-5) ------------------------------
-// The stdin decoder is downstream of every keystroke the host terminal
-// produces, so its debug/warn tail runs hot. Byte payloads are Debug-formatted
-// but BOUNDED (see `bounded_bytes_debug`) so a runaway paste can't turn the log
-// into a memory hog. Levels mirror the pre-facade calls: unsupported/dropped
-// buffers are DEBUG (routine framing noise), the lone-escape flush is WARN
-// (may reach the pane as a spurious Esc), UTF-8-continuation waits are TRACE.
+// Raw input is content. Keep only typed classes and lengths (ADR-0039 §1).
+// Unsupported/dropped buffers are DEBUG, lone-escape flushes WARN, and
+// UTF-8 continuation waits TRACE, matching the existing level discipline.
 
-const MAX_TRACE_BYTE_PREVIEW: usize = 64;
-
-/// Shape a byte slice for a tracing field so a runaway paste can't blow up
-/// the log. Long payloads are truncated with a "(+N more)" tail; the Debug
-/// form (`[0x1b, 0x5b, ...]`) survives.
-pub(crate) fn bounded_bytes_debug(bytes: &[u8]) -> String {
-    if bytes.len() <= MAX_TRACE_BYTE_PREVIEW {
-        format!("{:?}", bytes)
-    } else {
-        let head = &bytes[..MAX_TRACE_BYTE_PREVIEW];
-        format!(
-            "{:?} (+{} more)",
-            head,
-            bytes.len() - MAX_TRACE_BYTE_PREVIEW
-        )
-    }
+/// Record sanitized input metadata without accepting raw bytes or Debug text.
+pub(crate) fn raw_input_event_parsed(input: types::InputMetadata) {
+    tracing::debug!(event = "raw_input.parsed", subsystem = "raw_input", outcome = "ok",
+        input_metadata = %input, "raw input event parsed");
 }
 
-pub(crate) fn raw_input_event_parsed(chunk: &[u8], event: &str) {
-    tracing::debug!(
-        event = "raw_input.parsed",
-        subsystem = "raw_input",
-        outcome = "ok",
-        raw_bytes = bounded_bytes_debug(chunk),
-        parsed = event,
-        "raw input event parsed"
-    );
-}
-
-pub(crate) fn raw_input_flushing_lone_escape(bytes: &[u8]) {
+/// Record only the length of a flushed escape.
+pub(crate) fn raw_input_flushing_lone_escape(input_len: usize) {
     tracing::warn!(
         event = "raw_input.flush",
         subsystem = "raw_input",
         outcome = "lone_escape",
-        bytes = bounded_bytes_debug(bytes),
+        input_len,
         "flushing lone escape after input timeout; if this follows an alt chord or focus switch it may reach the pane as plain esc"
     );
 }
 
-pub(crate) fn raw_input_waiting_utf8_continuation(bytes: &[u8]) {
+/// Record only the number of pending UTF-8 bytes.
+pub(crate) fn raw_input_waiting_utf8_continuation(input_len: usize) {
     tracing::trace!(
         event = "raw_input.wait",
         subsystem = "raw_input",
         outcome = "utf8_continuation",
-        bytes = bounded_bytes_debug(bytes),
+        input_len,
         "waiting for UTF-8 continuation bytes"
     );
 }
 
-pub(crate) fn raw_input_waiting_escaped_utf8_continuation(bytes: &[u8]) {
+/// Record only the number of pending escaped UTF-8 bytes.
+pub(crate) fn raw_input_waiting_escaped_utf8_continuation(input_len: usize) {
     tracing::trace!(
         event = "raw_input.wait",
         subsystem = "raw_input",
         outcome = "escaped_utf8_continuation",
-        bytes = bounded_bytes_debug(bytes),
+        input_len,
         "waiting for escaped UTF-8 continuation bytes"
     );
 }
 
-pub(crate) fn raw_input_dropping_incomplete_buffer(bytes: &[u8]) {
+/// Record only the length of a discarded incomplete buffer.
+pub(crate) fn raw_input_dropping_incomplete_buffer(input_len: usize) {
     tracing::debug!(
         event = "raw_input.drop",
         subsystem = "raw_input",
         outcome = "incomplete",
-        bytes = bounded_bytes_debug(bytes),
+        input_len,
         "dropping incomplete raw input buffer after timeout"
     );
 }
 
-pub(crate) fn raw_input_unsupported_escape(sequence: &str) {
+/// Record only the length of an unsupported escape sequence.
+pub(crate) fn raw_input_unsupported_escape(input_len: usize) {
     tracing::debug!(
         event = "raw_input.drop",
         subsystem = "raw_input",
         outcome = "unsupported_escape",
-        sequence,
+        input_len,
         "dropping unsupported escape sequence"
     );
 }
@@ -3024,13 +3179,22 @@ pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
     );
 }
 
+/// Discard untrusted agent identity text without logging its content.
+pub(crate) fn agent_name_dropped(source: &'static str) {
+    tracing::warn!(
+        code = crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+        source,
+        "agent name dropped"
+    );
+}
+
 // --- agent-resume family (logging redesign PR-6) ---------------------------
-// The three deferred agent-resume paths (empty argv, shell spawn failure,
-// send-command failure) all reach tracing with %terminal_id / %plan.agent /
-// %err. TerminalId is Display-shaped; the facade takes a shaped &str so no
-// other module carries the raw Display fmt. Level stays WARN — a failed
-// resume drops the pane back to its non-resumed state, which is surfaced
-// to the user via the terminal.
+// The three deferred launch failures are empty argv, shell spawn failure and
+// command send failure. They retain the plan and set resume_failed, suppressing
+// automatic retries in this server. Agent info reports blocked_reason=resume_failed.
+// An explicit operator retry makes one new attempt. All three paths log WARN
+// through the facade with shaped terminal and agent strings. Only spawn and send
+// failures include an err field.
 
 pub(crate) fn agent_resume_empty_argv(pane: u32, terminal: &str, agent: &str) {
     tracing::warn!(
@@ -3082,14 +3246,9 @@ pub(crate) fn agent_resume_send_command_failed(pane: u32, terminal: &str, agent:
 // intercepts are DEBUG (routine but story-critical when a keybind misfires),
 // modifier-only drops are DEBUG, empty-encoding is WARN.
 
-/// Shape a crossterm KeyEvent for the tracing tail: the code / modifiers /
-/// kind / state tuple every terminal-key site cares about. Single formatter
-/// so a schema change lands in one place instead of eighteen.
-pub(crate) fn shape_key_event(event: &crossterm::event::KeyEvent) -> String {
-    format!(
-        "code={:?} modifiers={:?} kind={:?} state={:?}",
-        event.code, event.modifiers, event.kind, event.state
-    )
+/// Discard character values before a key enters telemetry (ADR-0039 §1).
+pub(crate) fn shape_key_event(event: &crossterm::event::KeyEvent) -> types::InputMetadata {
+    types::InputMetadata::key(event.code, event.modifiers)
 }
 
 pub(crate) fn terminal_key_intercept_action(event: &crossterm::event::KeyEvent, action: &str) {
@@ -3097,7 +3256,7 @@ pub(crate) fn terminal_key_intercept_action(event: &crossterm::event::KeyEvent, 
         event = "terminal_key.intercept",
         subsystem = "terminal_key",
         outcome = "action",
-        key = shape_key_event(event),
+        input_metadata = %shape_key_event(event),
         action,
         "intercepted terminal direct keybinding before forwarding to pane"
     );
@@ -3108,7 +3267,7 @@ pub(crate) fn terminal_key_intercept_command(event: &crossterm::event::KeyEvent,
         event = "terminal_key.intercept",
         subsystem = "terminal_key",
         outcome = "command",
-        key = shape_key_event(event),
+        input_metadata = %shape_key_event(event),
         command,
         "intercepted terminal direct custom command before forwarding to pane"
     );
@@ -3119,7 +3278,7 @@ pub(crate) fn terminal_key_page_intercept(code: &crossterm::event::KeyCode, line
         event = "terminal_key.intercept",
         subsystem = "terminal_key",
         outcome = "page_scroll",
-        code = format!("{:?}", code),
+        input_metadata = %types::InputMetadata::key(*code, crossterm::event::KeyModifiers::empty()),
         lines,
         "intercepted page key for pane scrollback"
     );
@@ -3130,7 +3289,7 @@ pub(crate) fn terminal_key_modifier_only_dropped(event: &crossterm::event::KeyEv
         event = "terminal_key.drop",
         subsystem = "terminal_key",
         outcome = "modifier_only",
-        key = shape_key_event(event),
+        input_metadata = %shape_key_event(event),
         "dropping modifier-only terminal key event instead of forwarding it to pane"
     );
 }
@@ -3138,15 +3297,15 @@ pub(crate) fn terminal_key_modifier_only_dropped(event: &crossterm::event::KeyEv
 pub(crate) fn terminal_key_forward_ambiguous(
     event: &crossterm::event::KeyEvent,
     protocol: &str,
-    encoded: &[u8],
+    input_len: usize,
 ) {
     tracing::debug!(
         event = "terminal_key.forward",
         subsystem = "terminal_key",
         outcome = "ambiguous",
-        key = shape_key_event(event),
+        input_metadata = %shape_key_event(event),
         protocol,
-        encoded = bounded_bytes_debug(encoded),
+        input_len,
         "forwarding potentially-ambiguous terminal key to pane"
     );
 }
@@ -3156,7 +3315,7 @@ pub(crate) fn terminal_key_empty_encoding(event: &crossterm::event::KeyEvent) {
         event = "terminal_key.encode",
         subsystem = "terminal_key",
         outcome = "empty",
-        key = shape_key_event(event),
+        input_metadata = %shape_key_event(event),
         "key produced empty encoding"
     );
 }
@@ -4932,12 +5091,36 @@ pub(crate) fn mesh_custody_failed(operation: &'static str, code: &'static str) {
     tracing::warn!(target: "flock::mesh", event = "mesh.custody.failed", operation, code, "mesh custody operation failed");
 }
 
+/// Unexpected scope-release failure, with no token, path or bearer contents.
+pub(crate) fn client_token_unlock_failed(error: &std::io::Error) {
+    tracing::warn!(
+        event = "client_token.lock.release_failed",
+        error = %error,
+        errno = error.raw_os_error(),
+        "client-token lock release failed"
+    );
+}
+
 /// An untrusted client-token entry was ignored; never log its contents or bearer.
 pub(crate) fn client_token_entry_unsafe(entry: &str) {
     tracing::warn!(
         event = "client_token.entry.unsafe",
         entry,
         "untrusted client-token entry ignored"
+    );
+}
+
+/// A content anchor no longer resolves, so copying refuses rather than retargets.
+pub(crate) fn selection_content_unavailable(pane_closed: bool) {
+    tracing::debug!(
+        event = "selection.copy_refused",
+        subsystem = "selection",
+        reason = if pane_closed {
+            "pane_closed"
+        } else {
+            "content_unavailable"
+        },
+        "selected content is no longer available"
     );
 }
 
@@ -5443,6 +5626,17 @@ mod tests {
     }
 
     #[test]
+    fn stalled_observer_log_is_typed_and_connection_scoped() {
+        let log = capture_logs(|| client_conn_write_stalled(42));
+        assert!(log.contains("event=\"client_conn.write_stalled\""), "{log}");
+        assert!(log.contains("outcome=\"disconnected\""), "{log}");
+        assert!(log.contains("client_id=42"), "{log}");
+        assert!(log.contains("WARN"), "{log}");
+        assert!(!log.contains("host="), "{log}");
+        assert!(!log.contains("path="), "{log}");
+    }
+
+    #[test]
     fn client_conn_write_flush_read_split_by_stage() {
         let w = capture_logs(|| client_conn_write_failed("EPIPE"));
         assert!(w.contains("event=\"client_conn.write\""), "{w}");
@@ -5627,7 +5821,7 @@ mod tests {
             staged.contains("path=\"/tmp/flock-clip-7.png\""),
             "{staged}"
         );
-        assert!(staged.contains("bytes=4096"), "{staged}");
+        assert!(staged.contains("byte_count=4096"), "{staged}");
         assert!(staged.contains("INFO"), "{staged}");
 
         let fail = capture_logs(|| client_clipboard_image_stage_failed(7, "ENOSPC"));
@@ -5741,30 +5935,252 @@ mod tests {
 
     // ------ logging redesign PR-5: raw_input family ------------------------
 
-    #[test]
-    fn bounded_bytes_debug_truncates_long_payloads() {
-        let short = bounded_bytes_debug(&[1, 2, 3]);
-        assert_eq!(short, "[1, 2, 3]", "short payloads Debug as-is");
-        let long: Vec<u8> = (0..100).collect();
-        let shaped = bounded_bytes_debug(&long);
-        assert!(shaped.starts_with('['), "still Debug-shaped: {shaped}");
-        assert!(
-            shaped.contains("(+36 more)"),
-            "long payload truncated with count: {shaped}"
-        );
-        assert!(
-            !shaped.contains("99"),
-            "the tail is dropped so a runaway paste can't blow up the log: {shaped}"
-        );
+    fn capture_input_json(f: impl FnOnce()) -> String {
+        let dir = crate::test_support::TempDir::socket();
+        let path = dir.path().join("input.log");
+        let file = File::create(&path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(Mutex::new(file))
+            .with_max_level(tracing::Level::TRACE)
+            .event_format(InputJsonFormat::default())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        fs::read_to_string(path).unwrap()
     }
 
     #[test]
-    fn raw_input_event_parsed_is_debug_with_bounded_bytes() {
-        let out = capture_logs(|| raw_input_event_parsed(&[0x1b, 0x5b, 0x41], "Key(Up, empty)"));
-        assert!(out.contains("event=\"raw_input.parsed\""), "{out}");
-        assert!(out.contains("subsystem=\"raw_input\""), "{out}");
-        assert!(out.contains("raw_bytes=\"[27, 91, 65]\""), "{out}");
-        assert!(out.contains("parsed=\"Key(Up, empty)\""), "{out}");
+    fn written_input_json_has_canonical_shape() {
+        let out = capture_input_json(|| {
+            let _ = crate::raw_input::parse_raw_input_bytes_sync(
+                b"a\x1b[A\x1b[15~\x1b[200~secret\x1b[201~\x1b[I\x1b[<4;2;3M",
+            );
+            raw_input_waiting_utf8_continuation(1);
+            raw_input_waiting_escaped_utf8_continuation(2);
+        });
+        let records: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let inputs: Vec<_> = records
+            .iter()
+            .filter(|r| r["event"] == "raw_input.parsed")
+            .collect();
+        assert_eq!(inputs.len(), 6, "{out}");
+        assert_eq!(inputs[0]["key_class"], "character");
+        assert_eq!(inputs[0]["modifiers"], serde_json::json!({}));
+        assert_eq!(inputs[1]["named_key"], "up");
+        assert_eq!(inputs[2]["function_key"], 5);
+        assert_eq!(inputs[3]["input_class"], "paste");
+        assert_eq!(inputs[3]["input_len"], 18);
+        assert_eq!(inputs[4]["input_class"], "focus");
+        assert_eq!(inputs[5]["input_class"], "mouse");
+        assert_eq!(inputs[5]["modifiers"], serde_json::json!({"shift":true}));
+        for (index, record) in inputs.iter().enumerate() {
+            assert!(record.get("input_len").is_some());
+            assert!(record.get("input_metadata").is_none());
+            if index >= 3 {
+                assert!(record.get("key_class").is_none());
+            }
+            if index != 1 {
+                assert!(record.get("named_key").is_none());
+            }
+            if index != 2 {
+                assert!(record.get("function_key").is_none());
+            }
+            assert!(!record.as_object().unwrap().values().any(|v| v.is_null()));
+        }
+        for record in records.iter().filter(|r| r["event"] == "raw_input.wait") {
+            assert!(record.get("input_len").is_some());
+            assert!(record.get("bytes").is_none());
+        }
+    }
+
+    #[test]
+    fn typed_input_canary_never_reaches_logs() {
+        let canary = "PaneSecret1698🦩";
+        let out = capture_input_json(|| {
+            let mut framer = crate::raw_input::RawInputFramer::default();
+            for character in canary.chars() {
+                let mut bytes = [0; 4];
+                let text = character.encode_utf8(&mut bytes);
+                // Splitting the scalar also exercises pending UTF-8 handling.
+                for byte in text.bytes() {
+                    for event in framer.push(&[byte]) {
+                        if let crate::raw_input::RawInputEvent::Key(key) = event {
+                            let event = crossterm::event::KeyEvent::new(key.code, key.modifiers);
+                            terminal_key_empty_encoding(&event);
+                            terminal_key_intercept_action(&event, "ToggleFloat");
+                            terminal_key_intercept_command(&event, "edit config");
+                            terminal_key_page_intercept(&event.code, 3);
+                            terminal_key_modifier_only_dropped(&event);
+                            terminal_key_forward_ambiguous(&event, "legacy", text.len());
+                        }
+                    }
+                    assert!(framer.flush_timeout().is_empty());
+                }
+            }
+            let paste = format!("\x1b[200~{canary}\x1b[201~");
+            assert!(matches!(framer.push(paste.as_bytes()).as_slice(),
+                [crate::raw_input::RawInputEvent::Paste(text)] if text == canary));
+        });
+        assert!(
+            out.contains("raw_input.parsed"),
+            "input path must emit logs"
+        );
+        for expected in [
+            "action",
+            "command",
+            "page_scroll",
+            "modifier_only",
+            "ambiguous",
+            "empty",
+        ] {
+            assert!(
+                out.contains(&format!("\"outcome\":\"{expected}\"")),
+                "missing wrapper: {expected}"
+            );
+        }
+        assert_private_input_json(&out, canary);
+    }
+
+    fn assert_private_input_json(out: &str, canary: &str) {
+        for line in out.lines() {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            for field in [
+                "raw_bytes",
+                "parsed",
+                "bytes",
+                "key",
+                "code",
+                "sequence",
+                "encoded",
+                "input_metadata",
+            ] {
+                assert!(
+                    record.get(field).is_none(),
+                    "legacy input field {field} escaped into telemetry"
+                );
+            }
+            assert!(
+                !line.contains(canary),
+                "paste content escaped into telemetry"
+            );
+            assert!(
+                !line.contains("🦩"),
+                "typed character escaped into telemetry"
+            );
+            assert!(
+                !line.contains("Char("),
+                "character debug escaped into telemetry"
+            );
+        }
+    }
+
+    #[test]
+    fn drained_input_canary_never_reaches_logs() {
+        let canary = "DrainSecret1965🦩";
+        let out = capture_input_json(|| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(canary.len() + 32);
+            let mut buffer = format!("{canary}\x1b[200~{canary}\x1b[201~").into_bytes();
+            crate::raw_input::drain_buffer(&mut buffer, &tx);
+            assert!(buffer.is_empty());
+            for character in canary.chars() {
+                assert!(
+                    matches!(rx.try_recv().unwrap(), crate::raw_input::RawInputEvent::Key(key)
+                    if key.code == crossterm::event::KeyCode::Char(character))
+                );
+            }
+            assert!(
+                matches!(rx.try_recv().unwrap(), crate::raw_input::RawInputEvent::Paste(text) if text == canary)
+            );
+            assert!(rx.try_recv().is_err());
+        });
+        assert!(out.contains("raw_input.parsed"));
+        assert_private_input_json(&out, canary);
+    }
+
+    #[test]
+    fn input_json_keeps_default_envelope_order() {
+        let out = capture_input_json(|| {
+            tracing::info!(event = "format.reference", "reference formatter");
+            let _ = crate::raw_input::parse_raw_input_bytes_sync(b"x");
+        });
+        assert_eq!(out.lines().count(), 2);
+        for line in out.lines() {
+            assert!(line.starts_with("{\"timestamp\":"), "{line}");
+            assert!(
+                line.find("\"level\":").unwrap() < line.find("\"event\":").unwrap(),
+                "{line}"
+            );
+            assert!(
+                line.find("\"message\":").unwrap() < line.find("\"target\":").unwrap(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_input_diagnostics_survive_report_redaction() {
+        let out = capture_input_json(|| {
+            structured_worker_shutdown_failed(&crate::structured::workers::ShutdownError(vec![(
+                "worker-example".into(),
+                crate::api::error_code::ErrorCode::SessionBusy,
+            )]));
+            self_compact_armed("pane-example", 11);
+            self_compact_continued("pane-example", 12);
+            self_compact_completed("pane-example", 13);
+            client_clipboard_image_staged(1, 14, "image-example.png");
+            handoff_recorded("file-example", "png", 15);
+            let _ = crate::raw_input::parse_raw_input_bytes_sync(b"s");
+        });
+        let records = crate::report::redact::extract(
+            &out,
+            "fixture.log",
+            &crate::report::redact::Scrubber::new(None, None),
+        );
+        assert_eq!(records.len(), 7);
+        assert!(records[0]
+            .fields
+            .contains(&("failure_code".into(), "session_busy".into())));
+        for (record, count) in records[1..6].iter().zip(11..=15) {
+            assert!(
+                record
+                    .fields
+                    .contains(&("byte_count".into(), count.to_string())),
+                "{record:?}"
+            );
+        }
+        for record in records {
+            for (name, _) in record.fields {
+                assert!(![
+                    "bytes",
+                    "code",
+                    "input_len",
+                    "input_class",
+                    "key_class",
+                    "modifiers",
+                    "raw_bytes",
+                    "parsed",
+                    "key",
+                    "sequence",
+                    "encoded"
+                ]
+                .contains(&name.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_input_event_parsed_is_debug_with_typed_metadata() {
+        let out = capture_logs(|| {
+            let _ = crate::raw_input::parse_raw_input_bytes_sync(b"\x1b[A");
+        });
+        assert!(out.contains("raw_input.parsed"), "{out}");
+        assert!(out.contains("input_len"), "{out}");
+        assert!(out.contains("named_key"), "{out}");
+        assert!(!out.contains("raw_bytes"), "{out}");
+        assert!(!out.contains("parsed="), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
     }
 
@@ -5816,22 +6232,28 @@ mod tests {
     }
 
     #[test]
-    fn raw_input_flushing_lone_escape_is_warn_with_bytes() {
-        let out = capture_logs(|| raw_input_flushing_lone_escape(&[0x1b]));
+    fn raw_input_flushing_lone_escape_is_warn_with_length() {
+        let out = capture_logs(|| raw_input_flushing_lone_escape(1));
         assert!(out.contains("event=\"raw_input.flush\""), "{out}");
         assert!(out.contains("outcome=\"lone_escape\""), "{out}");
-        assert!(out.contains("bytes=\"[27]\""), "{out}");
+        assert!(out.contains("input_len=1"), "{out}");
         assert!(out.contains("WARN"), "lone-escape must WARN: {out}");
+        assert!(
+            out.contains(
+                "if this follows an alt chord or focus switch it may reach the pane as plain esc"
+            ),
+            "{out}"
+        );
     }
 
     #[test]
     fn raw_input_waiting_events_are_trace() {
-        let utf8 = capture_logs(|| raw_input_waiting_utf8_continuation(&[0xc3]));
+        let utf8 = capture_logs(|| raw_input_waiting_utf8_continuation(1));
         assert!(utf8.contains("event=\"raw_input.wait\""), "{utf8}");
         assert!(utf8.contains("outcome=\"utf8_continuation\""), "{utf8}");
         assert!(utf8.contains("TRACE"), "{utf8}");
 
-        let esc = capture_logs(|| raw_input_waiting_escaped_utf8_continuation(&[0x1b, 0xc3]));
+        let esc = capture_logs(|| raw_input_waiting_escaped_utf8_continuation(2));
         assert!(
             esc.contains("outcome=\"escaped_utf8_continuation\""),
             "{esc}"
@@ -5841,19 +6263,19 @@ mod tests {
 
     #[test]
     fn raw_input_dropping_incomplete_buffer_is_debug() {
-        let out = capture_logs(|| raw_input_dropping_incomplete_buffer(&[0xff, 0xfe]));
+        let out = capture_logs(|| raw_input_dropping_incomplete_buffer(2));
         assert!(out.contains("event=\"raw_input.drop\""), "{out}");
         assert!(out.contains("outcome=\"incomplete\""), "{out}");
-        assert!(out.contains("bytes=\"[255, 254]\""), "{out}");
+        assert!(out.contains("input_len=2"), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
     }
 
     #[test]
-    fn raw_input_unsupported_escape_is_debug_with_sequence() {
-        let out = capture_logs(|| raw_input_unsupported_escape("\x1b[?9999z"));
+    fn raw_input_unsupported_escape_is_debug_with_length() {
+        let out = capture_logs(|| raw_input_unsupported_escape(9));
         assert!(out.contains("event=\"raw_input.drop\""), "{out}");
         assert!(out.contains("outcome=\"unsupported_escape\""), "{out}");
-        assert!(out.contains("sequence="), "{out}");
+        assert!(out.contains("input_len=9"), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
     }
 
@@ -5901,18 +6323,16 @@ mod tests {
     }
 
     #[test]
-    fn shape_key_event_covers_all_four_fields() {
-        let ev = crossterm::event::KeyEvent::new_with_kind_and_state(
-            crossterm::event::KeyCode::Char('a'),
+    fn shape_key_event_discards_character_and_state() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('🦩'),
             crossterm::event::KeyModifiers::CONTROL,
-            crossterm::event::KeyEventKind::Press,
-            crossterm::event::KeyEventState::empty(),
         );
-        let shaped = shape_key_event(&ev);
-        assert!(shaped.contains("code="), "{shaped}");
-        assert!(shaped.contains("modifiers="), "{shaped}");
-        assert!(shaped.contains("kind="), "{shaped}");
-        assert!(shaped.contains("state="), "{shaped}");
+        let shaped = serde_json::to_value(shape_key_event(&ev)).unwrap();
+        assert_eq!(
+            shaped,
+            serde_json::json!({"input_class":"key", "key_class":"character", "modifiers":{"control":true}})
+        );
     }
 
     #[test]
@@ -5925,7 +6345,7 @@ mod tests {
         assert!(a.contains("event=\"terminal_key.intercept\""), "{a}");
         assert!(a.contains("outcome=\"action\""), "{a}");
         assert!(a.contains("action=\"ToggleFloat\""), "{a}");
-        assert!(a.contains("code="), "{a}");
+        assert!(a.contains("key_class"), "{a}");
         assert!(a.contains("DEBUG"), "{a}");
 
         let c = capture_logs(|| terminal_key_intercept_command(&ev, "edit config"));
@@ -5940,7 +6360,7 @@ mod tests {
             capture_logs(|| terminal_key_page_intercept(&crossterm::event::KeyCode::PageUp, 24));
         assert!(out.contains("event=\"terminal_key.intercept\""), "{out}");
         assert!(out.contains("outcome=\"page_scroll\""), "{out}");
-        assert!(out.contains("code=\"PageUp\""), "{out}");
+        assert!(out.contains("page_up"), "{out}");
         assert!(out.contains("lines=24"), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
     }
@@ -5958,16 +6378,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_key_forward_ambiguous_debug_with_protocol_and_encoded() {
+    fn terminal_key_forward_ambiguous_debug_with_protocol_and_length() {
         let ev = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Esc,
             crossterm::event::KeyModifiers::empty(),
         );
-        let out = capture_logs(|| terminal_key_forward_ambiguous(&ev, "Legacy", &[0x1b]));
+        let out = capture_logs(|| terminal_key_forward_ambiguous(&ev, "Legacy", 1));
         assert!(out.contains("event=\"terminal_key.forward\""), "{out}");
         assert!(out.contains("outcome=\"ambiguous\""), "{out}");
         assert!(out.contains("protocol=\"Legacy\""), "{out}");
-        assert!(out.contains("encoded=\"[27]\""), "{out}");
+        assert!(out.contains("input_len=1"), "{out}");
         assert!(out.contains("DEBUG"), "{out}");
     }
 
