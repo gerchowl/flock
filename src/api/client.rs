@@ -44,6 +44,7 @@ impl ConnectionTarget {
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     target: ConnectionTarget,
+    credential: Option<std::sync::Arc<crate::structured::lease::LeaseCredential>>,
 }
 
 impl ApiClient {
@@ -52,7 +53,21 @@ impl ApiClient {
     }
 
     pub fn for_target(target: ConnectionTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            credential: None,
+        }
+    }
+
+    /// Immutable session transport, reused by calls, probes and channel reconnects.
+    pub(crate) fn scoped(
+        path: PathBuf,
+        credential: crate::structured::lease::LeaseCredential,
+    ) -> Self {
+        Self {
+            target: ConnectionTarget::SocketPath(path),
+            credential: Some(std::sync::Arc::new(credential)),
+        }
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -73,7 +88,7 @@ impl ApiClient {
             return Ok(refusal);
         }
         let mut stream = self.connect()?;
-        write_request(&mut stream, request)?;
+        write_request(&mut stream, request, self.credential.as_deref())?;
 
         let mut reader = BufReader::new(stream);
         let mut response = read_json_line(&mut reader)?;
@@ -208,7 +223,8 @@ impl ApiClient {
         stream
             .set_read_timeout(Some(remaining))
             .map_err(|err| Attempt::BeforeSend(err.into()))?;
-        write_request(&mut stream, request).map_err(Attempt::AfterSend)?;
+        write_request(&mut stream, request, self.credential.as_deref())
+            .map_err(Attempt::AfterSend)?;
         after_write();
         let mut response =
             read_json_line_until(&stream, deadline, Instant::now).map_err(Attempt::AfterSend)?;
@@ -250,7 +266,7 @@ impl ApiClient {
             ));
         }
         let mut stream = self.connect()?;
-        write_request(&mut stream, request)?;
+        write_request(&mut stream, request, self.credential.as_deref())?;
         if let Some(timeout) = read_timeout {
             stream.set_read_timeout(Some(timeout))?;
         }
@@ -421,8 +437,24 @@ impl From<serde_json::Error> for ApiClientError {
     }
 }
 
-fn write_request(stream: &mut UnixStream, request: &Request) -> Result<(), ApiClientError> {
-    stream.write_all(serde_json::to_string(request)?.as_bytes())?;
+fn write_request(
+    stream: &mut UnixStream,
+    request: &Request,
+    credential: Option<&crate::structured::lease::LeaseCredential>,
+) -> Result<(), ApiClientError> {
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        request: &'a Request,
+        credential: &'a crate::structured::lease::LeaseCredential,
+    }
+    let wire = match credential {
+        Some(credential) => serde_json::to_vec(&Envelope {
+            request,
+            credential,
+        })?,
+        None => serde_json::to_vec(request)?,
+    };
+    stream.write_all(&wire)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())

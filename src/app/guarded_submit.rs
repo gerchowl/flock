@@ -32,6 +32,7 @@ const CLEAR_SLACK: usize = 8;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Attempt {
+    scope: Option<crate::api::scoped::Scope>,
     pub(crate) evidence: crate::api::schema::DeliveryAttempt,
     pub(crate) text: String,
     cursor: Box<str>,
@@ -842,6 +843,11 @@ impl App {
             ),
         };
         Ok(Attempt {
+            scope: if wake {
+                None
+            } else {
+                self.current_api_scope.clone()
+            },
             evidence,
             text: text.to_owned(),
             cursor: terminal.turn_cursor().into_boxed_str(),
@@ -870,6 +876,17 @@ impl App {
         attempt: &mut Attempt,
         now: Instant,
     ) -> Option<Outcome> {
+        if attempt
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.caller() == crate::structured::lease::Caller::Uncertain)
+        {
+            return Some(self.conclude_guarded_attempt(
+                pane,
+                attempt,
+                &Outcome::Abandoned("caller_gone"),
+            ));
+        }
         let outcome = match attempt.stash.as_ref().map(|stash| stash.phase) {
             Some(StashPhase::Restoring { outcome, .. }) => {
                 self.advance_draft_restore(pane, attempt, outcome, now)
@@ -1293,7 +1310,7 @@ impl App {
                 .send(crate::events::AppEvent::AgentSubmit {
                     request_id,
                     pane_id,
-                    attempt,
+                    attempt: Box::new(attempt),
                     respond_to,
                 })
                 .await;
@@ -1486,6 +1503,7 @@ impl Attempt {
 impl Attempt {
     pub(crate) fn test_new() -> Self {
         Self {
+            scope: None,
             evidence: new_evidence("test-attempt".into(), "test-pane", false, Vec::new()),
             text: String::new(),
             cursor: "1:0:0:0:i".into(),
@@ -1509,6 +1527,26 @@ impl Attempt {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scoped_parked_submit_rechecks_before_any_later_step() {
+        let (_leases, lease, scope, _) = crate::api::scoped::tests::live_scope();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        let mut attempt = Attempt::test_new();
+        attempt.scope = Some(scope);
+        drop(lease);
+        assert_eq!(
+            app.advance_guarded_submit("test-pane", &mut attempt, Instant::now()),
+            Some(Outcome::Abandoned("caller_gone"))
+        );
+    }
 
     // The idempotence guard hides duplicate calls from the event stream. Count
     // invocations so App-level lifecycle tests can enforce a single finalizer.
