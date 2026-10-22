@@ -12,9 +12,12 @@ The first data message is a generated `hello` frame containing a client token.
 The core opens the store once off the async executor, then verifies current
 private token storage using S2a's bounded blocking-I/O budget. Unproven hellos
 never take the exclusive management/cleanup lock. An absolute five-second
-deadline covers receipt, verification and the successful `welcome` write. Missing, malformed, unsafe, removed or incorrect
-credentials fail closed with 4401. Close delivery is best effort within the
-failure ceiling; an unusable transport can end without a delivered close frame.
+deadline covers receipt, verification and the successful `welcome` write.
+Missing, malformed, removed or incorrect credentials fail closed with 4401.
+Initial hello verification closes with 1001 for a missing store worker, a
+deadline miss, store I/O failure or unsafe storage. The client retains its token
+and reconnects, without gaining admission. Close delivery is best effort within
+the failure ceiling; an unusable transport can end without a delivered close frame.
 Credentials, raw frames and their parse errors do not enter diagnostics.
 
 `welcome` carries the wire version, server version, verified opaque principal,
@@ -59,8 +62,8 @@ has been written, within the existing write/liveness bound. The primitive closes
 all registered sockets for that principal, leaving other principals alone.
 A verified socket registers before welcome and rechecks current token storage
 after registration; revocation in that gap closes 4403 without welcome. A
-post-registration store failure or handshake deadline instead closes 1001,
-keeping the credential eligible for reconnect. A failed welcome send drops the
+store failure or handshake deadline, during either verification, instead closes 1001,
+keeping the credential eligible for reconnect. A failed welcome encode or send drops the
 transport without another send or an auth close. Neither failure proves token
 revocation (ADR-0036 §5a). No
 filesystem watcher or automatic command-time revocation route is added

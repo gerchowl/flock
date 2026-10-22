@@ -24,6 +24,20 @@ describe("auth refusal → NeedsToken from every state with a socket", () => {
 });
 
 describe("transient handshake loss retains credentials", () => {
+  test("hello store unavailability retains the token until a later welcome", () => {
+    const h = new Harness();
+    REACH["Hello"]?.(h);
+    h.step(step({ step: "expect_connect", within_ms: 10_000 }));
+    h.net.current().serverClose(1001, "store unavailable");
+    expect(h.connection.state).toBe("Reconnecting");
+    h.step(step({ step: "expect_connect", not_before_ms: 250, within_ms: 500 }));
+    h.net.current().open();
+    expect(h.connection.state).toBe("Hello");
+    expect(JSON.parse(h.net.frames.at(-1)?.text ?? "null").token).toBe("fixture-token");
+    expect(h.connection.error).not.toContain("token refused");
+    h.net.current().deliver(WELCOME);
+    expect(h.connection.state).toBe("Live");
+  });
   for (const code of [1001, 1006]) {
     test(`Hello + close ${code} reconnects with the same token`, () => {
       const h = new Harness();

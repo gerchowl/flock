@@ -95,7 +95,7 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
                 <p class="phone__headline" data-testid="inbox-headline">
                   {headline()}
                 </p>
-                <InboxCards cards={props.inbox} source={props.source} />
+                <InboxCards cards={props.inbox} source={props.source} sender={props.sender} />
               </Match>
               <Match when={tab() === "agents"}>
                 <h1 class="phone__title">Agents</h1>

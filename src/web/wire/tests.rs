@@ -321,7 +321,7 @@ fn hello_deadline_is_absolute_and_releases_an_unauthenticated_slot() {
         server.clock.advance(HANDSHAKE_DEADLINE_MS);
         assert!(matches!(
             client.receive().await,
-            Received::Close(AUTH_REFUSED_CLOSE) | Received::End
+            Received::Close(GOING_AWAY_CLOSE)
         ));
         let permit = within(
             server
@@ -756,7 +756,7 @@ fn authentication_work_cannot_extend_the_original_hello_deadline() {
         server.clock.deadline_count(5_000, 2).await; server.clock.advance(5_000);
         let result = client.receive().await;
         release.send(()).unwrap(); within(blocker).await.unwrap();
-        assert!(matches!(result, Received::Close(AUTH_REFUSED_CLOSE) | Received::End));
+        assert!(matches!(result, Received::Close(GOING_AWAY_CLOSE)));
         server.finish().await;
     });
 }
@@ -1055,6 +1055,131 @@ fn failed_welcome_send_does_not_attempt_a_revocation_close() {
             matches!(sink.pending, Some(Message::Text(_))),
             "failed send must drop the transport, without another send attempt"
         );
+        assert!(received.try_recv().is_err());
+    });
+}
+
+#[test]
+fn hello_store_io_and_unsafe_failures_preserve_credentials() {
+    runtime(async {
+        for unsafe_mode in [true, false] {
+            let server = Server::new().await;
+            let dir = server._root.path().join("client-tokens");
+            let saved = server._root.path().join("saved-tokens");
+            if unsafe_mode {
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            } else {
+                fs::rename(&dir, &saved).unwrap();
+            }
+            let error = server
+                .core
+                .shared
+                .store
+                .authenticate(&Bearer("a".repeat(64)))
+                .err()
+                .unwrap();
+            assert!(matches!(
+                (&error, unsafe_mode),
+                (TokenError::Unsafe, true) | (TokenError::Io(_), false)
+            ));
+            let mut client = Socket::open(&server).await;
+            client.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
+            let result = client.receive().await;
+            if unsafe_mode {
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            } else {
+                fs::rename(&saved, &dir).unwrap();
+            }
+            assert!(
+                matches!(result, Received::Close(GOING_AWAY_CLOSE)),
+                "{error:?}: {result:?}"
+            );
+            assert!(server
+                .core
+                .shared
+                .store
+                .authenticate(&Bearer("a".repeat(64)))
+                .is_ok());
+            server.finish().await;
+        }
+    });
+}
+
+#[test]
+fn hello_unavailable_store_worker_is_not_an_auth_refusal() {
+    runtime(async {
+        let server = Server::new().await;
+        let mut tasks = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..4 {
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            releases.push(release);
+            tasks.push(tokio::spawn(async move {
+                super::super::store_io::shared()
+                    .run(move || {
+                        ready.send(()).unwrap();
+                        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                    })
+                    .await
+            }));
+            within(started).await.unwrap();
+        }
+        assert!(super::super::store_io::shared().run(|| ()).await.is_none());
+        let mut client = Socket::open(&server).await;
+        client.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"a".repeat(64)})).await;
+        let result = client.receive().await;
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for task in tasks {
+            assert!(within(task).await.unwrap().is_some());
+        }
+        assert!(
+            matches!(result, Received::Close(GOING_AWAY_CLOSE)),
+            "{result:?}"
+        );
+        assert!(server
+            .core
+            .shared
+            .store
+            .authenticate(&Bearer("a".repeat(64)))
+            .is_ok());
+        server.finish().await;
+    });
+}
+
+#[test]
+fn failed_welcome_encode_drops_without_any_close_send() {
+    runtime(async {
+        let clock = TestClock::new();
+        let (mut sink, _release, mut started, mut received, _) = gated_sink();
+        let (_stop, mut stopped) = watch::channel(false);
+        let (_revoke, mut revoked) = watch::channel(false);
+        let welcome = ServerFrame::Welcome {
+            protocol: WIRE_JSON_VERSION,
+            server_version: "x".repeat(MAX_MESSAGE),
+            capabilities: vec![],
+            principal: "fixture-principal".into(),
+            server_epoch: "fixture-epoch".into(),
+            idempotency_window_ms: IDEMPOTENCY_WINDOW_MS,
+        };
+        assert!(
+            !within(finish_welcome(
+                &mut sink,
+                &clock,
+                clock.now() + Duration::from_millis(HANDSHAKE_DEADLINE_MS),
+                async { Ok(()) },
+                welcome,
+                (&mut stopped, &mut revoked),
+            ))
+            .await
+        );
+        assert!(
+            sink.pending.is_none(),
+            "encoding failure must never send a close"
+        );
+        assert!(started.try_recv().is_err());
         assert!(received.try_recv().is_err());
     });
 }
