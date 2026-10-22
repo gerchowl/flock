@@ -227,6 +227,13 @@
   color: var(--muted);
 }
 
+.card__stale {
+  margin: 0.25rem 0;
+  font-size: 0.8rem;
+  font-style: italic;
+  opacity: 0.8;
+}
+
 .card__title {
   margin: 0.25rem 0;
   font-size: 1rem;

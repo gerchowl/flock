@@ -71,6 +71,8 @@ impl Case {
             generation,
             leases: leases.clone(),
             state: fixture.root.path().to_owned(),
+            storage: Default::default(),
+            mcp: fixture.mcp(),
             stall_after: STALL,
             lineage: None,
         };
@@ -835,4 +837,190 @@ fn drop_after_failed_shutdown_does_not_wait_a_second_time() {
     worker.join().unwrap();
     dropper.join().unwrap();
     result.expect("Drop must not repeat the full teardown after its deadline");
+}
+
+#[tokio::test]
+async fn registry_worker_launch_uses_configured_blob_threshold() {
+    let (mut registry, mut workers, notify, now) = owner();
+    let config: crate::config::Config =
+        toml::from_str("[sessions]\nblob_min_bytes = 64\n").unwrap();
+    let block = json!({"type":"thinking", "thinking":"x".repeat(256)});
+    let bytes = serde_json::to_vec(&block).unwrap();
+    assert!(bytes.len() > config.sessions.blob_min_bytes);
+    assert!(bytes.len() < 2048);
+    let message = json!({"type":"assistant", "message":{"role":"assistant", "content":[block]}});
+    let (mut case, mut launch, factory) = Case::prepare(
+        &mut registry,
+        1919,
+        "worker-exit-ok",
+        vec![message, event("result")],
+    );
+    launch.storage = config.sessions;
+    case.generation = workers.start(&mut registry, launch, factory).unwrap();
+    case.ready(&mut registry, &mut workers, &notify, now).await;
+    case.submit(&workers);
+    wait(&notify, || {
+        workers.poll(&mut registry, now, 1000);
+        workers.report(&case.id, case.generation).is_some()
+    })
+    .await;
+    let report = workers.report(&case.id, case.generation).unwrap();
+    assert_eq!(report.result.as_ref().unwrap().outcome, Outcome::Exited);
+    assert!(!report.authority_retained);
+    assert!(workers.entries[&case.id].thread.is_none());
+    let stream = fs::read_to_string(
+        case.fixture
+            .root
+            .path()
+            .join("sessions")
+            .join(&case.id)
+            .join(format!("{}.jsonl", case.session)),
+    )
+    .unwrap();
+    let stored = stream
+        .lines()
+        .map(|line| {
+            let envelope: Value = serde_json::from_str(line).unwrap();
+            serde_json::from_str::<Value>(envelope["raw"].as_str().unwrap()).unwrap()
+        })
+        .find(|value| value["type"] == "assistant")
+        .expect("worker persisted assistant");
+    let reference: crate::structured::blobs::BlobRef =
+        serde_json::from_value(stored["message"]["content"][0].clone())
+            .expect("configured threshold must project this block");
+    let store = crate::structured::blobs::BlobStore::open(case.fixture.root.path()).unwrap();
+    assert_eq!(reference.size, bytes.len() as u64);
+    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), block);
+}
+
+#[tokio::test]
+async fn registry_stream_owner_preserves_history_without_competing_with_state_sink() {
+    use crate::structured::history::Item;
+    let (mut registry, mut workers, notify, now) = owner();
+    let case = Case::start(
+        &mut registry,
+        &mut workers,
+        91,
+        "state-reducer",
+        vec![event("command_lifecycle"), event("control_request")],
+    );
+    case.human(&mut registry, &mut workers, &notify, now).await;
+    let history = workers
+        .history(&registry, &case.id)
+        .expect("registry runtime owns publication")
+        .clone();
+    let mut cut = history.subscribe(None).unwrap();
+    let mut open = false;
+    let replay_deadline = Instant::now() + LIMIT;
+    loop {
+        assert!(
+            Instant::now() < replay_deadline,
+            "owned replay must reach the barrier"
+        );
+        match cut.page().unwrap() {
+            Item::Record(record) => {
+                let value: Value = serde_json::from_str(&record.raw).unwrap();
+                open |= value["type"] == "flk_permission_request" && value["state"] == "open";
+            }
+            Item::Synced(_) => break,
+            Item::Pending | Item::Progress => {}
+            item => panic!("{item:?}"),
+        }
+    }
+    assert!(open);
+    assert!(!registry
+        .get(&case.id)
+        .unwrap()
+        .1
+        .update
+        .needs_human
+        .is_empty());
+    assert!(workers.stop(&case.id, case.generation));
+    case.finish(
+        &mut registry,
+        &mut workers,
+        &notify,
+        now,
+        Some(Outcome::Stopped),
+    )
+    .await;
+    assert!(workers.runtime(&case.id, case.generation).is_none());
+    let history = workers
+        .history(&registry, &case.id)
+        .expect("history outlives runtime");
+    let mut cut = history.subscribe(None).unwrap();
+    let mut closed = false;
+    let deadline = Instant::now() + LIMIT;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "stopped stream must terminate or fail visibly"
+        );
+        match cut.page() {
+            Ok(Item::Record(record)) => {
+                let value: Value = serde_json::from_str(&record.raw).unwrap();
+                closed |= value["type"] == "flk_permission_request" && value["state"] == "closed";
+            }
+            Ok(Item::End) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    assert!(
+        closed,
+        "cancelled notifications cannot erase durable permission closes"
+    );
+    assert!(registry
+        .get(&case.id)
+        .unwrap()
+        .1
+        .update
+        .needs_human
+        .is_empty());
+    let mut cold = Registry::restore(vec![registry.get(&case.id).unwrap().0.clone()]).unwrap();
+    let generation = cold.get(&case.id).unwrap().2;
+    let mut cold_owner = Workers::new(Arc::new(Notify::new()));
+    assert!(cold_owner.runtime(&case.id, generation).is_none());
+    let path = case
+        .fixture
+        .root
+        .path()
+        .join("sessions")
+        .join(&case.id)
+        .join(format!("{}.jsonl", case.session));
+    let retained = crate::structured::history::History::open_retained(&path).unwrap();
+    let mut other = cold.get(&case.id).unwrap().0.clone();
+    other.agent_id = "other-history-agent".into();
+    other.session_id = "other-history-session".into();
+    other.name = None;
+    let other_generation = cold.register(other).unwrap();
+    assert_eq!(
+        cold_owner.install_retained(
+            &cold,
+            "other-history-agent",
+            other_generation,
+            retained.clone()
+        ),
+        Err(ErrorCode::AgentNotFound)
+    );
+
+    assert_eq!(
+        cold_owner.install_retained(&cold, &case.id, generation + 1, retained.clone()),
+        Err(ErrorCode::AgentNotFound)
+    );
+    cold_owner
+        .install_retained(&cold, &case.id, generation, retained.clone())
+        .unwrap();
+    assert_eq!(
+        cold_owner.install_retained(&cold, &case.id, generation, retained),
+        Err(ErrorCode::SessionBusy)
+    );
+    let mut restored = cold_owner
+        .history(&cold, &case.id)
+        .unwrap()
+        .subscribe(None)
+        .unwrap();
+    assert!(matches!(restored.page().unwrap(), Item::Record(_)));
+    registry.remove(&case.id, case.generation).unwrap();
+    assert!(workers.history(&registry, &case.id).is_none());
 }
