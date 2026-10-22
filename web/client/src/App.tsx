@@ -31,7 +31,7 @@ import { captureCode, type CodePage } from "./capture-code";
 import { EXCHANGE_FAILED, RUN_CLIENT_OPEN, createTokenStore, exchangeCode, type ExchangeRequest, type SessionLike } from "./wire/token";
 import { createWireTransport } from "./wire/transport";
 import { ConnectionBar } from "./workbench/ConnectionBar";
-import type { Sender } from "./workbench/Composer";
+import { createWireSender } from "./workbench/sender";
 import { SAMPLE_INBOX } from "./workbench/inbox";
 import { SAMPLE_AGENTS } from "./workbench/samples";
 import { Workbench } from "./workbench/Workbench";
@@ -108,12 +108,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   onCleanup(connection.onChange(refresh));
   const [revision, setRevision] = createSignal(0);
   onCleanup(connection.onChange(() => setRevision(revision() + 1)));
-  const sender: Sender = {
-    commands: () => (revision(), connection.commands()),
-    // `submit` sends the message, not only types it (`AgentSendParams`; S7a's agent-send script).
-    send: (agent, text, echoAfter) => connection.command("agent.send", { target: agent, text, submit: true }, undefined, echoAfter),
-    blocked: () => (revision(), connection.principal === null ? "Sending opens once the server has welcomed this client." : null),
-  };
+  const sender = createWireSender(connection, revision);
   onCleanup(connection.onTransition((state) => state === "NeedsToken" && tokens.clear()));
   let disposed = false;
   onCleanup(() => {

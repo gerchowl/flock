@@ -23,8 +23,8 @@ export type InboxCard = {
   readonly choices: readonly string[];
   /** Whether the agent is blocked on this card. Blocking cards sort first. */
   readonly blocking: boolean;
-  /** What answering waits for, shown beside the disabled choices. */
-  readonly waitsFor: string;
+  /** What answering waits for, shown beside a sample card's disabled choices; live permission cards answer for real. */
+  readonly waitsFor?: string;
   /** A permission card's server `request_seq`, verbatim, for PR 2's decide; absent on samples and pending cards. */
   readonly requestSeq?: number;
   /** The agent's stream had a history gap that nothing has followed yet: the card may be out of date. */

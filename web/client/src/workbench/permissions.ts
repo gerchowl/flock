@@ -24,7 +24,10 @@
  * history `gap` marks that agent's cards stale until its next entry, `synced`
  * or `reset`. The next entry is the signal the transport guarantees: the wire
  * transport passes on only the first `synced` of a stream, so a gap after a
- * re-subscribe gets none, but the replay's entries follow the gap. A notice
+ * re-subscribe gets none, and the transport cannot tell when a replay ends.
+ * Stale therefore clears on the first entry after the gap, not at the replay's
+ * end; the server's `request_seq` check is the backstop, refusing an answer to
+ * a request that changed meanwhile, and the card shows that refusal. A notice
  * for a record no listed id owns expires on the next `synced` or `reset`.
  *
  * One subscription per agent with listed ids, opened when its first id is
@@ -69,7 +72,6 @@ type Tracked = {
 };
 
 const CHOICES = ["Allow once", "Always allow", "Deny"] as const;
-const WAITS_FOR = "#1749 PR 2 (answering prompts)";
 
 /** The live permission inbox over `transport`. */
 export type PermissionInbox = {
@@ -97,7 +99,6 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
     agentLabel: tracked.label,
     choices: CHOICES,
     blocking: true,
-    waitsFor: WAITS_FOR,
     ...(tracked.stale ? { stale: true as const } : {}),
   });
 
@@ -136,8 +137,7 @@ export function createPermissionInbox(transport: Transport): PermissionInbox {
       detail: `Unusable permission record: ${problem}`,
       choices: [],
       blocking: false,
-      waitsFor: WAITS_FOR,
-    },
+      },
   });
 
   const publish = (): void => {
