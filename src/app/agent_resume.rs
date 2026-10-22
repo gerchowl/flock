@@ -748,7 +748,9 @@ mod tests {
         app.state.active = Some(0);
         app.state.ensure_test_terminals();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.set_agent_name("retry-agent".into());
+        terminal
+            .set_agent_name("retry-agent".into())
+            .expect("the retry fixture uses a valid agent name");
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),
