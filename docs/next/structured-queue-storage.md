@@ -124,11 +124,19 @@ that refuse open.
 The ADR-0036 §4 owner decisions in #1820 and #1922 separate three cases:
 
 1. **Unknown data are forward compatibility.** Unknown kinds are logged and
-   skipped when folding state; their cursors, raw replay and original bytes are
-   retained. Known records with unknown top-level fields or enum names retain
-   their known projection and queue position for inspection, as before. Unknown
+   skipped when folding state; their cursors, parsed replay values and original
+   file bytes are retained. Known records with unknown top-level fields or enum
+   names retain their known projection and queue position for inspection, as before. Unknown
    enum names remain `Unknown(raw)`; uninterpreted items cannot be scheduled.
-   This preserves positions for later known updates/removals without executing
+   Here `raw` is a parsed `serde_json::Value`, not an exact byte representation:
+   serialization normalizes whitespace and escapes, and object keys come back
+   sorted without `preserve_order`. Original complete records keep their exact
+   bytes because unknown data prevent checkpoint replacement, as required by
+   [#1820](https://github.com/gerchowl/flock/issues/1820) and
+   [#1922](https://github.com/gerchowl/flock/issues/1922) under ADR-0028 §3a and
+   ADR-0036 §4. This preserves JSON meaning in memory without risking a
+   normalized rewrite of unknown on-disk semantics. The retained projections
+   preserve positions for later known updates/removals without executing
    unknown semantics. A same-version journal remains writable for known inputs
    (unknown contents imply a hand-edit or writer bug), while its existing
    checkpoint protection prevents discarding raw state. Once its worker requires

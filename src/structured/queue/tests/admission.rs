@@ -1248,6 +1248,36 @@ fn batch_entropy_failure_keeps_the_journal_and_items_unchanged() {
                 count as usize,
                 "normal entropy recovers without poisoning"
             );
+            let records = q.journal().replay(through).unwrap().records;
+            if leading_invalid {
+                let invalid = q
+                    .journal()
+                    .items()
+                    .iter()
+                    .find(|i| i.item_id == id(9))
+                    .unwrap();
+                assert_eq!(invalid.state, State::Failed);
+                assert_eq!(
+                    invalid.metadata["refusal"],
+                    ErrorCode::InvalidRequest.as_str()
+                );
+                assert_eq!(
+                    records,
+                    vec![json!({
+                        "seq":through + 1, "kind":"fail", "item_id":id(9),
+                        "reason":ErrorCode::InvalidRequest.as_str(),
+                    })]
+                );
+            } else {
+                assert!(records.is_empty());
+            }
+            let recovered_through = q.journal().replay(0).unwrap().through;
+            assert_eq!(q.batch(100).unwrap().unwrap().items.len(), count as usize);
+            assert_eq!(
+                q.journal().replay(0).unwrap().through,
+                recovered_through,
+                "formation must not fail the same item twice"
+            );
         }
     }
 }
