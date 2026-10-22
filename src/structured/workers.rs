@@ -41,6 +41,8 @@ pub struct Launch {
     pub leases: SessionLeases,
     /// Durable stream/supervision directory.
     pub state: PathBuf,
+    /// Caller-supplied `[sessions]` storage policy, captured for this launch.
+    pub storage: super::blobs::StorageConfig,
     /// Pinned flock executable and owning server socket for this session.
     pub mcp: SessionMcp,
     /// Caller-supplied sessions stall policy, with no guessed default.
@@ -149,6 +151,7 @@ impl Workers {
             generation: current,
             leases,
             state,
+            storage,
             mcp,
             stall_after,
             lineage,
@@ -170,9 +173,15 @@ impl Workers {
             .filter(|(_, _, g)| *g == current)
             .map(|(r, _, _)| r.clone())
             .ok_or(ErrorCode::AgentNotFound)?;
-        let generation = registry
-            .begin_launch(&agent_id, current)
-            .map_err(|_| ErrorCode::AgentStartFailed)?;
+        let generation =
+            registry
+                .begin_launch(&agent_id, current)
+                .map_err(|error| match error {
+                    super::registry::RegistryError::RecoveryRequired => {
+                        ErrorCode::StructuredRecoveryRequired
+                    }
+                    _ => ErrorCode::AgentStartFailed,
+                })?;
         let (tx, messages) = mpsc::sync_channel(2);
         let stop = StopRequest::default();
         let cancelled = stop.clone();
@@ -211,7 +220,7 @@ impl Workers {
                     let profile = prepare().map_err(|error| (error.code(), error.to_string()))?;
                     let location = StreamLocation {
                         data_dir: state.clone(),
-                        storage: Default::default(),
+                        storage,
                         agent: record.agent_id.clone(),
                         session: record.session_id.clone(),
                     };

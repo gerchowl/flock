@@ -2220,7 +2220,7 @@ fn tear_down(target: &Cleanup, force: bool, close_parent: bool) -> Result<TearDo
                 };
                 crate::worktree::run_worktree_command(&command).map_err(|message| ServerError {
                     code: "worktree_prune_failed".to_string(),
-                    message,
+                    message: message.into(),
                 })?;
             }
         }

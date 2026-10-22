@@ -484,7 +484,7 @@ mod tests {
             .attached_terminal_id
             .clone();
         let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
-        terminal.set_agent_name(name.to_string());
+        terminal.set_agent_name(name.to_string()).unwrap();
         terminal.agent_id.to_string()
     }
 
