@@ -457,7 +457,9 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+    use crossterm::event::{
+        KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::layout::Rect;
 
     use super::super::{
@@ -872,6 +874,24 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn modified_click_on_unsafe_osc8_link_shows_nonfatal_notice() {
+        let (mut app, info) = app_with_screen_bytes(b"\x1b]8;;-a\x1b\\label\x1b]8;;\x1b\\");
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: info.inner_rect.x + 1,
+            row: info.inner_rect.y,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        app.handle_mouse(event);
+        let toast = app.state.toast.as_ref().expect("operator notice");
+        assert_eq!(toast.title, "link blocked");
+        assert_eq!(toast.context, "link cannot begin with an option");
+        assert_eq!(toast.kind, crate::app::state::ToastKind::NeedsAttention);
+        assert!(app.toast_deadline.is_some());
+        assert!(!app.state.should_quit);
     }
 
     #[tokio::test]

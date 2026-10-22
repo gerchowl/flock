@@ -322,12 +322,18 @@ fn host_terminal_is_held() -> bool {
 /// True once this leg has written a host window title (#361), i.e. flock owns
 /// the terminal's title and owes it back on the way out.
 ///
-/// Set by the FIRST [`ServerMessage::SetWindowTitle`](protocol::ServerMessage)
-/// this leg receives, never at setup: a server with `[title] enabled = false`
+/// Set by the first locally permitted
+/// [`ServerMessage::SetWindowTitle`](protocol::ServerMessage), never at setup:
+/// a server with `[title] enabled = false`
 /// sends nothing, so a leg attached to it leaves the host title completely
 /// untouched — nothing pushed, nothing to restore, no empty write blanking a
 /// title flock never set.
 static HOST_WINDOW_TITLE_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// Local client veto, loaded before terminal ownership and refreshed with the
+/// existing client config reload. Also gates panic/held-terminal restoration,
+/// which can run outside the client loop and must not bypass local policy.
+static HOST_WINDOW_TITLE_ALLOWED: AtomicBool = AtomicBool::new(true);
 
 /// Writes `title` to the host terminal's window, taking ownership of the title
 /// on the first call.
@@ -338,6 +344,9 @@ static HOST_WINDOW_TITLE_OWNED: AtomicBool = AtomicBool::new(false);
 /// pushed and deliberately did not pop, so pushing again would grow the host's
 /// title stack once per switch, without bound.
 fn set_host_window_title(title: &str) {
+    if !HOST_WINDOW_TITLE_ALLOWED.load(Ordering::Acquire) {
+        return;
+    }
     let first_publish = !HOST_WINDOW_TITLE_OWNED.swap(true, Ordering::AcqRel);
     let inherited_hold = INHERITED_TERMINAL_HOLD.load(Ordering::Acquire);
     let _ = crate::terminal_notify::write_host_sequence(&host_window_title_sequence(
@@ -365,7 +374,9 @@ fn host_window_title_sequence(title: &str, first_publish: bool, inherited_hold: 
 /// frame and the title: restoring here would flash the shell's title between
 /// legs and drop the stack entry the next leg's exit is going to pop.
 fn restore_host_window_title() {
-    if !HOST_WINDOW_TITLE_OWNED.swap(false, Ordering::AcqRel) {
+    if !HOST_WINDOW_TITLE_OWNED.swap(false, Ordering::AcqRel)
+        || !HOST_WINDOW_TITLE_ALLOWED.load(Ordering::Acquire)
+    {
         return;
     }
     let _ = crate::terminal_notify::write_host_sequence(
@@ -1899,9 +1910,9 @@ fn run_client_with_mode(
     // still held — ctrl-c/signal, error return, or the `std::process::exit`
     // paths below that skip TerminalGuard::drop (#69). Disarmed only when this
     // leg hands the held terminal off to a real next leg.
-    let held_restore = HeldRestoreGuard::new();
-
     let loaded_config = crate::config::Config::load();
+    HOST_WINDOW_TITLE_ALLOWED.store(loaded_config.config.title.enabled, Ordering::Release);
+    let held_restore = HeldRestoreGuard::new();
     // Whether, and how, this leg redials a dropped transport (#436).
     let reconnect_plan = remote_reconnect_plan(
         &loaded_config.config,
@@ -2143,7 +2154,9 @@ async fn run_client_loop(
     };
     // `ui.file_drop` gate (#79): whether a dropped local file is ferried to the
     // server. Read once per attach leg (cheap; file-drops are rare).
-    let file_drop_mode = crate::config::Config::load().config.ui.file_drop;
+    let local_config = crate::config::Config::load().config;
+    HOST_WINDOW_TITLE_ALLOWED.store(local_config.title.enabled, Ordering::Release);
+    let file_drop_mode = local_config.ui.file_drop;
     // One-shot guard for the first-paint trace event so subsequent frames are
     // a single cheap bool check.
     let mut first_paint_logged = false;
@@ -2730,8 +2743,8 @@ async fn run_client_loop(
                     ServerMessage::SetWindowTitle { title } => {
                         // Already debounced and deduped server-side, and
                         // already dropped by the slot router above if it came
-                        // from a slot that is no longer active — so anything
-                        // reaching here is a title this terminal should wear.
+                        // from a slot that is no longer active. The local
+                        // client still has its own veto at the output boundary.
                         set_host_window_title(&title);
                     }
                     ServerMessage::Clipboard { data } => {
@@ -4060,6 +4073,7 @@ fn reload_local_client_config(
             for diagnostic in loaded.config.ui.sound.diagnostics() {
                 crate::logging::client_config_sound_diagnostic(&diagnostic.to_string());
             }
+            HOST_WINDOW_TITLE_ALLOWED.store(loaded.config.title.enabled, Ordering::Release);
             *sound_config = loaded.config.ui.sound;
             *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
             debug!("reloaded local client config");
@@ -4577,6 +4591,56 @@ mod tests {
     }
 
     #[test]
+    fn server_identity1076_protocol_32_client_handles_protocol_31_refusal() {
+        let (_lock, _scrub) = crate::config::test_config_env_guard();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let hello: ClientMessage = protocol::read_message(&mut server, MAX_FRAME_SIZE).unwrap();
+            assert!(matches!(hello, ClientMessage::Hello { version: 32, .. }));
+            protocol::write_message(
+                &mut server,
+                &ServerMessage::Welcome {
+                    version: 31,
+                    encoding: RenderEncoding::SemanticFrame,
+                    error: Some("incompatible protocol".into()),
+                },
+            )
+            .unwrap();
+        });
+        let error = do_handshake(
+            &mut client,
+            80,
+            24,
+            0,
+            0,
+            RenderEncoding::SemanticFrame,
+            false,
+            None,
+            None,
+        )
+        .unwrap_err();
+        worker.join().unwrap();
+        assert!(matches!(
+            &error,
+            ClientError::HandshakeRejected { version: 31, .. }
+        ));
+        let error = AttachAttemptError::Handshake(error);
+        let mut retry = HandoffRetry::default();
+        assert!(
+            !retry.should_retry(&error, Duration::ZERO),
+            "skew cannot start a handoff"
+        );
+        assert!(retry.should_retry(&refusal_handshake_error(), Duration::ZERO));
+        assert!(
+            retry.should_retry(&error, Duration::ZERO),
+            "old-server refusal stays recoverable during handoff"
+        );
+    }
+
+    #[test]
     fn live_handoff_refusals_are_recognized_in_both_phases() {
         assert!(refusal_session_error().is_live_handoff_refusal());
         assert!(refusal_handshake_error().is_live_handoff_refusal());
@@ -4899,6 +4963,7 @@ mod tests {
         let fleet = protocol::FleetSnapshot {
             origin: "hopper".to_string(),
             peers: vec![protocol::FleetPeer {
+                node_id: None,
                 name: "kiln".to_string(),
                 ssh_target: "operator@kiln".to_string(),
                 host: Some("kiln".to_string()),
@@ -6632,3 +6697,7 @@ mod tests {
         mark_terminal_owned(false);
     }
 }
+
+#[cfg(test)]
+#[path = "title_tests.rs"]
+mod title_tests;

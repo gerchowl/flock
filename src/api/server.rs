@@ -263,7 +263,7 @@ pub(crate) fn handle_connection(
 
     let (request, credential) = match super::scoped::decode(line) {
         Ok(request) => request,
-        Err(()) => {
+        Err(detail) => {
             write_json_line_allow_disconnect(
                 &mut stream,
                 &ErrorResponse {
@@ -271,7 +271,10 @@ pub(crate) fn handle_connection(
                     error: ErrorBody {
                         data: None,
                         code: "invalid_request".into(),
-                        message: "invalid request".into(),
+                        message: detail.map_or_else(
+                            || "invalid request".into(),
+                            |error| format!("invalid request: {error}"),
+                        ),
                     },
                 },
             )?;
