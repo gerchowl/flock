@@ -127,7 +127,7 @@ fn scoped_socket_rejects_missing_and_wrong_credentials_before_a_fast_path() {
             _=>serde_json::json!({"request":{"id":"scope","method":"ping","params":{"unexpected":secret}},"credential":secret,"extra":true}),
         };
         let policy = app.runtime_config.uid_policy.clone();
-        let task=std::thread::spawn(move || crate::api::server::handle_connection(server,&tx,&EventHub::default(),&Arc::new(AtomicBool::new(true)),None,&Mutex::default(),&policy).unwrap());
+        let task=std::thread::spawn(move || crate::api::server::handle_connection(server,&tx,&EventHub::default(),&Arc::new(AtomicBool::new(true)),None,&Mutex::default(),&crate::api::client_listener::Health::default(),&policy).unwrap());
         writeln!(client,"{payload}").unwrap();
         if mode!="malformed" {
             let msg=tokio::time::timeout(Duration::from_secs(5),app.api_rx.recv()).await.unwrap().unwrap();
