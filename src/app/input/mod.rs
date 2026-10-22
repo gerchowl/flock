@@ -364,6 +364,20 @@ impl App {
         self.last_pane_click = None;
         if let Err(err) = crate::platform::open_url(&url) {
             crate::logging::pane_open_url_failed(&url, &err.to_string());
+            let previous_toast = self.state.toast.clone();
+            self.state.toast = Some(crate::app::state::ToastNotification {
+                kind: crate::app::state::ToastKind::NeedsAttention,
+                title: if matches!(&err, crate::platform::OpenUrlError::Refused(_)) {
+                    "link blocked"
+                } else {
+                    "link not opened"
+                }
+                .into(),
+                context: err.to_string(),
+                position: None,
+                target: None,
+            });
+            self.sync_toast_deadline(previous_toast);
         }
         true
     }
