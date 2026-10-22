@@ -1002,6 +1002,26 @@ back-to-back turns. For a structured agent there is no polling at all:
 
 ### 4. Storage
 
+Owner amendment (#1820): each queue identity header declares a journal format
+version. Missing stamps mean version 1. Append/checkpoint require a journal
+version no greater than the writer's supported version, and checkpoint writes
+the writer's own version before any new-format append. Bump for every new kind,
+top-level field or enum name. Newer journals load read-only with persistence
+leniency (ADR-0028 §3a), preserving raw bytes without repair or rewriting.
+Every mutation returns typed `queue_journal_newer { found, supported }`;
+queue status exposes the refusal, which requires a compatible writer and must
+never be retried in a loop. Opaque checkpoint passthrough is forbidden because
+an older writer cannot preserve unknown records' interleaving semantics.
+Owner clarification (#1820): unknown kinds/fields/enum names follow lenient
+recovery, with raw bytes preserved and unknown semantics never delivered.
+Malformed known records in supported formats load read-only as
+`queue_journal_corrupt { seq, offset, reason }`: stop folding, refuse every
+mutation/checkpoint and preserve the whole file. Operator recovery is outside
+this slice. A crash-torn final line keeps the existing truncation/sync path;
+it is not corruption. Neither read-only mode permits tail repair.
+The fsync-temp, rename, fsync-directory rule below is unchanged.
+
+
 - **Per-agent session stream.** Every stdout line of a structured agent is
   appended, with a per-stream `seq` and a receive timestamp, to
   `<data dir>/sessions/<agent>/<session>.jsonl`. This is the lossless copy;
