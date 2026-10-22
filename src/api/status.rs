@@ -57,6 +57,7 @@ pub fn read_runtime_status_at(
             session_health,
             api_listener,
             agent_account_diagnostic,
+            ..
         } => Ok(Some(RuntimeStatus {
             version: Some(version),
             protocol: Some(protocol),
