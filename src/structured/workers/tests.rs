@@ -839,6 +839,30 @@ fn drop_after_failed_shutdown_does_not_wait_a_second_time() {
     result.expect("Drop must not repeat the full teardown after its deadline");
 }
 
+#[test]
+fn restored_unknown_refuses_before_profile_preparation_and_preserves_epoch() {
+    let mut registry = Registry::default();
+    let mut workers = Workers::new(Arc::new(Notify::new()));
+    let (case, launch, _) = Case::prepare(&mut registry, 901, "state-reducer", vec![]);
+    registry.restore_handoff_unknown(std::slice::from_ref(&case.id));
+    let (_, projection, generation) = registry.get(&case.id).unwrap();
+    let before = format!("{:?}", projection.update);
+    let error = workers
+        .start(&mut registry, launch, |_| {
+            panic!("Unknown must refuse before preparation")
+        })
+        .unwrap_err();
+    assert_eq!(
+        error,
+        crate::api::error_code::ErrorCode::StructuredRecoveryRequired
+    );
+    let (_, after, epoch) = registry.get(&case.id).unwrap();
+    assert_eq!(epoch, generation);
+    assert_eq!(format!("{:?}", after.update), before);
+    assert!(workers.runtime(&case.id, epoch).is_none());
+    assert!(!case.leases.is_reserved(&case.session).unwrap());
+}
+
 #[tokio::test]
 async fn registry_worker_launch_uses_configured_blob_threshold() {
     let (mut registry, mut workers, notify, now) = owner();

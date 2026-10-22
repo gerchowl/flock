@@ -137,6 +137,7 @@ impl App {
             id,
             ResponseResult::AgentList {
                 agents,
+                structured_agents: self.structured_infos(),
                 // #320: the same call answers "who is here" and "who can I
                 // reach". A separate fleet verb would have been a second
                 // listing to keep in step with this one.
@@ -146,6 +147,26 @@ impl App {
     }
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
+        match self.structured_target(&target.target) {
+            Ok(Some((agent_id, _))) => {
+                return encode_success(
+                    id,
+                    ResponseResult::StructuredAgentInfo {
+                        agent: self
+                            .structured_info(&agent_id)
+                            .expect("resolved registered record"),
+                    },
+                )
+            }
+            Err(code) => {
+                return encode_error(
+                    id,
+                    code.as_str(),
+                    "target is ambiguous across runtimes; use an agent id",
+                )
+            }
+            Ok(None) => {}
+        }
         // This read supplies conservative bulk self-exclusion (#1010), not
         // authority: even an unproven pane must not hibernate itself mid-loop.
         if target.target == "self" {
