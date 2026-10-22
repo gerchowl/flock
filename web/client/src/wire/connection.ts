@@ -361,11 +361,11 @@ export class WireConnection {
    *   principal that queued it, so none can be queued before a first
    *   `welcome`.
    */
-  command(verb: string, args: JsonValue, cmdId?: string, echoAfter?: number | null): string {
+  command(verb: string, args: JsonValue, cmdId?: string, echoAfter?: number): string {
     const principal = this.principal;
     if (principal === null) throw new Error("no principal yet: connect once before sending commands");
     const id = cmdId ?? this.#options.newCommandId?.() ?? uuidv7(this.#options.clock.wallNow());
-    this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending", ...(echoAfter == null ? {} : { echo_after: echoAfter }) });
+    this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending", ...(echoAfter === undefined ? {} : { echo_after: echoAfter }) });
     this.#flush();
     return id;
   }

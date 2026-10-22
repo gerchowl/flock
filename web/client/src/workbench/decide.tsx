@@ -8,14 +8,21 @@
  * closed record or when the id is delisted (ADR-0038 §1), and until then it
  * says it was answered. A typed refusal is shown in plain words and never
  * retried; the buttons stay disabled for that `request_seq`, and a new open
- * record, with a new seq, enables them again. One decision is in flight per
- * request. "Always allow" is a standing grant, so it takes one inline confirm,
+ * record, with a new seq, enables them again only after the person clicks
+ * "Review new request" (below). One decision is in flight per request. "Always allow" is a standing grant, so it takes one inline confirm,
  * and every decision is bound to the `request_id` and `request_seq` the person
  * was shown: each button carries the values it was rendered with, and the
  * command sends exactly those, never the card's current ones. When a request's
  * seq changes, the card enters "Request changed — review it": every button
  * (and an open confirm) stays disabled until the person acknowledges with
  * "Review new request", and only then do the buttons bind to the new seq.
+ * The same holds for a request id that closes and comes back: the inbox remembers
+ * closed ids for the view (`InboxCards`), and a returning id starts unacknowledged.
+ * The server does not promise ids stay unique forever: it rejects an id that is
+ * still open or in its last 1024 closed handles, but "reusing an evicted harness ID
+ * is safe because its new sequence cannot match an old decision", and a new
+ * transport starts a new book (`src/structured/permissions.rs` lines 3-4, 11-14,
+ * `observe`). The bound-decide invariant therefore does not rest on id uniqueness.
  * A card whose agent stream has a history gap is stale: its buttons wait for the
  * resync (ADR-0038 §1).
  *
@@ -116,12 +123,15 @@ export type DecideUi = {
   readonly error: Signal<Raised | null>;
 };
 
-/** Creates one card's {@link DecideUi}. */
-export function createDecideUi(): DecideUi {
+/**
+ * Creates one card's {@link DecideUi}. A `reopened` card is one whose request id closed earlier in
+ * this view: it starts bound to nothing it shows, so it is "Request changed" until reviewed.
+ */
+export function createDecideUi(reopened = false): DecideUi {
   return {
     message: createSignal(""),
     confirming: createSignal<Target | null>(null),
-    bound: createSignal<Target | null>(null),
+    bound: createSignal<Target | null>(reopened ? UNBOUND : null),
     attempts: createSignal(0),
     error: createSignal<Raised | null>(null),
   };

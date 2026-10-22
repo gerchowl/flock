@@ -109,6 +109,24 @@ describe("answering a prompt", () => {
     expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
   });
 
+  test("a request id that closes and reopens needs the review step before any button enables", () => {
+    const app = prompt();
+    app.close("atlas", "r1");
+    expect(cards(app.root)).toHaveLength(0);
+    // The server may reuse an id once it is outside its retained-closed window (permissions.rs).
+    app.event("atlas", "r1", "Bash", { command: "rm -rf build" }, 50);
+    expect(cards(app.root)).toHaveLength(1);
+    expect(status(app)).toBe("Request changed — review it.");
+    for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(0);
+    button(app, "Review new request").click();
+    expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(1);
+    expect(cmds(app)[0]?.args).toMatchObject({ request_id: "r1", request_seq: 50 });
+  });
+
   test("a caught send error covers the status only until the status changes", () => {
     const app = prompt();
     const connection = app.h.connection as unknown as { command: (...args: unknown[]) => string };

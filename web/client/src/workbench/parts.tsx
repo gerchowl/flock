@@ -58,18 +58,25 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
         : "Sample cards: the live inbox arrives with G5 (#1597).";
   // A card is rebuilt on every record, so what the person typed lives here, by request.
   const uis = new Map<string, DecideUi>();
+  // Request ids that closed during this view. The server may reuse an id once it falls out of its
+  // retained-closed window, so a card that comes back under one starts unacknowledged.
+  const closed = new Set<string>();
   const uiFor = (card: InboxCard): DecideUi => {
     const key = `${card.agent}\u0000${card.id}`;
     const found = uis.get(key);
     if (found !== undefined) return found;
-    const fresh = createDecideUi();
+    const fresh = createDecideUi(closed.has(key));
     uis.set(key, fresh);
     return fresh;
   };
   // No state leaks: an entry goes when its request closes or is delisted.
   createEffect(() => {
     const live = new Set(props.cards.map((card) => `${card.agent}\u0000${card.id}`));
-    for (const key of [...uis.keys()]) if (!live.has(key)) uis.delete(key);
+    for (const key of [...uis.keys()])
+      if (!live.has(key)) {
+        uis.delete(key);
+        closed.add(key);
+      }
   });
   return (
     <>
