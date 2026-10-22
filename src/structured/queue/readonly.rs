@@ -29,8 +29,9 @@ pub struct QueueJournalCorrupt {
     /// Cursor of the bad record when readable, or the last recovered cursor
     /// when unknown data block a required checkpoint.
     pub seq: Option<u64>,
-    /// Byte offset of the first bad record, incomplete snapshot or required
-    /// checkpoint boundary when unknown data prevent rewriting.
+    /// Byte offset of the first bad record or incomplete snapshot. When unknown
+    /// data prevent rewriting, this is the file length at refusal, including any
+    /// torn suffix; it is not necessarily a record boundary.
     pub offset: u64,
     /// Stable diagnostic identifier, never an untrusted payload or parser message.
     pub reason: &'static str,
