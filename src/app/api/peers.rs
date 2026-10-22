@@ -75,14 +75,7 @@ impl App {
             |kind| kind.as_str().to_string(),
         );
 
-        let git_refresh = Some(project_poller_health(
-            &self.git_refresh_health,
-            now,
-            stale_after,
-            broken_mult,
-            self.git_refresh_health.in_flight_since,
-            |kind| kind.as_str().to_string(),
-        ));
+        let git_refresh = Some(self.git_refresh_health_at(now, stale_after, broken_mult));
 
         // A `[checks] enable = false` server has no runner tick to have
         // health for; report `None` rather than a permanent Broken row that
@@ -120,6 +113,52 @@ impl App {
             checks_runner,
             peer_poll,
         }
+    }
+
+    /// Project cached scheduling facts only. Inactivity is not a failed round.
+    fn git_refresh_health_at(
+        &self,
+        now: std::time::Instant,
+        stale_after: u64,
+        broken_mult: u64,
+    ) -> crate::api::schema::PollerHealth {
+        use crate::api::schema::PollerReason;
+        let health = &self.git_refresh_health;
+        let mut row = project_poller_health(
+            health,
+            now,
+            stale_after,
+            broken_mult,
+            health.in_flight_since,
+            |kind| kind.as_str().to_owned(),
+        );
+        if health
+            .in_flight_age_secs(now)
+            .is_some_and(|age| age >= crate::health::GIT_REFRESH_MAX_ROUND_SECS)
+        {
+            row.status = "broken".into();
+            row.last_error = Some(crate::health::GitRefreshErrorKind::Stalled.as_str().into());
+            return row;
+        }
+        if health.in_flight_since.is_none() {
+            row.reason = if !self.state.app_client_attached {
+                Some(PollerReason::NoViewer)
+            } else if self.state.workspaces.is_empty() {
+                Some(PollerReason::NoWorkspaces)
+            } else {
+                self.git_refresh_idle
+            };
+            if row.reason.is_some() {
+                row.status = "idle".into();
+                return row;
+            }
+        }
+        // Age alone diagnoses missing freshness, never an invented failure.
+        if row.last_error.is_none() && row.status != "ok" {
+            row.status = "degraded".into();
+            row.reason = Some(PollerReason::AwaitingRefresh);
+        }
+        row
     }
 
     /// One-hop relay payload: THIS server's own polled peers as
@@ -421,6 +460,7 @@ fn project_poller_health<E: Copy + Eq>(
         .to_string();
     crate::api::schema::PollerHealth {
         status,
+        reason: None,
         last_success_age_secs: health.last_success_age_secs(now),
         consecutive_failures: health.consecutive_failures,
         in_flight: in_flight_since_override.is_some(),
