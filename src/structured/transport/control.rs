@@ -4,7 +4,7 @@ use permissions::{CloseReason, Closing};
 
 #[derive(Default)]
 struct Admission {
-    open: Option<Value>,
+    open: Option<crate::structured_wire::PermissionRecord>,
     answer: Option<permissions::Answer>,
     refusal: Option<permissions::Answer>,
 }
@@ -74,8 +74,8 @@ impl<'a> Recorder<'a> {
             self.storage,
         )
     }
-    fn audit(&mut self, value: &Value) -> io::Result<Received> {
-        let mut raw = encode(value)?;
+    fn audit(&mut self, value: &impl Serialize) -> io::Result<Received> {
+        let mut raw = encode(&serde_json::to_value(value)?)?;
         raw.pop();
         self.record(&raw, raw.len() as u64, true, None, None)
     }
@@ -247,13 +247,8 @@ impl<'a> Recorder<'a> {
         let grant_request_id = admission
             .answer
             .as_ref()
-            .and_then(|answer| answer.audit.get("grant_request_id"))
-            .and_then(Value::as_str);
-        let request_seq = admission
-            .open
-            .as_ref()
-            .and_then(|audit| audit.get("request_seq"))
-            .and_then(Value::as_u64);
+            .and_then(|answer| answer.audit.grant_request_id());
+        let request_seq = admission.open.as_ref().map(|audit| audit.request_seq);
         let raw = self.record(line, count, false, grant_request_id, request_seq)?;
         // Persist open before publishing raw: cancellation at either notification
         // must still leave an open record for the terminal close to match.

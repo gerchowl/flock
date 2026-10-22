@@ -2827,3 +2827,75 @@ fn disconnected_acceptance_observer_requests_stop_without_admitting_bytes() {
     assert!(handle.cancel.load(Ordering::Acquire));
     assert!(!handle.input_inflight());
 }
+
+#[test]
+fn stored_permission_pair_replays_as_known_events() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    permission(&mut output, "typed-request");
+    receive(&transport);
+    receive(&transport);
+    let seq = permission_handle(&transport, "typed-request");
+    call_decide(
+        &transport,
+        &owner(),
+        &decide("typed-request", permissions::Decision::Deny, seq),
+    )
+    .unwrap();
+    receive(&transport);
+    single_permission_response(&transport, &mut input);
+    let audits: Vec<_> = records(&root)
+        .into_iter()
+        .filter(|record| {
+            serde_json::from_str::<Value>(&record.raw).unwrap()["type"] == "flk_permission_request"
+        })
+        .collect();
+    assert_eq!(audits.len(), 2);
+    let examples: Vec<Value> =
+        include_str!("../../../web/client/test/fixtures/wire/permission-decision.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter_map(|line| line.get("frame").and_then(|frame| frame.get("ev")).cloned())
+            .collect();
+    assert_eq!(examples.len(), 2);
+    for (record, example) in audits.into_iter().zip(examples) {
+        assert_eq!(
+            serde_json::from_str::<Value>(&record.raw).unwrap(),
+            example,
+            "producer/fixture drift"
+        );
+        assert_eq!(
+            record.raw,
+            serde_json::to_string(&example).unwrap(),
+            "wire byte drift"
+        );
+        let event = SessionEvent::parse(&record.raw, "fixture");
+        assert!(
+            !matches!(event, SessionEvent::Unknown { .. }),
+            "permission audit must be known: {}",
+            record.raw
+        );
+        let known: crate::structured::claude::KnownSessionEvent =
+            serde_json::from_str(&record.raw).unwrap();
+        assert_eq!(
+            serde_json::to_value(known).unwrap(),
+            serde_json::from_str::<Value>(&record.raw).unwrap()
+        );
+        let received = Received {
+            record,
+            event,
+            persisted: true,
+            accepted: None,
+        };
+        if example["state"] == "closed" {
+            assert!(matches!(
+                received.state_input(),
+                Some(crate::structured::state::Input::ControlAnswered(
+                    "typed-request"
+                ))
+            ));
+        } else {
+            assert!(received.state_input().is_none());
+        }
+    }
+}
