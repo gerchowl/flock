@@ -14,6 +14,11 @@ agent: string,
  */
 request_id: string,
 /**
+ * Required flk-issued handle from the open record, carried unchanged by S7
+ * slice 5. JSON number, exact in JavaScript below 2^53 like stream cursors.
+ */
+request_seq: number,
+/**
  * Permission choice admitted by S6-MVP.
  */
 decision: PermissionDecision,
