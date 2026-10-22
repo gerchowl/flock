@@ -1023,3 +1023,26 @@ Remove these settings and callers:
 - The `forward_limit` and `peer_not_configured` routing refusals: known owners route through the mesh or queue while offline; unknown owners without a stored hint are refused as unknown.
 
 Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown keys with file and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
+
+
+### Structured session read/control contracts
+
+`agent.list` adds `structured_agents` (defaulting to `[]` when absent in an older
+response) alongside unchanged PTY `agents` and `fleet`. Each structured entry has
+`runtime: "structured"`, `agent_id`, `name`, `harness`, `lifecycle`, presentation
+`status`, canonical `state`, `session_id`, `cwd`, `model`, and `lease_state`.
+`name` and `model` can be null. `view` is omitted when no attached view exists;
+there are no fabricated `pane_id`, `terminal_id`, workspace or tab fields.
+`lease_state` is `absent`, `reserved`, `bound`, or `uncertain`; this is binding
+evidence, not proof of process liveness or caller authority.
+
+`agent.get` and `agent.status` accept `{"target":"<agent id or unique name>"}`.
+For structured targets the response type is `structured_agent_info`, containing
+`agent`. A name shared with a PTY target is `agent_target_ambiguous`; use an id.
+`agent.stop` takes the same target shape and returns the current structured
+record while cancellation and cleanup run asynchronously. It requires operator
+or owning-agent authority. Offline stop is idempotent; Unknown ownership refuses
+with `structured_recovery_required` (retry `after_human`, CLI exit 1).
+Pane-only operations return `runtime_unsupported` (retry `never`, CLI exit 2).
+These contracts do not enable public structured start; that remains gated until
+all #1843 routing and #1734 credential protection land. Mesh VERSION remains 5.
