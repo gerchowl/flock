@@ -491,3 +491,31 @@ fn public_lease_state_reports_binding_without_authority_or_waiting() {
     lease.release();
     assert_eq!(leases.state("agent", "session"), LeaseState::Absent);
 }
+
+#[test]
+fn owner_admission_refuses_contended_lease_snapshot_without_waiting() {
+    let leases = SessionLeases::default();
+    let shared = leases.clone();
+    let (ready, seen) = std::sync::mpsc::sync_channel(1);
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    let holder = std::thread::spawn(move || {
+        let _held = shared.0.lock();
+        ready.send(()).unwrap();
+        // A blocking-lock regression must fail after this ceiling, never hang CI.
+        let _ = wait.recv_timeout(std::time::Duration::from_secs(10));
+    });
+    seen.recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let snapshot = leases.admitted_identities();
+    let workers =
+        crate::structured::workers::Workers::new(std::sync::Arc::new(tokio::sync::Notify::new()));
+    let counted = workers.counts(&leases, "fixture-parent");
+    let released = release.send(());
+    holder.join().unwrap();
+    assert!(snapshot.is_none());
+    assert_eq!(
+        counted,
+        Err(crate::api::error_code::ErrorCode::SpawnCallerUnknown)
+    );
+    released.unwrap();
+}

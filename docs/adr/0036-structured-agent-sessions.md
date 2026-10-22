@@ -554,7 +554,8 @@ omitted until S10. No PTY placement, process id or caller credential is fabricat
 
 `agent.get` and its `agent.status` alias resolve registered identity/name, refusing
 cross-runtime ambiguity. `agent.stop` accepts only a structured target and is
-restricted to the operator or the owning agent. Stop latches cancellation and
+restricted to the operator and the structured agent itself only. PTY callers
+and lineage parents receive no stop authority. Stop latches cancellation and
 returns current facts; it does not promise immediate Offline. Offline stop is
 idempotent. A restored Unknown record refuses launch before epoch advancement or
 profile preparation, and refuses stop without process ownership, with
@@ -1353,7 +1354,7 @@ local use, and its types precede G3 in S7a. No deployment is authorized here.
 | Parameter | Proposed value | Rationale |
 | --- | --- | --- |
 | Connect deadline | 10 s per attempt, from attempt start through name resolution, TCP/TLS and HTTP upgrade | Bounds a black-holed route without waiting for operating-system timeouts; allows mobile connection setup. |
-| Handshake deadline | 5 s from WebSocket open to authenticated `welcome`; server closes if valid `hello` is absent within 5 s | Hello is local validation, not model work. Neither side can hold an unauthenticated socket indefinitely. |
+| Handshake deadline | 5 s from WebSocket open to authenticated `welcome`; server closes 1001 if `hello` is absent within 5 s | Hello is local validation, not model work. Neither side can hold an unauthenticated socket indefinitely. |
 | Handoff deadline | 10 s from handoff request, across producer quiescence, claim settlement, flush and readiness for exclusive transfer | This is local coordination, not model work. Bound a stuck producer or flush without releasing ownership; fail and continue serving from the old owner rather than half-transfer. |
 | Heartbeat interval | 15 s from `welcome`, independent of other traffic | Detects suspended or half-open peers even during long quiet turns; four round trips/minute per connected client. |
 | Liveness window | 45 s | Three heartbeat intervals tolerate brief scheduling delays while bounding stale display and server resource retention. |
@@ -1416,7 +1417,10 @@ capped reconnect) and network loss (reconnect). During initial hello and the
 post-registration recheck, a handshake deadline miss, unavailable token-store
 worker, store I/O failure or unsafe storage closes with **1001**, preserving the
 credential for reconnect. Unsafe storage is not evidence that a bearer is invalid.
-Only an unauthorized or revoked credential justifies **4401** during hello.
+An unauthorized or revoked credential, an explicit authentication-scope
+refusal, or a malformed/tokenless hello justifies **4401** during hello.
+If no initial hello arrives within the handshake deadline, close **1001** and
+retain the token for reconnect; absence alone is not an auth refusal.
 A failed welcome encode or send drops the transport without attempting another
 close send; it cannot establish revocation. Only a credential that no longer authenticates, a changed verified principal,
 or a revocation signal justifies **4403** after registration.
@@ -3177,3 +3181,18 @@ Operator cleanup is explicit: inspect the retained directory and associated
 processes, establish that none still uses it, then remove the directory by hand.
 No automatic PID-only reaping and no cleanup CLI is introduced in this slice;
 operator tooling is a follow-up owned by the architect.
+
+### Amendment: Atomic structured admission (#1843 part 2a)
+
+The Workers owner is the single admission authority for structured launches.
+It checks limits and reserves a pending slot keyed by agent id in one owner
+operation before starting a producer. Counts combine live leases with pending
+slots, deduplicated by agent id. Agent-started launches count toward capacity
+and parent fanout; the attested operator exemption is unchanged. Lease-table
+contention refuses with `spawn_caller_unknown` without waiting on the App thread.
+
+A pending slot ends on lease acquisition or launch failure, never on elapsed
+time alone. Pending metadata grants neither caller identity nor signaling
+rights. Preparation remains off-thread and bounded by its owner. Part 2b adds
+the production CLI/socket caller and its loaded session policy; public client
+and server start remain gated until part 3 completes narrowed MCP admission.

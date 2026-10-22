@@ -981,9 +981,15 @@ impl App {
         err: TerminalTargetError,
     ) -> crate::api::schema::ErrorBody {
         match err {
-            TerminalTargetError::RuntimeUnsupported {target} => crate::api::schema::ErrorBody {
-                data:None,code:crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str().into(),message:format!("agent {target} has no PTY placement; this operation requires a pane"),
-            },
+            TerminalTargetError::RuntimeUnsupported { target } => {
+                crate::api::schema::ErrorBody {
+                    data: None,
+                    code: crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str().into(),
+                    message: format!(
+                        "agent {target} has no PTY placement; this operation requires a pane"
+                    ),
+                }
+            }
             TerminalTargetError::NotFound { target } => crate::api::schema::ErrorBody {
                 data: None,
                 code: "agent_not_found".into(),

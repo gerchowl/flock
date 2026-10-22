@@ -262,3 +262,49 @@ async fn structured_stop_requires_operator_or_owning_lease_identity() {
         "operator_only"
     );
 }
+
+#[tokio::test]
+async fn missing_structured_metadata_is_a_typed_internal_error_not_a_panic() {
+    assert_eq!(
+        app().structured_info("missing").unwrap_err(),
+        ErrorCode::InternalError
+    );
+}
+
+#[test]
+fn stop_authority_excludes_pty_agents_and_lineage_parents() {
+    let pane = crate::workspace::Workspace::test_new("fixture").tabs[0]
+        .layout
+        .pane_ids()[0];
+    let target = "structured-fixture";
+    assert!(!may_stop(
+        SpawnCaller::Agent {
+            ws_idx: 0,
+            pane_id: pane,
+            agent_id: target.into()
+        },
+        target
+    ));
+    assert!(!may_stop(
+        SpawnCaller::Structured {
+            agent_id: Some("parent-agent".into()),
+            depth: 0
+        },
+        target
+    ));
+    assert!(!may_stop(
+        SpawnCaller::Structured {
+            agent_id: None,
+            depth: 0
+        },
+        target
+    ));
+    assert!(may_stop(
+        SpawnCaller::Structured {
+            agent_id: Some(target.into()),
+            depth: 0
+        },
+        target
+    ));
+    assert!(may_stop(SpawnCaller::Operator { pane: None }, target));
+}

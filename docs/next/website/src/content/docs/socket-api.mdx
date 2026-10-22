@@ -1051,7 +1051,7 @@ For structured targets the response type is `structured_agent_info`, containing
 `agent`. A name shared with a PTY target is `agent_target_ambiguous`; use an id.
 `agent.stop` takes the same target shape and returns the current structured
 record while cancellation and cleanup run asynchronously. It requires operator
-or owning-agent authority. Offline stop is idempotent; Unknown ownership refuses
+or structured-self authority. Offline stop is idempotent; Unknown ownership refuses
 with `structured_recovery_required` (retry `after_human`, CLI exit 1).
 Pane-only operations return `runtime_unsupported` (retry `never`, CLI exit 2).
 These contracts do not enable public structured start; that remains gated until
