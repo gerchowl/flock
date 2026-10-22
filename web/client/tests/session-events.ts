@@ -32,8 +32,8 @@ function narrow(event: KnownSessionEvent): void {
   switch (event.type) {
     case "assistant":
       event satisfies Assistant;
-      // @ts-expect-error An assistant has no typed control response payload.
-      event.response.subtype;
+      // Flattened extras must not widen the assistant's absent-only subtype (§6).
+      event.subtype satisfies undefined;
       break;
     case "user": event satisfies import("../src/gen/User").User; break;
     case "command_lifecycle": event satisfies import("../src/gen/CommandLifecycle").CommandLifecycle; break;

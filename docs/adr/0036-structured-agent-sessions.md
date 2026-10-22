@@ -364,6 +364,14 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   token that only the local operator can mint over the unix socket, and the
   `principal` in `welcome` names the token, never the address.
 
+**Scoped session MCP requests (#1734).** Every structured-session MCP API request carries a server-issued credential scoped to one lease reservation generation. The server verifies it against current kernel peer identity and the live bound lease root, and derives only an agent principal. Failed or revoked session authentication never falls back to operator ancestry classification. This applies independently to every connection, queued request and channel attachment; lease/root loss refuses subsequent admission. Already admitted work never acquires operator authority. Parent-change exit is defense in depth. Unscoped arbitrary same-UID programs retain the explicitly cooperative #1177 limitation; dedicated-account policy remains mandatory unless the operator opts out.
+
+Slice A adds the scoped local request envelope and server admission. Slice B of #1734 supplies mandatory generated MCP credentials and immutable transport propagation; public structured starts remain gated until both land. Legacy unscoped CLI/MCP requests retain their existing policy. Credentials are not operator/client tokens and never appear in logs, errors or status. Failed scoped decoding or authentication cannot be retried through legacy dispatch. Revocation precedes cleanup and lease removal; scoped subscriptions close on revoked or unreadable identity. Operations admitted before root loss may finish with agent authority only. The scoped verifier requires a living kernel process, not merely a matching birth time: zombies cannot authorize admission. The local envelope is `{"request": <Request>, "credential": <LeaseCredential>}`; malformed scoped envelopes return `invalid_request`, authentication failures return `not_authorized`, and neither path retries as a legacy request.
+
+Slice B of #1734 provisions each generation credential only in the generated private MCP configuration's child environment (`FLOCK_MCP_LEASE_CREDENTIAL`), alongside an explicit `mcp serve --structured` mode. It never enters Claude's launch environment or process arguments. Before reading stdin, the MCP child captures that mode, the absolute socket endpoint and the credential into immutable client state. Calls, compatibility probes, subscriptions and reconnects use that same state. Missing, malformed or inconsistent configuration fails startup; authentication failure never selects unscoped transport. Ordinary unscoped MCP remains compatible. Public structured starts still require the registry/start slice (#1439).
+
+Scoped verification never waits for the lease registry lock: contention has a typed refusal and no snapshot fallback. Each admission performs at most sixteen kernel process-fact reads, refusing ancestry beyond that budget. This is a bounded supported ancestry depth, not permission to trust partial evidence. Credential comparison uses opaque accumulation (`core::hint::black_box`) to prevent optimizer replacement with an early-exit comparison. Encoded credential length is public format information. Legacy unscoped malformed requests retain serde diagnosis; scoped schema failures keep their fixed, secret-free error. JSON syntax diagnostics contain no field values.
+
 ### 2. Mapping session events onto flk state, questions and waits
 
 A new `StateSource::Session` joins `Screen`, `Hook`, `Plugin`,
@@ -1149,6 +1157,10 @@ server → client
   ack     { cmd_id, ok, result? | error{ code, message, exit, retry } }
 ```
 
+Agent replay preserves the receive-time `known`/`shape` provenance of §5a/§8.
+Legacy records without it produce `provenance_missing` history gaps while later
+records continue. Replay never reclassifies using the current harness version.
+
 **S7-min fleet and permission contracts (#1746).** The `fleet` snapshot stream
 lists structured agents as `FleetAgentRow { id, label, state: AgentState,
 activity?, waiting_on_human: string[] }`. `AgentState` is the shared S4 object,
@@ -1250,6 +1262,11 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   infeasible. Keep the store bounded at 128 live codes and request bodies at
   1024 bytes. Cross-origin and non-loopback requests are refused, and neither
   codes nor tokens enter diagnostic logs.
+  The opener's URL argument is an explicit credential-in-argv exception:
+  `open`/`xdg-open` have no stdin or environment URL channel. The exchange code
+  is visible through `ps` for the opener's lifetime. Single use, the 60-second
+  TTL and fragment-only transport bound this known exposure; process logging
+  masks the code. This exception does not permit long-lived tokens in argv.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location
   (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.
@@ -1351,6 +1368,29 @@ never opened on the current connection is a protocol error, not a closed-ID case
 Protocol errors close with a visible diagnosis and capped reconnect (a server
 upgrade can cure them). A newer client follows §5's ReadOnly capabilities and
 holds commands; it can keep reading and detecting stale transport.
+
+**Session replay provenance (S7-min slice 3, #1829).** New session-store
+`StreamRecord`s add optional `known` (boolean) and `shape` (the original
+`ShapeKey` string). The receive-time adapter sets `known`; unknown events retain
+the original sender's harness/version-scoped `shape`. Known records keep their
+stored blob projection. Readers ignore additive envelope fields under ADR-0028
+§3a. Replay never invokes the current parser to reconstruct classification or
+shape. A legacy record without classification, or an unknown without its shape,
+yields a typed history gap with reason `provenance_missing`; later records still
+replay. It is neither a whole-replay refusal nor an entity snapshot. A missing
+retained prefix uses the same gap path with reason `retained_prefix`.
+
+The registry's runtime stream owner registers bounded continuation and captures
+its durable head under one publication lock. An owned file cut pages through that
+head before exactly one `synced`; subsequent publications cannot fall between
+registration and the barrier. Capture and registration are one operation over
+the locked book; constructing the owned cut afterwards cannot open a hole.
+Replay retains unread page bytes. Runtime-only, source-fenced byte checkpoints
+let a consumer resume its applied cursor after lag without rescanning the prefix;
+they are neither new wire fields nor durable cursor authority. Lag terminates
+unfinished replay on its next page. Terminal permission audits use this same source,
+even when runtime notification delivery is cancelled. Partial deltas consume no
+durable cursor and do not enter this source. The S4 reader remains singular.
 
 **Replay and resync.** Reconnect authenticates again, then sends each seq
 stream's `sub { after:last_applied_seq }`, preserving any unfinished resync
@@ -1512,7 +1552,10 @@ that the existing implementation already enforces these rules.
 scopes on **every cmd**, before claiming an idempotency key, returning a cached
 ack or dispatching a verb; cached hello authorization is insufficient. Serialize
 this authorization/admission boundary with operator revocation, so a command
-cannot be newly admitted after revocation. On detection of a removed/replaced
+cannot be newly admitted after revocation. Each admission or management operation
+explicitly unlocks its owned file description at scope exit, including completion
+or cancellation of lock-helper transfers. An inherited pre-exec descriptor in a
+child cannot extend that critical section. On detection of a removed/replaced
 token, return an error ack for the triggering cmd with `code:"auth_revoked"`
 before closing **all sockets for that token with 4403**; clients enter NeedsToken.
 Order that ack before the close on the triggering socket, without waiting for
@@ -1711,6 +1754,11 @@ encodes non-JSON diagnostics as a JSON string.
   discriminators distinguish SSE and control envelopes that otherwise share
   the same top-level shape. Missing discriminators are null. This refines the
   key's representation without changing the owner decision.
+- **Replay provenance.** The §5 session-store `known`/`shape` metadata fixes
+  the sender's original classification and version-scoped key across restarts
+  and parser upgrades. A now-known payload originally classified unknown still
+  uses its original unknown wrapper. Missing legacy provenance emits the
+  `provenance_missing` history gap and replay continues, without recomputation.
 - **Rendering.** Every frontend renders `Unknown` (and a known event's
   `extra`) as a collapsible JSON dump with the shape key as its title. That
   rendering is part of the reference client and of the TUI's structured view.

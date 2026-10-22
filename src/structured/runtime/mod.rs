@@ -63,6 +63,8 @@ pub struct Runtime {
     stop: StopRequest,
     control: StopHandle,
     events: mpsc::Receiver<Received>,
+    /// Stored publication handle for the registry runtime owner.
+    pub(super) history: super::history::History,
 }
 impl Runtime {
     /// Offer a bounded user envelope only while idle; WouldBlock never waits.
@@ -172,6 +174,8 @@ pub(crate) fn run_notified(
 }
 
 /// Worker-owned cancellation exists before spawn, including deadline escalation.
+/// The tuple pairs the launch profile with the session MCP endpoint supplied for
+/// the same lease (ADR-0036 §1/§1a).
 pub(crate) fn run_controlled(
     state: &Path,
     (profile, mcp): (LaunchProfile, SessionMcp),
@@ -267,6 +271,7 @@ pub(crate) fn run_controlled(
             ))
         }
     };
+    let history = transport.history.clone();
     let control = transport.stop_handle();
     let input = transport.input_handle();
     let (events_tx, events) = mpsc::sync_channel(4);
@@ -296,6 +301,7 @@ pub(crate) fn run_controlled(
     }
     let publication_failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ready(Runtime {
+            history,
             transport: input,
             stop: stop.clone(),
             control: control.clone(),
@@ -304,6 +310,7 @@ pub(crate) fn run_controlled(
     }))
     .is_err();
     if publication_failed {
+        lease.revoke();
         stop.request();
         control.cancel();
     }
@@ -313,8 +320,12 @@ pub(crate) fn run_controlled(
         files,
         config,
         stop.clone(),
-        || control.close_stdin(),
         || {
+            lease.revoke();
+            control.close_stdin();
+        },
+        || {
+            lease.revoke();
             control.close_stdin();
             match io_rx.recv_timeout(IO_LIMIT) {
                 Ok(received) => facts = received,
@@ -372,6 +383,7 @@ fn startup_failed(
     io_confirmed: bool,
     lease: &mut super::lease::Lease,
 ) -> LaunchError {
+    lease.revoke();
     let stop = StopRequest::default();
     stop.request();
     // Missing child pipes precede all I/O workers. A partially started transport
