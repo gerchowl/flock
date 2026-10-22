@@ -662,15 +662,17 @@ impl App {
                     via,
                     ..
                 } if *correlation_id == params.correlation_id => {
+                    // Only an exact local route binding admits a trusted destination label.
+                    let host_label = self.state.server_delivery_name(to_host, route);
                     // #410: say whether the hop was ours or a hub's.
                     let (path, how) = match via {
                         Some(hub) => (
                             format!("via {hub}"),
-                            format!("handed up to {hub}, which delivered it to {to_host}"),
+                            format!("handed up to {hub}, which delivered it to {host_label}"),
                         ),
                         None => (
                             "direct".to_string(),
-                            format!("handed to {to_host} via [[peers]] {route}"),
+                            format!("handed to {host_label} via [[peers]] {route}"),
                         ),
                     };
                     found = Some(ResponseResult::MsgStatus {
@@ -2618,6 +2620,273 @@ mod tests {
             value["result"]["route"], "kiln",
             "the route is what a reader needs to reproduce the hop"
         );
+    }
+
+    #[tokio::test]
+    async fn security2166_r4_status_detail_resolves_trusted_route_names() {
+        for (host, route, pinned, expected) in [
+            (
+                "node-trusted.example",
+                "node-trusted.example",
+                false,
+                "node-trusted.example",
+            ),
+            (
+                "node-dial.example",
+                "node-trusted.example",
+                false,
+                "node-trusted.example",
+            ),
+            (
+                "node-pinned.example",
+                "node-pinned.example",
+                true,
+                "node-pinned.example",
+            ),
+            (
+                "node-pinned.example",
+                "node-trusted.example",
+                true,
+                "node-trusted.example",
+            ),
+        ] {
+            let mut app = test_app_with_hub(crate::api::EventHub::default());
+            app.state.peers.push(crate::config::PeerConfig {
+                name: "node-trusted.example".into(),
+                ssh: "node-dial.example".into(),
+                ..Default::default()
+            });
+            if pinned {
+                app.state
+                    .server_nodes
+                    .insert("node-pinned.example".into(), "node-id".into());
+                if route != host {
+                    app.state
+                        .server_nodes
+                        .insert(route.into(), "node-id".into());
+                }
+            }
+            app.emit_event(EventEnvelope {
+                event: EventKind::MessageRelayed,
+                data: EventData::MessageRelayed {
+                    correlation_id: "trusted-host".into(),
+                    from_agent: "agent_atlas_cafe".into(),
+                    to_agent: "agent_nodea_beef".into(),
+                    to_host: host.into(),
+                    route: route.into(),
+                    via: None,
+                    relayed_at_ms: 1,
+                    intent: MsgIntent::Fyi,
+                },
+            });
+            let ResponseResult::MsgStatus {
+                detail, to_host, ..
+            } = status_of(&mut app, "trusted-host")
+            else {
+                panic!("expected message status")
+            };
+            let detail = detail.unwrap();
+            assert!(
+                detail.starts_with(&format!("handed to {expected} via")),
+                "{host} over {route}: {detail:?}"
+            );
+            assert!(!detail.contains(crate::peer_name::BADGE), "{detail:?}");
+            assert_eq!(to_host.as_deref(), Some(host));
+        }
+    }
+
+    #[tokio::test]
+    async fn security2166_r4_status_detail_never_trusts_route_lookalikes() {
+        for (host, route) in [
+            ("node-trusted.example\u{200b}", "node-trusted.example"),
+            ("node-trusted.example ", "node-trusted.example"),
+            ("n\u{43e}de-trusted.example", "node-trusted.example"),
+            ("NODE-TRUSTED.EXAMPLE", "node-trusted.example"),
+            ("node-other.example", "node-trusted.example"),
+            ("", "node-trusted.example"),
+            ("node-trusted.example", ""),
+            ("node-trusted.example", "node-trusted.example\u{200b}"),
+            ("node-trusted.example", "node-other.example"),
+        ] {
+            let mut app = test_app_with_hub(crate::api::EventHub::default());
+            app.state.peers.push(crate::config::PeerConfig {
+                name: "node-trusted.example".into(),
+                ..Default::default()
+            });
+            app.emit_event(EventEnvelope {
+                event: EventKind::MessageRelayed,
+                data: EventData::MessageRelayed {
+                    correlation_id: "claimed-host".into(),
+                    from_agent: "agent_atlas_cafe".into(),
+                    to_agent: "agent_nodea_beef".into(),
+                    to_host: host.into(),
+                    route: route.into(),
+                    via: None,
+                    relayed_at_ms: 1,
+                    intent: MsgIntent::Fyi,
+                },
+            });
+            let ResponseResult::MsgStatus {
+                detail, to_host, ..
+            } = status_of(&mut app, "claimed-host")
+            else {
+                panic!("expected message status")
+            };
+            assert!(
+                detail.unwrap().contains(crate::peer_name::BADGE),
+                "{host:?}"
+            );
+            assert_eq!(to_host.as_deref(), Some(host));
+        }
+    }
+
+    #[tokio::test]
+    async fn security2166_r3_status_detail_presents_legacy_machine_metadata() {
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.state.peers.push(crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        let raw = "node-trusted.example\u{200b}";
+        app.emit_event(EventEnvelope {
+            event: EventKind::MessageRelayed,
+            data: EventData::MessageRelayed {
+                correlation_id: "legacy-host".into(),
+                from_agent: "agent_atlas_cafe".into(),
+                to_agent: "agent_nodea_beef".into(),
+                to_host: raw.into(),
+                route: "node-route.example".into(),
+                relayed_at_ms: 1,
+                intent: MsgIntent::Fyi,
+                via: None,
+            },
+        });
+        let response: serde_json::Value = serde_json::from_str(&app.handle_api_request(Request {
+            id: "legacy".into(),
+            method: Method::MsgStatus(MsgStatusParams {
+                reference: None,
+                correlation_id: "legacy-host".into(),
+            }),
+        }))
+        .unwrap();
+        assert_eq!(response["result"]["to_host"], raw);
+        let detail = response["result"]["detail"].as_str().unwrap();
+        assert!(detail.contains("[unverified]"), "{detail:?}");
+        assert!(!detail.contains("node-trusted.example"), "{detail:?}");
+        assert!(!detail.contains('\u{200b}'), "{detail:?}");
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MachineHostSource {
+        OwnerHint,
+        Polled,
+        Relayed,
+    }
+
+    const MACHINE_HOST_SOURCES: [MachineHostSource; 3] = [
+        MachineHostSource::OwnerHint,
+        MachineHostSource::Polled,
+        MachineHostSource::Relayed,
+    ];
+
+    fn security2166_r3_queued_machine_host(
+        name: &str,
+        source: MachineHostSource,
+    ) -> (serde_json::Value, super::super::mesh_mail::Payload) {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut app = test_app_with_hub(crate::api::EventHub::default());
+        app.node_id = Some(
+            crate::mesh::identity::NodeIdentity::load()
+                .unwrap()
+                .node_id(),
+        );
+        app.state.peers.push(crate::config::PeerConfig {
+            name: "node-trusted.example".into(),
+            ..Default::default()
+        });
+        let node = crate::mesh::identity::NodeIdentity::fixture([21; 32]).node_id();
+        let recipient = "11111111-1111-4111-8111-111111111111";
+        match source {
+            MachineHostSource::OwnerHint => {
+                crate::mesh::runtime_store::with_store(|store| {
+                    store
+                        .note_owner(recipient, &node, name, 1)
+                        .map_err(|e| e.to_string())
+                })
+                .unwrap();
+            }
+            MachineHostSource::Polled | MachineHostSource::Relayed => {
+                let config = crate::config::PeerConfig {
+                    name: "node-source.example".into(),
+                    ..Default::default()
+                };
+                let mut peer = crate::peers::PeerSummaryState::new(&config);
+                peer.host = Some(name.into());
+                peer.node_id = Some(node);
+                peer.workspaces = vec![serde_json::from_value(serde_json::json!({
+                    "id": "ws_remote", "workspace": "remote", "status": "idle",
+                    "agents": [{"agent_id": recipient, "pane_id": "ws_remote:p1", "agent": "cc", "status": "idle"}]
+                })).unwrap()];
+                if matches!(source, MachineHostSource::Polled) {
+                    app.state.peers.push(config);
+                    app.state.peer_summaries.push(peer);
+                } else {
+                    app.state.relayed_fleet_cache.insert(
+                        "claim".into(),
+                        crate::peers::RelayedEntry {
+                            peer,
+                            via: Some("node-hub.example".into()),
+                            hub_pushed: true,
+                        },
+                    );
+                }
+                assert_eq!(app.locate_agent(recipient).unwrap().pane_id, "ws_remote:p1");
+            }
+        }
+        let response: serde_json::Value = serde_json::from_str(&send(
+            &mut app,
+            MsgSendParams {
+                from_agent: Some("agent_atlas_cafe".into()),
+                to: MessageTarget::Agent {
+                    agent: recipient.into(),
+                },
+                body: "host metadata".into(),
+                correlation_id: Some("machine-host".into()),
+                in_reply_to: None,
+                intent: MsgIntent::Fyi,
+            },
+        ))
+        .unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        let key: crate::mesh::key::MessageKey =
+            serde_json::from_value(response["result"]["message_key"].clone()).unwrap();
+        let record = crate::mesh::runtime_store::with_store(|store| {
+            store.get(&key).map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        let payload = serde_json::from_slice(&record.envelope.body).unwrap();
+        (response, payload)
+    }
+
+    #[tokio::test]
+    async fn security2166_r3_to_host_is_machine_metadata() {
+        for source in MACHINE_HOST_SOURCES {
+            for name in ["node-trusted.example", r"node-observed\label"] {
+                let (response, _) = security2166_r3_queued_machine_host(name, source);
+                assert_eq!(response["result"]["to_host"], name, "{source:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn security2166_r3_persisted_host_is_machine_metadata() {
+        for source in MACHINE_HOST_SOURCES {
+            for name in ["node-trusted.example", r"node-observed\label"] {
+                let (_, payload) = security2166_r3_queued_machine_host(name, source);
+                assert_eq!(payload.host.as_deref(), Some(name), "{source:?}");
+            }
+        }
     }
 
     fn configure_unreachable_message_peer(

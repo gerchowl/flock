@@ -38,7 +38,12 @@ pub(crate) fn member_label_moded(
 ) -> String {
     if mode == crate::config::ServerLabelConfig::Icon {
         if let Some(glyph) = icon_name.and_then(crate::server_icons::resolve) {
-            return format!("{glyph} \u{00b7} {target}");
+            let badge = if crate::peer_name::is_claim(host) {
+                "[unverified] "
+            } else {
+                ""
+            };
+            return format!("{badge}{glyph} \u{00b7} {target}");
         }
     }
     member_label(host, target)
@@ -174,8 +179,8 @@ pub(crate) fn solo_remote_label(
     mode: crate::config::ServerLabelConfig,
     peer: &crate::peers::PeerSummaryState,
     summary: &crate::api::schema::PeerWorkspaceSummary,
+    host: &str,
 ) -> String {
-    let host = peer.host.as_deref().unwrap_or(peer.peer.as_str());
     let member = member_label_moded(
         mode,
         peer.icon.as_deref(),
@@ -210,6 +215,19 @@ pub(crate) fn server_field_label(
 ) -> String {
     use crate::config::ServerLabelConfig;
     let glyph = icon_name.and_then(crate::server_icons::resolve);
+    if crate::peer_name::is_claim(host) {
+        if let Some(glyph) = glyph.as_ref().filter(|_| mode != ServerLabelConfig::Name) {
+            let payload = host
+                .strip_prefix(crate::peer_name::BADGE)
+                .unwrap_or(host)
+                .trim_start_matches(' ');
+            return if mode == ServerLabelConfig::Icon {
+                format!("[unverified] {glyph}")
+            } else {
+                format!("[unverified] {glyph} {payload}")
+            };
+        }
+    }
     match (mode, glyph) {
         (ServerLabelConfig::Name, _) | (_, None) => host.to_string(),
         (ServerLabelConfig::Both, Some(glyph)) => format!("{glyph} {host}"),
@@ -240,6 +258,20 @@ pub(crate) fn server_field_label(
 /// a discarded project). The target renders whole either way; what changes is
 /// that the fallback no longer contradicts the ladder.
 pub(crate) fn agent_location_label(
+    server: &str,
+    tab: Option<&str>,
+    project: Option<&str>,
+    target: &str,
+    max_width: usize,
+) -> String {
+    if crate::peer_name::is_claim(server) {
+        let full = agent_location_label_raw(server, tab, project, target, usize::MAX);
+        return crate::peer_name::fit(&full, max_width).unwrap_or(full);
+    }
+    agent_location_label_raw(server, tab, project, target, max_width)
+}
+
+fn agent_location_label_raw(
     server: &str,
     tab: Option<&str>,
     project: Option<&str>,
@@ -561,7 +593,12 @@ mod tests {
         let peer = peer_named("atlas");
         let summary = remote_summary(Some("github.com/gerchowl/flock"), Some("main"));
         assert_eq!(
-            solo_remote_label(crate::config::ServerLabelConfig::Both, &peer, &summary),
+            solo_remote_label(
+                crate::config::ServerLabelConfig::Both,
+                &peer,
+                &summary,
+                peer.display_name()
+            ),
             "gerchowl/flock \u{00b7} atlas:main"
         );
     }
@@ -573,7 +610,12 @@ mod tests {
         let peer = peer_named("atlas");
         let summary = remote_summary(None, Some("wip"));
         assert_eq!(
-            solo_remote_label(crate::config::ServerLabelConfig::Both, &peer, &summary),
+            solo_remote_label(
+                crate::config::ServerLabelConfig::Both,
+                &peer,
+                &summary,
+                peer.display_name()
+            ),
             "atlas:wip"
         );
     }
@@ -651,7 +693,12 @@ mod tests {
         peer.icon = Some("toad".into());
         let summary = remote_summary(Some("github.com/gerchowl/flock"), Some("main"));
         assert_eq!(
-            solo_remote_label(crate::config::ServerLabelConfig::Icon, &peer, &summary),
+            solo_remote_label(
+                crate::config::ServerLabelConfig::Icon,
+                &peer,
+                &summary,
+                peer.display_name()
+            ),
             format!("gerchowl/flock \u{00b7} {glyph} \u{00b7} main")
         );
     }

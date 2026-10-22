@@ -85,6 +85,7 @@ mod mcp;
 mod mesh;
 mod owner_policy;
 mod pane;
+mod peer_name;
 mod peer_stream;
 mod peers;
 mod persist;
