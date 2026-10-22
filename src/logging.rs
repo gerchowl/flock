@@ -3166,6 +3166,15 @@ pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
     );
 }
 
+/// Discard untrusted agent identity text without logging its content.
+pub(crate) fn agent_name_dropped(source: &'static str) {
+    tracing::warn!(
+        code = crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+        source,
+        "agent name dropped"
+    );
+}
+
 // --- agent-resume family (logging redesign PR-6) ---------------------------
 // The three deferred launch failures are empty argv, shell spawn failure and
 // command send failure. They retain the plan and set resume_failed, suppressing
