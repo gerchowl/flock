@@ -554,7 +554,8 @@ omitted until S10. No PTY placement, process id or caller credential is fabricat
 
 `agent.get` and its `agent.status` alias resolve registered identity/name, refusing
 cross-runtime ambiguity. `agent.stop` accepts only a structured target and is
-restricted to the operator or the owning agent. Stop latches cancellation and
+restricted to the operator and the structured agent itself only. PTY callers
+and lineage parents receive no stop authority. Stop latches cancellation and
 returns current facts; it does not promise immediate Offline. Offline stop is
 idempotent. A restored Unknown record refuses launch before epoch advancement or
 profile preparation, and refuses stop without process ownership, with
@@ -3180,3 +3181,18 @@ Operator cleanup is explicit: inspect the retained directory and associated
 processes, establish that none still uses it, then remove the directory by hand.
 No automatic PID-only reaping and no cleanup CLI is introduced in this slice;
 operator tooling is a follow-up owned by the architect.
+
+### Amendment: Atomic structured admission (#1843 part 2a)
+
+The Workers owner is the single admission authority for structured launches.
+It checks limits and reserves a pending slot keyed by agent id in one owner
+operation before starting a producer. Counts combine live leases with pending
+slots, deduplicated by agent id. Agent-started launches count toward capacity
+and parent fanout; the attested operator exemption is unchanged. Lease-table
+contention refuses with `spawn_caller_unknown` without waiting on the App thread.
+
+A pending slot ends on lease acquisition or launch failure, never on elapsed
+time alone. Pending metadata grants neither caller identity nor signaling
+rights. Preparation remains off-thread and bounded by its owner. Part 2b adds
+the production CLI/socket caller and its loaded session policy; public client
+and server start remain gated until part 3 completes narrowed MCP admission.

@@ -956,9 +956,13 @@ fn resolve_agent_target(target: &str, request_id: &str) -> std::io::Result<serde
         .and_then(serde_json::Value::as_str)
         == Some("structured")
     {
-        return Ok(
-            serde_json::json!({"id":request_id,"error":{"code":crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),"message":"this operation requires a PTY placement"}}),
-        );
+        return Ok(serde_json::json!({
+            "id": request_id,
+            "error": {
+                "code": crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),
+                "message": "this operation requires a PTY placement"
+            }
+        }));
     }
     Ok(response)
 }
