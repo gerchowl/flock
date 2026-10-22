@@ -11,7 +11,7 @@
 //! authority and Unknown lifecycle, requiring explicit recovery rather than restart.
 #![deny(missing_docs)]
 use super::{
-    launch::{LaunchError, LaunchProfile},
+    launch::{LaunchError, LaunchProfile, SessionMcp},
     lease::SessionLeases,
     registry::{Record, Registry},
     runtime::{self, Exit, Runtime},
@@ -41,6 +41,10 @@ pub struct Launch {
     pub leases: SessionLeases,
     /// Durable stream/supervision directory.
     pub state: PathBuf,
+    /// Caller-supplied `[sessions]` storage policy, captured for this launch.
+    pub storage: super::blobs::StorageConfig,
+    /// Pinned flock executable and owning server socket for this session.
+    pub mcp: SessionMcp,
     /// Caller-supplied sessions stall policy, with no guessed default.
     pub stall_after: Duration,
     /// Optional authenticated delegation lineage.
@@ -111,6 +115,7 @@ impl Worker {
 /// discard confirmed completions, while uncertain ownership remains recoverable.
 pub struct Workers {
     entries: BTreeMap<String, Worker>,
+    history: BTreeMap<String, (u64, super::history::History)>,
     notify: Arc<Notify>,
     // Coalesced wake for teardown while the async server loop is quiescent.
     wake: mpsc::SyncSender<()>,
@@ -127,6 +132,7 @@ impl Workers {
             wakes,
             shutdown_result: None,
             entries: BTreeMap::new(),
+            history: BTreeMap::new(),
             notify,
         }
     }
@@ -145,6 +151,8 @@ impl Workers {
             generation: current,
             leases,
             state,
+            storage,
+            mcp,
             stall_after,
             lineage,
         } = launch;
@@ -165,9 +173,15 @@ impl Workers {
             .filter(|(_, _, g)| *g == current)
             .map(|(r, _, _)| r.clone())
             .ok_or(ErrorCode::AgentNotFound)?;
-        let generation = registry
-            .begin_launch(&agent_id, current)
-            .map_err(|_| ErrorCode::AgentStartFailed)?;
+        let generation =
+            registry
+                .begin_launch(&agent_id, current)
+                .map_err(|error| match error {
+                    super::registry::RegistryError::RecoveryRequired => {
+                        ErrorCode::StructuredRecoveryRequired
+                    }
+                    _ => ErrorCode::AgentStartFailed,
+                })?;
         let (tx, messages) = mpsc::sync_channel(2);
         let stop = StopRequest::default();
         let cancelled = stop.clone();
@@ -206,6 +220,7 @@ impl Workers {
                     let profile = prepare().map_err(|error| (error.code(), error.to_string()))?;
                     let location = StreamLocation {
                         data_dir: state.clone(),
+                        storage,
                         agent: record.agent_id.clone(),
                         session: record.session_id.clone(),
                     };
@@ -213,7 +228,7 @@ impl Workers {
                     let event_wake = wake.clone();
                     runtime::run_controlled(
                         &state,
-                        profile,
+                        (profile, mcp),
                         lease,
                         location,
                         |runtime| {
@@ -271,6 +286,34 @@ impl Workers {
             .filter(|w| w.generation == generation && !w.finished)
             .and_then(|w| w.runtime.as_ref())
     }
+    /// Registry-fenced stored stream, retained after runtime exit. This handle
+    /// lives with runtime ownership, never inside the pure registry/AppState.
+    pub fn history(&self, registry: &Registry, id: &str) -> Option<&super::history::History> {
+        let (generation, source) = self.history.get(id)?;
+        let (_, _, current) = registry.get(id)?;
+        (*generation == current).then_some(source)
+    }
+    /// Install a closed-file source recovered on an I/O worker. A changed epoch,
+    /// active producer or already installed source refuses stale recovery.
+    pub fn install_retained(
+        &mut self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+        source: super::history::History,
+    ) -> Result<(), ErrorCode> {
+        if registry.get(id).is_none_or(|(record, _, g)| {
+            g != generation || !source.belongs_to(&record.agent_id, &record.session_id)
+        }) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        if self.history(registry, id).is_some() || self.entries.get(id).is_some_and(|w| !w.finished)
+        {
+            return Err(ErrorCode::SessionBusy);
+        }
+        self.history.insert(id.into(), (generation, source));
+        Ok(())
+    }
     /// Latch cancellation without blocking on preparation, process or I/O cleanup.
     pub fn stop(&self, id: &str, generation: u64) -> bool {
         let Some(worker) = self.entries.get(id).filter(|w| w.generation == generation) else {
@@ -306,6 +349,8 @@ impl Workers {
                 }
                 match worker.messages.try_recv() {
                     Ok(Message::Ready(runtime)) => {
+                        self.history
+                            .insert(id.clone(), (worker.generation, runtime.history.clone()));
                         if worker.stop.requested() {
                             runtime.stop();
                         }
@@ -392,6 +437,9 @@ impl Workers {
                 changed = true;
             }
         }
+        self.history.retain(|id, (generation, _)| {
+            registry.get(id).is_some_and(|(_, _, g)| g == *generation)
+        });
         // Removed records need no completed handle; uncertain ownership must survive.
         self.entries.retain(|id, worker| {
             worker.join_finished();
