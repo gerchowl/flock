@@ -77,7 +77,7 @@ fn permission_message_is_trimmed_at_utf8_boundary() {
         let mut request = args(&b, "request-example", Decision::Deny);
         request.message = Some(format!(" \t{}\r\n ", expected.replace('\n', "\r\n")));
         let answer = b.prepare(&token(), &request).unwrap();
-        assert_eq!(answer.response["message"], expected);
+        assert_eq!(answer.response["response"]["response"]["message"], expected);
         assert_eq!(
             serde_json::to_value(answer.audit).unwrap()["message"],
             expected
