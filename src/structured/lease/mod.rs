@@ -13,6 +13,21 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Read-only reservation evidence. It never grants authority to act or signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseState {
+    /// No reservation is present.
+    Absent,
+    /// A launcher is reserved, without a bound root.
+    Reserved,
+    /// A root identity is bound; liveness still requires kernel verification.
+    Bound,
+    /// Registry contention, revocation or incomplete identity prevents evidence.
+    Uncertain,
+}
+
 const LOCK_LIMIT: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +73,21 @@ pub struct Lease {
     generation: Generation,
 }
 impl SessionLeases {
+    /// Inspect a single record non-blockingly, without exposing PIDs or credentials.
+    pub(crate) fn state(&self, agent: &str, session: &str) -> LeaseState {
+        let Some(entries) = self.0.try_lock() else {
+            return LeaseState::Uncertain;
+        };
+        match entries.get(session).filter(|entry| entry.agent == agent) {
+            None => LeaseState::Absent,
+            Some(entry) if !entry.generation.live() => LeaseState::Uncertain,
+            Some(entry) => match entry.root {
+                Root::Launcher(_) => LeaseState::Reserved,
+                Root::Process(_) if entry.process.is_some() => LeaseState::Bound,
+                _ => LeaseState::Uncertain,
+            },
+        }
+    }
     // ADR-0036 §1a: acquire both views before mutation; timeout leaves the
     // reservation intact. No process creation or OS lookup runs under these locks.
     fn update<T>(&self, change: impl FnOnce(&mut BTreeMap<String, Entry>) -> T) -> io::Result<T> {

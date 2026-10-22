@@ -84,8 +84,8 @@ pub fn notification_toast_for_state_change(
     }
 }
 
-fn toast_agent_label(agent_label: &str) -> &str {
-    agent_label
+fn toast_agent_label(agent_label: &str) -> std::borrow::Cow<'_, str> {
+    crate::terminal::agent_name::display(agent_label)
 }
 
 pub(crate) fn toast_event_text(kind: ToastKind) -> &'static str {
@@ -1017,9 +1017,7 @@ impl AppState {
                     terminal
                         .and_then(|terminal| terminal.manual_label.as_deref().map(str::to_string))
                 })
-                .or_else(|| {
-                    terminal.and_then(|terminal| terminal.agent_name.as_deref().map(str::to_string))
-                })
+                .or_else(|| terminal.and_then(|terminal| terminal.agent_name().map(str::to_string)))
                 .or_else(|| {
                     terminal
                         .and_then(|terminal| terminal.effective_agent_label().map(str::to_string))
@@ -1028,12 +1026,9 @@ impl AppState {
                     launch_label(terminal.and_then(|terminal| terminal.launch_argv.as_ref()))
                 })
                 .unwrap_or_else(|| format!("pane {pane_number}"));
-            let display_agent = terminal.and_then(|terminal| terminal.effective_display_agent());
-            let agent_label = display_agent.as_deref().or_else(|| {
-                terminal
-                    .and_then(|terminal| terminal.agent_name.as_deref())
-                    .or_else(|| terminal.and_then(|terminal| terminal.effective_agent_label()))
-            });
+            let label = crate::terminal::agent_name::display(&label).into_owned();
+            let display_agent = terminal.and_then(|terminal| terminal.display_agent_label());
+            let agent_label = display_agent.as_deref();
             let custom_status = terminal.and_then(|terminal| terminal.effective_custom_status());
             let (state, seen) = terminal
                 .map(|terminal| terminal.presentation_state(pane.seen))
@@ -6102,7 +6097,8 @@ mod tests {
             .terminals
             .get_mut(&shell_terminal_id)
             .unwrap()
-            .set_manual_label("wheel notes".into());
+            .set_manual_label("wheel notes".into())
+            .unwrap();
         let working_terminal_id = state.workspaces[0].terminal_id(working).cloned().unwrap();
         state
             .terminals
@@ -6149,7 +6145,8 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_manual_label("weekly review".into());
+            .set_manual_label("weekly review".into())
+            .unwrap();
         state.open_navigator();
         state.navigator.query = "weekly".into();
 
@@ -7733,6 +7730,17 @@ mod tests {
             state.toast.as_ref().map(|toast| toast.kind),
             Some(ToastKind::Finished)
         );
+    }
+
+    #[test]
+    fn security_label_toast_sink_escapes_untrusted_label() {
+        for (case, label) in crate::test_support::hostile_agent_names() {
+            assert_ne!(
+                toast_agent_label(&label).to_string(),
+                label,
+                "raw toast label: {case}"
+            );
+        }
     }
 
     #[test]

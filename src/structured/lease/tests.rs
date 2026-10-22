@@ -471,3 +471,23 @@ fn unconfirmed_cleanup_logs_reservation_identity() {
     assert_eq!(output.matches("process cleanup unconfirmed").count(), 1);
     assert!(!output.contains("registry busy during release"));
 }
+
+#[test]
+fn public_lease_state_reports_binding_without_authority_or_waiting() {
+    let leases = SessionLeases::default();
+    assert_eq!(leases.state("agent", "session"), LeaseState::Absent);
+    let mut lease = leases.reserve("agent", "session", None).unwrap();
+    assert_eq!(leases.state("agent", "session"), LeaseState::Reserved);
+    assert_eq!(leases.state("other", "session"), LeaseState::Absent);
+    {
+        let _guard = leases.0.lock();
+        assert_eq!(leases.state("agent", "session"), LeaseState::Uncertain);
+    }
+    lease.spawned().unwrap();
+    lease.bind_test_peer(std::process::id());
+    assert_eq!(leases.state("agent", "session"), LeaseState::Bound);
+    lease.generation.revoke();
+    assert_eq!(leases.state("agent", "session"), LeaseState::Uncertain);
+    lease.release();
+    assert_eq!(leases.state("agent", "session"), LeaseState::Absent);
+}

@@ -87,7 +87,7 @@ impl std::error::Error for TurnEndUnknown {}
 pub struct StreamLocation {
     /// Existing flock data root (not the harness profile).
     pub data_dir: PathBuf,
-    /// Storage threshold captured from `[sessions]` at launch.
+    /// Caller-supplied persistence policy captured for this session.
     pub storage: super::blobs::StorageConfig,
     /// Agent identifier, containing only ASCII letters, digits, '-' or '_'.
     pub agent: String,
@@ -181,21 +181,18 @@ impl Received {
             }
         }
         if self.record.origin == RecordOrigin::Flk {
+            if let SessionEvent::PermissionRequest(record) = &self.event {
+                return match record.state {
+                    crate::structured_wire::PermissionState::Closed { .. } => {
+                        Some(super::state::Input::ControlAnswered(&record.request_id))
+                    }
+                    _ => None,
+                };
+            }
             if let SessionEvent::Unknown { value, .. } = &self.event {
                 if value.get("type").and_then(Value::as_str) == Some("flk_input_accepted") {
                     // Monotonic stamps belong to this launch, never to replay.
                     return None;
-                }
-                if value.get("type").and_then(Value::as_str) == Some("flk_permission_request") {
-                    return match (
-                        value.get("state").and_then(Value::as_str),
-                        value.get("request_id").and_then(Value::as_str),
-                    ) {
-                        (Some("closed"), Some(id)) => {
-                            Some(super::state::Input::ControlAnswered(id))
-                        }
-                        _ => None,
-                    };
                 }
             }
         }
@@ -625,7 +622,7 @@ impl InputHandle {
     }
 }
 
-fn encode(value: &Value) -> io::Result<Vec<u8>> {
+fn encode(value: &impl Serialize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     serde_json::to_writer(InputBuffer(&mut bytes), value)?;
     bytes.push(b'\n');
@@ -737,7 +734,10 @@ fn write_inputs(
 /// Recovery truncates only a final tail without a trailing LF, syncs the repair,
 /// logs discarded bytes and resumes the last good sequence. Malformed records
 /// ending in LF are corruption and are refused, as are non-dense sequences.
-fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(File, u64)> {
+fn open_stream(
+    location: StreamLocation,
+    cancel: &AtomicBool,
+) -> io::Result<(File, u64, permissions::Orphaned)> {
     let dir = location.data_dir.join("sessions");
     private_fs::ensure_private_dir(&dir)?;
     let dir = dir.join(location.agent);
@@ -746,12 +746,17 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
     let mut file = match private_fs::create_private_file(&path) {
         Ok(file) => {
             drop(file);
-            return Ok((private_fs::open_append_file(&path)?, 0));
+            return Ok((
+                private_fs::open_append_file(&path)?,
+                0,
+                permissions::Orphaned::default(),
+            ));
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => private_fs::open_append_file(&path)?,
         Err(e) => return Err(e),
     };
     let length = file.metadata()?.len();
+    let mut orphaned = permissions::Orphaned::default();
     let mut good_bytes = 0;
     let mut seq = 0_u64;
     {
@@ -774,6 +779,7 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
                     return Err(io::Error::other("non-dense session sequence"));
                 }
                 seq = record.seq;
+                orphaned.observe(&record);
                 good_bytes += n;
             } else {
                 // A bounded scan accepts only an unterminated final tail. Any
@@ -800,7 +806,7 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
         file.sync_all()?;
         crate::logging::structured_stream_repaired(length - good_bytes);
     }
-    Ok((file, seq))
+    Ok((file, seq, orphaned))
 }
 
 fn pump(
@@ -816,7 +822,7 @@ fn pump(
 ) -> io::Result<()> {
     let blobs = super::blobs::BlobStore::open(&location.data_dir).map_err(io::Error::other)?;
     let threshold = location.storage.blob_min_bytes;
-    let (mut file, mut seq) = open_stream(location, cancel)?;
+    let (mut file, mut seq, orphaned) = open_stream(location, cancel)?;
     history.initialize(&file, seq)?;
     let mut recorder = control::Recorder::new(
         &mut file,
@@ -830,6 +836,7 @@ fn pump(
         (&blobs, threshold, history),
     );
     let result = (|| {
+        recorder.recover(orphaned)?;
         let mut line = Vec::new();
         let mut count = 0_u64;
         let mut metadata = metadata::Line::default();

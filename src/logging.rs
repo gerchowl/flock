@@ -97,9 +97,13 @@ pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'s
 
 /// Report the first corrupt queue record without exposing any input payload.
 pub(crate) fn structured_queue_corrupt(reason: &crate::structured::queue::QueueJournalCorrupt) {
-    tracing::warn!(event = "structured.queue.corrupt", sequence = ?reason.seq,
-        offset = reason.offset, reason = reason.reason,
-        "queue journal is read-only; operator recovery required");
+    tracing::warn!(
+        event = "structured.queue.corrupt",
+        sequence = ?reason.seq,
+        offset = reason.offset,
+        reason = reason.reason,
+        "queue journal is read-only; operator recovery required"
+    );
 }
 
 /// Report a durable corrupt-blob replacement without exposing stored content.
@@ -122,6 +126,15 @@ pub(crate) fn structured_blob_repair_lock_unavailable(
         blob = reference.blob.as_str(),
         error_kind = ?kind,
         "repair lock unavailable; publishing without coordination"
+    );
+}
+
+/// Report a malformed permission header without disclosing the stored payload.
+pub(crate) fn structured_permission_recovery_skipped(seq: u64) {
+    tracing::warn!(
+        event = "structured.permission.recovery_skipped",
+        seq,
+        "invalid permission recovery header skipped and preserved"
     );
 }
 
@@ -3175,6 +3188,15 @@ pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
         reason = "pruned_empty",
         tab,
         "restored tab lost all panes after pruning missing layout nodes"
+    );
+}
+
+/// Discard untrusted agent identity text without logging its content.
+pub(crate) fn agent_name_dropped(source: &'static str) {
+    tracing::warn!(
+        code = crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+        source,
+        "agent name dropped"
     );
 }
 
