@@ -21,6 +21,7 @@
 
 pub(crate) mod client_exchange;
 pub(crate) mod gui;
+pub(crate) mod listener_foundation;
 pub(crate) mod store_io;
 // The listener slice mounts this independently tested protocol core.
 #[allow(dead_code)]

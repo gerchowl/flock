@@ -42,6 +42,10 @@ pub struct AgentDecide {
     pub agent: String,
     /// Harness request identity from the derived open-request record.
     pub request_id: String,
+    /// Required flk-issued handle from the open record, carried unchanged by S7
+    /// slice 5. JSON number, exact in JavaScript below 2^53 like stream cursors.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub request_seq: u64,
     /// Permission choice admitted by S6-MVP.
     pub decision: PermissionDecision,
     /// Optional explanation supplied with the answer.
@@ -50,20 +54,7 @@ pub struct AgentDecide {
     pub message: Option<String>,
 }
 
-/// Closed permission vocabulary shared by the client and S6-MVP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-// Later wire slices consume this payload.
-#[cfg_attr(feature = "web", allow(dead_code))]
-pub enum PermissionDecision {
-    /// Permit only this request.
-    AllowOnce,
-    /// Permit this tool beyond the current request.
-    AllowAlways,
-    /// Refuse the request.
-    Deny,
-}
+pub use super::permission::PermissionDecision;
 
 #[cfg(test)]
 mod tests {
@@ -99,8 +90,7 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(decision).unwrap(), choice);
             for message in [None, Some("Operator explanation")] {
-                let mut value =
-                    json!({"agent":"fixture-agent","request_id":"request-one","decision":choice});
+                let mut value = json!({"agent":"fixture-agent","request_id":"request-one","request_seq":1,"decision":choice});
                 if let Some(message) = message {
                     value["message"] = json!(message);
                 }

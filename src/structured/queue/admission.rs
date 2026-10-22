@@ -44,7 +44,15 @@ pub(crate) struct Failure {
 impl From<io::Error> for Failure {
     fn from(source: io::Error) -> Self {
         Self {
-            code: ErrorCode::InputWriteUnknown,
+            code: match source.get_ref() {
+                Some(error) if error.is::<super::QueueJournalNewer>() => {
+                    ErrorCode::QueueJournalNewer
+                }
+                Some(error) if error.is::<super::QueueJournalCorrupt>() => {
+                    ErrorCode::QueueJournalCorrupt
+                }
+                _ => ErrorCode::InputWriteUnknown,
+            },
             source: Some(source),
         }
     }
@@ -70,10 +78,11 @@ pub(crate) struct Admission {
     max_batch: usize,
 }
 impl Admission {
-    /// Refuse future data whose scheduling meaning cannot be proved.
+    /// Open inspection for read-only journals and admit known inputs otherwise.
+    /// Unknown item semantics remain excluded from automatic batch formation.
     pub fn new(journal: Journal, max_batch: usize) -> Result<Self, Failure> {
         journal.healthy()?;
-        if journal.future || max_batch == 0 {
+        if max_batch == 0 {
             return Err(refuse(ErrorCode::InvalidRequest));
         }
         Ok(Self { journal, max_batch })
@@ -91,6 +100,7 @@ impl Admission {
         principal: Principal,
         gate: Gate,
     ) -> Result<(), Failure> {
+        self.journal.writable()?;
         if item.delivery != Delivery::AtIdle || item.priority != Priority::Normal {
             return Err(refuse(ErrorCode::QueueModeUnsupported));
         }
@@ -103,7 +113,6 @@ impl Admission {
             }
             _ => return Err(refuse(ErrorCode::OperatorOnly)),
         };
-        self.journal.healthy()?;
         if [
             "admission_hash",
             "gate",
@@ -180,7 +189,8 @@ impl Admission {
         Ok(())
     }
     fn eligible(&self, item: &Item, now_ms: u64) -> bool {
-        item.state == State::Queued
+        !self.journal.opaque.contains(&item.item_id)
+            && item.state == State::Queued
             && item.delivery == Delivery::AtIdle
             && item.priority == Priority::Normal
             && metadata(item, "gate")["decision"] == "send"
@@ -211,7 +221,7 @@ impl Admission {
         now_ms: u64,
         fill: Entropy<'_>,
     ) -> Result<Option<Batch>, Failure> {
-        self.journal.healthy()?;
+        self.journal.writable()?;
         let mut failed: Vec<(String, ErrorCode)> = Vec::new();
         let candidate = loop {
             let mut eligible = self.journal.items().iter().filter(|i| {
@@ -273,6 +283,7 @@ impl Admission {
     }
     /// Replace existing items together, retaining order; no success precedes sync.
     pub fn replace(&mut self, items: Vec<Item>) -> Result<(), Failure> {
+        self.journal.writable()?;
         for item in &items {
             let old = self
                 .journal
@@ -310,7 +321,7 @@ impl Admission {
     // Classify all deterministic failures before append. Only an actual append
     // I/O failure (or an already poisoned journal) has uncertain durability.
     fn commit(&mut self, change: Change) -> Result<(), Failure> {
-        self.journal.healthy()?;
+        self.journal.writable()?;
         let mut items = self.journal.items().to_vec();
         change
             .apply(&mut items)

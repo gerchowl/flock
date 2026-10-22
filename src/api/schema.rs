@@ -3047,6 +3047,9 @@ pub enum ResponseResult {
         session_health: Option<crate::platform::SessionHealth>,
         #[serde(default)]
         api_listener: Option<ApiListenerHealth>,
+        /// Confirmed structured listener state; failure never stops the server or its PTYs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_listener: Option<super::client_listener::Status>,
         /// Missing on older servers; observing status never starts an NSS lookup.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_account_diagnostic: Option<AgentAccountDiagnostic>,
@@ -5130,6 +5133,7 @@ pub struct PeerWorkspaceSummary {
     pub is_linked_worktree: bool,
     /// Short agent label of the workspace's attention-leading pane (e.g. "cc").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
     /// Seconds since the leading pane's state last changed.
@@ -5161,6 +5165,7 @@ pub struct PeerAgentSummary {
     /// Public pane id on the owning server. A routing detail, not a name.
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
 }
@@ -5763,6 +5768,7 @@ mod tests {
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
+                client_listener: None,
                 agent_account_diagnostic: None,
             },
         };

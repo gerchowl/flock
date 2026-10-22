@@ -5,8 +5,8 @@
  * - **fixture** replays the recorded session as the `fixture` agent, with
  *   sample rows and inbox cards, under the replay badge (the owner preview);
  * - **wire** connects to the configured server (G3a, #1747). Its agent list
- *   is fleet-lite (#1746); the inbox stays empty until G5 (#1597). Its
- *   token is, in order: one exchanged for the fragment's one-time code, the
+ *   is fleet-lite (#1746); its inbox lists the open permission prompts (#1749).
+ *   Its token is, in order: one exchanged for the fragment's one-time code, the
  *   one this tab already holds in `sessionStorage`, or the shell's (Tauri).
  *   With none it waits in NeedsToken (ADR-0038 §3, `src/wire/token.ts`).
  *
@@ -111,7 +111,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const sender: Sender = {
     commands: () => (revision(), connection.commands()),
     // `submit` sends the message, not only types it (`AgentSendParams`; S7a's agent-send script).
-    send: (agent, text) => connection.command("agent.send", { target: agent, text, submit: true }),
+    send: (agent, text, echoAfter) => connection.command("agent.send", { target: agent, text, submit: true }, undefined, echoAfter),
     blocked: () => (revision(), connection.principal === null ? "Sending opens once the server has welcomed this client." : null),
   };
   onCleanup(connection.onTransition((state) => state === "NeedsToken" && tokens.clear()));
