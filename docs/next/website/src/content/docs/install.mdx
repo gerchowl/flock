@@ -139,6 +139,15 @@ using the SHA-256 computed from the release build. `flk update` and remote
 bootstrap verify declared checksums before installing. A mismatch refuses the
 download and removes the temporary file. Preview downloads use the same verifier.
 
-Legacy manifests may still contain bare URL strings. Those downloads remain
+Remote installation verifies the received file before replacing the existing
+binary, using `sha256sum` or `shasum -a 256`. If neither is installed, it refuses
+with `checksum_tool_missing` (exit 10): install coreutils or Perl's shasum on the
+remote system. This check applies even to transfers from legacy manifests.
+A transfer mismatch reports `remote_checksum_mismatch` (exit 10) and is safe to
+retry because the existing binary is preserved. Ordinary shell failures retain
+their original diagnostic.
+Local checksum failures report `checksum_mismatch` with exit 10.
+
+Legacy manifests may still contain bare URL strings or a null checksum. Those downloads remain
 unverified during this transition; requiring a checksum is tracked in #2076.
 Checksums detect differences from the manifest and are not independent signatures.

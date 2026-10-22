@@ -13,6 +13,8 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use crate::api::error_code::ErrorCode;
+use crate::checksum::AssetRef;
 use crate::process::TracedCommand;
 use std::time::{Duration, Instant};
 
@@ -144,8 +146,6 @@ impl UpdateChannel {
         }
     }
 }
-
-use crate::checksum::AssetRef;
 
 #[derive(Deserialize)]
 struct UpdateManifest {
@@ -519,6 +519,49 @@ fn check_homebrew_latest() -> Result<Option<Version>, String> {
 // Download + install
 // ---------------------------------------------------------------------------
 
+/// Preserve a checksum refusal through the updater's CLI boundary (ADR-0029).
+#[derive(Debug)]
+pub(crate) enum UpdateError {
+    /// A declared checksum is malformed or differs from the downloaded bytes.
+    Checksum(String),
+    /// Existing updater failures retain their original diagnostics and exit.
+    Other(String),
+}
+
+impl UpdateError {
+    pub(crate) fn code(&self) -> Option<ErrorCode> {
+        matches!(self, Self::Checksum(_)).then_some(ErrorCode::ChecksumMismatch)
+    }
+    pub(crate) fn exit(&self) -> i32 {
+        self.code()
+            .map_or(crate::cli::exit::FAILURE, ErrorCode::exit)
+    }
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Checksum(message) | Self::Other(message) => message,
+        }
+    }
+}
+impl From<String> for UpdateError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+impl From<&str> for UpdateError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.into())
+    }
+}
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(code) = self.code() {
+            write!(f, "{code}: ")?;
+        }
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for UpdateError {}
+
 struct DownloadedUpdate {
     current_exe: PathBuf,
     tmp_path: Option<PathBuf>,
@@ -533,7 +576,7 @@ impl Drop for DownloadedUpdate {
 }
 
 /// Download a release to a prepared executable temp file without touching the running server.
-fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
+fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, UpdateError> {
     let current_exe = env::current_exe().map_err(|e| format!("can't find current binary: {e}"))?;
 
     let parent = current_exe.parent().ok_or("can't find binary directory")?;
@@ -546,7 +589,8 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
             "install directory not writable: {} ({}). Try running with appropriate permissions.",
             parent.display(),
             e
-        ));
+        )
+        .into());
     }
     let _ = fs::remove_file(&test_path);
 
@@ -570,9 +614,12 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
 
     if let Err(e) = crate::checksum::verify_asset(&tmp_path, release.sha256.as_deref()) {
         let _ = fs::remove_file(&tmp_path);
-        return Err(format!(
-            "downloaded update checksum verification failed: {e}"
-        ));
+        let message = format!("downloaded update checksum verification failed: {e}");
+        return Err(if e.kind() == io::ErrorKind::InvalidData {
+            UpdateError::Checksum(message)
+        } else {
+            UpdateError::Other(message)
+        });
     }
     if let Some(expected) = &release.sha256 {
         crate::logging::update_checksum_verified(expected);
@@ -584,7 +631,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755)) {
             let _ = fs::remove_file(&tmp_path);
-            return Err(format!("chmod failed: {e}"));
+            return Err(format!("chmod failed: {e}").into());
         }
     }
 
@@ -1877,7 +1924,7 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
     clippy::print_stderr,
     reason = "user-facing progress on the controlling terminal during self-update — download / install / already-up-to-date lines belong on the operator's stderr"
 )]
-pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+pub(crate) fn self_update(options: SelfUpdateOptions) -> Result<Version, UpdateError> {
     let channel = UpdateChannel::configured();
     if is_homebrew_managed_install() {
         if channel == UpdateChannel::Preview {
@@ -1887,7 +1934,8 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         }
         return Err(format!(
             "self-update is disabled for Homebrew installs; run `{HOMEBREW_UPDATE_COMMAND}`"
-        ));
+        )
+        .into());
     }
 
     if is_mise_managed_install() {
@@ -1898,7 +1946,8 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         }
         return Err(format!(
             "self-update is disabled for mise installs; run `{MISE_UPDATE_COMMAND}`"
-        ));
+        )
+        .into());
     }
 
     if is_nix_managed_install() {
@@ -3358,7 +3407,14 @@ mod tests {
                         None => std::env::remove_var("PATH"),
                     }
                 }
-                assert!(matches!(result, Err(error) if error.contains("sha256 mismatch")));
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("checksum mismatch must refuse"),
+                };
+                assert!(error.to_string().contains("sha256 mismatch"));
+                assert_eq!(error.code(), Some(ErrorCode::ChecksumMismatch));
+                assert_eq!(error.exit(), crate::cli::exit::REFUSED);
+                assert_eq!(ErrorCode::from_code("checksum_mismatch"), error.code());
             }
         }
     }
@@ -3475,3 +3531,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod checksum_tests;

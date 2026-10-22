@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{self, Read},
+    io::{self, Read, Seek},
     path::Path,
 };
 
@@ -34,6 +34,7 @@ impl<'de> Deserialize<'de> for AssetRef {
                     .ok_or_else(|| serde::de::Error::custom("asset object is missing url"))?;
                 let sha256 = object
                     .remove("sha256")
+                    .filter(|value| !value.is_null())
                     .map(|value| {
                         value.as_str().map(str::to_string).ok_or_else(|| {
                             serde::de::Error::custom("asset sha256 must be a string")
@@ -84,7 +85,7 @@ pub(crate) fn verify_sha256(path: &Path, expected: &str) -> io::Result<()> {
         ));
     }
 
-    let actual = file_sha256(path)?;
+    let actual = file_sha256(&mut File::open(path)?)?;
     if actual != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -94,8 +95,9 @@ pub(crate) fn verify_sha256(path: &Path, expected: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn file_sha256(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
+/// Hash and rewind the same open handle that the remote installer streams.
+pub(crate) fn file_sha256(file: &mut File) -> io::Result<String> {
+    file.rewind()?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -105,6 +107,7 @@ fn file_sha256(path: &Path) -> io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
+    file.rewind()?;
     Ok(to_lower_hex(&hasher.finalize()))
 }
 
@@ -164,6 +167,34 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn null_checksum_is_absent_and_remains_unverified() {
+        let asset: super::AssetRef = serde_json::from_value(serde_json::json!({
+            "url":"https://example.invalid/asset", "sha256":null
+        }))
+        .unwrap();
+        assert_eq!(asset.sha256(), None);
+        let root = crate::test_support::TempDir::socket();
+        assert!(super::verify_asset(&root.path().join("not-downloaded"), asset.sha256()).is_ok());
+    }
+
+    #[test]
+    fn transfer_hash_uses_and_rewinds_the_open_handle_after_path_replacement() {
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("asset");
+        fs::write(&path, b"original").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        fs::rename(&path, root.path().join("moved")).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        let expected =
+            super::file_sha256(&mut std::fs::File::open(root.path().join("moved")).unwrap())
+                .unwrap();
+        assert_eq!(super::file_sha256(&mut file).unwrap(), expected);
+        let mut sent = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut sent).unwrap();
+        assert_eq!(sent, b"original");
     }
 
     #[test]
