@@ -136,6 +136,7 @@ impl AppQueue {
             generation: self.case.generation,
             leases: self.case.leases.clone(),
             state: self.case.fixture.root.path().to_owned(),
+            storage: Default::default(),
             mcp: self.case.fixture.mcp(),
             stall_after: STALL,
             queue_rewrite_bytes: max_policy(),
