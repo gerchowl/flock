@@ -36,7 +36,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Accept complete lines up to 2 MiB; larger lines produce explicit summaries.
 pub const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
-const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
+/// Recovery limit for one encoded record, including its terminating newline.
+pub(super) const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +71,18 @@ struct ControlPlane {
     input: mpsc::SyncSender<Input>,
 }
 
+/// Typed refusal: lossy stdout has not established whether the turn ended.
+/// Only a real result or a new runtime permits further stdin; inspecting this
+/// error or the status flag never clears the S3a guard.
+#[derive(Debug)]
+pub struct TurnEndUnknown;
+impl std::fmt::Display for TurnEndUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("structured_turn_end_unknown")
+    }
+}
+impl std::error::Error for TurnEndUnknown {}
+
 /// Durable stream location. Components are validated before any worker starts.
 pub struct StreamLocation {
     /// Existing flock data root (not the harness profile).
@@ -80,6 +93,14 @@ pub struct StreamLocation {
     pub agent: String,
     /// Session identifier with the same restrictions; `queue` is reserved (any case).
     pub session: String,
+}
+
+/// Shared safe namespace components for live and retained session files.
+pub(super) fn valid_component(component: &str) -> bool {
+    !component.is_empty()
+        && component
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
 }
 
 /// Trusted source of the record, assigned by the transport, never by stdout JSON.
@@ -93,10 +114,16 @@ pub enum RecordOrigin {
 }
 
 /// Lossless normal-line envelope; oversize/invalid UTF-8 lines use named summaries.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamRecord {
     /// Dense per-session cursor, continued when an existing stream is reopened.
     pub seq: u64,
+    /// Original receive-time classification; absent on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known: Option<bool>,
+    /// Original sender shape for unknown records, including observed version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<super::claude::ShapeKey>,
     /// Receive time in milliseconds since the Unix epoch.
     pub received_at_ms: u128,
     /// Trusted origin, distinct from any similarly named field inside `raw`.
@@ -192,6 +219,8 @@ pub enum Completion {
 /// result confirms the boundary. The supervisor owns socket refusal and cleanup.
 pub struct Transport {
     input: InputHandle,
+    /// Stored publication handle, shared only with the runtime owner.
+    pub(super) history: super::history::History,
     output: mpsc::Receiver<Received>,
     completion: mpsc::Receiver<Completion>,
 }
@@ -254,11 +283,7 @@ impl Transport {
         before_first_write: impl FnOnce() -> io::Result<()> + Send + 'static,
     ) -> io::Result<Self> {
         for component in [&location.agent, &location.session] {
-            if component.is_empty()
-                || !component
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-            {
+            if !valid_component(component) {
                 return Err(io::Error::other("invalid structured stream component"));
             }
         }
@@ -298,10 +323,17 @@ impl Transport {
             cancel.clone(),
             done.clone(),
         );
+        let history = super::history::History::default();
+        history.bind(&location.agent, &location.session);
+        let source = history.clone();
         thread::Builder::new()
             .name("session-stdout".into())
             .spawn(move || {
-                let result = pump(stdout, location, &version, output_tx, &b, &u, &c, &plane);
+                let _producer = source.producer();
+                let result = pump(
+                    stdout, location, &version, output_tx, &b, &u, &c, &plane, &source,
+                );
+                source.finish(result.is_err());
                 plane.book.lock().end();
                 if result.is_err() {
                     c.store(true, Ordering::Release);
@@ -331,6 +363,7 @@ impl Transport {
             return Err(err);
         }
         Ok(Self {
+            history,
             input: InputHandle {
                 input: Some(input),
                 accepted: accepted_tx,
@@ -501,6 +534,11 @@ impl InputHandle {
         self.busy.load(Ordering::Acquire)
     }
 
+    /// Read-only observation of the existing unconfirmed-boundary guard.
+    pub(super) fn turn_end_unknown(&self) -> bool {
+        self.uncertain.load(Ordering::Acquire)
+    }
+
     /// Offer one user envelope at idle. WouldBlock means busy; it never queues a
     /// mid-turn steering write. Input is capped before serialization allocation.
     /// Success records acceptance for S4's caller-supplied stall policy, even if
@@ -526,7 +564,7 @@ impl InputHandle {
             ));
         }
         if self.uncertain.load(Ordering::Acquire) {
-            return Err(io::Error::other("structured_turn_end_unknown"));
+            return Err(io::Error::other(TurnEndUnknown));
         }
         let permissions = self
             .permissions
@@ -706,7 +744,10 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
     private_fs::ensure_private_dir(&dir)?;
     let path = dir.join(format!("{}.jsonl", location.session));
     let mut file = match private_fs::create_private_file(&path) {
-        Ok(file) => return Ok((file, 0)),
+        Ok(file) => {
+            drop(file);
+            return Ok((private_fs::open_append_file(&path)?, 0));
+        }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => private_fs::open_append_file(&path)?,
         Err(e) => return Err(e),
     };
@@ -771,10 +812,12 @@ fn pump(
     uncertain: &AtomicBool,
     cancel: &AtomicBool,
     controls: &ControlPlane,
+    history: &super::history::History,
 ) -> io::Result<()> {
     let blobs = super::blobs::BlobStore::open(&location.data_dir).map_err(io::Error::other)?;
     let threshold = location.storage.blob_min_bytes;
     let (mut file, mut seq) = open_stream(location, cancel)?;
+    history.initialize(&file, seq)?;
     let mut recorder = control::Recorder::new(
         &mut file,
         &mut seq,
@@ -784,7 +827,7 @@ fn pump(
         uncertain,
         cancel,
         controls,
-        (&blobs, threshold),
+        (&blobs, threshold, history),
     );
     let result = (|| {
         let mut line = Vec::new();
@@ -877,7 +920,7 @@ fn emit(
     uncertain: &AtomicBool,
     cancel: &AtomicBool,
     synthetic: bool,
-    storage: (&super::blobs::BlobStore, usize),
+    storage: (&super::blobs::BlobStore, usize, &super::history::History),
 ) -> io::Result<()> {
     let received = persist(
         file, seq, line, count, version, busy, uncertain, synthetic, None, None, storage,
@@ -896,7 +939,7 @@ fn persist(
     synthetic: bool,
     grant_request_id: Option<&str>,
     permission_request_seq: Option<u64>,
-    storage: (&super::blobs::BlobStore, usize),
+    storage: (&super::blobs::BlobStore, usize, &super::history::History),
 ) -> io::Result<Received> {
     let origin = if synthetic || count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err()
     {
@@ -950,6 +993,11 @@ fn persist(
             .ok_or_else(|| io::Error::other("session sequence exhausted"))?;
     }
     let mut record = StreamRecord {
+        known: Some(!matches!(event, SessionEvent::Unknown { .. })),
+        shape: match &event {
+            SessionEvent::Unknown { shape, .. } => Some(shape.clone()),
+            _ => None,
+        },
         seq: *seq,
         received_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -967,6 +1015,9 @@ fn persist(
         encoded.push(b'\n');
         file.write_all(&encoded)?;
         file.sync_data()?;
+        let stored = Arc::new(record);
+        storage.2.publish(stored.clone(), encoded.len())?;
+        record = Arc::unwrap_or_clone(stored);
         record.raw = live_raw;
     }
     if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {

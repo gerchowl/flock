@@ -5,6 +5,26 @@ use crate::codex_version::{Compatibility, TESTED_VERSION};
 use std::{fs, process::Stdio};
 
 const CEILING: Duration = Duration::from_secs(5);
+// Only fixtures block for actual producer evidence, with one shared ceiling.
+// The production controller API performs no receive or notification wait.
+fn wait<'a>(
+    worker: &'a mut Worker,
+    binding: &mut Binding,
+    owners: &mut Ownership,
+    clock: impl Fn() -> Instant,
+) -> Result<Option<&'a Evidence>, Fault> {
+    worker.tick(binding, owners, clock())?;
+    if let Some(at) = worker.flight {
+        let remaining = WORK_TIMEOUT
+            .saturating_sub(clock().saturating_duration_since(at))
+            .min(CEILING);
+        worker
+            .wakes
+            .recv_timeout(remaining)
+            .expect("reader notification missing or producer disconnected");
+    }
+    worker.tick(binding, owners, clock())
+}
 struct Rig {
     fixture: Fixture,
     binding: Binding,
@@ -50,9 +70,13 @@ impl Rig {
                 Instant::now() < end,
                 "producer wakes never completed a work unit"
             );
-            self.worker
-                .wait(&mut self.binding, &mut self.owners, || self.now)
-                .unwrap();
+            wait(
+                &mut self.worker,
+                &mut self.binding,
+                &mut self.owners,
+                || self.now,
+            )
+            .unwrap();
             if self.worker.flight.is_none() {
                 return self
                     .worker
@@ -173,9 +197,10 @@ fn source_loss_and_reused_writer_identity_invalidate_cached_evidence() {
         let failure = if writer_mismatch {
             rig.tick().unwrap_err()
         } else {
-            rig.worker
-                .wait(&mut rig.binding, &mut rig.owners, || rig.now)
-                .unwrap_err()
+            wait(&mut rig.worker, &mut rig.binding, &mut rig.owners, || {
+                rig.now
+            })
+            .unwrap_err()
         };
         assert_eq!(
             failure,
@@ -246,7 +271,7 @@ fn local_writer_exit_is_observed_before_delivery_of_queued_results() {
     .unwrap();
     let now = Instant::now();
     let mut worker = Worker::new(admission, &mut binding, &mut owners, now).unwrap();
-    worker.wait(&mut binding, &mut owners, || now).unwrap();
+    wait(&mut worker, &mut binding, &mut owners, || now).unwrap();
     assert_eq!(binding.decision(&owners), Decision::Bound);
     worker
         .tick(&mut binding, &mut owners, now + EOF_INTERVAL)
@@ -348,28 +373,6 @@ fn alive_but_silent_reader_times_out_without_renewing_cached_idle_or_working() {
 }
 
 #[test]
-fn missing_notification_has_a_bounded_failure_and_does_not_reset_the_work_budget() {
-    let mut rig = Rig::new(1024);
-    rig.admitted();
-    let silent = Silent::install(&mut rig);
-    rig.now = rig.worker.next_due();
-    rig.tick().unwrap();
-    let dispatch = rig.worker.flight.unwrap();
-    // Wait's remaining budget is zero on its second supplied-clock sample.
-    let calls = AtomicUsize::new(0);
-    let result = rig.worker.wait(&mut rig.binding, &mut rig.owners, || {
-        if calls.fetch_add(1, Ordering::Relaxed) == 0 {
-            dispatch
-        } else {
-            dispatch + WORK_TIMEOUT
-        }
-    });
-    assert_eq!(result.unwrap_err(), Fault::Stalled);
-    assert_eq!(rig.binding.decision(&rig.owners), Decision::Unknown);
-    drop(silent);
-}
-
-#[test]
 fn dead_or_disconnected_reader_cannot_leave_cached_evidence_authoritative() {
     for admitted in [false, true] {
         let mut rig = Rig::new(1024);
@@ -461,9 +464,7 @@ fn stale_result_retirement_and_duplicate_live_ownership_cannot_restore_authority
         )
         .unwrap();
         let mut worker = Worker::new(a, &mut rig.binding, &mut rig.owners, rig.now).unwrap();
-        worker
-            .wait(&mut rig.binding, &mut rig.owners, || rig.now)
-            .unwrap();
+        wait(&mut worker, &mut rig.binding, &mut rig.owners, || rig.now).unwrap();
         assert_eq!(rig.binding.decision(&rig.owners), Decision::Bound);
         assert_eq!(rig.tick().unwrap_err(), Fault::Revoked);
         worker.stop(&mut rig.binding, &mut rig.owners);
@@ -510,9 +511,7 @@ fn compaction_handoff_stays_owned_and_destination_requires_its_own_local_claim()
     )
     .unwrap();
     let mut compact = Worker::new(a, &mut rig.binding, &mut rig.owners, rig.now).unwrap();
-    compact
-        .wait(&mut rig.binding, &mut rig.owners, || rig.now)
-        .unwrap();
+    wait(&mut compact, &mut rig.binding, &mut rig.owners, || rig.now).unwrap();
     assert_eq!(compact.evidence.as_ref().unwrap().boundary, before);
     let handoff = compact
         .handoff(&mut rig.binding, &mut rig.owners, rig.now)
@@ -606,7 +605,7 @@ fn copied_history_needs_destination_home_writer_validation_and_a_new_boundary() 
     )
     .unwrap();
     let mut worker = Worker::new(a, &mut dest, &mut rig.owners, rig.now).unwrap();
-    worker.wait(&mut dest, &mut rig.owners, || rig.now).unwrap();
+    wait(&mut worker, &mut dest, &mut rig.owners, || rig.now).unwrap();
     assert_eq!(
         worker
             .evidence
@@ -648,9 +647,7 @@ fn failed_worker_admission_preserves_the_launch_trust_scope() {
         .unwrap();
         let mut worker = Worker::new(a, &mut rig.binding, &mut rig.owners, rig.now).unwrap();
         assert_eq!(
-            worker
-                .wait(&mut rig.binding, &mut rig.owners, || rig.now)
-                .unwrap_err(),
+            wait(&mut worker, &mut rig.binding, &mut rig.owners, || rig.now).unwrap_err(),
             Fault::Source(Error::Record(Reason::MalformedRecord))
         );
         assert_eq!(
@@ -663,4 +660,65 @@ fn failed_worker_admission_preserves_the_launch_trust_scope() {
         );
         drain_closed(&worker.replies);
     }
+}
+
+#[test]
+fn late_tick_accepts_queued_work_before_checking_the_outstanding_deadline() {
+    for work_bytes in [7, 1024] {
+        let mut rig = Rig::new(work_bytes);
+        rig.tick().unwrap();
+        // Real worker publication precedes the delayed controller clock sample.
+        rig.worker
+            .wakes
+            .recv_timeout(CEILING)
+            .expect("worker never published its result");
+        rig.now += WORK_TIMEOUT + Duration::from_secs(1);
+        let progress_at = rig
+            .tick()
+            .expect("ready work was mistaken for a stalled reader")
+            .unwrap()
+            .progress_at;
+        assert_eq!(progress_at, rig.now);
+        assert!(rig.worker.flight.is_none());
+        assert!(rig.worker.fault.is_none());
+        rig.now = rig.worker.next_due();
+        rig.admitted();
+        let boundary = rig.worker.evidence.as_ref().unwrap().boundary.clone();
+        rig.now = rig.worker.next_due();
+        rig.tick().unwrap();
+        rig.worker
+            .wakes
+            .recv_timeout(CEILING)
+            .expect("bound reader never completed its unit");
+        rig.now += WORK_TIMEOUT + Duration::from_secs(1);
+        assert_eq!(rig.tick().unwrap().unwrap().boundary, boundary);
+        assert_eq!(rig.binding.decision(&rig.owners), Decision::Bound);
+    }
+}
+
+#[test]
+fn wake_poll_returns_without_waiting_for_a_live_silent_producer() {
+    let mut rig = Rig::new(1024);
+    rig.admitted();
+    let (producer, wake_rx) = mpsc::sync_channel(1);
+    rig.worker.wakes = wake_rx;
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let polled = rig.worker.poll_wake();
+        result_tx
+            .send(polled)
+            .expect("wake poll consumer disappeared");
+        drop(rig);
+        stopped_tx
+            .send(())
+            .expect("wake poll cleanup consumer disappeared");
+    });
+    let result = result_rx.recv_timeout(CEILING);
+    // Also unblock an injected blocking regression before asserting failure.
+    drop(producer);
+    stopped_rx
+        .recv_timeout(CEILING)
+        .expect("wake poll producer failed to stop");
+    assert!(!result.expect("wake poll blocked on a live silent producer"));
 }
