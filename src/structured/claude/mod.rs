@@ -304,7 +304,7 @@ macro_rules! events {
         /// Unknown events reach clients only through ADR-0036 §8's wrapper.
         /// Deserialization uses the adapter parser and rejects unknown payloads;
         /// those require the separate unknown wrapper, including its shape key.
-        #[cfg(any(test, feature = "ts"))]
+        #[cfg(any(test, feature = "ts", feature = "web"))]
         #[derive(Debug, Clone, PartialEq, Serialize)]
         #[serde(untagged)]
         #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -314,7 +314,7 @@ macro_rules! events {
             $($(#[$doc])* $name(Box<$name>),)*
         }
 
-        #[cfg(any(test, feature = "ts"))]
+        #[cfg(any(test, feature = "ts", feature = "web"))]
         impl<'de> Deserialize<'de> for KnownSessionEvent {
             fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 let value = Value::deserialize(d)?;

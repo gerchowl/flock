@@ -368,6 +368,10 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
 
 Slice A adds the scoped local request envelope and server admission. Slice B of #1734 supplies mandatory generated MCP credentials and immutable transport propagation; public structured starts remain gated until both land. Legacy unscoped CLI/MCP requests retain their existing policy. Credentials are not operator/client tokens and never appear in logs, errors or status. Failed scoped decoding or authentication cannot be retried through legacy dispatch. Revocation precedes cleanup and lease removal; scoped subscriptions close on revoked or unreadable identity. Operations admitted before root loss may finish with agent authority only. The scoped verifier requires a living kernel process, not merely a matching birth time: zombies cannot authorize admission. The local envelope is `{"request": <Request>, "credential": <LeaseCredential>}`; malformed scoped envelopes return `invalid_request`, authentication failures return `not_authorized`, and neither path retries as a legacy request.
 
+Slice B of #1734 provisions each generation credential only in the generated private MCP configuration's child environment (`FLOCK_MCP_LEASE_CREDENTIAL`), alongside an explicit `mcp serve --structured` mode. It never enters Claude's launch environment or process arguments. Before reading stdin, the MCP child captures that mode, the absolute socket endpoint and the credential into immutable client state. Calls, compatibility probes, subscriptions and reconnects use that same state. Missing, malformed or inconsistent configuration fails startup; authentication failure never selects unscoped transport. Ordinary unscoped MCP remains compatible. Public structured starts still require the registry/start slice (#1439).
+
+Scoped verification never waits for the lease registry lock: contention has a typed refusal and no snapshot fallback. Each admission performs at most sixteen kernel process-fact reads, refusing ancestry beyond that budget. This is a bounded supported ancestry depth, not permission to trust partial evidence. Credential comparison uses opaque accumulation (`core::hint::black_box`) to prevent optimizer replacement with an early-exit comparison. Encoded credential length is public format information. Legacy unscoped malformed requests retain serde diagnosis; scoped schema failures keep their fixed, secret-free error. JSON syntax diagnostics contain no field values.
+
 ### 2. Mapping session events onto flk state, questions and waits
 
 A new `StateSource::Session` joins `Screen`, `Hook`, `Plugin`,
@@ -774,11 +778,12 @@ same queue (owner decision 5): there is no second input path.
   anchor?: { item_id | correlation_id | question_id | fork_point },
   priority: normal | urgent,          ordering only: which waiting item goes first
   delivery: at_idle | steer | interrupt,   timing only: when the item is written
-  state: queued | held | stashed | delivered | done | cancelled | dropped,
+  state: queued | held | stashed | delivered | done | cancelled | dropped | failed,
   (queued → delivered → done | cancelled; queued → held | stashed | dropped;
-   held | stashed → queued; delivered → held when the process dies without a result)
+   held | stashed → queued; queued → failed with a typed refusal;
+   delivered → held when the process dies without a result)
   stash?: name,                       which stash a stashed item is in
-  edit_lease?: { client, until_ms },  an open editor; the item is skipped while it holds
+  edit_lease?: { client, until_ms },  human producers only; skipped while it holds
   batch_id?: uuid,                    the message the item was written in
   relevant_now?: { p, band },         the last relevance check (below)
   body, attachments: [blob refs] }
@@ -835,6 +840,17 @@ same queue (owner decision 5): there is no second input path.
   that every item in it records; a one-item batch uses the `item_id` as its
   uuid, as before. `command_lifecycle` for that uuid moves all its items
   together. Up to `[queue] max_batch` (default 8) items go in one batch.
+
+  **Command exception (architect decision for #1802, 2026-10-17).** A harness
+  slash-command item is sent **verbatim**, as the sole text block of its own
+  isolated turn, without a producer label and never batched with another item.
+  The label would break command parsing. Attribution remains in the queue item
+  and its audit/lifecycle records. Only an operator may create command items:
+  the operator composer or `flk agent send` authenticated as operator/token
+  principal. Text from agents, MCP or relayed peers that starts with `/` remains
+  ordinary input, wrapped in the normal producer-labelled template, and cannot
+  become a harness command. Neither a slash prefix nor a claimed producer in
+  request JSON grants operator authority.
 - **Relatedness joins (owner decision 5).** After rules 1 to 4, when
   System One is configured (§2a's `[systemone]` client), the server asks
   it, in one call, one `noul` per candidate among the next
@@ -910,6 +926,18 @@ same queue (owner decision 5): there is no second input path.
     flk never uses it for a take-back.
 - **Acknowledgement (E3).** `command_lifecycle` drives the item state, so
   "delivered" means the harness started it, not that bytes were written.
+- **Pending turns (architect revised decision, #1896 review).** Only a real
+  result consumed by the queue owner or runtime exit/error ends its reservation.
+  Harness cancellation keeps the items cancelled while waiting for the result;
+  operator take-back (§3 above) is a separate operation, not implemented by this
+  worker slice. Indeterminate loss retains the S3a writer guard. Status reports
+  the batch ID, original reservation time and an explicit cause: `awaiting_result`,
+  `turn_end_unknown` or `cancelled_awaiting_result`. A refused uncertain offer
+  writes no stdin and restores its original queued items instead of holding them
+  as `input_write_failed`. A real result or runtime exit/restart recovers the
+  pending state; restart holds unresolved items `session_unconfirmed`, never
+  automatically resending them. No queue timeout is inferred from pending age.
+  Stall observation belongs to the session state/supervision policy.
 - **Ported producers.** `msg.send` / `msg.reply` delivery to a structured
   agent becomes a queue item instead of the inbox nudge and knock order
   (ADR-0026, which superseded the delivery contracts of ADR-0008, ADR-0018
@@ -929,9 +957,33 @@ live. The misses came from an external, client-side supervisor that polled
 `agent_status` every few minutes and missed short idle windows between
 back-to-back turns. For a structured agent there is no polling at all:
 
+- **Input framing (architect decision, #1885 review).** Every non-command
+  item uses a single header line `From <producer> (item <item_id>):` with
+  reply metadata and `Attachments (blob refs): <JSON refs>` on that line.
+  Producer/attachment values are JSON-encoded so embedded newlines remain
+  escaped, including U+2028, U+2029 and U+0085. Attachment strings must be
+  content-addressed `blob:<sha256>` refs: exactly 64 lowercase hex digits
+  after `blob:`. Reply `question_id` must be a canonical lowercase hyphenated
+  UUID. The next line is `<<<flk-item <nonce>`, followed
+  by the literal body and a final line `flk-item <nonce>>>>`. Here `<nonce>`
+  denotes 128 random bits encoded as 32 lowercase hex digits. Generate a
+  fresh nonce per rendered item and regenerate if its hex string occurs
+  anywhere in the body. Sender text, including fake labels, attachment lines
+  or delimiters, remains inside that item's block. Attachments and reply
+  metadata never enter the body block. The operator-only native command
+  exception in §3 remains verbatim and isolated. Admission and replacement
+  validate anchors and refs, refusing `invalid_request` before writing.
+  Rendering validates again: an invalid head becomes durably `failed`
+  with its typed refusal, allowing subsequent items through. A valid prefix
+  is delivered before a later malformed item is failed.
 - **Trigger.** The turn end is the `result` event (E1). An armed self-compact
   (`flock_self_compact`, `flk pane arm-self-compact`) queues a `command`
-  item with body `/compact`, `delivery: at_idle`, `priority: urgent`. By
+  item with body `/compact`, `delivery: at_idle`, `priority: urgent`. The §3
+  command exception applies to direct command items: operator authorization
+  is required, the body is sent verbatim alone, and attribution stays in
+  queue/audit records. The agent-initiated self-compact authorization path
+  belongs to S5c (#1879); this admission slice does not implement or grant it.
+  An agent's recap or supervisor text cannot manufacture that authority. By
   §3, `at_idle` means it is never written into a running turn, and `urgent`
   means it is the first item written after that `result`, ahead of any
   `normal` `at_idle` item. Background shells, held waits and subagents do not matter, because
@@ -949,6 +1001,26 @@ back-to-back turns. For a structured agent there is no polling at all:
   did for a `pty` agent.
 
 ### 4. Storage
+
+Owner amendment (#1820): each queue identity header declares a journal format
+version. Missing stamps mean version 1. Append/checkpoint require a journal
+version no greater than the writer's supported version, and checkpoint writes
+the writer's own version before any new-format append. Bump for every new kind,
+top-level field or enum name. Newer journals load read-only with persistence
+leniency (ADR-0028 §3a), preserving raw bytes without repair or rewriting.
+Every mutation returns typed `queue_journal_newer { found, supported }`;
+queue status exposes the refusal, which requires a compatible writer and must
+never be retried in a loop. Opaque checkpoint passthrough is forbidden because
+an older writer cannot preserve unknown records' interleaving semantics.
+Owner clarification (#1820): unknown kinds/fields/enum names follow lenient
+recovery, with raw bytes preserved and unknown semantics never delivered.
+Malformed known records in supported formats load read-only as
+`queue_journal_corrupt { seq, offset, reason }`: stop folding, refuse every
+mutation/checkpoint and preserve the whole file. Operator recovery is outside
+this slice. A crash-torn final line keeps the existing truncation/sync path;
+it is not corruption. Neither read-only mode permits tail repair.
+The fsync-temp, rename, fsync-directory rule below is unchanged.
+
 
 - **Per-agent session stream.** Every stdout line of a structured agent is
   appended, with a per-stream `seq` and a receive timestamp, to
@@ -1005,7 +1077,23 @@ back-to-back turns. For a structured agent there is no polling at all:
   `<data dir>/blobs/<sha256>` and the stored line keeps `{blob: sha256,
   size, preview}` in its place. Partial deltas (`stream_event`) are relayed
   live and not persisted; the complete `assistant` event that follows carries
-  the same content.
+  the same content. A corrupt object is repaired by a verified put. Only repairs
+  attempt serialization across stores/processes using an advisory directory lock;
+  first writes never lock, since racing Missing writers publish identical verified
+  bytes without repair events. Contended nonblocking acquisition backs off on
+  the supplied monotonic clock: sleep 1 ms, doubling thereafter and clipping each
+  request to the remaining 20 ms budget. Elapsed time bounds normal contention;
+  eight attempts only guard against a clock/sleeper that fails to advance.
+  Clock expiry reports `TimedOut`; attempt exhaustion reports `WouldBlock`.
+  The bounds apply to requested sleeps, not OS scheduling or filesystem latency.
+  On a lock error or exhaustion, one `structured.blob.repair_lock_unavailable`
+  warning names only the error kind
+  and blob hash, then publication proceeds without the lock. The current object
+  is reverified before rename; coordinated writers emit `structured.blob.repaired`
+  only when replacing corrupt bytes, after directory fsync, with hash and size,
+  never content. Fallback may duplicate that diagnostic but must not lose a blob
+  or stop the pump because locking failed. Other filesystem I/O failures remain
+  explicit. Direct filesystem mutations outside the lock are not coordinated.
 - **Rehydrate.** The native transcript Claude writes under the profile is a
   disposable working copy. A byte prefix of it (E11) is the only thing flk
   ever writes back, under a new session uuid, and only for a fork behind a
@@ -1084,6 +1172,10 @@ server → client
   lagged  { sub_id, skipped_to }              closes id; fresh sub, no unsub (§5a)
   ack     { cmd_id, ok, result? | error{ code, message, exit, retry } }
 ```
+
+Agent replay preserves the receive-time `known`/`shape` provenance of §5a/§8.
+Legacy records without it produce `provenance_missing` history gaps while later
+records continue. Replay never reclassifies using the current harness version.
 
 **S7-min fleet and permission contracts (#1746).** The `fleet` snapshot stream
 lists structured agents as `FleetAgentRow { id, label, state: AgentState,
@@ -1186,6 +1278,11 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   infeasible. Keep the store bounded at 128 live codes and request bodies at
   1024 bytes. Cross-origin and non-loopback requests are refused, and neither
   codes nor tokens enter diagnostic logs.
+  The opener's URL argument is an explicit credential-in-argv exception:
+  `open`/`xdg-open` have no stdin or environment URL channel. The exchange code
+  is visible through `ps` for the opener's lifetime. Single use, the 60-second
+  TTL and fragment-only transport bound this known exposure; process logging
+  masks the code. This exception does not permit long-lived tokens in argv.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location
   (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.
@@ -1281,12 +1378,40 @@ policy does not retry a condition assertion or declare a command successful.
 WS close **4401** means auth refused during hello; **4403** means token revoked
 mid-session. Both enter NeedsToken, holding the outbox without reconnecting until
 a new token arrives. These codes differ from protocol failures (visible error,
-capped reconnect) and network loss (reconnect).
+capped reconnect) and network loss (reconnect). A verified socket whose
+post-registration token recheck misses the handshake deadline or loses its store
+worker closes with **1001**, preserving the credential for reconnect. A failed
+welcome send drops the transport without attempting an auth close; it cannot
+establish revocation. Only a credential that no longer authenticates, a changed verified principal,
+or a revocation signal justifies **4403** after registration.
 Frames for a closed subscription ID are silently dropped. A frame for an ID
 never opened on the current connection is a protocol error, not a closed-ID case.
 Protocol errors close with a visible diagnosis and capped reconnect (a server
 upgrade can cure them). A newer client follows §5's ReadOnly capabilities and
 holds commands; it can keep reading and detecting stale transport.
+
+**Session replay provenance (S7-min slice 3, #1829).** New session-store
+`StreamRecord`s add optional `known` (boolean) and `shape` (the original
+`ShapeKey` string). The receive-time adapter sets `known`; unknown events retain
+the original sender's harness/version-scoped `shape`. Known records keep their
+stored blob projection. Readers ignore additive envelope fields under ADR-0028
+§3a. Replay never invokes the current parser to reconstruct classification or
+shape. A legacy record without classification, or an unknown without its shape,
+yields a typed history gap with reason `provenance_missing`; later records still
+replay. It is neither a whole-replay refusal nor an entity snapshot. A missing
+retained prefix uses the same gap path with reason `retained_prefix`.
+
+The registry's runtime stream owner registers bounded continuation and captures
+its durable head under one publication lock. An owned file cut pages through that
+head before exactly one `synced`; subsequent publications cannot fall between
+registration and the barrier. Capture and registration are one operation over
+the locked book; constructing the owned cut afterwards cannot open a hole.
+Replay retains unread page bytes. Runtime-only, source-fenced byte checkpoints
+let a consumer resume its applied cursor after lag without rescanning the prefix;
+they are neither new wire fields nor durable cursor authority. Lag terminates
+unfinished replay on its next page. Terminal permission audits use this same source,
+even when runtime notification delivery is cancelled. Partial deltas consume no
+durable cursor and do not enter this source. The S4 reader remains singular.
 
 **Replay and resync.** Reconnect authenticates again, then sends each seq
 stream's `sub { after:last_applied_seq }`, preserving any unfinished resync
@@ -1650,6 +1775,11 @@ encodes non-JSON diagnostics as a JSON string.
   discriminators distinguish SSE and control envelopes that otherwise share
   the same top-level shape. Missing discriminators are null. This refines the
   key's representation without changing the owner decision.
+- **Replay provenance.** The §5 session-store `known`/`shape` metadata fixes
+  the sender's original classification and version-scoped key across restarts
+  and parser upgrades. A now-known payload originally classified unknown still
+  uses its original unknown wrapper. Missing legacy provenance emits the
+  `provenance_missing` history gap and replay continues, without recomputation.
 - **Rendering.** Every frontend renders `Unknown` (and a known event's
   `extra`) as a collapsible JSON dump with the shape key as its title. That
   rendering is part of the reference client and of the TUI's structured view.

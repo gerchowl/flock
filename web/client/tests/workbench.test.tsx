@@ -12,6 +12,7 @@ import type { ServerFrame } from "../src/gen/ServerFrame";
 import { createFixtureFleet, type AgentRow, type FleetObserver, type FleetSource } from "../src/fleet";
 import { createManager, emptyLayout, type Layout } from "../src/layout/model";
 import { createFixtureTransport } from "../src/transport/fixture";
+import { OUTBOX_KEY } from "../src/wire/outbox";
 import { createWireTransport } from "../src/wire/transport";
 import { STATUS_LABELS, phaseLine, rowLine, sendHint, type Sender } from "../src/workbench/Composer";
 import type { AgentState } from "../src/gen/AgentState";
@@ -586,9 +587,9 @@ describe("composer", () => {
     const statuses = Object.keys(STATUS_LABELS) as (keyof typeof STATUS_LABELS)[];
     const commands = statuses.map((status, i) => ({ cmd_id: `c${i}`, verb: "agent.send", args: { target: "p0", text: `m${i}`, submit: true }, principal: "p", created_ms: 0, status }));
     const all: Sender = { commands: () => commands, send: () => "c9", decide: () => "c10", blocked: () => null };
-    const agents: AgentRow[] = [...phases.map((state, i) => ({ id: `p${i}`, label: `p${i}`, state, activity: "", waitingOnHuman: [] })), { id: "unlisted", label: "unlisted", state: "working", activity: "", waitingOnHuman: [] }];
-    let shown: AgentRow[] = agents;
-    const root = mount(() => <Workbench fleet={{ subscribe: (o) => (queueMicrotask(() => o.rows(shown)), () => undefined) }} transport={createFixtureTransport("")} inbox={[]} sender={all} layout={emptyLayout()} saveLayout={() => undefined} source="live" />);
+    const agents: AgentRow[] = phases.map((state, i) => ({ id: `p${i}`, label: `p${i}`, state, activity: "", waitingOnHuman: [] }));
+    let fleet: FleetObserver | undefined;
+    const root = mount(() => <Workbench fleet={{ subscribe: (o) => ((fleet = o), queueMicrotask(() => o.rows(agents)), () => undefined) }} transport={createFixtureTransport("")} inbox={[]} sender={all} layout={emptyLayout()} saveLayout={() => undefined} source="live" />);
     await tick();
     const texts: string[] = [];
     for (const row of $$(root, "agent-row") as HTMLButtonElement[]) {
@@ -599,8 +600,12 @@ describe("composer", () => {
     ($$(root, "agent-row")[0] as HTMLButtonElement).click();
     expect($$(root, "sent-message")).toHaveLength(statuses.length);
     texts.push($(root, "composer")?.textContent ?? "");
-    shown = [];
-    expect(texts).toHaveLength(agents.length + 1);
+    // The focused agent leaves the list: its composer states the undefined row (`rowLine(undefined)`).
+    fleet?.rows([]);
+    expect($$(root, "agent-row")).toHaveLength(0);
+    expect($(root, "agent-phase")?.textContent).toBe(rowLine(undefined).line);
+    texts.push($(root, "composer")?.textContent ?? "");
+    expect(texts).toHaveLength(agents.length + 2);
     for (const text of texts) expect(text.toLowerCase()).not.toMatch(/deliver|queued until/);
   });
 
@@ -627,6 +632,60 @@ describe("composer", () => {
     const cmd = sentFrames(h).find((frame) => (frame as { t: string }).t === "cmd") as { cmd_id: string };
     h.net.current().deliver({ t: "ack", cmd_id: cmd.cmd_id, ok: true });
     expect($$(root, "sent-message").map((item) => item.textContent)).toEqual(["continueaccepted by the server"]);
+  });
+
+  test("the send cursor is stored with the outbox record, and never sent (#1773)", () => {
+    const h = new Harness();
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    search.value = "atlas";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($$(root, "palette-item")[0] as HTMLElement).click();
+    h.net.current().deliver({ t: "ev", sub_id: agentSub(h, "atlas"), stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "older" } } });
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: 1 });
+    const box = $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
+    box.value = "please rebase";
+    box.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($(root, "composer") as HTMLFormElement).requestSubmit();
+    const stored = JSON.parse(h.store.getItem(OUTBOX_KEY) ?? "null") as { commands: { echo_after?: number }[] };
+    expect(stored.commands.map((command) => command.echo_after)).toEqual([1]);
+    const cmd = sentFrames(h).find((frame) => (frame as { t: string }).t === "cmd");
+    expect(Object.keys(cmd as object).sort()).toEqual(["args", "cmd_id", "resume_only", "t", "verb"]);
+  });
+
+  test("after a reload, a restored pending message is accepted and its event arrives: it shows once (#1773)", () => {
+    const h = new Harness();
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    // What the composer stored before the reload: sent at cursor 1, still pending.
+    const restored = { cmd_id: "c-restored", verb: "agent.send", args: { target: "atlas", text: "please rebase", submit: true }, principal: "fixture-principal", created_ms: 0, status: "pending", echo_after: 1 } as const;
+    h.step(step({ step: "given", cursors: {}, outbox: [restored] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
+    expect(sentFrames(h).find((frame) => (frame as { t: string }).t === "cmd")).toMatchObject({ cmd_id: "c-restored", resume_only: false });
+    h.net.current().deliver({ t: "ack", cmd_id: "c-restored", ok: true });
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    search.value = "atlas";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($$(root, "palette-item")[0] as HTMLElement).click();
+    const said = (seq: number, text: string): void =>
+      h.net.current().deliver({ t: "ev", sub_id: agentSub(h, "atlas"), stream: "agent/atlas", seq, ts_ms: 0, ev: { type: "user", message: { role: "user", content: text } } });
+    said(1, "older");
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: 1 });
+    expect(listed(root)).toEqual(["please rebaseaccepted by the server"]);
+    said(2, "please rebase");
+    expect($(root, "focus-pane")?.textContent?.split("please rebase").length).toBe(2);
+    expect(listed(root)).toEqual([]);
   });
 
   test("an acked message whose echo differs in text shows as accepted, then folds at the next person's turn", () => {

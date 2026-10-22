@@ -12,11 +12,20 @@
  * person's turn has arrived after an accepted message, it leaves "Your
  * messages", so it shows once.
  *
- * Folding needs the transcript's cursor at the send, recorded only while
- * the transcript is Current; a message sent earlier is not foldable and
- * stays listed. Each person's turn after the cursor folds one message: one
- * with the same text first, then any, since the echo's text may differ
- * (whitespace, for example).
+ * Folding needs the transcript's cursor at the send, taken only while the
+ * transcript is Current; a message sent earlier is not foldable and stays
+ * listed. The cursor is stored with the outbox record (`echo_after`,
+ * `outbox.ts`), so a message restored after a reload still folds (#1773).
+ * Each person's turn after the cursor folds one message: one with the same
+ * text first, then any, since the echo's text may differ (whitespace, for
+ * example).
+ *
+ * Known limit: "any person's turn" includes one that is not this message's
+ * event, such as a line typed into the agent's terminal after the send. It
+ * folds a waiting message too, which then leaves "Your messages" although
+ * its own event has not arrived. Matching is not widened by heuristics:
+ * the real fix is server-side correlation, the transcript event carrying
+ * the command's `cmd_id` (#1677).
  *
  * Drafts are kept per agent while the workbench is open, so switching
  * agents never loses one.
@@ -41,8 +50,11 @@ import type { OutboxEntry } from "../wire/outbox";
 export type Sender = {
   /** The outbox, oldest first; reactive. */
   readonly commands: () => readonly OutboxEntry[];
-  /** Queues `agent.send`; throws when no principal is known yet. */
-  readonly send: (agent: string, text: string) => string;
+  /**
+   * Queues `agent.send`, storing `echoAfter` with the command (the
+   * composer's send cursor, or null); throws when no principal is known yet.
+   */
+  readonly send: (agent: string, text: string, echoAfter: number | null) => string;
   /** Queues `agent.decide`; throws when no principal is known yet. */
   readonly decide: (args: AgentDecide) => string;
   /** Why sending is impossible right now, or null. */
@@ -120,9 +132,8 @@ export function sendHint(platform: string): string {
 type Seen = { readonly cursor: number; readonly texts: ReadonlyMap<number, string>; readonly current: boolean };
 
 /**
- * Composer state that outlives one agent's composer: drafts by agent, what
- * each agent's transcript has shown, and the transcript cursor each sent
- * message was sent at.
+ * Composer state that outlives one agent's composer: drafts by agent, and
+ * what each agent's transcript has shown.
  */
 export type ComposerState = {
   readonly drafts: Map<string, string>;
@@ -130,16 +141,18 @@ export type ComposerState = {
   readonly observe: (agent: string, seq: number, text: string | null) => void;
   /** The agent's transcript stream became Current, or (re)started replaying. */
   readonly current: (agent: string, current: boolean) => void;
-  /** `cmdId` was just sent to `agent`. */
-  readonly sent: (agent: string, cmdId: string) => void;
-  /** Which accepted commands' events the transcript has shown (see the module doc). */
-  readonly echoed: (agent: string, accepted: readonly { readonly cmdId: string; readonly text: string }[]) => ReadonlySet<string>;
+  /** The cursor a message sent to `agent` now records, or null while its transcript is not Current. */
+  readonly cursor: (agent: string) => number | null;
+  /**
+   * Which accepted commands' events the transcript has shown (see the
+   * module doc). `after` is each one's send cursor; one without is not foldable.
+   */
+  readonly echoed: (agent: string, accepted: readonly { readonly cmdId: string; readonly text: string; readonly after: number | null }[]) => ReadonlySet<string>;
 };
 
 /** Creates the {@link ComposerState} of one workbench. */
 export function createComposerState(): ComposerState {
   const [seen, setSeen] = createSignal<ReadonlyMap<string, Seen>>(new Map());
-  const sentAt = new Map<string, number>();
   const of = (agent: string): Seen => seen().get(agent) ?? { cursor: 0, texts: new Map(), current: false };
   return {
     drafts: new Map(),
@@ -152,20 +165,17 @@ export function createComposerState(): ComposerState {
     current: (agent, current) => {
       if (of(agent).current !== current) setSeen(new Map(seen()).set(agent, { ...of(agent), current }));
     },
-    sent: (agent, cmdId) => {
+    cursor: (agent) => {
       // Before the transcript is Current its cursor is not the stream's: the message stays unfoldable.
       const now = of(agent);
-      if (now.current) sentAt.set(cmdId, now.cursor);
+      return now.current ? now.cursor : null;
     },
     echoed: (agent, accepted) => {
       const turns = [...of(agent).texts].sort(([a], [b]) => a - b);
       const used = new Set<number>();
       const matched = new Set<string>();
-      // A command restored from storage, or sent before Current, has no send cursor: it stays listed.
-      const foldable = accepted.flatMap((command) => {
-        const after = sentAt.get(command.cmdId);
-        return after === undefined ? [] : [{ ...command, after }];
-      });
+      // A command sent before Current, or stored without its cursor, stays listed.
+      const foldable = accepted.flatMap(({ after, ...command }) => (after === null ? [] : [{ ...command, after }]));
       const fold = (same: boolean): void => {
         for (const { cmdId, text, after } of foldable) {
           if (matched.has(cmdId)) continue;
@@ -207,7 +217,7 @@ export function Composer(props: {
       const sent = sentText(entry, props.agent);
       return sent === null ? [] : [{ entry, sent }];
     });
-    const accepted = own.filter(({ entry }) => entry.status === "acked").map(({ entry, sent }) => ({ cmdId: entry.cmd_id, text: sent }));
+    const accepted = own.filter(({ entry }) => entry.status === "acked").map(({ entry, sent }) => ({ cmdId: entry.cmd_id, text: sent, after: entry.echo_after ?? null }));
     const echoed = props.state.echoed(props.agent, accepted);
     return own
       .filter(({ entry }) => !echoed.has(entry.cmd_id))
@@ -217,7 +227,7 @@ export function Composer(props: {
     const message = text().trim();
     if (message === "" || props.sender === null || blocked() !== null) return;
     try {
-      props.state.sent(props.agent, props.sender.send(props.agent, message));
+      props.sender.send(props.agent, message, props.state.cursor(props.agent));
       setText("");
       setError(null);
     } catch (thrown) {

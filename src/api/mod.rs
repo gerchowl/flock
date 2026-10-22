@@ -1,5 +1,6 @@
 pub mod agent_state;
 pub mod client;
+pub(crate) mod client_listener;
 pub mod client_tokens;
 pub(crate) mod compatibility;
 pub(crate) mod error_code;
@@ -104,3 +105,6 @@ pub(crate) fn effect_exit_code(result: &serde_json::Value) -> Option<i32> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod poller_compat_tests;

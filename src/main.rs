@@ -99,7 +99,7 @@ mod release_notes;
 mod remote;
 mod render_prof;
 mod report;
-#[cfg(test)]
+#[cfg(any(test, feature = "web"))]
 mod structured_wire;
 #[cfg(not(test))]
 #[path = "structured_wire/production.rs"]
