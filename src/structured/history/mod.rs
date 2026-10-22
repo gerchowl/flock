@@ -133,7 +133,7 @@ impl History {
         )?;
         let file = crate::platform::structured::open_token(path)?;
         let length = file.metadata()?.len();
-        let head = tail_head(&file, length)?;
+        let head = tail_head(&file, length, &mut Vec::new())?;
         if head == 0 && length != 0 {
             return Err(io::Error::other(
                 "nonempty history requires a positive head",
@@ -292,8 +292,8 @@ impl Registered {
     }
 }
 /// Grow the cold tail geometrically, bounded by storage's single-record limit.
-fn tail_head(file: &File, length: u64) -> io::Result<u64> {
-    let mut tail = Vec::new();
+fn tail_head(file: &File, length: u64, tail: &mut Vec<u8>) -> io::Result<u64> {
+    tail.clear();
     if length == 0 {
         return Ok(0);
     }

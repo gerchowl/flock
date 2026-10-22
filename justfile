@@ -116,6 +116,11 @@ client-check:
 # or Bun changes: it records the lock's sha256 and Bun version, fetches with an
 # empty hash and keeps the hash nix reports. Commit the file it writes. If the fetch fails for
 # any other reason (network, a lock bun refuses), the file is left as it was.
+# On failure or INT/TERM, restore before returning. A process-group signal can
+# arrive twice because just forwards it: each handler restores directly, and
+# restore ignores repeats and disarms EXIT before copying. A second signal
+# during EXIT must restore too, not exit past the active callback. SIGKILL
+# and host crashes cannot run cleanup and are outside this contract.
 client-deps-hash:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -123,12 +128,13 @@ client-deps-hash:
     cp nix/client-deps.json "$backup"
     restore() {
       trap '' INT TERM
+      trap - EXIT
       cp "$backup" nix/client-deps.json
       rm -f "$backup"
     }
     trap restore EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    trap 'restore; exit 130' INT
+    trap 'restore; exit 143' TERM
     lock=$(nix-hash --type sha256 --flat web/client/bun.lock)
     printf '{\n  "lock": "%s",\n  "hash": ""\n}\n' "$lock" > nix/client-deps.json
     bun=$(nix eval --raw .#flock-client.deps.bunVersion)
