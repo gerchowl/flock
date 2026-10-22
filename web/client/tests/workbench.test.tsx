@@ -15,6 +15,7 @@ import { createFixtureTransport } from "../src/transport/fixture";
 import { OUTBOX_KEY } from "../src/wire/outbox";
 import { createWireTransport } from "../src/wire/transport";
 import { STATUS_LABELS, phaseLine, rowLine, sendHint, type Sender } from "../src/workbench/Composer";
+import type { AgentState } from "../src/gen/AgentState";
 import type { Phase } from "../src/gen/Phase";
 import { SAMPLE_INBOX } from "../src/workbench/inbox";
 import { markFor } from "../src/workbench/marks";
@@ -40,7 +41,7 @@ function mount(view: () => ReturnType<typeof App>): HTMLElement {
 }
 
 /** The generated `AgentState` a real fleet row carries (ADR-0028 §3a). */
-const workingState = { turn: "working", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} };
+const workingState: AgentState = { turn: "working", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} };
 
 const $ = (root: ParentNode, id: string): Element | null => root.querySelector(`[data-testid="${id}"]`);
 const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAll(`[data-testid="${id}"]`)];
@@ -210,14 +211,14 @@ describe("phone", () => {
     expect(document.getElementById(activity?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Waits for the events stream (S7-rest)");
   });
 
-  test("live, as the wire App mounts it, the inbox shows no sample cards and says it arrives with G5", async () => {
+  test("live, with no open prompts, the inbox shows no sample cards and nothing is blocked", async () => {
     const root = mount(() => (
-      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source="live" />
+      <Workbench fleet={createFixtureFleet([])} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source="live" />
     ));
     await tick();
-    expect($(root, "inbox-headline")?.textContent).toBe("Your inbox arrives with G5 (#1597).");
+    expect($(root, "inbox-headline")?.textContent).toBe("Nothing is blocked on you.");
     expect($$(root, "inbox-card")).toHaveLength(0);
-    expect($(root, "phone")?.textContent).not.toMatch(/Sample|blocked on you/);
+    expect($(root, "phone")?.textContent).not.toMatch(/Sample|G5/);
   });
 
   test("the agent screen is a history entry: system back returns to its tab, and the URL is untouched", async () => {
@@ -787,10 +788,10 @@ describe("wire mode, one transport per connection", () => {
     expect($(root, "connection-bar")?.textContent).toContain("The server refused the token.");
   });
 
-  test("wire mode shows no sample inbox cards; the inbox says it arrives with G5", () => {
+  test("wire mode shows no sample inbox cards; with no listed prompts the inbox says so", () => {
     const { root } = liveApp();
     expect($$(root, "inbox-card")).toHaveLength(0);
-    expect($(root, "inbox")?.textContent).toContain("The live inbox arrives with G5 (#1597).");
+    expect($(root, "inbox")?.textContent).toContain("No open permission prompts.");
     expect($(root, "inbox")?.textContent).not.toMatch(/Sample/);
   });
 });
