@@ -113,31 +113,44 @@ client-check:
 
 # Recompute nix/client-deps.json, the pinned hash of the client's
 # dependencies for `nix build .#flock-client` (#1731), after web/client/bun.lock
-# changes: it records the lock's sha256, fetches with a placeholder hash and
-# keeps the hash nix reports. Commit the file it writes. If the fetch fails for
+# or Bun changes: it records the lock's sha256 and Bun version, fetches with an
+# empty hash and keeps the hash nix reports. Commit the file it writes. If the fetch fails for
 # any other reason (network, a lock bun refuses), the file is left as it was.
+# On failure or INT/TERM, restore before returning. A process-group signal can
+# arrive twice because just forwards it: each handler restores directly, and
+# restore ignores repeats and disarms EXIT before copying. A second signal
+# during EXIT must restore too, not exit past the active callback. SIGKILL
+# and host crashes cannot run cleanup and are outside this contract.
 client-deps-hash:
     #!/usr/bin/env bash
     set -euo pipefail
     backup=$(mktemp)
     cp nix/client-deps.json "$backup"
-    restore() { cp "$backup" nix/client-deps.json; rm -f "$backup"; }
+    restore() {
+      trap '' INT TERM
+      trap - EXIT
+      cp "$backup" nix/client-deps.json
+      rm -f "$backup"
+    }
+    trap restore EXIT
+    trap 'restore; exit 130' INT
+    trap 'restore; exit 143' TERM
     lock=$(nix-hash --type sha256 --flat web/client/bun.lock)
     printf '{\n  "lock": "%s",\n  "hash": ""\n}\n' "$lock" > nix/client-deps.json
+    bun=$(nix eval --raw .#flock-client.deps.bunVersion)
     log=$(nix build .#flock-client.deps --no-link 2>&1 || true)
     hash=$(printf '%s\n' "$log" | sed -n 's/^ *got: *//p' | tail -n 1)
     if [ -z "$hash" ]; then
       printf '%s\n' "$log" >&2
-      restore
       echo "client-deps-hash: the fetch failed before nix reported a hash (see above); nix/client-deps.json is unchanged" >&2
       exit 1
     fi
-    printf '{\n  "lock": "%s",\n  "hash": "%s"\n}\n' "$lock" "$hash" > nix/client-deps.json
+    printf '{\n  "lock": "%s",\n  "bun": "%s",\n  "hash": "%s"\n}\n' "$lock" "$bun" "$hash" > nix/client-deps.json
     if ! nix build .#flock-client.deps --no-link; then
-      restore
       echo "client-deps-hash: the fetch did not reproduce $hash; nix/client-deps.json is unchanged" >&2
       exit 1
     fi
+    trap - EXIT INT TERM
     rm -f "$backup"
     echo "nix/client-deps.json: $hash"
 

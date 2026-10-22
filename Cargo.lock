@@ -715,6 +715,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "ed25519-dalek",
+ "finl_unicode",
  "futures-util",
  "getrandom 0.4.2",
  "hyper",

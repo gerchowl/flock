@@ -9,14 +9,45 @@ use std::time::Duration;
 
 /// Internal worker argument; the worker receives no path or credential.
 pub(crate) const WORKER_ARG: &str = "--client-token-lock";
+/// Owned advisory-lock description whose scope ends independently of child fds.
+///
+/// Close alone waits for every fork/dup reference to disappear. Explicit unlock
+/// keeps admission and revocation bounded to their operation (ADR-0036 §5a).
+/// An unlocked instance is also valid while an owned helper waits to acquire it.
+/// Do not clone the descriptor; [`PendingLock`] is the sole transfer path.
+pub(crate) struct LockFile(File);
+impl LockFile {
+    /// Own the description and release any lock on it when this guard drops.
+    pub(crate) fn new(file: File) -> Self {
+        Self(file)
+    }
+    /// Attempt admission without waiting; active contention retains its refusal.
+    pub(crate) fn try_lock(&self) -> Result<(), TryLockError> {
+        self.0.try_lock()
+    }
+}
+impl AsRawFd for LockFile {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            crate::logging::client_token_unlock_failed(&error);
+        }
+    }
+}
+
 /// A pending lock owns its helper until acquisition, cancellation or timeout.
 pub(crate) struct PendingLock {
-    file: Option<File>,
+    file: Option<LockFile>,
     helper: Option<(Child, UnixStream)>,
 }
 impl PendingLock {
     /// Start without blocking the caller. Only a contended lock needs a helper.
     pub(crate) fn begin(file: File, executable: &Path) -> io::Result<Self> {
+        let file = LockFile::new(file);
         let contended = match file.try_lock() {
             Ok(()) => false,
             Err(TryLockError::WouldBlock) => true,
@@ -56,7 +87,7 @@ impl PendingLock {
         })
     }
     /// Wait at most the supplied lock deadline; cleanup also runs when abandoned.
-    pub(crate) fn finish(mut self, deadline: Duration) -> io::Result<File> {
+    pub(crate) fn finish(mut self, deadline: Duration) -> io::Result<LockFile> {
         if let Some((_, stream)) = &mut self.helper {
             stream.set_read_timeout(Some(deadline))?;
             let mut ack = [0];
@@ -126,8 +157,13 @@ pub(crate) fn worker() -> io::Result<()> {
             std::process::exit(crate::cli::exit::SUCCESS);
         })?;
     file.lock()?;
+    // The parent retains this same description through the operation. Unlocking
+    // here would break the transfer; the parent guard releases it after admission.
     std::io::stdout().write_all(b"L")
 }
+
+#[cfg(test)]
+pub(crate) mod inherited_holder;
 
 #[cfg(test)]
 mod tests;

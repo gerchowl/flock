@@ -12,7 +12,11 @@ import type { ServerFrame } from "../src/gen/ServerFrame";
 import { createFixtureFleet, type AgentRow, type FleetObserver, type FleetSource } from "../src/fleet";
 import { createManager, emptyLayout, type Layout } from "../src/layout/model";
 import { createFixtureTransport } from "../src/transport/fixture";
+import { OUTBOX_KEY } from "../src/wire/outbox";
 import { createWireTransport } from "../src/wire/transport";
+import { STATUS_LABELS, phaseLine, rowLine, sendHint, type Sender } from "../src/workbench/Composer";
+import type { AgentState } from "../src/gen/AgentState";
+import type { Phase } from "../src/gen/Phase";
 import { SAMPLE_INBOX } from "../src/workbench/inbox";
 import { markFor } from "../src/workbench/marks";
 import { SAMPLE_AGENTS } from "../src/workbench/samples";
@@ -36,9 +40,17 @@ function mount(view: () => ReturnType<typeof App>): HTMLElement {
   return root;
 }
 
+/** The generated `AgentState` a real fleet row carries (ADR-0028 §3a). */
+const workingState: AgentState = { turn: "working", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} };
+
 const $ = (root: ParentNode, id: string): Element | null => root.querySelector(`[data-testid="${id}"]`);
 const $$ = (root: ParentNode, id: string): Element[] => [...root.querySelectorAll(`[data-testid="${id}"]`)];
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+/** The fleet stream's sub id: the connection allocates every id. */
+const fleetSub = (h: Harness): string => (sentFrames(h).find((frame) => (frame as { t: string; stream?: string }).t === "sub" && (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
+/** The sub id of the latest `sub` for `agent`: ids are unique per connection, not per view. */
+const agentSub = (h: Harness, agent: string): string =>
+  (sentFrames(h).filter((frame) => (frame as { t: string; stream?: string }).t === "sub" && (frame as { stream?: string }).stream === `agent/${agent}`).at(-1) as { sub_id: string }).sub_id;
 
 describe("fixture mode", () => {
   test("renders the top bar, sidebar, focus pane and inbox under the replay badge", async () => {
@@ -97,17 +109,28 @@ describe("wire mode", () => {
     expect(h.net.attempts[0]?.url).toBe("wss://fixture.invalid/v1/ws");
     expect($(root, "replay-badge")).toBeNull();
     expect($(root, "sidebar")?.textContent).toBe("Loading the agent list…");
-    expect(root.querySelector(".topbar__status")?.textContent).toBe("Connecting");
+    expect($(root, "connection-bar")?.querySelector("strong")?.textContent).toBe("Connecting");
     h.step(step({ step: "open" }));
     h.step(step({ step: "send", frame: WELCOME }));
     const sub = sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string };
-    const row = { id: "atlas", label: "atlas", state: "working", activity: "Reading the ADR", waiting_on_human: [] };
+    const row = { id: "atlas", label: "atlas", state: workingState, activity: "Reading the ADR", waiting_on_human: [] };
     h.step(step({ step: "send", frame: { t: "gap", sub_id: sub.sub_id, from: 1, to: 0, snapshot_to: 1 } }));
     h.step(step({ step: "send", frame: { t: "ev", sub_id: sub.sub_id, stream: "fleet", seq: 1, ts_ms: 0, ev: { type: "fleet.upsert", row } } }));
     expect($$(root, "agent-row").map((agent) => agent.textContent)).toEqual(["atlasReading the ADR"]);
     expect($(root, "agent-summary")?.textContent).toBe("1 agents · 1 working");
     h.net.current().drop();
-    expect(root.querySelector(".topbar__status")?.textContent).toContain("Reconnecting · Connection lost");
+    expect($(root, "connection-bar")?.textContent).toContain("ReconnectingConnection lost");
+    expect($(root, "connection-bar")?.textContent).not.toContain("secret");
+  });
+
+  test("an unreadable stored outbox record is named in the connection strip, and the app still loads", () => {
+    const h = new Harness();
+    h.store.setItem("flock.outbox.v1", JSON.stringify({ principal: "p", commands: [{ cmd_id: "c9", verb: 1 }] }));
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    expect($(root, "workbench")).not.toBeNull();
+    expect($(root, "outbox-problem")?.textContent).toBe("Dropped unreadable stored command: c9.");
   });
 
   test("an agent list that failed says why, and an empty one says so", async () => {
@@ -121,7 +144,7 @@ describe("wire mode", () => {
           return () => undefined;
         },
       };
-      const root = mount(() => <Workbench fleet={fleet} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} source="replay" />);
+      const root = mount(() => <Workbench fleet={fleet} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} source="replay" />);
       await tick();
       expect($(root, "sidebar")?.textContent).toBe(note);
       dispose?.();
@@ -137,8 +160,7 @@ describe("wire mode", () => {
         transport={createWireTransport(h.connection)}
         inbox={SAMPLE_INBOX}
         layout={emptyLayout()}
-        saveLayout={() => undefined}
-        source="live"
+        sender={null} saveLayout={() => undefined} source="live"
       />
     ));
     await tick();
@@ -150,14 +172,14 @@ describe("wire mode", () => {
     h.step(step({ step: "send", frame: { t: "synced", sub_id: sub.sub_id, seq: 1 } }));
     expect($(root, "focus-pane")?.textContent).toContain("hello from the wire");
     expect($(root, "transcript-synced")?.textContent).toBe("Up to date");
-    expect($(root, "focus-pane")?.textContent).not.toMatch(/recording|Replay/);
+    expect(root.querySelector(".transcript")?.textContent).not.toMatch(/recording|Replay/);
   });
 
   test("a live agent's refused history says so, without replay wording", async () => {
     const h = new Harness();
     live(h);
     const root = mount(() => (
-      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createWireTransport(h.connection)} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} source="live" />
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createWireTransport(h.connection)} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} source="live" />
     ));
     await tick();
     ($$(root, "agent-row")[1] as HTMLButtonElement).click();
@@ -170,7 +192,7 @@ describe("wire mode", () => {
 describe("phone", () => {
   async function phone(source: "replay" | "live" = "replay"): Promise<HTMLElement> {
     const root = mount(() => (
-      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={SAMPLE_INBOX} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source={source} />
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={SAMPLE_INBOX} layout={emptyLayout()} sender={null} saveLayout={() => undefined} mode="phone" source={source} />
     ));
     await tick();
     return root;
@@ -189,14 +211,14 @@ describe("phone", () => {
     expect(document.getElementById(activity?.getAttribute("aria-describedby") ?? "")?.textContent).toBe("Waits for the events stream (S7-rest)");
   });
 
-  test("live, as the wire App mounts it, the inbox shows no sample cards and says it arrives with G5", async () => {
+  test("live, with no open prompts, the inbox shows no sample cards and nothing is blocked", async () => {
     const root = mount(() => (
-      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source="live" />
+      <Workbench fleet={createFixtureFleet([])} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} mode="phone" source="live" />
     ));
     await tick();
-    expect($(root, "inbox-headline")?.textContent).toBe("Your inbox arrives with G5 (#1597).");
+    expect($(root, "inbox-headline")?.textContent).toBe("Nothing is blocked on you.");
     expect($$(root, "inbox-card")).toHaveLength(0);
-    expect($(root, "phone")?.textContent).not.toMatch(/Sample|blocked on you/);
+    expect($(root, "phone")?.textContent).not.toMatch(/Sample|G5/);
   });
 
   test("the agent screen is a history entry: system back returns to its tab, and the URL is untouched", async () => {
@@ -226,7 +248,7 @@ describe("phone", () => {
     const saved: Layout = structuredClone(manager.state);
     const layouts: Layout[] = [];
     const root = mount(() => (
-      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={saved} saveLayout={(next) => void layouts.push(next)} mode="phone" source="replay" />
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={saved} saveLayout={(next) => void layouts.push(next)} mode="phone" source="replay" />
     ));
     await tick();
     tab(root, "Agents")?.click();
@@ -243,7 +265,7 @@ describe("phone", () => {
   test("widening past the breakpoint with the agent screen open consumes its history entry", async () => {
     const [mode, setMode] = createSignal<"phone" | "desktop">("phone");
     const root = mount(() => (
-      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} mode={mode()} source="replay" />
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} sender={null} layout={emptyLayout()} saveLayout={() => undefined} mode={mode()} source="replay" />
     ));
     await tick();
     const prior: unknown = history.state;
@@ -311,7 +333,7 @@ describe("phone", () => {
     send(WELCOME);
     const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
     send({ t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: 1 });
-    send({ t: "ev", sub_id: fleet, stream: "fleet", seq: 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id: "atlas", label: "atlas", state: "working", waiting_on_human: [] } } });
+    send({ t: "ev", sub_id: fleet, stream: "fleet", seq: 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id: "atlas", label: "atlas", state: workingState, waiting_on_human: [] } } });
     send({ t: "synced", sub_id: fleet, seq: 1 });
     expect($(root, "phone")).not.toBeNull();
     const backButton = (): HTMLButtonElement | undefined => [...root.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("Back"));
@@ -341,7 +363,7 @@ describe("phone", () => {
     send({ t: "ev", sub_id: first, stream: "agent/atlas", seq: 2, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "a late line" } } });
     send({ t: "synced", sub_id: second, seq: 0 });
     send({ t: "subfail", sub_id: second, code: "unknown_stream", message: "gone" });
-    expect(root.querySelector(".topbar__status")?.textContent).toBe("Live");
+    expect(root.querySelector(".connection-bar__state")?.textContent).toBe("Live");
     expect(pane).toContain("the current line");
     expect($(root, "focus-pane")?.textContent).toBe(pane);
   });
@@ -349,7 +371,7 @@ describe("phone", () => {
 
 describe("command palette", () => {
   async function workbench(fleet: FleetSource): Promise<HTMLElement> {
-    const root = mount(() => <Workbench fleet={fleet} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} source="replay" />);
+    const root = mount(() => <Workbench fleet={fleet} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} sender={null} saveLayout={() => undefined} source="replay" />);
     await tick();
     return root;
   }
@@ -417,6 +439,297 @@ describe("command palette", () => {
   });
 });
 
+describe("composer", () => {
+  test("in fixture mode it is disabled and says why", async () => {
+    const config = { transport: "fixture", fixtureJsonl: "", source: "x" } as const;
+    const root = mount(() => <App config={{ ok: true, config }} />);
+    await tick();
+    expect($(root, "agent-phase")?.textContent).toBe("Replay: sending needs a live server.");
+    expect(($(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement).disabled).toBe(true);
+  });
+
+  test("sends agent.send through the outbox and shows the command's state", async () => {
+    const h = new Harness();
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    expect($(root, "agent-phase")).toBeNull();
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    search.value = "atlas";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($$(root, "palette-item")[0] as HTMLButtonElement).click();
+    expect($(root, "agent-phase")?.textContent).toBe("Agent not in the agent list");
+
+    const box = $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
+    box.value = "please rebase";
+    box.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($(root, "composer") as HTMLFormElement).requestSubmit();
+    // Opening atlas made the connection Syncing: the command waits for Live.
+    expect($$(root, "sent-message").map((item) => item.getAttribute("data-status"))).toEqual(["pending"]);
+    expect(sentFrames(h).some((frame) => (frame as { t: string }).t === "cmd")).toBe(false);
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: 0 });
+    const cmd = sentFrames(h).find((frame) => (frame as { t: string }).t === "cmd") as { cmd_id: string };
+    expect(cmd).toMatchObject({ t: "cmd", verb: "agent.send", args: { target: "atlas", text: "please rebase", submit: true }, resume_only: false });
+    expect($$(root, "sent-message").map((item) => item.getAttribute("data-status"))).toEqual(["sent"]);
+    expect(box.value).toBe("");
+    h.net.current().deliver({ t: "ack", cmd_id: cmd.cmd_id, ok: false, error: { code: "agent_busy", message: "try later", exit: 3, retry: "later" } });
+    expect($(root, "sent-message")?.textContent).toBe("please rebaserefused by the server: try later");
+  });
+
+  test("an accepted message is never in the transcript before the server's event, and shows once after it", async () => {
+    const h = new Harness();
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    search.value = "atlas";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($$(root, "palette-item")[0] as HTMLButtonElement).click();
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: 0 });
+    const box = $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
+    box.value = "please rebase";
+    box.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($(root, "composer") as HTMLFormElement).requestSubmit();
+    const cmd = sentFrames(h).find((frame) => (frame as { t: string }).t === "cmd") as { cmd_id: string };
+    h.net.current().deliver({ t: "ack", cmd_id: cmd.cmd_id, ok: true });
+    expect($$(root, "sent-message").map((item) => item.textContent)).toEqual(["please rebaseaccepted by the server"]);
+    expect(root.querySelector(".transcript")?.textContent).not.toContain("please rebase");
+    h.net.current().deliver({ t: "ev", sub_id: agentSub(h, "atlas"), stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "please rebase" } } });
+    expect(root.querySelector(".transcript")?.textContent).toContain("please rebase");
+    expect($(root, "focus-pane")?.textContent?.split("please rebase").length).toBe(2);
+    expect($$(root, "sent-message")).toEqual([]);
+  });
+
+  /** The wire App, focused on atlas, whose history holds `history` user texts; returns a sender and an event source. */
+  function liveAtlas(history: readonly string[]): { root: HTMLElement; send: (text: string) => string; ack: (id: string) => void; said: (seq: number, text: string) => void } {
+    const h = new Harness();
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    search.value = "atlas";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($$(root, "palette-item")[0] as HTMLElement).click();
+    const said = (seq: number, text: string): void =>
+      h.net.current().deliver({ t: "ev", sub_id: agentSub(h, "atlas"), stream: "agent/atlas", seq, ts_ms: 0, ev: { type: "user", message: { role: "user", content: text } } });
+    history.forEach((text, index) => said(index + 1, text));
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: history.length });
+    const send = (text: string): string => {
+      const box = $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
+      box.value = text;
+      box.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      ($(root, "composer") as HTMLFormElement).requestSubmit();
+      const cmds = sentFrames(h).filter((frame) => (frame as { t: string }).t === "cmd") as { cmd_id: string }[];
+      return cmds.at(-1)?.cmd_id ?? "";
+    };
+    return { root, send, ack: (id) => h.net.current().deliver({ t: "ack", cmd_id: id, ok: true }), said };
+  }
+  const listed = (root: HTMLElement): (string | null)[] => $$(root, "sent-message").map((item) => item.textContent);
+
+  test("the same text already in the history is not this message's event", () => {
+    const { root, send, ack, said } = liveAtlas(["continue"]);
+    ack(send("continue"));
+    expect(listed(root)).toEqual(["continueaccepted by the server"]);
+    said(2, "continue");
+    expect(listed(root)).toEqual([]);
+  });
+
+  test("two identical sends need two events", () => {
+    const { root, send, ack, said } = liveAtlas([]);
+    const first = send("continue");
+    const second = send("continue");
+    ack(first);
+    ack(second);
+    said(1, "continue");
+    expect(listed(root)).toEqual(["continueaccepted by the server"]);
+    said(2, "continue");
+    expect(listed(root)).toEqual([]);
+  });
+
+  test("the phase line states every reported phase as a fact", () => {
+    const expected: { readonly [P in Phase]: string } = {
+      working: "Agent working",
+      settling: "Agent finishing its turn",
+      finished: "Agent idle",
+      waiting_on_event: "Agent waiting on an event",
+      finished_with_background: "Agent idle, background work running",
+      blocked: "Agent blocked",
+      needs_human: "Agent needs you",
+      offline: "Agent offline",
+      hibernated: "Agent hibernated",
+      limit_reached: "Agent at its usage limit",
+      unknown: "Agent state unknown",
+      gone: "Agent ended",
+    };
+    for (const [state, line] of Object.entries(expected) as [Phase, string][]) {
+      expect(phaseLine(state)).toEqual({ line, open: state !== "gone" });
+    }
+    expect(rowLine(undefined)).toEqual({ line: "Agent not in the agent list", open: true });
+  });
+
+  test("no composer string predicts delivery: every phase and every outbox state", async () => {
+    const phases: Phase[] = ["working", "settling", "finished", "waiting_on_event", "finished_with_background", "blocked", "needs_human", "offline", "hibernated", "limit_reached", "unknown", "gone"];
+    const statuses = Object.keys(STATUS_LABELS) as (keyof typeof STATUS_LABELS)[];
+    const commands = statuses.map((status, i) => ({ cmd_id: `c${i}`, verb: "agent.send", args: { target: "p0", text: `m${i}`, submit: true }, principal: "p", created_ms: 0, status }));
+    const all: Sender = { commands: () => commands, send: () => "c9", blocked: () => null };
+    const agents: AgentRow[] = phases.map((state, i) => ({ id: `p${i}`, label: `p${i}`, state, activity: "", waitingOnHuman: [] }));
+    let fleet: FleetObserver | undefined;
+    const root = mount(() => <Workbench fleet={{ subscribe: (o) => ((fleet = o), queueMicrotask(() => o.rows(agents)), () => undefined) }} transport={createFixtureTransport("")} inbox={[]} sender={all} layout={emptyLayout()} saveLayout={() => undefined} source="live" />);
+    await tick();
+    const texts: string[] = [];
+    for (const row of $$(root, "agent-row") as HTMLButtonElement[]) {
+      row.click();
+      texts.push($(root, "composer")?.textContent ?? "");
+    }
+    expect($$(root, "sent-message")).toHaveLength(0);
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    expect($$(root, "sent-message")).toHaveLength(statuses.length);
+    texts.push($(root, "composer")?.textContent ?? "");
+    // The focused agent leaves the list: its composer states the undefined row (`rowLine(undefined)`).
+    fleet?.rows([]);
+    expect($$(root, "agent-row")).toHaveLength(0);
+    expect($(root, "agent-phase")?.textContent).toBe(rowLine(undefined).line);
+    texts.push($(root, "composer")?.textContent ?? "");
+    expect(texts).toHaveLength(agents.length + 2);
+    for (const text of texts) expect(text.toLowerCase()).not.toMatch(/deliver|queued until/);
+  });
+
+  test("a message sent before the transcript is Current is not foldable: an older identical line never hides it", () => {
+    const h = new Harness();
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    search.value = "atlas";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($$(root, "palette-item")[0] as HTMLElement).click();
+    const box = $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
+    box.value = "continue";
+    box.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($(root, "composer") as HTMLFormElement).requestSubmit();
+    h.net.current().deliver({ t: "ev", sub_id: agentSub(h, "atlas"), stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "continue" } } });
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: 1 });
+    const cmd = sentFrames(h).find((frame) => (frame as { t: string }).t === "cmd") as { cmd_id: string };
+    h.net.current().deliver({ t: "ack", cmd_id: cmd.cmd_id, ok: true });
+    expect($$(root, "sent-message").map((item) => item.textContent)).toEqual(["continueaccepted by the server"]);
+  });
+
+  test("the send cursor is stored with the outbox record, and never sent (#1773)", () => {
+    const h = new Harness();
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    h.step(step({ step: "given", cursors: {}, outbox: [] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    search.value = "atlas";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($$(root, "palette-item")[0] as HTMLElement).click();
+    h.net.current().deliver({ t: "ev", sub_id: agentSub(h, "atlas"), stream: "agent/atlas", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "older" } } });
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: 1 });
+    const box = $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
+    box.value = "please rebase";
+    box.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($(root, "composer") as HTMLFormElement).requestSubmit();
+    const stored = JSON.parse(h.store.getItem(OUTBOX_KEY) ?? "null") as { commands: { echo_after?: number }[] };
+    expect(stored.commands.map((command) => command.echo_after)).toEqual([1]);
+    const cmd = sentFrames(h).find((frame) => (frame as { t: string }).t === "cmd");
+    expect(Object.keys(cmd as object).sort()).toEqual(["args", "cmd_id", "resume_only", "t", "verb"]);
+  });
+
+  test("after a reload, a restored pending message is accepted and its event arrives: it shows once (#1773)", () => {
+    const h = new Harness();
+    const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
+    // What the composer stored before the reload: sent at cursor 1, still pending.
+    const restored = { cmd_id: "c-restored", verb: "agent.send", args: { target: "atlas", text: "please rebase", submit: true }, principal: "fixture-principal", created_ms: 0, status: "pending", echo_after: 1 } as const;
+    h.step(step({ step: "given", cursors: {}, outbox: [restored] }));
+    const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
+    h.net.current().open();
+    h.net.current().deliver(WELCOME);
+    h.net.current().deliver({ t: "gap", sub_id: fleetSub(h), from: 1, to: 0, snapshot_to: 0 });
+    h.net.current().deliver({ t: "synced", sub_id: fleetSub(h), seq: 0 });
+    expect(sentFrames(h).find((frame) => (frame as { t: string }).t === "cmd")).toMatchObject({ cmd_id: "c-restored", resume_only: false });
+    h.net.current().deliver({ t: "ack", cmd_id: "c-restored", ok: true });
+    ($(root, "palette-trigger") as HTMLButtonElement).click();
+    const search = $(root, "palette")?.querySelector("input") as HTMLInputElement;
+    search.value = "atlas";
+    search.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($$(root, "palette-item")[0] as HTMLElement).click();
+    const said = (seq: number, text: string): void =>
+      h.net.current().deliver({ t: "ev", sub_id: agentSub(h, "atlas"), stream: "agent/atlas", seq, ts_ms: 0, ev: { type: "user", message: { role: "user", content: text } } });
+    said(1, "older");
+    h.net.current().deliver({ t: "synced", sub_id: agentSub(h, "atlas"), seq: 1 });
+    expect(listed(root)).toEqual(["please rebaseaccepted by the server"]);
+    said(2, "please rebase");
+    expect($(root, "focus-pane")?.textContent?.split("please rebase").length).toBe(2);
+    expect(listed(root)).toEqual([]);
+  });
+
+  test("an acked message whose echo differs in text shows as accepted, then folds at the next person's turn", () => {
+    const { root, send, ack, said } = liveAtlas(["older"]);
+    ack(send("please  rebase"));
+    expect(listed(root)).toEqual(["please  rebaseaccepted by the server"]);
+    said(2, "please rebase");
+    expect(listed(root)).toEqual([]);
+  });
+
+  const sender: Sender = { commands: () => [], send: () => "c1", blocked: () => null };
+  const rows: AgentRow[] = [
+    { id: "atlas", label: "atlas", state: "working", activity: "", waitingOnHuman: [] },
+    { id: "kite", label: "kite", state: "gone", activity: "", waitingOnHuman: [] },
+  ];
+  async function composing(): Promise<HTMLElement> {
+    const root = mount(() => <Workbench fleet={createFixtureFleet(rows)} transport={createFixtureTransport("")} inbox={[]} sender={sender} layout={emptyLayout()} saveLayout={() => undefined} source="live" />);
+    await tick();
+    return root;
+  }
+  const textarea = (root: HTMLElement): HTMLTextAreaElement => $(root, "composer")?.querySelector("textarea") as HTMLTextAreaElement;
+
+  test("a gone agent's composer is closed and says the agent has ended", async () => {
+    const root = await composing();
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    expect($(root, "agent-phase")?.textContent).toBe("Agent ended");
+    expect(textarea(root).disabled).toBe(true);
+    expect(($(root, "composer")?.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  test("drafts survive switching agents, and the send shortcut is shown", async () => {
+    const root = await composing();
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    textarea(root).value = "half a thought";
+    textarea(root).dispatchEvent(new InputEvent("input", { bubbles: true }));
+    ($$(root, "agent-row")[1] as HTMLButtonElement).click();
+    expect(textarea(root).value).toBe("");
+    ($$(root, "agent-row")[0] as HTMLButtonElement).click();
+    expect(textarea(root).value).toBe("half a thought");
+    expect($(root, "send-hint")?.textContent).toMatch(/^(⌘|Ctrl) \+ Enter to send$/);
+    expect(["MacIntel", "Win32"].map(sendHint)).toEqual(["⌘ + Enter to send", "Ctrl + Enter to send"]);
+  });
+});
+
 describe("wire mode, one transport per connection", () => {
   const config = { transport: "wire", serverUrl: "https://fixture.invalid", token: "secret" } as const;
   const send = (h: Harness, frame: ServerFrame): void => h.step(step({ step: "send", frame }));
@@ -436,7 +749,7 @@ describe("wire mode, one transport per connection", () => {
     const fleet = (sentFrames(h).find((frame) => (frame as { stream?: string }).stream === "fleet") as { sub_id: string }).sub_id;
     const ids = ["atlas", "kite", "ember"];
     send(h, { t: "gap", sub_id: fleet, from: 1, to: 0, snapshot_to: ids.length });
-    ids.forEach((id, i) => send(h, { t: "ev", sub_id: fleet, stream: "fleet", seq: i + 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id, label: id, state: "working", waiting_on_human: [] } } }));
+    ids.forEach((id, i) => send(h, { t: "ev", sub_id: fleet, stream: "fleet", seq: i + 1, ts_ms: 0, ev: { type: "fleet.upsert", row: { id, label: id, state: workingState, waiting_on_human: [] } } }));
     send(h, { t: "synced", sub_id: fleet, seq: ids.length });
     return { h, root };
   }
@@ -453,12 +766,12 @@ describe("wire mode, one transport per connection", () => {
     const [first, second, current] = subs as [string, string, string];
     send(h, { t: "ev", sub_id: current, stream: "agent/ember", seq: 1, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "ember's own line" } } });
     send(h, { t: "synced", sub_id: current, seq: 1 });
-    expect(root.querySelector(".topbar__status")?.textContent).toBe("Live");
+    expect(root.querySelector(".connection-bar__state")?.textContent).toBe("Live");
     const pane = $(root, "focus-pane")?.textContent;
     send(h, { t: "ev", sub_id: first, stream: "agent/atlas", seq: 2, ts_ms: 0, ev: { type: "user", message: { role: "user", content: "late atlas line" } } });
     send(h, { t: "synced", sub_id: second, seq: 0 });
     send(h, { t: "subfail", sub_id: first, code: "unknown_stream", message: "gone" });
-    expect(root.querySelector(".topbar__status")?.textContent).toBe("Live");
+    expect(root.querySelector(".connection-bar__state")?.textContent).toBe("Live");
     expect($(root, "focus-pane")?.textContent).toBe(pane ?? "");
     expect(pane).toContain("ember's own line");
   });
@@ -470,15 +783,15 @@ describe("wire mode, one transport per connection", () => {
     const root = mount(() => <App config={{ ok: true, config }} env={{ clock: h.clock, sockets: h.net.factory, random: () => 0, store: h.store }} />);
     h.step(step({ step: "open" }));
     h.step(step({ step: "token_refused", code: 4401 }));
-    const status = root.querySelector(".topbar__status")?.textContent ?? "";
-    expect(status).toContain("Saved layout could not be loaded");
-    expect(status).toContain("NeedsToken · The server refused the token.");
+    expect(root.querySelector(".topbar__status")?.textContent).toContain("Saved layout could not be loaded");
+    expect(root.querySelector(".connection-bar__state")?.textContent).toBe("NeedsToken");
+    expect($(root, "connection-bar")?.textContent).toContain("The server refused the token.");
   });
 
-  test("wire mode shows no sample inbox cards; the inbox says it arrives with G5", () => {
+  test("wire mode shows no sample inbox cards; with no listed prompts the inbox says so", () => {
     const { root } = liveApp();
     expect($$(root, "inbox-card")).toHaveLength(0);
-    expect($(root, "inbox")?.textContent).toContain("The live inbox arrives with G5 (#1597).");
+    expect($(root, "inbox")?.textContent).toContain("No open permission prompts.");
     expect($(root, "inbox")?.textContent).not.toMatch(/Sample/);
   });
 });
@@ -498,7 +811,7 @@ describe("status marks", () => {
 
   test("differ in shape, not only in hue", async () => {
     const root = mount(() => (
-      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} saveLayout={() => undefined} source="replay" />
+      <Workbench fleet={createFixtureFleet(SAMPLE_AGENTS)} transport={createFixtureTransport("")} inbox={[]} layout={emptyLayout()} sender={null} saveLayout={() => undefined} source="replay" />
     ));
     await tick();
     const shapes = $$(root, "agent-row").map((agent) => {

@@ -3,7 +3,7 @@ mod output;
 pub(crate) mod timing;
 use crate::{
     api::client_tokens::Bearer,
-    structured::permissions::auth::tokens::{Session, TokenStore},
+    structured::permissions::auth::tokens::{Session, TokenError, TokenStore},
     structured_wire::*,
 };
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -14,7 +14,7 @@ use axum::{
     routing::get,
     Router,
 };
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::HashMap,
@@ -191,18 +191,64 @@ async fn authenticate(
         return None;
     };
     let token = Bearer(token);
-    let session = verify(shared, end, token.clone()).await?;
+    let session = verify(shared, end, token.clone()).await.ok()?;
     Some((session, protocol > WIRE_JSON_VERSION, token))
 }
-async fn verify(shared: &Shared, end: Instant, token: Bearer) -> Option<Session> {
+/// Post-verification failures carry credential evidence separately from availability.
+enum HandshakeFailure {
+    /// A verified credential no longer authenticates or its principal was revoked.
+    Revoked,
+    /// Verification capacity, store I/O or the original handshake deadline failed.
+    Unavailable,
+    /// Welcome encoding or socket delivery failed; no auth conclusion is possible.
+    Transport,
+}
+async fn verify(shared: &Shared, end: Instant, token: Bearer) -> Result<Session, HandshakeFailure> {
     let store = shared.store.clone();
     before(
         shared.clock.as_ref(),
         end,
         super::store_io::shared().run(move || store.authenticate(&token)),
     )
-    .await??
-    .ok()
+    .await
+    .flatten()
+    .ok_or(HandshakeFailure::Unavailable)?
+    .map_err(|error| match error {
+        TokenError::Unauthorized | TokenError::Revoked => HandshakeFailure::Revoked,
+        _ => HandshakeFailure::Unavailable,
+    })
+}
+/// Complete the registered handshake under its original ADR-0036 §5a deadline.
+async fn finish_welcome<S: Sink<Message> + Unpin>(
+    socket: &mut S,
+    clock: &dyn Clock,
+    end: Instant,
+    confirmed: impl Future<Output = Result<(), HandshakeFailure>>,
+    welcome: ServerFrame,
+    signals: (&mut watch::Receiver<bool>, &mut watch::Receiver<bool>),
+) -> bool {
+    let (stop, revoked) = signals;
+    let ready = async {
+        confirmed.await?;
+        let frame = output::encode(welcome).ok_or(HandshakeFailure::Transport)?;
+        socket
+            .send(frame)
+            .await
+            .map_err(|_| HandshakeFailure::Transport)
+    };
+    let accepted = tokio::select! { biased;
+        _ = stop.changed() => return false,
+        _ = revoked.changed() => Err(HandshakeFailure::Revoked),
+        sent = before(clock, end, ready) => sent.unwrap_or(Err(HandshakeFailure::Unavailable)),
+    };
+    let code = match accepted {
+        Ok(()) => return true,
+        Err(HandshakeFailure::Revoked) => AUTH_REVOKED_CLOSE,
+        Err(HandshakeFailure::Unavailable) => GOING_AWAY_CLOSE,
+        Err(HandshakeFailure::Transport) => return false,
+    };
+    let _ = socket.send(close(code)).now_or_never();
+    false
 }
 async fn connection(
     mut socket: WebSocket,
@@ -266,21 +312,24 @@ async fn connection(
         idempotency_window_ms: IDEMPOTENCY_WINDOW_MS,
     };
     let registered = revoked.clone();
-    let ready = async {
+    let confirmed = async {
         let session = verify(&shared, end, token).await?;
         if session.info.principal != principal || *registered.borrow() {
-            return None;
+            return Err(HandshakeFailure::Revoked);
         }
         drop(hello);
-        socket.send(output::encode(welcome)?).await.ok()
+        Ok(())
     };
-    let accepted = tokio::select! { biased;
-        _ = stop.changed() => return,
-        _ = revoked.changed() => None,
-        sent = before(shared.clock.as_ref(), end, ready) => sent.flatten(),
-    };
-    if accepted.is_none() {
-        let _ = socket.send(close(AUTH_REVOKED_CLOSE)).now_or_never();
+    if !finish_welcome(
+        &mut socket,
+        shared.clock.as_ref(),
+        end,
+        confirmed,
+        welcome,
+        (&mut stop, &mut revoked),
+    )
+    .await
+    {
         return;
     }
     let (sink, mut stream) = socket.split();

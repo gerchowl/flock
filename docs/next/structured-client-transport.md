@@ -58,7 +58,11 @@ command slice calls its 4403 fan-out only after the triggering auth_revoked ack
 has been written, within the existing write/liveness bound. The primitive closes
 all registered sockets for that principal, leaving other principals alone.
 A verified socket registers before welcome and rechecks current token storage
-after registration; revocation in that gap closes 4403 without welcome. No
+after registration; revocation in that gap closes 4403 without welcome. A
+post-registration store failure or handshake deadline instead closes 1001,
+keeping the credential eligible for reconnect. A failed welcome send drops the
+transport without another send or an auth close. Neither failure proves token
+revocation (ADR-0036 §5a). No
 filesystem watcher or automatic command-time revocation route is added
 here; the command slice must recheck storage before dispatch as ADR-0036 requires.
 Closing the core cancels pending hellos and authenticated sockets. Explicit
