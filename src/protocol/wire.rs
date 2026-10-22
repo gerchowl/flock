@@ -122,7 +122,8 @@ use serde::{Deserialize, Serialize};
 /// reason in a pane with one.
 /// v30 also adds `wait.park` (#1031), gated by #868.
 /// v31 adds local-operator client credentials and browser handoff (#1827).
-pub const PROTOCOL_VERSION: u32 = 31;
+/// v32 preserves node identity in carried FleetPeer snapshots (#1076).
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// Refusal notice sent to clients while a live update handoff is in
 /// progress. Clients recognize this exact string (in a rejection `Welcome`
@@ -212,6 +213,8 @@ pub struct FleetSnapshot {
 /// by an age in seconds at capture time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetPeer {
+    /// Stable mesh node identity; absent only for unverified legacy rows.
+    pub node_id: Option<String>,
     /// Peer name from the hub's config (display fallback).
     pub name: String,
     /// SSH destination for switch-on-select.
@@ -1235,6 +1238,7 @@ mod tests {
         FleetSnapshot {
             origin: "hopper".to_owned(),
             peers: vec![FleetPeer {
+                node_id: Some("0123456789abcdef".repeat(4)),
                 name: "kiln".to_owned(),
                 ssh_target: "operator@kiln".to_owned(),
                 host: Some("kiln".to_owned()),
@@ -1279,6 +1283,7 @@ mod tests {
                 icon: Some("anvil".to_owned()),
             }],
             origin_summary: Some(Box::new(FleetPeer {
+                node_id: Some("0123456789abcdef".repeat(4)),
                 name: "hopper".to_owned(),
                 ssh_target: HOME_SWITCH_TARGET.to_owned(),
                 host: Some("hopper".to_owned()),
@@ -1780,6 +1785,15 @@ mod tests {
         assert_eq!(msg, decoded);
     }
 
+    #[test]
+    fn server_identity1076_protocol_31_snapshot_is_refused() {
+        assert!(matches!(
+            check_client_version(31),
+            VersionCheck::Incompatible(_)
+        ));
+        assert!(matches!(check_client_version(32), VersionCheck::Compatible));
+    }
+
     // ---- Version negotiation ----
 
     #[test]
@@ -1863,7 +1877,7 @@ mod tests {
     // PINNED_PROTOCOL_VERSION and paste the refreshed GOLDEN table (the failing
     // test prints it paste-ready).
 
-    const PINNED_PROTOCOL_VERSION: u32 = 31;
+    const PINNED_PROTOCOL_VERSION: u32 = 32;
 
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -2092,7 +2106,7 @@ mod tests {
             ("Clipboard", 0x40c41ce0c93f16c9),
             ("ReloadSoundConfig", 0xaf63ba4c8601b2c6),
             ("MouseCapture", 0x084db707b5028782),
-            ("SwitchServer", 0xbaea5f0b8386b93e),
+            ("SwitchServer", 0x56483359caf4ac4c),
             ("SetWindowTitle", 0x942464eba5877d51),
         ];
 
