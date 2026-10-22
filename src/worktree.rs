@@ -149,6 +149,90 @@ pub(crate) fn build_worktree_remove_command(
     }
 }
 
+/// A present path whose linked-checkout identity cannot be verified (#370).
+/// Force cannot establish identity. Device observations never decide refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckoutUnreachable {
+    /// The registered checkout path, preserved for recovery.
+    pub path: PathBuf,
+    /// Same device as the parent suggests an unmounted mount point; unknown on stat failure.
+    pub possible_unmounted_mount_point: Option<bool>,
+}
+impl CheckoutUnreachable {
+    /// Recovery needs external action, never a repo-wide prune or forced retry.
+    pub const RECOVERY: &'static str = concat!(
+        "Remount and retry, or, if the checkout is really gone, ",
+        "remove the directory yourself and retry. ",
+        "Flock will not run git worktree prune: it is repo-wide ",
+        "and can unlink temporarily absent checkouts."
+    );
+    /// Stable structured detail shared by API removal and kill-by-path.
+    pub fn data(&self) -> serde_json::Value {
+        serde_json::json!({"path":self.path.display().to_string(),
+            "possible_unmounted_mount_point":self.possible_unmounted_mount_point,
+            "recovery":Self::RECOVERY})
+    }
+}
+impl std::fmt::Display for CheckoutUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Checkout {} is present but its Git worktree registration cannot be verified. {}{}",
+            self.path.display(),
+            if self.possible_unmounted_mount_point == Some(true) {
+                "It may be an unmounted mount point (same device as parent; hint only). "
+            } else {
+                ""
+            },
+            Self::RECOVERY
+        )
+    }
+}
+
+/// Classify before removal: absent paths retain git's single-record cleanup.
+/// present paths must have mutually matching gitfile/admin/common-dir identities.
+/// This is deliberately separate from stderr's forceable-refusal classifier.
+pub(crate) fn check_worktree_remove(repo: &Path, path: &Path) -> Result<(), CheckoutUnreachable> {
+    if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(());
+    }
+    let verified = (|| -> Option<()> {
+        let gitfile = path.join(".git");
+        let text = std::fs::read_to_string(&gitfile).ok()?;
+        let target = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+        let admin = path.join(target).canonicalize().ok()?;
+        let common = run_command_capture(
+            "git",
+            &[
+                "-C",
+                &repo.to_string_lossy(),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            None,
+        )
+        .ok()?;
+        let common = PathBuf::from(common.trim()).canonicalize().ok()?;
+        if admin.parent()? != common.join("worktrees").canonicalize().ok()? {
+            return None;
+        }
+        let back = std::fs::read_to_string(admin.join("gitdir")).ok()?;
+        if admin.join(back.trim()).canonicalize().ok()? != gitfile.canonicalize().ok()? {
+            return None;
+        }
+        let owner = std::fs::read_to_string(admin.join("commondir")).ok()?;
+        (admin.join(owner.trim()).canonicalize().ok()? == common).then_some(())
+    })();
+    if verified.is_some() {
+        return Ok(());
+    }
+    Err(CheckoutUnreachable {
+        path: path.to_owned(),
+        possible_unmounted_mount_point: crate::platform::same_device_as_parent(path),
+    })
+}
+
 /// Why git refused a `git worktree remove`, when the refusal is one `--force`
 /// clears (#351).
 ///
@@ -260,8 +344,8 @@ pub enum WorktreeRemoveOutcome {
     /// — the classification, not git's raw wording, so a caller can report what
     /// it agreed to lose instead of re-deriving it from a string.
     Recovered { refusal: WorktreeRemoveRefusal },
-    /// Not removed. The message is git's own, from whichever attempt got
-    /// furthest.
+    /// Not removed. Shared checkout-identity refusal or git's error from the
+    /// attempt that got furthest.
     Failed(String),
 }
 
@@ -290,8 +374,10 @@ pub(crate) fn remove_worktree_unattended(
     path: &Path,
     force: bool,
 ) -> WorktreeRemoveOutcome {
-    let attempt =
-        |force: bool| run_worktree_command(&build_worktree_remove_command(repo_root, path, force));
+    let attempt = |force: bool| {
+        check_worktree_remove(repo_root, path).map_err(|error| error.to_string())?;
+        run_worktree_command(&build_worktree_remove_command(repo_root, path, force))
+    };
     let Err(err) = attempt(force) else {
         return WorktreeRemoveOutcome::Removed { forced: force };
     };
@@ -3961,6 +4047,48 @@ mod tests {
     fn generated_branch_slug_is_worktree_namespaced_and_stable() {
         assert_eq!(generated_branch_slug(0), "worktree/brave-river-0000");
         assert_eq!(generated_branch_slug(9), "worktree/calm-cloud-0009");
+    }
+
+    #[test]
+    fn removal_checks_gitdir_owner_and_backlink_before_force() {
+        let repo = crate::test_support::create_committed_repo("remove-admin-owner");
+        let root = crate::test_support::unique_temp_path("remove-admin-checkouts");
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&root).unwrap();
+        for (path, branch) in [(&a, "worktree/a"), (&b, "worktree/b")] {
+            crate::test_support::run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            check_worktree_remove(&repo, path).unwrap();
+        }
+        let original = std::fs::read(a.join(".git")).unwrap();
+        std::fs::copy(b.join(".git"), a.join(".git")).unwrap();
+        assert!(
+            check_worktree_remove(&repo, &a).is_err(),
+            "another entry's backlink is not this checkout"
+        );
+        assert!(
+            matches!(remove_worktree_unattended(&repo, &a, true), WorktreeRemoveOutcome::Failed(message) if message.contains(CheckoutUnreachable::RECOVERY))
+        );
+        std::fs::write(a.join(".git"), original).unwrap();
+        let foreign = crate::test_support::create_committed_repo("foreign-remove-admin-owner");
+        assert!(
+            check_worktree_remove(&foreign, &a).is_err(),
+            "a valid gitdir must still belong to the requested repo"
+        );
+        check_worktree_remove(&repo, &a).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(foreign).unwrap();
     }
 
     #[test]

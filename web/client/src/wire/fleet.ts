@@ -10,25 +10,12 @@
  *
  * @module
  */
+import type { FleetAgentRow } from "../gen/FleetAgentRow";
+import type { FleetDelta } from "../gen/FleetDelta";
 import type { Phase } from "../gen/Phase";
 import type { WireEvent } from "../gen/WireEvent";
 import type { AgentRow, FleetSource } from "../fleet";
 import type { WireConnection } from "./connection";
-
-/**
- * A narrow local mirror of `FleetAgentRow` and `FleetDelta`, as decided on
- * #1746. Their ts-rs types are not generated yet; these are replaced by
- * them when they land, and are checked at runtime until then.
- */
-type FleetAgentRow = {
-  readonly id: string;
-  readonly label: string;
-  /** The S4 state enum. */
-  readonly state: Phase;
-  readonly activity?: string;
-  readonly waiting_on_human: readonly string[];
-};
-type FleetDelta = { readonly type: "fleet.upsert"; readonly row: FleetAgentRow } | { readonly type: "fleet.remove"; readonly id: string };
 
 /** Typed against {@link Phase}, so a new state fails `tsc` until listed. */
 const PHASES: { readonly [P in Phase]: true } = {
@@ -50,13 +37,15 @@ type Json = { readonly [key: string]: unknown };
 const isObject = (value: unknown): value is Json => typeof value === "object" && value !== null && !Array.isArray(value);
 const isStrings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === "string");
 
+/** Checks only what {@link agentRow} reads; `state` is the generated `AgentState` object. */
 function isRow(row: unknown): row is FleetAgentRow {
+  if (!isObject(row) || !isObject(row["state"])) return false;
+  const phase = row["state"]["phase"];
   return (
-    isObject(row) &&
     typeof row["id"] === "string" &&
     typeof row["label"] === "string" &&
-    typeof row["state"] === "string" &&
-    Object.hasOwn(PHASES, row["state"]) &&
+    typeof phase === "string" &&
+    Object.hasOwn(PHASES, phase) &&
     (row["activity"] === undefined || typeof row["activity"] === "string") &&
     isStrings(row["waiting_on_human"])
   );
@@ -71,7 +60,7 @@ export function fleetDelta(ev: WireEvent): FleetDelta | null {
 }
 
 function agentRow(row: FleetAgentRow): AgentRow {
-  return { id: row.id, label: row.label, state: row.state, activity: row.activity ?? "", waitingOnHuman: row.waiting_on_human };
+  return { id: row.id, label: row.label, state: row.state.phase, activity: row.activity ?? "", waitingOnHuman: row.waiting_on_human };
 }
 
 /** Creates a {@link FleetSource} whose subscriptions run on `connection`. */

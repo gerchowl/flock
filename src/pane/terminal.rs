@@ -112,6 +112,8 @@ pub(crate) struct GhosttyPaneTerminal {
 
 pub(crate) struct GhosttyPaneCore {
     pub terminal: crate::ghostty::Terminal,
+    content_revision: u64,
+    pinned_selection: Option<(u64, crate::ghostty::TrackedSelection)>,
     pub render_state: crate::ghostty::RenderState,
     pub kitty_keyboard: KittyKeyboardTracker,
     pub initial_default_foreground: Option<crate::ghostty::RgbColor>,
@@ -217,6 +219,22 @@ impl PaneTerminal {
 
     pub fn recent_unwrapped_ansi(&self, lines: usize) -> String {
         self.ghostty.recent_unwrapped_ansi(lines)
+    }
+
+    /// Capture or extend content identity under the parser lock (ADR-0040 §1).
+    pub fn pin_selection(
+        &self,
+        selection: &mut crate::selection::Selection,
+        drag: Option<(u16, u16, Rect)>,
+    ) {
+        self.ghostty.pin_selection(selection, drag);
+    }
+    /// Resolve current endpoint coordinates, refusing discarded content.
+    pub fn resolve_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<crate::selection::Selection> {
+        self.ghostty.resolve_selection(selection)
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -353,6 +371,8 @@ impl GhosttyPaneTerminal {
         Ok(Self {
             core: Mutex::new(GhosttyPaneCore {
                 terminal,
+                content_revision: 0,
+                pinned_selection: None,
                 render_state,
                 kitty_keyboard: KittyKeyboardTracker::default(),
                 initial_default_foreground,
@@ -540,6 +560,7 @@ impl GhosttyPaneTerminal {
         xtgettcap_responses: Vec<XtgettcapResponse>,
         terminal_responses: &mut Vec<Bytes>,
     ) {
+        core.content_revision = core.content_revision.saturating_add(1);
         let mut events = Vec::with_capacity(default_color_events.len() + xtgettcap_responses.len());
         events.extend(
             default_color_events
@@ -1069,6 +1090,81 @@ impl GhosttyPaneTerminal {
             .ok()
             .and_then(|core| ghostty_recent_ansi(&core, lines, true).ok())
             .unwrap_or_default()
+    }
+
+    /// Capture or extend the runtime-owned content anchor (ADR-0040 §1).
+    pub fn pin_selection(
+        &self,
+        selection: &mut crate::selection::Selection,
+        drag: Option<(u16, u16, Rect)>,
+    ) {
+        let Ok(mut core) = self.core.lock() else {
+            selection.content_revision = Some(0);
+            return;
+        };
+        let core = &mut *core;
+        let Some(scrollbar) = core.terminal.scrollbar().ok() else {
+            selection.content_revision = Some(0);
+            return;
+        };
+        if let Some((col, row, rect)) = drag {
+            let Some(resolved) = resolve_content_selection(core, selection) else {
+                selection.content_revision = Some(0);
+                return;
+            };
+            *selection = resolved;
+            selection.drag(
+                col,
+                row,
+                rect,
+                Some(ScrollMetrics {
+                    offset_from_bottom: scrollbar
+                        .total
+                        .saturating_sub(scrollbar.offset + scrollbar.len),
+                    max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len),
+                    viewport_rows: scrollbar.len,
+                }),
+            );
+        } else {
+            selection.rebase_capture(scrollbar.offset as u32);
+        }
+        let revision = selection.content_revision.replace(0);
+        if let Some(revision) = revision {
+            if let Some((id, range)) = core
+                .pinned_selection
+                .as_mut()
+                .filter(|(id, _)| *id == revision)
+            {
+                let Some(current) = range.points(&core.terminal) else {
+                    return;
+                };
+                let mut points = selection.endpoints();
+                points[0].0 = current[0].0;
+                selection.set_endpoints(points);
+                if range.update(&core.terminal, points).is_some() {
+                    selection.content_revision = Some(*id);
+                }
+            }
+        } else if let Some(id) = core.content_revision.checked_add(1) {
+            // SAFETY: the pins stay in this core with the terminal. All access
+            // uses the parser mutex; core destruction has exclusive ownership.
+            if let Some(range) = unsafe {
+                crate::ghostty::TrackedSelection::new(&core.terminal, selection.endpoints())
+            } {
+                core.content_revision = id;
+                core.pinned_selection = Some((id, range));
+                selection.content_revision = Some(id);
+            }
+        }
+    }
+
+    /// Resolve current endpoint coordinates, refusing discarded content.
+    pub fn resolve_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<crate::selection::Selection> {
+        let core = self.core.lock().ok()?;
+        resolve_content_selection(&core, selection)
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -1702,10 +1798,27 @@ fn ghostty_restore_scroll_offset_from_bottom(
     }
 }
 
+fn resolve_content_selection(
+    core: &GhosttyPaneCore,
+    selection: &crate::selection::Selection,
+) -> Option<crate::selection::Selection> {
+    let mut resolved = selection.clone();
+    if let Some(revision) = selection.content_revision {
+        let (_, range) = core
+            .pinned_selection
+            .as_ref()
+            .filter(|(id, _)| *id == revision)?;
+        resolved.set_endpoints(range.points(&core.terminal)?);
+    }
+    Some(resolved)
+}
+
 fn ghostty_extract_selection(
     core: &mut GhosttyPaneCore,
     selection: &crate::selection::Selection,
 ) -> Result<String, crate::ghostty::Error> {
+    let selection = resolve_content_selection(core, selection)
+        .ok_or(crate::ghostty::Error::selection_unavailable())?;
     let ((start_row, start_col), (end_row, end_col)) = selection.ordered_cells();
     core.terminal
         .read_text_screen((start_col, start_row), (end_col, end_row), false)

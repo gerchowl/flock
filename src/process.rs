@@ -595,9 +595,6 @@ impl TracedCommand {
 /// via `ps`); this is the backstop for when someone forgets, not the primary
 /// defence.
 fn redact_arg(arg: &str) -> String {
-    if let Some((url, _)) = arg.split_once("#code=") {
-        return format!("{url}#code=<redacted>");
-    }
     const SECRET_PREFIXES: [&str; 4] = [
         "authorization:",
         "proxy-authorization:",
@@ -620,7 +617,44 @@ fn redact_arg(arg: &str) -> String {
             };
         }
     }
-    arg.to_string()
+    redact_url_credentials(arg)
+}
+
+/// Preserve URL destinations and ordinary parameters while masking credentials.
+/// This also covers URLs embedded in option values or command text.
+fn redact_url_credentials(arg: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    if !arg.contains("://") {
+        return arg.to_owned();
+    }
+    static URL: OnceLock<Regex> = OnceLock::new();
+    static PARAM: OnceLock<Regex> = OnceLock::new();
+    let url = URL.get_or_init(|| {
+        Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+"#).expect("static argv URL pattern")
+    });
+    let param = PARAM.get_or_init(|| {
+        Regex::new(r"(?i)([?#&](?:code|token|secret|key)=)[^&#]*")
+            .expect("static secret URL parameter pattern")
+    });
+    url.replace_all(arg, |captures: &regex::Captures<'_>| {
+        let value = &captures[0];
+        let authority_start = value.find("://").expect("matched scheme") + 3;
+        let authority_end = value[authority_start..]
+            .find(['/', '?', '#'])
+            .map_or(value.len(), |end| authority_start + end);
+        let masked = if let Some(at) = value[authority_start..authority_end].rfind('@') {
+            format!(
+                "{}***{}",
+                &value[..authority_start],
+                &value[authority_start + at..]
+            )
+        } else {
+            value.to_owned()
+        };
+        param.replace_all(&masked, "${1}<redacted>").into_owned()
+    })
+    .into_owned()
 }
 
 /// Shape a failed command's captured stderr into a bounded, credential-masked
@@ -655,17 +689,39 @@ pub(crate) fn shape_stderr_tail(stderr: &[u8]) -> Option<String> {
 /// Shape a `Command`'s argv into a single log-safe string: args joined with
 /// spaces, capped at `MAX_ARG_LOG_CHARS`, with an ellipsis marker on overflow.
 /// Non-UTF8 args become lossy strings so the audit trail never fails to render.
+/// Known token shapes, URL credentials and named secret flag values are masked
+/// before the cap. A separate secret flag consumes the next argument as its value.
+/// Arbitrary unlabelled secrets cannot be identified; callers must use stdin/env.
 #[allow(dead_code)] // Called from the wrapper commit's impl (also under #[allow]); real callers land in the migration.
 fn shape_args(command: &Command) -> String {
+    const SECRET_FLAGS: [&str; 4] = ["--password", "--token", "--api-key", "--secret"];
     let mut buf = String::new();
+    let mut secret_value = false;
     for arg in command.get_args() {
         if !buf.is_empty() {
             buf.push(' ');
         }
-        buf.push_str(&redact_arg(&arg.to_string_lossy()));
+        let arg = arg.to_string_lossy();
+        if secret_value {
+            buf.push_str("<redacted>");
+            secret_value = false;
+        } else if let Some((flag, _)) = arg
+            .split_once('=')
+            .filter(|(flag, _)| SECRET_FLAGS.contains(flag))
+        {
+            buf.push_str(flag);
+            buf.push_str("=<redacted>");
+        } else {
+            secret_value = SECRET_FLAGS.contains(&arg.as_ref());
+            buf.push_str(&redact_arg(&arg));
+        }
         if buf.len() >= MAX_ARG_LOG_CHARS {
             break;
         }
+    }
+    // Scrub before truncation so a token crossing the cap cannot leave a prefix.
+    if let std::borrow::Cow::Owned(masked) = crate::report::redact::mask_secret_tokens(&buf) {
+        buf = masked;
     }
     if buf.len() > MAX_ARG_LOG_CHARS {
         // Char-boundary-safe truncation: back off to the last boundary at or
@@ -808,6 +864,112 @@ mod tests {
         let secret = "y".repeat(16);
         let basic = redact_arg(&format!("AUTHORIZATION: Basic {secret}"));
         assert!(!basic.contains(&secret), "{basic}");
+    }
+
+    fn logged_fixture_args(args: &[String]) -> String {
+        capture_logs(|| {
+            TracedCommand::new(TRUE_PROG, "argv-fixture")
+                .args(args)
+                .status_traced()
+                .expect("fixture command");
+        })
+    }
+
+    #[test]
+    fn bare_token_shapes_are_masked_in_actual_exec_logs() {
+        let tokens = [
+            format!("{}{}", "ghp_", "x".repeat(20)),
+            format!("{}{}", "github_pat_", "x".repeat(24)),
+            format!("{}{}", "sk-", "x".repeat(24)),
+            format!("{}{}", "xoxb-", "x".repeat(16)),
+            format!("{}{}", "AKIA", "A".repeat(16)),
+            format!(
+                "{}{}.{}.{}",
+                "eyJ",
+                "a".repeat(12),
+                "b".repeat(12),
+                "c".repeat(12)
+            ),
+        ];
+        for token in tokens {
+            let logs =
+                logged_fixture_args(&["keep-before".into(), token.clone(), "keep-after".into()]);
+            assert!(!logs.contains(&token), "token survived");
+            assert!(logs.contains("<redacted-token>"));
+            assert!(logs.contains("keep-before") && logs.contains("keep-after"));
+        }
+    }
+
+    #[test]
+    fn url_userinfo_is_masked_without_erasing_the_destination() {
+        let credentials = ["fixture-user", "fixture-password"].join(":");
+        let url = format!("https://{credentials}@example.com/repo?view=diff");
+        let logs = logged_fixture_args(&[url]);
+        assert!(!logs.contains(&credentials));
+        assert!(logs.contains("https://***@example.com/repo?view=diff"));
+    }
+
+    #[test]
+    fn secret_flags_mask_values_in_both_forms_and_keep_other_args() {
+        for flag in ["--password", "--token", "--api-key", "--secret"] {
+            let secret = ["fixture", "credential"].join("-");
+            for args in [
+                vec![
+                    flag.into(),
+                    secret.clone(),
+                    "--verbose".into(),
+                    "ordinary".into(),
+                ],
+                vec![
+                    format!("{flag}={secret}"),
+                    "--verbose".into(),
+                    "ordinary".into(),
+                ],
+            ] {
+                let logs = logged_fixture_args(&args);
+                assert!(!logs.contains(&secret), "secret survived for {flag}");
+                assert!(logs.contains(flag));
+                assert!(logs.contains("--verbose ordinary"));
+            }
+        }
+    }
+
+    #[test]
+    fn secret_url_parameters_are_masked_and_other_parameters_survive() {
+        let secret = ["fixture", "credential"].join("-");
+        for name in ["code", "token", "secret", "key", "TOKEN"] {
+            for separator in ['?', '#'] {
+                let url =
+                    format!("https://example.com/{separator}view=diff&{name}={secret}&page=2");
+                let logs = logged_fixture_args(&[url]);
+                assert!(!logs.contains(&secret));
+                assert!(logs.contains(&format!("{name}=<redacted>&page=2")));
+                assert!(logs.contains("view=diff"));
+            }
+        }
+        let logs = logged_fixture_args(&[format!("https://example.com/#code={secret}")]);
+        assert!(!logs.contains(&secret));
+    }
+
+    #[test]
+    fn ordinary_git_argv_and_program_are_unchanged() {
+        let mut command = Command::new("git");
+        command.args(["-C", "fixture-repo", "status", "--porcelain=v1", "--branch"]);
+        assert_eq!(command.get_program(), "git");
+        assert_eq!(
+            shape_args(&command),
+            "-C fixture-repo status --porcelain=v1 --branch"
+        );
+    }
+
+    #[test]
+    fn token_crossing_the_log_cap_is_masked_before_truncation() {
+        let token = format!("{}{}", "ghp_", "x".repeat(30));
+        let mut command = Command::new(TRUE_PROG);
+        command.arg(format!("{}{token}", "x".repeat(MAX_ARG_LOG_CHARS - 10)));
+        let args = shape_args(&command);
+        assert!(!args.contains("ghp_"));
+        assert!(args.len() <= MAX_ARG_LOG_CHARS + ARG_TRUNCATED_MARKER.len());
     }
 
     /// #318: a 2s sampler exiting 0 forever wrote 98.9% of flock-server.log.
