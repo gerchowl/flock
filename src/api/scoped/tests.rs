@@ -168,3 +168,12 @@ fn scoped_continuations_stop_after_revocation_and_context_is_restored() {
     drop(guard);
     assert!(Scope::current().is_none());
 }
+
+#[test]
+fn legacy_invalid_request_keeps_serde_detail_but_scoped_detail_is_redacted() {
+    let legacy = decode(r#"{"id":"x","method":"unknown-fixture-method","params":{}}"#)
+        .unwrap_err()
+        .unwrap();
+    assert!(legacy.to_string().contains("unknown-fixture-method"));
+    assert!(decode(r#"{"request":{"id":"x","method":"secret-canary","params":{}},"credential":"credential-canary"}"#).unwrap_err().is_none());
+}

@@ -5,6 +5,7 @@ import { App } from "../src/App";
 import type { Transport } from "../src/transport";
 import { FIXTURE_STREAM, createFixtureTransport } from "../src/transport/fixture";
 import { Transcript } from "../src/views/Transcript";
+import { createComposerState } from "../src/workbench/Composer";
 import { readFixture, readVariants } from "./fixture-replay";
 
 let dispose: (() => void) | undefined;
@@ -80,6 +81,31 @@ describe("Transcript", () => {
     observer?.reset?.();
     expect(root.querySelector('[data-testid="transcript-gap"]')).toBeNull();
     expect(root.querySelector('[data-testid="unknown-event"]')).toBeNull();
+  });
+
+  test("a reset mid-stream ends Current, so a send then records no echo cursor (#1791)", () => {
+    let observer: Parameters<Transport["subscribe"]>[2] | undefined;
+    const transport: Transport = { subscribe: (_stream, _after, given) => ((observer = given), { close: () => undefined }) };
+    const composer = createComposerState();
+    const currents: boolean[] = [];
+    mount(() => (
+      <Transcript
+        transport={transport}
+        stream="agent/a"
+        source="live"
+        onEntry={(seq, text) => composer.observe("a", seq, text)}
+        onCurrent={(current) => (currents.push(current), composer.current("a", current))}
+      />
+    ));
+    const said = (seq: number, text: string) => ({ seq, kind: "known", event: { type: "user", message: { role: "user", content: text } } }) as const;
+    observer?.entry(said(1, "earlier"));
+    observer?.synced();
+    observer?.reset?.();
+    expect(currents).toEqual([false, true, false]);
+    // Sent while the stream replays again: its cursor (1) is not the stream's.
+    composer.sent("a", "c1");
+    observer?.entry(said(2, "hello"));
+    expect([...composer.echoed("a", [{ cmdId: "c1", text: "hello" }])]).toEqual([]);
   });
 
   test("a failed subscription is shown, not swallowed", async () => {
