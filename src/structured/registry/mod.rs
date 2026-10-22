@@ -198,6 +198,14 @@ impl Registry {
         if self.unparsed.is_some() {
             return Err(RegistryError::UnsupportedCollectionShape);
         }
+        if record
+            .name
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            crate::logging::agent_name_dropped("registry");
+            return Err(RegistryError::InvalidRecord);
+        }
         if record.agent_id.is_empty()
             || record.session_id.is_empty()
             || record.harness != "claude"
