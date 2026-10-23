@@ -3051,6 +3051,9 @@ pub enum ResponseResult {
         session_health: Option<crate::platform::SessionHealth>,
         #[serde(default)]
         api_listener: Option<ApiListenerHealth>,
+        /// Confirmed structured listener state; failure never stops the server or its PTYs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_listener: Option<super::client_listener::Status>,
         /// Missing on older servers; observing status never starts an NSS lookup.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_account_diagnostic: Option<AgentAccountDiagnostic>,
@@ -4938,8 +4941,8 @@ pub struct PollerHealthSummary {
     pub pr: PollerHealth,
     /// The periodic git working-tree refresh that keeps sidebar branch /
     /// dirty / ahead-behind numbers accurate (#295). `None` from a peer on
-    /// the previous release; `Some` here always, because the refresher runs
-    /// as long as any workspace exists.
+    /// the previous release. A closed viewer gate or absent/ineligible
+    /// workspaces reports `idle` with its reason; it does not stamp success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_refresh: Option<PollerHealth>,
     /// The `[checks]` runner tick — the scheduler that dispatches script /
@@ -4958,6 +4961,25 @@ pub struct PollerHealthSummary {
     pub peer_poll: Option<PollerHealth>,
 }
 
+/// Why a poller is intentionally inactive or awaiting its next refresh.
+/// Codes contain no paths or host identifiers. Future peer values decode as
+/// `Unknown`; the optional field is ignored by older JSON readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollerReason {
+    /// No rendering app client is attached; the viewer-only gate is closed.
+    NoViewer,
+    /// No workspace exists to refresh.
+    NoWorkspaces,
+    /// Workspaces exist but none supplies a nonempty working directory.
+    NoEligibleWorkspaces,
+    /// No failure is known, but fresh results have not arrived yet.
+    AwaitingRefresh,
+    /// A newer peer supplied an unrecognized reason.
+    #[serde(other)]
+    Unknown,
+}
+
 /// One poller's health.
 ///
 /// Carries the raw facts AND a computed verdict on purpose: a watchdog wants
@@ -4966,8 +4988,11 @@ pub struct PollerHealthSummary {
 /// colour a badge. Making either reconstruct the other guarantees they disagree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollerHealth {
-    /// `ok` | `degraded` | `broken`.
+    /// `ok` | `idle` | `degraded` | `broken`; unknown future values remain readable.
     pub status: String,
+    /// Typed inactivity or pending-refresh reason; absent for other pollers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PollerReason>,
     /// Seconds since the last SUCCESSFUL round. `None` = never succeeded,
     /// which is not the same as "0 seconds ago" and must not render as fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5118,6 +5143,7 @@ pub struct PeerWorkspaceSummary {
     pub is_linked_worktree: bool,
     /// Short agent label of the workspace's attention-leading pane (e.g. "cc").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
     /// Seconds since the leading pane's state last changed.
@@ -5149,6 +5175,7 @@ pub struct PeerAgentSummary {
     /// Public pane id on the owning server. A routing detail, not a name.
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
 }
@@ -5752,6 +5779,7 @@ mod tests {
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
+                client_listener: None,
                 agent_account_diagnostic: None,
             },
         };

@@ -12,14 +12,22 @@ use super::responses::{encode_error, encode_error_body, encode_error_with_data, 
 
 struct ApiFailure {
     code: &'static str,
-    message: String,
+    message: crate::process::CommandFailure,
+    data: Option<serde_json::Value>,
 }
 
 impl ApiFailure {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    fn new(code: &'static str, message: impl Into<crate::process::CommandFailure>) -> Self {
         Self {
             code,
             message: message.into(),
+            data: None,
+        }
+    }
+    fn encode(self, id: String) -> String {
+        match self.data {
+            Some(data) => encode_error_with_data(id, self.code, self.message, data),
+            None => encode_error(id, self.code, self.message),
         }
     }
 }
@@ -82,7 +90,7 @@ impl App {
     ) -> String {
         let source = match self.resolve_worktree_list_source(params.workspace_id, params.cwd) {
             Ok(source) => source,
-            Err(err) => return encode_error(id, err.code, err.message),
+            Err(err) => return err.encode(id),
         };
         let entries = match crate::worktree::list_existing_worktrees(&source.source_repo_root) {
             Ok(entries) => entries,
@@ -128,12 +136,12 @@ impl App {
         let base = params.base.unwrap_or_else(|| "HEAD".into());
         let mut source = match self.resolve_worktree_source(params.workspace_id, params.cwd) {
             Ok(source) => source,
-            Err(err) => return encode_error(id, err.code, err.message),
+            Err(err) => return err.encode(id),
         };
         let checkout_path = match params.path {
             Some(path) => match absolute_user_path("path", &path) {
                 Ok(path) => path,
-                Err(err) => return encode_error(id, err.code, err.message),
+                Err(err) => return err.encode(id),
             },
             None => crate::worktree::default_checkout_path(
                 &self.state.worktree_directory,
@@ -176,7 +184,7 @@ impl App {
         }
         let parent_ws_idx = match self.ensure_source_parent_membership(&mut source, true) {
             Ok(idx) => idx,
-            Err(err) => return encode_error(id, err.code, err.message),
+            Err(err) => return err.encode(id),
         };
 
         let ws_idx = match self.create_workspace_with_options(checkout_path.clone(), params.focus) {
@@ -390,7 +398,7 @@ impl App {
         let checkout_path = match params.path {
             Some(path) => match absolute_user_path("path", &path) {
                 Ok(path) => path,
-                Err(err) => return encode_error(id, err.code, err.message),
+                Err(err) => return err.encode(id),
             },
             None => crate::worktree::default_checkout_path(
                 &self.state.worktree_directory,
@@ -628,11 +636,11 @@ impl App {
         }
         let mut source = match self.resolve_worktree_source(params.workspace_id, params.cwd) {
             Ok(source) => source,
-            Err(err) => return encode_error(id, err.code, err.message),
+            Err(err) => return err.encode(id),
         };
         let entry = match self.find_worktree_entry(&source, params.path, params.branch) {
             Ok(entry) => entry,
-            Err(err) => return encode_error(id, err.code, err.message),
+            Err(err) => return err.encode(id),
         };
         if entry.is_bare || entry.is_prunable {
             return encode_error(id, "worktree_not_found", "worktree cannot be opened");
@@ -645,7 +653,7 @@ impl App {
         let created_source_workspace =
             match self.ensure_source_parent_membership(&mut source, !defer_source_created_event) {
                 Ok(created) => created,
-                Err(err) => return encode_error(id, err.code, err.message),
+                Err(err) => return err.encode(id),
             };
         let (ws_idx, created_workspace) = if let Some(ws_idx) = already_open {
             if params.focus {
@@ -748,7 +756,7 @@ impl App {
 
         let workspace_id = match self.remove_worktree_checkout(ws_idx, &space, params.force) {
             Ok(workspace_id) => workspace_id,
-            Err(failure) => return encode_error(id, failure.code, failure.message),
+            Err(failure) => return failure.encode(id),
         };
 
         encode_success(
@@ -775,6 +783,13 @@ impl App {
         checkout: &Path,
         force: bool,
     ) -> Result<(), ApiFailure> {
+        crate::worktree::check_worktree_remove(repo_root, checkout).map_err(|failure| {
+            ApiFailure {
+                code: crate::api::error_code::ErrorCode::WorktreeCheckoutUnreachable.as_str(),
+                message: failure.to_string().into(),
+                data: Some(failure.data()),
+            }
+        })?;
         let command = crate::worktree::build_worktree_remove_command(repo_root, checkout, force);
         if let Err(err) = crate::worktree::run_worktree_command(&command) {
             // Both codes mean "rerun with force"; they differ in what the
@@ -835,7 +850,7 @@ impl App {
     ) -> String {
         let target = match self.resolve_kill_target(&params) {
             Ok(target) => target,
-            Err(err) => return encode_error(id, err.code, err.message),
+            Err(err) => return err.encode(id),
         };
 
         // #631's self-guard, BEFORE the merge gate: the gate can spend a `gh`
@@ -843,7 +858,7 @@ impl App {
         // for an answer nobody asked for.
         if !params.dry_run {
             if let Err(err) = self.refuse_unguarded_self_kill(&target, &params) {
-                return encode_error(id, err.code, err.message);
+                return err.encode(id);
             }
         }
 
@@ -943,14 +958,14 @@ impl App {
                 };
                 match self.remove_worktree_checkout(ws_idx, &space, params.force) {
                     Ok(workspace_id) => Some(workspace_id),
-                    Err(failure) => return encode_error(id, failure.code, failure.message),
+                    Err(failure) => return failure.encode(id),
                 }
             }
             None => {
                 if let Err(failure) =
                     Self::run_worktree_remove(&target.repo_root, &target.checkout, params.force)
                 {
-                    return encode_error(id, failure.code, failure.message);
+                    return failure.encode(id);
                 }
                 None
             }
@@ -1111,12 +1126,37 @@ impl App {
                         });
                     }
                 }
+                // Verify registration in a remembered repo, never infer ownership
+                // from an unreadable checkout's parent directory.
+                let mut seen_repos = std::collections::BTreeSet::new();
+                for ws in &self.state.workspaces {
+                    let Some(space) = crate::workspace::git_space_metadata(&ws.identity_cwd) else {
+                        continue;
+                    };
+                    let repo = crate::worktree::main_root_from_common_dir(Path::new(&space.key));
+                    if !seen_repos.insert(repo.clone()) {
+                        continue;
+                    }
+                    let registered =
+                        crate::worktree::list_existing_worktrees(&repo).is_ok_and(|rows| {
+                            rows.iter().any(|row| {
+                                !row.is_bare
+                                    && crate::worktree::canonical_or_original(&row.path)
+                                        == canonical
+                                    && canonical != crate::worktree::canonical_or_original(&repo)
+                            })
+                        });
+                    if registered {
+                        return Ok(KillTarget {
+                            workspace_idx: None,
+                            repo_root: repo,
+                            checkout: canonical,
+                        });
+                    }
+                }
                 let space = crate::workspace::git_space_metadata(&canonical).ok_or_else(|| {
-                    // A checkout git cannot read is not killable by path:
-                    // there is no repo to run `git worktree remove` in, and
-                    // guessing one would aim a destructive verb from a
-                    // derivation nothing verified. The workspace form still
-                    // reaches it, because a workspace remembers its repo.
+                    // No readable checkout and no remembered repo verified its
+                    // registration. Do not guess a repo for a destructive verb.
                     ApiFailure::new(
                         "not_git_worktree",
                         "path is not a readable Git work tree; kill it through its workspace",
@@ -1832,6 +1872,228 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    fn unreachable_fixture_path(name: &str) -> PathBuf {
+        let path = unique_temp_path(name);
+        path.parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(path.file_name().unwrap())
+    }
+
+    /// All public removal seams retain an unreachable registration and its sibling.
+    fn unreachable_checkout_seams(tree: bool) {
+        let repo = create_committed_repo("unreachable-checkout-repo");
+        let checkout = unreachable_fixture_path("unreachable-checkout");
+        let sibling = unreachable_fixture_path("temporarily-absent-checkout");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree/unreachable",
+                checkout.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree/absent",
+                sibling.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        std::fs::remove_dir_all(&sibling).unwrap();
+        std::fs::remove_dir_all(&checkout).unwrap();
+        std::fs::create_dir(&checkout).unwrap();
+        if tree {
+            std::fs::write(checkout.join("keep.txt"), "owned fixture data").unwrap();
+        }
+        let mut app = app_with_parent(&repo);
+        let call = |app: &mut App, method| -> serde_json::Value {
+            serde_json::from_str(&app.handle_api_request(Request {
+                id: "unreachable".into(),
+                method,
+            }))
+            .unwrap()
+        };
+        let check = |response: &serde_json::Value| {
+            assert_eq!(
+                response["error"]["code"], "worktree_checkout_unreachable",
+                "{response}"
+            );
+            let data = &response["error"]["data"];
+            assert_eq!(data["path"], checkout.to_string_lossy().as_ref());
+            assert_eq!(
+                data["possible_unmounted_mount_point"],
+                serde_json::json!(crate::platform::same_device_as_parent(&checkout))
+            );
+            assert_eq!(
+                data["recovery"],
+                crate::worktree::CheckoutUnreachable::RECOVERY
+            );
+            assert!(response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("repo-wide"));
+        };
+        // No workspace holds this target: registration must supply its repo.
+        for force in [false, true] {
+            check(&call(
+                &mut app,
+                crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                    path: Some(checkout.display().to_string()),
+                    keep_branch: true,
+                    keep_processes: true,
+                    force,
+                    ..Default::default()
+                }),
+            ));
+        }
+        let child = push_worktree_workspace(&mut app, &repo, &checkout);
+        for force in [false, true] {
+            check(&call(
+                &mut app,
+                crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
+                    workspace_id: child.clone(),
+                    force,
+                }),
+            ));
+            check(&call(
+                &mut app,
+                crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                    workspace_id: Some(child.clone()),
+                    keep_branch: true,
+                    keep_processes: true,
+                    force,
+                    ..Default::default()
+                }),
+            ));
+        }
+        app.state.worktree_remove = Some(crate::app::state::WorktreeRemoveState {
+            managed: true,
+            workspace_id: child.clone(),
+            repo_root: repo.clone(),
+            path: checkout.clone(),
+            error: None,
+            removing: false,
+            force_confirmation: None,
+            focus: crate::app::state::RemoveWorktreeControl::Remove,
+            force: true,
+            probe: None,
+            delete_branch: true,
+            branch: Some("worktree/unreachable".into()),
+            merge_gate: Some(crate::worktree::WorktreeMergeGate::CheckoutMissing),
+            branch_protected: false,
+            gate_timed_out: false,
+        });
+        app.state.mode = crate::app::state::Mode::ConfirmRemoveWorktree;
+        app.start_worktree_remove();
+        match wait_for_event(
+            &mut app,
+            |event| matches!(event, crate::events::AppEvent::WorktreeRemoveFinished(_)),
+            DEFAULT_EVENT_WAIT,
+        ) {
+            crate::events::AppEvent::WorktreeRemoveFinished(result) => {
+                app.handle_worktree_remove_finished(result)
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+        let dialog = app.state.worktree_remove.as_ref().unwrap();
+        assert_eq!(dialog.force_confirmation, None);
+        assert_eq!(
+            dialog.error.as_deref(),
+            Some(
+                crate::worktree::check_worktree_remove(&repo, &checkout)
+                    .unwrap_err()
+                    .to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert!(checkout.is_dir());
+        if tree {
+            assert_eq!(
+                std::fs::read_to_string(checkout.join("keep.txt")).unwrap(),
+                "owned fixture data"
+            );
+        }
+        let rows = crate::worktree::list_existing_worktrees(&repo).unwrap();
+        assert!(
+            rows.iter().any(|row| row.path == sibling),
+            "never prune a temporarily missing sibling"
+        );
+        assert!(rows.iter().any(|row| row.path == checkout));
+        // Only the user's explicit deletion changes the classification to absent.
+        std::fs::remove_dir_all(&checkout).unwrap();
+        let result = call(
+            &mut app,
+            crate::api::schema::Method::WorktreeRemove(WorktreeRemoveParams {
+                workspace_id: child,
+                force: false,
+            }),
+        );
+        assert!(result.get("error").is_none(), "{result}");
+        let rows = crate::worktree::list_existing_worktrees(&repo).unwrap();
+        assert!(!rows.iter().any(|row| row.path == checkout));
+        assert!(rows.iter().any(|row| row.path == sibling));
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn empty_checkout_is_refused_by_api_path_and_tui_without_pruning() {
+        unreachable_checkout_seams(false);
+    }
+    #[test]
+    fn tree_without_gitfile_is_refused_by_api_path_and_tui_without_pruning() {
+        unreachable_checkout_seams(true);
+    }
+
+    #[test]
+    fn absent_checkout_still_removes_by_registered_path_without_pruning_sibling() {
+        let repo = create_committed_repo("absent-kill-path-repo");
+        let checkout = unreachable_fixture_path("absent-kill-target");
+        let sibling = unreachable_fixture_path("absent-kill-sibling");
+        for (path, branch) in [
+            (&checkout, "worktree/target"),
+            (&sibling, "worktree/sibling"),
+        ] {
+            run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            std::fs::remove_dir_all(path).unwrap();
+        }
+        let mut app = app_with_parent(&repo);
+        let response = app.handle_api_request(Request {
+            id: "absent".into(),
+            method: crate::api::schema::Method::WorktreeKill(WorktreeKillParams {
+                path: Some(checkout.display().to_string()),
+                keep_branch: true,
+                keep_processes: true,
+                ..Default::default()
+            }),
+        });
+        let result: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(result["result"]["removed"], true, "{result}");
+        let rows = crate::worktree::list_existing_worktrees(&repo).unwrap();
+        assert!(!rows.iter().any(|row| row.path == checkout));
+        assert!(rows.iter().any(|row| row.path == sibling));
+        std::fs::remove_dir_all(repo).unwrap();
     }
 
     fn app_with_parent(repo: &Path) -> App {
