@@ -706,6 +706,17 @@ fn close_fds(fds: &[RawFd]) {
 
 #[cfg(unix)]
 fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> io::Result<()> {
+    recv_fds_into_observing(stream, expected, out, |_| {})
+}
+
+/// Observe kernel-installed descriptor flags before the portable fcntl fallback.
+#[cfg(unix)]
+fn recv_fds_into_observing(
+    stream: &UnixStream,
+    expected: usize,
+    out: &mut Vec<RawFd>,
+    mut received: impl FnMut(&[RawFd]),
+) -> io::Result<()> {
     // Sized well past one batch, so a batch carrying more than the remainder,
     // or more than the batch limit, arrives whole and is refused by count.
     // Truncation is not a safe way to refuse: on macOS the kernel installs
@@ -759,6 +770,7 @@ fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> 
             return Err(io::Error::other("handoff fd control message was truncated"));
         }
         collected?;
+        received(&out[before..]);
         // Set every received PTY/listener descriptor before any importer child can be spawned.
         for fd in &out[before..] {
             crate::platform::received_fd::close_on_exec(*fd)?;
@@ -1245,6 +1257,31 @@ mod tests {
         assert_eq!(batch_sizes_on_the_wire(64), vec![64]);
         assert_eq!(batch_sizes_on_the_wire(65), vec![64, 1]);
         assert_eq!(batch_sizes_on_the_wire(150), vec![64, 64, 22]);
+    }
+
+    #[test]
+    fn handoff_receive_passes_platform_flags_before_fcntl() {
+        let (reads, writes) = pipes(1);
+        let (sender, receiver) = pair_with_timeout();
+        send_fds(&sender, &writes).unwrap();
+        let mut received = Vec::new();
+        let mut observed = Vec::new();
+        let result = recv_fds_into_observing(&receiver, 1, &mut received, |fds| {
+            observed.extend(
+                fds.iter()
+                    .map(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) }),
+            );
+        });
+        close_fds(&received);
+        close_fds(&writes);
+        assert_all_write_ends_closed(&reads);
+        result.unwrap();
+        assert_eq!(
+            observed.len(),
+            1,
+            "inspect before fallback can mask a missing receive flag"
+        );
+        crate::platform::received_fd::assert_kernel_received_flags(&observed);
     }
 
     #[test]
