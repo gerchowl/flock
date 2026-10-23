@@ -889,7 +889,7 @@ async fn registry_worker_launch_uses_configured_blob_threshold() {
         "worker-exit-ok",
         vec![message, event("result")],
     );
-    launch.storage = config.sessions;
+    launch.storage = config.sessions.storage();
     case.generation = workers.start(&mut registry, launch, factory).unwrap();
     case.ready(&mut registry, &mut workers, &notify, now).await;
     case.submit(&workers);
