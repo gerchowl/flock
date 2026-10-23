@@ -1593,6 +1593,7 @@ impl HeadlessServer {
                 clone_detection_warning: self.app.clone_detection_warning.clone(),
                 agent_start_label: true,
                 agent_questions: true,
+                structured_agents: true,
                 pane_input_write_ack: false,
             }),
             self.app.runtime_config.uid_policy.clone(),
