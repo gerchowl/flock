@@ -20,6 +20,9 @@
 //! Callers pass a static `subsystem` label ("remote", "git", "platform", …)
 //! so grep-able events fall on the right role in the fleet log.
 
+mod failure;
+pub(crate) use failure::CommandFailure;
+
 use std::ffi::OsStr;
 use std::io;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -165,6 +168,31 @@ impl<K: Fn(u32)> Drop for CommandGroup<K> {
 // will resurface as an unfulfilled expectation there, not stale here.
 #[allow(dead_code)]
 impl TracedCommand {
+    /// Enrich only launch-time ENOENT, never a command's exit status or stderr.
+    /// A missing working directory takes precedence over executable lookup.
+    fn spawn_error(&self, source: io::Error) -> io::Error {
+        if source.kind() != io::ErrorKind::NotFound {
+            return source;
+        }
+        let current_dir = self
+            .inner
+            .get_current_dir()
+            .filter(|dir| {
+                dir.metadata()
+                    .is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+            })
+            .map(std::path::Path::to_path_buf);
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            failure::SpawnFailure {
+                program: self.program.clone(),
+                path_length: std::env::var_os("PATH").map_or(0, |path| path.len()),
+                current_dir,
+                source,
+            },
+        )
+    }
+
     /// Build a new traced command targeting `program`, tagged with a static
     /// `subsystem` label ("remote", "git", "platform", …) for grep-ability.
     pub(crate) fn new(program: impl AsRef<OsStr>, subsystem: &'static str) -> Self {
@@ -371,7 +399,7 @@ impl TracedCommand {
         let result = (|| -> io::Result<Output> {
             // Same funnel exemption as `output_traced` — this IS the wrapper.
             #[allow(clippy::disallowed_methods)]
-            let mut child = self.inner.spawn()?;
+            let mut child = self.inner.spawn().map_err(|err| self.spawn_error(err))?;
             if let Some(input) = input {
                 if let Some(mut stdin) = child.stdin.take() {
                     std::thread::spawn(move || {
@@ -448,7 +476,7 @@ impl TracedCommand {
             // This IS the funnel the lint points at — same exemption as
             // `output_traced` below, which owns the crate's only `output()`.
             #[allow(clippy::disallowed_methods)]
-            let mut child = self.inner.spawn()?;
+            let mut child = self.inner.spawn().map_err(|err| self.spawn_error(err))?;
             if let Some(mut stdin) = child.stdin.take() {
                 stdin.write_all(input)?;
                 // Explicit drop closes the pipe; without it the child waits on
@@ -482,7 +510,7 @@ impl TracedCommand {
         // The single crate-wide site for `Command::output` — every other
         // caller must go through TracedCommand (clippy `disallowed_methods`).
         #[allow(clippy::disallowed_methods)]
-        let result = self.inner.output();
+        let result = self.inner.output().map_err(|err| self.spawn_error(err));
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
             Ok(output) => {
@@ -507,7 +535,7 @@ impl TracedCommand {
         let start = Instant::now();
         // The single crate-wide site for `Command::status`.
         #[allow(clippy::disallowed_methods)]
-        let result = self.inner.status();
+        let result = self.inner.status().map_err(|err| self.spawn_error(err));
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
             Ok(status) => {
@@ -532,7 +560,7 @@ impl TracedCommand {
         let args = shape_args(&self.inner);
         // The single crate-wide site for `Command::spawn`.
         #[allow(clippy::disallowed_methods)]
-        let result = self.inner.spawn();
+        let result = self.inner.spawn().map_err(|err| self.spawn_error(err));
         match &result {
             Ok(child) => {
                 crate::logging::process_spawned(
@@ -1271,6 +1299,38 @@ mod tests {
         assert!(out.contains("subsystem=\"test\""), "{out}");
         assert!(out.contains("outcome=\"ok\""), "{out}");
         assert!(out.contains("INFO"), "{out}");
+    }
+
+    #[test]
+    fn launch_methods_preserve_typed_not_found() {
+        let dir = crate::test_support::TempDir::socket();
+        for program in [
+            dir.path().join("missing-program").display().to_string(),
+            "git".into(),
+        ] {
+            let mut command = TracedCommand::new(&program, "test");
+            command.env("PATH", dir.path());
+            let errors = [
+                command.output_traced().unwrap_err(),
+                command.status_traced().unwrap_err(),
+                command.spawn_traced().unwrap_err(),
+                command.output_traced_with_stdin(b"").unwrap_err(),
+                command
+                    .output_traced_with_timeout(Duration::from_secs(1))
+                    .unwrap_err(),
+            ];
+            for error in errors {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound);
+                let typed = error
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<failure::SpawnFailure>()
+                    .unwrap();
+                assert_eq!(typed.program, program);
+                assert!(typed.current_dir.is_none());
+                assert_eq!(typed.source.raw_os_error(), Some(2));
+            }
+        }
     }
 
     #[test]

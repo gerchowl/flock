@@ -179,8 +179,8 @@ describe("wire transport", () => {
     const sub = (sentFrames(h).at(-1) as { sub_id: string }).sub_id;
     const send = (frame: ServerFrame): void => h.step(step({ step: "send", frame }));
     send({ t: "gap", sub_id: sub, from: 1, to: 2 });
-    send({ t: "ev", sub_id: sub, stream: "agent/a", seq: 3, ts_ms: 0, ev: { type: "user", message: {} } });
-    send({ t: "ev", sub_id: sub, stream: "agent/a", seq: 4, ts_ms: 0, ev: { type: "unknown", raw: "x y", shape: "claude/2:x" } });
+    send({ t: "ev", sub_id: sub, stream: "agent/a", seq: 3, ts_ms: 30, ev: { type: "user", message: {} } });
+    send({ t: "ev", sub_id: sub, stream: "agent/a", seq: 4, ts_ms: 40, ev: { type: "unknown", raw: "x y", shape: "claude/2:x" } });
     send({ t: "synced", sub_id: sub, seq: 4 });
     send({ t: "lagged", sub_id: sub, skipped_to: 9 });
     const resub = lastSub(h);
@@ -190,8 +190,8 @@ describe("wire transport", () => {
     send({ t: "ev", sub_id: resub, stream: "agent/a", seq: 5, ts_ms: 0, ev: { type: "user", message: {} } });
     expect(seen).toEqual([
       { seq: 2, kind: "gap", from: 1, to: 2 },
-      { seq: 3, kind: "known", event: { type: "user", message: {} } as never },
-      { seq: 4, kind: "unknown", unknown: { raw: "x y", shape: "claude/2:x" } },
+      { seq: 3, tsMs: 30, kind: "known", event: { type: "user", message: {} } as never },
+      { seq: 4, tsMs: 40, kind: "unknown", unknown: { raw: "x y", shape: "claude/2:x" } },
       "synced",
       "failed: agent removed",
     ]);
@@ -403,4 +403,23 @@ describe("sub_id_reused (ADR-0036 §5a)", () => {
     const subs = sentFrames(h).filter((frame) => (frame as { t: string }).t === "sub") as { stream: string }[];
     expect(subs.filter((frame) => frame.stream === "agent/a")).toHaveLength(1);
   });
+});
+
+
+test("lagged skipped_to is diagnostic and never becomes an applied cursor", () => {
+  for (const applied of [null, 2]) {
+    const h = new Harness();
+    live(h);
+    const seen: number[] = [];
+    h.connection.subscribe("agent/a", {
+      event: (seq) => seen.push(seq), gap: () => undefined, synced: () => undefined,
+      snapshot: () => undefined, reset: () => undefined, refused: () => undefined,
+    });
+    if (applied !== null) h.step(step({ step: "send", frame: { t: "ev", sub_id: "s1", stream: "agent/a", seq: applied, ts_ms: 0, ev: { type: "user", message: {} } } }));
+    h.step(step({ step: "send", frame: { t: "lagged", sub_id: "s1", skipped_to: 99 } }));
+    expect(h.connection.streams().get("s2")?.cursor).toBe(applied);
+    expect(sentFrames(h).at(-1)).toEqual({ t: "sub", sub_id: "s2", stream: "agent/a", ...(applied === null ? {} : { after: applied }) });
+    h.step(step({ step: "send", frame: { t: "ev", sub_id: "s2", stream: "agent/a", seq: 3, ts_ms: 0, ev: { type: "user", message: {} } } }));
+    expect(seen).toEqual(applied === null ? [3] : [2, 3]);
+  }
 });

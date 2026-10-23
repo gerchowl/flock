@@ -35,6 +35,7 @@ describe("transient handshake loss retains credentials", () => {
       h.net.current().open();
       expect(h.connection.state).toBe("Hello");
       expect(JSON.parse(h.net.frames.at(-1)?.text ?? "null").token).toBe("fixture-token");
+      expect(h.connection.error).not.toContain("token refused");
       h.net.current().deliver(WELCOME);
       expect(h.connection.state).toBe("Live");
     });

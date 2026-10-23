@@ -212,7 +212,12 @@ pub struct HeadlessServer {
     app: app::App,
     api_tx: Option<api::ApiRequestSender>,
     api_server: Option<api::ServerHandle>,
+    /// Logical-server health survives API socket replacement during handoff rollback.
+    client_wire_health: crate::api::client_listener::Health,
     client_listener: UnixListener,
+    /// Bound structured listener and acceptor lifetime, including handoff preparation.
+    #[cfg(feature = "web")]
+    client_wire: Option<crate::web::client_listener::Listener>,
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
@@ -249,6 +254,8 @@ pub struct HeadlessServer {
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
+    // True only after the replacement owns the committed handoff.
+    handoff_completed: bool,
     /// Panes whose pending input the current `--skip-undrained` handoff has
     /// dropped. Reported with the outcome even when a later step fails.
     handoff_skipped_undrained: Vec<api::schema::UndrainedPane>,
@@ -595,11 +602,18 @@ impl HeadlessServer {
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(config_diagnostics);
 
+        let client_wire_health = api_server
+            .as_ref()
+            .map(|server| server.client_listener.clone())
+            .unwrap_or_default();
         Ok(Self {
             app,
             api_tx,
             api_server,
+            client_wire_health,
             client_listener: listener,
+            #[cfg(feature = "web")]
+            client_wire: None,
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
@@ -615,6 +629,7 @@ impl HeadlessServer {
             last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
+            handoff_completed: false,
             handoff_skipped_undrained: Vec::new(),
             pending_handoff_repaint_nudge: false,
             should_quit,
@@ -634,6 +649,44 @@ impl HeadlessServer {
     /// - Handles scheduled tasks (resize poll, animation, session save, etc.)
     /// - Renders virtually and streams frames to clients
     pub async fn run(&mut self) -> io::Result<()> {
+        #[cfg(feature = "web")]
+        {
+            if let Some(wire) = &mut self.client_wire {
+                wire.activate();
+            }
+        }
+        let result = self.run_loop().await;
+        #[cfg(feature = "web")]
+        if let Some(wire) = self.client_wire.take() {
+            return crate::web::client_listener::finish_shutdown(result, wire.shutdown().await);
+        }
+        result
+    }
+    /// Prepare while rollback is still possible; activation belongs to the run loop.
+    #[cfg(feature = "web")]
+    async fn prepare_client_wire(
+        &mut self,
+        inherited: Option<std::net::TcpListener>,
+    ) -> io::Result<()> {
+        self.client_wire = crate::web::client_listener::Listener::prepare(
+            self.app.state.config.client.bind,
+            self.app.client_codes.clone(),
+            crate::session::data_dir(),
+            inherited,
+            self.client_wire_health.clone(),
+            self.app.render_notify.clone(),
+        )
+        .await?;
+        if let Some(wire) = &self.client_wire {
+            self.app
+                .client_codes
+                .set_endpoint(wire.socket.local_addr()?)
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+    /// Own the event loop inside the structured listener's lifetime.
+    async fn run_loop(&mut self) -> io::Result<()> {
         crate::logging::startup("server");
 
         // Register SIGINT handler for graceful shutdown.
@@ -1370,6 +1423,13 @@ impl HeadlessServer {
         {
             manifest.store_generation = store_generation.saturating_add(1);
         }
+        #[cfg(feature = "web")]
+        {
+            manifest.client_listener = self.client_wire.is_some();
+            if manifest.client_listener {
+                manifest.version = crate::server::handoff::CLIENT_LISTENER_HANDOFF_VERSION;
+            }
+        }
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
             &socket_path,
@@ -1391,6 +1451,11 @@ impl HeadlessServer {
                     continue;
                 };
                 fds.push(runtime.duplicate_handoff_fd()?);
+            }
+            #[cfg(feature = "web")]
+            if let Some(wire) = &self.client_wire {
+                use std::os::fd::IntoRawFd;
+                fds.push(crate::platform::client_listener::duplicate(&wire.socket)?.into_raw_fd());
             }
             Ok::<(), io::Error>(())
         })();
@@ -1479,11 +1544,17 @@ impl HeadlessServer {
         }
         crate::server::handoff::wait_owned_ack(&mut stream);
 
+        self.commit_handoff_shutdown();
+        info!("live handoff completed; old server exiting");
+        Ok(skipped_undrained)
+    }
+
+    /// Enter exporter shutdown only after the replacement's owned acknowledgement.
+    fn commit_handoff_shutdown(&mut self) {
         self.shutting_down = true;
         self.app.state.should_quit = true;
         self.app.no_session = true;
-        info!("live handoff completed; old server exiting");
-        Ok(skipped_undrained)
+        self.handoff_completed = true;
     }
 
     #[cfg(not(unix))]
@@ -1513,7 +1584,7 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
-        let api_server = api::start_server_with_capabilities(
+        let api_server = api::server::start_server_with_capabilities_and_health(
             api_tx,
             self.app.event_hub.clone(),
             Some(crate::api::schema::ServerCapabilities {
@@ -1522,9 +1593,11 @@ impl HeadlessServer {
                 clone_detection_warning: self.app.clone_detection_warning.clone(),
                 agent_start_label: true,
                 agent_questions: true,
+                structured_agents: true,
                 pane_input_write_ack: true,
             }),
             self.app.runtime_config.uid_policy.clone(),
+            self.client_wire_health.clone(),
         )?;
 
         let client_path = client_socket_path();
@@ -3812,6 +3885,14 @@ impl HeadlessServer {
         self.app.state.app_client_attached = self.has_app_client();
         self.app.input_writes.service_due(now);
         let structured_changed = self.app.service_structured_workers(now);
+        #[cfg(feature = "web")]
+        if let Some(wire) = &mut self.client_wire {
+            wire.service(
+                &self.app.state.structured_agents,
+                &mut self.app.structured_workers,
+                &crate::session::data_dir(),
+            );
+        }
         self.app.start_ready_pastes();
         let mut changed = structured_changed;
 
@@ -4078,7 +4159,11 @@ impl HeadlessServer {
         // Remove socket files.
         self.cleanup_sockets()?;
 
-        structured.map_err(io::Error::other)
+        if self.handoff_completed {
+            Ok(())
+        } else {
+            structured.map_err(io::Error::other)
+        }
     }
 
     /// Removes socket files created by the server.
@@ -4233,6 +4318,8 @@ pub fn run_server() -> io::Result<()> {
             Err(err) => return Err(err),
         };
 
+        #[cfg(feature = "web")]
+        server.prepare_client_wire(None).await?;
         crate::logging::server_started(&api::socket_path(), &client_socket_path());
         print_ready_message(&api::socket_path(), &client_socket_path());
 
@@ -4251,6 +4338,19 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     init_logging();
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
+    #[cfg(feature = "web")]
+    let wire_listener = if received.manifest.client_listener {
+        Some(
+            crate::platform::client_listener::take(&mut received.fds).inspect_err(|err| {
+                let _ = crate::server::handoff::report_import_refusal(
+                    &mut received.stream,
+                    &err.to_string(),
+                );
+            })?,
+        )
+    } else {
+        None
+    };
     crate::server::handoff::log_import_result(received.manifest.panes.len());
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4329,6 +4429,11 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             Some(api_tx.clone()),
             Some(api_server),
         )?;
+        #[cfg(feature = "web")]
+        if let Err(err) = server.prepare_client_wire(wire_listener).await {
+            crate::server::handoff::report_import_refusal(&mut received.stream, &err.to_string())?;
+            return Err(err);
+        }
         // Late failure tests corrupt only their supplied sandbox identity after bootstrap.
         if cfg!(debug_assertions) {
             if let Some(path) = std::env::var_os("FLOCK_TEST_HANDOFF_CORRUPT_IDENTITY_PATH") {
@@ -4897,7 +5002,7 @@ mod tests {
             &notify,
         )
         .await;
-        let (offline, _, _) = Case::prepare(
+        let (offline, mut restored_launch, _) = Case::prepare(
             &mut server.app.state.structured_agents,
             43,
             "state-reducer",
@@ -4987,6 +5092,22 @@ mod tests {
             .structured_workers
             .runtime(&case.id, case.generation)
             .is_none());
+        let generation = restored.state.structured_agents.get(&case.id).unwrap().2;
+        restored_launch.agent_id = case.id.clone();
+        restored_launch.generation = generation;
+        restored_launch.leases = restored.session_leases.clone();
+        assert_eq!(
+            restored.structured_workers.start(
+                &mut restored.state.structured_agents,
+                restored_launch,
+                |_| panic!("handoff-restored Unknown cannot prepare")
+            ),
+            Err(ErrorCode::StructuredRecoveryRequired)
+        );
+        assert_eq!(
+            restored.state.structured_agents.get(&case.id).unwrap().2,
+            generation
+        );
         let error = server.complete_shutdown().unwrap_err();
         let diagnostic = error
             .get_ref()
@@ -4995,6 +5116,19 @@ mod tests {
         assert!(diagnostic
             .0
             .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
+        // The committed handoff keeps this diagnostic but must exit successfully.
+        server.commit_handoff_shutdown();
+        let log = crate::logging::capture_logs(|| assert!(server.complete_shutdown().is_ok()));
+        assert!(log.contains("structured.worker.shutdown_failed"));
+        assert!(log.contains("structured_worker_cleanup_failed"));
+        assert!(
+            server
+                .app
+                .structured_workers
+                .shutdown(&mut server.app.state.structured_agents)
+                .is_err(),
+            "successful handoff does not erase the cached diagnostic"
+        );
     }
 
     #[tokio::test]
@@ -5175,6 +5309,95 @@ mod tests {
         assert!(bytes.try_recv().is_err());
     }
 
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn fatal_client_accept_keeps_the_server_loop_and_shell_pty_alive() {
+        async fn request(
+            tx: &api::ApiRequestSender,
+            method: &str,
+            params: serde_json::Value,
+        ) -> serde_json::Value {
+            let (respond_to, response) = std::sync::mpsc::channel();
+            tx.send(api::ApiRequestMessage {
+                scope: None,
+                request: serde_json::from_value(
+                    serde_json::json!({"id":"listener-survival","method":method,"params":params}),
+                )
+                .unwrap(),
+                respond_to,
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
+            })
+            .unwrap();
+            let response = tokio::task::spawn_blocking(move || {
+                response
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("headless request producer disappeared or stayed silent")
+            })
+            .await
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert!(value.get("error").is_none(), "{value}");
+            value
+        }
+        let (data, failed) = crate::web::client_listener::tests::failed_listener().await;
+        let health = failed.health.clone();
+        let mut server = test_headless_server();
+        server.app.state.default_shell = "/bin/sh".into();
+        server.app.state.config.terminal.default_shell = "/bin/sh".into();
+        server.app.state.config.checks.enable = false;
+        server.app.next_auto_update_check = None;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        server.app.api_rx = rx;
+        server.client_wire_health = health.clone();
+        server.client_wire = Some(failed);
+        let quit = server.should_quit.clone();
+        let wake = server.server_event_tx.clone();
+        let exercise = async {
+            assert_eq!(
+                health.status(),
+                Some(crate::api::client_listener::Status::Failed)
+            );
+            let created = request(
+                &tx,
+                "workspace.create",
+                serde_json::json!({"cwd":data.path(),"focus":true}),
+            )
+            .await;
+            let pane = created["result"]["root_pane"]["pane_id"]
+                .as_str()
+                .expect("live shell pane");
+            request(&tx,"pane.write_input",serde_json::json!({"pane_id":pane,"text":"printf '%s%s\\n' listener- survived\n","raw":true})).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let read = request(
+                        &tx,
+                        "pane.read",
+                        serde_json::json!({"pane_id":pane,"source":"recent","format":"text"}),
+                    )
+                    .await;
+                    if read.to_string().contains("listener-survived") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("shell producer stayed silent after listener failure");
+            quit.store(true, Ordering::Release);
+            wake.send(ServerEvent::QuitSignal)
+                .await
+                .expect("owned server shutdown wake");
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(server.run(), exercise)
+        })
+        .await
+        .expect("headless loop did not finish after explicit owned shutdown");
+        result.unwrap();
+    }
+
     fn test_headless_server() -> HeadlessServer {
         let config = crate::config::Config::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5209,7 +5432,10 @@ mod tests {
             app,
             api_tx: None,
             api_server: None,
+            client_wire_health: Default::default(),
             client_listener: listener,
+            #[cfg(feature = "web")]
+            client_wire: None,
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
@@ -5225,6 +5451,7 @@ mod tests {
             last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
+            handoff_completed: false,
             handoff_skipped_undrained: Vec::new(),
             pending_handoff_repaint_nudge: false,
             should_quit: Arc::new(AtomicBool::new(false)),
