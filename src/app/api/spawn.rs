@@ -219,6 +219,9 @@ impl App {
         // prevent, which is why fork's answer to the same class is the
         // opposite one.
         let caller = self.spawn_caller();
+        // This first check is an early policy refusal before location resolution
+        // and launch preparation. The shared structured funnel rechecks before
+        // owner-thread reservation, which is the atomic admission authority.
         let lineage = match self.admit_spawn(SpawnVerb::Spawn, &caller, None) {
             Ok(Some(lineage)) => lineage,
             Ok(None) => {
@@ -238,6 +241,14 @@ impl App {
                 );
             }
         };
+
+        if params.runtime == crate::api::schema::AgentRuntime::Structured && params.unattended {
+            return encode_error(
+                id,
+                "runtime_unsupported",
+                "structured spawn does not support unattended mode",
+            );
+        }
 
         // #1179: an agent caller, so `route` unless it narrows to `deny`.
         let questions = match Self::admit_questions(&caller, params.questions, params.unattended) {
@@ -270,6 +281,78 @@ impl App {
         else {
             return encode_error(id, "internal_error", "resolved workspace has no cwd");
         };
+
+        if params.runtime == crate::api::schema::AgentRuntime::Structured {
+            if kind != AgentKind::Claude || params.focus || params.questions.is_some() {
+                return encode_error(
+                    id,
+                    "runtime_unsupported",
+                    "unsupported structured spawn options",
+                );
+            }
+            let name = params
+                .name
+                .unwrap_or_else(crate::app::worktrees::generated_fork_run_id);
+            if name == "self" {
+                return encode_error(id, "invalid_agent_name", "self is a reserved agent target");
+            }
+            match self.structured_target(&name) {
+                Ok(None) => {}
+                Ok(Some((agent, _))) => {
+                    let code =
+                        if self
+                            .state
+                            .structured_agents
+                            .get(&agent)
+                            .is_some_and(|(_, p, _)| {
+                                p.update.state.lifecycle
+                                    == crate::api::agent_state::Lifecycle::Unknown
+                            })
+                        {
+                            crate::api::error_code::ErrorCode::StructuredRecoveryRequired
+                        } else {
+                            crate::api::error_code::ErrorCode::AgentNameTaken
+                        };
+                    return encode_error(id, code.as_str(), "MCP spawn requires a fresh identity");
+                }
+                Err(code) => {
+                    return encode_error(id, code.as_str(), "structured name is ambiguous")
+                }
+            }
+            let start = crate::api::schema::AgentStartParams {
+                runtime: params.runtime,
+                model: params.model,
+                name,
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                argv: vec!["claude".into()],
+                dry_run: false,
+                workspace_id: None,
+                tab_id: None,
+                split: None,
+                active: false,
+                here: false,
+                focus: false,
+                label: None,
+                questions: None,
+                unattended: false,
+            };
+            return match self.start_structured_request(
+                start,
+                &caller,
+                SpawnVerb::Spawn,
+                Some(prompt),
+            ) {
+                Ok(result) => encode_success(id, result),
+                Err(code) => encode_error(id, code.as_str(), "structured spawn refused"),
+            };
+        }
+        if params.model.is_some() {
+            return encode_error(
+                id,
+                "runtime_unsupported",
+                "--model requires structured runtime",
+            );
+        }
 
         // #359: the child is exec'd from argv with no shell in between, so the
         // agent profile the REQUESTER is on has to be carried explicitly or the
@@ -677,6 +760,8 @@ mod tests {
         Request {
             id: "req".into(),
             method: Method::AgentSpawn(AgentSpawnParams {
+                runtime: crate::api::schema::AgentRuntime::Pty,
+                model: None,
                 agent: agent.into(),
                 prompt: prompt.into(),
                 location: SpawnLocation::WorktreePath {
@@ -812,6 +897,8 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: Method::AgentSpawn(AgentSpawnParams {
+                runtime: crate::api::schema::AgentRuntime::Pty,
+                model: None,
                 agent: "opencode".into(),
                 prompt: "review #42".into(),
                 location: SpawnLocation::WorkspaceId {

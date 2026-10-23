@@ -79,7 +79,9 @@ async fn resource_accept_errors_wait_on_the_supplied_clock_then_keep_serving() {
 /// Construct a failed accept task without involving any installed server or external command.
 pub(crate) async fn failed_listener() -> (crate::test_support::TempDir, Listener) {
     let data = crate::test_support::TempDir::socket();
-    let core = Core::new(data.path().to_owned()).await.unwrap();
+    let core = Core::new(data.path().to_owned(), Arc::new(tokio::sync::Notify::new()))
+        .await
+        .unwrap();
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
     let health = Health::default();
     health.publish(Status::Listening);
@@ -199,6 +201,7 @@ async fn refuse_wildcard(inherit_as_loopback: bool) {
         root.path().to_owned(),
         Some(socket),
         Health::default(),
+        Arc::new(tokio::sync::Notify::new()),
     )
     .await
     .err()

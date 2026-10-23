@@ -203,6 +203,7 @@ impl Run {
     async fn restart(&mut self) {
         let old = self.case.generation;
         let launch = Launch {
+            opening_turn: None,
             agent_id: self.case.id.clone(),
             generation: old,
             leases: self.case.leases.clone(),
@@ -735,6 +736,7 @@ async fn worker_queue_restart_refuses_to_discard_undrained_completions() {
     })
     .await;
     let launch = Launch {
+        opening_turn: None,
         agent_id: r.case.id.clone(),
         generation: r.case.generation,
         leases: r.case.leases.clone(),
