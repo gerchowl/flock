@@ -844,6 +844,42 @@ fn input_line(transport: &Transport, input: &mut File) -> Value {
 }
 
 #[test]
+fn permission_message_transport_refusal_keeps_open_audit_and_stdin() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    permission(&mut output, "request-example");
+    receive_after_accepted(&transport);
+    receive_after_accepted(&transport);
+    let request_seq = permission_handle(&transport, "request-example");
+    let mut request = decide("request-example", permissions::Decision::Deny, request_seq);
+    request.message = Some(format!("{}x", "é".repeat(1024)));
+    assert_eq!(
+        call_decide(&transport, &owner(), &request),
+        Err(ErrorCode::InvalidParams)
+    );
+    assert_eq!(waiting_ids(&transport), vec!["request-example"]);
+    assert_eq!(records(&root).len(), 2);
+    private_fs::set_nonblocking(&input).unwrap();
+    assert_eq!(
+        input.read(&mut [0; 1]).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let expected = "é".repeat(1024);
+    request.message = Some(format!("  {expected}  "));
+    call_decide(&transport, &owner(), &request).unwrap();
+    let response = input_line(&transport, &mut input);
+    assert_eq!(response["response"]["response"]["message"], expected);
+    let closed = receive(&transport).record;
+    assert_eq!(closed.origin, RecordOrigin::Flk);
+    let audit: Value = serde_json::from_str(&closed.raw).unwrap();
+    assert_eq!(audit["state"], "closed");
+    assert_eq!(audit["message"], expected);
+    drop(output);
+    reader_done(&transport).unwrap();
+    assert_eq!(records(&root).len(), 3);
+}
+
+#[test]
 fn permission_decisions_are_audited_before_control_stdin_and_keep_turn_busy() {
     for (decision, behavior) in [
         (permissions::Decision::AllowOnce, "allow"),

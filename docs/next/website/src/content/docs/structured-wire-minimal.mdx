@@ -81,7 +81,12 @@ rows and checkpoints, but are dropped when a fresh projection changes the row.
 
 `agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, required `request_seq`, `decision`
 (`allow_once`, `allow_always` or `deny`), and optional `message`. Only a
-token-authenticated client principal can submit this command. The ack uses the
+token-authenticated client principal can submit this command. The optional message
+is normalized from CRLF to LF and trimmed, then limited to 2048 UTF-8 bytes
+(`MAX_PERMISSION_DECISION_MESSAGE_BYTES`). The `prompt_control_bytes` rules
+permit newlines and tabs and refuse other controls. Invalid messages return
+`invalid_params` before any reservation, grant, audit or harness input. Empty
+and absent messages are allowed. The ack uses the
 same envelope as `agent.send`, echoes `cmd_id`, and on success returns
 `AgentDecideResult`, echoing the applied request ID and decision:
 
@@ -91,7 +96,7 @@ same envelope as `agent.send`, echoes `cmd_id`, and on success returns
 
 Failures use `ok: false` and the existing `WireError` envelope without `result`.
 `AgentDecideErrorCode` names `permission_request_unknown`,
-`permission_request_closed` and `not_authorized`, with retry class `never`.
+`permission_request_closed`, `not_authorized` and `invalid_params`, with retry class `never`.
 These names are contracts for S6 (#1429) to register before serving them; this
 slice adds no API error registrations or authorization behavior.
 
