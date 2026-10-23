@@ -56,7 +56,7 @@ struct Client {
     read_only: bool,
     // The replay slice supplies bounded data through this same writer.
     #[allow(dead_code)]
-    data: mpsc::Sender<ServerFrame>,
+    data: mpsc::Sender<output::Delivery>,
     revoke: watch::Sender<bool>,
 }
 struct Shared {

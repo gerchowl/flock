@@ -146,3 +146,34 @@ Every returned descriptor is protected before import can spawn a child. The list
 that a transferred socket is IPv4, stream-typed and listening and retains exporter rollback ownership
 through duplication. This mount integrates the helpers into the listener lifecycle
 and the handoff manifest described above.
+
+### Internal history delivery foundation
+
+ADR-0036 §5a's owner bridge is crate-private and has a tested consumer that
+recovers real session JSONL and delivers it through the verified socket writer.
+WebSocket subscription registration follows in part 4b of #1830.
+
+Each bridge has a 32-request mailbox and services at most 32 requests per owner
+turn. Full admission fails with `WouldBlock`; losing the owner fails with
+`BrokenPipe`. The owner captures the registry generation and stored namespace. Unsupported
+stored path components are unavailable subjects and never reach filesystem recovery.
+Cold recovery defers with `WouldBlock` while a worker is preparing or cleanup
+authority remains unconfirmed. An installed canonical source remains readable.
+Retained recovery runs off the async executor, with at most four blocking jobs
+per bridge. A cancelled waiter keeps its I/O slot until that job returns,
+including when the job is still queued. A blocked filesystem can occupy those
+slots; it cannot create an unbounded recovery queue.
+
+Installation rechecks generation and namespace on the owner. A stale generation
+or mismatched namespace fails with `Interrupted`. If another recovery or the live producer
+already installed the current source, the consumer receives that canonical
+source. A cancelled installation request is discarded before changing ownership.
+Storage failures propagate without installing a source.
+
+Queued writer deliveries carry an independent subscription liveness fence.
+Closing it discards that subscription's queued frames and acknowledges them as
+discarded. Sibling deliveries remain eligible, and heartbeat messages retain
+priority between writes. A successful acknowledgement means the frame flushed;
+a closed acknowledgement channel means the writer failed. A write already
+started before the fence closes cannot be recalled, so clients still discard
+late frames for closed IDs as required by §5a.
