@@ -223,6 +223,19 @@ impl App {
                 )
             }
         };
+        if params.runtime == crate::api::schema::AgentRuntime::Structured {
+            return match self.start_structured(params, &caller) {
+                Ok(result) => encode_success(id, result),
+                Err(code) => encode_error(id, code.as_str(), "structured start refused"),
+            };
+        }
+        if params.model.is_some() {
+            return encode_error(
+                id,
+                "runtime_unsupported",
+                "--model requires structured runtime",
+            );
+        }
         let result = match self.start_agent(params, &caller, questions) {
             Ok(started) => started,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),

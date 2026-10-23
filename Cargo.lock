@@ -718,6 +718,8 @@ dependencies = [
  "finl_unicode",
  "futures-util",
  "getrandom 0.4.2",
+ "hyper",
+ "hyper-util",
  "libc",
  "parking_lot",
  "png",

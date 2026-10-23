@@ -1152,8 +1152,29 @@ pub struct AgentRenameParams {
     pub name: Option<String>,
 }
 
+/// Execution mode; omitted selectors preserve the terminal start contract.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRuntime {
+    /// Traditional terminal-backed launch.
+    #[default]
+    Pty,
+    /// Restricted pane-free Claude session.
+    Structured,
+}
+impl AgentRuntime {
+    fn is_pty(&self) -> bool {
+        *self == Self::Pty
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStartParams {
+    /// Explicit opt-in; the public route remains gated until #1843 part 3.
+    #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
+    pub runtime: AgentRuntime,
+    /// Structured model selector, never raw launch flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Resolve the allocation plan without creating resources.
     #[serde(default)]
     pub dry_run: bool,

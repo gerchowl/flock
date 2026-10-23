@@ -625,7 +625,11 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
     let (mut registry, mut workers, notify, now) = owner();
     let (a, launch, _) = Case::prepare(&mut registry, 10, "state-reducer", vec![]);
     let (tx, messages) = mpsc::sync_channel(2);
-    drop(tx);
+    let producer = std::thread::spawn(move || drop(tx));
+    producer.join().unwrap();
+    workers
+        .pending
+        .insert(a.id.clone(), Some("fixture-parent".into()));
     workers.entries.insert(
         a.id.clone(),
         Worker {
@@ -645,6 +649,11 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
         workers.report(&a.id, a.generation).is_some()
     })
     .await;
+    assert!(
+        !workers.pending.contains_key(&a.id),
+        "disconnected launch must free its pending slot"
+    );
+    assert_eq!(workers.counts(&a.leases, "fixture-parent"), Ok((0, 0)));
     assert!(workers.entries[&a.id].thread.is_none());
     let report = workers.report(&a.id, a.generation).unwrap();
     assert!(report.authority_retained);
@@ -880,9 +889,7 @@ async fn registry_worker_launch_uses_configured_blob_threshold() {
         "worker-exit-ok",
         vec![message, event("result")],
     );
-    launch.storage = super::super::blobs::StorageConfig {
-        blob_min_bytes: config.sessions.blob_min_bytes,
-    };
+    launch.storage = config.sessions.storage();
     case.generation = workers.start(&mut registry, launch, factory).unwrap();
     case.ready(&mut registry, &mut workers, &notify, now).await;
     case.submit(&workers);
