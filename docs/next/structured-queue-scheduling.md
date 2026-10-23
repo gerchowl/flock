@@ -87,5 +87,6 @@ notification delivery and requires durable replay. Final persisted records drain
 before reservation retirement. Producer routing is #1957/#1958 and queue/global
 publication is #1956, without new queue deadlines or public endpoints here.
 
-The worker machinery in #1955 is not production enforcement by itself. The
-production launch path is #1843; #1928 remains open until that path exists.
+The landed production launch path in #1843 now supplies the configured policy to
+these worker-owned queues, enforcing the production checkpoint requirement in
+#1928.
