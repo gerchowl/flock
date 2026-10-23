@@ -133,10 +133,15 @@ impl App {
     ) -> String {
         let agents = self.collect_agent_infos_at(clock());
         let fleet = self.collect_fleet_agents(&agents);
+        let structured_agents = match self.structured_infos() {
+            Ok(agents) => agents,
+            Err(code) => return encode_error(id, code.as_str(), "structured metadata unavailable"),
+        };
         encode_success(
             id,
             ResponseResult::AgentList {
                 agents,
+                structured_agents,
                 // #320: the same call answers "who is here" and "who can I
                 // reach". A separate fleet verb would have been a second
                 // listing to keep in step with this one.
@@ -146,6 +151,22 @@ impl App {
     }
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
+        match self.structured_target(&target.target) {
+            Ok(Some((agent_id, _))) => {
+                return match self.structured_info(&agent_id) {
+                    Ok(agent) => encode_success(id, ResponseResult::StructuredAgentInfo { agent }),
+                    Err(code) => encode_error(id, code.as_str(), "structured metadata unavailable"),
+                };
+            }
+            Err(code) => {
+                return encode_error(
+                    id,
+                    code.as_str(),
+                    "target is ambiguous across runtimes; use an agent id",
+                )
+            }
+            Ok(None) => {}
+        }
         // This read supplies conservative bulk self-exclusion (#1010), not
         // authority: even an unproven pane must not hibernate itself mid-loop.
         if target.target == "self" {

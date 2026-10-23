@@ -114,6 +114,12 @@ impl App {
         let resolved = self
             .resolve_terminal_target(target)
             .map_err(AgentRenameError::Target)?;
+        if name
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            return Err(AgentRenameError::InvalidName);
+        }
         let normalized_name = name.and_then(|name| {
             let trimmed = name.trim().to_string();
             (!trimmed.is_empty()).then_some(trimmed)
@@ -141,8 +147,12 @@ impl App {
         };
         match normalized_name {
             Some(name) => {
-                terminal.set_agent_name(name.clone());
-                terminal.set_manual_label(name);
+                terminal
+                    .set_agent_name(name.clone())
+                    .map_err(|_| AgentRenameError::InvalidName)?;
+                terminal
+                    .set_manual_label(name)
+                    .map_err(|_| AgentRenameError::InvalidName)?;
             }
             None => terminal.clear_agent_name(),
         }
@@ -530,7 +540,9 @@ impl App {
         caller: &SpawnCaller,
         questions: crate::api::schema::QuestionPolicy,
     ) -> Result<crate::api::schema::ResponseResult, AgentStartError> {
-        let name = params.name.trim().to_string();
+        let name = crate::terminal::agent_name::validate(&params.name)
+            .map_err(|_| AgentStartError::InvalidName)?
+            .to_string();
         if name.is_empty() {
             return Err(AgentStartError::InvalidName);
         }
@@ -839,8 +851,12 @@ impl App {
         };
         terminal.launch_env = spawn_env;
         terminal.questions = questions;
-        terminal.set_agent_name(name.clone());
-        terminal.set_manual_label(name);
+        terminal
+            .set_agent_name(name.clone())
+            .map_err(|_| AgentStartError::InvalidName)?;
+        terminal
+            .set_manual_label(name)
+            .map_err(|_| AgentStartError::InvalidName)?;
         self.state.mark_session_dirty();
 
         let agent = self
@@ -869,7 +885,7 @@ impl App {
             AgentStartError::InvalidName => crate::api::schema::ErrorBody {
                 data: None,
                 code: "invalid_agent_name".into(),
-                message: "agent name must not be empty".into(),
+                message: format!("{}; a new agent name must not be empty", crate::terminal::agent_name::POLICY),
             },
             AgentStartError::EmptyArgv => crate::api::schema::ErrorBody {
                 data: None,
@@ -965,6 +981,15 @@ impl App {
         err: TerminalTargetError,
     ) -> crate::api::schema::ErrorBody {
         match err {
+            TerminalTargetError::RuntimeUnsupported { target } => {
+                crate::api::schema::ErrorBody {
+                    data: None,
+                    code: crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str().into(),
+                    message: format!(
+                        "agent {target} has no PTY placement; this operation requires a pane"
+                    ),
+                }
+            }
             TerminalTargetError::NotFound { target } => crate::api::schema::ErrorBody {
                 data: None,
                 code: "agent_not_found".into(),
@@ -1001,6 +1026,7 @@ impl App {
     ) -> crate::api::schema::ErrorBody {
         match err {
             AgentRenameError::Target(err) => self.agent_target_error_body(err),
+            AgentRenameError::InvalidName => crate::terminal::agent_name::refusal(),
             AgentRenameError::DuplicateName { name, candidates } => crate::api::schema::ErrorBody {
                 data: None,
                 code: "agent_name_taken".into(),
@@ -1332,7 +1358,7 @@ impl App {
         Some(crate::api::schema::AgentInfo {
             agent_id: terminal.agent_id.to_string(),
             terminal_id: pane.terminal_id,
-            name: terminal.agent_name.clone(),
+            name: terminal.agent_name().map(str::to_owned),
             agent: pane.agent,
             title: pane.title,
             display_agent: pane.display_agent,
@@ -1489,6 +1515,7 @@ fn last_non_empty_line(text: &str) -> Option<String> {
 }
 
 pub(super) enum AgentRenameError {
+    InvalidName,
     Target(TerminalTargetError),
     DuplicateName {
         name: String,
@@ -1648,6 +1675,41 @@ mod tests {
         })
         .join()
         .expect("exit observer thread")
+    }
+
+    #[tokio::test]
+    async fn security_agent_name_api_boundaries_refuse_before_side_effects() {
+        let mut failures = Vec::new();
+        for method in ["agent.rename", "agent.start", "agent.spawn"] {
+            for (case, name) in crate::test_support::hostile_agent_names() {
+                let mut app = test_app();
+                app.state.config.fleet.agent_spawn_enabled = true;
+                app.state.workspaces = vec![crate::workspace::Workspace::test_new("name-security")];
+                app.state.ensure_test_terminals();
+                let terminal = app.state.terminals.values_mut().next().unwrap();
+                terminal.set_agent_name("safe".into()).unwrap();
+                let target = terminal.id.to_string();
+                let params = match method {
+                    "agent.rename" => serde_json::json!({"target":target,"name":name}),
+                    "agent.start" => serde_json::json!({"name":name,"argv":[]}),
+                    "agent.spawn" => {
+                        serde_json::json!({"name":name,"agent":"codex","prompt":"fixture task","location":{"kind":"workspace_id","workspace_id":"workspace-fixture"}})
+                    }
+                    _ => unreachable!(),
+                };
+                let request = serde_json::from_value(
+                    serde_json::json!({"id":"security-name","method":method,"params":params}),
+                )
+                .unwrap();
+                let response = app.handle_api_request(request);
+                let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+                if value["error"]["code"] != "invalid_agent_name" {
+                    failures.push((method, case));
+                }
+                assert_eq!(app.state.terminals.len(), 1);
+            }
+        }
+        assert!(failures.is_empty(), "unrefused name cases: {failures:?}");
     }
 
     fn test_app() -> crate::app::App {

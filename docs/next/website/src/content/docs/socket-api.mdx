@@ -155,6 +155,8 @@ The allocation methods `worktree.create`, `agent.fork`, `agent.start`, `workspac
 
 Worktree methods manage Git checkouts as Flock workspaces. `worktree.create` creates a checkout and returns the new `workspace`, `tab`, `root_pane`, and `worktree` records. Its `base` is passed to `git worktree add` as written: the server never fetches, because it runs `worktree.create` on its own loop, and a network wait there would stall every client and the TUI. `flk worktree create --base`, `flk delegate start --base` and the TUI's new-worktree dialog refresh the base from its remote on their own side first and send the resolved ref, so a raw socket client that wants a fresh base fetches before it calls. `worktree.open` opens an existing checkout or returns the already-open workspace. `worktree.remove` runs `git worktree remove` against a linked child workspace and never deletes the branch.
 
+Worktree launch failures keep their method's existing error code. A missing program names the dependency in `error.message` and carries `error.data.reason: "program_not_found"`, `program`, and `path_length` (the server's PATH length in bytes, never its contents). Run `flk preflight` to check server dependencies. A missing launch working directory instead carries `reason: "current_dir_not_found"` and `current_dir`. Filesystem errors and a running git command's path refusals keep their existing messages and do not acquire launch metadata. Repository discovery itself reads Git metadata from files and requires no external program.
+
 Create a worktree from a source workspace:
 
 ```json
@@ -364,6 +366,23 @@ Built-in checks:
 - **`issue_guard`** — polls the configured GitHub repos via the `gh` CLI, parses a `flk-trigger` fenced block from ISSUE BODIES only (never comments), and dispatches the trigger's action when the author matches the configured `owner`. Non-owner bodies are audited via `trigger_ignored`; broken blocks emit `trigger_errored` and post a comment back on the issue. Dedupe by `run_id` (when set on the block) or hash of the body; the dedupe set persists across server restarts by seeding from the durable log's `trigger_fired` events. The target can be a pane id, agent name, worktree path or basename, or branch name; the response is a `chain` of fork edges, deepest first. Lifecycle and fork events are mirrored to a per-session append-only log (rotated, crash-tolerant); the per-revision pane-output events stay in memory only.
 
 Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`, and exactly one of `workspace_id` or `path` for `worktree.kill`. Raw socket `cwd` and `path` values must be absolute, and a relative one is refused with `invalid_request` naming the field (`cwd must be an absolute path, got "repo"`); the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Flock worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
+
+A registered checkout directory that is present but has no valid `.git` link
+back to this repository's worktree admin entry is refused with
+`worktree_checkout_unreachable` (exit 10, retry `after_human`). `--force` cannot
+override it. The TUI kill dialog gives the same recovery: remount and retry, or,
+if the checkout is really gone, remove the directory yourself and retry. Flock
+never runs `git worktree prune` during removal or kill: pruning is repo-wide
+and can unlink other checkouts that are only temporarily absent. A completely
+absent directory still permits Git to remove that single registration.
+
+The refusal's `error.data` has `path` (the checkout path), `recovery` (the
+recovery text), and `possible_unmounted_mount_point` (`true` for the same device
+as its parent, `false` for a different device, or `null` if stat failed). This
+is a best-effort hint only; device identity never decides whether removal is
+allowed. Kill-by-path can use a remembered repository's registered worktree
+list when the checkout cannot identify itself; without a verified repository
+registration it still refuses `not_git_worktree`.
 
 `worktree.list` rows carry `last_commit_at` (unix seconds of the last commit on the branch) and are ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. Pass `"scan": true` to also resolve each linked row's `kill_verdict` — `{"verdict": "merged" | "not_merged" | "open_pr" | "unknown" | "checkout_missing", "evidence": ..., "protected": ..., "timed_out": ...}` — through the same gate `worktree.kill` enforces. Both fields are omitted rather than null when unknown: an absent `kill_verdict` means the row was not scanned, NOT that the branch is unmerged, and an absent `last_commit_at` means Git could not date it.
 
@@ -1004,3 +1023,25 @@ Remove these settings and callers:
 - The `forward_limit` and `peer_not_configured` routing refusals: known owners route through the mesh or queue while offline; unknown owners without a stored hint are refused as unknown.
 
 Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown keys with file and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
+
+### Structured session read/control contracts
+
+`agent.list` adds `structured_agents` (defaulting to `[]` when absent in an older
+response) alongside unchanged PTY `agents` and `fleet`. Each structured entry has
+`runtime: "structured"`, `agent_id`, `name`, `harness`, `lifecycle`, presentation
+`status`, canonical `state`, `session_id`, `cwd`, `model`, and `lease_state`.
+`name` and `model` can be null. `view` is omitted when no attached view exists;
+there are no fabricated `pane_id`, `terminal_id`, workspace or tab fields.
+`lease_state` is `absent`, `reserved`, `bound`, or `uncertain`; this is binding
+evidence, not proof of process liveness or caller authority.
+
+`agent.get` and `agent.status` accept `{"target":"<agent id or unique name>"}`.
+For structured targets the response type is `structured_agent_info`, containing
+`agent`. A name shared with a PTY target is `agent_target_ambiguous`; use an id.
+`agent.stop` takes the same target shape and returns the current structured
+record while cancellation and cleanup run asynchronously. It requires operator
+or structured-self authority. Offline stop is idempotent; Unknown ownership refuses
+with `structured_recovery_required` (retry `after_human`, CLI exit 1).
+Pane-only operations return `runtime_unsupported` (retry `never`, CLI exit 2).
+These contracts do not enable public structured start; that remains gated until
+all #1843 routing and #1734 credential protection land. Mesh VERSION remains 5.

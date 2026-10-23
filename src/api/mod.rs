@@ -9,8 +9,10 @@ mod events_read;
 pub mod question;
 mod reply_wait;
 pub mod schema;
+pub(crate) mod scoped;
 pub(crate) mod server;
 mod status;
+pub mod structured_agent;
 mod subscriptions;
 mod wait;
 pub mod wait_predicate;
@@ -18,8 +20,9 @@ pub mod wait_predicate;
 pub use event_hub::EventHub;
 pub(crate) use reply_wait::{best_answer, Answer};
 pub(crate) use server::socket_peer_pid;
+pub(crate) use server::start_server;
 pub(crate) use server::start_server_for_mode;
-pub use server::{start_server, ServerHandle};
+pub use server::ServerHandle;
 pub use status::{read_runtime_status_at, RuntimeStatus};
 
 use std::path::PathBuf;
@@ -75,6 +78,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
 }
 
 pub struct ApiRequestMessage {
+    /// Scoped transport attribution; None is an ordinary legacy request.
+    pub(crate) scope: Option<scoped::Scope>,
     pub request: Request,
     pub respond_to: std::sync::mpsc::Sender<String>,
     /// PID of the process on the other end of the API socket, when the
@@ -101,3 +106,6 @@ pub(crate) fn effect_exit_code(result: &serde_json::Value) -> Option<i32> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod poller_compat_tests;
