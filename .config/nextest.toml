@@ -29,6 +29,16 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 serial-pty = { max-threads = 1 }
 
 [[profile.default.overrides]]
+# #1894: mount.rs belongs to client_tokens; all optional web acceptance tests run once.
+filter = 'binary(=client_tokens) | binary(=gui_feature_gate) | binary(=gui_bundle_build) | (binary(=flk) & (test(web::) | test(server::headless::tests::fatal_client_accept_)))'
+retries = 0
+
+[[profile.default.overrides]]
+# #1894: foundation accept and descriptor safety must fail on their first attempt.
+filter = 'binary(=flk) & (test(api::client_listener::) | test(api::server::tests::ping_reports_only_) | test(web::listener_foundation::) | test(platform::client_listener::) | test(platform::received_fd::) | test(receiver_accumulates_150_fds_across_batches_in_order) | test(handoff_receive_passes_platform_flags_before_fcntl))'
+retries = 0
+
+[[profile.default.overrides]]
 # Hang ceiling only (#1317): condition waits decide correctness, while a
 # silent live producer must eventually produce a named test failure in CI.
 # Retain the stricter 180s backstop: each binary's measured p99 is below 18s
@@ -89,6 +99,11 @@ retries = 2
 [[profile.default.overrides]]
 # #1490 proves the finite frozen-readiness request sequence and client EOF.
 filter = 'binary(=delegate_r4) & test(=a28_a_frozen_server_cannot_hold_start_in_readiness)'
+retries = 0
+
+[[profile.default.overrides]]
+# #2000: admission and helper lock-lifetime regressions must fail on first run.
+filter = 'binary(=flk) & (test(structured::permissions::auth::tokens::) | test(platform::client_token_lock::))'
 retries = 0
 
 [[profile.default.overrides]]

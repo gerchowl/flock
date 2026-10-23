@@ -207,6 +207,9 @@ impl Run {
             generation: old,
             leases: self.case.leases.clone(),
             state: self.case.fixture.root.path().to_owned(),
+            storage: Default::default(),
+            mcp: self.case.fixture.mcp(),
+            admission: None,
             stall_after: STALL,
             queue_rewrite_bytes: self.threshold,
             lineage: None,
@@ -651,6 +654,7 @@ async fn worker_queue_result_followed_by_exit_never_offers_the_next_item() {
                 true
             }
             Ok(Message::Ready(_)) => panic!("duplicate readiness during exit"),
+            Ok(Message::Leased) => panic!("duplicate lease acquisition during exit"),
             Err(mpsc::TryRecvError::Empty) => false,
             Err(error) => panic!("producer lost its exit report: {error}"),
         }
@@ -735,6 +739,9 @@ async fn worker_queue_restart_refuses_to_discard_undrained_completions() {
         generation: r.case.generation,
         leases: r.case.leases.clone(),
         state: r.case.fixture.root.path().to_owned(),
+        storage: Default::default(),
+        mcp: r.case.fixture.mcp(),
+        admission: None,
         stall_after: STALL,
         queue_rewrite_bytes: r.threshold,
         lineage: None,
