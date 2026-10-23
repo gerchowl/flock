@@ -37,8 +37,18 @@ bootstrap, live updates/removal and recovery.
 
 ### Fleet-lite store recovery
 
-An empty, unmarked lock with neither data record safely retries initialization
-at zero: cursor durability always precedes the initialization marker.
+An empty, unmarked lock with neither data record opens at zero. This includes an
+empty legacy lock from the snapshot-only layout (#1974). Legacy locks were always
+unmarked, even after positions had been published through `fleet.json`. That
+layout's only high-water floor was `fleet.json`; if it is lost, there is no better
+floor to recover. Opening at zero preserves the old behavior.
+
+In the cursor-based layout, cursor durability precedes the initialization marker.
+If an unmarked lock already has a matching cursor, opening fsyncs the cursor's
+parent directory again before
+marking the lock. This completes a previous initialization whose rename succeeded
+but directory fsync failed. A directory-fsync error refuses opening and leaves
+the lock unmarked for a later retry.
 `fleet.lock` carries that marker, so deleting it together with `fleet.cursor`
 while an older `fleet.json` survives reopens at that older head. The operator
 must never delete the lock.
