@@ -2,13 +2,31 @@
 //! Reserve before launch. Unconfirmed process cleanup retains the reservation;
 //! an unresolved reservation never grants operator authority. UID policy is #1629.
 #![deny(missing_docs)]
+mod scoped;
 use super::supervision::ProcessIdentity;
 use crate::platform;
 use parking_lot::Mutex;
+use scoped::Generation;
+pub(crate) use scoped::LeaseCredential;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Read-only reservation evidence. It never grants authority to act or signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseState {
+    /// No reservation is present.
+    Absent,
+    /// A launcher is reserved, without a bound root.
+    Reserved,
+    /// A root identity is bound; liveness still requires kernel verification.
+    Bound,
+    /// Registry contention, revocation or incomplete identity prevents evidence.
+    Uncertain,
+}
 
 const LOCK_LIMIT: Duration = Duration::from_millis(100);
 
@@ -24,6 +42,7 @@ struct Entry {
     parent: Option<String>,
     process: Option<ProcessIdentity>,
     root: Root,
+    generation: Generation,
 }
 /// Server-owned lease table shared with its runtime workers.
 #[derive(Clone, Default)]
@@ -51,8 +70,24 @@ pub struct Lease {
     spawned: bool,
     released: bool,
     cleanup_confirmed: bool,
+    generation: Generation,
 }
 impl SessionLeases {
+    /// Inspect a single record non-blockingly, without exposing PIDs or credentials.
+    pub(crate) fn state(&self, agent: &str, session: &str) -> LeaseState {
+        let Some(entries) = self.0.try_lock() else {
+            return LeaseState::Uncertain;
+        };
+        match entries.get(session).filter(|entry| entry.agent == agent) {
+            None => LeaseState::Absent,
+            Some(entry) if !entry.generation.live() => LeaseState::Uncertain,
+            Some(entry) => match entry.root {
+                Root::Launcher(_) => LeaseState::Reserved,
+                Root::Process(_) if entry.process.is_some() => LeaseState::Bound,
+                _ => LeaseState::Uncertain,
+            },
+        }
+    }
     // ADR-0036 §1a: acquire both views before mutation; timeout leaves the
     // reservation intact. No process creation or OS lookup runs under these locks.
     fn update<T>(&self, change: impl FnOnce(&mut BTreeMap<String, Entry>) -> T) -> io::Result<T> {
@@ -90,6 +125,8 @@ impl SessionLeases {
         session: &str,
         lineage: Option<(&str, u32)>,
     ) -> Result<Lease, crate::api::error_code::ErrorCode> {
+        let generation =
+            Generation::new().map_err(|_| crate::api::error_code::ErrorCode::AgentStartFailed)?;
         self.update(|entries| {
             if entries.contains_key(session) {
                 return Err(crate::api::error_code::ErrorCode::SessionBusy);
@@ -102,6 +139,7 @@ impl SessionLeases {
                     parent: lineage.map(|(parent, _)| parent.to_owned()),
                     process: None,
                     root: Root::Launcher(std::process::id()),
+                    generation: generation.clone(),
                 },
             );
             Ok(())
@@ -114,6 +152,7 @@ impl SessionLeases {
             spawned: false,
             released: false,
             cleanup_confirmed: false,
+            generation,
         })
     }
     /// Worker-side cleanup confirmation. Never wait on this lock in the app loop.
@@ -125,6 +164,16 @@ impl SessionLeases {
         Ok(entries.contains_key(session))
     }
 
+    /// Nonblocking owner census facts; metadata never grants caller authority.
+    pub(crate) fn admitted_identities(&self) -> Option<BTreeMap<String, Option<String>>> {
+        let entries = self.0.try_lock()?;
+        Some(
+            entries
+                .values()
+                .map(|entry| (entry.agent.clone(), entry.parent.clone()))
+                .collect(),
+        )
+    }
     /// Conservative live reservation counts, including pending agent-started launches.
     pub fn counts(&self, parent: &str) -> io::Result<(usize, usize)> {
         let entries = self
@@ -231,6 +280,10 @@ impl SessionLeases {
     }
 }
 impl Lease {
+    /// Require this live, unspawned reservation before installing session MCP.
+    pub(super) fn matches_session(&self, session: &str) -> bool {
+        !self.released && !self.spawned && self.session == session
+    }
     /// Verify that the reserved identity is the runtime's stream identity.
     pub(super) fn matches(&self, agent: &str, session: &str) -> bool {
         self.agent == agent && self.session == session
@@ -271,6 +324,7 @@ impl Lease {
     }
     /// Release after the runtime confirms process-tree cleanup, including startup errors.
     pub(super) fn release(&mut self) {
+        self.revoke();
         self.cleanup_confirmed = true;
         if self.released {
             return;
@@ -292,6 +346,7 @@ impl Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
+        self.revoke();
         if !self.spawned && !self.released {
             self.release();
         }
@@ -306,3 +361,11 @@ impl Drop for Lease {
 }
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+impl Lease {
+    /// Bind the current fixture peer without spawning a harness.
+    pub(crate) fn bind_test_peer(&mut self, pid: u32) {
+        self.bind(pid).expect("bind owned test peer");
+    }
+}

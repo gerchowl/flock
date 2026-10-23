@@ -117,14 +117,10 @@ impl Tab {
             .filter_map(|id| {
                 let pane = self.panes.get(id)?;
                 let terminal = terminals.get(&pane.attached_terminal_id)?;
-                let fallback_agent_label = terminal
-                    .agent_name
-                    .as_deref()
-                    .or_else(|| terminal.effective_agent_label())?
-                    .to_string();
-                let agent_label = terminal
-                    .effective_display_agent()
-                    .unwrap_or_else(|| fallback_agent_label.clone());
+                terminal
+                    .agent_name()
+                    .or_else(|| terminal.effective_agent_label())?;
+                let agent_label = terminal.display_agent_label()?.into_owned();
                 let presentation = terminal.effective_presentation();
                 let (state, seen) = terminal.presentation_state(pane.seen);
                 Some(PaneDetail {
@@ -392,7 +388,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut terminal = terminal_for_pane(&ws, root_pane);
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
-        terminal.set_agent_name("planner".into());
+        terminal.set_agent_name("planner".into()).unwrap();
         terminals.insert(terminal.id.clone(), terminal);
 
         let labels: Vec<_> = ws
