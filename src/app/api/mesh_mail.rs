@@ -524,6 +524,13 @@ impl App {
         &mut self,
         server: Option<&crate::api::ServerHandle>,
     ) -> Result<(), String> {
+        self.runtime_config.structured_mcp = server.and_then(|server| match server.session_mcp() {
+            Ok(endpoint) => Some(endpoint),
+            Err(_) => {
+                crate::logging::structured_mcp_endpoint_unavailable();
+                None
+            }
+        });
         self.node_id = server.and_then(|server| server.node_id.clone());
         self.clone_detection_warning =
             server.and_then(|server| server.clone_detection_warning.clone());

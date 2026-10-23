@@ -106,7 +106,12 @@ impl Server {
         let dir = root.path().join("client-tokens");
         fs::create_dir(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        for (name, token, principal) in [("one", "a", "c"), ("two", "d", "e")] {
+        for (name, token, principal) in [
+            ("one", "a", "c"),
+            ("two", "d", "e"),
+            ("three", "b", "f"),
+            ("four", "1", "2"),
+        ] {
             let path = dir.join(format!("{name}.token"));
             fs::write(&path, json!({"token":token.repeat(64),"principal":principal.repeat(32),"scopes":["read","send","answer","operate"]}).to_string()).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -422,11 +427,11 @@ fn fanout_closes_only_the_verified_principal_and_cleanup_is_owned() {
     });
 }
 #[test]
-fn sixteen_pending_hellos_bound_slots_and_shutdown_refuses_new_upgrades() {
+fn pending_hellos_reserve_authenticated_capacity_and_shutdown_refuses_upgrades() {
     runtime(async {
         let server = Server::new().await;
         let mut sockets = Vec::new();
-        for _ in 0..16 {
+        for _ in 0..PENDING_HELLOS {
             sockets.push(Socket::open(&server).await);
         }
         let (_, refusal) = Socket::upgrade(&server).await;
@@ -532,14 +537,14 @@ fn writer_prioritizes_ping_between_bounded_data_writes() {
         let (sink, release, ready, mut received, _) = gated_sink();
         let (priority, high) = mpsc::channel(4);
         let (data, low) = mpsc::channel(8);
-        data.try_send(data_frame("first")).unwrap();
+        data.try_send(data_frame("first").into()).unwrap();
         let task = tokio::spawn(output::writer(sink, Arc::new(clock), high, low));
         within(ready).await.unwrap();
         for _ in 0..8 {
-            data.try_send(data_frame("backlog")).unwrap();
+            data.try_send(data_frame("backlog").into()).unwrap();
         }
         assert!(matches!(
-            data.try_send(data_frame("overflow")),
+            data.try_send(data_frame("overflow").into()),
             Err(mpsc::error::TrySendError::Full(_))
         ));
         priority
@@ -576,7 +581,7 @@ fn live_silent_writer_expires_at_its_original_ceiling_and_is_dropped() {
         let (sink, _alive, ready, _received, dropped) = gated_sink();
         let (_priority, high) = mpsc::channel(4);
         let (data, low) = mpsc::channel(8);
-        data.try_send(data_frame("stuck")).unwrap();
+        data.try_send(data_frame("stuck").into()).unwrap();
         let task = tokio::spawn(output::writer(sink, Arc::new(clock.clone()), high, low));
         within(ready).await.unwrap();
         clock.deadline(LIVENESS_WINDOW_MS).await;
@@ -592,7 +597,7 @@ fn dead_writer_fails_without_waiting_for_liveness_expiry() {
         let (sink, dead, ready, _received, dropped) = gated_sink();
         let (_priority, high) = mpsc::channel(4);
         let (data, low) = mpsc::channel(8);
-        data.try_send(data_frame("dead")).unwrap();
+        data.try_send(data_frame("dead").into()).unwrap();
         let task = tokio::spawn(output::writer(sink, Arc::new(clock.clone()), high, low));
         within(ready).await.unwrap();
         drop(dead);
@@ -863,7 +868,7 @@ fn abandoned_writer_releases_the_sink_without_waiting_for_the_peer() {
         let (sink, _alive, ready, _received, dropped) = gated_sink();
         let (_priority, high) = mpsc::channel(4);
         let (data, low) = mpsc::channel(8);
-        data.try_send(data_frame("abandoned")).unwrap();
+        data.try_send(data_frame("abandoned").into()).unwrap();
         let task = tokio::spawn(output::writer(sink, Arc::new(clock.clone()), high, low));
         within(ready).await.unwrap();
         task.abort();
@@ -954,6 +959,33 @@ async fn revoke_during_hello(at: u64, registered: usize) {
     ));
     assert_eq!(fired.load(Ordering::SeqCst), 1);
     server.finish().await;
+}
+
+#[test]
+fn per_principal_quota_preserves_siblings_and_global_sixteen_socket_limit() {
+    runtime(async {
+        let server = Server::new().await;
+        let mut sockets = Vec::new();
+        for token in ["a", "d", "b", "1"] {
+            for _ in 0..PRINCIPAL_CONNECTIONS {
+                let mut client = Socket::open(&server).await;
+                client.hello(1, &token.repeat(64)).await;
+                sockets.push(client);
+            }
+            if token == "a" {
+                let mut excess = Socket::open(&server).await;
+                excess.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":token.repeat(64)})).await;
+                assert!(matches!(
+                    excess.receive().await,
+                    Received::Close(GOING_AWAY_CLOSE)
+                ));
+            }
+        }
+        assert_eq!(sockets.len(), CONNECTIONS as usize);
+        let (_, refusal) = Socket::upgrade(&server).await;
+        assert!(refusal.starts_with("HTTP/1.1 503"));
+        server.finish().await;
+    });
 }
 
 #[test]
@@ -1149,5 +1181,162 @@ fn failed_welcome_encode_drops_without_any_close_send() {
         );
         assert!(started.try_recv().is_err());
         assert!(received.try_recv().is_err());
+    });
+}
+
+#[test]
+fn token_scope_refusal_closes_hello_with_4401() {
+    assert_eq!(
+        HandshakeFailure::from(TokenError::Scope).hello_code(),
+        Some(AUTH_REFUSED_CLOSE)
+    );
+}
+
+#[test]
+fn closed_subscription_discards_queued_output_without_harming_sibling_or_ping() {
+    runtime(async {
+        let (sink, release, started, mut frames, _) = gated_sink();
+        let (priority, high) = mpsc::channel(4);
+        let (data, low) = mpsc::channel(8);
+        data.try_send(data_frame("in-flight").into()).unwrap();
+        let task = tokio::spawn(output::writer(sink, Arc::new(TestClock::new()), high, low));
+        within(started).await.unwrap();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sibling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut acknowledgements = Vec::new();
+        for (id, fence) in [
+            ("closed", &closed),
+            ("sibling", &sibling),
+            ("closed", &closed),
+        ] {
+            let (delivered, acknowledgement) = tokio::sync::oneshot::channel();
+            data.try_send(output::Delivery {
+                frame: data_frame(id),
+                active: Some(fence.clone()),
+                delivered: Some(delivered),
+            })
+            .unwrap();
+            acknowledgements.push((id, acknowledgement));
+        }
+        closed.store(false, Ordering::Release);
+        priority
+            .try_send(
+                output::encode(ServerFrame::Ping {
+                    nonce: "priority".into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        for expected in [
+            json!({"t":"synced","sub_id":"in-flight","seq":0}),
+            json!({"t":"ping","nonce":"priority"}),
+            json!({"t":"synced","sub_id":"sibling","seq":0}),
+        ] {
+            let Message::Text(actual) = within(frames.recv()).await.unwrap() else {
+                panic!("text required")
+            };
+            assert_eq!(serde_json::from_str::<Value>(&actual).unwrap(), expected);
+        }
+        for (id, ack) in acknowledgements {
+            assert_eq!(within(ack).await.unwrap(), id == "sibling");
+        }
+        assert!(frames.try_recv().is_err());
+        assert!(sibling.load(Ordering::Acquire));
+        drop(priority);
+        within(task).await.unwrap();
+    });
+}
+#[test]
+fn owner_lookup_replay_consumes_real_storage_and_the_verified_socket_writer() {
+    use crate::structured::{
+        history::{owner, Item},
+        registry::{Record, Registry, StructuredRuntime},
+        workers::Workers,
+    };
+    use std::io::Write;
+    runtime(async {
+        let server = Server::new().await;
+        let mut socket = Socket::open(&server).await;
+        socket.hello(1, &"a".repeat(64)).await;
+        server.clock.deadline(15_000).await;
+        let root = server._root.path();
+        let mut registry = Registry::default();
+        registry
+            .register(Record {
+                runtime: StructuredRuntime::Structured,
+                agent_id: "fixture-agent".into(),
+                name: None,
+                harness: "claude".into(),
+                session_id: "history".into(),
+                cwd: root.to_owned(),
+                model: None,
+            })
+            .unwrap();
+        let sessions = root.join("sessions");
+        crate::platform::structured::ensure_private_dir(&sessions).unwrap();
+        let directory = sessions.join("fixture-agent");
+        crate::platform::structured::ensure_private_dir(&directory).unwrap();
+        let mut file =
+            crate::platform::structured::create_private_file(&directory.join("history.jsonl"))
+                .unwrap();
+        writeln!(file,"{}",json!({"seq":1,"known":true,"received_at_ms":1,"origin":"claude","result_subtype":null,"raw":"{\"type\":\"assistant\",\"message\":{}}"})).unwrap();
+        file.sync_all().unwrap();
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let mut workers = Workers::new(wake.clone());
+        let (consumer, mut owner) = owner::channel(wake.clone());
+        let mut lookup = tokio::spawn(async move { consumer.lookup("fixture-agent".into()).await });
+        within(wake.notified()).await;
+        // A stalled owner lookup must not freeze the independent heartbeat writer.
+        server.clock.advance(15_000);
+        let Received::Text(ping) = socket.receive().await else {
+            panic!("ping required")
+        };
+        assert_eq!(ping["t"], "ping");
+        socket.send(json!({"t":"pong","nonce":ping["nonce"]})).await;
+        let source=within(async {
+            loop {
+                owner.service(&registry,&mut workers,root);
+                tokio::select! { result=&mut lookup=>break result.unwrap().unwrap().unwrap(),_=wake.notified()=>() }
+            }
+        }).await;
+        let mut cut = source.subscribe(None).unwrap();
+        let Item::Record(record) = cut.page().unwrap() else {
+            panic!("stored record required")
+        };
+        let frame = ServerFrame::Ev {
+            sub_id: "history-consumer".into(),
+            stream: "agent/fixture-agent".into(),
+            seq: Some(record.seq),
+            ts_ms: 1,
+            ev: WireEvent::Session(Box::new(serde_json::from_str(&record.raw).unwrap())),
+        };
+        let sender = server
+            .core
+            .shared
+            .clients
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .data
+            .clone();
+        let (delivered, ack) = tokio::sync::oneshot::channel();
+        sender
+            .try_send(output::Delivery {
+                frame,
+                active: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+                delivered: Some(delivered),
+            })
+            .unwrap();
+        assert!(within(ack).await.unwrap());
+        let Received::Text(event) = socket.receive().await else {
+            panic!("event required")
+        };
+        assert_eq!(event["seq"], 1);
+        assert_eq!(event["ev"], json!({"type":"assistant","message":{}}));
+        assert!(matches!(cut.page().unwrap(), Item::Synced(1)));
+        server.finish().await;
     });
 }

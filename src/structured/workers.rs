@@ -1,7 +1,7 @@
 //! Owned workers for ADR-0036 S3a-3; no public start/admission route until #1843.
 //!
 //! Lease locks, preparation and supervision run off the app loop. Each launch has
-//! two bounded owner messages (ready/end) and the runtime's bounded stream queue.
+//! three bounded owner messages (lease/ready/end) and the runtime's bounded stream queue.
 //! Only `Received::state_input` adapts stream records, including book closes.
 //! Polling drains four records per agent and rearms the shared wake when full.
 //! Exact S4 deadlines share the app scheduler; silence never kills a process.
@@ -30,6 +30,8 @@ use std::{
 };
 use tokio::sync::Notify;
 const BATCH: usize = 4;
+mod admission;
+pub(crate) use admission::Admission;
 
 /// Internal launch policy, supplied by authenticated admission in #1843.
 pub struct Launch {
@@ -49,6 +51,8 @@ pub struct Launch {
     pub stall_after: Duration,
     /// Optional authenticated delegation lineage.
     pub lineage: Option<(String, u32)>,
+    /// Agent-caller policy; None is the already-attested operator exemption.
+    pub(crate) admission: Option<Admission>,
 }
 /// Completion available only after preceding stream records have been reduced.
 #[derive(Debug)]
@@ -59,6 +63,7 @@ pub struct Report {
     pub authority_retained: bool,
 }
 enum Message {
+    Leased,
     Ready(Runtime),
     End(Report),
 }
@@ -116,6 +121,9 @@ impl Worker {
 pub struct Workers {
     entries: BTreeMap<String, Worker>,
     history: BTreeMap<String, (u64, super::history::History)>,
+    pending: BTreeMap<String, Option<String>>,
+    #[cfg(test)]
+    before_reserve: Option<mpsc::Receiver<()>>,
     notify: Arc<Notify>,
     // Coalesced wake for teardown while the async server loop is quiescent.
     wake: mpsc::SyncSender<()>,
@@ -133,6 +141,9 @@ impl Workers {
             shutdown_result: None,
             entries: BTreeMap::new(),
             history: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            #[cfg(test)]
+            before_reserve: None,
             notify,
         }
     }
@@ -155,6 +166,7 @@ impl Workers {
             mcp,
             stall_after,
             lineage,
+            admission,
         } = launch;
         if let Some(previous) = self.entries.get_mut(&agent_id) {
             previous.join_finished();
@@ -173,24 +185,47 @@ impl Workers {
             .filter(|(_, _, g)| *g == current)
             .map(|(r, _, _)| r.clone())
             .ok_or(ErrorCode::AgentNotFound)?;
-        let generation =
-            registry
-                .begin_launch(&agent_id, current)
-                .map_err(|error| match error {
-                    super::registry::RegistryError::RecoveryRequired => {
-                        ErrorCode::StructuredRecoveryRequired
-                    }
-                    _ => ErrorCode::AgentStartFailed,
-                })?;
-        let (tx, messages) = mpsc::sync_channel(2);
+        if registry
+            .get(&agent_id)
+            .is_some_and(|(_, p, _)| p.update.state.lifecycle == Lifecycle::Unknown)
+        {
+            return Err(ErrorCode::StructuredRecoveryRequired);
+        }
+        self.reserve_pending(
+            &agent_id,
+            lineage.as_ref().map(|(id, _)| id.as_str()),
+            &leases,
+            admission.as_ref(),
+        )?;
+        let generation = registry.begin_launch(&agent_id, current).map_err(|error| {
+            self.pending.remove(&agent_id);
+            match error {
+                super::registry::RegistryError::RecoveryRequired => {
+                    ErrorCode::StructuredRecoveryRequired
+                }
+                _ => ErrorCode::AgentStartFailed,
+            }
+        })?;
+        let (tx, messages) = mpsc::sync_channel(3);
         let stop = StopRequest::default();
         let cancelled = stop.clone();
         let notify = self.notify.clone();
         let wake = self.wake.clone();
+        #[cfg(test)]
+        let before_reserve = self.before_reserve.take();
         let thread = std::thread::Builder::new()
             .name("structured-launch".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if let Some(barrier) = before_reserve {
+                        barrier.recv_timeout(Duration::from_secs(10)).map_err(|_| {
+                            (
+                                ErrorCode::AgentStartFailed,
+                                "reservation barrier failed".into(),
+                            )
+                        })?;
+                    }
                     let lease = leases
                         .reserve(
                             &record.agent_id,
@@ -198,6 +233,9 @@ impl Workers {
                             lineage.as_ref().map(|(id, depth)| (id.as_str(), *depth)),
                         )
                         .map_err(|code| (code, code.as_str().to_owned()))?;
+                    let _ = tx.try_send(Message::Leased);
+                    notify.notify_one();
+                    let _ = wake.try_send(());
                     let prepare = || -> Result<_, LaunchError> {
                         if cancelled.requested() {
                             return Err(io::Error::new(
@@ -261,7 +299,10 @@ impl Workers {
                 notify.notify_one();
                 let _ = wake.try_send(());
             })
-            .map_err(|_| ErrorCode::AgentStartFailed)?;
+            .map_err(|_| {
+                self.pending.remove(&agent_id);
+                ErrorCode::AgentStartFailed
+            })?;
         self.shutdown_result = None;
         self.entries.insert(
             agent_id,
@@ -292,6 +333,18 @@ impl Workers {
         let (generation, source) = self.history.get(id)?;
         let (_, _, current) = registry.get(id)?;
         (*generation == current).then_some(source)
+    }
+    /// Cold recovery requires a quiescent producer and confirmed cleanup.
+    /// Existing canonical history remains readable while a worker is active.
+    pub(crate) fn history_recovery_allowed(&self, id: &str) -> bool {
+        self.entries.get(id).is_none_or(|worker| {
+            worker.finished
+                && worker.thread.is_none()
+                && worker
+                    .report
+                    .as_ref()
+                    .is_some_and(|report| !report.authority_retained)
+        })
     }
     /// Install a closed-file source recovered on an I/O worker. A changed epoch,
     /// active producer or already installed source refuses stale recovery.
@@ -343,11 +396,14 @@ impl Workers {
             {
                 worker.stop();
             }
-            for _ in 0..2 {
+            for _ in 0..3 {
                 if worker.report.is_some() {
                     break;
                 }
                 match worker.messages.try_recv() {
+                    Ok(Message::Leased) => {
+                        self.pending.remove(id);
+                    }
                     Ok(Message::Ready(runtime)) => {
                         self.history
                             .insert(id.clone(), (worker.generation, runtime.history.clone()));
@@ -363,8 +419,12 @@ impl Workers {
                             unix_ms,
                         );
                     }
-                    Ok(Message::End(report)) => worker.report = Some(report),
+                    Ok(Message::End(report)) => {
+                        self.pending.remove(id);
+                        worker.report = Some(report);
+                    }
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        self.pending.remove(id);
                         worker.stop();
                         worker.report = Some(Report {
                             result: Err((

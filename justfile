@@ -55,6 +55,7 @@ lint: ts-check
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
     cargo clippy --all-targets --locked --features ts -- -D warnings
+    cargo clippy --locked --bin flk --features web -- -D warnings
 
 # Build internal API docs and reject broken links, markup and other warnings.
 doc-check:

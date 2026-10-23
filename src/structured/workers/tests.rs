@@ -75,6 +75,7 @@ impl Case {
             mcp: fixture.mcp(),
             stall_after: STALL,
             lineage: None,
+            admission: None,
         };
         let f = fixture.clone();
         let authority = leases.clone();
@@ -624,7 +625,11 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
     let (mut registry, mut workers, notify, now) = owner();
     let (a, launch, _) = Case::prepare(&mut registry, 10, "state-reducer", vec![]);
     let (tx, messages) = mpsc::sync_channel(2);
-    drop(tx);
+    let producer = std::thread::spawn(move || drop(tx));
+    producer.join().unwrap();
+    workers
+        .pending
+        .insert(a.id.clone(), Some("fixture-parent".into()));
     workers.entries.insert(
         a.id.clone(),
         Worker {
@@ -644,6 +649,11 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
         workers.report(&a.id, a.generation).is_some()
     })
     .await;
+    assert!(
+        !workers.pending.contains_key(&a.id),
+        "disconnected launch must free its pending slot"
+    );
+    assert_eq!(workers.counts(&a.leases, "fixture-parent"), Ok((0, 0)));
     assert!(workers.entries[&a.id].thread.is_none());
     let report = workers.report(&a.id, a.generation).unwrap();
     assert!(report.authority_retained);
@@ -879,9 +889,7 @@ async fn registry_worker_launch_uses_configured_blob_threshold() {
         "worker-exit-ok",
         vec![message, event("result")],
     );
-    launch.storage = super::super::blobs::StorageConfig {
-        blob_min_bytes: config.sessions.blob_min_bytes,
-    };
+    launch.storage = config.sessions.storage();
     case.generation = workers.start(&mut registry, launch, factory).unwrap();
     case.ready(&mut registry, &mut workers, &notify, now).await;
     case.submit(&workers);
@@ -1049,4 +1057,157 @@ async fn registry_stream_owner_preserves_history_without_competing_with_state_si
     assert!(matches!(restored.page().unwrap(), Item::Record(_)));
     registry.remove(&case.id, case.generation).unwrap();
     assert!(workers.history(&registry, &case.id).is_none());
+}
+
+fn limited_launch(mut launch: Launch, leases: &SessionLeases) -> Launch {
+    launch.leases = leases.clone();
+    launch.lineage = Some(("fixture-parent".into(), 0));
+    launch.admission = Some(Admission {
+        config: crate::spawn::FleetConfig {
+            max_concurrent_agents: 1,
+            ..Default::default()
+        },
+        pty: crate::spawn::SpawnCensus {
+            live_agent_started: 0,
+            parent_live_children: 0,
+            child_depth: 1,
+        },
+        paused: false,
+        verb: crate::spawn::SpawnVerb::Fork,
+    });
+    launch
+}
+
+/// A producer held before lease acquisition cannot leave an uncounted admission gap.
+#[tokio::test]
+async fn owner_pending_reservation_blocks_concurrent_start_and_failure_frees_it() {
+    let (mut registry, mut workers, notify, now) = owner();
+    let leases = SessionLeases::default();
+    let (first, launch, _) = Case::prepare(&mut registry, 120, "state-reducer", vec![]);
+    let (release, barrier) = mpsc::channel();
+    workers.before_reserve = Some(barrier);
+    let generation = workers
+        .start(&mut registry, limited_launch(launch, &leases), |_| {
+            Err(io::Error::other("fixture preparation failure").into())
+        })
+        .unwrap();
+    assert_eq!(workers.counts(&leases, "fixture-parent"), Ok((1, 1)));
+    assert!(!leases.is_reserved(&first.session).unwrap());
+    workers.poll(&mut registry, now + Duration::from_secs(3600), 1000);
+    assert_eq!(
+        workers.counts(&leases, "fixture-parent"),
+        Ok((1, 1)),
+        "a clock cannot release pending admission"
+    );
+    let (_, second, _) = Case::prepare(&mut registry, 121, "state-reducer", vec![]);
+    let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = prepared.clone();
+    let refused = workers.start(&mut registry, limited_launch(second, &leases), move |_| {
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(io::Error::other("unadmitted preparation").into())
+    });
+    release.send(()).unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&first.id, generation).is_some()
+    })
+    .await;
+    let remaining = workers.counts(&leases, "fixture-parent");
+    let cleanup = workers.shutdown(&mut registry);
+    assert_eq!(refused, Err(ErrorCode::AtAgentCapacity));
+    assert!(!prepared.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        remaining,
+        Ok((0, 0)),
+        "failed preparation releases reservation"
+    );
+    cleanup.unwrap();
+    let (_, third, _) = Case::prepare(&mut registry, 122, "state-reducer", vec![]);
+    workers
+        .start(&mut registry, limited_launch(third, &leases), |_| {
+            Err(io::Error::other("fixture preparation failure").into())
+        })
+        .unwrap();
+    workers.shutdown(&mut registry).unwrap();
+}
+
+#[test]
+fn owner_counts_deduplicate_pending_and_leased_identity() {
+    let (_, mut workers, _, _) = owner();
+    let leases = SessionLeases::default();
+    workers
+        .pending
+        .insert("fixture-child".into(), Some("fixture-parent".into()));
+    let lease = leases
+        .reserve(
+            "fixture-child",
+            "00000000-0000-4000-8000-000000000123",
+            Some(("fixture-parent", 0)),
+        )
+        .unwrap();
+    assert_eq!(workers.counts(&leases, "fixture-parent"), Ok((1, 1)));
+    drop(lease);
+    assert_eq!(workers.counts(&leases, "fixture-parent"), Ok((1, 1)));
+}
+
+#[tokio::test]
+async fn owner_failed_lease_acquisition_releases_pending_reservation() {
+    let (mut registry, mut workers, notify, _) = owner();
+    let leases = SessionLeases::default();
+    let (case, launch, _) = Case::prepare(&mut registry, 124, "state-reducer", vec![]);
+    let existing = leases
+        .reserve("other-fixture-agent", &case.session, None)
+        .unwrap();
+    let generation = workers
+        .start(&mut registry, limited_launch(launch, &leases), |_| {
+            panic!("a duplicate lease must never prepare a profile")
+        })
+        .unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&case.id, generation).is_some()
+    })
+    .await;
+    let pending = workers.pending.contains_key(&case.id);
+    drop(existing);
+    let _ = workers.shutdown(&mut registry);
+    assert!(!pending, "lease failure must release its owner reservation");
+}
+
+/// Lease acquisition transfers accounting before preparation completes.
+#[tokio::test]
+async fn owner_lease_acquisition_retires_pending_without_double_counting() {
+    let (mut registry, mut workers, notify, _) = owner();
+    let leases = SessionLeases::default();
+    let (case, launch, _) = Case::prepare(&mut registry, 125, "state-reducer", vec![]);
+    let (entered, seen) = mpsc::sync_channel(1);
+    let (release, barrier) = mpsc::sync_channel(1);
+    let generation = workers
+        .start(&mut registry, limited_launch(launch, &leases), move |_| {
+            entered.send(()).unwrap();
+            barrier
+                .recv_timeout(LIMIT)
+                .map_err(|_| io::Error::other("profile barrier failed"))?;
+            Err(io::Error::other("fixture preparation failure").into())
+        })
+        .unwrap();
+    seen.recv_timeout(LIMIT)
+        .expect("preparation must acquire its lease first");
+    let count_before = workers.counts(&leases, "fixture-parent");
+    workers.poll(&mut registry, Instant::now(), 1000);
+    let pending = workers.pending.contains_key(&case.id);
+    let count_after = workers.counts(&leases, "fixture-parent");
+    release.send(()).unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&case.id, generation).is_some()
+    })
+    .await;
+    workers.shutdown(&mut registry).unwrap();
+    assert!(
+        !pending,
+        "the lease replaces, rather than supplements, pending ownership"
+    );
+    assert_eq!(count_before, Ok((1, 1)));
+    assert_eq!(count_after, Ok((1, 1)));
 }

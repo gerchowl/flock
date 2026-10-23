@@ -1772,3 +1772,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) use agent::test_structured_start;

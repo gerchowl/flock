@@ -31,15 +31,15 @@ const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 
 pub struct ServerHandle {
-    _thread: std::thread::JoinHandle<()>,
+    _thread: Option<std::thread::JoinHandle<()>>,
+    /// Kernel executable lookup, independent of request-selected launch data.
+    pub(crate) mcp_executable: fn() -> io::Result<PathBuf>,
     path: PathBuf,
     pub(crate) node_id: Option<String>,
     pub(crate) clone_detection_warning: Option<String>,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
     /// Structured listener health owned by this server, shared with its lifecycle owner.
-    // The #1894 lifecycle owner reads this handle when the transport is mounted.
-    #[allow(dead_code)]
     pub(crate) client_listener: crate::api::client_listener::Health,
 }
 
@@ -56,6 +56,32 @@ impl Drop for ServerHandle {
 }
 
 impl ServerHandle {
+    /// Pin MCP to this listener, independent of inherited client variables.
+    pub(crate) fn session_mcp(&self) -> std::io::Result<crate::structured::launch::SessionMcp> {
+        crate::structured::launch::SessionMcp::new(
+            &(self.mcp_executable)()?,
+            &std::path::absolute(&self.path)?,
+        )
+    }
+
+    /// Stop and join this fixture's owned listener, without signaling processes.
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        // A listener that already observed shutdown may have closed before wakeup.
+        drop(UnixStream::connect(&self.path));
+        let thread = self._thread.take().expect("owned accept thread");
+        let (finished, completion) = std::sync::mpsc::sync_channel(1);
+        let joiner = std::thread::spawn(move || {
+            let _ = finished.send(thread.join());
+        });
+        completion
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bounded fixture listener shutdown")
+            .unwrap();
+        joiner.join().unwrap();
+    }
+
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
         remove_socket_file_if_owned(&self.path, self.identity)
     }
@@ -101,6 +127,23 @@ pub(crate) fn start_server_with_capabilities(
     capabilities: Option<ServerCapabilities>,
     uid_policy: crate::structured::identity::UidPolicy,
 ) -> std::io::Result<ServerHandle> {
+    start_server_with_capabilities_and_health(
+        api_tx,
+        event_hub,
+        capabilities,
+        uid_policy,
+        Default::default(),
+    )
+}
+
+/// Rebind the API socket while retaining its logical server's listener health.
+pub(crate) fn start_server_with_capabilities_and_health(
+    api_tx: ApiRequestSender,
+    event_hub: EventHub,
+    capabilities: Option<ServerCapabilities>,
+    uid_policy: crate::structured::identity::UidPolicy,
+    client_listener: crate::api::client_listener::Health,
+) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
 
@@ -115,7 +158,6 @@ pub(crate) fn start_server_with_capabilities(
     let clone_detection_warning = capabilities
         .as_ref()
         .and_then(|caps| caps.clone_detection_warning.clone());
-    let client_listener = crate::api::client_listener::Health::default();
     let connection_status = client_listener.clone();
     let thread = std::thread::spawn(move || {
         let health = Arc::new(Mutex::new(crate::api::schema::ApiListenerHealth::default()));
@@ -151,7 +193,8 @@ pub(crate) fn start_server_with_capabilities(
     });
 
     Ok(ServerHandle {
-        _thread: thread,
+        _thread: Some(thread),
+        mcp_executable: std::env::current_exe,
         node_id,
         clone_detection_warning,
         path,

@@ -2,6 +2,8 @@
 //! Paging performs bounded filesystem work and belongs on the consumer's I/O
 //! worker, never the heartbeat loop. Neither replay nor publication reads Runtime.
 #![deny(missing_docs)]
+pub(crate) mod owner;
+
 use super::transport::StreamRecord;
 use parking_lot::Mutex;
 use std::{
@@ -43,7 +45,7 @@ pub enum Item {
         /// Loss diagnosis.
         reason: GapReason,
     },
-    /// Captured head, emitted exactly once even for an empty cut.
+    /// Captured head, emitted once unless lag closes replay before its barrier.
     Synced(u64),
     /// Closed continuation; resubscribe from the applied cursor, not this head.
     Lagged(u64),
@@ -131,7 +133,7 @@ impl History {
         )?;
         let file = crate::platform::structured::open_token(path)?;
         let length = file.metadata()?.len();
-        let head = tail_head(&file, length, &mut Vec::new())?;
+        let head = tail_head(&file, length)?;
         if head == 0 && length != 0 {
             return Err(io::Error::other(
                 "nonempty history requires a positive head",
@@ -139,16 +141,16 @@ impl History {
         }
         let source = Self::default();
         source.bind(agent, session);
-        source.initialize(&file, head)?;
+        source.initialize(&file, head, length)?;
         source.finish(false);
         Ok(source)
     }
     /// Install the recovered file/head before the producer accepts new records.
-    pub(super) fn initialize(&self, file: &File, head: u64) -> io::Result<()> {
+    pub(super) fn initialize(&self, file: &File, head: u64, end: u64) -> io::Result<()> {
         let mut book = self.0.lock();
         book.file = Some(file.try_clone()?);
         book.head = head;
-        book.end = file.metadata()?.len();
+        book.end = end;
         drop(book);
         self.1.notify_waiters();
         Ok(())
@@ -290,8 +292,8 @@ impl Registered {
     }
 }
 /// Grow the cold tail geometrically, bounded by storage's single-record limit.
-fn tail_head(file: &File, length: u64, tail: &mut Vec<u8>) -> io::Result<u64> {
-    tail.clear();
+fn tail_head(file: &File, length: u64) -> io::Result<u64> {
+    let mut tail = Vec::new();
     if length == 0 {
         return Ok(0);
     }

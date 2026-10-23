@@ -31,13 +31,17 @@ dbg_macro = "deny"
 # `flock web`: xterm.js <-> flock PTY bridge (gerchowl/flock#131). Kept behind a
 # feature so axum/futures-util/rust-embed stay out of a default `flock` build.
 # tokio/net + tokio/io-util are the runtime drivers axum needs for `axum::serve`.
-web = ["dep:anyhow", "dep:axum", "dep:futures-util", "dep:rust-embed", "tokio/net", "tokio/io-util"]
+web = ["dep:anyhow", "dep:axum", "dep:hyper", "dep:hyper-util", "dep:futures-util", "dep:rust-embed", "tokio/net", "tokio/io-util"]
 
 ts = ["dep:ts-rs"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
 axum = { version = "0.8", features = ["ws"], optional = true }
+# Own HTTP/1 connection tasks and configure header/half-close policy for the mounted client.
+# Both packages are already transitive dependencies of axum; no new package versions.
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "service"], optional = true }
 base64 = "0.23.0"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"

@@ -37,6 +37,16 @@ pub(crate) fn structured_worker_shutdown_failed(error: &crate::structured::worke
     }
 }
 
+/// Optional structured launch provisioning must never prevent server startup.
+/// Resolution details may contain private paths, so report only the typed code.
+pub(crate) fn structured_mcp_endpoint_unavailable() {
+    tracing::warn!(
+        event = "structured.mcp.endpoint_unavailable",
+        code = crate::api::error_code::ErrorCode::ServerUnavailable.as_str(),
+        "structured MCP endpoint unavailable; structured start will refuse"
+    );
+}
+
 /// Report failed structured-session cleanup without reading session contents.
 pub(crate) fn structured_config_cleanup_failed(err: &io::Error) {
     tracing::error!(event = "structured.config.cleanup_failed", error = %err,
@@ -50,6 +60,28 @@ pub(crate) fn structured_stream_repaired(bytes_dropped: u64) {
         bytes_dropped,
         "removed torn final session record"
     );
+}
+
+/// Classify internal browser-exchange failures without formatting credential-bearing data.
+#[cfg(feature = "web")]
+pub(crate) fn client_exchange_failed(
+    error: Option<&crate::structured::permissions::auth::tokens::TokenError>,
+) {
+    use crate::structured::permissions::auth::tokens::TokenError;
+    let (reason, io_kind) = match error {
+        Some(TokenError::Io(error)) => ("store_io", Some(error.kind())),
+        Some(TokenError::Unsafe) => ("unsafe_store", None),
+        Some(TokenError::Busy) => ("store_busy", None),
+        Some(TokenError::Unauthorized | TokenError::Revoked | TokenError::Scope) => return,
+        None => ("worker_unavailable", None),
+    };
+    tracing::warn!(event = "client.exchange.internal_failure", subsystem = "structured_client", reason, io_kind = ?io_kind, "browser credential exchange unavailable");
+}
+
+/// Report secondary listener cleanup errors without replacing the primary server failure.
+#[cfg(feature = "web")]
+pub(crate) fn client_listener_shutdown_failed(error: &std::io::Error) {
+    tracing::warn!(event = "client.listener.shutdown_failed", subsystem = "structured_client", kind = ?error.kind(), errno = ?error.raw_os_error(), "client listener cleanup failed after server failure");
 }
 
 /// Report a single capacity refusal without recording tool input or prompts.

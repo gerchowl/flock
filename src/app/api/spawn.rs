@@ -128,6 +128,8 @@ impl SpawnCaller {
 pub(super) struct SpawnLineage {
     pub parent_agent_id: String,
     pub child_depth: u32,
+    /// PTY-only facts; the owner adds lease and pending identities atomically.
+    pub pty_census: SpawnCensus,
 }
 
 impl App {
@@ -491,10 +493,11 @@ impl App {
             }
             SpawnCaller::Operator { .. } => return Ok(None),
         };
+        let pty_census = census;
         let (leased, children) = self
-            .session_leases
-            .counts(agent_id)
-            .map_err(|_| SpawnRefusal::CallerUnknown)?;
+            .structured_workers
+            .counts(&self.session_leases, agent_id)
+            .map_err(|_| SpawnRefusal::RegistryBusy)?;
         census.live_agent_started += leased;
         census.parent_live_children += children;
         if let Some((ws_idx, pane_id)) = inherits_depth_from {
@@ -511,6 +514,10 @@ impl App {
         Ok(Some(SpawnLineage {
             parent_agent_id: agent_id.clone(),
             child_depth: census.child_depth,
+            pty_census: SpawnCensus {
+                child_depth: census.child_depth,
+                ..pty_census
+            },
         }))
     }
 
@@ -650,7 +657,10 @@ pub(super) fn refusal_data(refusal: &SpawnRefusal) -> serde_json::Value {
                 map.insert("env_value".into(), value.clone().into());
             }
         }
-        SpawnRefusal::FleetPaused | SpawnRefusal::NotEnabled | SpawnRefusal::CallerUnknown => {}
+        SpawnRefusal::RegistryBusy
+        | SpawnRefusal::FleetPaused
+        | SpawnRefusal::NotEnabled
+        | SpawnRefusal::CallerUnknown => {}
     }
     data
 }
@@ -717,6 +727,30 @@ mod tests {
             rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    /// PTY attribution stays intact when both structured census copies are busy.
+    #[tokio::test]
+    async fn pty_admit_spawn_maps_registry_contention_to_retryable_session_busy() {
+        let mut app = app_with_one_pane();
+        let (pane_id, agent_id) = caller_pane_is_an_agent(&mut app);
+        let caller = super::SpawnCaller::Agent {
+            ws_idx: 0,
+            pane_id,
+            agent_id,
+        };
+        let (release, holder) = app.session_leases.test_hold_census();
+        let result = app.admit_spawn(crate::spawn::SpawnVerb::Fork, &caller, None);
+        let released = release.send(());
+        holder.join().unwrap();
+        released.unwrap();
+        let refusal = result.expect_err("census contention must refuse without waiting");
+        assert_eq!(refusal, crate::spawn::SpawnRefusal::RegistryBusy);
+        assert_eq!(refusal.code(), "session_busy");
+        assert!(refusal.retryable());
+        let data = super::refusal_data(&refusal);
+        assert_eq!(data["refusal"], "session_busy");
+        assert_eq!(data["retryable"], true);
     }
 
     /// Off by default. Exposing a spawn verb to agents is the same

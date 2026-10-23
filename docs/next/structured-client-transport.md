@@ -1,20 +1,26 @@
-# Structured client transport core
+# Structured client transport
 
-ADR-0036 sections 5/5a define a separate JSON WebSocket protocol. The core in
-#1893 is a self-contained router. It starts no listener and changes no running
-server: #1894 owns the opt-in loopback listener, HTTP origin/Host and public-funnel
-guards, GUI router and browser-code exchange. Mounting it without those hosting
-guards is unsupported. `flk web` remains the existing terminal bridge.
+ADR-0036 sections 5/5a define a separate JSON WebSocket protocol. The protocol core
+from #1893 is mounted by #1894 in the real headless-server lifecycle, alongside
+the GUI bundle and browser-code exchange. Build with the `web` feature and set
+`[client] bind = "127.0.0.1:7682"` to opt in. Port 0 asks the OS for a free port;
+`flk client open --print` reports the live address, including after a config
+reload. The listener is off by default. `flk web` remains the separate terminal
+bridge.
 
 The first data message is a generated `hello` frame containing a client token.
 The core opens the store once off the async executor, then verifies current
 private token storage using S2a's bounded blocking-I/O budget. Unproven hellos
-never take the exclusive management/cleanup lock. An absolute five-second deadline covers receipt, verification and the
-successful `welcome` write. Missing, malformed, removed or incorrect
-credentials fail closed with 4401. Initial hello verification closes with 1001
-for a missing store worker, a deadline miss, store I/O failure or unsafe storage.
-The client retains its token and reconnects, without gaining admission.
-Close delivery is best effort within the failure ceiling; an unusable transport can end without a delivered close frame.
+never take the exclusive management/cleanup lock. An absolute five-second
+deadline covers receipt, verification and the successful `welcome` write.
+Missing, malformed, removed or incorrect credentials and explicit
+authentication-scope refusals fail closed with 4401. If the first `hello` never
+arrives before the five-second deadline, the server closes 1001 and the client
+retains its token for reconnect. Initial hello verification also closes with
+1001 for a missing store worker, a deadline miss, store I/O failure or unsafe
+storage. The client retains its token and reconnects, without gaining admission.
+Close delivery is best effort within the failure ceiling; an unusable transport
+can end without a delivered close frame.
 Credentials, raw frames and their parse errors do not enter diagnostics.
 
 `welcome` carries the wire version, server version, verified opaque principal,
@@ -34,10 +40,17 @@ No valid pong for 45 seconds ends the socket and releases its resources. The
 initial baseline is the successful welcome. A supplied monotonic clock governs
 handshake, write and heartbeat deadlines; wall-clock changes grant no liveness.
 
-There are at most 16 upgraded sockets, including unauthenticated hellos.
-A single token, or 16 slow unauthenticated hellos, can occupy all 16 slots.
-This slot-hogging limit needs the hosting guards in #1894; the core applies no
-per-token fairness or pending-hello quota. Each connection has an eight-message
+There are at most 32 HTTP connections before upgrade, plus at most 16 upgraded
+sockets. HTTP overflow closes the accepted I/O before reading a request. The entire HTTP connection has a five-second ceiling, including headers,
+body receipt, response writes and keepalive. Expiry closes its I/O. Successful
+upgrades leave that HTTP lifetime and use the core's independent deadlines. Only
+four unverified
+hello/recheck attempts may be in flight at once; a verified token principal may
+register at most four sockets. Pending overload refuses upgrade with 503; principal overload closes
+1001. Existing authenticated connections retain capacity when slow hellos fill
+the probation slots. This bounds ownership; repeated local connection spam can
+still delay a new connection. It does not grant per-process fairness before
+credentials are known. Each connection has an eight-message
 data queue and a four-message priority queue.
 The writer checks priority between data writes. Frames and reassembled messages
 are capped at 64 KiB, and outgoing serialization stops at that cap rather than
@@ -69,18 +82,66 @@ fictional credential to an isolated deterministic token record. It does not
 claim full client/subscription-script conformance before the later slices and
 S8's complete adapter have landed.
 
+The mounted listener accepts exactly `127.0.0.1`. Other addresses, including
+other members of IPv4's loopback block, receive a typed `NonLoopback` refusal
+before the forwarding probe or router construction. The lower-level descriptor
+adopter independently rejects sockets outside `127.0.0.0/8` (#1960).
+An inherited socket without a configured bind receives `Unconfigured`; an
+address or nonzero-port mismatch receives `BindMismatch`. Descriptor adoption
+closes a refused socket through its sole owner (#1972).
+
+The listener requires numeric Host and same-origin Origin matching its actual
+bound IPv4 authority (normalizing HTTP's default port only). API routes require
+Origin; top-level GUI navigation may omit it. Forwarded headers grant nothing.
+The GUI index carries CSP with self-only default, script and style sources,
+self plus the exact WebSocket URL for connections, and no objects, base URL,
+framing or form actions. There is no generated configuration script.
+
+Startup runs `tailscale serve status --json` off the async executor, bounded at
+five seconds and 64 KiB. Any serve or funnel configuration targeting the bound
+port, unsuccessful or malformed status, and an unavailable probe refuse the
+configured listener and server startup; there is no silent fallback. Exit status
+is checked before parsing JSON. Forwarding changes after startup are not
+monitored. The operator must keep forwarding to this port disabled.
+
+Live handoff transfers the bound listening descriptor rather than rebinding its
+port after commit. The importer validates a listening socket and its configured
+address, constructs the guarded routers before ready, then accepts only after
+commit. Descriptor-extension version 2 makes an older importer refuse before
+commit, including handoffs with zero PTYs. Existing sockets reconnect when the
+exporter exits. Connections attempted while the exporter is exiting may also be
+reset; ownership acknowledgement precedes that exit and clients use §5a's normal
+reconnect path. Failed imports preserve the exporter's listener. Received sockets
+are close-on-exec so later children cannot retain the port. Process-local browser
+codes are not transferred; obtain a fresh URL after handoff or restart. A changed
+nonzero configured address requires a restart rather than adopting a mismatched
+listener. A fatal accept failure stops only the listener and publishes typed
+failed status;
+the server loop and its agents continue. Server shutdown cancels owned
+HTTP connection tasks, closes accepted I/O and checks core lease release before
+returning. If the event loop and listener cleanup both fail, the event-loop error
+is returned and the secondary cleanup error is logged by kind and errno.
+HTTP/1 half-close handling and admission deadlines are configured on the
+owned connection driver.
+
+Completed exchange failures remain uniform 401 with no-store, including oversized bodies
+and internal store/worker errors. Only internal typed classes and I/O kinds enter
+server diagnostics; neither credentials, one-time codes nor raw errors do.
+
 ## Listener recovery foundation (#1894)
 
-The foundation starts no listener. Its reusable accept policy treats peer resets,
+The separately reviewed foundation supplies the reusable accept policy. It treats peer resets,
 interrupted accepts and other per-connection errors as recoverable and logs them
-at debug level. Resource exhaustion and unclassified errors (including errors
+at debug level. Unsupported accept operations (`EOPNOTSUPP`, `ENOPROTOOPT`),
+resource exhaustion and unclassified errors (including errors
 without an errno) emit a structured warning and
-waits `ACCEPT_RESOURCE_BACKOFF` (100 ms) on the supplied monotonic clock before
+wait `ACCEPT_RESOURCE_BACKOFF` (100 ms) on the supplied monotonic clock before
 accepting again. Only an invalid listener descriptor (`EBADF`, `EINVAL`,
 `ENOTSOCK`) ends that listener task and publishes the typed `failed` state once.
 It does not end the headless server loop or its agents. Ping carries the optional
 `client_listener` state (`listening` or `failed`), absent when disabled.
-This state is owned by each API server and injected into its listener owner;
+This state belongs to the logical server and is injected into its API socket
+and listener owner. Handoff rollback retains it when replacing the API socket;
 independent server instances never share a process static.
 
 On Linux, `MSG_CMSG_CLOEXEC` makes every SCM_RIGHTS descriptor close-on-exec
@@ -91,5 +152,36 @@ receipt (logging may also own a worker), but those threads do not spawn children
 The importer does not spawn its own children until descriptor protection is done.
 Every returned descriptor is protected before import can spawn a child. The listener descriptor helper additionally verifies
 that a transferred socket is IPv4, stream-typed and listening and retains exporter rollback ownership
-through duplication. Mounting and listener transfer through handoff remain the
-responsibility of the subsequent #1894 mounting change.
+through duplication. This mount integrates the helpers into the listener lifecycle
+and the handoff manifest described above.
+
+### Internal history delivery foundation
+
+ADR-0036 §5a's owner bridge is crate-private and has a tested consumer that
+recovers real session JSONL and delivers it through the verified socket writer.
+WebSocket subscription registration follows in part 4b of #1830.
+
+Each bridge has a 32-request mailbox and services at most 32 requests per owner
+turn. Full admission fails with `WouldBlock`; losing the owner fails with
+`BrokenPipe`. The owner captures the registry generation and stored namespace. Unsupported
+stored path components are unavailable subjects and never reach filesystem recovery.
+Cold recovery defers with `WouldBlock` while a worker is preparing or cleanup
+authority remains unconfirmed. An installed canonical source remains readable.
+Retained recovery runs off the async executor, with at most four blocking jobs
+per bridge. A cancelled waiter keeps its I/O slot until that job returns,
+including when the job is still queued. A blocked filesystem can occupy those
+slots; it cannot create an unbounded recovery queue.
+
+Installation rechecks generation and namespace on the owner. A stale generation
+or mismatched namespace fails with `Interrupted`. If another recovery or the live producer
+already installed the current source, the consumer receives that canonical
+source. A cancelled installation request is discarded before changing ownership.
+Storage failures propagate without installing a source.
+
+Queued writer deliveries carry an independent subscription liveness fence.
+Closing it discards that subscription's queued frames and acknowledges them as
+discarded. Sibling deliveries remain eligible, and heartbeat messages retain
+priority between writes. A successful acknowledgement means the frame flushed;
+a closed acknowledgement channel means the writer failed. A write already
+started before the fence closes cannot be recalled, so clients still discard
+late frames for closed IDs as required by §5a.

@@ -54,7 +54,7 @@ pub(super) const AGENT_HISTORY_USAGE: &str =
 
 pub(super) const AGENT_RESULT_USAGE: &str =
     "flk agent result <target> [--max-chars N] [--offset N]";
-pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--questions ask_human|ask_operator|route|deny] [--unattended] [--dry-run] -- <argv...>";
+pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--runtime pty|structured] [--model MODEL] [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--questions ask_human|ask_operator|route|deny] [--unattended] [--dry-run] -- <argv...>";
 
 pub(super) const AGENT_RESTART_USAGE: &str =
     "flk agent restart self|<target> --reason TEXT [--continue-with TEXT|@FILE]";
@@ -99,6 +99,8 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
 /// into them never reaches the request.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AgentStartFlags {
+    runtime: crate::api::schema::AgentRuntime,
+    model: Option<String>,
     dry_run: bool,
     cwd: Option<String>,
     workspace_id: Option<String>,
@@ -139,6 +141,18 @@ fn parse_agent_start_flags(args: &[String], separator: usize) -> Result<AgentSta
                 .ok_or_else(|| format!("missing value for {flag}"))
         };
         match args[index].as_str() {
+            "--runtime" => {
+                flags.runtime = match value_for("--runtime")?.as_str() {
+                    "pty" => crate::api::schema::AgentRuntime::Pty,
+                    "structured" => crate::api::schema::AgentRuntime::Structured,
+                    _ => return Err("--runtime requires pty or structured".into()),
+                };
+                index += 2;
+            }
+            "--model" => {
+                flags.model = Some(value_for("--model")?);
+                index += 2;
+            }
             "--cwd" => {
                 flags.cwd = Some(value_for("--cwd")?);
                 index += 2;
@@ -248,6 +262,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         }
     };
     let AgentStartFlags {
+        runtime,
+        model,
         dry_run,
         cwd,
         workspace_id,
@@ -260,6 +276,12 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         ready_timeout_ms,
         asked,
     } = flags;
+    // Keep the client gate closed too: older servers would ignore the selector
+    // and launch raw PTY argv. Part 3 must negotiate support before opening it.
+    if runtime == crate::api::schema::AgentRuntime::Structured && (wait_ready || !cfg!(test)) {
+        eprintln!("runtime_unsupported: structured start awaits final routing; pane readiness is unsupported");
+        return Ok(crate::cli::exit::USAGE);
+    }
     let asked = asked.gate(
         &format!("agent start {name}"),
         super::questions::server_takes_questions,
@@ -274,6 +296,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let response = super::send_request(&Request {
         id: "cli:agent:start".into(),
         method: Method::AgentStart(AgentStartParams {
+            runtime,
+            model,
             label: None,
             dry_run,
             name: name.clone(),
@@ -957,9 +981,13 @@ fn resolve_agent_target(target: &str, request_id: &str) -> std::io::Result<serde
         .and_then(serde_json::Value::as_str)
         == Some("structured")
     {
-        return Ok(
-            serde_json::json!({"id":request_id,"error":{"code":crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),"message":"this operation requires a PTY placement"}}),
-        );
+        return Ok(serde_json::json!({
+            "id": request_id,
+            "error": {
+                "code": crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),
+                "message": "this operation requires a PTY placement"
+            }
+        }));
     }
     Ok(response)
 }
@@ -1497,4 +1525,9 @@ mod restart_tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_structured_start(args: &[String]) -> std::io::Result<i32> {
+    agent_start(args)
 }
