@@ -37,6 +37,16 @@ pub(crate) fn structured_worker_shutdown_failed(error: &crate::structured::worke
     }
 }
 
+/// Optional structured launch provisioning must never prevent server startup.
+/// Resolution details may contain private paths, so report only the typed code.
+pub(crate) fn structured_mcp_endpoint_unavailable() {
+    tracing::warn!(
+        event = "structured.mcp.endpoint_unavailable",
+        code = crate::api::error_code::ErrorCode::ServerUnavailable.as_str(),
+        "structured MCP endpoint unavailable; structured start will refuse"
+    );
+}
+
 /// Report failed structured-session cleanup without reading session contents.
 pub(crate) fn structured_config_cleanup_failed(err: &io::Error) {
     tracing::error!(event = "structured.config.cleanup_failed", error = %err,

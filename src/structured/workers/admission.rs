@@ -20,9 +20,7 @@ impl Workers {
         leases: &SessionLeases,
         parent: &str,
     ) -> Result<(usize, usize), ErrorCode> {
-        let mut identities = leases
-            .admitted_identities()
-            .ok_or(ErrorCode::SpawnCallerUnknown)?;
+        let mut identities = leases.admitted_identities().ok_or(ErrorCode::SessionBusy)?;
         for (id, parent) in &self.pending {
             identities
                 .entry(id.clone())

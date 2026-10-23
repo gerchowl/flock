@@ -412,6 +412,7 @@ impl Workers {
                         worker.report = Some(report);
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        self.pending.remove(id);
                         worker.stop();
                         worker.report = Some(Report {
                             result: Err((
