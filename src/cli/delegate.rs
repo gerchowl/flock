@@ -83,7 +83,8 @@ pub(super) const START_USAGE: &str = concat!(
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
     "  --harness NAME      the agent to run, default opencode; a startup dialog is named rather\n",
-    "                      than typed into: claude_folder_trust, codex_folder_trust, codex_hook_review\n",
+    "                      than typed into: claude_folder_trust, claude_folder_trust_with_permissions,\n",
+    "                      codex_folder_trust, codex_hook_review\n",
     "                      codex defaults to never approvals and workspace-write (network blocked)\n",
     "  --worktree          run in a fresh linked worktree: --branch is required, --repo and --base optional\n",
     "  --repo PATH         a linked worktree is swapped for its main checkout, branching from its HEAD\n",
@@ -510,6 +511,8 @@ struct StartupDialog {
     shows: fn(&str) -> bool,
     /// What the delegate says when readiness finds it.
     refusal: &'static str,
+    /// Whether this dialog retains a pending start as a named human block.
+    keep_on_start: bool,
 }
 
 /// The `agent.result` refusals that are ordinary whichever harness asked.
@@ -555,11 +558,20 @@ const HARNESSES: [HarnessSpec; 3] = [
         // transcript entry, so the gap this covers is the same one it covers
         // for opencode: the store, not the screen, is the slow side.
         result_grace: Duration::from_secs(10),
-        startup_dialogs: &[StartupDialog {
-            code: "claude_folder_trust",
-            shows: crate::detect::claude_waiting_on_folder_trust,
-            refusal: "Claude Code is waiting on its folder-trust dialog (see #605)",
-        }],
+        startup_dialogs: &[
+            StartupDialog {
+                code: "claude_folder_trust",
+                shows: crate::detect::claude_waiting_on_folder_trust,
+                refusal: "Claude Code is waiting on its folder-trust dialog (see #605)",
+                keep_on_start: false,
+            },
+            StartupDialog {
+                code: "claude_folder_trust_with_permissions",
+                shows: crate::detect::claude_waiting_on_folder_trust_with_permissions,
+                refusal: "Claude Code needs operator approval of folder trust and pre-approved tool permissions",
+                keep_on_start: true,
+            },
+        ],
     },
     HarnessSpec {
         name: "codex",
@@ -574,6 +586,7 @@ const HARNESSES: [HarnessSpec; 3] = [
                 code: "codex_hook_review",
                 shows: crate::detect::codex_waiting_on_hook_review,
                 refusal: "Codex is waiting on its hook-review dialog; see #626, or `flk integration install codex` to trust flk's hook",
+                keep_on_start: false,
             },
             // Codex keys trust on the repository root, so one acceptance in the
             // main checkout covers every later worktree of that repository.
@@ -581,6 +594,7 @@ const HARNESSES: [HarnessSpec; 3] = [
                 code: "codex_folder_trust",
                 shows: crate::detect::codex_waiting_on_folder_trust,
                 refusal: "Codex is waiting on its folder-trust dialog (see #828); trust the repository once in Codex, which covers its worktrees, or add a trusted [projects] entry for the repository root to ~/.codex/config.toml",
+                keep_on_start: false,
             },
         ],
     },
@@ -2833,6 +2847,9 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     let settled_record = match await_ready(name, &agent, harness, ready_deadline) {
         Ok(record) => record,
         Err(reason) => {
+            if let Some(dialog) = reason.startup_dialog.filter(|dialog| dialog.keep_on_start) {
+                return Ok(keep_startup_block(&entry, dialog, flags.json));
+            }
             if reason.deadline_reached {
                 // The verdict read the screen already: its tail is printed
                 // from that read rather than a second one, which a server
@@ -3001,6 +3018,32 @@ fn fail_started(
 ) -> i32 {
     undo_start(entry, cleanup, written, flags, reason, screen);
     1
+}
+
+/// Persist an unsubmitted human block without closing its pane or checkout.
+/// Registry durability failures leave the pane available and return failure.
+fn keep_startup_block(entry: &Entry, dialog: &StartupDialog, json: bool) -> i32 {
+    let saved = write_entry(entry).and_then(|()| {
+        let path = entry_path(&entry.name);
+        let dir = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        std::fs::File::open(dir)?.sync_all()
+    });
+    if let Err(err) = saved {
+        eprintln!(
+            "delegate {}: could not durably record the block; pane {} retained: {err}",
+            entry.name, entry.pane_id
+        );
+        return crate::cli::exit::FAILURE;
+    }
+    let info = serde_json::json!({"startup_dialog": dialog.code, "status_text": dialog.refusal});
+    emit_outcome(
+        entry,
+        Outcome::AgentBlocked.as_str(),
+        Some(&info),
+        json,
+        &entry.cursor,
+    );
+    exit::AGENT_BLOCKED
 }
 
 /// [`fail_started`], saying whether it rolled back cleanly, so nothing the
@@ -3580,6 +3623,7 @@ fn harness_for(entry: &Entry) -> &'static HarnessSpec {
 struct ReadyFailure {
     reason: String,
     deadline_reached: bool,
+    startup_dialog: Option<&'static StartupDialog>,
 }
 
 impl From<String> for ReadyFailure {
@@ -3587,6 +3631,7 @@ impl From<String> for ReadyFailure {
         Self {
             reason,
             deadline_reached: false,
+            startup_dialog: None,
         }
     }
 }
@@ -3596,6 +3641,7 @@ impl ReadyFailure {
         Self {
             reason,
             deadline_reached: true,
+            startup_dialog: None,
         }
     }
 }
@@ -3648,7 +3694,7 @@ fn await_ready(
                         if let Some(refusal) =
                             startup_dialog_refusal(name, harness, &pane_id, deadline)
                         {
-                            return Err(refusal.into());
+                            return Err(refusal);
                         }
                         // A dialog's prompt can arrive before its footer in a
                         // separate PTY read. Confirm readiness on the next poll
@@ -3666,7 +3712,7 @@ fn await_ready(
                     startup_dialog_asked = true;
                     if let Some(refusal) = startup_dialog_refusal(name, harness, &pane_id, deadline)
                     {
-                        return Err(refusal.into());
+                        return Err(refusal);
                     }
                 }
                 if expired(Some(deadline)) {
@@ -3716,12 +3762,13 @@ fn startup_dialog_refusal(
     harness: &HarnessSpec,
     pane_id: &str,
     deadline: Instant,
-) -> Option<String> {
+) -> Option<ReadyFailure> {
     let dialog = startup_dialog_shown(harness, pane_id, deadline)?;
-    Some(format!(
-        "delegate {name}: {}: {}",
-        dialog.code, dialog.refusal
-    ))
+    Some(ReadyFailure {
+        reason: format!("delegate {name}: {}: {}", dialog.code, dialog.refusal),
+        deadline_reached: false,
+        startup_dialog: Some(dialog),
+    })
 }
 
 /// The harness's startup dialog this pane is showing, from one bounded read.
@@ -3837,6 +3884,7 @@ fn delegate_wait_for_ready(
             ReadyFailure {
                 reason: format!("delegate {name}: readiness could not be watched: {err}"),
                 deadline_reached: timed_out,
+                startup_dialog: None,
             }
         })?;
     if let Err(err) = crate::api::client::parse_response_value(ack) {
@@ -5110,6 +5158,17 @@ impl Await<'_> {
                 for (key, value) in observation.as_object().into_iter().flatten() {
                     info[key] = value.clone();
                 }
+                if matches!(outcome, Outcome::AgentBlocked) {
+                    if let Some(dialog) = self
+                        .harness
+                        .startup_dialogs
+                        .iter()
+                        .find(|dialog| (dialog.shows)(&screen))
+                    {
+                        info["startup_dialog"] = serde_json::json!(dialog.code);
+                        info["status_text"] = serde_json::json!(dialog.refusal);
+                    }
+                }
                 info["settled_with_background_shells"] =
                     serde_json::json!(crate::detect::settled_with_background_shells(&screen));
                 emit_outcome(
@@ -5698,6 +5757,7 @@ fn emit_outcome(
                 "outcome": outcome,
                 "status": text("status"),
                 "status_text": text("status_text"),
+                "startup_dialog": text("startup_dialog"),
                 "text": text("text"),
                 "total_chars": text("total_chars"),
                 "next_offset": text("next_offset"),
@@ -5745,6 +5805,91 @@ fn emit_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permissions_trust_has_a_distinct_startup_dialog_name() {
+        let harness = validate_harness(Some("claude")).unwrap();
+        let shown = |screen: &str| {
+            harness
+                .startup_dialogs
+                .iter()
+                .find(|dialog| (dialog.shows)(screen))
+                .map(|dialog| dialog.code)
+        };
+        let screen =
+            include_str!("../../tests/fixtures/attention-1023/claude-trust-with-permissions.txt");
+        assert_eq!(shown(screen), Some("claude_folder_trust_with_permissions"));
+        assert_eq!(shown(TRUST_DIALOG_SCREEN), Some("claude_folder_trust"));
+        for absent in [
+            "Accessing workspace:",
+            "This folder pre-approves 17 tool permissions",
+            "Yes, I trust this folder",
+            "Enter to confirm",
+        ] {
+            assert_ne!(
+                shown(&screen.replace(absent, "")),
+                Some("claude_folder_trust_with_permissions")
+            );
+        }
+        let history = format!("{screen}\n{}\n❯ \n{}\n", "─".repeat(30), "─".repeat(30));
+        assert_eq!(shown(&history), None);
+    }
+
+    fn assert_permissions_variant(directory_question: bool, cancel: &str) {
+        let screen =
+            include_str!("../../tests/fixtures/attention-1023/claude-trust-gated-grants.txt")
+                .replace("No, continue without these permissions", cancel);
+        let screen = if directory_question {
+            screen
+                .replace("Accessing workspace:", "Now in a new directory:")
+                .replace(
+                    "Quick safety check: Is this a project you created or one you trust?",
+                    "This session hasn't worked here before. Is this a directory you created or one you trust?",
+                )
+                .replace("Yes, I trust this folder", "Yes, trust it and apply them")
+        } else {
+            screen
+        };
+        let harness = validate_harness(Some("claude")).unwrap();
+        let shown = |screen: &str| {
+            harness
+                .startup_dialogs
+                .iter()
+                .find(|dialog| (dialog.shows)(screen))
+        };
+        let dialog = shown(&screen).expect("the live dialog must have a name");
+        assert_eq!(dialog.code, "claude_folder_trust_with_permissions");
+        assert!(dialog.keep_on_start);
+        assert_eq!(
+            shown(&screen.replace("This folder pre-approves 3 tool permissions in", ""))
+                .unwrap()
+                .code,
+            "claude_folder_trust",
+            "the permission notice distinguishes this from plain trust",
+        );
+        let history = format!("{screen}\n{}\n❯ \n{}\n", "─".repeat(30), "─".repeat(30));
+        assert!(shown(&history).is_none(), "a later composer owns the pane");
+    }
+
+    #[test]
+    fn permission_trust_project_without_grants_is_named() {
+        assert_permissions_variant(false, "No, continue without these permissions");
+    }
+
+    #[test]
+    fn permission_trust_project_exit_is_named() {
+        assert_permissions_variant(false, "No, exit");
+    }
+
+    #[test]
+    fn permission_trust_directory_without_grants_is_named() {
+        assert_permissions_variant(true, "No, continue without these permissions");
+    }
+
+    #[test]
+    fn permission_trust_directory_exit_is_named() {
+        assert_permissions_variant(true, "No, exit");
+    }
 
     #[test]
     fn expired_report_uses_cached_screen_without_io_or_advice() {
