@@ -472,7 +472,17 @@ restart (`structured_recovery_required`, retry `after_human`, exit 1).
 Pane-only operations on structured records, including attach, readiness and
 settled waits, return `runtime_unsupported` (retry `never`, exit 2). Use the
 structured state for observation instead. PTY records keep their existing fields.
-Public structured launch remains gated pending the final #1843 routing slice.
+Start a pane-free session with `flk agent start NAME --runtime structured --model MODEL --cwd /absolute/checkout -- claude`.
+The CLI refuses an older server without the `structured_agents` capability
+(`server_version_gap`, retry `after_handoff`, exit 78). CLI starts are idle; the
+narrowed MCP spawn also delivers its framed opening prompt through stream stdin.
+The default `structured.run_as = "flk-agent"` refuses until the dedicated-user
+launcher (#1208) exists. Explicit `run_as = "operator"` is required today and
+retains the cooperative same-UID limit (#1177, #1629).
+If optional MCP provisioning failed at listener startup, structured starts return
+`structured_endpoint_restart_required` (retry `after_human`, exit 1): correct
+executable/socket resolution and restart or hand off the listener. Repeating the
+request alone does not recover it. Ordinary PTY routes remain available.
 
 ```bash
 flk agent list [--resumable]
@@ -487,7 +497,7 @@ flk agent rename <target> <name>|--clear
 flk agent focus <target>
 flk agent wait <target> --status <idle|working|blocked|done|unknown|hibernated|settled> [--after CURSOR] [--settle MS] [--timeout MS] | --ready [--timeout MS]
 flk agent attach <target> [--takeover]
-flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--questions ask_human|ask_operator|route|deny] [--unattended] [--dry-run] -- <argv...>
+flk agent start <name> [--runtime pty|structured] [--model MODEL] [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--questions ask_human|ask_operator|route|deny] [--unattended] [--dry-run] -- <argv...>
 flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--questions POLICY] [--unattended] [--dry-run]
 flk agent hibernate <target>|--all
 flk agent resume <target>|--all
@@ -899,7 +909,7 @@ The config is mode 0600 inside a fresh mode 0700 session directory. Rotation rep
 
 The available tools are the closed table below, subject to the same per-tool policy as socket calls. Messaging and `flock_delegate_list` with `architect: "self"` use the attested structured agent identity. Operator-only owner/policy writes have no MCP tool and refuse as `not_exposed_via_mcp`; direct socket attempts from the same leased ancestry still refuse with `operator_only` (exit 13). Tools requiring a pane, including pane-based restart, self-compaction and wait parking, do not acquire a pane from this registration and can refuse with `no_caller_pane` or their existing tool-specific refusal.
 
-This wires the internal runtime; public structured starts remain gated by #1439. It does not pre-allow tools or answer permission requests: stdio permissions and richer MCP question handling remain the S6 work in ADR-0036 (#1307). The default dedicated-user launch is still refused until #1208; explicit operator-mode sessions retain operator-uid filesystem access, and process detachment remains a limit until uid enforcement (#1629).
+Public structured starts use the same lease-bound MCP registration. It does not pre-allow tools or answer permission requests: stdio permissions and richer MCP question handling remain the S6 work in ADR-0036 (#1307). The default dedicated-user launch is still refused until #1208; explicit operator-mode sessions retain operator-uid filesystem access, and process detachment remains a limit until uid enforcement (#1629).
 
 ### Addressing across hosts
 
@@ -930,8 +940,9 @@ Exposed tools:
 
 | Tool | Wraps | Notes |
 | --- | --- | --- |
-| `flock_agent_list` | `agent.list` | `agents` = this server's panes (`blocked` ones need attention); `fleet` = every addressable agent INCLUDING other hosts, with `agent_id`, `host` and `local`. |
-| `flock_agent_get` | `agent.get` | Target is a pane id, terminal id, or unique agent name. |
+| `flock_agent_list` | `agent.list` | `structured_agents` contains pane-free typed records; `agents` = this server's panes (`blocked` ones need attention); `fleet` = every addressable agent INCLUDING other hosts, with `agent_id`, `host` and `local`. |
+| `flock_agent_get` | `agent.get` | Target is a pane id, terminal id, structured agent id, or unique name. Structured records use `StructuredAgentInfo` and have no placement. |
+| `flock_agent_stop` | `agent.stop` | `{target: string}` stops a structured session; operator or that agent itself only. PTY targets return `runtime_unsupported` (never retry, exit 2). |
 | `flock_agent_read` | `agent.read` | The pane's terminal output as drawn. Read-only: it changes no pane state and does not move the operator's attention ordering. |
 | `flock_agent_history` | `agent.history` | The agent's own conversation from its session transcript, not the pane's wrapped output. Safe to poll: it touches no pane state. `detail` picks `reply`/`collapsed`/`full`; hand back `next_cursor` to get only what has been written since. A turn with `after_compaction: true` is the first of a new epoch — everything older was superseded by a compaction, so it is history rather than context. Claude and opencode. |
 | `flock_agent_result` | `agent.result` | The reply an agent's newest turn ended on — how a delegated task went — with `status`/`status_text` from a final `DONE:`/`BLOCKED:`/`VERDICT:` line and `finished` saying whether that turn is over. Paged by `offset`/`max_chars`. Claude and opencode; read-only. |
@@ -964,7 +975,7 @@ The mutating MCP allowlist is explicit (#645): `flock_agent_fork` creates a link
 | Additional tool | Wraps | Notes |
 | --- | --- | --- |
 | `flock_pane_submit` | `pane.submit` | Guarded text submission with bounded acceptance confirmation. Submitting to your calling workspace requires `self: true`; otherwise `self_submit_unconfirmed`. |
-| `flock_agent_start` | `agent.spawn` | Closed harness kind and prompt, without arbitrary argv. |
+| `flock_agent_start` | `agent.spawn` | Closed harness kind and prompt, without arbitrary argv. Optional `runtime: "pty" | "structured"` (default `pty`) and `model: string` for structured Claude. |
 | `flock_agent_restart` | `agent.restart` | Restart your own agent after its turn using saved launch and session state. |
 
 ### Resources: files handed over to an agent
@@ -1093,5 +1104,56 @@ server URL from its own location; no config script is served.
 The code expires after 60 seconds; it is exchanged once for a bearer and is never
 placed in the query or diagnostic logs. Set `[client] bind = "127.0.0.1:7682"`
 explicitly. This is separate from the terminal bridge's `[web]` settings and
-requires the `web` feature. The structured listener integration is tracked by
-#1828; the exchange router alone does not start a listener.
+requires the `web` feature. The headless server mounts the GUI, browser-code
+exchange and WebSocket core on this opt-in listener. Port `0` selects an
+OS-assigned port; `client open` reports the live address after binding and keeps
+it across configuration reloads. Host/Origin must match that address. Startup
+accepts only the exact IPv4 loopback address `127.0.0.1`. Startup and handoff
+import refuse any serve or funnel configuration targeting the bound port,
+including tailnet-only serve, and an unavailable, unsuccessful or malformed
+bounded forwarding probe. Forwarding changes after startup are not monitored
+(#1972).
+The handshake-only transport currently advertises no command capabilities;
+subscription and command routing follow in the remaining structured-client slices.
+
+### Structured MCP launch boundaries
+
+`flock_agent_start` retains the narrowed `agent.spawn` contract: required `agent`,
+`prompt`, and `location`; optional `name`, `runtime`, `model`, and PTY `questions`.
+MCP structured spawn requires a fresh name/identity and accepts only `agent: "claude"` and a tracked `worktree_path` or
+`workspace_id`. No raw binary, argv, profile, lease credential or MCP endpoint is
+accepted as launch authority. Explicit question policies, focus and new-branch
+placement and `unattended: true` are refused for structured starts. The name
+`self` is reserved and cannot be used for a fresh structured identity. Stdio permission decisions and
+richer question routing remain ADR-0036 S6 work (#1307).
+
+The server attests the caller and enforces spawn opt-in, pause, depth, fanout and
+capacity through the same owner admission. An unrelated MCP process cannot use
+operator authority to spawn. An opening prompt is validated and nonce-framed
+before it reaches stream stdin; it never becomes harness argv. Unknown restored
+records remain fenced. Resuming an existing record through CLI/socket is
+operator-only, even when an agent targets itself (`operator_only`, exit 13).
+Resume keeps the original parent and depth. MCP spawn cannot resume records;
+mesh relays refuse structured start/spawn. Browser token scopes do not confer
+socket operator identity. The structured WebSocket command endpoint is not yet
+implemented (#1828/#1677). Scoped transport verifies the live lease on each request
+and at effect admission, including queued requests. The lease credential exists
+only in the generated private MCP config and captured MCP client context; it
+never reaches Claude's launch environment. CLI and MCP negotiate
+`structured_agents` before sending a selector to an older server.
+
+Structured start/read/stop does not provide pane keys, attach, transcript
+history, pane readiness or settled waiting. The existing tool-specific
+`runtime_unsupported` refusal means correct the operation, not retry it.
+See the repository's `tests/probes/structured-public.md` for the isolated fake
+harness dogfood. Mesh protocol VERSION remains 5.
+
+A successful structured turn returns the canonical `state.turn: idle` with
+session authority. It does not invent `background: none`: until background
+facts are known, presentation status need not be `done`. Observe turn and
+lifecycle facts separately.
+
+Launch settings and fleet limits currently take effect at server startup.
+Restart after editing `[structured]` or `[fleet]`; live reload does not apply
+those sections yet (#2043). The analogous `[sessions]` reload limitation is
+tracked by #1975. The isolated dogfood uses a fresh server for each policy.

@@ -156,7 +156,7 @@ impl SpawnPrompt {
         })
     }
 
-    /// The composed turn, as the single positional argv element it becomes.
+    /// The composed, nonce-framed turn for one argv element or structured stdin.
     pub fn as_argv_element(&self) -> &str {
         &self.composed
     }

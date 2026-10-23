@@ -3501,6 +3501,8 @@ fn refused_questions(
     }
     let preview = bounded(
         Method::AgentStart(AgentStartParams {
+            runtime: Default::default(),
+            model: None,
             dry_run: true,
             name: name.to_string(),
             cwd: None,
@@ -3556,6 +3558,8 @@ fn start_the_agent(
     let argv = (harness.argv)(options);
     let response = request(
         Method::AgentStart(AgentStartParams {
+            runtime: Default::default(),
+            model: None,
             dry_run: false,
             name: name.to_string(),
             cwd: Some(placement.cwd.clone()),

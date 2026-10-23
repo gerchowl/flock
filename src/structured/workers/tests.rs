@@ -67,6 +67,7 @@ impl Case {
             .unwrap();
         let leases = SessionLeases::default();
         let launch = Launch {
+            opening_turn: None,
             agent_id: id.clone(),
             generation,
             leases: leases.clone(),
@@ -181,6 +182,7 @@ impl Case {
                 finished: false,
                 events_closed: false,
                 stall_after: STALL,
+                lineage: None,
                 thread: Some(std::thread::spawn(|| {})),
             },
         );
@@ -190,6 +192,11 @@ impl Case {
         })
         .await;
         case
+    }
+    pub(crate) fn forget_report(&self, workers: &mut Workers) {
+        let worker = workers.entries.get_mut(&self.id).unwrap();
+        assert!(worker.finished && worker.thread.is_none());
+        worker.report = None;
     }
     pub fn submit(&self, workers: &Workers) {
         workers.runtime(&self.id, self.generation).unwrap().try_submit(&json!({"type":"user","message":{"role":"user","content":"fixture turn"},"parent_tool_use_id":null,"session_id":""})).unwrap();
@@ -625,7 +632,11 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
     let (mut registry, mut workers, notify, now) = owner();
     let (a, launch, _) = Case::prepare(&mut registry, 10, "state-reducer", vec![]);
     let (tx, messages) = mpsc::sync_channel(2);
-    drop(tx);
+    let producer = std::thread::spawn(move || drop(tx));
+    producer.join().unwrap();
+    workers
+        .pending
+        .insert(a.id.clone(), Some("fixture-parent".into()));
     workers.entries.insert(
         a.id.clone(),
         Worker {
@@ -637,6 +648,7 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
             finished: false,
             events_closed: false,
             stall_after: STALL,
+            lineage: None,
             thread: Some(std::thread::spawn(|| {})),
         },
     );
@@ -645,6 +657,11 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
         workers.report(&a.id, a.generation).is_some()
     })
     .await;
+    assert!(
+        !workers.pending.contains_key(&a.id),
+        "disconnected launch must free its pending slot"
+    );
+    assert_eq!(workers.counts(&a.leases, "fixture-parent"), Ok((0, 0)));
     assert!(workers.entries[&a.id].thread.is_none());
     let report = workers.report(&a.id, a.generation).unwrap();
     assert!(report.authority_retained);
@@ -880,9 +897,7 @@ async fn registry_worker_launch_uses_configured_blob_threshold() {
         "worker-exit-ok",
         vec![message, event("result")],
     );
-    launch.storage = super::super::blobs::StorageConfig {
-        blob_min_bytes: config.sessions.blob_min_bytes,
-    };
+    launch.storage = config.sessions.storage();
     case.generation = workers.start(&mut registry, launch, factory).unwrap();
     case.ready(&mut registry, &mut workers, &notify, now).await;
     case.submit(&workers);
@@ -1203,4 +1218,74 @@ async fn owner_lease_acquisition_retires_pending_without_double_counting() {
     );
     assert_eq!(count_before, Ok((1, 1)));
     assert_eq!(count_after, Ok((1, 1)));
+}
+
+/// A new lease generation must preserve ancestry even when the operator resumes.
+#[tokio::test]
+async fn operator_resume_preserves_original_lease_lineage() {
+    let (mut registry, mut workers, notify, now) = owner();
+    let (case, mut launch, _) = Case::prepare(&mut registry, 1734, "state-reducer", vec![]);
+    launch.lineage = Some(("original-parent".into(), 2));
+    let template = Launch {
+        opening_turn: None,
+        agent_id: case.id.clone(),
+        generation: case.generation,
+        leases: case.leases.clone(),
+        state: case.fixture.root.path().to_owned(),
+        mcp: case.fixture.mcp(),
+        storage: Default::default(),
+        stall_after: STALL,
+        lineage: None,
+        admission: None,
+    };
+    let generation = workers
+        .start(&mut registry, launch, |_| {
+            Err(io::Error::other("owned first-launch failure").into())
+        })
+        .unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, now, 1000);
+        workers.report(&case.id, generation).is_some()
+            && workers
+                .entries
+                .get(&case.id)
+                .unwrap()
+                .thread
+                .as_ref()
+                .is_none_or(JoinHandle::is_finished)
+    })
+    .await;
+    let mut resume = template;
+    resume.generation = generation;
+    resume.lineage = None;
+    let leases = case.leases.clone();
+    let (seen, observed) = mpsc::channel();
+    let generation = workers
+        .start(&mut registry, resume, move |_| {
+            seen.send(leases.admitted_identities().unwrap()).unwrap();
+            Err(io::Error::other("owned resumed-launch failure").into())
+        })
+        .unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, now, 1000);
+        workers.report(&case.id, generation).is_some()
+    })
+    .await;
+    let identities = observed.recv_timeout(LIMIT).unwrap();
+    assert_eq!(
+        identities.get(&case.id),
+        Some(&Some("original-parent".into()))
+    );
+}
+
+#[tokio::test]
+async fn finished_without_report_allows_retained_recovery() {
+    let wake = Arc::new(Notify::new());
+    let mut registry = Registry::default();
+    let mut workers = Workers::new(wake.clone());
+    let case = Case::uncertain(&mut registry, &mut workers, 432, &wake).await;
+    let worker = workers.entries.get_mut(&case.id).unwrap();
+    assert!(worker.finished && worker.thread.is_none());
+    worker.report = None;
+    assert!(workers.history_recovery_allowed(&case.id));
 }

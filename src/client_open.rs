@@ -7,6 +7,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Live browser-code storage bound, independent of failed exchanges.
+const MAX_LIVE_CODES: usize = 128;
+/// Code lifetime, measured only on the monotonic clock.
+const CODE_LIFETIME: Duration = Duration::from_secs(60);
 /// Reject ambiguous, wildcard, remote, or ephemeral dogfood endpoints.
 pub(crate) fn endpoint(bind: Option<SocketAddr>) -> Option<String> {
     bind.filter(|a| a.ip() == Ipv4Addr::LOCALHOST && a.port() != 0)
@@ -18,19 +22,28 @@ pub(crate) struct Codes(Arc<Mutex<Registry>>);
 #[derive(Default)]
 struct Registry {
     pending: HashMap<[u8; 32], (Instant, Bearer)>,
+    endpoint: Option<SocketAddr>,
 }
 impl Codes {
+    /// Current live endpoint is independent of configuration reloads.
+    pub(crate) fn bound_endpoint(&self) -> Option<SocketAddr> {
+        self.0.lock().ok()?.endpoint
+    }
+    /// Publish the actual OS bind before operator requests can mint browser URLs.
+    #[cfg(feature = "web")]
+    pub(crate) fn set_endpoint(&self, bind: SocketAddr) -> Result<(), TokenError> {
+        self.0.lock().map_err(|_| TokenError::Busy)?.endpoint = Some(bind);
+        Ok(())
+    }
     /// Retain at most 128 live handoffs, with a hard 60-second lifetime.
     pub(crate) fn mint(&self, code: String, token: Bearer, now: Instant) -> Result<(), TokenError> {
         let code: [u8; 32] = Sha256::digest(code.as_bytes()).into();
         let mut state = self.0.lock().map_err(|_| TokenError::Busy)?;
         state.pending.retain(|_, (expiry, _)| now < *expiry);
-        if state.pending.len() >= 128 || state.pending.contains_key(&code) {
+        if state.pending.len() >= MAX_LIVE_CODES || state.pending.contains_key(&code) {
             return Err(TokenError::Busy);
         }
-        state
-            .pending
-            .insert(code, (now + Duration::from_secs(60), token));
+        state.pending.insert(code, (now + CODE_LIFETIME, token));
         Ok(())
     }
     // Slice 2 (#1828) mounts the exchange only in web-enabled builds.
