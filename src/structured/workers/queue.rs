@@ -128,6 +128,32 @@ impl Service {
             },
         ))
     }
+    /// Commit the authenticated first message on the launch worker, before Ready.
+    /// Returning its lifecycle UUID acknowledges the same owner commit as enqueue.
+    pub fn admit_opening(
+        &mut self,
+        starter: String,
+        prompt: crate::spawn::prompt::SpawnPrompt,
+    ) -> Result<String, Failure> {
+        use crate::structured::queue::model::{Delivery, Kind, Priority, Producer, State};
+        let item_id = crate::structured::queue::admission::lifecycle_id()?;
+        let producer = Producer::Agent(starter);
+        let item = Item {
+            item_id: item_id.clone(),
+            producer: producer.clone(),
+            kind: Kind::Message,
+            state: State::Queued,
+            delivery: Delivery::AtIdle,
+            priority: Priority::Normal,
+            body: prompt.as_argv_element().to_owned(),
+            attachments: vec![],
+            metadata: Default::default(),
+        };
+        self.policy()?;
+        self.scheduler
+            .enqueue(item, Principal::Origin(producer), Gate::Send)?;
+        Ok(item_id)
+    }
     pub fn flush(&mut self, cancelled: bool, notify: &impl Fn()) -> bool {
         if let Some(update) = self.pending.take() {
             match self.updates.try_send(update) {
@@ -141,7 +167,8 @@ impl Service {
         }
         true
     }
-    pub fn tick(&mut self, input: &InputHandle, stopped: bool, notify: &impl Fn()) {
+    /// Whether this operation failed at the stdin boundary.
+    pub fn tick(&mut self, input: &InputHandle, stopped: bool, notify: &impl Fn()) -> bool {
         let mut changed = self.initial;
         if let Ok(state) = self.states.try_recv() {
             if state.through >= self.required {
@@ -165,10 +192,13 @@ impl Service {
             (id, result)
         });
         if changed {
-            self.publish(input, stopped, admitted, None);
+            self.publish(input, stopped, admitted, None)
+        } else {
+            false
         }
     }
-    pub fn event(&mut self, input: &InputHandle, received: &Received, stopped: bool) {
+    /// Whether this operation failed at the stdin boundary.
+    pub fn event(&mut self, input: &InputHandle, received: &Received, stopped: bool) -> bool {
         // The pump sees this result before the registry reduces it. Only a
         // snapshot covering this sequence may re-establish the stdin gate.
         if crate::structured::queue::scheduler::ends_turn(&received.event) {
@@ -178,7 +208,7 @@ impl Service {
         let result = self
             .policy()
             .and_then(|_| self.scheduler.observe(&received.event));
-        self.publish(input, stopped, None, result.err());
+        self.publish(input, stopped, None, result.err())
     }
     fn policy(&mut self) -> Result<(), Failure> {
         if let Some(code) = self.blocked {
@@ -196,7 +226,7 @@ impl Service {
         stopped: bool,
         admitted: Option<(String, Result<(), Failure>)>,
         error: Option<Failure>,
-    ) {
+    ) -> bool {
         let mut offer = if let Some(error) = error {
             Err(error)
         } else if stopped || self.scheduler.journal().items().is_empty() {
@@ -250,6 +280,7 @@ impl Service {
                 cut,
             });
         }
+        error == Some(ErrorCode::InputWriteFailed)
     }
     pub fn finish(&mut self, input: &InputHandle, notify: &impl Fn()) -> bool {
         let error = self.policy().and_then(|_| self.scheduler.exited()).err();

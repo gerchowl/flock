@@ -409,6 +409,10 @@ fn nonce(
         }
     }
 }
+/// Mint a queue lifecycle UUID using the same entropy source as batch identities.
+pub(crate) fn lifecycle_id() -> Result<String, Failure> {
+    batch_uuid(&mut getrandom::fill)
+}
 fn batch_uuid(fill: Entropy<'_>) -> Result<String, Failure> {
     let mut h = nonce("", fill)?.into_bytes();
     h[12] = b'4';

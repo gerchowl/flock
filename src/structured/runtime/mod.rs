@@ -207,6 +207,7 @@ pub(crate) fn run_notified(
         Control {
             stop: StopRequest::default(),
             queue_rewrite_bytes: None,
+            opening_turn: None,
         },
     )
 }
@@ -217,6 +218,8 @@ pub(crate) struct Control {
     pub stop: StopRequest,
     /// None for transport-only assembly; workers always supply configured policy.
     pub queue_rewrite_bytes: Option<std::num::NonZeroU64>,
+    /// Attested starter and framed first message, committed before runtime publication.
+    pub opening_turn: Option<(String, crate::spawn::prompt::SpawnPrompt)>,
 }
 
 /// Worker-owned cancellation exists before spawn, including deadline escalation.
@@ -234,6 +237,7 @@ pub(crate) fn run_controlled(
     let Control {
         stop,
         queue_rewrite_bytes,
+        opening_turn,
     } = policy;
     if !lease.matches(&location.agent, &location.session)
         || profile.session_id() != location.session
@@ -243,10 +247,21 @@ pub(crate) fn run_controlled(
     profile.register_flock_mcp(Some(&lease), &mcp)?;
     let (queue, queue_client) = match queue_rewrite_bytes {
         Some(bytes) => {
-            let (owner, client) =
+            let (mut owner, client) =
                 super::workers::queue::Service::open(state, &location.agent, bytes)
                     .map_err(super::workers::queue::launch_error)?;
+            if let Some((starter, prompt)) = opening_turn {
+                owner.admit_opening(starter, prompt).map_err(|error| {
+                    LaunchError::QueueAdmission {
+                        code: error.code,
+                        source: error.source,
+                    }
+                })?;
+            }
             (Some(owner), Some(client))
+        }
+        None if opening_turn.is_some() => {
+            return Err(io::Error::other("opening turn requires queue owner").into())
         }
         None => (None, None),
     };
@@ -563,7 +578,9 @@ fn collect(
             if !queue.flush(control.cancelled(), notify) {
                 return false;
             }
-            queue.tick(&input, stop.requested(), notify);
+            if queue.tick(&input, stop.requested(), notify) && control.cancelled() {
+                stop.request();
+            }
             queue.flush(control.cancelled(), notify)
         });
         if pending.is_none() && queue_ready {
@@ -600,7 +617,9 @@ fn collect(
                         facts.delivery_cancelled = true;
                     }
                     if let Some(queue) = &mut queue {
-                        queue.event(&input, &received, stop.requested());
+                        if queue.event(&input, &received, stop.requested()) && control.cancelled() {
+                            stop.request();
+                        }
                     }
                     if !control.cancelled() {
                         pending = Some(received);

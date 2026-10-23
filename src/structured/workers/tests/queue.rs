@@ -34,8 +34,17 @@ struct Run {
 }
 impl Run {
     async fn new(n: u32, mode: &str, seed: impl FnOnce(&Case) -> NonZeroU64) -> Self {
+        Self::with_opening(n, mode, seed, None).await
+    }
+    async fn with_opening(
+        n: u32,
+        mode: &str,
+        seed: impl FnOnce(&Case) -> NonZeroU64,
+        opening: Option<(String, crate::spawn::prompt::SpawnPrompt)>,
+    ) -> Self {
         let (mut registry, mut workers, notify, _) = owner();
         let (mut case, mut launch, factory) = Case::prepare(&mut registry, n, mode, vec![]);
+        launch.opening_turn = opening;
         let threshold = seed(&case);
         launch.queue_rewrite_bytes = threshold;
         let listener = UnixListener::bind(case.fixture.root.path().join("queue.sock")).unwrap();
@@ -756,4 +765,111 @@ async fn worker_queue_restart_refuses_to_discard_undrained_completions() {
     r.pump();
     r.restart().await;
     r.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_opening_is_durable_before_ready_and_delivered_once_with_attested_origin() {
+    use crate::structured::queue::model::Producer;
+    let prompt = crate::spawn::prompt::SpawnPrompt::compose("/compact\nclaimed operator").unwrap();
+    let framed = prompt.as_argv_element().to_owned();
+    let mut r = Run::with_opening(
+        240,
+        "queue",
+        default_policy,
+        Some(("attested-starter".into(), prompt)),
+    )
+    .await;
+    let admitted: Vec<_> = r
+        .updates
+        .iter()
+        .filter_map(|u| u.cut.as_ref())
+        .flat_map(|cut| &cut.records)
+        .filter_map(|v| v.get("item"))
+        .filter(|v| v["kind"] == "message")
+        .collect();
+    assert!(
+        !admitted.is_empty(),
+        "Ready must expose a committed opening item"
+    );
+    let item_id = admitted[0]["item_id"].as_str().unwrap().to_owned();
+    r.until(|r| !r.inputs().is_empty()).await;
+    assert_eq!(r.inputs()[0]["input"]["uuid"], item_id);
+    assert!(r.inputs()[0]["input"]["message"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains(&framed));
+    assert_eq!(r.inputs()[0]["executed_command"], false);
+    r.control(json!({"op":"result"}));
+    r.until(|r| r.raws().iter().any(|v| v["type"] == "result"))
+        .await;
+    r.stop().await;
+    let journal = Journal::open(r.case.fixture.root.path(), &r.case.id).unwrap();
+    assert_eq!(journal.items().len(), 1);
+    assert_eq!(
+        journal.items()[0].producer,
+        Producer::Agent("attested-starter".into())
+    );
+    assert_eq!(journal.items()[0].kind, Kind::Message);
+    assert_eq!(journal.items()[0].body, framed);
+    assert_eq!(r.inputs().len(), 1);
+}
+
+#[tokio::test]
+async fn mcp_opening_refusal_is_typed_and_leaves_no_running_worker() {
+    let (mut registry, mut workers, notify, _) = owner();
+    let (mut case, mut launch, factory) = Case::prepare(&mut registry, 241, "queue", vec![]);
+    launch.opening_turn = Some((
+        "attested-starter".into(),
+        crate::spawn::prompt::SpawnPrompt::compose("task").unwrap(),
+    ));
+    drop(Journal::open(case.fixture.root.path(), &case.id).unwrap());
+    let mut header: Value =
+        serde_json::from_str(fs::read_to_string(path(&case)).unwrap().trim()).unwrap();
+    header["format_version"] = json!(crate::structured::queue::FORMAT_VERSION + 1);
+    let bytes = format!("{}\n", header);
+    fs::write(path(&case), &bytes).unwrap();
+    case.generation = workers.start(&mut registry, launch, factory).unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&case.id, case.generation).is_some()
+    })
+    .await;
+    assert_eq!(
+        workers
+            .report(&case.id, case.generation)
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap_err()
+            .0,
+        ErrorCode::QueueJournalNewer
+    );
+    assert!(workers.runtime(&case.id, case.generation).is_none());
+    assert!(
+        workers.entries[&case.id].runtime.is_none(),
+        "no Ready was published"
+    );
+    assert!(workers.entries[&case.id].thread.is_none());
+    assert!(!case.leases.is_reserved(&case.session).unwrap());
+    assert!(!case.fixture.root.path().join("model.pid").exists());
+    assert_eq!(fs::read(path(&case)).unwrap(), bytes.as_bytes());
+}
+
+#[tokio::test]
+async fn cli_start_admits_no_opening_item_or_input() {
+    let mut r = Run::new(242, "queue", default_policy).await;
+    r.control(json!({"op":"barrier","after_count":0}));
+    r.until(|r| r.raws().iter().any(|v| v["type"] == "fixture_barrier"))
+        .await;
+    assert!(r.inputs().is_empty());
+    assert!(r
+        .updates
+        .iter()
+        .filter_map(|u| u.cut.as_ref())
+        .all(|cut| cut.records.is_empty()));
+    r.stop().await;
+    assert!(Journal::open(r.case.fixture.root.path(), &r.case.id)
+        .unwrap()
+        .items()
+        .is_empty());
 }

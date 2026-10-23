@@ -36,8 +36,8 @@ pub(crate) use admission::Admission;
 
 /// Internal launch policy, supplied by authenticated admission in #1843.
 pub struct Launch {
-    /// Validated, nonce-framed MCP opening turn; CLI starts remain idle.
-    pub opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
+    /// Attested starter and validated, nonce-framed MCP opening turn; CLI starts stay idle.
+    pub opening_turn: Option<(String, crate::spawn::prompt::SpawnPrompt)>,
     /// Stable registered identity.
     pub agent_id: String,
     /// Current registry epoch; replaced atomically by a fresh launch epoch.
@@ -285,8 +285,7 @@ impl Workers {
                     };
                     let event_notify = notify.clone();
                     let event_wake = wake.clone();
-                    let mut input_failed = false;
-                    let result = runtime::run_controlled(
+                    runtime::run_controlled(
                         &state,
                         (profile, mcp),
                         lease,
@@ -294,14 +293,6 @@ impl Workers {
                         |runtime| {
                             if cancelled.requested() {
                                 runtime.stop();
-                            } else if let Some(prompt) = &opening_turn {
-                                let user = serde_json::json!({"type":"user", "message":{
-                                    "role":"user", "content":prompt.as_argv_element()},
-                                    "parent_tool_use_id":null,"session_id":""});
-                                if runtime.try_submit(&user).is_err() {
-                                    input_failed = true;
-                                    runtime.stop();
-                                }
                             }
                             let _ = tx.try_send(Message::Ready(runtime));
                             notify.notify_one();
@@ -314,14 +305,10 @@ impl Workers {
                         runtime::Control {
                             stop: cancelled.clone(),
                             queue_rewrite_bytes: Some(queue_rewrite_bytes),
+                            opening_turn,
                         },
                     )
-                    .map_err(|error| (error.code(), error.to_string()));
-                    if input_failed {
-                        Err((ErrorCode::AgentStartFailed, "opening turn refused".into()))
-                    } else {
-                        result
-                    }
+                    .map_err(|error| (error.code(), error.to_string()))
                 }))
                 .unwrap_or_else(|_| {
                     Err((
