@@ -4,14 +4,18 @@
  */
 import { describe, expect, test } from "bun:test";
 
+import type { AgentState } from "../src/gen/AgentState";
+import type { Phase } from "../src/gen/Phase";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import type { AgentRow } from "../src/fleet";
+import { fixtureExamples } from "../src/gen/FixtureExamples";
 import { createWireFleet } from "../src/wire/fleet";
 import { Harness, live, sentFrames, step } from "./wire/harness";
 
 type Seen = { readonly rows: readonly string[] } | { readonly failed: string };
 
-const row = (id: string, extra: object = {}): object => ({ id, label: id.toUpperCase(), state: "working", waiting_on_human: [], ...extra });
+const agentState = (phase: Phase): AgentState => ({ turn: "idle", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase, source: {} });
+const row = (id: string, extra: object = {}): object => ({ id, label: id.toUpperCase(), state: agentState("working"), waiting_on_human: [], ...extra });
 const upsert = (seq: number, value: object): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { type: "fleet.upsert", row: value } as never });
 const remove = (seq: number, id: string): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { type: "fleet.remove", id } });
 
@@ -45,10 +49,36 @@ describe("wire fleet", () => {
       { id: "atlas", label: "ATLAS", state: "working", activity: "editing", waitingOnHuman: ["r1"] },
       { id: "kite", label: "KITE", state: "working", activity: "", waitingOnHuman: [] },
     ]);
-    send(h, upsert(3, row("kite", { state: "needs_human" })));
+    send(h, upsert(3, row("kite", { state: agentState("needs_human") })));
     send(h, remove(4, "atlas"));
     expect(seen).toEqual([{ rows: ["atlas", "kite"] }, { rows: ["atlas", "kite"] }, { rows: ["kite"] }]);
     expect(last()[0]?.state).toBe("needs_human");
+  });
+
+  test("the real fleet-lite frames, with their AgentState object, become rows", () => {
+    const { h, seen, last } = subscribed();
+    const frames = fixtureExamples["fleet-lite"].flatMap((line) => (line.step === "send" && line.frame?.t === "ev" && line.frame.sub_id === "s1" ? [line.frame] : []));
+    expect(frames.map((frame) => (frame.ev as { type: string }).type)).toEqual(["fleet.upsert", "fleet.upsert", "fleet.upsert", "fleet.remove"]);
+    send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 2 });
+    send(h, frames[0] as ServerFrame);
+    send(h, frames[1] as ServerFrame);
+    send(h, { t: "synced", sub_id: "s1", seq: 2 });
+    expect(last()).toEqual([
+      { id: "fixture-agent", label: "Example", state: "working", activity: "Reading a file", waitingOnHuman: [] },
+      { id: "second-fixture-agent", label: "Second", state: "needs_human", activity: "", waitingOnHuman: ["request-one"] },
+    ]);
+    send(h, frames[2] as ServerFrame);
+    expect(last()[0]?.activity).toBe("Writing a file");
+    send(h, frames[3] as ServerFrame);
+    expect(last().map((r) => r.id)).toEqual(["fixture-agent"]);
+    expect(seen.every((entry) => "rows" in entry)).toBe(true);
+  });
+
+  test("a flat-string state, the old hand-written shape, is not a fleet delta", () => {
+    const { h, seen } = subscribed();
+    send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+    send(h, upsert(1, row("atlas", { state: "working" })));
+    expect(seen).toEqual([{ failed: expect.stringContaining("not a fleet delta") }]);
   });
 
   test("a later snapshot replaces every row, so a missing agent is gone", () => {
@@ -69,7 +99,7 @@ describe("wire fleet", () => {
   });
 
   test("a payload that is not a fleet delta ends the list visibly", () => {
-    for (const bad of [{ type: "fleet.upsert", row: row("a", { state: "dancing" }) }, { type: "fleet.upsert", row: { id: "a" } }, { type: "fleet.rename", id: "a" }, "atlas"]) {
+    for (const bad of [{ type: "fleet.upsert", row: row("a", { state: agentState("dancing" as Phase) }) }, { type: "fleet.upsert", row: row("a", { state: "working" }) }, { type: "fleet.upsert", row: { id: "a" } }, { type: "fleet.rename", id: "a" }, "atlas"]) {
       const { h, seen } = subscribed();
       send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 0 });
       send(h, { t: "ev", sub_id: "s1", stream: "fleet", seq: 1, ts_ms: 0, ev: bad as never });

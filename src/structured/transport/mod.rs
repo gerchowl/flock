@@ -36,7 +36,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Accept complete lines up to 2 MiB; larger lines produce explicit summaries.
 pub const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
-const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
+/// Recovery limit for one encoded record, including its terminating newline.
+pub(super) const RECORD_LIMIT: u64 = 16 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(2);
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +58,7 @@ struct UserInput {
 enum Input {
     User(UserInput),
     Decision(Control),
+    Refusal(Vec<u8>),
 }
 enum Command {
     Decide(Control),
@@ -69,14 +71,36 @@ struct ControlPlane {
     input: mpsc::SyncSender<Input>,
 }
 
+/// Typed refusal: lossy stdout has not established whether the turn ended.
+/// Only a real result or a new runtime permits further stdin; inspecting this
+/// error or the status flag never clears the S3a guard.
+#[derive(Debug)]
+pub struct TurnEndUnknown;
+impl std::fmt::Display for TurnEndUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("structured_turn_end_unknown")
+    }
+}
+impl std::error::Error for TurnEndUnknown {}
+
 /// Durable stream location. Components are validated before any worker starts.
 pub struct StreamLocation {
     /// Existing flock data root (not the harness profile).
     pub data_dir: PathBuf,
+    /// Caller-supplied persistence policy captured for this session.
+    pub storage: super::blobs::StorageConfig,
     /// Agent identifier, containing only ASCII letters, digits, '-' or '_'.
     pub agent: String,
     /// Session identifier with the same restrictions; `queue` is reserved (any case).
     pub session: String,
+}
+
+/// Shared safe namespace components for live and retained session files.
+pub(super) fn valid_component(component: &str) -> bool {
+    !component.is_empty()
+        && component
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
 }
 
 /// Trusted source of the record, assigned by the transport, never by stdout JSON.
@@ -90,10 +114,16 @@ pub enum RecordOrigin {
 }
 
 /// Lossless normal-line envelope; oversize/invalid UTF-8 lines use named summaries.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamRecord {
     /// Dense per-session cursor, continued when an existing stream is reopened.
     pub seq: u64,
+    /// Original receive-time classification; absent on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known: Option<bool>,
+    /// Original sender shape for unknown records, including observed version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<super::claude::ShapeKey>,
     /// Receive time in milliseconds since the Unix epoch.
     pub received_at_ms: u128,
     /// Trusted origin, distinct from any similarly named field inside `raw`.
@@ -104,14 +134,20 @@ pub struct StreamRecord {
     /// Retained on disk so replay cannot manufacture a transient human prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_grant_request_id: Option<String>,
+    /// Book-issued permission handle for this stdout request, never copied from
+    /// harness JSON. Older records lack a handle and cannot authorize decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_request_seq: Option<u64>,
     /// Exact line without its LF; synthetic summaries explicitly identify loss.
     pub raw: String,
 }
 
-/// A persisted record paired with S1's infallible adapter interpretation.
+/// A live event paired with its envelope and explicit persistence status.
 #[derive(Debug)]
 pub struct Received {
-    /// Durable envelope; written before this notification is offered.
+    /// False for live-only partial deltas; their seq must not advance a cursor.
+    pub persisted: bool,
+    /// Durable envelope, or a live-only delta with the preceding durable seq.
     pub record: StreamRecord,
     /// Interpretation using the observed harness version.
     pub event: SessionEvent,
@@ -136,22 +172,27 @@ impl Received {
         {
             return Some(super::state::Input::Progress);
         }
+        if let Some(request_seq) = self.record.permission_request_seq {
+            if matches!(self.event, SessionEvent::CanUseTool(_)) {
+                return Some(super::state::Input::PermissionEvent(
+                    &self.event,
+                    request_seq,
+                ));
+            }
+        }
         if self.record.origin == RecordOrigin::Flk {
+            if let SessionEvent::PermissionRequest(record) = &self.event {
+                return match record.state {
+                    crate::structured_wire::PermissionState::Closed { .. } => {
+                        Some(super::state::Input::ControlAnswered(&record.request_id))
+                    }
+                    _ => None,
+                };
+            }
             if let SessionEvent::Unknown { value, .. } = &self.event {
                 if value.get("type").and_then(Value::as_str) == Some("flk_input_accepted") {
                     // Monotonic stamps belong to this launch, never to replay.
                     return None;
-                }
-                if value.get("type").and_then(Value::as_str) == Some("flk_permission_request") {
-                    return match (
-                        value.get("state").and_then(Value::as_str),
-                        value.get("request_id").and_then(Value::as_str),
-                    ) {
-                        (Some("closed"), Some(id)) => {
-                            Some(super::state::Input::ControlAnswered(id))
-                        }
-                        _ => None,
-                    };
                 }
             }
         }
@@ -175,6 +216,8 @@ pub enum Completion {
 /// result confirms the boundary. The supervisor owns socket refusal and cleanup.
 pub struct Transport {
     input: InputHandle,
+    /// Stored publication handle, shared only with the runtime owner.
+    pub(super) history: super::history::History,
     output: mpsc::Receiver<Received>,
     completion: mpsc::Receiver<Completion>,
 }
@@ -237,11 +280,7 @@ impl Transport {
         before_first_write: impl FnOnce() -> io::Result<()> + Send + 'static,
     ) -> io::Result<Self> {
         for component in [&location.agent, &location.session] {
-            if component.is_empty()
-                || !component
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-            {
+            if !valid_component(component) {
                 return Err(io::Error::other("invalid structured stream component"));
             }
         }
@@ -256,12 +295,13 @@ impl Transport {
         }
         private_fs::set_nonblocking(&stdout)?;
         private_fs::set_nonblocking(&stdin)?;
-        let (input, input_rx) = mpsc::sync_channel(permissions::MAX_OPEN + 1);
+        let (input, input_rx) = mpsc::sync_channel(permissions::MAX_OPEN_PERMISSION_REQUESTS + 1);
         let (decisions, decision_rx) = mpsc::sync_channel(4);
         let permissions = Arc::new(parking_lot::Mutex::new(Book::new(location.agent.clone())));
         // The busy gate permits one admission until stdout retires its turn.
         // The stdout owner drains these facts before handling each response.
-        let (accepted_tx, accepted) = mpsc::sync_channel(permissions::MAX_OPEN + 1);
+        let (accepted_tx, accepted) =
+            mpsc::sync_channel(permissions::MAX_OPEN_PERMISSION_REQUESTS + 1);
         let plane = ControlPlane {
             accepted,
             book: permissions.clone(),
@@ -280,10 +320,17 @@ impl Transport {
             cancel.clone(),
             done.clone(),
         );
+        let history = super::history::History::default();
+        history.bind(&location.agent, &location.session);
+        let source = history.clone();
         thread::Builder::new()
             .name("session-stdout".into())
             .spawn(move || {
-                let result = pump(stdout, location, &version, output_tx, &b, &u, &c, &plane);
+                let _producer = source.producer();
+                let result = pump(
+                    stdout, location, &version, output_tx, &b, &u, &c, &plane, &source,
+                );
+                source.finish(result.is_err());
                 plane.book.lock().end();
                 if result.is_err() {
                     c.store(true, Ordering::Release);
@@ -313,6 +360,7 @@ impl Transport {
             return Err(err);
         }
         Ok(Self {
+            history,
             input: InputHandle {
                 input: Some(input),
                 accepted: accepted_tx,
@@ -372,8 +420,9 @@ impl Transport {
         self.input.close_permissions(principal, id, reason)
     }
 
-    /// Open permission ids; contention fails closed rather than claiming no wait.
-    pub fn waiting_on_human(&self) -> Result<Vec<String>, ErrorCode> {
+    /// Open `(request_id, request_seq)` handles; contention fails closed rather
+    /// than claiming no wait. Carry the surfaced pair unchanged into a decide.
+    pub fn waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
         self.input.waiting_on_human()
     }
 
@@ -415,7 +464,7 @@ impl Drop for Transport {
 }
 
 impl InputHandle {
-    pub(super) fn waiting_on_human(&self) -> Result<Vec<String>, ErrorCode> {
+    pub(super) fn waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
         Ok(self
             .permissions
             .try_lock()
@@ -436,17 +485,18 @@ impl InputHandle {
         let bytes = match encode(&answer.response) {
             Ok(bytes) => bytes,
             Err(_) => {
-                book.aborted(&answer.id);
+                book.aborted(&answer.id, answer.request_seq);
                 return Err(ErrorCode::InvalidParams);
             }
         };
         let id = answer.id.clone();
+        let request_seq = answer.request_seq;
         if self
             .decisions
             .try_send(Command::Decide(Control { answer, bytes }))
             .is_err()
         {
-            book.aborted(&id);
+            book.aborted(&id, request_seq);
             return Err(ErrorCode::SessionBusy);
         }
         Ok(())
@@ -481,6 +531,11 @@ impl InputHandle {
         self.busy.load(Ordering::Acquire)
     }
 
+    /// Read-only observation of the existing unconfirmed-boundary guard.
+    pub(super) fn turn_end_unknown(&self) -> bool {
+        self.uncertain.load(Ordering::Acquire)
+    }
+
     /// Offer one user envelope at idle. WouldBlock means busy; it never queues a
     /// mid-turn steering write. Input is capped before serialization allocation.
     /// Success records acceptance for S4's caller-supplied stall policy, even if
@@ -489,6 +544,16 @@ impl InputHandle {
     /// Loss with no identifiable event type yields `structured_turn_end_unknown`
     /// until a real result confirms the boundary; never retry it as ordinary busy.
     pub(super) fn try_submit(&self, user: &Value) -> io::Result<()> {
+        self.try_submit_observed(user, || {})
+    }
+
+    /// Offer input and request supervisor shutdown only if its acceptance fact
+    /// cannot reach the pump. Existing I/O cancellation does not imply stop intent.
+    pub(super) fn try_submit_observed(
+        &self,
+        user: &Value,
+        observer_unavailable: impl FnOnce(),
+    ) -> io::Result<()> {
         if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -496,7 +561,7 @@ impl InputHandle {
             ));
         }
         if self.uncertain.load(Ordering::Acquire) {
-            return Err(io::Error::other("structured_turn_end_unknown"));
+            return Err(io::Error::other(TurnEndUnknown));
         }
         let permissions = self
             .permissions
@@ -539,7 +604,11 @@ impl InputHandle {
             self.busy.store(false, Ordering::Release);
             return Err(io::Error::other(err.to_string()));
         }
+        // The busy gate admits one input per turn, and the pump drains facts
+        // before each stdout line and poll. The bounded queue cannot fill while
+        // that pump is connected, so failure means its observer disconnected.
         if self.accepted.try_send(Accepted { at, at_ms }).is_err() {
+            observer_unavailable();
             self.cancel.store(true, Ordering::Release);
             self.busy.store(false, Ordering::Release);
             return Err(io::Error::new(
@@ -553,7 +622,7 @@ impl InputHandle {
     }
 }
 
-fn encode(value: &Value) -> io::Result<Vec<u8>> {
+fn encode(value: &impl Serialize) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     serde_json::to_writer(InputBuffer(&mut bytes), value)?;
     bytes.push(b'\n');
@@ -624,6 +693,7 @@ fn write_inputs(
                     }
                     Input::User(input) => (input.bytes, None),
                     Input::Decision(control) => (control.bytes, Some(control.answer)),
+                    Input::Refusal(bytes) => (bytes, None),
                 };
                 if let Some(check) = before_first_write.take() {
                     check()?;
@@ -664,18 +734,29 @@ fn write_inputs(
 /// Recovery truncates only a final tail without a trailing LF, syncs the repair,
 /// logs discarded bytes and resumes the last good sequence. Malformed records
 /// ending in LF are corruption and are refused, as are non-dense sequences.
-fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(File, u64)> {
+fn open_stream(
+    location: StreamLocation,
+    cancel: &AtomicBool,
+) -> io::Result<(File, u64, permissions::Orphaned)> {
     let dir = location.data_dir.join("sessions");
     private_fs::ensure_private_dir(&dir)?;
     let dir = dir.join(location.agent);
     private_fs::ensure_private_dir(&dir)?;
     let path = dir.join(format!("{}.jsonl", location.session));
     let mut file = match private_fs::create_private_file(&path) {
-        Ok(file) => return Ok((file, 0)),
+        Ok(file) => {
+            drop(file);
+            return Ok((
+                private_fs::open_append_file(&path)?,
+                0,
+                permissions::Orphaned::default(),
+            ));
+        }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => private_fs::open_append_file(&path)?,
         Err(e) => return Err(e),
     };
     let length = file.metadata()?.len();
+    let mut orphaned = permissions::Orphaned::default();
     let mut good_bytes = 0;
     let mut seq = 0_u64;
     {
@@ -698,6 +779,7 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
                     return Err(io::Error::other("non-dense session sequence"));
                 }
                 seq = record.seq;
+                orphaned.observe(&record);
                 good_bytes += n;
             } else {
                 // A bounded scan accepts only an unterminated final tail. Any
@@ -724,7 +806,7 @@ fn open_stream(location: StreamLocation, cancel: &AtomicBool) -> io::Result<(Fil
         file.sync_all()?;
         crate::logging::structured_stream_repaired(length - good_bytes);
     }
-    Ok((file, seq))
+    Ok((file, seq, orphaned))
 }
 
 fn pump(
@@ -736,12 +818,25 @@ fn pump(
     uncertain: &AtomicBool,
     cancel: &AtomicBool,
     controls: &ControlPlane,
+    history: &super::history::History,
 ) -> io::Result<()> {
-    let (mut file, mut seq) = open_stream(location, cancel)?;
+    let blobs = super::blobs::BlobStore::open(&location.data_dir).map_err(io::Error::other)?;
+    let threshold = location.storage.blob_min_bytes;
+    let (mut file, mut seq, orphaned) = open_stream(location, cancel)?;
+    history.initialize(&file, seq, file.metadata()?.len())?;
     let mut recorder = control::Recorder::new(
-        &mut file, &mut seq, version, &tx, busy, uncertain, cancel, controls,
+        &mut file,
+        &mut seq,
+        version,
+        &tx,
+        busy,
+        uncertain,
+        cancel,
+        controls,
+        (&blobs, threshold, history),
     );
     let result = (|| {
+        recorder.recover(orphaned)?;
         let mut line = Vec::new();
         let mut count = 0_u64;
         let mut metadata = metadata::Line::default();
@@ -832,9 +927,10 @@ fn emit(
     uncertain: &AtomicBool,
     cancel: &AtomicBool,
     synthetic: bool,
+    storage: (&super::blobs::BlobStore, usize, &super::history::History),
 ) -> io::Result<()> {
     let received = persist(
-        file, seq, line, count, version, busy, uncertain, synthetic, None,
+        file, seq, line, count, version, busy, uncertain, synthetic, None, None, storage,
     )?;
     publish(received, tx, cancel)
 }
@@ -849,6 +945,8 @@ fn persist(
     uncertain: &AtomicBool,
     synthetic: bool,
     grant_request_id: Option<&str>,
+    permission_request_seq: Option<u64>,
+    storage: (&super::blobs::BlobStore, usize, &super::history::History),
 ) -> io::Result<Received> {
     let origin = if synthetic || count > MAX_LINE_BYTES as u64 || std::str::from_utf8(line).is_err()
     {
@@ -887,10 +985,26 @@ fn persist(
         }
         _ => (false, None),
     };
-    *seq = seq
-        .checked_add(1)
-        .ok_or_else(|| io::Error::other("session sequence exhausted"))?;
-    let record = StreamRecord {
+    let stored_raw = if kind.as_deref() == Some("stream_event") {
+        None
+    } else {
+        storage
+            .0
+            .project(&raw, storage.1)
+            .map_err(io::Error::other)?
+    };
+    let persisted = stored_raw.is_some();
+    if persisted {
+        *seq = seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("session sequence exhausted"))?;
+    }
+    let mut record = StreamRecord {
+        known: Some(!matches!(event, SessionEvent::Unknown { .. })),
+        shape: match &event {
+            SessionEvent::Unknown { shape, .. } => Some(shape.clone()),
+            _ => None,
+        },
         seq: *seq,
         received_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -899,12 +1013,29 @@ fn persist(
         origin,
         result_subtype,
         permission_grant_request_id: grant_request_id.map(str::to_owned),
+        permission_request_seq,
         raw,
     };
-    let mut encoded = serde_json::to_vec(&record)?;
-    encoded.push(b'\n');
-    file.write_all(&encoded)?;
-    file.sync_data()?;
+    if let Some(raw) = stored_raw {
+        let live_raw = std::mem::replace(&mut record.raw, raw);
+        let mut encoded = serde_json::to_vec(&record)?;
+        encoded.push(b'\n');
+        file.write_all(&encoded)?;
+        file.sync_data()?;
+        let stored = Arc::new(record);
+        storage.2.publish(stored.clone(), encoded.len())?;
+        record = StreamRecord {
+            raw: live_raw,
+            seq: stored.seq,
+            known: stored.known,
+            shape: stored.shape.clone(),
+            received_at_ms: stored.received_at_ms,
+            origin: stored.origin,
+            result_subtype: stored.result_subtype.clone(),
+            permission_grant_request_id: stored.permission_grant_request_id.clone(),
+            permission_request_seq: stored.permission_request_seq,
+        };
+    }
     if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {
         uncertain.store(false, Ordering::Release);
         busy.store(false, Ordering::Release);
@@ -916,16 +1047,13 @@ fn persist(
         uncertain.store(true, Ordering::Release);
     }
     Ok(Received {
+        persisted,
         record,
         event,
         accepted: None,
     })
 }
-fn publish(
-    mut received: Received,
-    tx: &mpsc::SyncSender<Received>,
-    cancel: &AtomicBool,
-) -> io::Result<()> {
+fn publish<T>(mut received: T, tx: &mpsc::SyncSender<T>, cancel: &AtomicBool) -> io::Result<()> {
     loop {
         if cancel.load(Ordering::Acquire) {
             return Err(cancelled());

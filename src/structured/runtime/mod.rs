@@ -7,7 +7,8 @@
 #![deny(missing_docs)]
 
 use super::launch::{
-    registry_has_messaging_socket, LaunchError, LaunchProfile, SessionConfigDir, VerifiedBinary,
+    registry_has_messaging_socket, LaunchError, LaunchProfile, SessionConfigDir, SessionMcp,
+    VerifiedBinary,
 };
 use super::supervision::{self, StopRequest};
 use super::transport::{
@@ -62,21 +63,26 @@ pub struct Runtime {
     stop: StopRequest,
     control: StopHandle,
     events: mpsc::Receiver<Received>,
+    /// Stored publication handle for the registry runtime owner.
+    pub(super) history: super::history::History,
 }
 impl Runtime {
     /// Offer a bounded user envelope only while idle; WouldBlock never waits.
     /// Successful admission emits an internal accepted-input fact through
     /// `Received::state_input`, arming S4 silence observation before started.
     /// Success acknowledges admission, not delivery or provider execution.
-    /// Cancellation errors also request process shutdown, not just pipe closure.
+    /// An unavailable acceptance observer requests process shutdown; ordinary
+    /// I/O cancellation preserves the independently observed exit outcome.
     /// `structured_turn_end_unknown` means loss concealed the boundary; await a
     /// subsequent result or explicitly stop, rather than retry as ordinary busy.
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
-        let result = self.transport.try_submit(user);
-        if result.is_err() && self.control.cancelled() {
-            self.stop.request();
-        }
-        result
+        self.transport
+            .try_submit_observed(user, || self.stop.request())
+    }
+    /// Whether lossy stdout left the turn boundary unconfirmed. This never
+    /// releases stdin: only a real result or a new runtime clears the guard.
+    pub fn turn_end_unknown(&self) -> bool {
+        self.transport.turn_end_unknown()
     }
     /// Server entry for a dispatcher-authenticated agent.decide command.
     /// Token identity is context, never a field decoded from command arguments.
@@ -97,16 +103,18 @@ impl Runtime {
     ) -> Result<(), crate::api::error_code::ErrorCode> {
         self.transport.close_permissions(principal, id, reason)
     }
-    /// Current permission ids for S4 attention; a busy snapshot fails closed.
-    pub fn waiting_on_human(&self) -> Result<Vec<String>, crate::api::error_code::ErrorCode> {
+    /// Current `(request_id, request_seq)` handles for operator decisions; a busy snapshot fails closed.
+    pub fn waiting_on_human(
+        &self,
+    ) -> Result<Vec<(String, u64)>, crate::api::error_code::ErrorCode> {
         self.transport.waiting_on_human()
     }
-    /// Poll persisted events. Empty is not EOF; monitor the owning worker result too.
+    /// Poll complete events and live-only partial deltas. Empty is not EOF; monitor the owning worker result too.
     /// Feed `Received::state_input` into S4 so book closures clear attention.
     pub fn try_receive(&self) -> Result<Received, mpsc::TryRecvError> {
         self.events.try_recv()
     }
-    /// Wait for a persisted event on a worker, with a finite deadline.
+    /// Wait for a complete event or live-only delta on a worker, with a finite deadline.
     /// Server-loop callers must use `try_receive` instead.
     pub fn receive_timeout(&self, timeout: Duration) -> Result<Received, mpsc::RecvTimeoutError> {
         self.events.recv_timeout(timeout)
@@ -132,14 +140,16 @@ impl Drop for Runtime {
 /// lookup window; see `registry_has_messaging_socket`. Forward the returned exit
 /// through the caller's event channel. This API does not expose agent.start or
 /// reserve a lease; the caller must reserve before preparing the launch.
+/// `mcp` pins this build and the owning server socket; no ambient endpoint lookup.
 pub fn run(
     state: &Path,
     profile: LaunchProfile,
     lease: super::lease::Lease,
     location: StreamLocation,
+    mcp: SessionMcp,
     ready: impl FnOnce(Runtime),
 ) -> Result<Exit, LaunchError> {
-    run_notified(state, profile, lease, location, ready, || {})
+    run_notified(state, profile, lease, location, mcp, ready, || {})
 }
 
 /// Worker assembly with a nonblocking wake after each queued stream notification.
@@ -150,12 +160,13 @@ pub(crate) fn run_notified(
     profile: LaunchProfile,
     lease: super::lease::Lease,
     location: StreamLocation,
+    mcp: SessionMcp,
     ready: impl FnOnce(Runtime),
     notify: impl Fn() + Send + 'static,
 ) -> Result<Exit, LaunchError> {
     run_controlled(
         state,
-        profile,
+        (profile, mcp),
         lease,
         location,
         ready,
@@ -165,9 +176,11 @@ pub(crate) fn run_notified(
 }
 
 /// Worker-owned cancellation exists before spawn, including deadline escalation.
+/// The tuple pairs the launch profile with the session MCP endpoint supplied for
+/// the same lease (ADR-0036 §1/§1a).
 pub(crate) fn run_controlled(
     state: &Path,
-    profile: LaunchProfile,
+    (profile, mcp): (LaunchProfile, SessionMcp),
     mut lease: super::lease::Lease,
     location: StreamLocation,
     ready: impl FnOnce(Runtime),
@@ -179,6 +192,7 @@ pub(crate) fn run_controlled(
     {
         return Err(io::Error::other("structured lease/stream mismatch").into());
     }
+    profile.register_flock_mcp(Some(&lease), &mcp)?;
     for entry in supervision::sweep_stale_sessions(state)? {
         crate::logging::structured_sweep_outcome(&entry);
     }
@@ -259,6 +273,7 @@ pub(crate) fn run_controlled(
             ))
         }
     };
+    let history = transport.history.clone();
     let control = transport.stop_handle();
     let input = transport.input_handle();
     let (events_tx, events) = mpsc::sync_channel(4);
@@ -288,6 +303,7 @@ pub(crate) fn run_controlled(
     }
     let publication_failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ready(Runtime {
+            history,
             transport: input,
             stop: stop.clone(),
             control: control.clone(),
@@ -296,6 +312,7 @@ pub(crate) fn run_controlled(
     }))
     .is_err();
     if publication_failed {
+        lease.revoke();
         stop.request();
         control.cancel();
     }
@@ -305,8 +322,12 @@ pub(crate) fn run_controlled(
         files,
         config,
         stop.clone(),
-        || control.close_stdin(),
         || {
+            lease.revoke();
+            control.close_stdin();
+        },
+        || {
+            lease.revoke();
             control.close_stdin();
             match io_rx.recv_timeout(IO_LIMIT) {
                 Ok(received) => facts = received,
@@ -364,6 +385,7 @@ fn startup_failed(
     io_confirmed: bool,
     lease: &mut super::lease::Lease,
 ) -> LaunchError {
+    lease.revoke();
     let stop = StopRequest::default();
     stop.request();
     // Missing child pipes precede all I/O workers. A partially started transport

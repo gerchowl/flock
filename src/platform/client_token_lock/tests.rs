@@ -127,3 +127,28 @@ fn parent_ipc_disconnection_terminates_the_waiter_without_lock_release() {
     assert_eq!(result.unwrap(), 0);
     reaped(pid);
 }
+
+#[test]
+fn finished_and_abandoned_pending_locks_release_before_inherited_descriptors_close() {
+    for finish in [true, false] {
+        let (_root, path, holder) = fixture();
+        drop(holder);
+        let pending = PendingLock::begin(open(&path), &executable()).unwrap();
+        let mut inherited =
+            inherited_holder::Holder::spawn(pending.file.as_ref().unwrap()).unwrap();
+        if finish {
+            drop(pending.finish(Duration::from_secs(5)).unwrap());
+        } else {
+            drop(pending);
+        }
+        let result = open(&path).try_lock();
+        inherited.verify().unwrap();
+        assert!(
+            result.is_ok(),
+            "pending finish={finish} lock retained by child pid={} descriptor={} inode={}",
+            inherited.pid,
+            inherited.descriptor,
+            inherited.inode
+        );
+    }
+}
