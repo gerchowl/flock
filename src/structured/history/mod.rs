@@ -482,4 +482,4 @@ impl Cut {
     }
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

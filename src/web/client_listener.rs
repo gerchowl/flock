@@ -96,6 +96,7 @@ impl Listener {
         data: PathBuf,
         inherited: Option<TcpListener>,
         health: Health,
+        wake: Arc<tokio::sync::Notify>,
     ) -> io::Result<Option<Self>> {
         let Some(bind) = bind else {
             return if inherited.is_none() {
@@ -134,7 +135,7 @@ impl Listener {
             .map_err(io::Error::other)??;
         socket.set_nonblocking(true)?;
         let acceptor = tokio::net::TcpListener::from_std(socket.try_clone()?)?;
-        let core = Core::new(data.clone()).await?;
+        let core = Core::new(data.clone(), wake).await?;
         let csp = HeaderValue::from_str(&format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://{actual}/v1/ws; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")).map_err(io::Error::other)?;
         let router = core
             .router()
@@ -148,6 +149,15 @@ impl Listener {
             prepared: Some((acceptor, router)),
             task: None,
         }))
+    }
+    /// Run history admission only on the application owner.
+    pub(crate) fn service(
+        &mut self,
+        registry: &crate::structured::registry::Registry,
+        workers: &mut crate::structured::workers::Workers,
+        root: &std::path::Path,
+    ) {
+        self.core.service(registry, workers, root);
     }
     /// Start only inside the owning server loop, after handoff commit if importing.
     pub(crate) fn activate(&mut self) {
