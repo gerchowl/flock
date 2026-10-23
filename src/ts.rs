@@ -50,6 +50,7 @@ fn contracts() -> BTreeMap<PathBuf, String> {
     collector.add::<QuestionForm>();
     collector.add::<QuestionCloseReason>();
     collector.add::<AgentInfo>();
+    collector.add::<crate::api::structured_agent::StructuredAgentInfo>();
     collector.add::<FleetAgentInfo>();
     collector.add::<WorkspaceInfo>();
     collector.add::<PaneInfo>();
@@ -86,9 +87,12 @@ fn contracts() -> BTreeMap<PathBuf, String> {
         .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
     scripts.sort();
+    let mut permission_lifecycle = String::new();
     let mut examples = String::from(
         r#"// Generated from wire JSONL scripts by just gen-ts.
 import type { FixtureLine } from "./FixtureLine";
+import type { PermissionRecord } from "./PermissionRecord";
+import type { AgentDecideResult } from "./AgentDecideResult";
 export const fixtureExamples = {
 "#,
     );
@@ -104,6 +108,31 @@ export const fixtureExamples = {
             .lines()
         {
             let value: serde_json::Value = serde_json::from_str(line).expect("fixture JSON");
+            if name == "permission-decision" {
+                let frame = &value["frame"];
+                let typed = if frame["t"] == "ev" {
+                    let record: crate::structured_wire::PermissionRecord =
+                        serde_json::from_value(frame["ev"].clone())
+                            .expect("typed permission fixture");
+                    Some((
+                        serde_json::to_value(record).expect("permission JSON"),
+                        "PermissionRecord",
+                    ))
+                } else if frame["t"] == "ack" {
+                    let ack: crate::structured_wire::AgentDecideResult =
+                        serde_json::from_value(frame["result"].clone())
+                            .expect("typed decision ack");
+                    Some((
+                        serde_json::to_value(ack).expect("ack JSON"),
+                        "AgentDecideResult",
+                    ))
+                } else {
+                    None
+                };
+                if let Some((payload, ty)) = typed {
+                    permission_lifecycle.push_str(&format!("({payload}) satisfies {ty},\n"));
+                }
+            }
             examples.push_str(&serde_json::to_string(&value).expect("fixture literal"));
             examples.push_str(
                 ",
@@ -119,6 +148,9 @@ export const fixtureExamples = {
         "} satisfies Record<string, FixtureLine[]>;
 ",
     );
+    examples.push_str("export const permissionLifecycle = [\n");
+    examples.push_str(&permission_lifecycle);
+    examples.push_str("] as const;\n");
     files.insert(PathBuf::from("FixtureExamples.ts"), examples);
     files
 }

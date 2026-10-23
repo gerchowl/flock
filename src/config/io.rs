@@ -1898,6 +1898,33 @@ mod spoke_config_tests {
 mod blob_storage_tests {
     use super::*;
     #[test]
+    fn live_loader_reports_invalid_sessions_stall_policy() {
+        for value in [0, 4999, 3_600_001] {
+            let loaded =
+                load_live_config_from_str(&format!("[sessions]\nstall_ms = {value}\n")).unwrap();
+            assert_eq!(loaded.invalid_sections, ["sessions"]);
+            assert!(loaded
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("invalid sessions config") && d.contains("sessions.stall_ms")));
+        }
+        for value in [5000, 3_600_000] {
+            let loaded =
+                load_live_config_from_str(&format!("[sessions]\nstall_ms = {value}\n")).unwrap();
+            assert!(loaded.invalid_sections.is_empty());
+            assert_eq!(loaded.config.sessions.stall_ms, value);
+        }
+        assert_eq!(
+            load_live_config_from_str("")
+                .unwrap()
+                .config
+                .sessions
+                .stall_ms,
+            120_000
+        );
+    }
+
+    #[test]
     fn live_loader_applies_sessions_threshold_and_defaults() {
         let default = load_live_config_from_str("").unwrap();
         assert_eq!(default.config.sessions.blob_min_bytes, 2048);

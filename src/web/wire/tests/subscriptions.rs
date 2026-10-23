@@ -15,6 +15,7 @@ fn record(seq: u64) -> StreamRecord {
         origin: RecordOrigin::Claude,
         result_subtype: None,
         permission_grant_request_id: None,
+        permission_request_seq: None,
         raw: json!({"type":"assistant","message":{"content":[]}}).to_string(),
     }
 }
