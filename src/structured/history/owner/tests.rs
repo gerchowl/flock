@@ -370,7 +370,10 @@ async fn invalid_stored_namespaces_never_reach_filesystem_recovery() {
                 model: None,
             })
             .unwrap();
-        assert!(fixture.lookup(id).await.unwrap().is_none());
+        assert_eq!(
+            fixture.lookup(id).await.err().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert!(fixture.workers.history(&fixture.registry, id).is_none());
     }
 }

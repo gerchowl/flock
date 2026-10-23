@@ -78,3 +78,8 @@ pub(super) fn encode(frame: ServerFrame) -> Option<Message> {
     serde_json::to_writer(&mut bytes, &frame).ok()?;
     Some(Message::Text(String::from_utf8(bytes.0).ok()?.into()))
 }
+
+/// Preflight without cloning a possibly large raw payload.
+pub(super) fn fits(frame: &ServerFrame) -> bool {
+    serde_json::to_writer(&mut Limited(Vec::new()), frame).is_ok()
+}

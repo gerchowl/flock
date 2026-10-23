@@ -47,6 +47,7 @@ enum Request {
 enum Located {
     Ready(History),
     Busy,
+    Invalid,
     Retained(std::path::PathBuf, u64),
 }
 /// Construct the private transport/owner bridge with its existing app wake.
@@ -72,14 +73,19 @@ impl Client {
             .await
             .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
     }
-    /// None means unknown subject. Overload is WouldBlock, owner loss BrokenPipe,
+    /// None means unknown subject. Unsafe/reserved namespaces fail InvalidInput.
+    /// Overload is WouldBlock, owner loss BrokenPipe,
     /// stale recovery Interrupted; storage failures retain their original I/O kind.
     /// Recovery performs no filesystem work on the application owner or heartbeat executor.
     pub(crate) async fn lookup(&self, id: String) -> io::Result<Option<History>> {
+        if !crate::structured::transport::valid_component(&id) || id.eq_ignore_ascii_case("queue") {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
         let (tx, rx) = oneshot::channel();
         match self.request(Request::Lookup(id.clone(), tx), rx).await? {
             None => Ok(None),
             Some(Located::Ready(source)) => Ok(Some(source)),
+            Some(Located::Invalid) => Err(io::ErrorKind::InvalidInput.into()),
             Some(Located::Busy) => Err(io::ErrorKind::WouldBlock.into()),
             Some(Located::Retained(path, generation)) => {
                 let source = self.io.run(move || History::open_retained(&path)).await??;
@@ -104,29 +110,28 @@ impl Owner {
                     if reply.is_closed() {
                         continue;
                     }
-                    let found = registry
-                        .get(&id)
-                        .filter(|(record, _, _)| {
-                            crate::structured::transport::valid_component(&record.agent_id)
-                                && crate::structured::transport::valid_component(&record.session_id)
-                                && !record.session_id.eq_ignore_ascii_case("queue")
-                        })
-                        .map(|(record, _, generation)| {
-                            workers.history(registry, &id).cloned().map_or_else(
-                                || {
-                                    if !workers.history_recovery_allowed(&id) {
-                                        return Located::Busy;
-                                    }
-                                    Located::Retained(
-                                        root.join("sessions")
-                                            .join(&record.agent_id)
-                                            .join(format!("{}.jsonl", record.session_id)),
-                                        generation,
-                                    )
-                                },
-                                Located::Ready,
-                            )
-                        });
+                    let found = registry.get(&id).map(|(record, _, generation)| {
+                        if !crate::structured::transport::valid_component(&record.agent_id)
+                            || !crate::structured::transport::valid_component(&record.session_id)
+                            || record.session_id.eq_ignore_ascii_case("queue")
+                        {
+                            return Located::Invalid;
+                        }
+                        workers.history(registry, &id).cloned().map_or_else(
+                            || {
+                                if !workers.history_recovery_allowed(&id) {
+                                    return Located::Busy;
+                                }
+                                Located::Retained(
+                                    root.join("sessions")
+                                        .join(&record.agent_id)
+                                        .join(format!("{}.jsonl", record.session_id)),
+                                    generation,
+                                )
+                            },
+                            Located::Ready,
+                        )
+                    });
                     let _ = reply.send(found);
                 }
                 Request::Install(id, generation, source, reply) => {
@@ -150,7 +155,14 @@ impl Owner {
                         workers
                             .install_retained(registry, &id, generation, source.clone())
                             .map_err(|error| {
-                                io::Error::new(io::ErrorKind::Interrupted, error.as_str())
+                                io::Error::new(
+                                    if error == crate::api::error_code::ErrorCode::SessionBusy {
+                                        io::ErrorKind::WouldBlock
+                                    } else {
+                                        io::ErrorKind::Interrupted
+                                    },
+                                    error.as_str(),
+                                )
                             })?;
                         Ok(source)
                     })();

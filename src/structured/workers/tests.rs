@@ -191,6 +191,11 @@ impl Case {
         .await;
         case
     }
+    pub(crate) fn forget_report(&self, workers: &mut Workers) {
+        let worker = workers.entries.get_mut(&self.id).unwrap();
+        assert!(worker.finished && worker.thread.is_none());
+        worker.report = None;
+    }
     pub fn submit(&self, workers: &Workers) {
         workers.runtime(&self.id, self.generation).unwrap().try_submit(&json!({"type":"user","message":{"role":"user","content":"fixture turn"},"parent_tool_use_id":null,"session_id":""})).unwrap();
     }
@@ -1210,4 +1215,16 @@ async fn owner_lease_acquisition_retires_pending_without_double_counting() {
     );
     assert_eq!(count_before, Ok((1, 1)));
     assert_eq!(count_after, Ok((1, 1)));
+}
+
+#[tokio::test]
+async fn finished_without_report_allows_retained_recovery() {
+    let wake = Arc::new(Notify::new());
+    let mut registry = Registry::default();
+    let mut workers = Workers::new(wake.clone());
+    let case = Case::uncertain(&mut registry, &mut workers, 432, &wake).await;
+    let worker = workers.entries.get_mut(&case.id).unwrap();
+    assert!(worker.finished && worker.thread.is_none());
+    worker.report = None;
+    assert!(workers.history_recovery_allowed(&case.id));
 }
