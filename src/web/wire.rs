@@ -1,5 +1,6 @@
 //! Server-owned, opt-in structured transport; no PTY or model dispatch.
 mod output;
+mod subscriptions;
 pub(crate) mod timing;
 use crate::{
     api::client_tokens::Bearer,
@@ -54,12 +55,11 @@ struct Client {
     // The command slice enforces version gating before allocation.
     #[allow(dead_code)]
     read_only: bool,
-    // The replay slice supplies bounded data through this same writer.
-    #[allow(dead_code)]
-    data: mpsc::Sender<ServerFrame>,
+    data: mpsc::Sender<output::Delivery>,
     revoke: watch::Sender<bool>,
 }
 struct Shared {
+    histories: crate::structured::history::owner::Client,
     store: Arc<TokenStore>,
     epoch: String,
     clock: Arc<dyn Clock>,
@@ -84,6 +84,7 @@ impl Drop for Lease {
 /// Unmounted protocol core. The listener slice owns HTTP hosting guards and binding.
 /// Dropping the owner cancels every handshake and authenticated socket.
 pub(crate) struct Core {
+    owner: crate::structured::history::owner::Owner,
     shared: Arc<Shared>,
 }
 impl Drop for Core {
@@ -93,20 +94,27 @@ impl Drop for Core {
 }
 impl Core {
     /// New server epoch, independent of durable stream cursors or command identities.
-    pub(crate) async fn new(data: PathBuf) -> io::Result<Self> {
+    pub(crate) async fn new(data: PathBuf, wake: Arc<tokio::sync::Notify>) -> io::Result<Self> {
         let store = super::store_io::shared()
             .run(move || TokenStore::open(&data))
             .await
             .ok_or_else(|| io::Error::other("client token store worker unavailable"))?
             .map_err(io::Error::other)?;
-        Self::with_clock(store, Arc::new(SystemClock))
+        Self::with_clock(store, Arc::new(SystemClock), wake)
     }
     /// Embed with a supplied monotonic clock; deadlines never use wall-clock time.
-    pub(crate) fn with_clock(store: TokenStore, clock: Arc<dyn Clock>) -> io::Result<Self> {
+    pub(crate) fn with_clock(
+        store: TokenStore,
+        clock: Arc<dyn Clock>,
+        wake: Arc<tokio::sync::Notify>,
+    ) -> io::Result<Self> {
         let epoch = store.random::<16>().map_err(io::Error::other)?;
         let (stop, _) = watch::channel(false);
+        let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
+            owner,
             shared: Arc::new(Shared {
+                histories,
                 store: Arc::new(store),
                 epoch,
                 clock,
@@ -117,6 +125,15 @@ impl Core {
                 stop,
             }),
         })
+    }
+    /// Service the bounded history mailbox from the registry-owning app loop.
+    pub(crate) fn service(
+        &mut self,
+        registry: &crate::structured::registry::Registry,
+        workers: &mut crate::structured::workers::Workers,
+        root: &std::path::Path,
+    ) {
+        self.owner.service(registry, workers, root);
     }
     /// Mount only behind S2b-mount's loopback, Host/Origin and funnel guards.
     pub(crate) fn router(&self) -> Router {
@@ -357,6 +374,15 @@ async fn connection(
     let (sink, mut stream) = socket.split();
     let writer = output::writer(sink, shared.clock.clone(), priority_rx, data_rx);
     tokio::pin!(writer);
+    let Some((data, session)) = shared.clients.lock().ok().and_then(|clients| {
+        clients
+            .get(&id)
+            .map(|client| (client.data.clone(), client.session.clone()))
+    }) else {
+        return;
+    };
+    let mut subscriptions =
+        subscriptions::Subscriptions::new(shared.clone(), data, session, priority.clone());
     let mut heartbeat = Heartbeat::new(shared.clock.now());
     let code = loop {
         tokio::select! { biased;
@@ -372,6 +398,10 @@ async fn connection(
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                     Ok(ClientFrame::Pong { nonce }) => heartbeat.pong(&nonce, shared.clock.now()),
+                    Ok(ClientFrame::Sub { sub_id, stream, after }) => {
+                        if !subscriptions.subscribe(sub_id, stream, after) { break GOING_AWAY_CLOSE }
+                    }
+                    Ok(ClientFrame::Unsub { sub_id }) => subscriptions.unsubscribe(&sub_id),
                     _ => break POLICY_VIOLATION_CLOSE,
                 },
                 Some(Ok(Message::Binary(_))) => break POLICY_VIOLATION_CLOSE,

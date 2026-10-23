@@ -1387,3 +1387,5 @@ fn assert_first_corruption(first: &[u8], reason: &'static str, seq: Option<u64>)
     assert_all_storage_mutations_refuse(&mut journal, expected);
     assert_eq!(fs::read(root.path()).unwrap(), bytes);
 }
+
+mod policy;

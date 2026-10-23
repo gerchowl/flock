@@ -18,7 +18,14 @@ pub(crate) enum AcceptFailure {
 pub(crate) fn accept_failure(error: &io::Error) -> AcceptFailure {
     match error.raw_os_error() {
         Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK) => AcceptFailure::Fatal,
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => AcceptFailure::Resource,
+        Some(
+            libc::EMFILE
+            | libc::ENFILE
+            | libc::ENOBUFS
+            | libc::ENOMEM
+            | libc::ENOPROTOOPT
+            | libc::EOPNOTSUPP,
+        ) => AcceptFailure::Resource,
         Some(
             libc::ECONNABORTED
             | libc::ECONNRESET
@@ -27,8 +34,6 @@ pub(crate) fn accept_failure(error: &io::Error) -> AcceptFailure {
             | libc::ENETDOWN
             | libc::ENETUNREACH
             | libc::EHOSTUNREACH
-            | libc::ENOPROTOOPT
-            | libc::EOPNOTSUPP
             | libc::ETIMEDOUT
             | libc::ENETRESET,
         ) => AcceptFailure::Connection,
@@ -47,22 +52,55 @@ pub(crate) enum InvalidListener {
     Missing,
     Family,
     SocketType,
+    /// A socket inspection failed; retain the operation and its original errno.
+    Query(&'static str, Option<i32>),
     NotListening,
     /// The bound socket would permit exposure beyond IPv4 loopback.
     NonLoopback,
+    /// Import supplied a listener after the configured binding was removed.
+    #[cfg(feature = "web")]
+    Unconfigured,
+    /// The imported listener does not match the configured address or nonzero port.
+    #[cfg(feature = "web")]
+    BindMismatch {
+        expected: SocketAddr,
+        actual: SocketAddr,
+    },
 }
 impl std::fmt::Display for InvalidListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Missing => "missing structured listener descriptor",
-            Self::Family => "structured listener must use the IPv4 address family",
-            Self::SocketType => "structured listener must be a stream socket",
-            Self::NotListening => "structured listener socket is not listening",
-            Self::NonLoopback => "structured listener must bind IPv4 loopback",
-        })
+        match self {
+            Self::Query(operation, errno) => write!(
+                f,
+                "structured listener {operation} failed (errno {errno:?})"
+            ),
+            Self::Missing => f.write_str("missing structured listener descriptor"),
+            Self::Family => f.write_str("structured listener must use the IPv4 address family"),
+            Self::SocketType => f.write_str("structured listener must be a stream socket"),
+            Self::NotListening => f.write_str("structured listener socket is not listening"),
+            Self::NonLoopback => f.write_str(
+                "structured listener address is outside its allowed IPv4 loopback binding",
+            ),
+            #[cfg(feature = "web")]
+            Self::Unconfigured => {
+                f.write_str("received structured listener without a configured bind")
+            }
+            #[cfg(feature = "web")]
+            Self::BindMismatch { expected, actual } => write!(
+                f,
+                "received structured listener {actual} does not match configured bind {expected}"
+            ),
+        }
     }
 }
 impl std::error::Error for InvalidListener {}
+/// Preserve syscall diagnostics inside the typed descriptor refusal.
+fn query_failure(operation: &'static str, error: io::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        InvalidListener::Query(operation, error.raw_os_error()),
+    )
+}
 /// Refuse any address outside IPv4's loopback block, including wildcard binds.
 pub(crate) fn require_loopback(address: SocketAddr) -> io::Result<()> {
     if !matches!(address,SocketAddr::V4(address) if address.ip().is_loopback()) {
@@ -95,17 +133,13 @@ pub(crate) fn take(fds: &mut Vec<RawFd>) -> io::Result<TcpListener> {
         )
     } < 0
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            InvalidListener::SocketType,
-        ));
+        return Err(query_failure("getsockname", io::Error::last_os_error()));
     }
     let mut socket_type: libc::c_int = 0;
     // SO_TYPE returns an initialized C integer.
     unsafe {
-        option(fd, libc::SOL_SOCKET, libc::SO_TYPE, &mut socket_type).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, InvalidListener::SocketType)
-        })?;
+        option(fd, libc::SOL_SOCKET, libc::SO_TYPE, &mut socket_type)
+            .map_err(|error| query_failure("SO_TYPE", error))?;
     }
     let refusal = if address.ss_family as libc::c_int != libc::AF_INET {
         Some(InvalidListener::Family)
@@ -197,11 +231,12 @@ mod tests {
     fn duplicated_listener_has_owned_close_on_drop_semantics() {
         let original = TcpListener::bind("127.0.0.1:0").unwrap();
         let owned: OwnedFd = duplicate(&original).unwrap();
-        let fd = owned.as_raw_fd();
+        let address = original.local_addr().unwrap();
         drop(owned);
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
         assert!(original.local_addr().is_ok());
+        drop(original);
+        // A leaked duplicate retains the port, regardless of descriptor-number reuse.
+        let _rebound = TcpListener::bind(address).expect("duplicate retained the listening port");
     }
     #[test]
     fn missing_or_non_listening_descriptor_is_refused() {
@@ -219,7 +254,7 @@ mod tests {
         let file = std::fs::File::create(root.path().join("not-a-socket")).unwrap();
         reason(
             take(&mut vec![file.into_raw_fd()]).unwrap_err(),
-            InvalidListener::SocketType,
+            InvalidListener::Query("getsockname", Some(libc::ENOTSOCK)),
         );
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         reason(
@@ -250,18 +285,25 @@ mod family_tests {
             Some(&InvalidListener::Family)
         );
         assert!(fds.is_empty());
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
     }
     #[test]
     fn listening_unix_socket_is_refused_with_owned_descriptor_cleanup() {
         let root = crate::test_support::TempDir::socket();
         let socket = std::os::unix::net::UnixListener::bind(root.path().join("l.sock")).unwrap();
         refused(socket.into_raw_fd());
+        assert_eq!(
+            std::os::unix::net::UnixStream::connect(root.path().join("l.sock"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionRefused
+        );
     }
     #[test]
     fn listening_ipv6_socket_is_refused_with_owned_descriptor_cleanup() {
-        refused(TcpListener::bind("[::1]:0").unwrap().into_raw_fd());
+        let socket = TcpListener::bind("[::1]:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        refused(socket.into_raw_fd());
+        let _rebound = TcpListener::bind(address).expect("refused IPv6 listener retained its port");
     }
 }
 
@@ -272,6 +314,7 @@ mod loopback_tests {
     #[test]
     fn received_wildcard_listener_is_refused_and_closed() {
         let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let address = listener.local_addr().unwrap();
         let fd = listener.into_raw_fd();
         let mut fds = vec![fd];
         let error = take(&mut fds).unwrap_err();
@@ -283,8 +326,8 @@ mod loopback_tests {
             Some(&InvalidListener::NonLoopback)
         );
         assert!(fds.is_empty());
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        let _rebound =
+            TcpListener::bind(address).expect("refused wildcard listener retained its port");
     }
     #[test]
     fn loopback_exposure_boundary_is_the_entire_ipv4_loopback_block() {
@@ -299,6 +342,22 @@ mod loopback_tests {
                     .and_then(|e| e.downcast_ref::<InvalidListener>()),
                 Some(&InvalidListener::NonLoopback)
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    #[test]
+    fn inspection_refusals_retain_operation_and_errno() {
+        for operation in ["getsockname", "SO_TYPE"] {
+            let error = query_failure(operation, io::Error::from_raw_os_error(libc::ENOTSOCK));
+            assert_eq!(
+                error.get_ref().unwrap().downcast_ref::<InvalidListener>(),
+                Some(&InvalidListener::Query(operation, Some(libc::ENOTSOCK)))
+            );
+            assert!(error.to_string().contains(&libc::ENOTSOCK.to_string()));
         }
     }
 }

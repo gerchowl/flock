@@ -4,6 +4,7 @@ use super::wire::timing::{Clock, SystemClock};
 use super::{client_exchange, gui, wire::Core};
 use crate::api::client_listener::{Health, Status};
 use crate::client_open::Codes;
+use crate::platform::client_listener::InvalidListener;
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -95,17 +96,24 @@ impl Listener {
         data: PathBuf,
         inherited: Option<TcpListener>,
         health: Health,
+        wake: Arc<tokio::sync::Notify>,
     ) -> io::Result<Option<Self>> {
         let Some(bind) = bind else {
             return if inherited.is_none() {
                 Ok(None)
             } else {
-                Err(io::ErrorKind::InvalidInput.into())
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    InvalidListener::Unconfigured,
+                ))
             };
         };
         crate::platform::client_listener::require_loopback(bind)?;
         if bind.ip() != Ipv4Addr::LOCALHOST {
-            return Err(io::ErrorKind::InvalidInput.into());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                InvalidListener::NonLoopback,
+            ));
         }
         let socket = match inherited {
             Some(socket) => socket,
@@ -114,14 +122,20 @@ impl Listener {
         let actual = socket.local_addr()?;
         crate::platform::client_listener::require_loopback(actual)?;
         if actual.ip() != bind.ip() || (bind.port() != 0 && actual.port() != bind.port()) {
-            return Err(io::ErrorKind::InvalidInput.into());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                InvalidListener::BindMismatch {
+                    expected: bind,
+                    actual,
+                },
+            ));
         }
         tokio::task::spawn_blocking(move || check_funnel(actual.port()))
             .await
             .map_err(io::Error::other)??;
         socket.set_nonblocking(true)?;
         let acceptor = tokio::net::TcpListener::from_std(socket.try_clone()?)?;
-        let core = Core::new(data.clone()).await?;
+        let core = Core::new(data.clone(), wake).await?;
         let csp = HeaderValue::from_str(&format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://{actual}/v1/ws; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")).map_err(io::Error::other)?;
         let router = core
             .router()
@@ -135,6 +149,15 @@ impl Listener {
             prepared: Some((acceptor, router)),
             task: None,
         }))
+    }
+    /// Run history admission only on the application owner.
+    pub(crate) fn service(
+        &mut self,
+        registry: &crate::structured::registry::Registry,
+        workers: &mut crate::structured::workers::Workers,
+        root: &std::path::Path,
+    ) {
+        self.core.service(registry, workers, root);
     }
     /// Start only inside the owning server loop, after handoff commit if importing.
     pub(crate) fn activate(&mut self) {
@@ -243,6 +266,17 @@ fn targets_port(value: &serde_json::Value, port: u16) -> bool {
         serde_json::Value::Array(values) => values.iter().any(|value| targets_port(value, port)),
         _ => false,
     }
+}
+
+/// Preserve the event-loop failure when listener cleanup also fails.
+pub(crate) fn finish_shutdown(primary: io::Result<()>, shutdown: io::Result<()>) -> io::Result<()> {
+    if let Err(error) = shutdown {
+        if primary.is_ok() {
+            return Err(error);
+        }
+        crate::logging::client_listener_shutdown_failed(&error);
+    }
+    primary
 }
 
 #[cfg(test)]

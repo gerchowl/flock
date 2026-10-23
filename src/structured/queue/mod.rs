@@ -5,10 +5,13 @@
 //! and checkpoint publication require &mut self; replay returns an owned cut.
 //! A failed write/sync/rename poisons the handle: reopen under the lease to learn
 //! which bytes committed. No success or in-memory change precedes durability.
-//! Threshold configuration and worker/event-loop wiring belong to #1803.
+//! Optional configured checkpoint policy is available through open_with_policy.
+//! Production worker/event-loop wiring belongs to #1955 under #1803.
 #![deny(missing_docs)]
 pub(crate) mod admission;
 pub mod model;
+mod policy;
+pub use policy::RewritePolicy;
 mod readonly;
 use readonly::corrupt;
 pub use readonly::{QueueJournalCorrupt, QueueJournalNewer, ReadOnly};
@@ -62,6 +65,7 @@ pub struct Journal {
     corrupt: Option<QueueJournalCorrupt>,
     opaque: HashSet<String>,
     poisoned: bool,
+    rewrite: Option<RewritePolicy>,
     _lease: File,
 }
 fn problem(message: &str) -> io::Error {
@@ -111,6 +115,9 @@ impl Journal {
     /// Unknown data are logged and preserved raw, never interpreted for delivery.
     /// Only a supported journal's unterminated final tail is repaired.
     pub fn open(data: &Path, agent: &str) -> io::Result<Self> {
+        Self::open_inner(data, agent, None)
+    }
+    fn open_inner(data: &Path, agent: &str, rewrite: Option<RewritePolicy>) -> io::Result<Self> {
         if agent.is_empty()
             || !agent
                 .bytes()
@@ -157,6 +164,7 @@ impl Journal {
             corrupt: None,
             opaque: HashSet::new(),
             poisoned: false,
+            rewrite,
             _lease: lease,
         };
         if let Err(error) = journal.recover() {
@@ -247,7 +255,8 @@ impl Journal {
         self.writable()?;
         let mut items = self.items.clone();
         change.apply(&mut items)?;
-        let snapshot = if self.version < FORMAT_VERSION {
+        let needs_checkpoint = self.version < FORMAT_VERSION || self.rewrite_required()?;
+        let snapshot = if needs_checkpoint {
             self.items.len() as u64
         } else {
             0
@@ -262,7 +271,7 @@ impl Journal {
         };
         let value = serde_json::to_value(&record)?;
         let bytes = encode(&value)?;
-        if self.version < FORMAT_VERSION {
+        if needs_checkpoint {
             self.checkpoint()?;
         }
         self.durable(|this| {
@@ -573,7 +582,7 @@ impl Journal {
         if self.checkpoint.is_some_and(|(_, high)| self.seq < high) {
             return Err(corrupt(good, None, "incomplete_checkpoint"));
         }
-        if self.version < FORMAT_VERSION {
+        if self.version < FORMAT_VERSION || self.rewrite_required()? {
             self.checkpointable()?;
         }
         if good < self.file.metadata()?.len() {

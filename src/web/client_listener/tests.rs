@@ -79,7 +79,9 @@ async fn resource_accept_errors_wait_on_the_supplied_clock_then_keep_serving() {
 /// Construct a failed accept task without involving any installed server or external command.
 pub(crate) async fn failed_listener() -> (crate::test_support::TempDir, Listener) {
     let data = crate::test_support::TempDir::socket();
-    let core = Core::new(data.path().to_owned()).await.unwrap();
+    let core = Core::new(data.path().to_owned(), Arc::new(tokio::sync::Notify::new()))
+        .await
+        .unwrap();
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
     let health = Health::default();
     health.publish(Status::Listening);
@@ -199,6 +201,7 @@ async fn refuse_wildcard(inherit_as_loopback: bool) {
         root.path().to_owned(),
         Some(socket),
         Health::default(),
+        Arc::new(tokio::sync::Notify::new()),
     )
     .await
     .err()
@@ -218,4 +221,83 @@ async fn configured_wildcard_listener_is_a_typed_refusal_before_any_probe() {
 #[tokio::test]
 async fn inherited_wildcard_listener_is_a_typed_refusal_before_any_probe() {
     refuse_wildcard(true).await;
+}
+
+async fn assert_preparation_refusal(
+    bind: Option<SocketAddr>,
+    socket: Option<TcpListener>,
+    expected: InvalidListener,
+) {
+    let root = crate::test_support::TempDir::socket();
+    let error = Listener::prepare(
+        bind,
+        Codes::default(),
+        root.path().into(),
+        socket,
+        Health::default(),
+    )
+    .await
+    .err()
+    .expect("preparation must refuse before the forwarding probe");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<InvalidListener>()),
+        Some(&expected)
+    );
+}
+#[tokio::test]
+async fn alternate_loopback_address_has_typed_exact_binding_refusal() {
+    assert_preparation_refusal(
+        Some("127.0.0.5:0".parse().unwrap()),
+        None,
+        InvalidListener::NonLoopback,
+    )
+    .await;
+}
+#[tokio::test]
+async fn inherited_listener_without_bind_has_typed_refusal() {
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    assert_preparation_refusal(None, Some(socket), InvalidListener::Unconfigured).await;
+}
+#[tokio::test]
+async fn inherited_listener_port_mismatch_has_typed_refusal() {
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let actual = socket.local_addr().unwrap();
+    let expected = SocketAddr::from((
+        Ipv4Addr::LOCALHOST,
+        if actual.port() == u16::MAX {
+            1
+        } else {
+            actual.port() + 1
+        },
+    ));
+    assert_preparation_refusal(
+        Some(expected),
+        Some(socket),
+        InvalidListener::BindMismatch { expected, actual },
+    )
+    .await;
+}
+#[test]
+fn server_failure_wins_over_listener_shutdown_failure_and_logs_secondary_kind() {
+    let logs = crate::logging::capture_logs(|| {
+        let error = finish_shutdown(
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+            Err(io::Error::from_raw_os_error(libc::ENOMEM)),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    });
+    assert!(logs.contains("client.listener.shutdown_failed"));
+    assert!(logs.contains("OutOfMemory"));
+    assert!(logs.contains(&libc::ENOMEM.to_string()));
+    assert_eq!(
+        finish_shutdown(Ok(()), Err(io::Error::from_raw_os_error(libc::ENOMEM)))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ENOMEM)
+    );
+    assert!(finish_shutdown(Ok(()), Ok(())).is_ok());
 }

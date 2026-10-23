@@ -37,7 +37,8 @@ impl Default for StorageConfig {
         }
     }
 }
-fn stall_ms<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+/// Shared validation for the session silence threshold.
+pub(crate) fn stall_ms<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     let value = u64::deserialize(deserializer)?;
     if !(5_000..=3_600_000).contains(&value) {
         return Err(serde::de::Error::invalid_value(
