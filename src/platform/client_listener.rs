@@ -1,7 +1,7 @@
 //! Owned listening-socket descriptors exchanged by the live-handoff protocol.
 use std::{
     io,
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 /// Accept recovery classes shared by the listener owner and structured logging.
@@ -36,8 +36,8 @@ pub(crate) fn accept_failure(error: &io::Error) -> AcceptFailure {
     }
 }
 /// Duplicate without relinquishing the exporter's rollback ownership.
-// Used by the listener handoff owner when #1894 mounts the transport.
-#[allow(dead_code)]
+// Non-web builds transfer PTYs but do not adopt the optional TCP listener.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
 pub(crate) fn duplicate(listener: &TcpListener) -> io::Result<OwnedFd> {
     Ok(listener.try_clone()?.into())
 }
@@ -48,6 +48,8 @@ pub(crate) enum InvalidListener {
     Family,
     SocketType,
     NotListening,
+    /// The bound socket would permit exposure beyond IPv4 loopback.
+    NonLoopback,
 }
 impl std::fmt::Display for InvalidListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -56,13 +58,24 @@ impl std::fmt::Display for InvalidListener {
             Self::Family => "structured listener must use the IPv4 address family",
             Self::SocketType => "structured listener must be a stream socket",
             Self::NotListening => "structured listener socket is not listening",
+            Self::NonLoopback => "structured listener must bind IPv4 loopback",
         })
     }
 }
 impl std::error::Error for InvalidListener {}
+/// Refuse any address outside IPv4's loopback block, including wildcard binds.
+pub(crate) fn require_loopback(address: SocketAddr) -> io::Result<()> {
+    if !matches!(address,SocketAddr::V4(address) if address.ip().is_loopback()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            InvalidListener::NonLoopback,
+        ));
+    }
+    Ok(())
+}
 /// Consume the final owned descriptor, requiring IPv4, stream type and listening state.
-// Used by the listener handoff owner when #1894 mounts the transport.
-#[allow(dead_code)]
+// Non-web builds transfer PTYs but do not adopt the optional TCP listener.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
 pub(crate) fn take(fds: &mut Vec<RawFd>) -> io::Result<TcpListener> {
     let fd = fds
         .pop()
@@ -108,7 +121,9 @@ pub(crate) fn take(fds: &mut Vec<RawFd>) -> io::Result<TcpListener> {
     if let Some(reason) = refusal {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
     }
-    Ok(TcpListener::from(owned))
+    let listener = TcpListener::from(owned);
+    require_loopback(listener.local_addr()?)?;
+    Ok(listener)
 }
 /// # Safety
 /// The initialized output must be the POD layout for this socket option.
@@ -151,8 +166,8 @@ fn listening(fd: RawFd) -> io::Result<bool> {
 mod tests {
     use super::*;
     use std::os::fd::IntoRawFd;
-    #[test]
-    fn transferred_listener_keeps_the_port_and_is_close_on_exec() {
+    #[tokio::test]
+    async fn transferred_listener_keeps_the_port_and_is_close_on_exec() {
         let original = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = original.local_addr().unwrap();
         let mut descriptors = vec![duplicate(&original).unwrap().into_raw_fd()];
@@ -164,9 +179,19 @@ mod tests {
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
         drop(original);
         assert!(TcpListener::bind(address).is_err());
-        let _client = std::net::TcpStream::connect(address).unwrap();
         inherited.set_nonblocking(true).unwrap();
-        let _accepted = inherited.accept().unwrap();
+        let inherited = tokio::net::TcpListener::from_std(inherited).unwrap();
+        let _client = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .expect("connection producer stayed silent")
+        .unwrap();
+        let _accepted = tokio::time::timeout(std::time::Duration::from_secs(5), inherited.accept())
+            .await
+            .expect("connected peer never became accept-ready")
+            .unwrap();
     }
     #[test]
     fn duplicated_listener_has_owned_close_on_drop_semantics() {
@@ -237,5 +262,43 @@ mod family_tests {
     #[test]
     fn listening_ipv6_socket_is_refused_with_owned_descriptor_cleanup() {
         refused(TcpListener::bind("[::1]:0").unwrap().into_raw_fd());
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::*;
+    use std::os::fd::IntoRawFd;
+    #[test]
+    fn received_wildcard_listener_is_refused_and_closed() {
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let fd = listener.into_raw_fd();
+        let mut fds = vec![fd];
+        let error = take(&mut fds).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<InvalidListener>()),
+            Some(&InvalidListener::NonLoopback)
+        );
+        assert!(fds.is_empty());
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+    }
+    #[test]
+    fn loopback_exposure_boundary_is_the_entire_ipv4_loopback_block() {
+        for address in ["127.0.0.1:1", "127.0.1.2:1", "127.255.255.255:1"] {
+            require_loopback(address.parse().unwrap()).unwrap();
+        }
+        for address in ["0.0.0.0:1", "192.0.2.1:1", "[::1]:1"] {
+            let error = require_loopback(address.parse().unwrap()).unwrap_err();
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<InvalidListener>()),
+                Some(&InvalidListener::NonLoopback)
+            );
+        }
     }
 }
