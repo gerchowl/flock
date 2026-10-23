@@ -51,7 +51,7 @@ Flock only resumes panes that reported a native session reference through a curr
 
 After a client attaches and provides terminal size and theme context, Flock resumes eligible restored agent panes across workspaces and tabs without waiting for each pane to be focused.
 
-A deferred resume sets `resume_failed` only when spawning its shell or sending the resume command fails. That flag stops automatic retries in the current server; a cold server restart clears it and allows one fresh automatic attempt when restore conditions are met. Waiting for terminal theme context is a deferral, and an empty resume command is logged and skipped: neither sets the flag, so both remain eligible for reconsideration on later ticks.
+A deferred resume sets `resume_failed` when its command has no arguments, spawning its shell fails, or sending the resume command fails. That flag stops automatic retries in the current server; a cold server restart clears it and allows one fresh automatic attempt when restore conditions are met. An empty resume command is logged once for that automatic attempt, and its saved plan is retained. After that failure, agent info reports `blocked_reason: resume_failed`, and the plan remains resumable. Waiting for terminal theme context is a deferral: it does not set the flag and remains eligible for reconsideration on later ticks.
 
 Native session restore requires these Flock integration versions or newer:
 
@@ -110,3 +110,51 @@ During a handoff the old server briefly holds two descriptors per pane. On macOS
 | Server restart | No | Yes | Only with pane screen history | Only with native agent session restore |
 | Update without `--handoff` | Compatible servers keep running; restart-required servers may need stop/restart | Yes after restart | Only with pane screen history | Only with native agent session restore |
 | Update with `--handoff` | Best effort for supported running servers | Yes | Yes, from the live terminal if handoff succeeds | Yes, because the process keeps running if handoff succeeds |
+
+
+## Retained structured records
+
+Retained records are **DEAD** only by version-independent criteria: a non-object
+JSON element, or an exact canonical duplicate of a record already kept (live or
+retained). Canonical JSON sorts object keys and preserves JSON value types.
+Everything else this build cannot use is **FORWARD** and never automatically
+pruned. This includes supported-tag records with changed field shapes, unknown
+runtime/harness values, empty or odd identities, and non-identical conflicting
+records with the same agent ID, name or session ID. A rollback must not destroy
+a newer flk's data merely because this build cannot parse it.
+
+Every capture/save stamps newly retained records with `first_seen_ms` in Unix
+milliseconds. The stamp lives in the separate `structured_retention` snapshot
+field; preserved record JSON is unchanged. The sidecar binds each stamp to an
+array slot and a SHA-256 digest. Valid stamps and extra metadata survive cold
+restore, removal/compaction, repeated saves and live handoff. Invalid or newer
+metadata entries remain raw and are logged without their payloads. Older builds
+may discard the sidecar; a missing stamp gets a new conservative first-seen time
+at the next capture/save. Captures use an injected clock, stamp their snapshot
+copy and never prune. Only actual save/export boundaries prune the live registry.
+
+Saves remove DEAD records strictly older than 30 days
+(`RETAINED_DEAD_MAX_AGE`), then keep at most 256 (`RETAINED_DEAD_MAX`), pruning the
+oldest first. Equal timestamps use original record order. A backward clock does
+not age records early. A failed clock or an unknown sidecar collection format
+refuses automatic retention maintenance with a warning, preserving the data.
+FORWARD records have neither an automatic age limit nor an automatic count cap.
+A retained-only session, including opaque metadata, remains persistable.
+
+The operator list/purge commands and doctor reporting are tracked in #1853's
+second PR and are not available in this policy/persistence slice.
+
+### Repair an unknown collection shape
+
+A non-array `structured_agents` collection is preserved inactive. Admission
+fails closed with typed `UnsupportedCollectionShape`, directing you here. Other
+PTY workspaces still load; saves preserve the opaque collection.
+
+Back up `session.json` before making repairs. Inspect the backup with a binary
+that understands its format, preferably the version that wrote it. Never change
+or delete a running server's session file: it owns the in-memory copy and can
+overwrite an external edit. During an operator-controlled offline repair, restore
+a valid array from the backup or a compatible binary; preserve every record you
+do not understand. Do not replace an unknown collection with an empty array just
+to make admission succeed. Likewise preserve an unfamiliar `structured_retention`
+format until a compatible binary can interpret it.

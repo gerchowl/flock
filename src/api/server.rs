@@ -142,8 +142,8 @@ pub(crate) fn start_server_with_capabilities_and_health(
                 let capabilities = capabilities.clone();
                 let connection_running = Arc::clone(&listener_running);
                 let health = Arc::clone(&health);
-                let uid_policy = uid_policy.clone();
                 let client_listener = connection_status.clone();
+                let uid_policy = uid_policy.clone();
                 std::thread::spawn(move || {
                     if let Err(err) = handle_connection(
                         stream,
@@ -152,8 +152,8 @@ pub(crate) fn start_server_with_capabilities_and_health(
                         &connection_running,
                         capabilities,
                         &health,
-                        &uid_policy,
                         &client_listener,
+                        &uid_policy,
                     ) {
                         crate::logging::api_connection_failed(&err.to_string());
                     }
@@ -268,8 +268,8 @@ pub(crate) fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
-    uid_policy: &crate::structured::identity::UidPolicy,
     client_listener: &crate::api::client_listener::Health,
+    uid_policy: &crate::structured::identity::UidPolicy,
 ) -> std::io::Result<()> {
     let peer = crate::platform::peer::credentials(&stream);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
@@ -285,9 +285,9 @@ pub(crate) fn handle_connection(
         return Ok(());
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
+    let (request, credential) = match super::scoped::decode(line) {
         Ok(request) => request,
-        Err(err) => {
+        Err(detail) => {
             write_json_line_allow_disconnect(
                 &mut stream,
                 &ErrorResponse {
@@ -295,12 +295,32 @@ pub(crate) fn handle_connection(
                     error: ErrorBody {
                         data: None,
                         code: "invalid_request".into(),
-                        message: format!("invalid request: {err}"),
+                        message: detail.map_or_else(
+                            || "invalid request".into(),
+                            |error| format!("invalid request: {error}"),
+                        ),
                     },
                 },
             )?;
             return Ok(());
         }
+    };
+
+    let _scope = match credential {
+        Some(credential) => match super::scoped::Scope::enter(credential, peer, &request, api_tx) {
+            Ok(guard) => Some(guard),
+            Err(()) => {
+                return write_text_line_allow_disconnect(
+                    &mut stream,
+                    &error_response_json(
+                        request.id,
+                        crate::api::error_code::ErrorCode::NotAuthorized.as_str(),
+                        "scoped caller authentication refused".into(),
+                    ),
+                )
+            }
+        },
+        None => None,
     };
 
     let request_id = request.id.clone();
@@ -434,8 +454,8 @@ pub(crate) fn handle_connection(
                 capabilities,
                 peer,
                 listener_health,
-                uid_policy,
                 client_listener,
+                uid_policy,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             match &result {
@@ -465,8 +485,8 @@ fn handle_request(
     capabilities: Option<ServerCapabilities>,
     peer: crate::platform::peer::Credentials,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
-    uid_policy: &crate::structured::identity::UidPolicy,
     client_listener: &crate::api::client_listener::Health,
+    uid_policy: &crate::structured::identity::UidPolicy,
 ) -> String {
     match request.method {
         Method::Ping(_) => serde_json::to_string(&SuccessResponse {
@@ -551,6 +571,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PeersCheckoutPrepare(_) => "peers.checkout_prepare",
         Method::AgentList(_) => "agent.list",
         Method::AgentGet(_) => "agent.get",
+        Method::AgentStop(_) => "agent.stop",
         Method::AgentRead(_) => "agent.read",
         Method::AgentHistory(_) => "agent.history",
         Method::AgentResult(_) => "agent.result",
@@ -837,6 +858,12 @@ pub(super) fn should_stop_connection(
     stream: &mut UnixStream,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
+    if super::scoped::Scope::current()
+        .is_some_and(|scope| scope.caller() == crate::structured::lease::Caller::Uncertain)
+    {
+        return Ok(true);
+    }
+
     if !running.load(Ordering::Relaxed) {
         return Ok(true);
     }
@@ -883,6 +910,7 @@ pub(super) fn dispatch_to_app_with_timeout(
     timeout: Option<Duration>,
     peer: crate::platform::peer::Credentials,
 ) -> String {
+    let peer = super::scoped::Scope::current().map_or(peer, |scope| scope.peer());
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
@@ -891,6 +919,7 @@ pub(super) fn dispatch_to_app_with_timeout(
         peer_pid: peer.pid,
         peer_birth: peer.birth,
         peer_uid: peer.uid,
+        scope: super::scoped::Scope::current(),
     }) {
         return error_response_json(
             request_id,
@@ -987,8 +1016,8 @@ mod tests {
                     &connection_running,
                     None,
                     &health,
-                    &Default::default(),
                     &crate::api::client_listener::Health::default(),
+                    &Default::default(),
                 )
                 .unwrap();
                 running.store(false, Ordering::Relaxed);
@@ -1110,8 +1139,8 @@ mod tests {
                 None,
                 Default::default(),
                 &health,
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             );
             let response: serde_json::Value = serde_json::from_str(&response).unwrap();
             assert_eq!(response["result"]["api_listener"]["stopped"], true);
@@ -1342,8 +1371,8 @@ mod tests {
             None,
             crate::platform::peer::Credentials::default(),
             &Mutex::default(),
-            &app.runtime_config.uid_policy,
             &crate::api::client_listener::Health::default(),
+            &app.runtime_config.uid_policy,
         );
         let parsed: SuccessResponse = serde_json::from_str(&reply).unwrap();
         assert!(
@@ -1393,8 +1422,8 @@ mod tests {
                 None,
                 crate::platform::peer::Credentials::default(),
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &app.runtime_config.uid_policy,
-                &Default::default(),
             );
             let response: SuccessResponse = serde_json::from_str(&response).unwrap();
             let ResponseResult::Pong {
@@ -1445,8 +1474,8 @@ mod tests {
                 None,
                 crate::platform::peer::Credentials::default(),
                 &Mutex::default(),
-                &Default::default(),
                 health,
+                &Default::default(),
             );
             let reply: SuccessResponse = serde_json::from_str(&reply).unwrap();
             assert!(
@@ -1474,8 +1503,8 @@ mod tests {
             }),
             crate::platform::peer::Credentials::default(),
             &Mutex::default(),
-            &Default::default(),
             &crate::api::client_listener::Health::default(),
+            &Default::default(),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1499,8 +1528,8 @@ mod tests {
                 None,
                 Default::default(),
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             )
         });
 
@@ -1576,8 +1605,8 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1617,8 +1646,8 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1699,8 +1728,8 @@ mod tests {
             &running,
             None,
             &Mutex::default(),
-            &Default::default(),
             &crate::api::client_listener::Health::default(),
+            &Default::default(),
         )
         .unwrap();
         drop(api_tx);
@@ -1799,8 +1828,8 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             )
         });
 
@@ -1860,8 +1889,8 @@ mod tests {
                     &stop,
                     None,
                     &Mutex::default(),
-                    &Default::default(),
                     &crate::api::client_listener::Health::default(),
+                    &Default::default(),
                 )
             });
             client
@@ -1926,8 +1955,8 @@ mod tests {
                 &stop,
                 None,
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             )
         });
         client
@@ -1969,8 +1998,8 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             );
             done_tx.send(result).unwrap();
         });
