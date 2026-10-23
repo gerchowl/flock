@@ -35,6 +35,8 @@ pub(crate) use admission::Admission;
 
 /// Internal launch policy, supplied by authenticated admission in #1843.
 pub struct Launch {
+    /// Validated, nonce-framed MCP opening turn; CLI starts remain idle.
+    pub opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
     /// Stable registered identity.
     pub agent_id: String,
     /// Current registry epoch; replaced atomically by a fresh launch epoch.
@@ -76,6 +78,7 @@ struct Worker {
     finished: bool,
     events_closed: bool,
     stall_after: Duration,
+    lineage: Option<(String, u32)>,
     thread: Option<JoinHandle<()>>,
 }
 impl Worker {
@@ -158,6 +161,7 @@ impl Workers {
         prepare: impl FnOnce(&Record) -> Result<LaunchProfile, LaunchError> + Send + 'static,
     ) -> Result<u64, ErrorCode> {
         let Launch {
+            opening_turn,
             agent_id,
             generation: current,
             leases,
@@ -180,6 +184,12 @@ impl Workers {
                 return Err(ErrorCode::SessionBusy);
             }
         }
+        // Resume retains the original admission ancestry, including operator roots.
+        let lineage = self
+            .entries
+            .get(&agent_id)
+            .map_or(lineage, |w| w.lineage.clone());
+        let retained_lineage = lineage.clone();
         let record = registry
             .get(&agent_id)
             .filter(|(_, _, g)| *g == current)
@@ -264,7 +274,8 @@ impl Workers {
                     };
                     let event_notify = notify.clone();
                     let event_wake = wake.clone();
-                    runtime::run_controlled(
+                    let mut input_failed = false;
+                    let result = runtime::run_controlled(
                         &state,
                         (profile, mcp),
                         lease,
@@ -272,6 +283,14 @@ impl Workers {
                         |runtime| {
                             if cancelled.requested() {
                                 runtime.stop();
+                            } else if let Some(prompt) = &opening_turn {
+                                let user = serde_json::json!({"type":"user", "message":{
+                                    "role":"user", "content":prompt.as_argv_element()},
+                                    "parent_tool_use_id":null,"session_id":""});
+                                if runtime.try_submit(&user).is_err() {
+                                    input_failed = true;
+                                    runtime.stop();
+                                }
                             }
                             let _ = tx.try_send(Message::Ready(runtime));
                             notify.notify_one();
@@ -283,7 +302,12 @@ impl Workers {
                         },
                         cancelled.clone(),
                     )
-                    .map_err(|error| (error.code(), error.to_string()))
+                    .map_err(|error| (error.code(), error.to_string()));
+                    if input_failed {
+                        Err((ErrorCode::AgentStartFailed, "opening turn refused".into()))
+                    } else {
+                        result
+                    }
                 }))
                 .unwrap_or_else(|_| {
                     Err((
@@ -315,6 +339,7 @@ impl Workers {
                 finished: false,
                 events_closed: false,
                 stall_after,
+                lineage: retained_lineage,
                 thread: Some(thread),
             },
         );
@@ -334,8 +359,10 @@ impl Workers {
         let (_, _, current) = registry.get(id)?;
         (*generation == current).then_some(source)
     }
-    /// Cold recovery requires a quiescent producer and confirmed cleanup.
+    /// Cold recovery requires a joined producer without retained cleanup authority.
     /// Existing canonical history remains readable while a worker is active.
+    /// A finished worker without a report can recover once its thread is joined.
+    /// An explicit report retaining authority still defers recovery.
     pub(crate) fn history_recovery_allowed(&self, id: &str) -> bool {
         self.entries.get(id).is_none_or(|worker| {
             worker.finished
@@ -343,7 +370,7 @@ impl Workers {
                 && worker
                     .report
                     .as_ref()
-                    .is_some_and(|report| !report.authority_retained)
+                    .is_none_or(|report| !report.authority_retained)
         })
     }
     /// Install a closed-file source recovered on an I/O worker. A changed epoch,

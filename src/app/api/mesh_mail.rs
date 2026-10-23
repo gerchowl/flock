@@ -526,8 +526,8 @@ impl App {
     ) -> Result<(), String> {
         self.runtime_config.structured_mcp = server.and_then(|server| match server.session_mcp() {
             Ok(endpoint) => Some(endpoint),
-            Err(_) => {
-                crate::logging::structured_mcp_endpoint_unavailable();
+            Err(reason) => {
+                crate::logging::structured_mcp_endpoint_unavailable(reason);
                 None
             }
         });

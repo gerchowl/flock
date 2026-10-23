@@ -674,6 +674,7 @@ impl HeadlessServer {
             crate::session::data_dir(),
             inherited,
             self.client_wire_health.clone(),
+            self.app.render_notify.clone(),
         )
         .await?;
         if let Some(wire) = &self.client_wire {
@@ -1592,6 +1593,7 @@ impl HeadlessServer {
                 clone_detection_warning: self.app.clone_detection_warning.clone(),
                 agent_start_label: true,
                 agent_questions: true,
+                structured_agents: true,
                 pane_input_write_ack: false,
                 events_live_start: true,
             }),
@@ -3884,6 +3886,14 @@ impl HeadlessServer {
         self.app.state.app_client_attached = self.has_app_client();
         self.app.input_writes.service_due(now);
         let structured_changed = self.app.service_structured_workers(now);
+        #[cfg(feature = "web")]
+        if let Some(wire) = &mut self.client_wire {
+            wire.service(
+                &self.app.state.structured_agents,
+                &mut self.app.structured_workers,
+                &crate::session::data_dir(),
+            );
+        }
         self.app.start_ready_pastes();
         let mut changed = structured_changed;
 

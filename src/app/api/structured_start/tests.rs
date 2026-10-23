@@ -60,7 +60,6 @@ struct AdmissionFixture {
     app: App,
     server: Option<crate::api::ServerHandle>,
     socket: PathBuf,
-    _relative_root: Option<crate::structured::launch::SessionConfigDir>,
     fixture: Fixture,
     _env: Environment,
 }
@@ -89,14 +88,18 @@ impl AdmissionFixture {
         let mut path = vec![root.to_owned()];
         path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
         env.set("PATH", Some(std::env::join_paths(path).unwrap()));
-        let relative_root = relative.then(|| {
-            crate::structured::launch::SessionConfigDir::create(std::path::Path::new("."))
-                .expect("owned relative listener directory")
-        });
-        let socket = relative_root.as_ref().map_or_else(
-            || root.join("api.sock"),
-            |directory| PathBuf::from(directory.path().file_name().unwrap()).join("api.sock"),
-        );
+        let socket = if relative {
+            // guardrails-ok(hermetic): cwd is supplied by this owned subprocess fixture.
+            assert_eq!(
+                std::env::current_dir().unwrap(),
+                PathBuf::from(
+                    std::env::var_os("FLK_RELATIVE_FIXTURE_CWD").expect("owned child cwd")
+                )
+            );
+            PathBuf::from("relative.sock")
+        } else {
+            root.join("api.sock")
+        };
         env.set("FLOCK_SOCKET_PATH", Some(socket.clone().into()));
         fs::create_dir_all(crate::config::config_dir()).unwrap();
         let cwd = root.join("project");
@@ -113,6 +116,10 @@ impl AdmissionFixture {
         let script = fs::read_to_string(root.join("claude")).unwrap().replace(
             "assert sys.argv[1:] == json.loads((root / \"argv.json\").read_text()), \"argv drift\"",
             "assert sys.argv[1:4] == ['-p', '--input-format', 'stream-json']\nassert '--restricted' in sys.argv and '--strict-mcp-config' in sys.argv\nimport uuid\nuuid.UUID(sys.argv[sys.argv.index('--session-id') + 1])");
+        // Publish complete observed config atomically before readiness events.
+        let script = script.replace(
+            r#"(root / "observed-mcp.json").write_text(json.dumps(registration))"#,
+            "(root / \"observed-mcp.pending\").write_text(json.dumps(registration))\nos.replace(root / \"observed-mcp.pending\", root / \"observed-mcp.json\")");
         fixture.file("claude", script.as_bytes(), 0o700);
         let config: crate::config::Config = toml::from_str(&format!("[sessions]\nstall_ms = {stall_ms}\nblob_min_bytes = 64\n[structured]\nrun_as = 'operator'\nprofile = 'fixture'\ntoken_file = {:?}\n",root.join("token").to_str().unwrap())).unwrap();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -124,7 +131,16 @@ impl AdmissionFixture {
         let mut server = crate::api::server::start_server_with_capabilities(
             tx,
             hub.clone(),
-            None,
+            Some(crate::api::schema::ServerCapabilities {
+                structured_agents: true,
+                events_live_start: false,
+                live_handoff: false,
+                pane_input_write_ack: false,
+                node_id: None,
+                clone_detection_warning: None,
+                agent_start_label: true,
+                agent_questions: true,
+            }),
             policy.clone(),
         )
         .expect("ordinary listener startup");
@@ -138,7 +154,6 @@ impl AdmissionFixture {
             app,
             server: Some(server),
             socket,
-            _relative_root: relative_root,
             fixture,
             _env: env,
         };
@@ -551,10 +566,59 @@ async fn socket_structured_start_refuses_unavailable_launcher_and_unsupported_se
 /// Provisioning uses the actual listener handle and normal mesh initialization.
 #[tokio::test]
 async fn startup_with_relative_socket_keeps_legacy_routes_available() {
+    if std::env::var_os("FLK_RELATIVE_FIXTURE_CHILD").is_none() {
+        let cwd = crate::test_support::TempDir::socket();
+        let mut command = crate::process::TracedCommand::new(
+            std::env::current_exe().unwrap(),
+            "relative-socket-fixture",
+        );
+        command.args(["--exact", "app::api::structured_start::tests::startup_with_relative_socket_keeps_legacy_routes_available", "--nocapture", "--test-threads=1"])
+            .env_clear().env("PATH", std::env::var_os("PATH").unwrap())
+            .env("FLK_RELATIVE_FIXTURE_CHILD", "1")
+            .env("FLK_RELATIVE_FIXTURE_CWD", cwd.path())
+            .current_dir(cwd.path()).process_group(0);
+        let output = command
+            .output_traced_with_timeout_and_limit(LIMIT, 1024 * 1024)
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "relative socket fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fs::read_dir(cwd.path()).unwrap().next().is_none(),
+            "fixture listener must clean up"
+        );
+        return;
+    }
     let _guard = crate::config::test_config_env_guard();
     let mut fixture = AdmissionFixture::with_endpoint("s4-accepted-silent", 5000, true, false);
     assert!(!fixture.socket.is_absolute());
-    assert!(fixture.app.runtime_config.structured_mcp.is_some());
+    let (agent, generation) = fixture.start().await;
+    fixture.submit(&agent, generation);
+    let observed = fixture.fixture.root.path().join("observed-mcp.json");
+    let notify = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.structured_workers.poll(
+            &mut fixture.app.state.structured_agents,
+            Instant::now(),
+            1000,
+        );
+        observed.is_file()
+    })
+    .await;
+    let registered: Value = serde_json::from_slice(&fs::read(observed).unwrap()).unwrap();
+    let registered_socket = PathBuf::from(
+        registered["mcpServers"]["flock"]["env"]["FLOCK_SOCKET_PATH"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(registered_socket.is_absolute());
+    assert_eq!(
+        registered_socket.canonicalize().unwrap(),
+        fixture.socket.canonicalize().unwrap()
+    );
     let response = fixture
         .request(Method::AgentList(crate::api::schema::EmptyParams {}))
         .await;
@@ -594,7 +658,10 @@ async fn startup_with_unresolvable_endpoint_warns_and_only_structured_start_refu
         output.contains("structured.mcp.endpoint_unavailable"),
         "{output}"
     );
-    assert!(output.contains("server_unavailable"), "{output}");
+    assert!(
+        output.contains("structured_endpoint_restart_required"),
+        "{output}"
+    );
     assert!(!output.contains("private resolver detail canary"));
     let response = fixture
         .request(Method::AgentList(crate::api::schema::EmptyParams {}))
@@ -602,7 +669,37 @@ async fn startup_with_unresolvable_endpoint_warns_and_only_structured_start_refu
     assert_eq!(response["result"]["agents"], json!([]));
     let params: AgentStartParams = serde_json::from_value(json!({"name":"fixture-launch", "runtime":"structured", "argv":["claude"], "cwd":fixture.fixture.root.path().join("project")})).unwrap();
     let response = fixture.request(Method::AgentStart(params)).await;
-    assert_eq!(response["error"]["code"], "server_unavailable");
+    assert_eq!(
+        response["error"]["code"],
+        "structured_endpoint_restart_required"
+    );
     assert!(fixture.app.state.structured_agents.records().is_empty());
     assert!(!fixture.fixture.root.path().join("version.pid").exists());
+}
+
+#[test]
+fn endpoint_warning_has_a_closed_path_free_reason() {
+    for (failure, expected) in [
+        (crate::api::server::McpEndpointFailure::Exe, "exe"),
+        (crate::api::server::McpEndpointFailure::Socket, "socket"),
+    ] {
+        let capture = LogCapture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            crate::logging::structured_mcp_endpoint_unavailable(failure)
+        });
+        let bytes = capture.0.lock().unwrap().clone();
+        let log: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(log["fields"]["reason"], expected);
+        assert_eq!(
+            log["fields"]["event"],
+            "structured.mcp.endpoint_unavailable"
+        );
+        assert!(log["fields"].get("path").is_none());
+    }
 }

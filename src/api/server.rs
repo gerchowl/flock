@@ -30,11 +30,23 @@ const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 
+/// Fixed categories for optional MCP provisioning; never expose path details.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum McpEndpointFailure {
+    /// Executable lookup or validation failed.
+    Exe,
+    /// The bound listener cannot be resolved to an absolute endpoint.
+    Socket,
+}
+
 pub struct ServerHandle {
     _thread: Option<std::thread::JoinHandle<()>>,
-    /// Kernel executable lookup, independent of request-selected launch data.
+    /// Fixture-only executable failure injection.
+    #[cfg(test)]
     pub(crate) mcp_executable: fn() -> io::Result<PathBuf>,
     path: PathBuf,
+    // Resolved once at bind; None keeps ordinary startup available.
+    mcp_socket: Option<PathBuf>,
     pub(crate) node_id: Option<String>,
     pub(crate) clone_detection_warning: Option<String>,
     identity: SocketFileIdentity,
@@ -57,11 +69,17 @@ impl Drop for ServerHandle {
 
 impl ServerHandle {
     /// Pin MCP to this listener, independent of inherited client variables.
-    pub(crate) fn session_mcp(&self) -> std::io::Result<crate::structured::launch::SessionMcp> {
-        crate::structured::launch::SessionMcp::new(
-            &(self.mcp_executable)()?,
-            &std::path::absolute(&self.path)?,
-        )
+    pub(crate) fn session_mcp(
+        &self,
+    ) -> Result<crate::structured::launch::SessionMcp, McpEndpointFailure> {
+        let socket = self.mcp_socket.as_ref().ok_or(McpEndpointFailure::Socket)?;
+        #[cfg(test)]
+        let binary = (self.mcp_executable)();
+        #[cfg(not(test))]
+        let binary = std::env::current_exe();
+        let binary = binary.map_err(|_| McpEndpointFailure::Exe)?;
+        crate::structured::launch::SessionMcp::new(&binary, socket)
+            .map_err(|_| McpEndpointFailure::Exe)
     }
 
     /// Stop and join this fixture's owned listener, without signaling processes.
@@ -114,6 +132,7 @@ pub(crate) fn start_server_for_mode(
             clone_detection_warning: identity.clone_detection_warning.clone(),
             agent_start_label: true,
             agent_questions: true,
+            structured_agents: true,
             pane_input_write_ack: false,
             events_live_start: true,
         }),
@@ -147,6 +166,7 @@ pub(crate) fn start_server_with_capabilities_and_health(
     let path = socket_path();
     prepare_socket_path(&path)?;
 
+    let mcp_socket = std::path::absolute(&path).ok();
     let listener = UnixListener::bind(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
@@ -194,7 +214,9 @@ pub(crate) fn start_server_with_capabilities_and_health(
 
     Ok(ServerHandle {
         _thread: Some(thread),
+        #[cfg(test)]
         mcp_executable: std::env::current_exe,
+        mcp_socket,
         node_id,
         clone_detection_warning,
         path,
@@ -1577,6 +1599,7 @@ mod tests {
                 clone_detection_warning: None,
                 agent_start_label: true,
                 agent_questions: true,
+                structured_agents: true,
                 pane_input_write_ack: false,
                 events_live_start: false,
             }),
@@ -2427,5 +2450,36 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn endpoint_uses_the_bind_time_socket_and_classifies_socket_failure() {
+        let _guard = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        let socket = root.path().join("bound.sock");
+        let prior = std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR);
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &socket);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut server =
+            start_server_with_capabilities(tx, EventHub::default(), None, Default::default())
+                .unwrap();
+        if let Some(prior) = prior {
+            std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, prior);
+        } else {
+            std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        }
+        let expected = format!("{:?}", server.session_mcp().unwrap());
+        let bound = std::mem::replace(&mut server.path, root.path().join("later-path"));
+        let actual = format!("{:?}", server.session_mcp().unwrap());
+        server.path = bound;
+        server.mcp_socket = None;
+        let refused = matches!(server.session_mcp(), Err(McpEndpointFailure::Socket));
+        server.finish_for_test();
+        assert_eq!(
+            actual, expected,
+            "request-time cwd/path lookup must not replace the bound endpoint"
+        );
+        assert!(expected.contains(socket.to_str().unwrap()));
+        assert!(refused);
     }
 }

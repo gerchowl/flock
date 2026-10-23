@@ -417,6 +417,7 @@ fn mcp_stdio_handshake_and_tool_call_round_trip() {
         vec![
             "flock_agent_list",
             "flock_agent_get",
+            "flock_agent_stop",
             "flock_agent_read",
             "flock_agent_fork",
             "flock_agent_lineage",

@@ -1169,7 +1169,7 @@ impl AgentRuntime {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStartParams {
-    /// Explicit opt-in; the public route remains gated until #1843 part 3.
+    /// Explicit opt-in, sent only to a server advertising structured_agents.
     #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
     pub runtime: AgentRuntime,
     /// Structured model selector, never raw launch flags.
@@ -1237,6 +1237,12 @@ fn is_false(value: &bool) -> bool {
 /// `AgentStartParams`: no argv, no cwd, no pane placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSpawnParams {
+    /// Explicit structured opt-in, sent only after capability negotiation.
+    #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
+    pub runtime: AgentRuntime,
+    /// Structured model selector; PTY callers must omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Which agent to launch. A closed set — see `spawn::AgentKind`.
     pub agent: String,
     /// The child's opening turn. Passed to the agent as a single positional
@@ -2965,6 +2971,9 @@ pub struct ServerCapabilities {
     /// typed ring loss.
     #[serde(default)]
     pub events_live_start: bool,
+    /// Complete structured CLI/socket and narrowed MCP admission contract.
+    #[serde(default)]
+    pub structured_agents: bool,
     /// Enabled only after the complete server and client contract (#1639) ships.
     #[serde(default)]
     pub pane_input_write_ack: bool,
@@ -5786,6 +5795,7 @@ mod tests {
                     clone_detection_warning: None,
                     agent_start_label: true,
                     agent_questions: true,
+                    structured_agents: true,
                     pane_input_write_ack: false,
                     events_live_start: false,
                 }),
