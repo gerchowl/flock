@@ -823,7 +823,7 @@ fn pump(
     let blobs = super::blobs::BlobStore::open(&location.data_dir).map_err(io::Error::other)?;
     let threshold = location.storage.blob_min_bytes;
     let (mut file, mut seq, orphaned) = open_stream(location, cancel)?;
-    history.initialize(&file, seq)?;
+    history.initialize(&file, seq, file.metadata()?.len())?;
     let mut recorder = control::Recorder::new(
         &mut file,
         &mut seq,
@@ -1024,8 +1024,17 @@ fn persist(
         file.sync_data()?;
         let stored = Arc::new(record);
         storage.2.publish(stored.clone(), encoded.len())?;
-        record = Arc::unwrap_or_clone(stored);
-        record.raw = live_raw;
+        record = StreamRecord {
+            raw: live_raw,
+            seq: stored.seq,
+            known: stored.known,
+            shape: stored.shape.clone(),
+            received_at_ms: stored.received_at_ms,
+            origin: stored.origin,
+            result_subtype: stored.result_subtype.clone(),
+            permission_grant_request_id: stored.permission_grant_request_id.clone(),
+            permission_request_seq: stored.permission_request_seq,
+        };
     }
     if ends_turn || (origin == RecordOrigin::Flk && turn_end == "result") {
         uncertain.store(false, Ordering::Release);

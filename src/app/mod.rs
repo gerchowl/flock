@@ -171,6 +171,8 @@ pub(crate) const RECOVERY_PARK_LIMIT: Duration = Duration::from_secs(5);
 /// preserve normal command lookup through the server's PATH.
 #[derive(Default)]
 pub(crate) struct AppRuntimeConfig {
+    /// Owning listener endpoint, never supplied by an API caller.
+    pub(crate) structured_mcp: Option<crate::structured::launch::SessionMcp>,
     /// Command used by every app merge-evidence query, including workers.
     pub(crate) merge_gate: crate::worktree::MergeGateContext,
     /// Account lookup captured once, independent of caller-controlled requests.
@@ -193,6 +195,7 @@ impl AppRuntimeConfig {
             uid_policy.dedicated = Ok(None).into();
         }
         Self {
+            structured_mcp: None,
             merge_gate: Default::default(),
             uid_policy,
         }
@@ -4516,6 +4519,8 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_390".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -4692,6 +4697,8 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_390_explicit".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -4725,6 +4732,8 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_390_split".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -4750,6 +4759,8 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_398_active".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -4776,6 +4787,8 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_398_here".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -4871,6 +4884,8 @@ sidebar_pane_gap = 99
                 id: format!("req_agent_start_398_{index}"),
                 method: crate::api::schema::Method::AgentStart(
                     crate::api::schema::AgentStartParams {
+                        runtime: Default::default(),
+                        model: None,
                         label: None,
                         dry_run: false,
                         name: format!("worker-{index}"),
@@ -5340,6 +5355,8 @@ sidebar_pane_gap = 99
         };
 
         let base = || crate::api::schema::AgentStartParams {
+            runtime: Default::default(),
+            model: None,
             label: None,
             dry_run: false,
             name: "worker".into(),
@@ -5358,6 +5375,8 @@ sidebar_pane_gap = 99
         // `--active`: names the focused space, so there is something to split.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 dry_run: false,
                 active: true,
                 ..base()
@@ -5369,6 +5388,8 @@ sidebar_pane_gap = 99
         let response = attempt(&|app: &App| {
             let workspace_id = app.public_workspace_id(0);
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 dry_run: false,
                 workspace_id: Some(workspace_id),
                 ..base()
@@ -5380,6 +5401,8 @@ sidebar_pane_gap = 99
         let response = attempt(&|app: &App| {
             let tab_id = app.public_tab_id(0, 0).expect("a public tab id");
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 dry_run: false,
                 tab_id: Some(tab_id),
                 ..base()
@@ -5390,6 +5413,8 @@ sidebar_pane_gap = 99
         // `--cwd` naming an OPEN checkout: resolves to a space, so it splits it.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 dry_run: false,
                 cwd: Some(open_checkout.display().to_string()),
                 ..base()
@@ -5404,6 +5429,8 @@ sidebar_pane_gap = 99
         // `a_headless_start_naming_an_unopened_checkout_still_gets_a_space_of_its_own`.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 dry_run: false,
                 cwd: Some(unopened.display().to_string()),
                 ..base()
@@ -5437,6 +5464,8 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_398_precedence".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -5677,6 +5706,8 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_own_space".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),
@@ -5736,6 +5767,8 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_focus".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 label: None,
                 dry_run: false,
                 name: "worker".into(),

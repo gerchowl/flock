@@ -2554,9 +2554,7 @@ mod tests {
         assert!(requests.granted.is_empty());
     }
 
-    /// The same resolve, inside its budget: an error is still the server's own
-    /// refusal, reported with its words, and the latch has NOT been tripped —
-    /// so a later interruption still gets to say so once.
+    /// Pane-free records cannot supply a PTY sample for settled waits.
     #[test]
     fn structured_initial_record_refuses_pane_only_settled_wait() {
         let mut requests = Scripted::new(
@@ -2581,6 +2579,9 @@ mod tests {
         }
     }
 
+    /// The same resolve, inside its budget: an error is still the server's own
+    /// refusal, reported with its words, and the latch has NOT been tripped —
+    /// so a later interruption still gets to say so once.
     #[test]
     fn an_early_error_at_the_initial_resolve_is_the_servers_refusal() {
         let mut requests = Scripted::new(

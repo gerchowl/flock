@@ -2945,7 +2945,9 @@ fn write_permission_crash_prefix(
     let (mut file, mut seq) = (opened.0, opened.1);
     let blobs = super::super::blobs::BlobStore::open(root.path()).unwrap();
     let history = super::super::history::History::default();
-    history.initialize(&file, seq).unwrap();
+    history
+        .initialize(&file, seq, file.metadata().unwrap().len())
+        .unwrap();
     for audit in audits {
         let line = serde_json::to_vec(&serde_json::to_value(audit).unwrap()).unwrap();
         persist(

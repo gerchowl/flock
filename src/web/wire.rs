@@ -1,5 +1,6 @@
 //! Server-owned, opt-in structured transport; no PTY or model dispatch.
 mod output;
+mod subscriptions;
 pub(crate) mod timing;
 use crate::{
     api::client_tokens::Bearer,
@@ -30,6 +31,10 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 const MAX_MESSAGE: usize = 65_536;
 /// Upgraded socket cap, including pending hellos.
 const CONNECTIONS: u32 = 16;
+/// Pending unauthenticated sockets; leave capacity for authenticated sessions.
+const PENDING_HELLOS: usize = 4;
+/// Registered sockets per verified token principal, including pending welcome.
+const PRINCIPAL_CONNECTIONS: usize = 4;
 /// Maximum queued control messages per socket.
 const PRIORITY_CAPACITY: usize = 4;
 /// Maximum queued data messages per socket.
@@ -48,16 +53,18 @@ const POLICY_VIOLATION_CLOSE: u16 = 1008;
 struct Client {
     session: Session,
     // The command slice enforces version gating before allocation.
+    #[allow(dead_code)]
     read_only: bool,
-    // The replay slice supplies bounded data through this same writer.
-    data: mpsc::Sender<ServerFrame>,
+    data: mpsc::Sender<output::Delivery>,
     revoke: watch::Sender<bool>,
 }
 struct Shared {
+    histories: crate::structured::history::owner::Client,
     store: Arc<TokenStore>,
     epoch: String,
     clock: Arc<dyn Clock>,
     slots: Arc<Semaphore>,
+    hellos: Arc<Semaphore>,
     clients: Mutex<HashMap<u64, Client>>,
     next: AtomicU64,
     stop: watch::Sender<bool>,
@@ -77,6 +84,7 @@ impl Drop for Lease {
 /// Unmounted protocol core. The listener slice owns HTTP hosting guards and binding.
 /// Dropping the owner cancels every handshake and authenticated socket.
 pub(crate) struct Core {
+    owner: crate::structured::history::owner::Owner,
     shared: Arc<Shared>,
 }
 impl Drop for Core {
@@ -86,35 +94,53 @@ impl Drop for Core {
 }
 impl Core {
     /// New server epoch, independent of durable stream cursors or command identities.
-    pub(crate) async fn new(data: PathBuf) -> io::Result<Self> {
+    pub(crate) async fn new(data: PathBuf, wake: Arc<tokio::sync::Notify>) -> io::Result<Self> {
         let store = super::store_io::shared()
             .run(move || TokenStore::open(&data))
             .await
             .ok_or_else(|| io::Error::other("client token store worker unavailable"))?
             .map_err(io::Error::other)?;
-        Self::with_clock(store, Arc::new(SystemClock))
+        Self::with_clock(store, Arc::new(SystemClock), wake)
     }
     /// Embed with a supplied monotonic clock; deadlines never use wall-clock time.
-    pub(crate) fn with_clock(store: TokenStore, clock: Arc<dyn Clock>) -> io::Result<Self> {
+    pub(crate) fn with_clock(
+        store: TokenStore,
+        clock: Arc<dyn Clock>,
+        wake: Arc<tokio::sync::Notify>,
+    ) -> io::Result<Self> {
         let epoch = store.random::<16>().map_err(io::Error::other)?;
         let (stop, _) = watch::channel(false);
+        let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
+            owner,
             shared: Arc::new(Shared {
+                histories,
                 store: Arc::new(store),
                 epoch,
                 clock,
                 slots: Arc::new(Semaphore::new(CONNECTIONS as usize)),
+                hellos: Arc::new(Semaphore::new(PENDING_HELLOS)),
                 clients: Mutex::new(HashMap::new()),
                 next: AtomicU64::new(1),
                 stop,
             }),
         })
     }
+    /// Service the bounded history mailbox from the registry-owning app loop.
+    pub(crate) fn service(
+        &mut self,
+        registry: &crate::structured::registry::Registry,
+        workers: &mut crate::structured::workers::Workers,
+        root: &std::path::Path,
+    ) {
+        self.owner.service(registry, workers, root);
+    }
     /// Mount only behind S2b-mount's loopback, Host/Origin and funnel guards.
     pub(crate) fn router(&self) -> Router {
         Router::new().route("/v1/ws", get(upgrade).with_state(self.shared.clone()))
     }
     /// Later dispatch calls after writing the triggering auth_revoked acknowledgement.
+    #[allow(dead_code)]
     pub(crate) fn revoke(&self, session: &Session) {
         if let Ok(clients) = self.shared.clients.lock() {
             for client in clients.values() {
@@ -142,11 +168,14 @@ async fn upgrade(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> Res
     let Ok(permit) = shared.slots.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Ok(hello) = shared.hellos.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     ws.max_frame_size(MAX_MESSAGE)
         .max_message_size(MAX_MESSAGE)
         .write_buffer_size(0)
         .max_write_buffer_size(WRITE_BUFFER_BYTES)
-        .on_upgrade(move |socket| connection(socket, shared, permit))
+        .on_upgrade(move |socket| connection(socket, shared, permit, hello))
 }
 async fn before<T>(
     clock: &dyn Clock,
@@ -170,15 +199,15 @@ async fn authenticate(
         .await
         .ok_or(HandshakeFailure::Unavailable)?
     else {
-        return Err(HandshakeFailure::Revoked);
+        return Err(HandshakeFailure::Refused);
     };
     let ClientFrame::Hello {
         protocol,
         client: _,
         token: Some(token),
-    } = serde_json::from_str(&text).map_err(|_| HandshakeFailure::Revoked)?
+    } = serde_json::from_str(&text).map_err(|_| HandshakeFailure::Refused)?
     else {
-        return Err(HandshakeFailure::Revoked);
+        return Err(HandshakeFailure::Refused);
     };
     let token = Bearer(token);
     let session = verify(shared, end, token.clone()).await?;
@@ -186,12 +215,29 @@ async fn authenticate(
 }
 /// Handshake failures carry credential evidence separately from availability.
 enum HandshakeFailure {
-    /// A credential does not authenticate or its verified principal was revoked.
-    Revoked,
+    /// Malformed/tokenless hello, or a credential/authentication-scope refusal.
+    Refused,
     /// Verification capacity, store I/O or the original handshake deadline failed.
     Unavailable,
     /// Welcome encoding or socket delivery failed; no auth conclusion is possible.
     Transport,
+}
+impl From<TokenError> for HandshakeFailure {
+    fn from(error: TokenError) -> Self {
+        match error {
+            TokenError::Unauthorized | TokenError::Revoked | TokenError::Scope => Self::Refused,
+            TokenError::Busy | TokenError::Unsafe | TokenError::Io(_) => Self::Unavailable,
+        }
+    }
+}
+impl HandshakeFailure {
+    fn hello_code(self) -> Option<u16> {
+        match self {
+            Self::Refused => Some(AUTH_REFUSED_CLOSE),
+            Self::Unavailable => Some(GOING_AWAY_CLOSE),
+            Self::Transport => None,
+        }
+    }
 }
 async fn verify(shared: &Shared, end: Instant, token: Bearer) -> Result<Session, HandshakeFailure> {
     let store = shared.store.clone();
@@ -203,12 +249,7 @@ async fn verify(shared: &Shared, end: Instant, token: Bearer) -> Result<Session,
     .await
     .flatten()
     .ok_or(HandshakeFailure::Unavailable)?
-    .map_err(|error| match error {
-        TokenError::Unauthorized | TokenError::Revoked => HandshakeFailure::Revoked,
-        TokenError::Scope | TokenError::Busy | TokenError::Unsafe | TokenError::Io(_) => {
-            HandshakeFailure::Unavailable
-        }
-    })
+    .map_err(HandshakeFailure::from)
 }
 /// Complete the registered handshake under its original ADR-0036 §5a deadline.
 async fn finish_welcome<S: Sink<Message> + Unpin>(
@@ -230,19 +271,24 @@ async fn finish_welcome<S: Sink<Message> + Unpin>(
     };
     let accepted = tokio::select! { biased;
         _ = stop.changed() => return false,
-        _ = revoked.changed() => Err(HandshakeFailure::Revoked),
+        _ = revoked.changed() => Err(HandshakeFailure::Refused),
         sent = before(clock, end, ready) => sent.unwrap_or(Err(HandshakeFailure::Unavailable)),
     };
     let code = match accepted {
         Ok(()) => return true,
-        Err(HandshakeFailure::Revoked) => AUTH_REVOKED_CLOSE,
+        Err(HandshakeFailure::Refused) => AUTH_REVOKED_CLOSE,
         Err(HandshakeFailure::Unavailable) => GOING_AWAY_CLOSE,
         Err(HandshakeFailure::Transport) => return false,
     };
     let _ = socket.send(close(code)).now_or_never();
     false
 }
-async fn connection(mut socket: WebSocket, shared: Arc<Shared>, permit: OwnedSemaphorePermit) {
+async fn connection(
+    mut socket: WebSocket,
+    shared: Arc<Shared>,
+    permit: OwnedSemaphorePermit,
+    hello: OwnedSemaphorePermit,
+) {
     let Ok(id) = shared
         .next
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -263,10 +309,8 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     let (session, read_only, token) = match session {
         Ok(session) => session,
         Err(failure) => {
-            let code = match failure {
-                HandshakeFailure::Revoked => AUTH_REFUSED_CLOSE,
-                HandshakeFailure::Unavailable => GOING_AWAY_CLOSE,
-                HandshakeFailure::Transport => return,
+            let Some(code) = failure.hello_code() else {
+                return;
             };
             let _ = socket.send(close(code)).now_or_never();
             return;
@@ -277,6 +321,15 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     let (data, data_rx) = mpsc::channel(DATA_CAPACITY);
     let (revoke, mut revoked) = watch::channel(false);
     if let Ok(mut clients) = shared.clients.lock() {
+        if clients
+            .values()
+            .filter(|c| c.session.info.principal == principal)
+            .count()
+            >= PRINCIPAL_CONNECTIONS
+        {
+            let _ = socket.send(close(GOING_AWAY_CLOSE)).now_or_never();
+            return;
+        }
         clients.insert(
             id,
             Client {
@@ -301,8 +354,9 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     let confirmed = async {
         let session = verify(&shared, end, token).await?;
         if session.info.principal != principal || *registered.borrow() {
-            return Err(HandshakeFailure::Revoked);
+            return Err(HandshakeFailure::Refused);
         }
+        drop(hello);
         Ok(())
     };
     if !finish_welcome(
@@ -320,6 +374,15 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     let (sink, mut stream) = socket.split();
     let writer = output::writer(sink, shared.clock.clone(), priority_rx, data_rx);
     tokio::pin!(writer);
+    let Some((data, session)) = shared.clients.lock().ok().and_then(|clients| {
+        clients
+            .get(&id)
+            .map(|client| (client.data.clone(), client.session.clone()))
+    }) else {
+        return;
+    };
+    let mut subscriptions =
+        subscriptions::Subscriptions::new(shared.clone(), data, session, priority.clone());
     let mut heartbeat = Heartbeat::new(shared.clock.now());
     let code = loop {
         tokio::select! { biased;
@@ -335,6 +398,10 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str(&text) {
                     Ok(ClientFrame::Pong { nonce }) => heartbeat.pong(&nonce, shared.clock.now()),
+                    Ok(ClientFrame::Sub { sub_id, stream, after }) => {
+                        if !subscriptions.subscribe(sub_id, stream, after) { break GOING_AWAY_CLOSE }
+                    }
+                    Ok(ClientFrame::Unsub { sub_id }) => subscriptions.unsubscribe(&sub_id),
                     _ => break POLICY_VIOLATION_CLOSE,
                 },
                 Some(Ok(Message::Binary(_))) => break POLICY_VIOLATION_CLOSE,

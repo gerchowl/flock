@@ -262,3 +262,222 @@ async fn structured_stop_requires_operator_or_owning_lease_identity() {
         "operator_only"
     );
 }
+
+#[tokio::test]
+async fn missing_structured_metadata_is_a_typed_internal_error_not_a_panic() {
+    assert_eq!(
+        app().structured_info("missing").unwrap_err(),
+        ErrorCode::InternalError
+    );
+}
+
+#[test]
+fn stop_authority_excludes_pty_agents_and_lineage_parents() {
+    let pane = crate::workspace::Workspace::test_new("fixture").tabs[0]
+        .layout
+        .pane_ids()[0];
+    let target = "structured-fixture";
+    assert!(!may_stop(
+        SpawnCaller::Agent {
+            ws_idx: 0,
+            pane_id: pane,
+            agent_id: target.into()
+        },
+        target
+    ));
+    assert!(!may_stop(
+        SpawnCaller::Structured {
+            agent_id: Some("parent-agent".into()),
+            depth: 0
+        },
+        target
+    ));
+    assert!(!may_stop(
+        SpawnCaller::Structured {
+            agent_id: None,
+            depth: 0
+        },
+        target
+    ));
+    assert!(may_stop(
+        SpawnCaller::Structured {
+            agent_id: Some(target.into()),
+            depth: 0
+        },
+        target
+    ));
+    assert!(may_stop(SpawnCaller::Operator { pane: None }, target));
+}
+
+/// The narrowed scoped wire is fresh-only; Unknown metadata remains fenced.
+#[tokio::test]
+async fn scoped_structured_spawn_never_resumes_an_existing_identity() {
+    for unknown in [false, true] {
+        scoped_spawn_refusal(
+            unknown,
+            "fixture-agent",
+            false,
+            if unknown {
+                "structured_recovery_required"
+            } else {
+                "agent_name_taken"
+            },
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn scoped_structured_spawn_refuses_unattended() {
+    scoped_spawn_refusal(false, "fresh-agent", true, "runtime_unsupported").await;
+}
+
+#[tokio::test]
+async fn scoped_structured_spawn_reserves_self() {
+    scoped_spawn_refusal(false, "self", false, "invalid_agent_name").await;
+}
+
+async fn scoped_spawn_refusal(unknown: bool, name: &str, unattended: bool, expected: &str) {
+    let (leases, _lease, scope, peer) = crate::api::scoped::tests::live_scope();
+    let mut app = app();
+    app.session_leases = leases;
+    app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+        operator: peer.uid.unwrap(),
+        dedicated: Ok(None).into(),
+    };
+    app.state.config.fleet.agent_spawn_enabled = true;
+    app.state.workspaces = vec![crate::workspace::Workspace::test_new("scoped-fresh")];
+    app.state.ensure_test_terminals();
+    register(&mut app);
+    if unknown {
+        app.state
+            .structured_agents
+            .restore_handoff_unknown(&["structured-fixture".into()]);
+    }
+    let generation = app
+        .state
+        .structured_agents
+        .get("structured-fixture")
+        .unwrap()
+        .2;
+    let workspace = app.public_workspace_id(0);
+    let request: Request =
+            serde_json::from_value(json!({"id":"scoped-fresh", "method":"agent.spawn",
+            "params":{"runtime":"structured", "agent":"claude", "name":name, "unattended":unattended,
+            "prompt":"fresh task", "location":{"kind":"workspace_id","workspace_id":workspace}}}))
+            .unwrap();
+    let (respond_to, response) = std::sync::mpsc::channel();
+    app.handle_api_request_message(crate::api::ApiRequestMessage {
+        request,
+        respond_to,
+        peer_pid: peer.pid,
+        peer_birth: peer.birth,
+        peer_uid: peer.uid,
+        scope: Some(scope),
+    });
+    let result: Value = serde_json::from_str(
+        &response
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["error"]["code"], expected);
+    assert_eq!(
+        app.state
+            .structured_agents
+            .get("structured-fixture")
+            .unwrap()
+            .2,
+        generation
+    );
+    assert_eq!(app.state.structured_agents.records().len(), 1);
+}
+
+/// Existing history is operator-only, including self and unresolved agent callers.
+#[tokio::test]
+async fn structured_resume_refuses_every_agent_before_admission() {
+    for identity in [Some("other-agent"), Some("structured-fixture"), None] {
+        let mut app = app();
+        register(&mut app);
+        let params = serde_json::from_value(
+            json!({"name":"fixture-agent", "runtime":"structured", "argv":["claude"]}),
+        )
+        .unwrap();
+        let caller = SpawnCaller::Structured {
+            agent_id: identity.map(str::to_owned),
+            depth: 0,
+        };
+        let error = app.start_structured(params, &caller).unwrap_err();
+        assert_eq!(error, ErrorCode::OperatorOnly);
+        assert_eq!(
+            app.state
+                .structured_agents
+                .get("structured-fixture")
+                .unwrap()
+                .2,
+            1
+        );
+    }
+    let mut app = app();
+    register(&mut app);
+    let params = serde_json::from_value(
+        json!({"name":"fixture-agent", "runtime":"structured", "argv":["claude"]}),
+    )
+    .unwrap();
+    let caller = SpawnCaller::Agent {
+        ws_idx: 0,
+        pane_id: crate::workspace::Workspace::test_new("resume").tabs[0]
+            .layout
+            .pane_ids()[0],
+        agent_id: "structured-fixture".into(),
+    };
+    assert_eq!(
+        app.start_structured(params, &caller).unwrap_err(),
+        ErrorCode::OperatorOnly
+    );
+}
+
+/// The server boundary also refuses a relay bypassing the CLI transport filter.
+#[tokio::test]
+async fn structured_resume_refuses_a_recorded_mesh_edge() {
+    let mut app = app();
+    register(&mut app);
+    let pid = std::process::id();
+    let birth = crate::platform::process_start_time(pid).unwrap();
+    app.inbound
+        .attach(pid, birth, crate::platform::process_start_time)
+        .unwrap();
+    app.current_api_peer_pid = Some(pid);
+    let params = serde_json::from_value(
+        json!({"name":"fixture-agent", "runtime":"structured", "argv":["claude"]}),
+    )
+    .unwrap();
+    assert_eq!(
+        app.start_structured(params, &SpawnCaller::Operator { pane: None })
+            .unwrap_err(),
+        ErrorCode::OperatorOnly
+    );
+}
+
+/// Missing ancestry cannot promote a dedicated, unknown or unreadable UID.
+#[tokio::test]
+async fn structured_resume_refuses_nonoperator_uid_without_ancestry() {
+    for uid in [None, Some(42), Some(43)] {
+        let mut app = app();
+        register(&mut app);
+        app.current_api_peer_uid = Some(uid);
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: 41,
+            dedicated: Ok(Some(42)).into(),
+        };
+        let params = serde_json::from_value(
+            json!({"name":"fixture-agent", "runtime":"structured", "argv":["claude"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            app.start_structured(params, &SpawnCaller::Operator { pane: None })
+                .unwrap_err(),
+            ErrorCode::OperatorOnly
+        );
+    }
+}

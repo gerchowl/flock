@@ -540,6 +540,8 @@ export class WireConnection {
         return before.principal !== after.principal || before.capabilities.join() !== after.capabilities.join();
       case "operator_only":
         return before.principal !== after.principal;
+      case "invalid_agent":
+        return false;
       case "unknown_stream":
         return before.server_version !== after.server_version;
       case "cursor_ahead":
@@ -624,6 +626,7 @@ export class WireConnection {
         sub.handler.synced();
         return this.#settle();
       case "lagged":
+        // `skipped_to` is diagnostic only. Resume from the applied cursor.
         // `lagged` closes the id on the server, like `subfail`.
         this.#resub(sub, false);
         return this.#changed();
