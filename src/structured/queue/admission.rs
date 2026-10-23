@@ -191,6 +191,13 @@ impl Admission {
         })?;
         Ok(())
     }
+    /// Settle one retained item without rewriting its body or changing identity.
+    pub(super) fn fail_item(&mut self, item_id: String, reason: ErrorCode) -> Result<(), Failure> {
+        self.commit(Change::Fail {
+            item_id,
+            reason: reason.as_str().into(),
+        })
+    }
     fn eligible(&self, item: &Item, now_ms: u64) -> bool {
         !self.journal.opaque.contains(&item.item_id)
             && item.state == State::Queued

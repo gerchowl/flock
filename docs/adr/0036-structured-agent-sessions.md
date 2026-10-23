@@ -3331,6 +3331,15 @@ queue's message frame. It never uses direct stdin or command admission.
 CLI starts enqueue no opening turn. Refused admission reports the queue's typed
 refusal code, or `agent_start_failed` for other launch failures, and publishes
 no Ready runtime or partial harness process.
+Until stdin accepts that item, the owner retains a settlement guard. Startup
+failure terminally fails it with `agent_start_failed` through the existing queue
+Fail record. Its internal `opening_turn` metadata also fences an unresolved
+queued opening on reopen: settlement must commit before that generation may
+serve input. Failed settlement is logged with its typed code; reopening attempts
+the terminal write before delivery rather than replaying an old opening prompt.
+After accepted input, ordinary result and unresolved-turn recovery apply.
+A failed stdin offer requests supervisor stop even if transport cancellation has
+not yet happened (ADR-0036 §3/§4); busy and uncertain-turn pending remain waits.
 
 Both routes share App admission and the Workers owner reservation from parts
 2a/2b. MCP uses Spawn policy, including explicit node opt-in and attested caller

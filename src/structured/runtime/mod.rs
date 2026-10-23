@@ -578,7 +578,9 @@ fn collect(
             if !queue.flush(control.cancelled(), notify) {
                 return false;
             }
-            if queue.tick(&input, stop.requested(), notify) && control.cancelled() {
+            // ADR-0036 §3/§4: a failed stdin offer ends this runtime's authority.
+            // Do not wait for I/O cancellation before supervising its cleanup.
+            if queue.tick(&input, stop.requested(), notify) {
                 stop.request();
             }
             queue.flush(control.cancelled(), notify)
@@ -617,7 +619,7 @@ fn collect(
                         facts.delivery_cancelled = true;
                     }
                     if let Some(queue) = &mut queue {
-                        if queue.event(&input, &received, stop.requested()) && control.cancelled() {
+                        if queue.event(&input, &received, stop.requested()) {
                             stop.request();
                         }
                     }

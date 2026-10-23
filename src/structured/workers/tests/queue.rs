@@ -873,3 +873,244 @@ async fn cli_start_admits_no_opening_item_or_input() {
         .items()
         .is_empty());
 }
+
+#[tokio::test]
+async fn failed_spawn_settles_opening_and_resume_never_delivers_it() {
+    let (mut registry, mut workers, notify, _) = owner();
+    let (mut case, mut launch, factory) = Case::prepare(&mut registry, 243, "queue", vec![]);
+    let binary = fs::read(case.fixture.root.path().join("claude")).unwrap();
+    launch.opening_turn = Some((
+        "attested-starter".into(),
+        crate::spawn::prompt::SpawnPrompt::compose("stale opening").unwrap(),
+    ));
+    let f = case.fixture.clone();
+    case.generation = workers
+        .start(&mut registry, launch, move |record| {
+            let profile = factory(record)?;
+            let p = f.root.path().join("case.json");
+            let mut value: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+            value["version"] = json!("remove");
+            fs::write(p, serde_json::to_vec(&value).unwrap()).unwrap();
+            Ok(profile)
+        })
+        .unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&case.id, case.generation).is_some()
+    })
+    .await;
+    assert!(workers
+        .report(&case.id, case.generation)
+        .unwrap()
+        .result
+        .is_err());
+    assert!(workers.runtime(&case.id, case.generation).is_none());
+    let journal = Journal::open(case.fixture.root.path(), &case.id).unwrap();
+    assert_eq!(journal.items().len(), 1);
+    assert_eq!(
+        journal.items()[0].state,
+        State::Failed,
+        "failed start left an eligible opening"
+    );
+    assert_eq!(journal.items()[0].metadata["refusal"], "agent_start_failed");
+    drop(journal);
+    assert!(!case.leases.is_reserved(&case.session).unwrap());
+    let listener = UnixListener::bind(case.fixture.root.path().join("queue.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let threshold = default_policy(&case);
+    case.fixture.file("claude", &binary, 0o700);
+    let launch = Launch {
+        opening_turn: None,
+        agent_id: case.id.clone(),
+        generation: case.generation,
+        leases: case.leases.clone(),
+        state: case.fixture.root.path().to_owned(),
+        storage: Default::default(),
+        mcp: case.fixture.mcp(),
+        admission: None,
+        stall_after: STALL,
+        queue_rewrite_bytes: threshold,
+        lineage: None,
+    };
+    case.generation = workers
+        .start(&mut registry, launch, case.factory("queue", vec![]))
+        .unwrap();
+    let mut driver = None;
+    let mut updates = vec![];
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        while let Some(update) = workers.queue_update(&registry, &case.id, case.generation) {
+            updates.push(update);
+        }
+        assert!(workers.report(&case.id, case.generation).is_none());
+        match listener.accept() {
+            Ok((stream, _)) => {
+                driver = Some(stream);
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("resume handshake: {e}"),
+        }
+    })
+    .await;
+    let driver = driver.unwrap();
+    driver.set_write_timeout(Some(LIMIT)).unwrap();
+    let mut r = Run {
+        registry,
+        workers,
+        notify,
+        case,
+        driver,
+        updates,
+        threshold,
+    };
+    r.control(json!({"op":"barrier","after_count":0}));
+    r.until(|r| r.raws().iter().any(|v| v["type"] == "fixture_barrier"))
+        .await;
+    assert!(
+        r.inputs().is_empty(),
+        "resume delivered a failed launch's opening"
+    );
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn oversized_opening_admission_refuses_without_mutation_or_ready() {
+    let (mut registry, mut workers, notify, _) = owner();
+    let (mut case, mut launch, factory) = Case::prepare(&mut registry, 244, "queue", vec![]);
+    // The valid empty journal can open; this refusal must come from admission.
+    let (owner, _) =
+        owner_queue::Service::open(case.fixture.root.path(), &case.id, default_policy(&case))
+            .unwrap();
+    drop(owner);
+    let before = fs::read(path(&case)).unwrap();
+    launch.opening_turn = Some((
+        "a".repeat(2 * 1024 * 1024),
+        crate::spawn::prompt::SpawnPrompt::compose("bounded task").unwrap(),
+    ));
+    case.generation = workers.start(&mut registry, launch, factory).unwrap();
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        workers.report(&case.id, case.generation).is_some()
+    })
+    .await;
+    assert_eq!(
+        workers
+            .report(&case.id, case.generation)
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap_err()
+            .0,
+        ErrorCode::InvalidRequest
+    );
+    assert!(
+        workers.entries[&case.id].runtime.is_none(),
+        "refusal published Ready"
+    );
+    assert!(workers.entries[&case.id].thread.is_none());
+    assert!(!case.leases.is_reserved(&case.session).unwrap());
+    assert!(!case.fixture.root.path().join("model.pid").exists());
+    assert_eq!(fs::read(path(&case)).unwrap(), before);
+}
+
+#[test]
+fn reopening_refuses_an_unresolved_opening_before_any_delivery() {
+    use crate::structured::queue::admission::Admission;
+    let (mut registry, _, _, _) = owner();
+    let (case, _, _) = Case::prepare(&mut registry, 246, "queue", vec![]);
+    let mut admission = Admission::new(
+        Journal::open(case.fixture.root.path(), &case.id).unwrap(),
+        8,
+    )
+    .unwrap();
+    let mut input = request(246).item;
+    input.kind = Kind::Message;
+    input.metadata.insert("opening_turn".into(), json!(true));
+    admission
+        .enqueue(
+            input,
+            QueuePrincipal::Origin(crate::structured::queue::model::Producer::Agent(
+                "attested-starter".into(),
+            )),
+            Gate::Send,
+        )
+        .unwrap();
+    drop(admission);
+    let (service, _) =
+        owner_queue::Service::open(case.fixture.root.path(), &case.id, default_policy(&case))
+            .unwrap();
+    drop(service);
+    let journal = Journal::open(case.fixture.root.path(), &case.id).unwrap();
+    assert_eq!(journal.items()[0].state, State::Failed);
+    assert_eq!(journal.items()[0].metadata["refusal"], "agent_start_failed");
+}
+
+#[tokio::test]
+async fn older_input_cannot_disarm_opening_settlement_or_hide_its_final_cut() {
+    use crate::structured::queue::admission::Admission;
+    let mut r = Run::with_opening(
+        247,
+        "queue",
+        |case| {
+            let mut admission = Admission::new(
+                Journal::open(case.fixture.root.path(), &case.id).unwrap(),
+                8,
+            )
+            .unwrap();
+            admission
+                .enqueue(request(247).item, QueuePrincipal::Operator, Gate::Send)
+                .unwrap();
+            drop(admission);
+            default_policy(case)
+        },
+        Some((
+            "attested-starter".into(),
+            crate::spawn::prompt::SpawnPrompt::compose("unaccepted opening").unwrap(),
+        )),
+    )
+    .await;
+    r.until(|r| !r.inputs().is_empty()).await;
+    assert_eq!(r.inputs()[0]["input"]["uuid"], id(247));
+    r.stop().await;
+    let journal = Journal::open(r.case.fixture.root.path(), &r.case.id).unwrap();
+    let opening = journal
+        .items()
+        .iter()
+        .find(|item| item.kind == Kind::Message)
+        .unwrap();
+    assert_eq!(opening.state, State::Failed);
+    assert!(
+        r.updates
+            .iter()
+            .filter_map(|u| u.cut.as_ref())
+            .flat_map(|c| &c.records)
+            .any(|record| record["kind"] == "fail"
+                && record["item_id"] == opening.item_id
+                && record["reason"] == "agent_start_failed"),
+        "terminal cut omitted opening settlement"
+    );
+}
+
+#[test]
+fn opening_recovery_preserves_opaque_future_items_and_bytes() {
+    let (mut registry, _, _, _) = owner();
+    let (case, _, _) = Case::prepare(&mut registry, 248, "queue", vec![]);
+    let mut journal = Journal::open(case.fixture.root.path(), &case.id).unwrap();
+    let mut input = request(248).item;
+    input.kind = Kind::Unknown(json!("future_opening_kind"));
+    input.metadata.insert("opening_turn".into(), json!(true));
+    journal
+        .append(crate::structured::queue::Change::Upsert {
+            item: Box::new(input),
+            position: 0,
+        })
+        .unwrap();
+    drop(journal);
+    let before = fs::read(path(&case)).unwrap();
+    let (service, _) =
+        owner_queue::Service::open(case.fixture.root.path(), &case.id, default_policy(&case))
+            .unwrap();
+    drop(service);
+    assert_eq!(fs::read(path(&case)).unwrap(), before);
+}

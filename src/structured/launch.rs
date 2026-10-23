@@ -110,7 +110,11 @@ impl fmt::Display for LaunchError {
             Self::McpLeaseRequired => f.write_str(
                 "structured_mcp_lease_required: flock MCP requires this session reservation",
             ),
-            Self::QueueAdmission { code, source } => write!(f, "opening turn refused: {} ({source:?})", code.as_str()),
+            Self::QueueAdmission { code, source } => {
+                write!(f, "opening turn refused: {}", code.as_str())?;
+                if let Some(source) = source { write!(f, ": {source}")?; }
+                Ok(())
+            }
             Self::Io(err) => write!(f, "structured launch preparation failed: {err}"),
             Self::UnsupportedHarness => f.write_str(
                 "structured_harness_version_unsupported: require Claude Code >= 2.1.290 at an absolute binary path",

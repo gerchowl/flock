@@ -81,6 +81,7 @@ impl Client {
 /// Normal completion releases the lease after durable final-event processing.
 pub(in crate::structured) struct Service {
     scheduler: Scheduler,
+    opening: Option<String>,
     requests: mpsc::Receiver<Request>,
     states: mpsc::Receiver<Snapshot>,
     updates: mpsc::SyncSender<Update>,
@@ -98,7 +99,8 @@ pub(in crate::structured) struct Service {
 impl Service {
     pub fn open(data: &Path, agent: &str, bytes: NonZeroU64) -> Result<(Self, Client), Failure> {
         let journal = Journal::open_with_policy(data, agent, RewritePolicy::new(bytes))?;
-        let scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH)?)?;
+        let mut scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH)?)?;
+        scheduler.fail_stale_openings()?;
         let (tx, requests) = mpsc::sync_channel(1);
         let (state_tx, states) = mpsc::sync_channel(1);
         // Same four-completion bound as the session stream; no unbounded spool.
@@ -106,6 +108,7 @@ impl Service {
         Ok((
             Self {
                 scheduler,
+                opening: None,
                 requests,
                 states,
                 updates,
@@ -147,11 +150,12 @@ impl Service {
             priority: Priority::Normal,
             body: prompt.as_argv_element().to_owned(),
             attachments: vec![],
-            metadata: Default::default(),
+            metadata: [("opening_turn".into(), serde_json::Value::Bool(true))].into(),
         };
         self.policy()?;
         self.scheduler
             .enqueue(item, Principal::Origin(producer), Gate::Send)?;
+        self.opening = Some(item_id.clone());
         Ok(item_id)
     }
     pub fn flush(&mut self, cancelled: bool, notify: &impl Fn()) -> bool {
@@ -247,7 +251,10 @@ impl Service {
                 self.blocked = Some(error.code);
             }
         }
-        if matches!(offer, Ok(Offer::Submitted { .. })) {
+        if let Ok(Offer::Submitted { batch_id }) = &offer {
+            if self.opening.as_ref() == Some(batch_id) {
+                self.opening = None;
+            }
             self.required = self.covered.saturating_add(1);
             self.state = AgentState::unknown();
         }
@@ -282,13 +289,33 @@ impl Service {
         }
         error == Some(ErrorCode::InputWriteFailed)
     }
+    fn settle_opening(&mut self) -> Result<(), Failure> {
+        if let Some(id) = self.opening.take() {
+            self.scheduler.fail_item(id, ErrorCode::AgentStartFailed)?;
+        }
+        Ok(())
+    }
     pub fn finish(&mut self, input: &InputHandle, notify: &impl Fn()) -> bool {
-        let error = self.policy().and_then(|_| self.scheduler.exited()).err();
+        let error = self
+            .policy()
+            .and_then(|_| self.scheduler.exited())
+            .and_then(|_| self.settle_opening())
+            .err();
         self.publish(input, true, None, error);
         self.flush(true, notify);
         self.lost
     }
 }
+impl Drop for Service {
+    fn drop(&mut self) {
+        // Once stdin accepts the item, ordinary lifecycle/exit recovery owns it.
+        // Until then every launch failure must terminally settle its opening.
+        if let Err(error) = self.settle_opening() {
+            crate::logging::structured_queue_opening_settlement_failed(error.code);
+        }
+    }
+}
+
 fn failure(code: ErrorCode) -> Failure {
     Failure { code, source: None }
 }
