@@ -73,7 +73,11 @@ impl Client {
                     .get(&record.agent_id)
                     .ok_or(crate::api::error_code::ErrorCode::AgentNotFound)?;
                 let waiting = match workers.runtime(&record.agent_id, generation) {
-                    Some(runtime) => runtime.waiting_on_human()?,
+                    Some(runtime) => runtime
+                        .waiting_on_human()?
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect(),
                     // Only a quiescent producer proves that an absent book is empty.
                     None if workers.history_recovery_allowed(&record.agent_id) => Vec::new(),
                     None => return Err(crate::api::error_code::ErrorCode::SessionBusy),

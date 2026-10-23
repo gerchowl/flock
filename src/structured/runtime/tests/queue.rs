@@ -309,7 +309,16 @@ fn actual_s6_open_request_blocks_with_stale_s4_idle_and_cancel_releases_it() {
         Turn::Idle,
         "S4 has not consumed the open event yet"
     );
-    assert_eq!(run.running.runtime.waiting_on_human().unwrap(), ["permit"]);
+    assert_eq!(
+        run.running
+            .runtime
+            .waiting_on_human()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        ["permit"]
+    );
     let before = run.q().journal().replay(0).unwrap().through;
     assert!(run.offer().unwrap().is_none());
     assert_eq!(run.q().journal().replay(0).unwrap().through, before);
@@ -696,7 +705,7 @@ fn pending(batch_id: &str, since_ms: u64, cause: PendingCause) -> Offer {
 }
 
 #[test]
-fn queue_silent_reports_stable_pending_without_a_second_write() {
+fn queue_silent_reports_stable_pending_without_mutating_the_journal() {
     let mut run = QueueRun::mode("queue-silent");
     run.send(0, Producer::Human);
     assert_eq!(run.offer().unwrap(), Some(id(0)));
@@ -722,7 +731,8 @@ fn queue_silent_reports_stable_pending_without_a_second_write() {
         serde_json::to_value(run.outcome_at(400).unwrap()).unwrap(),
         json!({"outcome":"pending", "detail":{"batch_id":id(0), "since_ms":100, "cause":"awaiting_result"}})
     );
-    assert_eq!(run.barrier(1), 1);
+    // A socket barrier cannot prove the asynchronous stdin writer has flushed.
+    // The typed early returns and unchanged journal below guard repeated offers.
     assert!(matches!(
         run.running.result.try_recv(),
         Err(mpsc::TryRecvError::Empty)
@@ -820,6 +830,56 @@ fn turn_end_unknown_refusal_rolls_back_intact_instead_of_holding() {
 }
 
 #[test]
+fn refused_pending_id_describes_the_attempt_even_when_the_queued_batch_changes() {
+    let mut run = QueueRun::new();
+    let external = json!({"type":"user","uuid":"external","message":{"role":"user","content":[{"type":"text","text":"owned fixture input"}]}});
+    run.running.runtime.try_submit(&external).unwrap();
+    run.input();
+    run.send(0, Producer::Human);
+    run.loss();
+    let refused = pending(&id(0), 101, PendingCause::TurnEndUnknown);
+    assert_eq!(run.outcome_at(101).unwrap(), refused);
+    run.send(1, Producer::Human);
+    let before = run.q().journal().items().to_vec();
+    let through = run.q().journal().replay(0).unwrap().through;
+    for now_ms in [201, 301] {
+        assert_eq!(run.outcome_at(now_ms).unwrap(), refused);
+        assert_eq!(
+            run.q().status(&run.running.runtime),
+            Some(Pending {
+                batch_id: Some(id(0)),
+                since_ms: 101,
+                cause: PendingCause::TurnEndUnknown,
+            })
+        );
+    }
+    assert_eq!(run.q().journal().items(), before);
+    assert_eq!(run.q().journal().replay(0).unwrap().through, through);
+    run.result();
+    assert!(run.q().status(&run.running.runtime).is_none());
+    let batch = run.offer_at(401).unwrap().unwrap();
+    assert_ne!(batch, id(0));
+    let input = run.input();
+    assert_eq!(input["input"]["uuid"], batch);
+    assert_eq!(
+        input["input"]["message"]["content"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        run.q().status(&run.running.runtime),
+        Some(Pending {
+            batch_id: Some(batch),
+            since_ms: 401,
+            cause: PendingCause::AwaitingResult,
+        })
+    );
+    run.result();
+}
+
+#[test]
 fn cancelled_without_result_reports_pending_until_real_result_or_exit() {
     for (completed, result) in [(true, true), (true, false), (false, true), (false, false)] {
         let mut run = QueueRun::new();
@@ -876,4 +936,132 @@ fn cancelled_without_result_reports_pending_until_real_result_or_exit() {
             assert_eq!(run.q().journal().items()[2].state, State::Queued);
         }
     }
+}
+
+#[test]
+fn newer_journal_status_survives_scheduler_open_and_every_runtime_mutation_is_refused() {
+    readonly_runtime("newer");
+}
+
+#[test]
+fn corrupt_journal_status_survives_scheduler_open_and_every_runtime_mutation_is_refused() {
+    readonly_runtime("corrupt");
+}
+
+#[test]
+fn invalid_header_reports_typed_read_only_scheduler_status() {
+    readonly_runtime("header");
+}
+
+#[test]
+fn legacy_unknown_reports_typed_read_only_scheduler_status() {
+    readonly_runtime("legacy");
+}
+
+#[test]
+fn required_checkpoint_reports_typed_read_only_scheduler_status() {
+    readonly_runtime("checkpoint");
+}
+
+fn readonly_runtime(mode: &str) {
+    let mut run = QueueRun::mode("queue-silent");
+    run.send(1, Producer::Human);
+    run.offer().unwrap().unwrap();
+    assert_eq!(run.barrier(1), 1);
+    drop(run.scheduler.take());
+    let path = run
+        .fixture
+        .root
+        .path()
+        .join("sessions/fixture-agent/queue.jsonl");
+    let old = fs::read(&path).unwrap();
+    let mut lines = old.split_inclusive(|b| *b == b'\n');
+    let mut header: Value = serde_json::from_slice(lines.next().unwrap()).unwrap();
+    match mode {
+        "newer" => header["format_version"] = json!(999),
+        "header" => header["format_version"] = Value::Null,
+        "legacy" => {
+            header.as_object_mut().unwrap().remove("format_version");
+        }
+        "corrupt" | "checkpoint" => (),
+        _ => panic!("unexpected fixture mode"),
+    }
+    let mut bytes = serde_json::to_vec(&header).unwrap();
+    bytes.push(b'\n');
+    bytes.extend(lines.flatten());
+    let offset = bytes.len() as u64;
+    if mode == "corrupt" {
+        bytes.extend(b"{\"seq\":3,\"kind\":\"upsert\",\"item\":42}\ntorn tail");
+    } else if matches!(mode, "legacy" | "checkpoint") {
+        bytes.extend(b"{\"seq\":3,\"kind\":\"future\"}\n");
+    }
+    fs::write(&path, &bytes).unwrap();
+    let mut journal = Journal::open(run.fixture.root.path(), "fixture-agent").unwrap();
+    if mode == "checkpoint" {
+        assert!(journal.read_only().is_none());
+        assert!(journal.checkpoint().is_err());
+    }
+    let admission = Admission::new(journal, MAX_BATCH).unwrap();
+    let mut scheduler = Scheduler::new(admission).unwrap();
+    let status = scheduler.status(&run.running.runtime).unwrap();
+    let code = if mode != "newer" {
+        ErrorCode::QueueJournalCorrupt
+    } else {
+        ErrorCode::QueueJournalNewer
+    };
+    if mode != "newer" {
+        let (seq, offset, reason) = match mode {
+            "corrupt" => (Some(3), offset, "malformed_known_record"),
+            "header" => (None, 0, "invalid_format_version"),
+            "legacy" | "checkpoint" => (
+                Some(3),
+                bytes.len() as u64,
+                "unknown_data_prevents_checkpoint",
+            ),
+            _ => panic!("unexpected fixture mode"),
+        };
+        assert_eq!(
+            status.cause,
+            PendingCause::QueueJournalCorrupt(crate::structured::queue::QueueJournalCorrupt {
+                seq,
+                offset,
+                reason
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["cause"]["queue_journal_corrupt"]["reason"],
+            reason
+        );
+    } else {
+        assert_eq!(
+            status.cause,
+            PendingCause::QueueJournalNewer {
+                found: 999,
+                supported: 2
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&status).unwrap()["cause"]["queue_journal_newer"]["found"],
+            999
+        );
+    }
+    let event = crate::structured::claude::SessionEvent::parse(
+        &catalogue("result", Some("success")).to_string(),
+        "fixture",
+    );
+    let errors = [
+        scheduler
+            .deliver(&run.running.runtime, &run.state, 100)
+            .unwrap_err(),
+        scheduler.observe(&event).unwrap_err(),
+        scheduler.exited().unwrap_err(),
+        scheduler
+            .enqueue(item(2), Principal::Operator, Gate::Send)
+            .unwrap_err(),
+    ];
+    for error in errors {
+        assert_eq!(error.code, code);
+    }
+    assert_eq!(scheduler.status(&run.running.runtime).unwrap(), status);
+    assert_eq!(fs::read(path).unwrap(), bytes);
 }

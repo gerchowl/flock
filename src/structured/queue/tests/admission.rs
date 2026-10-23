@@ -504,7 +504,7 @@ fn future_lifecycle_record_budget_is_reserved_before_acceptance() {
 }
 
 #[test]
-fn missing_metadata_is_ineligible_and_future_journals_are_refused() {
+fn missing_metadata_is_ineligible_and_unknown_journals_remain_writable() {
     let root = Root::new();
     let mut j = root.open();
     j.append(upsert("legacy", 0)).unwrap();
@@ -513,7 +513,7 @@ fn missing_metadata_is_ineligible_and_future_journals_are_refused() {
     let future = Root::new();
     drop(future.open());
     future.write_records(encode(&json!({"seq":1,"kind":"future"})).unwrap());
-    assert!(Admission::new(future.open(), MAX_BATCH).is_err());
+    assert!(Admission::new(future.open(), MAX_BATCH).is_ok());
     let empty = Root::new();
     assert!(Admission::new(empty.open(), 0).is_err());
 }
@@ -1248,6 +1248,246 @@ fn batch_entropy_failure_keeps_the_journal_and_items_unchanged() {
                 count as usize,
                 "normal entropy recovers without poisoning"
             );
+            let records = q.journal().replay(through).unwrap().records;
+            if leading_invalid {
+                let invalid = q
+                    .journal()
+                    .items()
+                    .iter()
+                    .find(|i| i.item_id == id(9))
+                    .unwrap();
+                assert_eq!(invalid.state, State::Failed);
+                assert_eq!(
+                    invalid.metadata["refusal"],
+                    ErrorCode::InvalidRequest.as_str()
+                );
+                assert_eq!(
+                    records,
+                    vec![json!({
+                        "seq":through + 1, "kind":"fail", "item_id":id(9),
+                        "reason":ErrorCode::InvalidRequest.as_str(),
+                    })]
+                );
+            } else {
+                assert!(records.is_empty());
+            }
+            let recovered_through = q.journal().replay(0).unwrap().through;
+            assert_eq!(q.batch(100).unwrap().unwrap().items.len(), count as usize);
+            assert_eq!(
+                q.journal().replay(0).unwrap().through,
+                recovered_through,
+                "formation must not fail the same item twice"
+            );
         }
     }
+}
+
+#[test]
+fn newer_journal_refuses_all_admission_mutations_with_a_typed_version_error() {
+    let root = Root::new();
+    let mut admission = Admission::new(root.open(), MAX_BATCH).unwrap();
+    admission
+        .enqueue(input(1), Principal::Operator, Gate::Hold)
+        .unwrap();
+    let mut saved = admission.journal().items()[0].clone();
+    drop(admission);
+    let mut header: Value = serde_json::from_slice(&root.identity_prefix()).unwrap();
+    header["format_version"] = json!(999);
+    let old = fs::read(root.path()).unwrap();
+    let mut bytes = encode(&header).unwrap();
+    bytes.extend(old.split_inclusive(|b| *b == b'\n').skip(1).flatten());
+    fs::write(root.path(), &bytes).unwrap();
+    let mut admission = Admission::new(root.open(), MAX_BATCH).unwrap();
+    saved.state = State::Queued;
+    let errors = [
+        admission
+            .enqueue(input(1), Principal::Operator, Gate::Hold)
+            .unwrap_err(),
+        admission
+            .enqueue(input(2), Principal::Operator, Gate::Hold)
+            .unwrap_err(),
+        admission.batch(100).unwrap_err(),
+        admission.replace(vec![saved]).unwrap_err(),
+        admission.replace(vec![]).unwrap_err(),
+    ];
+    for error in errors {
+        assert_eq!(error.code, ErrorCode::QueueJournalNewer);
+        let source = error.source.unwrap();
+        let typed = source
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<QueueJournalNewer>()
+            .unwrap();
+        assert_eq!(
+            *typed,
+            QueueJournalNewer {
+                found: 999,
+                supported: FORMAT_VERSION
+            }
+        );
+        assert_eq!(error.code.retry().as_str(), "after_handoff");
+    }
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn same_version_unknown_kind_is_writable_through_admission() {
+    let root = Root::new();
+    drop(root.open());
+    let bytes = root.write_records(b"{\"seq\":1,\"kind\":\"future\",\"body\":42}\n");
+    let mut opened = None;
+    let logs = crate::logging::capture_logs(|| {
+        opened = Some(Admission::new(root.open(), MAX_BATCH).unwrap());
+    });
+    assert!(logs.contains("structured.queue.record_skipped"));
+    assert!(logs.contains("unknown_kind"));
+    let mut admission = opened.unwrap();
+    admission
+        .enqueue(input(1), Principal::Operator, Gate::Send)
+        .unwrap();
+    assert_eq!(
+        admission.batch(100).unwrap().unwrap().items[0].item_id,
+        id(1)
+    );
+    assert!(fs::read(root.path()).unwrap().starts_with(&bytes));
+}
+
+#[test]
+fn corrupt_journal_loads_in_admission_but_all_mutations_refuse() {
+    let root = Root::new();
+    drop(root.open());
+    let bytes = root.write_records(b"{\"seq\":1,\"kind\":\"upsert\",\"item\":42}\n");
+    let mut admission = Admission::new(root.open(), MAX_BATCH).unwrap();
+    let failures = [
+        admission
+            .enqueue(input(1), Principal::Operator, Gate::Send)
+            .unwrap_err(),
+        admission.batch(100).unwrap_err(),
+        admission.replace(vec![]).unwrap_err(),
+        admission.replace(vec![input(1)]).unwrap_err(),
+    ];
+    for error in failures {
+        assert_eq!(error.code, ErrorCode::QueueJournalCorrupt);
+        assert_eq!(error.code.retry().as_str(), "after_human");
+        assert_eq!(error.code.exit(), crate::cli::exit::FAILURE);
+        assert!(error
+            .source
+            .unwrap()
+            .get_ref()
+            .unwrap()
+            .is::<QueueJournalCorrupt>());
+    }
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
+}
+
+#[test]
+fn unknown_item_data_keep_positions_but_are_never_automatically_delivered() {
+    for extension in ["field", "enum"] {
+        let root = Root::new();
+        let mut q = queue(&root);
+        q.enqueue(input(1), Principal::Operator, Gate::Send)
+            .unwrap();
+        q.enqueue(input(2), Principal::Operator, Gate::Send)
+            .unwrap();
+        drop(q);
+        let raw = fs::read_to_string(root.path()).unwrap();
+        let mut lines: Vec<Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        if extension == "field" {
+            lines[1]["future_field"] = json!(true);
+        } else {
+            lines[1]["item"]["kind"] = json!("future_kind");
+        }
+        let bytes: Vec<u8> = lines
+            .iter()
+            .flat_map(|line| encode(line).unwrap())
+            .collect();
+        fs::write(root.path(), &bytes).unwrap();
+        let mut q = queue(&root);
+        assert!(q.journal().read_only().is_none());
+        assert_eq!(q.journal().items().len(), 2);
+        assert_eq!(
+            q.batch(100)
+                .unwrap()
+                .unwrap()
+                .items
+                .iter()
+                .map(|i| i.item_id.clone())
+                .collect::<Vec<_>>(),
+            vec![id(2)]
+        );
+        q.replace(vec![{
+            let mut b = q.journal().items()[1].clone();
+            b.state = State::Done;
+            b
+        }])
+        .unwrap();
+        assert!(q.batch(100).unwrap().is_none());
+        drop(q);
+        let mut q = queue(&root);
+        assert!(q.batch(100).unwrap().is_none());
+        assert!(fs::read(root.path()).unwrap().starts_with(&bytes));
+    }
+}
+
+#[test]
+fn invalid_header_refuses_admission_with_corrupt_code() {
+    assert_review_readonly_admission("header");
+}
+
+#[test]
+fn legacy_unknown_refuses_admission_with_corrupt_code() {
+    assert_review_readonly_admission("legacy");
+}
+
+#[test]
+fn required_checkpoint_refuses_admission_with_corrupt_code() {
+    assert_review_readonly_admission("checkpoint");
+}
+
+fn assert_review_readonly_admission(mode: &str) {
+    let root = Root::new();
+    drop(root.open());
+    let mut header: Value = serde_json::from_slice(&root.identity_prefix()).unwrap();
+    match mode {
+        "header" => header["format_version"] = Value::Null,
+        "legacy" => {
+            header.as_object_mut().unwrap().remove("format_version");
+        }
+        "checkpoint" => (),
+        _ => panic!("unexpected fixture mode"),
+    }
+    let mut bytes = encode(&header).unwrap();
+    bytes.extend(unknown_record("kind"));
+    fs::write(root.path(), &bytes).unwrap();
+    let mut journal = root.open();
+    if mode == "checkpoint" {
+        assert!(journal.read_only().is_none());
+        assert!(journal.checkpoint().is_err());
+    }
+    let mut q = Admission::new(journal, MAX_BATCH).unwrap();
+    let errors = [
+        q.enqueue(input(1), Principal::Operator, Gate::Send)
+            .unwrap_err(),
+        q.batch(100).unwrap_err(),
+        q.replace(vec![]).unwrap_err(),
+        q.replace(vec![input(1)]).unwrap_err(),
+    ];
+    for error in errors {
+        assert_eq!(error.code, ErrorCode::QueueJournalCorrupt);
+        assert_eq!(error.code.retry().as_str(), "after_human");
+        assert!(error
+            .source
+            .unwrap()
+            .get_ref()
+            .unwrap()
+            .is::<QueueJournalCorrupt>());
+    }
+    assert!(matches!(
+        q.journal().read_only(),
+        Some(ReadOnly::Corrupt(_))
+    ));
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
 }

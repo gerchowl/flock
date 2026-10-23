@@ -80,7 +80,7 @@ fn registry_s4_and_s6_project_into_the_generated_structured_only_contract() {
         serde_json::from_value(request["request"].clone()).unwrap(),
     )
     .unwrap();
-    let waiting = book.waiting();
+    let waiting: Vec<_> = book.waiting().into_iter().map(|(id, _)| id).collect();
     let row = project(StructuredAgent {
         record,
         state: &update.state,

@@ -1168,7 +1168,7 @@ impl App {
         let list = match crate::worktree::list_existing_worktrees(&space.repo_root) {
             Ok(list) => list,
             Err(err) => {
-                self.state.config_diagnostic = Some(err);
+                self.state.config_diagnostic = Some(err.into());
                 return;
             }
         };
@@ -1600,13 +1600,13 @@ impl App {
             );
             let result = if let Some(parent_dir) = parent_dir {
                 std::fs::create_dir_all(&parent_dir)
-                    .map_err(|err| err.to_string())
+                    .map_err(crate::process::CommandFailure::from)
                     .and_then(|()| crate::worktree::run_worktree_command(&command))
             } else {
                 crate::worktree::run_worktree_command(&command)
             };
-            let result =
-                result.map_err(|err| crate::worktree::explain_worktree_add_failure(&base, &err));
+            let result = result
+                .map_err(|err| crate::worktree::explain_worktree_add_failure(&base, &err).into());
             let _ = event_tx.blocking_send(AppEvent::WorktreeAddFinished(WorktreeAddResult {
                 path,
                 result,
@@ -1748,8 +1748,9 @@ impl App {
                 &crate::worktree::processes::protected_pids(None),
             );
             let result = crate::worktree::check_worktree_remove(&repo_root, &path)
-                .map_err(|error| error.to_string())
-                .and_then(|()| crate::worktree::run_worktree_command(&command));
+                .map_err(|error| crate::process::CommandFailure::from(error.to_string()))
+                .and_then(|()| crate::worktree::run_worktree_command(&command))
+                .map_err(Into::into);
             let _ =
                 event_tx.blocking_send(AppEvent::WorktreeRemoveFinished(WorktreeRemoveResult {
                     workspace_id,
@@ -2134,6 +2135,7 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
             crate::app::AppRuntimeConfig {
+                structured_mcp: None,
                 uid_policy: Default::default(),
                 merge_gate: crate::worktree::MergeGateContext {
                     gh_program: crate::test_support::unique_temp_path("missing-gh"),

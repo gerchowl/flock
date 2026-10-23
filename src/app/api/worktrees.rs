@@ -12,12 +12,12 @@ use super::responses::{encode_error, encode_error_body, encode_error_with_data, 
 
 struct ApiFailure {
     code: &'static str,
-    message: String,
+    message: crate::process::CommandFailure,
     data: Option<serde_json::Value>,
 }
 
 impl ApiFailure {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    fn new(code: &'static str, message: impl Into<crate::process::CommandFailure>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -786,7 +786,7 @@ impl App {
         crate::worktree::check_worktree_remove(repo_root, checkout).map_err(|failure| {
             ApiFailure {
                 code: crate::api::error_code::ErrorCode::WorktreeCheckoutUnreachable.as_str(),
-                message: failure.to_string(),
+                message: failure.to_string().into(),
                 data: Some(failure.data()),
             }
         })?;
@@ -4873,6 +4873,8 @@ mod tests {
         let spawn = app.handle_api_request(Request {
             id: "req".into(),
             method: crate::api::schema::Method::AgentSpawn(crate::api::schema::AgentSpawnParams {
+                runtime: crate::api::schema::AgentRuntime::Pty,
+                model: None,
                 agent: "claude".into(),
                 prompt: "pick up the second half".into(),
                 location: crate::api::schema::SpawnLocation::WorktreePath {

@@ -254,6 +254,8 @@ pub struct HeadlessServer {
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
+    // True only after the replacement owns the committed handoff.
+    handoff_completed: bool,
     /// Panes whose pending input the current `--skip-undrained` handoff has
     /// dropped. Reported with the outcome even when a later step fails.
     handoff_skipped_undrained: Vec<api::schema::UndrainedPane>,
@@ -627,6 +629,7 @@ impl HeadlessServer {
             last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
+            handoff_completed: false,
             handoff_skipped_undrained: Vec::new(),
             pending_handoff_repaint_nudge: false,
             should_quit,
@@ -655,7 +658,7 @@ impl HeadlessServer {
         let result = self.run_loop().await;
         #[cfg(feature = "web")]
         if let Some(wire) = self.client_wire.take() {
-            wire.shutdown().await?;
+            return crate::web::client_listener::finish_shutdown(result, wire.shutdown().await);
         }
         result
     }
@@ -1541,11 +1544,17 @@ impl HeadlessServer {
         }
         crate::server::handoff::wait_owned_ack(&mut stream);
 
+        self.commit_handoff_shutdown();
+        info!("live handoff completed; old server exiting");
+        Ok(skipped_undrained)
+    }
+
+    /// Enter exporter shutdown only after the replacement's owned acknowledgement.
+    fn commit_handoff_shutdown(&mut self) {
         self.shutting_down = true;
         self.app.state.should_quit = true;
         self.app.no_session = true;
-        info!("live handoff completed; old server exiting");
-        Ok(skipped_undrained)
+        self.handoff_completed = true;
     }
 
     #[cfg(not(unix))]
@@ -1584,6 +1593,7 @@ impl HeadlessServer {
                 clone_detection_warning: self.app.clone_detection_warning.clone(),
                 agent_start_label: true,
                 agent_questions: true,
+                structured_agents: true,
                 pane_input_write_ack: false,
             }),
             self.app.runtime_config.uid_policy.clone(),
@@ -4149,7 +4159,11 @@ impl HeadlessServer {
         // Remove socket files.
         self.cleanup_sockets()?;
 
-        structured.map_err(io::Error::other)
+        if self.handoff_completed {
+            Ok(())
+        } else {
+            structured.map_err(io::Error::other)
+        }
     }
 
     /// Removes socket files created by the server.
@@ -4988,7 +5002,7 @@ mod tests {
             &notify,
         )
         .await;
-        let (offline, _, _) = Case::prepare(
+        let (offline, mut restored_launch, _) = Case::prepare(
             &mut server.app.state.structured_agents,
             43,
             "state-reducer",
@@ -5078,6 +5092,22 @@ mod tests {
             .structured_workers
             .runtime(&case.id, case.generation)
             .is_none());
+        let generation = restored.state.structured_agents.get(&case.id).unwrap().2;
+        restored_launch.agent_id = case.id.clone();
+        restored_launch.generation = generation;
+        restored_launch.leases = restored.session_leases.clone();
+        assert_eq!(
+            restored.structured_workers.start(
+                &mut restored.state.structured_agents,
+                restored_launch,
+                |_| panic!("handoff-restored Unknown cannot prepare")
+            ),
+            Err(ErrorCode::StructuredRecoveryRequired)
+        );
+        assert_eq!(
+            restored.state.structured_agents.get(&case.id).unwrap().2,
+            generation
+        );
         let error = server.complete_shutdown().unwrap_err();
         let diagnostic = error
             .get_ref()
@@ -5086,6 +5116,19 @@ mod tests {
         assert!(diagnostic
             .0
             .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
+        // The committed handoff keeps this diagnostic but must exit successfully.
+        server.commit_handoff_shutdown();
+        let log = crate::logging::capture_logs(|| assert!(server.complete_shutdown().is_ok()));
+        assert!(log.contains("structured.worker.shutdown_failed"));
+        assert!(log.contains("structured_worker_cleanup_failed"));
+        assert!(
+            server
+                .app
+                .structured_workers
+                .shutdown(&mut server.app.state.structured_agents)
+                .is_err(),
+            "successful handoff does not erase the cached diagnostic"
+        );
     }
 
     #[tokio::test]
@@ -5276,12 +5319,12 @@ mod tests {
         ) -> serde_json::Value {
             let (respond_to, response) = std::sync::mpsc::channel();
             tx.send(api::ApiRequestMessage {
+                scope: None,
                 request: serde_json::from_value(
                     serde_json::json!({"id":"listener-survival","method":method,"params":params}),
                 )
                 .unwrap(),
                 respond_to,
-                scope: None,
                 peer_pid: Some(std::process::id()),
                 peer_birth: crate::platform::process_start_time(std::process::id()),
                 peer_uid: Some(crate::platform::peer::effective_uid()),
@@ -5408,6 +5451,7 @@ mod tests {
             last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
+            handoff_completed: false,
             handoff_skipped_undrained: Vec::new(),
             pending_handoff_repaint_nudge: false,
             should_quit: Arc::new(AtomicBool::new(false)),

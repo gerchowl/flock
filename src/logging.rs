@@ -49,6 +49,21 @@ pub(crate) fn structured_worker_shutdown_failed(error: &crate::structured::worke
     }
 }
 
+/// Optional structured launch provisioning must never prevent server startup.
+/// Resolution details may contain private paths; report only the typed code and category.
+pub(crate) fn structured_mcp_endpoint_unavailable(reason: crate::api::server::McpEndpointFailure) {
+    let reason = match reason {
+        crate::api::server::McpEndpointFailure::Exe => "exe",
+        crate::api::server::McpEndpointFailure::Socket => "socket",
+    };
+    tracing::warn!(
+        event = "structured.mcp.endpoint_unavailable",
+        reason,
+        code = crate::api::error_code::ErrorCode::StructuredEndpointRestartRequired.as_str(),
+        "structured MCP endpoint unavailable; structured start will refuse"
+    );
+}
+
 /// Report failed structured-session cleanup without reading session contents.
 pub(crate) fn structured_config_cleanup_failed(err: &io::Error) {
     tracing::error!(event = "structured.config.cleanup_failed", error = %err,
@@ -80,6 +95,29 @@ pub(crate) fn client_exchange_failed(
     tracing::warn!(event = "client.exchange.internal_failure", subsystem = "structured_client", reason, io_kind = ?io_kind, "browser credential exchange unavailable");
 }
 
+/// Report secondary listener cleanup errors without replacing the primary server failure.
+#[cfg(feature = "web")]
+pub(crate) fn client_listener_shutdown_failed(error: &std::io::Error) {
+    tracing::warn!(event = "client.listener.shutdown_failed", subsystem = "structured_client", kind = ?error.kind(), errno = ?error.raw_os_error(), "client listener cleanup failed after server failure");
+}
+
+/// Report a single capacity refusal without recording tool input or prompts.
+pub(crate) fn structured_permission_request_refused(
+    agent: &str,
+    request_id: &str,
+    request_seq: u64,
+    error_code: &str,
+) {
+    tracing::warn!(
+        event = "structured.permission.refused",
+        agent_id = agent,
+        request_id,
+        request_seq,
+        error_code,
+        "permission request denied at open-request capacity"
+    );
+}
+
 /// Report accept failures with typed classes and errno, never request contents.
 #[cfg(feature = "web")]
 pub(crate) fn client_accept_failed(
@@ -96,6 +134,27 @@ pub(crate) fn client_accept_failed(
     }
 }
 
+/// Report skipped queue records with fixed reasons and optional cursors, never payloads.
+pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'static str) {
+    tracing::warn!(
+        event = "structured.queue.record_skipped",
+        sequence = ?sequence,
+        reason,
+        "skipped queue record; original journal retained"
+    );
+}
+
+/// Report the first corrupt queue record without exposing any input payload.
+pub(crate) fn structured_queue_corrupt(reason: &crate::structured::queue::QueueJournalCorrupt) {
+    tracing::warn!(
+        event = "structured.queue.corrupt",
+        sequence = ?reason.seq,
+        offset = reason.offset,
+        reason = reason.reason,
+        "queue journal is read-only; operator recovery required"
+    );
+}
+
 /// Report a durable corrupt-blob replacement without exposing stored content.
 pub(crate) fn structured_blob_repaired(reference: &crate::structured::blobs::BlobRef) {
     tracing::warn!(
@@ -103,6 +162,28 @@ pub(crate) fn structured_blob_repaired(reference: &crate::structured::blobs::Blo
         blob = reference.blob.as_str(),
         size = reference.size,
         "repaired corrupt stored blob"
+    );
+}
+
+/// Report degraded repair coordination without logging OS error text or content.
+pub(crate) fn structured_blob_repair_lock_unavailable(
+    reference: &crate::structured::blobs::BlobRef,
+    kind: io::ErrorKind,
+) {
+    tracing::warn!(
+        event = "structured.blob.repair_lock_unavailable",
+        blob = reference.blob.as_str(),
+        error_kind = ?kind,
+        "repair lock unavailable; publishing without coordination"
+    );
+}
+
+/// Report a malformed permission header without disclosing the stored payload.
+pub(crate) fn structured_permission_recovery_skipped(seq: u64) {
+    tracing::warn!(
+        event = "structured.permission.recovery_skipped",
+        seq,
+        "invalid permission recovery header skipped and preserved"
     );
 }
 
@@ -3144,6 +3225,15 @@ pub(crate) fn session_restore_tab_pruned_empty(tab: &str) {
         reason = "pruned_empty",
         tab,
         "restored tab lost all panes after pruning missing layout nodes"
+    );
+}
+
+/// Discard untrusted agent identity text without logging its content.
+pub(crate) fn agent_name_dropped(source: &'static str) {
+    tracing::warn!(
+        code = crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+        source,
+        "agent name dropped"
     );
 }
 

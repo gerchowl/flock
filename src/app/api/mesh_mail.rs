@@ -524,6 +524,13 @@ impl App {
         &mut self,
         server: Option<&crate::api::ServerHandle>,
     ) -> Result<(), String> {
+        self.runtime_config.structured_mcp = server.and_then(|server| match server.session_mcp() {
+            Ok(endpoint) => Some(endpoint),
+            Err(reason) => {
+                crate::logging::structured_mcp_endpoint_unavailable(reason);
+                None
+            }
+        });
         self.node_id = server.and_then(|server| server.node_id.clone());
         self.clone_detection_warning =
             server.and_then(|server| server.clone_detection_warning.clone());
@@ -958,7 +965,7 @@ mod tests {
         let pane = app.state.workspaces[0].focused_pane_id().unwrap();
         let terminal_id = app.state.terminal_id_for_pane(0, pane).unwrap();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.set_agent_name("fixture".into());
+        terminal.set_agent_name("fixture".into()).unwrap();
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),

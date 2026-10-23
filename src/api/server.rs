@@ -30,9 +30,23 @@ const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 
+/// Fixed categories for optional MCP provisioning; never expose path details.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum McpEndpointFailure {
+    /// Executable lookup or validation failed.
+    Exe,
+    /// The bound listener cannot be resolved to an absolute endpoint.
+    Socket,
+}
+
 pub struct ServerHandle {
-    _thread: std::thread::JoinHandle<()>,
+    _thread: Option<std::thread::JoinHandle<()>>,
+    /// Fixture-only executable failure injection.
+    #[cfg(test)]
+    pub(crate) mcp_executable: fn() -> io::Result<PathBuf>,
     path: PathBuf,
+    // Resolved once at bind; None keeps ordinary startup available.
+    mcp_socket: Option<PathBuf>,
     pub(crate) node_id: Option<String>,
     pub(crate) clone_detection_warning: Option<String>,
     identity: SocketFileIdentity,
@@ -54,6 +68,38 @@ impl Drop for ServerHandle {
 }
 
 impl ServerHandle {
+    /// Pin MCP to this listener, independent of inherited client variables.
+    pub(crate) fn session_mcp(
+        &self,
+    ) -> Result<crate::structured::launch::SessionMcp, McpEndpointFailure> {
+        let socket = self.mcp_socket.as_ref().ok_or(McpEndpointFailure::Socket)?;
+        #[cfg(test)]
+        let binary = (self.mcp_executable)();
+        #[cfg(not(test))]
+        let binary = std::env::current_exe();
+        let binary = binary.map_err(|_| McpEndpointFailure::Exe)?;
+        crate::structured::launch::SessionMcp::new(&binary, socket)
+            .map_err(|_| McpEndpointFailure::Exe)
+    }
+
+    /// Stop and join this fixture's owned listener, without signaling processes.
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        // A listener that already observed shutdown may have closed before wakeup.
+        drop(UnixStream::connect(&self.path));
+        let thread = self._thread.take().expect("owned accept thread");
+        let (finished, completion) = std::sync::mpsc::sync_channel(1);
+        let joiner = std::thread::spawn(move || {
+            let _ = finished.send(thread.join());
+        });
+        completion
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bounded fixture listener shutdown")
+            .unwrap();
+        joiner.join().unwrap();
+    }
+
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
         remove_socket_file_if_owned(&self.path, self.identity)
     }
@@ -86,6 +132,7 @@ pub(crate) fn start_server_for_mode(
             clone_detection_warning: identity.clone_detection_warning.clone(),
             agent_start_label: true,
             agent_questions: true,
+            structured_agents: true,
             pane_input_write_ack: false,
         }),
         uid_policy,
@@ -118,6 +165,7 @@ pub(crate) fn start_server_with_capabilities_and_health(
     let path = socket_path();
     prepare_socket_path(&path)?;
 
+    let mcp_socket = std::path::absolute(&path).ok();
     let listener = UnixListener::bind(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
@@ -142,8 +190,8 @@ pub(crate) fn start_server_with_capabilities_and_health(
                 let capabilities = capabilities.clone();
                 let connection_running = Arc::clone(&listener_running);
                 let health = Arc::clone(&health);
-                let uid_policy = uid_policy.clone();
                 let client_listener = connection_status.clone();
+                let uid_policy = uid_policy.clone();
                 std::thread::spawn(move || {
                     if let Err(err) = handle_connection(
                         stream,
@@ -152,8 +200,8 @@ pub(crate) fn start_server_with_capabilities_and_health(
                         &connection_running,
                         capabilities,
                         &health,
-                        &uid_policy,
                         &client_listener,
+                        &uid_policy,
                     ) {
                         crate::logging::api_connection_failed(&err.to_string());
                     }
@@ -164,7 +212,10 @@ pub(crate) fn start_server_with_capabilities_and_health(
     });
 
     Ok(ServerHandle {
-        _thread: thread,
+        _thread: Some(thread),
+        #[cfg(test)]
+        mcp_executable: std::env::current_exe,
+        mcp_socket,
         node_id,
         clone_detection_warning,
         path,
@@ -268,8 +319,8 @@ pub(crate) fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
-    uid_policy: &crate::structured::identity::UidPolicy,
     client_listener: &crate::api::client_listener::Health,
+    uid_policy: &crate::structured::identity::UidPolicy,
 ) -> std::io::Result<()> {
     let peer = crate::platform::peer::credentials(&stream);
     if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
@@ -454,8 +505,8 @@ pub(crate) fn handle_connection(
                 capabilities,
                 peer,
                 listener_health,
-                uid_policy,
                 client_listener,
+                uid_policy,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
             match &result {
@@ -485,8 +536,8 @@ fn handle_request(
     capabilities: Option<ServerCapabilities>,
     peer: crate::platform::peer::Credentials,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
-    uid_policy: &crate::structured::identity::UidPolicy,
     client_listener: &crate::api::client_listener::Health,
+    uid_policy: &crate::structured::identity::UidPolicy,
 ) -> String {
     match request.method {
         Method::Ping(_) => serde_json::to_string(&SuccessResponse {
@@ -571,6 +622,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PeersCheckoutPrepare(_) => "peers.checkout_prepare",
         Method::AgentList(_) => "agent.list",
         Method::AgentGet(_) => "agent.get",
+        Method::AgentStop(_) => "agent.stop",
         Method::AgentRead(_) => "agent.read",
         Method::AgentHistory(_) => "agent.history",
         Method::AgentResult(_) => "agent.result",
@@ -1015,8 +1067,8 @@ mod tests {
                     &connection_running,
                     None,
                     &health,
-                    &Default::default(),
                     &crate::api::client_listener::Health::default(),
+                    &Default::default(),
                 )
                 .unwrap();
                 running.store(false, Ordering::Relaxed);
@@ -1138,8 +1190,8 @@ mod tests {
                 None,
                 Default::default(),
                 &health,
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             );
             let response: serde_json::Value = serde_json::from_str(&response).unwrap();
             assert_eq!(response["result"]["api_listener"]["stopped"], true);
@@ -1370,8 +1422,8 @@ mod tests {
             None,
             crate::platform::peer::Credentials::default(),
             &Mutex::default(),
-            &app.runtime_config.uid_policy,
             &crate::api::client_listener::Health::default(),
+            &app.runtime_config.uid_policy,
         );
         let parsed: SuccessResponse = serde_json::from_str(&reply).unwrap();
         assert!(
@@ -1421,8 +1473,8 @@ mod tests {
                 None,
                 crate::platform::peer::Credentials::default(),
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &app.runtime_config.uid_policy,
-                &Default::default(),
             );
             let response: SuccessResponse = serde_json::from_str(&response).unwrap();
             let ResponseResult::Pong {
@@ -1473,8 +1525,8 @@ mod tests {
                 None,
                 crate::platform::peer::Credentials::default(),
                 &Mutex::default(),
-                &Default::default(),
                 health,
+                &Default::default(),
             );
             let reply: SuccessResponse = serde_json::from_str(&reply).unwrap();
             assert!(
@@ -1498,12 +1550,13 @@ mod tests {
                 clone_detection_warning: None,
                 agent_start_label: true,
                 agent_questions: true,
+                structured_agents: true,
                 pane_input_write_ack: false,
             }),
             crate::platform::peer::Credentials::default(),
             &Mutex::default(),
-            &Default::default(),
             &crate::api::client_listener::Health::default(),
+            &Default::default(),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1527,8 +1580,8 @@ mod tests {
                 None,
                 Default::default(),
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             )
         });
 
@@ -1604,8 +1657,8 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1645,8 +1698,8 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             );
             done_tx.send(result).unwrap();
         });
@@ -1727,8 +1780,8 @@ mod tests {
             &running,
             None,
             &Mutex::default(),
-            &Default::default(),
             &crate::api::client_listener::Health::default(),
+            &Default::default(),
         )
         .unwrap();
         drop(api_tx);
@@ -1827,8 +1880,8 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             )
         });
 
@@ -1888,8 +1941,8 @@ mod tests {
                     &stop,
                     None,
                     &Mutex::default(),
-                    &Default::default(),
                     &crate::api::client_listener::Health::default(),
+                    &Default::default(),
                 )
             });
             client
@@ -1954,8 +2007,8 @@ mod tests {
                 &stop,
                 None,
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             )
         });
         client
@@ -1997,8 +2050,8 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             );
             done_tx.send(result).unwrap();
         });
@@ -2012,5 +2065,36 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn endpoint_uses_the_bind_time_socket_and_classifies_socket_failure() {
+        let _guard = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        let socket = root.path().join("bound.sock");
+        let prior = std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR);
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &socket);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut server =
+            start_server_with_capabilities(tx, EventHub::default(), None, Default::default())
+                .unwrap();
+        if let Some(prior) = prior {
+            std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, prior);
+        } else {
+            std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        }
+        let expected = format!("{:?}", server.session_mcp().unwrap());
+        let bound = std::mem::replace(&mut server.path, root.path().join("later-path"));
+        let actual = format!("{:?}", server.session_mcp().unwrap());
+        server.path = bound;
+        server.mcp_socket = None;
+        let refused = matches!(server.session_mcp(), Err(McpEndpointFailure::Socket));
+        server.finish_for_test();
+        assert_eq!(
+            actual, expected,
+            "request-time cwd/path lookup must not replace the bound endpoint"
+        );
+        assert!(expected.contains(socket.to_str().unwrap()));
+        assert!(refused);
     }
 }

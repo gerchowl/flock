@@ -19,6 +19,7 @@ fn record(seq: u64, raw: Value) -> StreamRecord {
         origin: RecordOrigin::Claude,
         result_subtype: None,
         permission_grant_request_id: None,
+        permission_request_seq: None,
         raw: raw.to_string(),
     }
 }
@@ -519,27 +520,18 @@ fn gap_and_live_checkpoints_preserve_exact_record_boundaries() {
     assert_eq!(latest.read_bytes(), 0);
 }
 #[test]
-fn cold_tail_allocation_tracks_the_final_record_instead_of_the_file_limit() {
+fn cold_tail_recovers_the_final_record_across_bounded_chunks() {
     let fixture = long_history(5_000);
-    let mut tail = Vec::new();
     let length = fixture.file.metadata().unwrap().len();
-    assert_eq!(tail_head(&fixture.file, length, &mut tail).unwrap(), 5_000);
-    assert!(tail.len() <= PAGE_BYTES);
-    assert!(tail.capacity() <= PAGE_BYTES);
+    assert_eq!(tail_head(&fixture.file, length).unwrap(), 5_000);
     let fixture = Fixture::new(vec![record(
         1,
         json!({"type":"future","payload":"x".repeat(PAGE_BYTES*3)}),
     )]);
     assert_eq!(
-        tail_head(
-            &fixture.file,
-            fixture.file.metadata().unwrap().len(),
-            &mut tail
-        )
-        .unwrap(),
+        tail_head(&fixture.file, fixture.file.metadata().unwrap().len(),).unwrap(),
         1
     );
-    assert!(tail.len() <= PAGE_BYTES * 4);
 }
 
 #[test]
@@ -607,7 +599,7 @@ fn registered_at_head_checkpoint_survives_later_publication() {
 fn recovery_uses_the_same_captured_length_for_head_and_end() {
     let mut fixture = Fixture::new(vec![record(1, json!({"type":"assistant","message":{}}))]);
     let length = fixture.file.metadata().unwrap().len();
-    let head = tail_head(&fixture.file, length, &mut Vec::new()).unwrap();
+    let head = tail_head(&fixture.file, length).unwrap();
     // Deterministically append between the recovery capture and installation.
     let second = record(2, json!({"type":"user","message":{}}));
     let bytes = serde_json::to_vec(&second).unwrap();

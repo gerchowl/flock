@@ -81,8 +81,11 @@ pub enum Method {
     PeersCheckoutPrepare(PeersCheckoutPrepareParams),
     #[serde(rename = "agent.list")]
     AgentList(EmptyParams),
-    #[serde(rename = "agent.get")]
+    #[serde(rename = "agent.get", alias = "agent.status")]
     AgentGet(AgentTarget),
+    /// Stop a structured worker without inventing a pane or restart plan.
+    #[serde(rename = "agent.stop")]
+    AgentStop(AgentTarget),
     #[serde(rename = "agent.read")]
     AgentRead(AgentReadParams),
     /// #276: an agent's own conversation, from the session transcript.
@@ -471,6 +474,7 @@ impl Method {
             | Self::AgentRename(_)
             | Self::AgentFocus(_)
             | Self::AgentStart(_)
+            | Self::AgentStop(_)
             | Self::AgentFork(_)
             | Self::AgentHibernate(_)
             | Self::AgentResume(_)
@@ -1148,8 +1152,29 @@ pub struct AgentRenameParams {
     pub name: Option<String>,
 }
 
+/// Execution mode; omitted selectors preserve the terminal start contract.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRuntime {
+    /// Traditional terminal-backed launch.
+    #[default]
+    Pty,
+    /// Restricted pane-free Claude session.
+    Structured,
+}
+impl AgentRuntime {
+    fn is_pty(&self) -> bool {
+        *self == Self::Pty
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStartParams {
+    /// Explicit opt-in, sent only to a server advertising structured_agents.
+    #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
+    pub runtime: AgentRuntime,
+    /// Structured model selector, never raw launch flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Resolve the allocation plan without creating resources.
     #[serde(default)]
     pub dry_run: bool,
@@ -1212,6 +1237,12 @@ fn is_false(value: &bool) -> bool {
 /// `AgentStartParams`: no argv, no cwd, no pane placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSpawnParams {
+    /// Explicit structured opt-in, sent only after capability negotiation.
+    #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
+    pub runtime: AgentRuntime,
+    /// Structured model selector; PTY callers must omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Which agent to launch. A closed set — see `spawn::AgentKind`.
     pub agent: String,
     /// The child's opening turn. Passed to the agent as a single positional
@@ -2934,6 +2965,9 @@ pub struct PeersEnrollResetParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerCapabilities {
+    /// Complete structured CLI/socket and narrowed MCP admission contract.
+    #[serde(default)]
+    pub structured_agents: bool,
     /// Enabled only after the complete server and client contract (#1639) ships.
     #[serde(default)]
     pub pane_input_write_ack: bool,
@@ -3249,6 +3283,9 @@ pub enum ResponseResult {
     AgentInfo {
         agent: AgentInfo,
     },
+    StructuredAgentInfo {
+        agent: crate::api::structured_agent::StructuredAgentInfo,
+    },
     AgentStarted {
         agent: AgentInfo,
         argv: Vec<String>,
@@ -3278,6 +3315,9 @@ pub enum ResponseResult {
     },
     AgentList {
         agents: Vec<AgentInfo>,
+        /// Additive pane-free records. Older responses omit this collection.
+        #[serde(default)]
+        structured_agents: Vec<crate::api::structured_agent::StructuredAgentInfo>,
         /// The fleet directory (#320): every agent this server can address,
         /// local ones included, each stamped with the host it lives on.
         ///
@@ -5103,6 +5143,7 @@ pub struct PeerWorkspaceSummary {
     pub is_linked_worktree: bool,
     /// Short agent label of the workspace's attention-leading pane (e.g. "cc").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
     /// Seconds since the leading pane's state last changed.
@@ -5134,6 +5175,7 @@ pub struct PeerAgentSummary {
     /// Public pane id on the owning server. A routing detail, not a name.
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
 }
@@ -5732,6 +5774,7 @@ mod tests {
                     clone_detection_warning: None,
                     agent_start_label: true,
                     agent_questions: true,
+                    structured_agents: true,
                     pane_input_write_ack: false,
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
