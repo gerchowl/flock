@@ -658,7 +658,7 @@ impl HeadlessServer {
         let result = self.run_loop().await;
         #[cfg(feature = "web")]
         if let Some(wire) = self.client_wire.take() {
-            wire.shutdown().await?;
+            return crate::web::client_listener::finish_shutdown(result, wire.shutdown().await);
         }
         result
     }
