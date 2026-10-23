@@ -38,8 +38,6 @@ pub struct ServerHandle {
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
     /// Structured listener health owned by this server, shared with its lifecycle owner.
-    // The #1894 lifecycle owner reads this handle when the transport is mounted.
-    #[allow(dead_code)]
     pub(crate) client_listener: crate::api::client_listener::Health,
 }
 
@@ -100,6 +98,23 @@ pub(crate) fn start_server_with_capabilities(
     capabilities: Option<ServerCapabilities>,
     uid_policy: crate::structured::identity::UidPolicy,
 ) -> std::io::Result<ServerHandle> {
+    start_server_with_capabilities_and_health(
+        api_tx,
+        event_hub,
+        capabilities,
+        uid_policy,
+        Default::default(),
+    )
+}
+
+/// Rebind the API socket while retaining its logical server's listener health.
+pub(crate) fn start_server_with_capabilities_and_health(
+    api_tx: ApiRequestSender,
+    event_hub: EventHub,
+    capabilities: Option<ServerCapabilities>,
+    uid_policy: crate::structured::identity::UidPolicy,
+    client_listener: crate::api::client_listener::Health,
+) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
 
@@ -114,7 +129,6 @@ pub(crate) fn start_server_with_capabilities(
     let clone_detection_warning = capabilities
         .as_ref()
         .and_then(|caps| caps.clone_detection_warning.clone());
-    let client_listener = crate::api::client_listener::Health::default();
     let connection_status = client_listener.clone();
     let thread = std::thread::spawn(move || {
         let health = Arc::new(Mutex::new(crate::api::schema::ApiListenerHealth::default()));

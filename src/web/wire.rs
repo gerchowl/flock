@@ -30,6 +30,10 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 const MAX_MESSAGE: usize = 65_536;
 /// Upgraded socket cap, including pending hellos.
 const CONNECTIONS: u32 = 16;
+/// Pending unauthenticated sockets; leave capacity for authenticated sessions.
+const PENDING_HELLOS: usize = 4;
+/// Registered sockets per verified token principal, including pending welcome.
+const PRINCIPAL_CONNECTIONS: usize = 4;
 /// Maximum queued control messages per socket.
 const PRIORITY_CAPACITY: usize = 4;
 /// Maximum queued data messages per socket.
@@ -48,8 +52,10 @@ const POLICY_VIOLATION_CLOSE: u16 = 1008;
 struct Client {
     session: Session,
     // The command slice enforces version gating before allocation.
+    #[allow(dead_code)]
     read_only: bool,
     // The replay slice supplies bounded data through this same writer.
+    #[allow(dead_code)]
     data: mpsc::Sender<ServerFrame>,
     revoke: watch::Sender<bool>,
 }
@@ -58,6 +64,7 @@ struct Shared {
     epoch: String,
     clock: Arc<dyn Clock>,
     slots: Arc<Semaphore>,
+    hellos: Arc<Semaphore>,
     clients: Mutex<HashMap<u64, Client>>,
     next: AtomicU64,
     stop: watch::Sender<bool>,
@@ -104,6 +111,7 @@ impl Core {
                 epoch,
                 clock,
                 slots: Arc::new(Semaphore::new(CONNECTIONS as usize)),
+                hellos: Arc::new(Semaphore::new(PENDING_HELLOS)),
                 clients: Mutex::new(HashMap::new()),
                 next: AtomicU64::new(1),
                 stop,
@@ -115,6 +123,7 @@ impl Core {
         Router::new().route("/v1/ws", get(upgrade).with_state(self.shared.clone()))
     }
     /// Later dispatch calls after writing the triggering auth_revoked acknowledgement.
+    #[allow(dead_code)]
     pub(crate) fn revoke(&self, session: &Session) {
         if let Ok(clients) = self.shared.clients.lock() {
             for client in clients.values() {
@@ -142,11 +151,14 @@ async fn upgrade(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> Res
     let Ok(permit) = shared.slots.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Ok(hello) = shared.hellos.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     ws.max_frame_size(MAX_MESSAGE)
         .max_message_size(MAX_MESSAGE)
         .write_buffer_size(0)
         .max_write_buffer_size(WRITE_BUFFER_BYTES)
-        .on_upgrade(move |socket| connection(socket, shared, permit))
+        .on_upgrade(move |socket| connection(socket, shared, permit, hello))
 }
 async fn before<T>(
     clock: &dyn Clock,
@@ -254,7 +266,12 @@ async fn finish_welcome<S: Sink<Message> + Unpin>(
     let _ = socket.send(close(code)).now_or_never();
     false
 }
-async fn connection(mut socket: WebSocket, shared: Arc<Shared>, permit: OwnedSemaphorePermit) {
+async fn connection(
+    mut socket: WebSocket,
+    shared: Arc<Shared>,
+    permit: OwnedSemaphorePermit,
+    hello: OwnedSemaphorePermit,
+) {
     let Ok(id) = shared
         .next
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -287,6 +304,15 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
     let (data, data_rx) = mpsc::channel(DATA_CAPACITY);
     let (revoke, mut revoked) = watch::channel(false);
     if let Ok(mut clients) = shared.clients.lock() {
+        if clients
+            .values()
+            .filter(|c| c.session.info.principal == principal)
+            .count()
+            >= PRINCIPAL_CONNECTIONS
+        {
+            let _ = socket.send(close(GOING_AWAY_CLOSE)).now_or_never();
+            return;
+        }
         clients.insert(
             id,
             Client {
@@ -313,6 +339,7 @@ async fn connection(mut socket: WebSocket, shared: Arc<Shared>, permit: OwnedSem
         if session.info.principal != principal || *registered.borrow() {
             return Err(HandshakeFailure::Refused);
         }
+        drop(hello);
         Ok(())
     };
     if !finish_welcome(

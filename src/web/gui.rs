@@ -61,7 +61,8 @@ fn refusal(status: StatusCode, code: ErrorCode, message: &'static str) -> Respon
         .into_response()
 }
 
-fn origin_allowed(headers: &HeaderMap, authority: &str) -> bool {
+/// Match the bound numeric authority for GUI and mounted protocol routes.
+pub(super) fn origin_allowed(headers: &HeaderMap, authority: &str) -> bool {
     // Browsers omit the default HTTP port when serializing Host and Origin.
     let canonical = authority.strip_suffix(":80").unwrap_or(authority);
     if headers.get_all(header::HOST).iter().count() != 1

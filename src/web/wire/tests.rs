@@ -106,7 +106,12 @@ impl Server {
         let dir = root.path().join("client-tokens");
         fs::create_dir(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        for (name, token, principal) in [("one", "a", "c"), ("two", "d", "e")] {
+        for (name, token, principal) in [
+            ("one", "a", "c"),
+            ("two", "d", "e"),
+            ("three", "b", "f"),
+            ("four", "1", "2"),
+        ] {
             let path = dir.join(format!("{name}.token"));
             fs::write(&path, json!({"token":token.repeat(64),"principal":principal.repeat(32),"scopes":["read","send","answer","operate"]}).to_string()).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -422,11 +427,11 @@ fn fanout_closes_only_the_verified_principal_and_cleanup_is_owned() {
     });
 }
 #[test]
-fn sixteen_pending_hellos_bound_slots_and_shutdown_refuses_new_upgrades() {
+fn pending_hellos_reserve_authenticated_capacity_and_shutdown_refuses_upgrades() {
     runtime(async {
         let server = Server::new().await;
         let mut sockets = Vec::new();
-        for _ in 0..16 {
+        for _ in 0..PENDING_HELLOS {
             sockets.push(Socket::open(&server).await);
         }
         let (_, refusal) = Socket::upgrade(&server).await;
@@ -954,6 +959,33 @@ async fn revoke_during_hello(at: u64, registered: usize) {
     ));
     assert_eq!(fired.load(Ordering::SeqCst), 1);
     server.finish().await;
+}
+
+#[test]
+fn per_principal_quota_preserves_siblings_and_global_sixteen_socket_limit() {
+    runtime(async {
+        let server = Server::new().await;
+        let mut sockets = Vec::new();
+        for token in ["a", "d", "b", "1"] {
+            for _ in 0..PRINCIPAL_CONNECTIONS {
+                let mut client = Socket::open(&server).await;
+                client.hello(1, &token.repeat(64)).await;
+                sockets.push(client);
+            }
+            if token == "a" {
+                let mut excess = Socket::open(&server).await;
+                excess.send(json!({"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":token.repeat(64)})).await;
+                assert!(matches!(
+                    excess.receive().await,
+                    Received::Close(GOING_AWAY_CLOSE)
+                ));
+            }
+        }
+        assert_eq!(sockets.len(), CONNECTIONS as usize);
+        let (_, refusal) = Socket::upgrade(&server).await;
+        assert!(refusal.starts_with("HTTP/1.1 503"));
+        server.finish().await;
+    });
 }
 
 #[test]
