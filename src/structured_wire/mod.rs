@@ -14,11 +14,16 @@ use serde_json::Value;
 #[cfg(test)]
 pub(crate) mod fixture;
 mod minimal;
+mod permission;
 // Later wire slices consume these exact payload re-exports.
 #[cfg_attr(feature = "web", allow(unused_imports))]
 pub use minimal::{
     AgentDecide, AgentDecideErrorCode, AgentDecideResult, FleetAgentRow, FleetDelta,
     PermissionDecision,
+};
+pub use permission::{
+    IgnoredPermissionReason, IgnoredPermissionSuggestions, PermissionAnswer, PermissionClose,
+    PermissionCloseReason, PermissionRecord, PermissionState,
 };
 #[cfg(test)]
 mod review_tests;
@@ -135,6 +140,8 @@ pub enum ClientFrame {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SubfailCode {
+    /// Unsafe or reserved agent namespace. Select a valid subject, never retry unchanged.
+    InvalidAgent,
     /// Clear only this stream's state/cursor and bootstrap without after.
     CursorAhead,
     /// Stop until the principal changes.

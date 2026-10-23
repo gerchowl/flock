@@ -18,7 +18,8 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 
     match subcommand {
         "list" => agent_list(&args[1..]),
-        "get" => agent_get(&args[1..]),
+        "get" | "status" => agent_get(&args[1..]),
+        "stop" => agent_stop(&args[1..]),
         "read" => agent_read(&args[1..]),
         "history" => agent_history(&args[1..]),
         "result" => agent_result(&args[1..]),
@@ -53,7 +54,7 @@ pub(super) const AGENT_HISTORY_USAGE: &str =
 
 pub(super) const AGENT_RESULT_USAGE: &str =
     "flk agent result <target> [--max-chars N] [--offset N]";
-pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--questions ask_human|ask_operator|route|deny] [--unattended] [--dry-run] -- <argv...>";
+pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--runtime pty|structured] [--model MODEL] [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--questions ask_human|ask_operator|route|deny] [--unattended] [--dry-run] -- <argv...>";
 
 pub(super) const AGENT_RESTART_USAGE: &str =
     "flk agent restart self|<target> --reason TEXT [--continue-with TEXT|@FILE]";
@@ -98,6 +99,8 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
 /// into them never reaches the request.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AgentStartFlags {
+    runtime: crate::api::schema::AgentRuntime,
+    model: Option<String>,
     dry_run: bool,
     cwd: Option<String>,
     workspace_id: Option<String>,
@@ -138,6 +141,18 @@ fn parse_agent_start_flags(args: &[String], separator: usize) -> Result<AgentSta
                 .ok_or_else(|| format!("missing value for {flag}"))
         };
         match args[index].as_str() {
+            "--runtime" => {
+                flags.runtime = match value_for("--runtime")?.as_str() {
+                    "pty" => crate::api::schema::AgentRuntime::Pty,
+                    "structured" => crate::api::schema::AgentRuntime::Structured,
+                    _ => return Err("--runtime requires pty or structured".into()),
+                };
+                index += 2;
+            }
+            "--model" => {
+                flags.model = Some(value_for("--model")?);
+                index += 2;
+            }
             "--cwd" => {
                 flags.cwd = Some(value_for("--cwd")?);
                 index += 2;
@@ -224,6 +239,12 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
+    if crate::terminal::agent_name::validate(name).is_err() {
+        return super::print_response(
+            &serde_json::json!({"ok": false, "error": crate::terminal::agent_name::refusal()}),
+        );
+    }
+
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
         eprintln!("usage: {AGENT_START_USAGE}");
         return Ok(2);
@@ -241,6 +262,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         }
     };
     let AgentStartFlags {
+        runtime,
+        model,
         dry_run,
         cwd,
         workspace_id,
@@ -253,6 +276,27 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         ready_timeout_ms,
         asked,
     } = flags;
+    if runtime == crate::api::schema::AgentRuntime::Structured {
+        if wait_ready {
+            return Ok(super::output::error(
+                &serde_json::json!({"error":{
+                "code":"runtime_unsupported", "message":"structured sessions have no pane readiness"}}),
+                crate::cli::exit::USAGE,
+            ));
+        }
+        let pong = super::send_request(&Request {
+            id: "cli:ping:structured".into(),
+            method: Method::Ping(crate::api::schema::PingParams::default()),
+        })?;
+        if !crate::api::compatibility::advertises_structured(&pong) {
+            return Ok(super::output::error(
+                &serde_json::json!({"error":{
+                "code":crate::api::compatibility::ERROR_CODE,
+                "message":"structured admission requires a newer server"}}),
+                crate::cli::exit::PROTOCOL_GAP,
+            ));
+        }
+    }
     let asked = asked.gate(
         &format!("agent start {name}"),
         super::questions::server_takes_questions,
@@ -267,6 +311,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let response = super::send_request(&Request {
         id: "cli:agent:start".into(),
         method: Method::AgentStart(AgentStartParams {
+            runtime,
+            model,
             label: None,
             dry_run,
             name: name.clone(),
@@ -704,6 +750,19 @@ fn agent_get(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn agent_stop(args: &[String]) -> std::io::Result<i32> {
+    let [target] = args else {
+        eprintln!("usage: flk agent stop <structured-agent>");
+        return Ok(super::exit::USAGE);
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:stop".into(),
+        method: Method::AgentStop(AgentTarget {
+            target: target.clone(),
+        }),
+    })?)
+}
+
 fn agent_focus(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!("usage: flk agent focus <target>");
@@ -925,12 +984,26 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn resolve_agent_target(target: &str, request_id: &str) -> std::io::Result<serde_json::Value> {
-    super::send_request(&Request {
+    let response = super::send_request(&Request {
         id: request_id.into(),
         method: Method::AgentGet(AgentTarget {
             target: target.to_owned(),
         }),
-    })
+    })?;
+    if response
+        .pointer("/result/agent/runtime")
+        .and_then(serde_json::Value::as_str)
+        == Some("structured")
+    {
+        return Ok(serde_json::json!({
+            "id": request_id,
+            "error": {
+                "code": crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),
+                "message": "this operation requires a PTY placement"
+            }
+        }));
+    }
+    Ok(response)
 }
 
 fn agent_rename(args: &[String]) -> std::io::Result<i32> {
@@ -947,6 +1020,12 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     } else {
         Some(args[1..].join(" "))
     };
+
+    if crate::terminal::agent_name::validate(name.as_deref().unwrap_or_default()).is_err() {
+        return super::print_response(
+            &serde_json::json!({"ok": false, "error": crate::terminal::agent_name::refusal()}),
+        );
+    }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:rename".into(),
@@ -1191,7 +1270,8 @@ fn agent_result(args: &[String]) -> std::io::Result<i32> {
 fn print_agent_help() {
     eprintln!("flk agent commands:");
     eprintln!("  flk agent list [--resumable]");
-    eprintln!("  flk agent get <target>");
+    eprintln!("  flk agent get|status <target>");
+    eprintln!("  flk agent stop <structured-agent>");
     eprintln!("  flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  {AGENT_HISTORY_USAGE}");
     eprintln!("  {AGENT_RESULT_USAGE}");
@@ -1459,4 +1539,9 @@ mod restart_tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_structured_start(args: &[String]) -> std::io::Result<i32> {
+    agent_start(args)
 }

@@ -40,10 +40,9 @@ type Tab = "inbox" | "agents";
 export function PhoneWorkbench(props: PhoneProps): JSX.Element {
   const [tab, setTab] = createSignal<Tab>("inbox");
   const [onAgent, setOnAgent] = createSignal(false);
-  const blocked = (): number => props.inbox.filter((card) => card.blocking).length;
-  // Live mode has no inbox source until G5 and shows no cards, so the headline counts nothing.
-  const headline = (): string =>
-    props.source === "live" ? "Your inbox arrives with G5 (#1597)." : blocked() === 0 ? "Nothing is blocked on you." : `${blocked()} blocked on you.`;
+  // The same count as the sidebar badge: what the server lists as waiting on a human.
+  const blocked = (): number => props.rows().reduce((sum, row) => sum + row.waitingOnHuman.length, 0);
+  const headline = (): string => (blocked() === 0 ? "Nothing is blocked on you." : `${blocked()} blocked on you.`);
   /*
    * The agent screen is a history entry, so the system back gesture returns
    * to the tab it came from instead of leaving the app. `pushState` without
@@ -96,7 +95,7 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
                 <p class="phone__headline" data-testid="inbox-headline">
                   {headline()}
                 </p>
-                <InboxCards cards={props.inbox} />
+                <InboxCards cards={props.inbox} source={props.source} sender={props.sender} />
               </Match>
               <Match when={tab() === "agents"}>
                 <h1 class="phone__title">Agents</h1>

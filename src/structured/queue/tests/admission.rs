@@ -1248,6 +1248,36 @@ fn batch_entropy_failure_keeps_the_journal_and_items_unchanged() {
                 count as usize,
                 "normal entropy recovers without poisoning"
             );
+            let records = q.journal().replay(through).unwrap().records;
+            if leading_invalid {
+                let invalid = q
+                    .journal()
+                    .items()
+                    .iter()
+                    .find(|i| i.item_id == id(9))
+                    .unwrap();
+                assert_eq!(invalid.state, State::Failed);
+                assert_eq!(
+                    invalid.metadata["refusal"],
+                    ErrorCode::InvalidRequest.as_str()
+                );
+                assert_eq!(
+                    records,
+                    vec![json!({
+                        "seq":through + 1, "kind":"fail", "item_id":id(9),
+                        "reason":ErrorCode::InvalidRequest.as_str(),
+                    })]
+                );
+            } else {
+                assert!(records.is_empty());
+            }
+            let recovered_through = q.journal().replay(0).unwrap().through;
+            assert_eq!(q.batch(100).unwrap().unwrap().items.len(), count as usize);
+            assert_eq!(
+                q.journal().replay(0).unwrap().through,
+                recovered_through,
+                "formation must not fail the same item twice"
+            );
         }
     }
 }
@@ -1400,4 +1430,64 @@ fn unknown_item_data_keep_positions_but_are_never_automatically_delivered() {
         assert!(q.batch(100).unwrap().is_none());
         assert!(fs::read(root.path()).unwrap().starts_with(&bytes));
     }
+}
+
+#[test]
+fn invalid_header_refuses_admission_with_corrupt_code() {
+    assert_review_readonly_admission("header");
+}
+
+#[test]
+fn legacy_unknown_refuses_admission_with_corrupt_code() {
+    assert_review_readonly_admission("legacy");
+}
+
+#[test]
+fn required_checkpoint_refuses_admission_with_corrupt_code() {
+    assert_review_readonly_admission("checkpoint");
+}
+
+fn assert_review_readonly_admission(mode: &str) {
+    let root = Root::new();
+    drop(root.open());
+    let mut header: Value = serde_json::from_slice(&root.identity_prefix()).unwrap();
+    match mode {
+        "header" => header["format_version"] = Value::Null,
+        "legacy" => {
+            header.as_object_mut().unwrap().remove("format_version");
+        }
+        "checkpoint" => (),
+        _ => panic!("unexpected fixture mode"),
+    }
+    let mut bytes = encode(&header).unwrap();
+    bytes.extend(unknown_record("kind"));
+    fs::write(root.path(), &bytes).unwrap();
+    let mut journal = root.open();
+    if mode == "checkpoint" {
+        assert!(journal.read_only().is_none());
+        assert!(journal.checkpoint().is_err());
+    }
+    let mut q = Admission::new(journal, MAX_BATCH).unwrap();
+    let errors = [
+        q.enqueue(input(1), Principal::Operator, Gate::Send)
+            .unwrap_err(),
+        q.batch(100).unwrap_err(),
+        q.replace(vec![]).unwrap_err(),
+        q.replace(vec![input(1)]).unwrap_err(),
+    ];
+    for error in errors {
+        assert_eq!(error.code, ErrorCode::QueueJournalCorrupt);
+        assert_eq!(error.code.retry().as_str(), "after_human");
+        assert!(error
+            .source
+            .unwrap()
+            .get_ref()
+            .unwrap()
+            .is::<QueueJournalCorrupt>());
+    }
+    assert!(matches!(
+        q.journal().read_only(),
+        Some(ReadOnly::Corrupt(_))
+    ));
+    assert_eq!(fs::read(root.path()).unwrap(), bytes);
 }

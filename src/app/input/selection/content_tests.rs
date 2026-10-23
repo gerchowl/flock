@@ -49,6 +49,26 @@ while IFS= read -r command; do
             printf '\033[2;J'
             printf 'DONE_erase2semi\r\n'
             ;;
+        cycle47|cycle1047|cycle1049)
+            mode=${command#cycle}
+            printf '\033[?%sh\033[H' "$mode"
+            i=0
+            while [ "$i" -lt 20 ]; do printf 'ALT_%s\r\n' "$i"; i=$((i+1)); done
+            printf '\033[3J\033[?%slDONE_%s\r\n' "$mode" "$command"
+            ;;
+        enter47|enter1047|enter1049)
+            mode=${command#enter}
+            printf '\033[?%sh\033[HSELECTA\r\nSELECTB\r\nDONE_%s\r\n' "$mode" "$command"
+            ;;
+        alt_history)
+            printf '\033[22J\033[6;1HDONE_alt_history'
+            ;;
+        reset_alt)
+            printf '\033c\033[?47hOTHER_A\r\nOTHER_B\r\nDONE_reset_alt\r\n'
+            ;;
+        reset_restore_alt)
+            printf '\033c\033[?1049h\033[?1049s\033[?47l\033[?1049rSELECTA\r\nSELECTB\r\nDONE_reset_alt49\r\n'
+            ;;
         alternate)
             printf '\033[?47h\033[HSELECTA\r\nSELECTB\r\nDONE_alternate\r\n'
             ;;
@@ -110,6 +130,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_scrollback(256 * 1024).await
+    }
+    async fn with_scrollback(capacity: usize) -> Self {
         let root =
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let mut state = AppState::test_new();
@@ -124,7 +147,7 @@ impl Fixture {
             40,
             root.path().to_owned(),
             &["/bin/sh".into(), "-c".into(), SCRIPT.into()],
-            256 * 1024,
+            capacity,
             Default::default(),
             events,
             notify.clone(),
@@ -215,6 +238,18 @@ impl Fixture {
     }
     fn copy(&mut self) {
         self.mouse(MouseEventKind::Up(MouseButton::Left), 6, 2);
+    }
+    fn assert_selected_history(&self) {
+        // PageList.scrollbar hides history when max_scrollback=0. Prove the
+        // retained rows directly: the viewport no longer shows them, but the
+        // live selection still extracts their exact text from screen coordinates.
+        assert!(!self.runtime().visible_text().contains("SELECTA"));
+        assert_eq!(
+            self.runtime()
+                .extract_selection(self.state.selection.as_ref().unwrap())
+                .as_deref(),
+            Some("SELECTA\nSELECTB")
+        );
     }
     fn assert_copy(&mut self) {
         self.copy();
@@ -405,15 +440,12 @@ async fn real_read_xtrestore_saved_true_1049_refuses_replacement_rows() {
 }
 
 #[tokio::test]
-async fn real_read_xtrestore_after_reset_keeps_resize_invalidation() {
+async fn real_read_primary_xtrestore_after_reset_survives_resize() {
     let mut fixture = Fixture::new().await;
     fixture.write_and_wait("reset_restore", "DONE_reset").await;
-    // Full reset clears saved modes. Even an unsaved restore conservatively
-    // marks alternate allocation; capture afterward to isolate resize tracking.
     fixture.select();
-    fixture.state.request_clipboard_write = Some(b"previous clipboard".to_vec());
     fixture.runtime().resize(8, 6, 0, 0);
-    assert_restored_selection_refused(&mut fixture);
+    fixture.assert_copy();
 }
 
 async fn assert_full_screen_clear_refuses(command: &str, alternate: bool) {
@@ -453,5 +485,110 @@ async fn real_read_deccolm_refuses_copy_on_both_screens() {
 async fn real_read_decaln_refuses_copy_on_both_screens() {
     for alternate in [false, true] {
         assert_full_screen_clear_refuses("decaln", alternate).await;
+    }
+}
+
+#[tokio::test]
+async fn real_read_primary_after_full_screen_app_survives_resize() {
+    for mode in [47, 1047, 1049] {
+        let mut fixture = Fixture::new().await;
+        let command = format!("cycle{mode}");
+        fixture
+            .write_and_wait(&command, &format!("DONE_{command}"))
+            .await;
+        fixture.select();
+        fixture.runtime().resize(8, 6, 0, 0);
+        fixture.assert_copy();
+    }
+}
+
+#[tokio::test]
+async fn real_read_primary_selection_survives_alternate_output_and_erase() {
+    for mode in [47, 1047, 1049] {
+        let mut fixture = Fixture::new().await;
+        fixture.select();
+        let command = format!("cycle{mode}");
+        fixture
+            .write_and_wait(&command, &format!("DONE_{command}"))
+            .await;
+        fixture.runtime().resize(8, 6, 0, 0);
+        fixture.assert_copy();
+    }
+}
+
+#[tokio::test]
+async fn real_read_primary_no_scrollback_resize_refuses_visibly() {
+    let mut fixture = Fixture::with_scrollback(0).await;
+    fixture.select();
+    fixture.state.request_clipboard_write = Some(b"previous clipboard".to_vec());
+    fixture.runtime().resize(8, 3, 0, 0);
+    assert_restored_selection_refused(&mut fixture);
+}
+
+#[tokio::test]
+async fn real_read_alternate_resize_and_teardown_refuse_in_all_screen_modes() {
+    for mode in [47, 1047, 1049] {
+        for action in [
+            "active_resize",
+            "inactive_resize",
+            "inactive_history",
+            "reset_alt",
+        ] {
+            let mut fixture = Fixture::new().await;
+            let command = format!("enter{mode}");
+            fixture
+                .write_and_wait(&command, &format!("DONE_{command}"))
+                .await;
+            fixture.select();
+            fixture.state.request_clipboard_write = Some(b"previous clipboard".to_vec());
+            match action {
+                "active_resize" => fixture.runtime().resize(8, 6, 0, 0),
+                "inactive_resize" | "inactive_history" => {
+                    if action == "inactive_history" {
+                        fixture
+                            .write_and_wait("alt_history", "DONE_alt_history")
+                            .await;
+                        fixture.assert_selected_history();
+                    }
+                    fixture.write_and_wait("primary", "DONE_primary").await;
+                    fixture.runtime().resize(3, 20, 0, 0);
+                    fixture.write_and_wait("alternate_return", "BACK_ALT").await;
+                }
+                _ => fixture.write_and_wait(action, "DONE_reset_alt").await,
+            }
+            assert_restored_selection_refused(&mut fixture);
+        }
+    }
+}
+
+#[tokio::test]
+async fn real_read_saved_true_restore_after_reset_still_refuses_alternate_resize() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .write_and_wait("reset_restore_alt", "DONE_reset_alt49")
+        .await;
+    fixture.select();
+    fixture.state.request_clipboard_write = Some(b"previous clipboard".to_vec());
+    fixture.runtime().resize(8, 6, 0, 0);
+    assert_restored_selection_refused(&mut fixture);
+}
+
+#[tokio::test]
+async fn real_read_primary_survives_resize_with_inactive_alternate_history() {
+    for mode in [47, 1047, 1049] {
+        let mut fixture = Fixture::new().await;
+        let command = format!("enter{mode}");
+        fixture
+            .write_and_wait(&command, &format!("DONE_{command}"))
+            .await;
+        fixture.select();
+        fixture
+            .write_and_wait("alt_history", "DONE_alt_history")
+            .await;
+        fixture.assert_selected_history();
+        fixture.write_and_wait("primary", "DONE_primary").await;
+        fixture.select();
+        fixture.runtime().resize(8, 6, 0, 0);
+        fixture.assert_copy();
     }
 }

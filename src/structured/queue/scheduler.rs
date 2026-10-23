@@ -19,8 +19,9 @@ pub(crate) enum PendingCause {
     /// An accepted batch still needs its real result; runtime exit/restart also
     /// ends the wait, holding unresolved items instead of resending them.
     AwaitingResult,
-    /// A malformed known record requires operator recovery, never a retry or
-    /// automatic journal rewrite. State is inspectable only until recovery.
+    /// A malformed known record or unknown data preventing a required checkpoint
+    /// require operator recovery, never a retry or automatic journal rewrite.
+    /// State is inspectable only until recovery.
     QueueJournalCorrupt(QueueJournalCorrupt),
     /// Journal downgrade refused. Only upgrading to a compatible writer permits
     /// mutations; a real harness result or a queue retry cannot recover it.
@@ -44,7 +45,9 @@ pub(crate) enum PendingCause {
 /// Status of an accepted batch or a candidate refused without any stdin write.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct Pending {
-    /// Accepted/refused batch UUID, or none when no candidate was formed.
+    /// Accepted batch UUID or the candidate UUID at refusal time; none when no
+    /// candidate was formed. A refusal ID is historical, not the current head:
+    /// later edits, removal, cancellation or admission do not update it.
     pub batch_id: Option<String>,
     /// Reservation/first-refusal time, or observation time for an S4/S6 gate.
     /// Zero for journal read-only refusal, which has no reservation clock.
@@ -117,7 +120,10 @@ impl Scheduler {
         self.admission.journal()
     }
     /// Current journal/accepted-turn blocker or unconfirmed refused candidate. Status and
-    /// deliver report the same cause/time. No status observation writes a record;
+    /// deliver report the same cause/time. A refused candidate retains its ID
+    /// and time from that attempt until a real result or runtime exit clears it
+    /// (ADR-0036 §3). It does not identify the current queue head or batch.
+    /// No status observation writes a record.
     /// S4/S6 gates and no-eligible-input are reported by deliver when unreserved.
     pub fn status(&self, runtime: &Runtime) -> Option<Pending> {
         if let Some(reason) = self.journal().read_only() {

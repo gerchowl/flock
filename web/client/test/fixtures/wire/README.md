@@ -23,7 +23,7 @@ ceiling; mismatch, unexpected output and premature exit fail immediately.
 | `observe` | Optional `connection:string`, `streams{sub_id:{state:string,cursor:number\|null}}`, `outbox{cmd_id:OutboxStatus}`, optional `absent_streams`, `absent_outbox`, `connection_transitions`. Assert only specified entries; null means no applied cursor, while zero is meaningful. G3 owns connection/stream states; outbox statuses are the closed six-state enum below. |
 | `deadline` | `stage:{kind:"connect"\|"handshake"\|"subscription"\|"command_ack",sub_id?,cmd_id?}`. Advance to the original stage ceiling, rejecting every early effect, with no duration override. Subscription and command stages require their identity. |
 | `heartbeat_missed` | Withhold valid current-socket traffic and advance to 45 s from the last valid current-socket frame. The fake transport determines that instant; an old callback cannot shift it. |
-| `close` | `code`, `reason`. Deliver a non-auth WS close (including 1001 for a post-registration handshake/store deadline); reconnect with the retained token. 4401/4403 are rejected here. |
+| `close` | `code`, `reason`. Deliver a non-auth WS close (including 1001 for an initial hello or post-registration handshake deadline, unavailable store worker, I/O failure or unsafe storage); reconnect with the retained token. 4401/4403 are rejected here. |
 | `drop` | Lose the active socket without a close, retaining applied state and outbox. |
 | `token_refused` | `code:4401\|4403`. Enter NeedsToken, hold pending outbox and do not reconnect until credentials change. |
 | `quiet` | Positive `ceiling_ms`. Advance the fake clock by that duration, requiring no client frame, close **or connection attempt** throughout. Required last, also usable between other operations. |

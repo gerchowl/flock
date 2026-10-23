@@ -603,7 +603,7 @@ fn broken_stdin_is_an_explicit_worker_error() {
 fn existing_stream_links_and_unsafe_modes_are_refused() {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
-    let (mut file, _) =
+    let (mut file, _, _) =
         open_stream(location(&root), &AtomicBool::new(false)).expect("private stream");
     file.write_all(b"").expect("fixture stream");
     drop(file);
@@ -628,7 +628,8 @@ fn existing_stream_links_and_unsafe_modes_are_refused() {
 fn torn_last_record_is_truncated_and_sequence_continues() {
     for tail in [b"{\"seq\":3".as_slice(), b"{not-json}".as_slice()] {
         let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
-        let (mut file, _) = open_stream(location(&root), &AtomicBool::new(false)).expect("stream");
+        let (mut file, _, _) =
+            open_stream(location(&root), &AtomicBool::new(false)).expect("stream");
         let mut good = Vec::new();
         for seq in 1..=2 {
             let record = serde_json::json!({"seq":seq,"received_at_ms":1,"origin":"claude","result_subtype":null,"raw":"prior"});
@@ -638,7 +639,7 @@ fn torn_last_record_is_truncated_and_sequence_continues() {
         file.write_all(&good).expect("good records");
         file.write_all(tail).expect("torn tail");
         drop(file);
-        let (file, seq) =
+        let (file, seq, _) =
             open_stream(location(&root), &AtomicBool::new(false)).expect("repair tail");
         assert_eq!(seq, 2);
         assert_eq!(
@@ -717,11 +718,11 @@ fn claude_cannot_spoof_transport_record_origin() {
 #[test]
 fn recovery_scans_an_oversized_torn_tail_without_accepting_it() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
-    let (mut file, _) = open_stream(location(&root), &AtomicBool::new(false)).expect("stream");
+    let (mut file, _, _) = open_stream(location(&root), &AtomicBool::new(false)).expect("stream");
     file.write_all(&vec![b'x'; RECORD_LIMIT as usize + 99])
         .expect("oversized torn tail");
     drop(file);
-    let (file, seq) =
+    let (file, seq, _) =
         open_stream(location(&root), &AtomicBool::new(false)).expect("repair oversized tail");
     assert_eq!(seq, 0);
     assert_eq!(file.metadata().expect("size").len(), 0);
@@ -730,7 +731,7 @@ fn recovery_scans_an_oversized_torn_tail_without_accepting_it() {
 #[test]
 fn malformed_newline_terminated_final_record_is_corruption() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).expect("fixture root");
-    let (mut file, _) = open_stream(location(&root), &AtomicBool::new(false)).expect("stream");
+    let (mut file, _, _) = open_stream(location(&root), &AtomicBool::new(false)).expect("stream");
     let bytes = b"{not-a-record}\n";
     file.write_all(bytes).expect("corrupt complete record");
     drop(file);
@@ -1041,7 +1042,7 @@ fn already_queued_user_input_waits_for_the_control_response() {
 fn unknown_persisted_raw_kind_reopens_without_permission_state() {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let cancel = AtomicBool::new(false);
-    let (mut file, mut seq) = open_stream(location(&root), &cancel).unwrap();
+    let (mut file, mut seq, _) = open_stream(location(&root), &cancel).unwrap();
     let (tx, rx) = mpsc::sync_channel(1);
     let raw = br#"{"type":"future_permission_kind","request_id":"future-request"}"#;
     emit(
@@ -1067,7 +1068,7 @@ fn unknown_persisted_raw_kind_reopens_without_permission_state() {
         SessionEvent::Unknown { .. }
     ));
     drop(file);
-    let (_file, seq) = open_stream(location(&root), &cancel).unwrap();
+    let (_file, seq, _) = open_stream(location(&root), &cancel).unwrap();
     assert_eq!(seq, 1);
     assert_eq!(records(&root)[0].raw, std::str::from_utf8(raw).unwrap());
     assert!(Book::new("fixture-agent".into()).waiting().is_empty());
@@ -2826,4 +2827,320 @@ fn disconnected_acceptance_observer_requests_stop_without_admitting_bytes() {
     assert!(stop.requested());
     assert!(handle.cancel.load(Ordering::Acquire));
     assert!(!handle.input_inflight());
+}
+
+#[test]
+fn stored_permission_pair_replays_as_known_events() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    permission(&mut output, "typed-request");
+    receive(&transport);
+    receive(&transport);
+    let seq = permission_handle(&transport, "typed-request");
+    call_decide(
+        &transport,
+        &owner(),
+        &decide("typed-request", permissions::Decision::Deny, seq),
+    )
+    .unwrap();
+    receive(&transport);
+    single_permission_response(&transport, &mut input);
+    let audits: Vec<_> = records(&root)
+        .into_iter()
+        .filter(|record| {
+            serde_json::from_str::<Value>(&record.raw).unwrap()["type"] == "flk_permission_request"
+        })
+        .collect();
+    assert_eq!(audits.len(), 2);
+    let examples: Vec<Value> =
+        include_str!("../../../web/client/test/fixtures/wire/permission-decision.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter_map(|line| line.get("frame").and_then(|frame| frame.get("ev")).cloned())
+            .collect();
+    assert_eq!(examples.len(), 2);
+    for (record, example) in audits.into_iter().zip(examples) {
+        assert_eq!(
+            serde_json::from_str::<Value>(&record.raw).unwrap(),
+            example,
+            "producer/fixture drift"
+        );
+        assert_eq!(
+            record.raw,
+            serde_json::to_string(&example).unwrap(),
+            "wire byte drift"
+        );
+        let event = SessionEvent::parse(&record.raw, "fixture");
+        assert!(
+            !matches!(event, SessionEvent::Unknown { .. }),
+            "permission audit must be known: {}",
+            record.raw
+        );
+        let known: crate::structured::claude::KnownSessionEvent =
+            serde_json::from_str(&record.raw).unwrap();
+        assert_eq!(
+            serde_json::to_value(known).unwrap(),
+            serde_json::from_str::<Value>(&record.raw).unwrap()
+        );
+        let received = Received {
+            record,
+            event,
+            persisted: true,
+            accepted: None,
+        };
+        if example["state"] == "closed" {
+            assert!(matches!(
+                received.state_input(),
+                Some(crate::structured::state::Input::ControlAnswered(
+                    "typed-request"
+                ))
+            ));
+        } else {
+            assert!(received.state_input().is_none());
+        }
+    }
+}
+
+fn seed_permission_crash(root: &SessionConfigDir, automatic: bool) -> u64 {
+    let request: crate::structured::claude::ToolRequest = serde_json::from_value(serde_json::json!({"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example","input":{"command":"true"}})).unwrap();
+    let mut book = Book::new("fixture-agent".into());
+    let mut audits = Vec::new();
+    if automatic {
+        audits.push(book.observe("grant-origin", request.clone()).unwrap());
+        let args = permissions::AgentDecide {
+            agent: "fixture-agent".into(),
+            request_id: "grant-origin".into(),
+            request_seq: 1,
+            decision: permissions::Decision::AllowAlways,
+            message: None,
+        };
+        let answer = book.prepare(&owner(), &args).unwrap();
+        assert!(book.begin_answer(&answer.id, answer.request_seq));
+        audits.push((*answer.audit).clone());
+        book.audited(&answer);
+        book.written(answer);
+        book.resume_after(audits.len() as u64);
+    }
+    let open = book.observe("orphan", request).unwrap();
+    let request_seq = open.request_seq;
+    audits.push(open);
+    if automatic {
+        let reserved = book
+            .automatic("orphan")
+            .unwrap()
+            .expect("exact grant reserved");
+        assert_eq!(reserved.audit.grant_request_id(), Some("grant-origin"));
+        assert!(book.waiting().is_empty());
+    }
+    write_permission_crash_prefix(root, audits);
+    // Crash cut: the real producer's open is fsynced, with no terminal or reserved-answer close.
+    request_seq
+}
+
+fn write_permission_crash_prefix(
+    root: &SessionConfigDir,
+    audits: Vec<crate::structured_wire::PermissionRecord>,
+) {
+    let opened = open_stream(location(root), &AtomicBool::new(false)).unwrap();
+    let (mut file, mut seq) = (opened.0, opened.1);
+    let blobs = super::super::blobs::BlobStore::open(root.path()).unwrap();
+    let history = super::super::history::History::default();
+    history
+        .initialize(&file, seq, file.metadata().unwrap().len())
+        .unwrap();
+    for audit in audits {
+        let line = serde_json::to_vec(&serde_json::to_value(audit).unwrap()).unwrap();
+        persist(
+            &mut file,
+            &mut seq,
+            &line,
+            line.len() as u64,
+            "fixture",
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            true,
+            None,
+            None,
+            (&blobs, location(root).storage.blob_min_bytes, &history),
+        )
+        .unwrap();
+    }
+}
+
+fn end_restarted_transport(transport: &Transport, output: File) {
+    drop(output);
+    reader_done(transport).unwrap();
+    transport.cancel();
+    assert_eq!(
+        worker_done(transport, false).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+}
+
+#[test]
+fn restart_closes_orphan_before_admitting_a_new_control_request() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let old_seq = seed_permission_crash(&root, false);
+    let (transport, mut output, _input) = start(&root);
+    permission(&mut output, "orphan");
+    let recovered = receive(&transport);
+    let value: Value = serde_json::from_str(&recovered.record.raw).unwrap();
+    assert_eq!(value["reason"], "session_ended");
+    assert_eq!(value["request_id"], "orphan");
+    assert_eq!(value["request_seq"], old_seq);
+    assert!(value.get("decision").is_none());
+    assert!(matches!(
+        recovered.event,
+        SessionEvent::PermissionRequest(_)
+    ));
+    let raw = receive(&transport);
+    assert_eq!(raw.record.origin, RecordOrigin::Claude);
+    assert!(raw.record.permission_request_seq.unwrap() > recovered.record.seq);
+    receive(&transport);
+    end_restarted_transport(&transport, output);
+    let closes: Vec<Value> = records(&root)
+        .iter()
+        .map(|record| serde_json::from_str(&record.raw).unwrap())
+        .filter(|raw: &Value| {
+            raw["request_id"] == "orphan"
+                && raw["state"] == "closed"
+                && raw["request_seq"] == old_seq
+        })
+        .collect();
+    assert_eq!(closes.len(), 1);
+}
+
+#[test]
+fn second_restart_appends_no_duplicate_permission_close() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    seed_permission_crash(&root, false);
+    let (transport, output, _input) = start(&root);
+    drop(output);
+    reader_done(&transport).unwrap();
+    transport.cancel();
+    worker_done(&transport, false).unwrap_err();
+    let before = fs::read(
+        root.path()
+            .join("sessions/fixture-agent/fixture-session.jsonl"),
+    )
+    .unwrap();
+    assert_eq!(records(&root).len(), 2);
+    let (transport, output, _input) = start(&root);
+    end_restarted_transport(&transport, output);
+    assert_eq!(
+        fs::read(
+            root.path()
+                .join("sessions/fixture-agent/fixture-session.jsonl")
+        )
+        .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn interrupted_automatic_grant_is_closed_after_restart() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let request_seq = seed_permission_crash(&root, true);
+    let (transport, output, _input) = start(&root);
+    drop(output);
+    reader_done(&transport).unwrap();
+    transport.cancel();
+    worker_done(&transport, false).unwrap_err();
+    let rows = records(&root);
+    assert_eq!(rows.len(), 4);
+    let close: Value = serde_json::from_str(&rows[3].raw).unwrap();
+    assert_eq!(
+        close,
+        serde_json::json!({"type":"flk_permission_request","state":"closed","request_id":"orphan","request_seq":request_seq,"reason":"session_ended"})
+    );
+    assert!(matches!(
+        SessionEvent::parse(&rows[3].raw, "fixture"),
+        SessionEvent::PermissionRequest(_)
+    ));
+}
+
+#[test]
+fn recovery_closes_are_all_durable_before_the_first_notification() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let mut book = Book::new("fixture-agent".into());
+    let request: crate::structured::claude::ToolRequest = serde_json::from_value(serde_json::json!({"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example","input":{}})).unwrap();
+    let audits = (0..6)
+        .map(|n| {
+            book.observe(&format!("orphan-{n}"), request.clone())
+                .unwrap()
+        })
+        .collect();
+    write_permission_crash_prefix(&root, audits);
+    let (transport, output, _input) = start(&root);
+    let first = receive(&transport);
+    assert_eq!(
+        serde_json::from_str::<Value>(&first.record.raw).unwrap()["reason"],
+        "session_ended"
+    );
+    assert_eq!(records(&root).len(), 12);
+    for _ in 1..6 {
+        receive(&transport);
+    }
+    end_restarted_transport(&transport, output);
+}
+
+#[test]
+fn recovery_preserves_legacy_unknown_invalid_and_stdout_records() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    seed_permission_crash(&root, false);
+    let mut rows = records(&root);
+    let mut legacy: Value = serde_json::from_str(&rows[0].raw).unwrap();
+    legacy.as_object_mut().unwrap().remove("request_seq");
+    rows[0].raw = legacy.to_string();
+    for (origin, raw) in [
+        (
+            RecordOrigin::Flk,
+            serde_json::json!({"type":"flk_future","opaque":"retained"}),
+        ),
+        (
+            RecordOrigin::Flk,
+            serde_json::json!({"type":"flk_permission_request","state":"open","request_id":"bad","request_seq":null}),
+        ),
+        (
+            RecordOrigin::Claude,
+            serde_json::json!({"type":"flk_permission_request","state":"open","request_id":"spoof","request_seq":4}),
+        ),
+    ] {
+        rows.push(StreamRecord {
+            known: None,
+            shape: None,
+            seq: rows.len() as u64 + 1,
+            received_at_ms: 0,
+            origin,
+            result_subtype: None,
+            permission_grant_request_id: None,
+            permission_request_seq: None,
+            raw: raw.to_string(),
+        });
+    }
+    let prefix: Vec<u8> = rows
+        .iter()
+        .flat_map(|record| {
+            let mut line = serde_json::to_vec(record).unwrap();
+            line.push(b'\n');
+            line
+        })
+        .collect();
+    let path = root
+        .path()
+        .join("sessions/fixture-agent/fixture-session.jsonl");
+    fs::write(&path, &prefix).unwrap();
+    let (transport, output, _input) = start(&root);
+    let recovered = receive(&transport);
+    assert_eq!(
+        serde_json::from_str::<Value>(&recovered.record.raw).unwrap(),
+        serde_json::json!({"type":"flk_permission_request","state":"closed","request_id":"orphan","request_seq":1,"reason":"session_ended"})
+    );
+    end_restarted_transport(&transport, output);
+    let before = fs::read(&path).unwrap();
+    assert!(before.starts_with(&prefix));
+    assert_eq!(records(&root).len(), 5);
+    let (transport, output, _input) = start(&root);
+    end_restarted_transport(&transport, output);
+    assert_eq!(fs::read(path).unwrap(), before);
 }

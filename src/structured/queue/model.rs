@@ -1,4 +1,9 @@
 //! Durable queue data, independent of scheduling and runtime (ADR-0036 §3).
+//!
+//! Unknown payloads retain parsed `serde_json::Value` data (ADR-0028 §3a), not
+//! exact bytes. Serialization normalizes whitespace and escapes; object keys
+//! sort without `serde_json`'s `preserve_order` feature. Unknown data prevent
+//! journal rewrites (#1820/#1922), preserving the original complete records.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -22,7 +27,8 @@ pub enum Producer {
     System(String),
     /// Returning fork identity.
     Fork(String),
-    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future name and parsed JSON payload retained for positional replay (ADR-0028 §3a).
+    // Serialization only. Deserialize is hand-written; do not derive it.
     #[serde(untagged)]
     Unknown(Value),
 }
@@ -49,7 +55,8 @@ pub enum Kind {
     Command,
     /// Input after an anchored command's result.
     Continuation,
-    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future name and parsed JSON payload retained for positional replay (ADR-0028 §3a).
+    // Serialization only. Deserialize is hand-written; do not derive it.
     #[serde(untagged)]
     Unknown(Value),
 }
@@ -74,7 +81,8 @@ pub enum State {
     Dropped,
     /// Permanently refused by formation, with a registered refusal reason.
     Failed,
-    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future name and parsed JSON payload retained for positional replay (ADR-0028 §3a).
+    // Serialization only. Deserialize is hand-written; do not derive it.
     #[serde(untagged)]
     Unknown(Value),
 }
@@ -87,7 +95,8 @@ pub enum Priority {
     Normal,
     /// Before normal items at the same delivery point.
     Urgent,
-    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future name and parsed JSON payload retained for positional replay (ADR-0028 §3a).
+    // Serialization only. Deserialize is hand-written; do not derive it.
     #[serde(untagged)]
     Unknown(Value),
 }
@@ -102,7 +111,8 @@ pub enum Delivery {
     Steer,
     /// Explicit future interrupt mode.
     Interrupt,
-    /// Future variant name retained verbatim for positional replay (ADR-0028 §3a).
+    /// Future name and parsed JSON payload retained for positional replay (ADR-0028 §3a).
+    // Serialization only. Deserialize is hand-written; do not derive it.
     #[serde(untagged)]
     Unknown(Value),
 }
