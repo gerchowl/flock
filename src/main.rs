@@ -99,7 +99,10 @@ mod release_notes;
 mod remote;
 mod render_prof;
 mod report;
-#[cfg(test)]
+#[cfg(any(test, feature = "web"))]
+mod structured_wire;
+#[cfg(not(any(test, feature = "web")))]
+#[path = "structured_wire/production.rs"]
 mod structured_wire;
 #[cfg(test)]
 mod test_support;
@@ -468,6 +471,9 @@ fn main() {
 
 fn run() -> io::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.len() == 2 && raw_args[1] == platform::client_token_lock::WORKER_ARG {
+        return platform::client_token_lock::worker();
+    }
     let args = match session::configure_from_args(&raw_args) {
         Ok(args) => args,
         Err(err) => {

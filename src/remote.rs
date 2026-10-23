@@ -531,30 +531,7 @@ impl RemoteFlock {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum RemoteAssetRef {
-    Url(String),
-    Object { url: String, sha256: Option<String> },
-}
-
-impl RemoteAssetRef {
-    fn url(&self) -> &str {
-        match self {
-            Self::Url(url) => url,
-            Self::Object { url, .. } => url,
-        }
-    }
-
-    fn sha256(&self) -> Option<&str> {
-        match self {
-            Self::Url(_) => None,
-            Self::Object { sha256, .. } => {
-                sha256.as_deref().filter(|value| !value.trim().is_empty())
-            }
-        }
-    }
-}
+use crate::checksum::AssetRef as RemoteAssetRef;
 
 #[derive(Deserialize)]
 struct RemoteUpdateManifest {
@@ -1455,14 +1432,12 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
         let _ = fs::remove_dir_all(&dir);
         return Err(io::Error::other("download failed"));
     }
-    if let Some(expected) = &asset.sha256 {
-        if let Err(err) = crate::checksum::verify_sha256(&path, expected) {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(io::Error::new(
-                err.kind(),
-                format!("downloaded remote asset checksum verification failed: {err}"),
-            ));
-        }
+    if let Err(err) = crate::checksum::verify_asset(&path, asset.sha256.as_deref()) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(io::Error::new(
+            err.kind(),
+            format!("downloaded remote asset checksum verification failed: {err}"),
+        ));
     }
 
     Ok(InstallSource::temporary(path, dir))
@@ -5076,6 +5051,29 @@ exit 0
         assert_eq!(protocol, 11);
         assert_eq!(asset.url(), "https://example.com/old");
         assert_eq!(asset.sha256(), Some("old"));
+    }
+
+    #[test]
+    fn stable_remote_asset_shapes_retain_checksum_for_shared_verification() {
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("binary");
+        fs::write(&path, b"corrupt").unwrap();
+        for value in [
+            serde_json::json!("https://example.invalid/asset"),
+            serde_json::json!({"url":"https://example.invalid/asset", "sha256":"a".repeat(64)}),
+        ] {
+            let manifest: RemoteUpdateManifest = serde_json::from_value(serde_json::json!({
+                "version":"99.0.0", "assets":{"fixture":value.clone()}
+            }))
+            .unwrap();
+            let asset = remote_asset_info(&manifest.assets["fixture"]);
+            let result = crate::checksum::verify_asset(&path, asset.sha256.as_deref());
+            if value.is_string() {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            }
+        }
     }
 
     #[test]

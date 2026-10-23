@@ -217,7 +217,7 @@ pub(crate) fn sanitize_reported_prompt(prompt: &str) -> String {
 }
 
 pub(super) fn normalize_reported_agent_label(agent: &str) -> Option<String> {
-    let trimmed = agent.trim();
+    let trimmed = crate::terminal::agent_name::validate(agent).ok()?;
     if trimmed.is_empty() {
         return None;
     }
