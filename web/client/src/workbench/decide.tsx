@@ -40,11 +40,19 @@ import type { OutboxEntry } from "../wire/outbox";
 import { STATUS_LABELS, type Sender } from "./Composer";
 import type { InboxCard } from "./inbox";
 
+/**
+ * The longest message the server takes, in UTF-8 bytes of the trimmed text. The server
+ * bound is #2249 (`prompt_control_bytes` rules, typed `invalid_params`). The generated
+ * TypeScript schema describes the bound but does not export a numeric constant.
+ */
+export const MESSAGE_MAX_BYTES = 2048;
+
 /** What the server's typed refusals mean for the person, in plain words. */
 export const REFUSALS: { readonly [C in AgentDecideErrorCode]: string } = {
   permission_request_unknown: "The server does not know this request any more. This card follows the agent's list.",
   permission_request_closed: "This request was already closed. This card follows the agent's list.",
   not_authorized: "This client is not allowed to answer permission prompts.",
+  invalid_params: `The trimmed message must be at most ${MESSAGE_MAX_BYTES} UTF-8 bytes and contain no control bytes other than newlines or tabs.`,
 };
 
 /** Where the answer to one request stands. */
@@ -88,13 +96,6 @@ const CHOICES: readonly { readonly label: string; readonly decision: PermissionD
   { label: "Always allow", decision: "allow_always" },
   { label: "Deny", decision: "deny" },
 ];
-
-/**
- * The longest message the server takes, in UTF-8 bytes of the trimmed text. The server
- * bound is #2249 (2048 bytes, `prompt_control_bytes` rules, typed `invalid_params`); this
- * constant becomes generated once #2249 lands.
- */
-export const MESSAGE_MAX_BYTES = 2048;
 
 const utf8Bytes = (text: string): number => new TextEncoder().encode(text).length;
 

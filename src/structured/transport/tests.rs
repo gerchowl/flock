@@ -830,17 +830,66 @@ fn input_line(transport: &Transport, input: &mut File) -> Value {
     private_fs::set_nonblocking(input).unwrap();
     let mut bytes = Vec::new();
     wait(transport, || {
-        let mut byte = [0];
-        match input.read(&mut byte) {
-            Ok(1) if byte[0] == b'\n' => Some(serde_json::from_slice(&bytes).unwrap()),
-            Ok(1) => {
-                bytes.push(byte[0]);
-                None
+        // Drain ready bytes instead of paying a worker-completion wait per byte.
+        // Bounded batches retain the deadline and worker-liveness checks even
+        // when a producer continuously writes without terminating its line.
+        for _ in 0..256 {
+            let mut byte = [0];
+            match input.read(&mut byte) {
+                Ok(1) if byte[0] == b'\n' => {
+                    return Some(serde_json::from_slice(&bytes).unwrap());
+                }
+                Ok(1) => bytes.push(byte[0]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
+                other => panic!("unexpected harness stdin: {other:?}"),
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => None,
-            other => panic!("unexpected harness stdin: {other:?}"),
         }
+        None
     })
+}
+
+#[test]
+fn permission_message_transport_refusal_keeps_open_audit_and_stdin() {
+    // Escaped tabs double the wire bytes without exceeding the permitted message bound.
+    for expected in [
+        "é".repeat(1024),
+        format!(
+            "a{}z",
+            "\t".repeat(permissions::MAX_PERMISSION_DECISION_MESSAGE_BYTES - 2)
+        ),
+    ] {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (transport, mut output, mut input) = start(&root);
+        permission(&mut output, "request-example");
+        receive_after_accepted(&transport);
+        receive_after_accepted(&transport);
+        let request_seq = permission_handle(&transport, "request-example");
+        let mut request = decide("request-example", permissions::Decision::Deny, request_seq);
+        request.message = Some(format!("{}x", "é".repeat(1024)));
+        assert_eq!(
+            call_decide(&transport, &owner(), &request),
+            Err(ErrorCode::InvalidParams)
+        );
+        assert_eq!(waiting_ids(&transport), vec!["request-example"]);
+        assert_eq!(records(&root).len(), 2);
+        private_fs::set_nonblocking(&input).unwrap();
+        assert_eq!(
+            input.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        request.message = Some(format!("  {expected}  "));
+        call_decide(&transport, &owner(), &request).unwrap();
+        let response = input_line(&transport, &mut input);
+        assert_eq!(response["response"]["response"]["message"], expected);
+        let closed = receive(&transport).record;
+        assert_eq!(closed.origin, RecordOrigin::Flk);
+        let audit: Value = serde_json::from_str(&closed.raw).unwrap();
+        assert_eq!(audit["state"], "closed");
+        assert_eq!(audit["message"], expected);
+        drop(output);
+        reader_done(&transport).unwrap();
+        assert_eq!(records(&root).len(), 3);
+    }
 }
 
 #[test]
