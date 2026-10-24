@@ -419,7 +419,7 @@ fn fanout_closes_only_the_verified_principal_and_cleanup_is_owned() {
             .unwrap()
             .session
             .clone();
-        server.core.revoke(&session);
+        server.core.shared.revoke(&session);
         assert!(matches!(
             one.receive().await,
             Received::Close(AUTH_REVOKED_CLOSE)
@@ -798,7 +798,6 @@ fn unknown_post_hello_operations_and_binary_frames_execute_nothing() {
     runtime(async {
         let server = Server::new().await;
         for frame in [
-            json!({"t":"cmd","cmd_id":"fixture","verb":"agent.decide","args":{"agent":"fiction","text":"no-dispatch","submit":true},"resume_only":false}),
             json!({"t":"new-operation"}),
             json!({"t":"hello","protocol":1,"client":{"name":"f","version":"1"},"token":"a".repeat(64)}),
         ] {
@@ -959,7 +958,7 @@ async fn revoke_during_hello(at: u64, registered: usize) {
             "revocation must fire at the requested handshake stage"
         );
         fs::remove_file(path).unwrap();
-        core.revoke(&session);
+        core.shared.revoke(&session);
         observed.fetch_add(1, Ordering::SeqCst);
     }));
     let mut client = Socket::open(&server).await;

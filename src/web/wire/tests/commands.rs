@@ -598,3 +598,173 @@ fn cross_runtime_id_and_name_collisions_refuse_before_queue_mutation() {
         }
     });
 }
+
+#[path = "decisions.rs"]
+mod decisions;
+
+#[test]
+fn send_and_decide_both_ack_on_the_same_socket() {
+    runtime(async {
+        let mut case = Case::new(183120).await;
+        let mut socket = case.open().await;
+        let send = case
+            .command(
+                &mut socket,
+                "agent.send",
+                json!({"target":case.queue.case.id,"text":"one socket turn","submit":true}),
+            )
+            .await;
+        assert_eq!(send["ok"], true);
+        assert_eq!(send["cmd_id"], "command-1");
+        assert!(send["result"]["item_id"].as_str().is_some());
+        let mut request = crate::structured::workers::tests::event("control_request");
+        request["request_id"] = json!("union-request");
+        case.queue.control(json!({"op":"event","event":request}));
+        case.queue
+            .until(|r| {
+                r.app
+                    .structured_workers
+                    .runtime(&r.case.id, r.case.generation)
+                    .unwrap()
+                    .waiting_on_human()
+                    .unwrap()
+                    .iter()
+                    .any(|(id, _)| id == "union-request")
+            })
+            .await;
+        let seq = case
+            .queue
+            .app
+            .structured_workers
+            .runtime(&case.queue.case.id, case.queue.case.generation)
+            .unwrap()
+            .waiting_on_human()
+            .unwrap()
+            .into_iter()
+            .find(|(id, _)| id == "union-request")
+            .unwrap()
+            .1;
+        let decision = case.command(&mut socket, "agent.decide", json!({"agent":case.queue.case.id,"request_id":"union-request","request_seq":seq,"decision":"deny"})).await;
+        assert_eq!(decision["ok"], true);
+        assert_eq!(decision["cmd_id"], "command-2");
+        assert_eq!(
+            decision["result"],
+            json!({"request_id":"union-request","decision":"deny"})
+        );
+        let session = &case
+            .queue
+            .app
+            .state
+            .structured_agents
+            .get(&case.queue.case.id)
+            .unwrap()
+            .0
+            .session_id;
+        let path = case
+            .queue
+            .case
+            .fixture
+            .root
+            .path()
+            .join("sessions")
+            .join(&case.queue.case.id)
+            .join(format!("{session}.jsonl"));
+        case.queue
+            .until(|_| {
+                fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("fixture_control_input")
+            })
+            .await;
+        let events = case.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|v| v["type"] == "fixture_input")
+                .count(),
+            1
+        );
+        let inputs: Vec<_> = events
+            .iter()
+            .filter(|v| v["type"] == "fixture_control_input")
+            .collect();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(
+            inputs[0]["input"]["response"]["request_id"],
+            "union-request"
+        );
+        case.stop().await;
+    });
+}
+
+#[test]
+fn send_scope_without_operate_is_not_authorized() {
+    runtime(async {
+        let mut case = Case::new(183121).await;
+        let mut socket = case.open().await;
+        case.scopes(json!(["read", "send"]));
+        let before = case.journal();
+        let response = case
+            .command(
+                &mut socket,
+                "agent.send",
+                json!({"target":case.queue.case.id,"text":"not an operator","submit":true}),
+            )
+            .await;
+        refusal(
+            response,
+            "not_authorized",
+            crate::api::error_code::ErrorCode::NotAuthorized.exit(),
+        );
+        assert_eq!(case.journal(), before);
+        assert!(!case.events().iter().any(|v| v["type"] == "fixture_input"));
+        case.stop().await;
+    });
+}
+
+#[test]
+fn local_pty_only_target_is_unsupported_for_agent() {
+    runtime(async {
+        let mut case = Case::new(183122).await;
+        case.queue.app.state.workspaces =
+            vec![crate::workspace::Workspace::test_new("send-pty-only")];
+        case.queue.app.state.ensure_test_terminals();
+        let pane = case.queue.app.state.workspaces[0]
+            .focused_pane_id()
+            .unwrap();
+        let terminal = case.queue.app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let state = case.queue.app.state.terminals.get_mut(&terminal).unwrap();
+        state.launch_argv = Some(vec!["claude".into()]);
+        state.set_agent_name("pty-only".into()).unwrap();
+        let target = state.agent_id.to_string();
+        assert!(case.queue.app.locate_agent(&target).unwrap().local);
+        assert!(case
+            .queue
+            .app
+            .state
+            .structured_agents
+            .get(&target)
+            .is_none());
+        let before = case.journal();
+        let mut socket = case.open().await;
+        let response = case
+            .command(
+                &mut socket,
+                "agent.send",
+                json!({"target":target,"text":"no queue for a pty","submit":true}),
+            )
+            .await;
+        refusal(
+            response,
+            "unsupported_for_agent",
+            crate::api::error_code::ErrorCode::UnsupportedForAgent.exit(),
+        );
+        assert_eq!(case.journal(), before);
+        assert!(!case.events().iter().any(|v| v["type"] == "fixture_input"));
+        case.stop().await;
+    });
+}

@@ -4,6 +4,7 @@ use crate::{
     api::error_code::ErrorCode,
     app::App,
     structured::permissions::{
+        self,
         auth::tokens::{Scope, TokenError},
         Principal,
     },
@@ -75,6 +76,7 @@ impl Client {
 }
 enum Outcome {
     Queued(Receipt),
+    Decided(Value),
 }
 fn dispatch(
     app: &mut App,
@@ -122,6 +124,32 @@ fn dispatch_verb(
             }
             Ok(Outcome::Queued(
                 app.structured_send(params, principal)?.committed,
+            ))
+        }
+        "agent.decide" => {
+            // TODO(#2249): Bound decide message independently of the frame limit.
+            let args: AgentDecide = serde_json::from_value(command.args.clone())
+                .map_err(|_| ErrorCode::InvalidParams)?;
+            let (_, _, generation) = app
+                .state
+                .structured_agents
+                .get(&args.agent)
+                .ok_or_else(|| missing_target(app, &args.agent))?;
+            let runtime = app
+                .structured_workers
+                .runtime(&args.agent, generation)
+                .ok_or(ErrorCode::AgentNotFound)?;
+            let backend: permissions::AgentDecide = serde_json::from_value(
+                serde_json::to_value(&args).map_err(|_| ErrorCode::SerializationError)?,
+            )
+            .map_err(|_| ErrorCode::InvalidParams)?;
+            runtime.agent_decide(principal, &backend)?;
+            Ok(Outcome::Decided(
+                serde_json::to_value(AgentDecideResult {
+                    request_id: args.request_id,
+                    decision: args.decision,
+                })
+                .map_err(|_| ErrorCode::SerializationError)?,
             ))
         }
         _ => Err(ErrorCode::ServerVersionGap),
@@ -191,7 +219,7 @@ impl Owner {
             self.remember(pending.key.clone());
             let _ = pending.response.send(ack(pending.key.1, result));
         }
-        // Retain the shared lane order; decision routing lives in #2370.
+        // Decisions have independent capacity even when every send receipt is pending.
         for lane in [1, 0] {
             for _ in 0..CAPACITY {
                 if lane == 0 && self.pending.len() == CAPACITY {
@@ -238,6 +266,10 @@ impl Owner {
                         receipt: parking_lot::Mutex::new(receipt),
                         response: request.response,
                     }),
+                    Ok(Outcome::Decided(value)) => {
+                        self.remember(key);
+                        let _ = request.response.send(ack(request.command.id, Ok(value)));
+                    }
                     Err(code) => {
                         let _ = request.response.send(ack(request.command.id, Err(code)));
                     }

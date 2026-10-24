@@ -165,12 +165,6 @@ impl Core {
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
         self.command_owner.service(app);
     }
-    /// Explicit principal revocation fan-out, also used by command admission.
-    // Commands use Shared directly; retain the existing owner-facing entry point.
-    #[allow(dead_code)]
-    pub(crate) fn revoke(&self, session: &Session) {
-        self.shared.revoke(session);
-    }
     /// Cancel transport work and wait for every connection lease, including hello.
     pub(crate) async fn shutdown(&self) -> Result<(), tokio::time::error::Elapsed> {
         self.shared.stop.send_replace(true);
@@ -440,8 +434,8 @@ async fn connection(
                         if !subscriptions.subscribe(sub_id, stream, after) { break GOING_AWAY_CLOSE }
                     }
                     Ok(ClientFrame::Unsub { sub_id }) => subscriptions.unsubscribe(&sub_id),
-                    Ok(ClientFrame::Cmd { cmd_id, verb, args, resume_only }) if verb != "agent.decide" => {
-                        let refusal = if verb != "agent.send" || read_only {
+                    Ok(ClientFrame::Cmd { cmd_id, verb, args, resume_only }) => {
+                        let refusal = if !matches!(verb.as_str(), "agent.send" | "agent.decide") || read_only {
                             Some(crate::api::error_code::ErrorCode::ServerVersionGap)
                         } else if cmd_id.len() > 128 {
                             Some(crate::api::error_code::ErrorCode::InvalidParams)
