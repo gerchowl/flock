@@ -4,6 +4,29 @@ use std::path::Path;
 use super::model::{KeyDiagnostic, KeyDiagnosticKind};
 use super::{config_overlay_path, config_path, Config};
 
+/// Describe invalid TOML without displaying parser messages or source excerpts.
+///
+/// Syntax errors identify the document root, not an unverified key. Positions
+/// are one-based byte line/columns from the parser span; a missing span is
+/// reported explicitly rather than guessed. Paths identify the source file.
+pub(super) fn toml_syntax_error(error: &toml::de::Error, source: &str, path: &Path) -> String {
+    let position = match error.span() {
+        Some(span) => {
+            let prefix = &source.as_bytes()[..span.start.min(source.len())];
+            let line = prefix.iter().filter(|&&b| b == b'\n').count() + 1;
+            let column = prefix.len()
+                - prefix
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map_or(0, |i| i + 1)
+                + 1;
+            format!("{}:{line}:{column}", path.display())
+        }
+        None => format!("{} (location unavailable)", path.display()),
+    };
+    format!("config parse error: invalid_toml at {position}; key=document root; expected TOML document; keeping current config")
+}
+
 /// Source warnings are independent of merging: even a shadowed obsolete key
 /// needs to be deleted from the file that declares it.
 pub(crate) fn removed_config_warnings() -> Vec<String> {
@@ -174,11 +197,26 @@ fn collect_locations(
 
 #[cfg(test)]
 mod tests {
+    use super::{toml_syntax_error, Path};
     fn messages(text: &str) -> Vec<String> {
         super::key_diagnostics(text, std::path::Path::new("fixture.toml"))
             .into_iter()
             .map(|diagnostic| diagnostic.message)
             .collect()
+    }
+
+    #[test]
+    fn security2384_syntax_positions_are_byte_columns_and_missing_spans_are_explicit() {
+        let source = "a = \"π\" nope\n";
+        let error = toml::from_str::<toml::Table>(source).unwrap_err();
+        let path = Path::new("fixture.toml");
+        let diagnostic = toml_syntax_error(&error, source, path);
+        assert!(diagnostic.contains("fixture.toml:1:10"));
+        assert!(!diagnostic.contains("π") && !diagnostic.contains("nope"));
+        let error: toml::de::Error = serde::de::Error::custom("PRIVATE_2384_no_span_message");
+        let diagnostic = toml_syntax_error(&error, source, path);
+        assert!(diagnostic.contains("location unavailable"));
+        assert!(!diagnostic.contains("PRIVATE_2384") && !diagnostic.contains(source));
     }
 
     #[test]

@@ -1,0 +1,1 @@
+- Invalid generic config env overrides and malformed TOML diagnostics no longer echo supplied values or source lines. Diagnostics retain the variable/key and expected type, or the source file and byte line/column; loader fallback behavior is unchanged.

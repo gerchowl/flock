@@ -319,7 +319,7 @@ fn load_with_overlay(
     let mut merged = env::env_override_table(&mut env_diagnostics);
 
     if let Some(b) = base {
-        let base_table = parse_config_table(b)?;
+        let base_table = parse_config_table(b, &config_path())?;
         // ADR-0002 open question 1: base (file) beats env.
         deep_merge_tables(&mut merged, base_table);
     }
@@ -331,7 +331,7 @@ fn load_with_overlay(
         return Ok(loaded);
     };
 
-    match parse_config_table(overlay) {
+    match parse_config_table(overlay, overlay_path) {
         Ok(overlay_table) => {
             // ADR-0002 open question 1: overlay beats base beats env.
             deep_merge_tables(&mut merged, overlay_table);
@@ -366,7 +366,7 @@ fn load_with_overlay_diagnostic(
     let mut merged = env::env_override_table(&mut env_diagnostics);
 
     if let Some(b) = base {
-        let base_table = parse_config_table(b)?;
+        let base_table = parse_config_table(b, &config_path())?;
         deep_merge_tables(&mut merged, base_table);
     }
 
@@ -380,7 +380,10 @@ fn load_with_overlay_diagnostic(
 
 /// Parse TOML text into the top-level config table, mapping a parse error or
 /// a non-table top level to the keep-current diagnostic.
-fn parse_config_table(content: &str) -> Result<toml::map::Map<String, toml::Value>, Vec<String>> {
+fn parse_config_table(
+    content: &str,
+    path: &Path,
+) -> Result<toml::map::Map<String, toml::Value>, Vec<String>> {
     // toml 1.x: `str::parse::<Value>` (FromStr) parses a single value, not a
     // document — use the serde document parser for the whole config file.
     match toml::from_str::<toml::Value>(content) {
@@ -389,8 +392,8 @@ fn parse_config_table(content: &str) -> Result<toml::map::Map<String, toml::Valu
             "config parse error: top-level config must be a table; keeping current config"
                 .to_string(),
         ]),
-        Err(err) => Err(vec![format!(
-            "config parse error: {err}; keeping current config"
+        Err(err) => Err(vec![super::diagnostics::toml_syntax_error(
+            &err, content, path,
         )]),
     }
 }
@@ -421,7 +424,7 @@ fn deep_merge_tables(
 
 #[cfg(test)]
 fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>> {
-    load_live_config_from_table(parse_config_table(content)?)
+    load_live_config_from_table(parse_config_table(content, Path::new("config.toml"))?)
 }
 
 fn load_live_config_from_table(
@@ -1044,6 +1047,60 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security2384_toml_diagnostics_do_not_echo_source() {
+        let _guard = crate::config::test_config_env_guard();
+        struct RestorePath(Option<std::ffi::OsString>);
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var(CONFIG_PATH_ENV_VAR, value),
+                    None => std::env::remove_var(CONFIG_PATH_ENV_VAR),
+                }
+            }
+        }
+        let _restore = RestorePath(std::env::var_os(CONFIG_PATH_ENV_VAR));
+        let probe = "CONFIG2384_TOML_PRIVATE_91d5ab73_never_echo_source_or_this_payload";
+        for overlay in [false, true] {
+            let root =
+                crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+            let base = root.path().join("config.toml");
+            let source = if overlay {
+                root.path().join("config.local.toml")
+            } else {
+                base.clone()
+            };
+            std::env::set_var(CONFIG_PATH_ENV_VAR, &base);
+            std::fs::write(&base, "[ui]\nconfirm_close = false\n").unwrap();
+            std::fs::write(
+                &source,
+                format!("[ui]\nconfirm_close = \"{probe}\" unexpected\n"),
+            )
+            .unwrap();
+            let mut diagnostics = Vec::new();
+            let logs = crate::logging::capture_logs(|| {
+                let loaded = Config::load();
+                diagnostics = loaded.diagnostics;
+                assert_eq!(
+                    loaded.config.ui.confirm_close,
+                    if overlay {
+                        false
+                    } else {
+                        Config::default().ui.confirm_close
+                    }
+                );
+            });
+            let text = diagnostics.join("\n");
+            assert!(!text.contains(probe), "TOML source leaked in diagnostics");
+            assert!(!logs.contains(probe), "TOML source leaked in logs");
+            if !overlay {
+                assert!(logs.contains("config.load") && logs.contains("invalid_toml"));
+            }
+            assert!(text.contains("invalid_toml") && text.contains("expected TOML document"));
+            assert!(text.contains(&format!("{}:2:", source.display())));
+        }
+    }
 
     #[test]
     fn upsert_top_level_bool_replaces_existing_value() {
