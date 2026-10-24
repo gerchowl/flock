@@ -164,6 +164,14 @@ max_spawn_fanout = {fanout}
             assert child["runtime"] == "structured" and "pane_id" not in child
             assert select.select([turn_ready], [], [], 10)[0], "opening turn was not consumed"
             assert os.read(turn_ready, 1) == b"T"
+            journals = list((root / "x").glob(f"**/sessions/{child_id}/queue.jsonl"))
+            assert len(journals) == 1, "one opening journal owner"
+            records = [json.loads(line) for line in journals[0].read_text().splitlines()]
+            added = [record["item"] for record in records if record.get("kind") == "upsert"]
+            assert len(added) == 1, "one durable opening admission"
+            assert added[0]["producer"] == {"agent": parent_id}, "attested MCP starter"
+            assert added[0]["kind"] == "message"
+            assert "dogfood-task" in added[0]["body"] and "UNTRUSTED TASK" in added[0]["body"]
             extra = dict(args, name="extra-child")
             expected = "at_agent_capacity" if scenario == "capacity" else "at_fanout_limit"
             assert tool("flock_agent_start", extra)["error"]["data"]["refusal"] == expected
@@ -188,14 +196,9 @@ max_spawn_fanout = {fanout}
                 refusal = json.loads(channel.readline())
                 assert refusal["exit"] == 13, refusal
                 assert refusal["response"]["error"]["code"] == "operator_only", refusal
-            resumed = cli("agent", "start", "dogfood-child", "--runtime", "structured", "--", "claude")["result"]["agent"]
-            assert resumed["agent_id"] == child_id and resumed["session_id"] == child["session_id"]
-            assert select.select([resume_ready], [], [], 10)[0], "operator resume readiness missing"
-            assert os.read(resume_ready, 1) == b"R"
-            # Fanout still bills the original parent after an operator resume.
-            assert tool("flock_agent_start", extra)["error"]["data"]["refusal"] == expected
-            cli("agent", "stop", child_id)
-            observe(child_id, "offline")
+            # Until #1956 consumes terminal queue cuts, unread completions fence resume.
+            resumed = cli("agent", "start", "dogfood-child", "--runtime", "structured", "--", "claude", code=1)
+            assert resumed["error"]["code"] == "session_busy", resumed
             control.sendall(b'"close"\n')
             channel.close()
             channel = None
