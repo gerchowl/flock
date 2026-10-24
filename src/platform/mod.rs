@@ -11,6 +11,7 @@ pub(crate) mod peer;
 pub(crate) mod received_fd;
 pub(crate) mod socket;
 pub(crate) mod structured;
+pub(crate) mod terminal_geometry;
 
 /// A same-device observation is only a possible unmounted-mount hint, not proof.
 pub(crate) fn same_device_as_parent(path: &std::path::Path) -> Option<bool> {

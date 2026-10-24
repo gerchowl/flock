@@ -235,6 +235,7 @@ async fn assert_preparation_refusal(
         root.path().into(),
         socket,
         Health::default(),
+        Arc::new(tokio::sync::Notify::new()),
     )
     .await
     .err()

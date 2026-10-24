@@ -328,6 +328,7 @@ fn entry_for(name: &str) -> Entry {
         base: None,
         base_sha: None,
         agent_id: None,
+        lock_resolution: None,
     }
 }
 
@@ -994,4 +995,15 @@ fn r2_submit_cap_exceeds_the_server_waits_and_reply_margin() {
     // Three 1s draft steps, three 2s windows, a 120ms gap and seven 50ms polls.
     let server_waits = crate::app::guarded_submit::SUBMIT_WAIT_BOUND;
     assert!(cap_for(&method) > server_waits + Duration::from_secs(1));
+}
+
+#[test]
+fn restack_codex_lock_resolution_keeps_its_own_write_cap() {
+    let method = Method::PaneResolveCodexLock(crate::api::schema::PaneResolveCodexLockParams {
+        pane_id: "p".into(),
+        choice: crate::api::schema::CodexLockChoice::Retry,
+        write_timeout_ms: None,
+    });
+    assert_eq!(cap_for(&method), Duration::from_secs(10));
+    assert_ne!(cap_for(&method), crate::api::client::SUBMIT_CAP);
 }

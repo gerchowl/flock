@@ -69,6 +69,9 @@ use crate::api::schema::{
     WorktreeListParams,
 };
 
+#[path = "delegate_lock.rs"]
+mod lock;
+
 use super::ready::{classify_ready_event, status_is_ready, ReadySignal};
 use super::settled::{Cursor, PinnedTarget, SettleTarget};
 
@@ -83,7 +86,8 @@ pub(super) const START_USAGE: &str = concat!(
     "  --brief FILE        a readable file; exactly `Read <path> and execute it exactly.` is typed\n",
     "  --cwd PATH          run in a workspace the delegate creates for that directory\n",
     "  --harness NAME      the agent to run, default opencode; a startup dialog is named rather\n",
-    "                      than typed into: claude_folder_trust, codex_folder_trust, codex_hook_review\n",
+    "                      than typed into: claude_folder_trust, codex_folder_trust, codex_hook_review,\n",
+    "                      codex_conversation_locked\n",
     "                      codex defaults to never approvals and workspace-write (network blocked)\n",
     "  --worktree          run in a fresh linked worktree: --branch is required, --repo and --base optional\n",
     "  --repo PATH         a linked worktree is swapped for its main checkout, branching from its HEAD\n",
@@ -119,6 +123,7 @@ pub(super) const START_USAGE: &str = concat!(
 pub(super) const SEND_USAGE: &str = concat!(
     "flk delegate send <name> --brief FILE [--await] [--timeout MS] [--settle MS]\n",
     "                    [--silence DURATION] [--ready-timeout MS] [--max-chars N] [--json]\n",
+    "  --resolve-lock retry|fork  explicitly resolve a detected Codex lock; no --brief or --await\n",
     "  one round at a time: a send while another round is being awaited is refused as busy\n",
     "  --ready-timeout MS  how long the agent may take to reach its prompt, default 60000\n",
     "  --silence DURATION  unchanged working screen during --await; default 3m, 0 disables",
@@ -267,7 +272,8 @@ fn cap_for(method: &Method) -> Duration {
         | Method::WorkspaceClose(_)
         | Method::AgentStart(_) => Duration::from_secs(60),
         Method::PaneSubmit(_) => crate::api::client::SUBMIT_CAP,
-        Method::PaneSendInput(_)
+        Method::PaneResolveCodexLock(_)
+        | Method::PaneSendInput(_)
         | Method::PaneSendKeys(_)
         | Method::PaneSendText(_)
         | Method::PaneWriteInput(_)
@@ -597,6 +603,11 @@ const HARNESSES: [HarnessSpec; 3] = [
                 shows: crate::detect::codex_waiting_on_folder_trust,
                 refusal: "Codex is waiting on its folder-trust dialog (see #828); trust the repository once in Codex, which covers its worktrees, or add a trusted [projects] entry for the repository root to ~/.codex/config.toml",
             },
+            StartupDialog {
+                code: lock::NAME,
+                shows: crate::detect::codex_conversation_locked,
+                refusal: lock::REFUSAL,
+            },
         ],
     },
 ];
@@ -820,6 +831,9 @@ struct Entry {
     /// are backfilled the first time a verb proves the terminal still matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_id: Option<String>,
+    /// Latest explicit lock-resolution intent; false does not prove a key was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lock_resolution: Option<serde_json::Value>,
 }
 
 impl Entry {
@@ -980,6 +994,7 @@ struct StartFlags {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct SendFlags {
+    resolve_lock: Option<crate::api::schema::CodexLockChoice>,
     brief: Option<String>,
     await_result: bool,
     timeout_ms: Option<u64>,
@@ -1036,6 +1051,7 @@ impl Verb {
             "--silence" => matches!(self, Self::Start | Self::Send | Self::Wait),
             "--settle" => matches!(self, Self::Start | Self::Send | Self::Wait),
             "--ready-timeout" => matches!(self, Self::Start | Self::Send),
+            "--resolve-lock" => self == Self::Send,
             "--brief" => matches!(self, Self::Start | Self::Send),
             "--cwd" | "--worktree" | "--repo" | "--branch" | "--base" | "--harness" | "--model"
             | "--sandbox" => self == Self::Start,
@@ -1112,6 +1128,13 @@ fn parse_flags(verb: Verb, args: &[String]) -> Result<Parsed, String> {
             "--settle" => flags.settle_ms = Some(number(flag, &value(&mut index)?)?),
             "--ready-timeout" => flags.ready_timeout_ms = Some(number(flag, &value(&mut index)?)?),
             "--max-chars" => flags.max_chars = Some(number(flag, &value(&mut index)?)?),
+            "--resolve-lock" => {
+                flags.resolve_lock = Some(match value(&mut index)?.as_str() {
+                    "retry" => crate::api::schema::CodexLockChoice::Retry,
+                    "fork" => crate::api::schema::CodexLockChoice::Fork,
+                    _ => return Err("--resolve-lock must be retry or fork".into()),
+                })
+            }
             "--brief" => flags.brief = Some(value(&mut index)?),
             "--cwd" => flags.cwd = Some(value(&mut index)?),
             "--repo" => flags.repo = Some(value(&mut index)?),
@@ -1150,6 +1173,7 @@ fn number<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String> {
 /// already rejects the flags it does not take.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Parsed {
+    resolve_lock: Option<crate::api::schema::CodexLockChoice>,
     brief: Option<String>,
     cwd: Option<String>,
     worktree: bool,
@@ -1199,6 +1223,7 @@ fn as_start(flags: &Parsed) -> StartFlags {
 
 fn as_send(flags: &Parsed) -> SendFlags {
     SendFlags {
+        resolve_lock: flags.resolve_lock,
         brief: flags.brief.clone(),
         await_result: flags.await_result,
         timeout_ms: flags.timeout_ms,
@@ -2829,6 +2854,7 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
         base: placement.base.as_ref().map(|fresh| fresh.base.clone()),
         base_sha: placement.base.as_ref().and_then(|fresh| fresh.sha.clone()),
         agent_id: field(&agent, "agent_id").map(str::to_string),
+        lock_resolution: None,
     };
     let failed = |entry: &Entry, written: bool, reason: Option<&str>| {
         fail_started(entry, &cleanup, written, &flags, reason, None)
@@ -2848,6 +2874,13 @@ fn delegate_start(args: &[String]) -> io::Result<i32> {
     let settled_record = match await_ready(name, &agent, harness, ready_deadline) {
         Ok(record) => record,
         Err(reason) => {
+            if reason
+                .startup_dialog
+                .is_some_and(|dialog| dialog.code == lock::NAME)
+            {
+                lock::save(&entry)?;
+                return Ok(lock::blocked(&entry, flags.json));
+            }
             if reason.deadline_reached {
                 // The verdict read the screen already: its tail is printed
                 // from that read rather than a second one, which a server
@@ -3654,6 +3687,7 @@ fn harness_for(entry: &Entry) -> &'static HarnessSpec {
 struct ReadyFailure {
     reason: String,
     deadline_reached: bool,
+    startup_dialog: Option<&'static StartupDialog>,
 }
 
 impl From<String> for ReadyFailure {
@@ -3661,6 +3695,7 @@ impl From<String> for ReadyFailure {
         Self {
             reason,
             deadline_reached: false,
+            startup_dialog: None,
         }
     }
 }
@@ -3670,6 +3705,7 @@ impl ReadyFailure {
         Self {
             reason,
             deadline_reached: true,
+            startup_dialog: None,
         }
     }
 }
@@ -3722,7 +3758,7 @@ fn await_ready(
                         if let Some(refusal) =
                             startup_dialog_refusal(name, harness, &pane_id, deadline)
                         {
-                            return Err(refusal.into());
+                            return Err(refusal);
                         }
                         // A dialog's prompt can arrive before its footer in a
                         // separate PTY read. Confirm readiness on the next poll
@@ -3740,7 +3776,7 @@ fn await_ready(
                     startup_dialog_asked = true;
                     if let Some(refusal) = startup_dialog_refusal(name, harness, &pane_id, deadline)
                     {
-                        return Err(refusal.into());
+                        return Err(refusal);
                     }
                 }
                 if expired(Some(deadline)) {
@@ -3790,12 +3826,13 @@ fn startup_dialog_refusal(
     harness: &HarnessSpec,
     pane_id: &str,
     deadline: Instant,
-) -> Option<String> {
+) -> Option<ReadyFailure> {
     let dialog = startup_dialog_shown(harness, pane_id, deadline)?;
-    Some(format!(
-        "delegate {name}: {}: {}",
-        dialog.code, dialog.refusal
-    ))
+    Some(ReadyFailure {
+        reason: format!("delegate {name}: {}: {}", dialog.code, dialog.refusal),
+        deadline_reached: false,
+        startup_dialog: Some(dialog),
+    })
 }
 
 /// The harness's startup dialog this pane is showing, from one bounded read.
@@ -3911,6 +3948,7 @@ fn delegate_wait_for_ready(
             ReadyFailure {
                 reason: format!("delegate {name}: readiness could not be watched: {err}"),
                 deadline_reached: timed_out,
+                startup_dialog: None,
             }
         })?;
     if let Err(err) = crate::api::client::parse_response_value(ack) {
@@ -4053,6 +4091,14 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
         Err(reason) => return Ok(usage(reason)),
     };
     let flags = as_send(&flags);
+    if let Some(choice) = flags.resolve_lock {
+        if flags.brief.is_some() || flags.await_result {
+            return Ok(usage(
+                "--resolve-lock cannot be combined with --brief or --await",
+            ));
+        }
+        return lock::resolve(name, choice, &flags);
+    }
     let Some(brief_path) = flags.brief.clone() else {
         return Ok(usage(format!("--brief is required\nusage: {}", SEND_USAGE)));
     };
@@ -4096,6 +4142,15 @@ fn delegate_send(args: &[String]) -> io::Result<i32> {
     let record = match await_prompt(name, &entry, ready_deadline) {
         Ok(record) => record,
         Err(reason) => {
+            if reason
+                .startup_dialog
+                .is_some_and(|dialog| dialog.code == lock::NAME)
+            {
+                return Ok(lock::refuse(
+                    crate::api::error_code::ErrorCode::CodexConversationLocked,
+                    lock::REFUSAL,
+                ));
+            }
             if reason.deadline_reached {
                 emit_ready_timeout(
                     name,
@@ -4168,6 +4223,20 @@ fn await_prompt(
     loop {
         match agent_record(&entry.terminal_id, Some(deadline)) {
             AgentFetch::Found(record) => {
+                // A missing cursor belongs to the compatibility diagnosis, which
+                // must run before any lock-screen I/O against an older server.
+                if harness_for(entry).name == "codex" && record["turn_cursor"].is_string() {
+                    if let Some(refusal) =
+                        startup_dialog_refusal(name, harness_for(entry), &entry.pane_id, deadline)
+                            .filter(|failure| {
+                                failure
+                                    .startup_dialog
+                                    .is_some_and(|dialog| dialog.code == lock::NAME)
+                            })
+                    {
+                        return Err(refusal);
+                    }
+                }
                 let status = field(&record, "agent_status")
                     .unwrap_or("unknown")
                     .to_string();
@@ -4470,6 +4539,7 @@ fn delegate_status(args: &[String]) -> io::Result<i32> {
                 "settled_with_background_shells": background_shells,
                 "blocked_reason": record.get("blocked_reason"),
                 "startup_dialog": startup_dialog,
+                "lock_resolution": entry.lock_resolution,
                 "retry_after_ms": record.get("retry_after_ms"),
                 "pane_id": entry.pane_id,
                 "workspace_id": entry.workspace_id,
@@ -5194,6 +5264,17 @@ impl Await<'_> {
                 for (key, value) in observation.as_object().into_iter().flatten() {
                     info[key] = value.clone();
                 }
+                if matches!(outcome, Outcome::AgentBlocked) {
+                    if let Some(dialog) = self
+                        .harness
+                        .startup_dialogs
+                        .iter()
+                        .find(|dialog| (dialog.shows)(&screen))
+                    {
+                        info["startup_dialog"] = serde_json::json!(dialog.code);
+                        info["status_text"] = serde_json::json!(dialog.refusal);
+                    }
+                }
                 info["settled_with_background_shells"] =
                     serde_json::json!(crate::detect::settled_with_background_shells(&screen));
                 emit_outcome(
@@ -5782,6 +5863,8 @@ fn emit_outcome(
                 "outcome": outcome,
                 "status": text("status"),
                 "status_text": text("status_text"),
+                "startup_dialog": text("startup_dialog"),
+                "lock_resolution": entry.lock_resolution,
                 "text": text("text"),
                 "total_chars": text("total_chars"),
                 "next_offset": text("next_offset"),
@@ -6372,13 +6455,12 @@ mod tests {
             None
         );
         for dialog in codex.startup_dialogs {
-            assert!(dialog
-                .refusal
-                .contains(if dialog.code == "codex_hook_review" {
-                    "#626"
-                } else {
-                    "#828"
-                }));
+            assert!(dialog.refusal.contains(match dialog.code {
+                "codex_hook_review" => "#626",
+                "codex_folder_trust" => "#828",
+                lock::NAME => "#1667",
+                other => panic!("missing dialog reference for {other}"),
+            }));
         }
         let opencode = validate_harness(Some("opencode")).expect("in the table");
         assert!(opencode.startup_dialogs.is_empty());
