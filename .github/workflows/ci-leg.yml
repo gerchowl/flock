@@ -185,6 +185,10 @@ jobs:
           name: nextest-archive-${{ inputs.leg }}
 
       - name: Run shard
+        # The Nix installer sets TMPDIR under HOME on the Linux runner.
+        # Test state must stay outside HOME, including fallback CLI sandboxes.
+        env:
+          TMPDIR: /tmp
         run: nix develop -c just ci-shard '${{ inputs.leg }}' '${{ matrix.shard.name }}' nextest-archive.tar.zst
 
       - name: Summarize

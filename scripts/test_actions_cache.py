@@ -135,6 +135,8 @@ class ActionsCachePolicy(unittest.TestCase):
                          "nix develop -c just ci-shard '${{ inputs.leg }}' "
                          "'${{ matrix.shard.name }}' nextest-archive.tar.zst")
         self.assertNotIn('if', run)
+        # The Nix installer otherwise points TMPDIR under the runner's HOME.
+        self.assertEqual(run.get('env', {}).get('TMPDIR'), '/tmp')
         self.assert_ci_dev_shell_cache(document, job, run['run'])
 
     def test_nix_cache_is_bounded_pinned_and_written_only_by_dev(self):
