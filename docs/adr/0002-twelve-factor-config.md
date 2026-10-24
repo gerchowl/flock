@@ -180,3 +180,13 @@ Prior art: PR #111 (#108-v1a), #112. Load: config/io.rs. Write:
 app/config_io.rs, cli.rs:263. Env: app/api/peers.rs:283, sound.rs:13,
 web/mod.rs:644-675. Pane: ui/settings.rs, app/input/settings.rs,
 app/state.rs:1179. Rollback: app/api.rs:504. Drift: main.rs:74-370.
+
+
+## Superseded in part by ADR-0041 (Q1 precedence)
+
+See [ADR-0041](0041-configuration-v2.md), accepted by the owner on
+2026-10-24 in #2367. Its env-above-file order supersedes this record's
+precedence decision and resolved question 1, including the web CSV env
+mappings. The other decisions remain accepted. Implementation and migration
+follow ADR-0041's ordered slices; this pointer does not claim the flip has
+shipped. The original decision text above remains intact.

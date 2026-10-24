@@ -69,6 +69,17 @@ explain why editing a file may not change the effective value. Source metadata
 is redacted with the value when it would disclose secret material or a
 sensitive credential path. Raw env strings, TOML snippets and parser errors
 must not leak classified data through provenance or diagnostics.
+Before the GUI exists, expose this explanation through
+`flk config get --provenance`, backed by the same socket read model. The
+precedence migration must not depend on a GUI being available.
+
+These are existing leak paths to close, not only future API precautions:
+`src/config/env.rs::env_override_table` currently formats the raw env value
+in `env {env_name}={raw:?}` diagnostics, and
+`src/config/io.rs::parse_config_table` formats TOML parse errors that echo
+source text. The inventory slice must add negative regression tests for both
+paths using distinctive secret probes, covering diagnostics and logs as well
+as API replies.
 
 ### 2. Inventory before exposure
 
@@ -91,6 +102,8 @@ Today's credential-related and potentially secret-bearing surfaces are:
 | `structured.profile`, `structured.run_as`, `security.agent_account` | Profile selector and account/authority policy; file-only env policy | Security-sensitive metadata, not bearer secrets. Document read visibility separately from mutation authority. |
 | `spawn.env.<agent>` | `src/config/spawn_env.rs`: lists of env variable names carried to children, not their values | Credential-routing metadata. Never expand or return the referenced process environment. |
 | `checks.script[].env`, `checks.script[].args` | `Config.checks` imports `src/checks/config.rs`; arbitrary child env values and argv, unlike the names-only `spawn.env` | Potential literal credentials. Classify/redact values before reads; never infer safety from the env key or array shape. |
+| `terminal.default_shell`, `web.flock_bin`, `checks.issue_guard.gh_bin`, `checks.script[].program` | Executable selectors from `src/config/model.rs` and imported `src/checks/config.rs` | Potentially sensitive executable paths or wrapper locations. Classify disclosure before reads; reading config never executes or opens the selected program. |
+| `checks.issue_guard.repos` | Repository identifiers configured in `src/checks/config.rs` | Potentially private repository metadata. Classify independently of credential bytes and redact when required. |
 | `systemone.urls`, `systemone.full_urls` | `src/config/model.rs`: endpoint strings in arrays | May contain userinfo or query credentials. Classify the whole value or provide a proven safe projection before read exposure. |
 | `thermal_command`, `gpu_command`, `keys.command[].command`, `peers[].relay_command` | Optional reporter commands, custom commands and relay commands | Free-form commands can embed secrets. Inventory must choose safe redaction before exposing their values, including defaults and shadowed layers. |
 | `peers[].ssh`, `web.allowed_users`, `channels[]` | Destinations, identity allowlists, channel names/owners/targets/scopes | Identity and routing metadata, not authentication tokens. Classify privacy independently of terminal-safe rendering. |
@@ -140,16 +153,23 @@ and `ui.sound.path`, `ui.sound.done_path`, `ui.sound.request_path`,
 `ui.sound.all_clear_path`. Reasons include structured collection
 semantics, config-relative paths and explicit security policy. Every omission
 must be documented by the schema rather than inferred from missing entries.
-The web-only CSV list-env exceptions for allowed origins/users must be
-identified explicitly during migration, not mistaken for generic coverage.
+The web-only CSV mappings `FLOCK_WEB_ALLOWED_ORIGINS` and
+`FLOCK_WEB_ALLOWED_USERS` are also in the precedence flip: an admitted env
+list wins over a nonempty file list. Today `src/web/mod.rs` consults those
+vars only when the file list is empty; that exception does not survive the
+owner's env-above-file decision. Preserve their CSV representation rather
+than pretending the generic scalar walker already handles them. Provenance
+must name the winning env variable and shadowed file layer. In particular,
+`allowed_users` is an authority list: replacing it can change who may connect,
+so migration must make that security effect visible.
 
 ### 4. Authority and secret redaction
 
 | Caller | `config.schema` / `config.get` | `config.set` |
 | --- | --- | --- |
 | Authenticated WS client with `read` | Classified, redacted view | Refused without `operate`. |
-| Authenticated WS client with `operate` | Needs `read` as well to use read methods | Operator mutation, subject to per-key restrictions and validation. |
-| Local socket operator established by ADR-0036 §1a | Read model | Operator mutation via the same writer. |
+| Authenticated WS client with `operate` | Needs `read` as well; redacted view | Operator mutation, subject to per-key restrictions and validation. |
+| Local socket operator established by ADR-0036 §1a | Redacted view, including for the local operator | Operator mutation via the same writer. |
 | Other permitted socket read caller | Redacted view under existing read authorization | Refused as operator-only. |
 
 The existing scopes are `read`, `send`, `answer`, `operate`; there is no
@@ -160,11 +180,14 @@ cached command-result access, following S6/S7 rules. An agent principal must
 not gain operator authority through config operations. No loopback trust or
 new credential-issuance path is introduced.
 
-Secrets are redacted before either transport serializes replies, including
-schema defaults, provenance, rejected-value diagnostics and GUI snapshots.
-Errors and logs carry typed reasons, never secret inputs. The inventory is a
-blocking prerequisite for enabling any read surface. Operator write authority
-does not implicitly grant a new secret-export operation.
+When implemented, the default for every caller, including the local socket
+operator, is the redacted view: fail closed. Secrets are redacted before
+either transport serializes replies, including schema defaults, provenance,
+rejected-value diagnostics and GUI snapshots. Errors and logs carry typed
+reasons, never secret inputs. The inventory is a blocking prerequisite for
+enabling any read surface. Neither local operator identity nor `operate`
+authorizes raw-secret export. Who, if anyone, may read raw secret values is
+an Open question requiring a further owner decision.
 
 ### 5. Operator writes and honest reload outcomes
 
@@ -192,8 +215,12 @@ For every affected section return exactly one outcome:
 - `rejected(reason)`: validation or application refused that section, with a
   typed reason and the running value retained.
 
-Do not silently skip a section. Reuse #2043/#2064/#2066's classifications and
-startup-baseline logic, translating an existing `invalid` section outcome to
+Do not silently skip a section. Current dev has only the aggregate
+`ConfigReloadStatus::{Applied, Partial, Failed}` report; per-section
+`invalid` outcomes and startup-baseline logic are proposed by the open PR
+[#2064](https://github.com/gerchowl/flock/pull/2064), not already on dev.
+The config.set slice (#2387) depends on #2064 and must reuse its work and
+#2066's corrections, translating that proposed `invalid` section outcome to
 this API's rejected form if necessary. An outcome must match what the
 consumer actually did (including `name`), not merely what was parsed. A
 restart-required difference persists across reloads until restart; document
@@ -235,10 +262,16 @@ layer until their separately documented removal.
 The flip must cover startup, reload, absent files and malformed-overlay
 fallback, with table-driven tests and content-safe diagnostics. Invalid env
 input remains diagnosed and skipped rather than coercing types or discarding
-a running config. Document existing web CSV exceptions and any separately
-approved change to them. No new project/system layer or widened env admission
-is part of this migration. Old binaries retain their old precedence; mixed
-versions must expose their own schema/capability and provenance, never imply
+a running config. The web CSV env vars `FLOCK_WEB_ALLOWED_ORIGINS` and
+`FLOCK_WEB_ALLOWED_USERS` are part of this same flip: they must win over
+nonempty file lists, with the winning variable and shadowed file shown by
+`flk config get --provenance`. Call out that `allowed_users` controls connection
+authority; env replacement may change access even when the file is unchanged.
+Test and document unset and empty-list behavior too, including the existing
+meaning of an empty `allowed_users` list (no identity filtering). Operators
+must audit inherited service env before upgrading. No new project/system
+layer or relaxation of the generic env blocklist is part of this migration.
+Old binaries retain their old precedence; mixed versions must expose their own schema/capability and provenance, never imply
 that fleet members have identical effective configuration.
 
 ## Rejected options
@@ -260,9 +293,9 @@ that fleet members have identical effective configuration.
 
 - Exact DTO names, schema versioning and capability fields are to be reviewed
   in the read/wire slices while preserving the semantics above.
-- Whether an operator needs any unredacted secret metadata beyond the
-  redacted read model, and its explicit authorization, is not decided. No
-  secret export is authorized by this ADR.
+- Who, if anyone, may read raw secret values, and through which explicit
+  authorization and export surface, needs an owner decision. Until then,
+  every caller, including the local operator, receives the redacted view.
 - The inventory must settle safe projections versus full redaction for
   arbitrary commands, URL credentials and identity metadata before reads ship.
 - Explicit write-layer selection, optional-value removal and concurrent-edit
