@@ -140,6 +140,8 @@ pub enum ClientFrame {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SubfailCode {
+    /// Unsafe or reserved agent namespace. Select a valid subject, never retry unchanged.
+    InvalidAgent,
     /// Clear only this stream's state/cursor and bootstrap without after.
     CursorAhead,
     /// Stop until the principal changes.

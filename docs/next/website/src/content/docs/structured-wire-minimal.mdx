@@ -35,6 +35,50 @@ for the retired ID are silently dropped; frames for never-opened IDs are protoco
 errors. Reusing a live or closed ID is refused with subfail code `sub_id_reused`. The `fleet-lite.jsonl` fixture pins
 bootstrap, live updates/removal and recovery.
 
+### Fleet-lite store recovery
+
+An empty, unmarked lock with neither data record opens at zero. This includes an
+empty legacy lock from the snapshot-only layout (#1974). Legacy locks were always
+unmarked, even after positions had been published through `fleet.json`. That
+layout's only high-water floor was `fleet.json`; if it is lost, there is no better
+floor to recover. Opening at zero preserves the old behavior.
+
+In the cursor-based layout, cursor durability precedes the initialization marker.
+If an unmarked lock already has a matching cursor, opening fsyncs the cursor's
+parent directory again before
+marking the lock. This completes a previous initialization whose rename succeeded
+but directory fsync failed. A directory-fsync error refuses opening and leaves
+the lock unmarked for a later retry.
+`fleet.lock` carries that marker, so deleting it together with `fleet.cursor`
+while an older `fleet.json` survives reopens at that older head. The operator
+must never delete the lock.
+
+The provider core persists a separate durable cursor before replacing the row
+snapshot. Subscription integration and the configured store location belong to
+S7-min slice 6b (#1832); the core currently has no product caller.
+
+For a store named `fleet.json`, preserve `fleet.cursor` and `fleet.lock` during
+recovery. A lost or corrupt snapshot opens with no rows at the cursor's preserved
+high-water and exposes a typed `SnapshotMissing` or `SnapshotCorrupt` diagnostic.
+Refresh the authoritative registry/S4/S6 provider before serving a recovery
+snapshot. A failed snapshot write may reserve positions that were never published;
+the recovery checkpoint covers those positions instead of reusing them.
+
+Opening leaves damaged snapshot bytes untouched. Copy them before a refresh or
+checkpoint replaces the file. If the cursor is missing after initialization or corrupt, or both recovery records
+are missing from an initialized store, opening refuses a zero reset. With the owning
+store closed, restore a trusted cursor backup or atomically replace its
+`{"high_water":N}` record using temp-file fsync, rename and directory fsync.
+Choose `N` at least as high as the surviving snapshot head and every cursor clients
+have observed. If that floor is unknown, keep the store closed rather than guess.
+A legacy valid snapshot with an unmarked lock seeds the cursor. A durable lock
+marker then prevents a missing cursor from being mistaken for legacy migration
+from an older snapshot. When both records are valid, the maximum high-water wins.
+
+Skipped rows log their array index and `unsupported`, `invalid` or `duplicate`
+reason without their contents. Unknown top-level row fields survive unchanged
+rows and checkpoints, but are dropped when a fresh projection changes the row.
+
 `agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, required `request_seq`, `decision`
 (`allow_once`, `allow_always` or `deny`), and optional `message`. Only a
 token-authenticated client principal can submit this command. The optional message

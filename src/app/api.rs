@@ -34,6 +34,8 @@ pub(crate) mod peers;
 pub(super) mod responses;
 mod revert;
 mod spawn;
+mod structured_agents;
+mod structured_start;
 mod tabs;
 pub(crate) mod workspaces;
 mod worktrees;
@@ -1593,6 +1595,7 @@ impl App {
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
+            Method::AgentStop(target) => return self.handle_structured_stop(request.id, target),
             Method::AgentFocus(target) => return self.handle_agent_focus(request.id, target),
             Method::AgentRename(params) => return self.handle_agent_rename(request.id, params),
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),

@@ -128,6 +128,8 @@ impl SpawnCaller {
 pub(super) struct SpawnLineage {
     pub parent_agent_id: String,
     pub child_depth: u32,
+    /// PTY-only facts; the owner adds lease and pending identities atomically.
+    pub pty_census: SpawnCensus,
 }
 
 impl App {
@@ -217,6 +219,9 @@ impl App {
         // prevent, which is why fork's answer to the same class is the
         // opposite one.
         let caller = self.spawn_caller();
+        // This first check is an early policy refusal before location resolution
+        // and launch preparation. The shared structured funnel rechecks before
+        // owner-thread reservation, which is the atomic admission authority.
         let lineage = match self.admit_spawn(SpawnVerb::Spawn, &caller, None) {
             Ok(Some(lineage)) => lineage,
             Ok(None) => {
@@ -236,6 +241,14 @@ impl App {
                 );
             }
         };
+
+        if params.runtime == crate::api::schema::AgentRuntime::Structured && params.unattended {
+            return encode_error(
+                id,
+                "runtime_unsupported",
+                "structured spawn does not support unattended mode",
+            );
+        }
 
         // #1179: an agent caller, so `route` unless it narrows to `deny`.
         let questions = match Self::admit_questions(&caller, params.questions, params.unattended) {
@@ -268,6 +281,78 @@ impl App {
         else {
             return encode_error(id, "internal_error", "resolved workspace has no cwd");
         };
+
+        if params.runtime == crate::api::schema::AgentRuntime::Structured {
+            if kind != AgentKind::Claude || params.focus || params.questions.is_some() {
+                return encode_error(
+                    id,
+                    "runtime_unsupported",
+                    "unsupported structured spawn options",
+                );
+            }
+            let name = params
+                .name
+                .unwrap_or_else(crate::app::worktrees::generated_fork_run_id);
+            if name == "self" {
+                return encode_error(id, "invalid_agent_name", "self is a reserved agent target");
+            }
+            match self.structured_target(&name) {
+                Ok(None) => {}
+                Ok(Some((agent, _))) => {
+                    let code =
+                        if self
+                            .state
+                            .structured_agents
+                            .get(&agent)
+                            .is_some_and(|(_, p, _)| {
+                                p.update.state.lifecycle
+                                    == crate::api::agent_state::Lifecycle::Unknown
+                            })
+                        {
+                            crate::api::error_code::ErrorCode::StructuredRecoveryRequired
+                        } else {
+                            crate::api::error_code::ErrorCode::AgentNameTaken
+                        };
+                    return encode_error(id, code.as_str(), "MCP spawn requires a fresh identity");
+                }
+                Err(code) => {
+                    return encode_error(id, code.as_str(), "structured name is ambiguous")
+                }
+            }
+            let start = crate::api::schema::AgentStartParams {
+                runtime: params.runtime,
+                model: params.model,
+                name,
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                argv: vec!["claude".into()],
+                dry_run: false,
+                workspace_id: None,
+                tab_id: None,
+                split: None,
+                active: false,
+                here: false,
+                focus: false,
+                label: None,
+                questions: None,
+                unattended: false,
+            };
+            return match self.start_structured_request(
+                start,
+                &caller,
+                SpawnVerb::Spawn,
+                Some(prompt),
+            ) {
+                Ok(result) => encode_success(id, result),
+                Err(code) => encode_error(id, code.as_str(), "structured spawn refused"),
+            };
+        }
+        if params.model.is_some() {
+            return encode_error(
+                id,
+                "runtime_unsupported",
+                "--model requires structured runtime",
+            );
+        }
 
         // #359: the child is exec'd from argv with no shell in between, so the
         // agent profile the REQUESTER is on has to be carried explicitly or the
@@ -491,10 +576,11 @@ impl App {
             }
             SpawnCaller::Operator { .. } => return Ok(None),
         };
+        let pty_census = census;
         let (leased, children) = self
-            .session_leases
-            .counts(agent_id)
-            .map_err(|_| SpawnRefusal::CallerUnknown)?;
+            .structured_workers
+            .counts(&self.session_leases, agent_id)
+            .map_err(|_| SpawnRefusal::RegistryBusy)?;
         census.live_agent_started += leased;
         census.parent_live_children += children;
         if let Some((ws_idx, pane_id)) = inherits_depth_from {
@@ -511,6 +597,10 @@ impl App {
         Ok(Some(SpawnLineage {
             parent_agent_id: agent_id.clone(),
             child_depth: census.child_depth,
+            pty_census: SpawnCensus {
+                child_depth: census.child_depth,
+                ..pty_census
+            },
         }))
     }
 
@@ -650,7 +740,10 @@ pub(super) fn refusal_data(refusal: &SpawnRefusal) -> serde_json::Value {
                 map.insert("env_value".into(), value.clone().into());
             }
         }
-        SpawnRefusal::FleetPaused | SpawnRefusal::NotEnabled | SpawnRefusal::CallerUnknown => {}
+        SpawnRefusal::RegistryBusy
+        | SpawnRefusal::FleetPaused
+        | SpawnRefusal::NotEnabled
+        | SpawnRefusal::CallerUnknown => {}
     }
     data
 }
@@ -667,6 +760,8 @@ mod tests {
         Request {
             id: "req".into(),
             method: Method::AgentSpawn(AgentSpawnParams {
+                runtime: crate::api::schema::AgentRuntime::Pty,
+                model: None,
                 agent: agent.into(),
                 prompt: prompt.into(),
                 location: SpawnLocation::WorktreePath {
@@ -717,6 +812,30 @@ mod tests {
             rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    /// PTY attribution stays intact when both structured census copies are busy.
+    #[tokio::test]
+    async fn pty_admit_spawn_maps_registry_contention_to_retryable_session_busy() {
+        let mut app = app_with_one_pane();
+        let (pane_id, agent_id) = caller_pane_is_an_agent(&mut app);
+        let caller = super::SpawnCaller::Agent {
+            ws_idx: 0,
+            pane_id,
+            agent_id,
+        };
+        let (release, holder) = app.session_leases.test_hold_census();
+        let result = app.admit_spawn(crate::spawn::SpawnVerb::Fork, &caller, None);
+        let released = release.send(());
+        holder.join().unwrap();
+        released.unwrap();
+        let refusal = result.expect_err("census contention must refuse without waiting");
+        assert_eq!(refusal, crate::spawn::SpawnRefusal::RegistryBusy);
+        assert_eq!(refusal.code(), "session_busy");
+        assert!(refusal.retryable());
+        let data = super::refusal_data(&refusal);
+        assert_eq!(data["refusal"], "session_busy");
+        assert_eq!(data["retryable"], true);
     }
 
     /// Off by default. Exposing a spawn verb to agents is the same
@@ -778,6 +897,8 @@ mod tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: Method::AgentSpawn(AgentSpawnParams {
+                runtime: crate::api::schema::AgentRuntime::Pty,
+                model: None,
                 agent: "opencode".into(),
                 prompt: "review #42".into(),
                 location: SpawnLocation::WorkspaceId {

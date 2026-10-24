@@ -55,7 +55,7 @@ impl Generation {
     pub(super) fn revoke(&self) {
         self.revoked.store(true, Ordering::Release);
     }
-    fn live(&self) -> bool {
+    pub(super) fn live(&self) -> bool {
         !self.revoked.load(Ordering::Acquire)
     }
 }
