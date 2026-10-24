@@ -2542,7 +2542,7 @@ fn blob_references_resolve_while_partial_deltas_are_live_only_and_restart_seq_is
         serde_json::from_value(projected["message"]["content"][0].clone()).unwrap();
     let bytes = super::super::blobs::BlobStore::open(root.path())
         .unwrap()
-        .get(&reference.blob)
+        .get(&reference.blob, reference.size)
         .unwrap();
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), block);
     drop(stdout);
@@ -2808,7 +2808,7 @@ fn corrupt_blob_is_repaired_while_the_session_keeps_streaming() {
     assert_eq!(stored.len(), 2);
     let projected: Value = serde_json::from_str(&stored[0].raw).unwrap();
     assert_eq!(projected["message"]["content"][0]["blob"], reference.blob);
-    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+    assert_eq!(store.get(&reference.blob, reference.size).unwrap(), bytes);
 }
 
 #[test]
