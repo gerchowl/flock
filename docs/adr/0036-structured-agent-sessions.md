@@ -3340,9 +3340,25 @@ before transmitting a structured selector, avoiding a legacy PTY launch.
 `agent.spawn` adds default-PTY `runtime` and optional structured `model`. MCP's
 `flock_agent_start` continues to build only that narrowed verb, never raw
 `agent.start`. Structured Claude resolves a tracked checkout, validates and
-nonce-frames the opening prompt (ADR-0014 §4), and submits it once through the
-worker's bounded runtime input. Failure stops the owned session and reports a
-typed start failure. CLI starts remain idle. There is no prompt in launch argv.
+nonce-frames the opening prompt (ADR-0014 §4). There is no prompt in launch argv.
+
+The MCP opening turn follows the single queue owner (ADR-0036 §3/S5, #1955).
+Before Ready, the launch worker commits one lifecycle-UUID item with
+`Producer::Agent` bound to the server-attested starter and `Kind::Message`.
+Its validated `SpawnPrompt` nonce frame is preserved byte for byte inside the
+queue's message frame. It never uses direct stdin or command admission.
+CLI starts enqueue no opening turn. Refused admission reports the queue's typed
+refusal code, or `agent_start_failed` for other launch failures, and publishes
+no Ready runtime or partial harness process.
+Until stdin accepts that item, the owner retains a settlement guard. Startup
+failure terminally fails it with `agent_start_failed` through the existing queue
+Fail record. Its internal `opening_turn` metadata also fences an unresolved
+queued opening on reopen: settlement must commit before that generation may
+serve input. Failed settlement is logged with its typed code; reopening attempts
+the terminal write before delivery rather than replaying an old opening prompt.
+After accepted input, ordinary result and unresolved-turn recovery apply.
+A failed stdin offer requests supervisor stop even if transport cancellation has
+not yet happened (ADR-0036 §3/§4); busy and uncertain-turn pending remain waits.
 
 Both routes share App admission and the Workers owner reservation from parts
 2a/2b. MCP uses Spawn policy, including explicit node opt-in and attested caller

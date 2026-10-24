@@ -115,6 +115,33 @@ impl Scheduler {
     pub fn enqueue(&mut self, item: Item, principal: Principal, gate: Gate) -> Result<(), Failure> {
         self.admission.enqueue(item, principal, gate)
     }
+    /// Settle known unaccepted openings before a resumed generation gains input authority.
+    /// Opaque future entries remain uninterpreted and byte-preserved (ADR-0028 §3a).
+    pub(in crate::structured) fn fail_stale_openings(&mut self) -> Result<(), Failure> {
+        let stale: Vec<_> = self
+            .journal()
+            .items()
+            .iter()
+            .filter(|item| {
+                item.state == State::Queued
+                    && !self.journal().opaque.contains(&item.item_id)
+                    && item.metadata.get("opening_turn") == Some(&Value::Bool(true))
+            })
+            .map(|item| item.item_id.clone())
+            .collect();
+        for id in stale {
+            self.fail_item(id, ErrorCode::AgentStartFailed)?;
+        }
+        Ok(())
+    }
+    /// Terminally refuse a launch-owned input; it cannot become eligible on resume.
+    pub(in crate::structured) fn fail_item(
+        &mut self,
+        item_id: String,
+        reason: ErrorCode,
+    ) -> Result<(), Failure> {
+        self.admission.fail_item(item_id, reason)
+    }
     /// Committed state and owned replay cuts for serialized publication.
     pub fn journal(&self) -> &Journal {
         self.admission.journal()
@@ -126,6 +153,12 @@ impl Scheduler {
     /// No status observation writes a record.
     /// S4/S6 gates and no-eligible-input are reported by deliver when unreserved.
     pub fn status(&self, runtime: &Runtime) -> Option<Pending> {
+        self.status_on(runtime.input_handle())
+    }
+    pub(in crate::structured) fn status_on(
+        &self,
+        runtime: &crate::structured::transport::InputHandle,
+    ) -> Option<Pending> {
         if let Some(reason) = self.journal().read_only() {
             return Some(Pending {
                 batch_id: None,
@@ -163,8 +196,16 @@ impl Scheduler {
         state: &AgentState,
         now_ms: u64,
     ) -> Result<Offer, Failure> {
+        self.deliver_on(runtime.input_handle(), state, now_ms)
+    }
+    pub(in crate::structured) fn deliver_on(
+        &mut self,
+        runtime: &crate::structured::transport::InputHandle,
+        state: &AgentState,
+        now_ms: u64,
+    ) -> Result<Offer, Failure> {
         self.journal().writable()?;
-        if let Some(pending) = self.status(runtime) {
+        if let Some(pending) = self.status_on(runtime) {
             return Ok(Offer::Pending(pending));
         }
         let open = runtime
@@ -238,6 +279,14 @@ impl Scheduler {
         self.virgin = false;
         Ok(Offer::Submitted { batch_id: batch.id })
     }
+    /// Capture a bootstrapped subscription under this sole writer's ownership.
+    pub(crate) fn subscription(&mut self) -> Result<super::Cut, Failure> {
+        self.admission.subscription()
+    }
+    /// Check configured rewrite policy under the scheduler's sole write ownership.
+    pub(crate) fn checkpoint_if_required(&mut self) -> Result<Option<super::Cut>, Failure> {
+        self.admission.checkpoint_if_required()
+    }
     fn members(&self) -> Vec<Item> {
         self.admission
             .journal()
@@ -301,19 +350,7 @@ impl Scheduler {
                 }
             }
         }
-        let result = match event {
-            SessionEvent::Success(e) => e
-                .parent_tool_use_id
-                .as_ref()
-                .and_then(Option::as_ref)
-                .is_none(),
-            SessionEvent::ExecutionError(e) => e
-                .parent_tool_use_id
-                .as_ref()
-                .and_then(Option::as_ref)
-                .is_none(),
-            _ => false,
-        };
+        let result = ends_turn(event);
         if result {
             let mut items = self.members();
             for item in &mut items {
@@ -338,5 +375,22 @@ impl Scheduler {
         self.refused = None;
         self.virgin = false;
         Ok(())
+    }
+}
+
+/// Only known top-level results establish the next S4 coverage boundary.
+pub(in crate::structured) fn ends_turn(event: &SessionEvent) -> bool {
+    match event {
+        SessionEvent::Success(e) => e
+            .parent_tool_use_id
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_none(),
+        SessionEvent::ExecutionError(e) => e
+            .parent_tool_use_id
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_none(),
+        _ => false,
     }
 }

@@ -133,6 +133,12 @@ if mode.startswith("queue"):
                     sys.exit(7)
                 if request["op"] == "event":
                     emit(request["event"])
+                elif request["op"] == "burst":
+                    events = request["events"]
+                    sys.stdout.write("".join(json.dumps(e) + "\n" for e in events))
+                    sys.stdout.flush()
+                    if request.get("exit"):
+                        sys.exit(7)
                 elif request["op"] == "lifecycle":
                     event = dict(find("command_lifecycle"))
                     event["state"] = request["state"]
