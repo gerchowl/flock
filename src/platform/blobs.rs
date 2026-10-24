@@ -132,14 +132,15 @@ fn validate(meta: &Metadata, directory: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Recognize filesystem refusals without leaking platform errno into core code.
+/// Recognize unsafe namespace entries without leaking platform errno into core code.
+/// Permission validation refusals carry no OS errno. Actual OS permission errors
+/// remain I/O failures rather than evidence of an unsafe entry.
 pub(crate) fn unsafe_path(error: &io::Error) -> bool {
     matches!(
         error.kind(),
-        io::ErrorKind::PermissionDenied
-            | io::ErrorKind::NotADirectory
-            | io::ErrorKind::InvalidInput
-    ) || error.raw_os_error() == Some(libc::ELOOP)
+        io::ErrorKind::NotADirectory | io::ErrorKind::InvalidInput
+    ) || (error.kind() == io::ErrorKind::PermissionDenied && error.raw_os_error().is_none())
+        || error.raw_os_error() == Some(libc::ELOOP)
 }
 
 #[cfg(test)]
@@ -167,6 +168,26 @@ mod tests {
             .read_to_end(&mut bytes)
             .unwrap();
         assert_eq!(bytes, b"owned elsewhere");
+    }
+    #[test]
+    fn actual_eacces_is_io_instead_of_an_unsafe_path_refusal() {
+        use crate::structured::blobs::BlobError;
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let path = root.path().join("non-executable");
+        std::fs::write(&path, b"fixture bytes").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // No execute bits means exec refuses even for a privileged test process.
+        // No child starts, and no ambient environment is passed to the attempt.
+        let error = crate::process::TracedCommand::new(&path, "blob-fixture")
+            .env_clear()
+            .status_traced()
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        let classified = BlobError::from(error);
+        assert!(
+            matches!(&classified, BlobError::Io(error) if error.raw_os_error() == Some(libc::EACCES)),
+            "{classified:?}"
+        );
     }
     #[test]
     fn contended_publication_lock_returns_without_waiting() {

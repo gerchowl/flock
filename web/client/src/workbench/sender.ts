@@ -14,7 +14,7 @@ export function createWireSender(connection: WireConnection, revision: () => num
   return {
     commands: () => (revision(), connection.commands()),
     // `submit` sends the message, not only types it (`AgentSendParams`; S7a's agent-send script).
-    send: (agent, text, echoAfter) => connection.command("agent.send", { target: agent, text, submit: true }, undefined, echoAfter),
+    send: (agent, text, echoAfter) => connection.command("agent.send", { target: agent, text, submit: true }, undefined, echoAfter ?? undefined),
     // `AgentDecide` carries `request_seq` as the card's open record sent it; nothing here changes it.
     decide: (args) => connection.command("agent.decide", args satisfies { readonly [key: string]: JsonValue } as JsonValue),
     blocked: () => (revision(), connection.principal === null ? "Sending opens once the server has welcomed this client." : null),

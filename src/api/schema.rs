@@ -190,6 +190,9 @@ pub enum Method {
     PaneWriteText(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]
     PaneSendKeys(PaneSendKeysParams),
+    /// Explicit retry/fork, refused unless the pane currently shows the Codex lock.
+    #[serde(rename = "pane.resolve_codex_lock")]
+    PaneResolveCodexLock(PaneResolveCodexLockParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
     #[serde(rename = "pane.write_keys")]
@@ -502,6 +505,7 @@ impl Method {
             | Self::PaneSendText(_)
             | Self::PaneWriteText(_)
             | Self::PaneSendKeys(_)
+            | Self::PaneResolveCodexLock(_)
             | Self::PaneSendInput(_)
             | Self::PaneWriteKeys(_)
             | Self::PaneWriteInput(_)
@@ -2045,6 +2049,32 @@ pub struct PaneSendKeysParams {
     pub write_timeout_ms: Option<serde_json::Value>,
     pub pane_id: String,
     pub keys: Vec<String>,
+}
+
+/// An operator's explicit choice on Codex's conversation-lock screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexLockChoice {
+    /// Continue the existing conversation in this pane.
+    Retry,
+    /// Fork the conversation in this pane.
+    Fork,
+}
+
+/// A single guarded key, never an automatic reply or a submitted brief.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneResolveCodexLockParams {
+    /// Same validated write budget as `pane.send_keys`; absent means 10000 ms.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
+    /// The pane whose live screen must still show the lock before writing.
+    pub pane_id: String,
+    /// Exactly one `r` or `f`, without Enter.
+    pub choice: CodexLockChoice,
 }
 
 /// `pane.arm_self_compact` params.
