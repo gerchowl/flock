@@ -26,10 +26,65 @@ Credentials, raw frames and their parse errors do not enter diagnostics.
 `welcome` carries the wire version, server version, verified opaque principal,
 random server epoch and 24-hour idempotency-window metadata. The epoch is fresh
 per core and never resets durable cursors. A newer client receives the server's
-wire version and no command capability. No command capabilities are advertised; agent-history subscriptions are
-described below, and command dispatch remains assigned to later slices. Binary frames and other non-protocol post-hello
-data operations are policy violations and close with 1008.
-There is no command admission, structured start or claim of durable journaling.
+wire version and cannot execute commands (`server_version_gap`). No command
+capabilities are advertised. Agent-history subscriptions and the decide-only
+command adapter are described below. Binary frames and other non-protocol
+post-hello data operations are policy violations and close with 1008.
+There is no durable command journal in this slice.
+
+## Structured permission commands
+
+This decide-only slice of #1831 routes `cmd agent.decide` on the app owner,
+using ADR-0036 sections 4/5/5a and the existing S6 permission API. `agent.send`
+keeps the existing policy refusal (close 1008), without dispatch or allocation;
+its queue-backed routing remains in #2251 until #2037/#2052/#2065 land.
+
+`agent.decide` uses the generated `AgentDecide` contract. Echo both the
+`request_id` and flk-issued `request_seq` from the open permission record;
+never synthesize a sequence. Success returns `{ request_id, decision }` through
+the normal ack envelope after S6 reserves the named answer. The agent stream's
+closed record remains authoritative for dismissing a permission card. Unknown,
+closed, stale and unauthorized decisions keep S6's registered refusal codes.
+An unknown local agent receives `agent_not_found`; an advertised remote agent
+or a known terminal target receives `unsupported_for_agent`. No command creates
+a runtime. The separate decision-message bound remains tracked in #2249.
+
+Decision requires `answer` scope; the shared S6 service additionally requires
+an `operate` token for operator authority. Every command rechecks the current
+token file and scopes while serializing admission with revocation. A
+removed/replaced token gets `auth_revoked`; its ack is flushed before all
+sockets for that token close 4403. Scope shrink instead returns `scope` and
+keeps the socket and allowed reads alive. Already admitted work is not
+cancelled by revocation. Deleting a token alone does not proactively close an
+idle read-only socket; the next command or reconnect detects it.
+
+Other verbs, including `agent.interrupt`, receive `server_version_gap` (exit 78)
+before allocating a command task, owner request or permission check. Command
+IDs above 128 bytes receive `invalid_params`. Four pending commands are allowed
+per socket; a fifth receives `session_busy`, leaving the socket open. Writer
+backpressure still applies to refusal acks, including the existing 64 KiB
+encoded-message cap and 45-second blocked-writer ceiling. The owner's decision
+mailbox holds 32 entries; it handles at most 32 requests per service turn. Full
+admission returns `session_busy`, including a race between the connection's
+capacity check and enqueue, without disconnecting a healthy socket. The shared
+send lane is retained but unmounted in this slice.
+Permission-book contention also refuses admission with `session_busy` (retry
+`later`, exit 1) before reserving a decision or writing harness input. The owner
+never waits on the transport's lock. The GUI displays the ack's refusal message
+and does not automatically resend it; this is not an accepted or lost decision.
+
+Duplicate detection is keyed by `(principal, cmd_id)` across that principal's
+sockets. The owner retains the last 1024 completed admissions across all
+principals, evicting the oldest completed key in FIFO order. Refused commands
+do not claim a key. A retained duplicate returns `session_unconfirmed` after
+authorization, without dispatch. This is a bounded in-memory fence, not a
+recovery journal: eviction, restart and handoff can forget completed keys.
+`resume_only: true` always returns `session_unconfirmed` without dispatch.
+There is no cached ack lookup or automatic resend. The already-filed #2296
+follow-ups (principal-isolated eviction and oversized refusal IDs) are unchanged
+from #2251's approved head and are not part of this port. Traffic from another
+principal can evict a recent completed key. An oversized command ID whose
+refusal exceeds the encoded-frame cap can still cause close 1001 (#2296).
 
 Application JSON pings run every 15 seconds independently of other traffic. Each
 nonce is unique to its epoch/socket and sequence. Keep at most three outstanding

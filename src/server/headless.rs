@@ -3893,6 +3893,7 @@ impl HeadlessServer {
                 &mut self.app.structured_workers,
                 &crate::session::data_dir(),
             );
+            wire.service_commands(&mut self.app);
         }
         self.app.start_ready_pastes();
         let mut changed = structured_changed;
