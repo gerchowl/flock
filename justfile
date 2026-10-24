@@ -81,7 +81,7 @@ ci-archive leg archive:
     cargo nextest archive --locked --features {{ci_features}} --archive-file "{{archive}}"
     python3 scripts/ci_shards.py verify --leg "{{leg}}" --archive-file "{{archive}}"
 
-# Run one CI shard, named in .config/ci-shards.toml, from an
+# Run one CI shard inside the dev shell for its runtime tools, from a
 # web/ts archive made by `ci-archive`, with its feature set already compiled.
 # It is extracted into this checkout's target/
 # because the integration tests bake `env!("CARGO_BIN_EXE_flk")` in at compile

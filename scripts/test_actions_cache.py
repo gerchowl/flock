@@ -121,6 +121,20 @@ class ActionsCachePolicy(unittest.TestCase):
         self.assertLess(job['steps'].index(install), job['steps'].index(cache))
         self.assertLess(job['steps'].index(cache), job['steps'].index(lint))
 
+    def test_archived_shards_run_in_the_dev_shell_on_every_platform(self):
+        job = workflow('ci-leg.yml')['jobs']['test']
+        steps = job['steps']
+        run, = [s for s in steps if s.get('name') == 'Run shard']
+        self.assertEqual(run['run'],
+                         "nix develop -c just ci-shard '${{ inputs.leg }}' "
+                         "'${{ matrix.shard.name }}' nextest-archive.tar.zst")
+        self.assertNotIn('if', run)
+        install, = [s for s in steps
+                    if s.get('uses', '').startswith('cachix/install-nix-action@')]
+        self.assertRegex(install['uses'], r'@[a-f0-9]{40}$')
+        self.assertNotIn('if', install)
+        self.assertLess(steps.index(install), steps.index(run))
+
     def test_nix_cache_is_bounded_pinned_and_written_only_by_dev(self):
         document = workflow('nix.yml')
         cache, = [s for s in steps(document)
