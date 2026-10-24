@@ -20,6 +20,12 @@ use tracing::info;
 
 #[cfg(unix)]
 const HANDOFF_VERSION: u32 = 1;
+/// Descriptor extension: old receivers must refuse before ready, even with zero PTYs.
+#[cfg(unix)]
+pub(crate) const CLIENT_LISTENER_HANDOFF_VERSION: u32 = 2;
+/// Import-only credential channel, consumed before the importer starts children.
+#[cfg(unix)]
+pub(crate) const HANDOFF_TOKEN_ENV: &str = "FLOCK_HANDOFF_TOKEN";
 #[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
@@ -65,6 +71,9 @@ pub(crate) struct HandoffManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structured_unknown: Vec<String>,
     pub panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
+    /// One listening TCP descriptor follows the PTY descriptors when present.
+    #[serde(default)]
+    pub client_listener: bool,
     /// Operator drafts kept in panes' stashes (#850), so a handoff does not
     /// drop them. Absent from an older server's manifest.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -117,7 +126,7 @@ pub(crate) fn spawn_handoff_import(
         .arg("server")
         .arg("--handoff-import")
         .arg(socket_path)
-        .arg(token)
+        .env(HANDOFF_TOKEN_ENV, token)
         // A test version override names the exporter's build, not the
         // importer's, which reports its own (#958).
         .env_remove("FLOCK_TEST_BUILD_VERSION")
@@ -456,7 +465,9 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
     let manifest_line = read_line_unbuffered(stream)?;
     let manifest: HandoffManifest = serde_json::from_str(&manifest_line)
         .map_err(|err| io::Error::other(format!("handoff manifest deserialize failed: {err}")))?;
-    if manifest.version != HANDOFF_VERSION {
+    if ![HANDOFF_VERSION, CLIENT_LISTENER_HANDOFF_VERSION].contains(&manifest.version)
+        || manifest.client_listener != (manifest.version == CLIENT_LISTENER_HANDOFF_VERSION)
+    {
         return Err(io::Error::other(format!(
             "unsupported handoff version {}",
             manifest.version
@@ -483,6 +494,12 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
             crate::build_info::version()
         )));
     }
+    if manifest.client_listener && !cfg!(feature = "web") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "handoff listener requires a web-enabled replacement",
+        ));
+    }
     stream.write_all(b"validated\n")?;
     stream.flush()?;
     if cfg!(debug_assertions)
@@ -496,7 +513,10 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
             manifest.panes.len()
         )));
     }
-    let fds = recv_fds(stream, manifest.panes.len())?;
+    let fds = recv_fds(
+        stream,
+        manifest.panes.len() + usize::from(manifest.client_listener),
+    )?;
     Ok((manifest, fds))
 }
 
@@ -546,6 +566,7 @@ pub(crate) fn manifest_for(
         structured_unknown: Vec::new(),
         panes,
         kept_drafts: Default::default(),
+        client_listener: false,
     }
 }
 
@@ -685,6 +706,17 @@ fn close_fds(fds: &[RawFd]) {
 
 #[cfg(unix)]
 fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> io::Result<()> {
+    recv_fds_into_observing(stream, expected, out, |_| {})
+}
+
+/// Observe kernel-installed descriptor flags before the portable fcntl fallback.
+#[cfg(unix)]
+fn recv_fds_into_observing(
+    stream: &UnixStream,
+    expected: usize,
+    out: &mut Vec<RawFd>,
+    mut received: impl FnMut(&[RawFd]),
+) -> io::Result<()> {
     // Sized well past one batch, so a batch carrying more than the remainder,
     // or more than the batch limit, arrives whole and is refused by count.
     // Truncation is not a safe way to refuse: on macOS the kernel installs
@@ -707,7 +739,13 @@ fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> 
         msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = space as _;
 
-        let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+        let read = unsafe {
+            libc::recvmsg(
+                stream.as_raw_fd(),
+                &mut msg,
+                crate::platform::received_fd::RECV_FLAGS,
+            )
+        };
         if read < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -732,6 +770,11 @@ fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> 
             return Err(io::Error::other("handoff fd control message was truncated"));
         }
         collected?;
+        received(&out[before..]);
+        // Set every received PTY/listener descriptor before any importer child can be spawned.
+        for fd in &out[before..] {
+            crate::platform::received_fd::close_on_exec(*fd)?;
+        }
         if byte[0] != FD_BATCH_TAG {
             return Err(io::Error::other(format!(
                 "handoff fd batch carried data byte {:#04x}, expected {:#04x}",
@@ -821,6 +864,39 @@ mod tests {
     use std::io::Read;
     use std::os::unix::net::UnixStream;
     use std::thread;
+
+    #[test]
+    fn importer_secret_uses_environment_and_never_argv_or_logs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TempDir::socket();
+        let importer = dir.path().join("importer");
+        std::fs::write(
+            &importer,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" \"$FLOCK_HANDOFF_TOKEN\" >\"$0.result\"\n",
+        )
+        .expect("fixture script");
+        std::fs::set_permissions(&importer, std::fs::Permissions::from_mode(0o700))
+            .expect("executable fixture");
+        let socket = dir.path().join("import.sock");
+        let token = ["fixture", "handoff", "credential"].join("-");
+        let logs = crate::logging::capture_logs(|| {
+            let mut child = spawn_handoff_import(Some(&importer), &socket, &token)
+                .expect("spawn fixture importer");
+            assert!(child.wait().expect("fixture completion").success());
+        });
+        assert!(!logs.contains(&token));
+        let received =
+            std::fs::read_to_string(importer.with_extension("result")).expect("fixture receipt");
+        assert_eq!(
+            received.lines().collect::<Vec<_>>(),
+            [
+                "server",
+                "--handoff-import",
+                socket.to_str().unwrap(),
+                token.as_str()
+            ]
+        );
+    }
 
     #[test]
     fn import_deadline_disarm_and_expiry_race_has_only_one_winner() {
@@ -1184,6 +1260,31 @@ mod tests {
     }
 
     #[test]
+    fn handoff_receive_passes_platform_flags_before_fcntl() {
+        let (reads, writes) = pipes(1);
+        let (sender, receiver) = pair_with_timeout();
+        send_fds(&sender, &writes).unwrap();
+        let mut received = Vec::new();
+        let mut observed = Vec::new();
+        let result = recv_fds_into_observing(&receiver, 1, &mut received, |fds| {
+            observed.extend(
+                fds.iter()
+                    .map(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) }),
+            );
+        });
+        close_fds(&received);
+        close_fds(&writes);
+        assert_all_write_ends_closed(&reads);
+        result.unwrap();
+        assert_eq!(
+            observed.len(),
+            1,
+            "inspect before fallback can mask a missing receive flag"
+        );
+        crate::platform::received_fd::assert_kernel_received_flags(&observed);
+    }
+
+    #[test]
     fn receiver_accumulates_150_fds_across_batches_in_order() {
         let (reads, writes) = pipes(150);
         let (sender, receiver) = pair_with_timeout();
@@ -1196,6 +1297,11 @@ mod tests {
         // Each received fd must be the write end of the pipe at the same
         // index: the importer pairs fds with manifest panes by position.
         for (idx, &fd) in received.iter().enumerate() {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0,
+                "PTY descriptor must not reach an importer child"
+            );
             let tag = idx as u8;
             assert_eq!(unsafe { libc::write(fd, (&tag as *const u8).cast(), 1) }, 1);
             let mut got = 0u8;

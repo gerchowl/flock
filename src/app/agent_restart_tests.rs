@@ -93,7 +93,7 @@ fn rig_with_harness_options(agent: &str, script: &str, options: &[&str]) -> Rig 
     terminal.cwd = directory.clone();
     terminal.launch_argv = Some(argv);
     terminal.launch_env = vec![("RESTART_PROFILE".into(), "fixture-env".into())];
-    terminal.set_agent_name("restart-fixture".into());
+    terminal.set_agent_name("restart-fixture".into()).unwrap();
     let mut rig = Rig {
         app,
         id,

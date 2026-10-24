@@ -35,7 +35,51 @@ for the retired ID are silently dropped; frames for never-opened IDs are protoco
 errors. Reusing a live or closed ID is refused with subfail code `sub_id_reused`. The `fleet-lite.jsonl` fixture pins
 bootstrap, live updates/removal and recovery.
 
-`agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, `decision`
+### Fleet-lite store recovery
+
+An empty, unmarked lock with neither data record opens at zero. This includes an
+empty legacy lock from the snapshot-only layout (#1974). Legacy locks were always
+unmarked, even after positions had been published through `fleet.json`. That
+layout's only high-water floor was `fleet.json`; if it is lost, there is no better
+floor to recover. Opening at zero preserves the old behavior.
+
+In the cursor-based layout, cursor durability precedes the initialization marker.
+If an unmarked lock already has a matching cursor, opening fsyncs the cursor's
+parent directory again before
+marking the lock. This completes a previous initialization whose rename succeeded
+but directory fsync failed. A directory-fsync error refuses opening and leaves
+the lock unmarked for a later retry.
+`fleet.lock` carries that marker, so deleting it together with `fleet.cursor`
+while an older `fleet.json` survives reopens at that older head. The operator
+must never delete the lock.
+
+The provider core persists a separate durable cursor before replacing the row
+snapshot. Subscription integration and the configured store location belong to
+S7-min slice 6b (#1832); the core currently has no product caller.
+
+For a store named `fleet.json`, preserve `fleet.cursor` and `fleet.lock` during
+recovery. A lost or corrupt snapshot opens with no rows at the cursor's preserved
+high-water and exposes a typed `SnapshotMissing` or `SnapshotCorrupt` diagnostic.
+Refresh the authoritative registry/S4/S6 provider before serving a recovery
+snapshot. A failed snapshot write may reserve positions that were never published;
+the recovery checkpoint covers those positions instead of reusing them.
+
+Opening leaves damaged snapshot bytes untouched. Copy them before a refresh or
+checkpoint replaces the file. If the cursor is missing after initialization or corrupt, or both recovery records
+are missing from an initialized store, opening refuses a zero reset. With the owning
+store closed, restore a trusted cursor backup or atomically replace its
+`{"high_water":N}` record using temp-file fsync, rename and directory fsync.
+Choose `N` at least as high as the surviving snapshot head and every cursor clients
+have observed. If that floor is unknown, keep the store closed rather than guess.
+A legacy valid snapshot with an unmarked lock seeds the cursor. A durable lock
+marker then prevents a missing cursor from being mistaken for legacy migration
+from an older snapshot. When both records are valid, the maximum high-water wins.
+
+Skipped rows log their array index and `unsupported`, `invalid` or `duplicate`
+reason without their contents. Unknown top-level row fields survive unchanged
+rows and checkpoints, but are dropped when a fresh projection changes the row.
+
+`agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, required `request_seq`, `decision`
 (`allow_once`, `allow_always` or `deny`), and optional `message`. Only a
 token-authenticated client principal can submit this command. The ack uses the
 same envelope as `agent.send`, echoes `cmd_id`, and on success returns
@@ -50,3 +94,50 @@ Failures use `ok: false` and the existing `WireError` envelope without `result`.
 `permission_request_closed` and `not_authorized`, with retry class `never`.
 These names are contracts for S6 (#1429) to register before serving them; this
 slice adds no API error registrations or authorization behavior.
+
+Live structured runtimes keep at most 16 open/in-flight requests
+(`MAX_OPEN_PERMISSION_REQUESTS`). The harness blocks per request, so more than a
+few concurrent prompts is pathological; 16 leaves headroom for parallel tool
+calls. An extra valid request receives a `permission_request_limit` deny (retry
+`never`), a structured warning and a durable closed audit with no matching open
+audit. The other requests and the session remain live.
+
+Every open request carries a flk-issued `request_seq: u64` in its audit, trusted
+stdout envelope and S4 snapshot. It increases strictly within the session,
+including across runtime resumes. S7 slice 5 must carry both `request_id` and
+`request_seq` from that display to `agent.decide`; an ID alone cannot authorize
+an answer. Like stream cursors, generated TypeScript represents this JSON number
+as `number`, exact below 2^53. Clients must preserve the exact value.
+
+The most recent 1024 closed `(request_id, request_seq)` handles are retained in
+FIFO closure order. A decision for a retained closed pair returns
+`permission_request_closed`; an evicted or never-seen pair returns
+`permission_request_unknown`. A reused harness ID receives a new sequence:
+a delayed decision for its old handle cannot approve the new request or install
+an `allow_always` grant. Session grants remain exact matches for this live runtime.
+
+## Permission lifecycle records
+
+`flk_permission_request` is a known agent-stream event, exported as the generated
+`PermissionRecord` type. Its `state` is `open` or `closed`; there is no `decided`
+state. Both carry `request_id` and the flk-issued `request_seq`. Only `open`
+carries `request: ToolRequest`, from which the client renders the tool summary.
+A close carries `decision`, nullable `message`, `principal` and `source`, or a
+closed reason enum. Capacity refusals use `permission_request_limit` and may
+have no preceding open. Other reasons include `ended`, `cancelled`, `result`,
+`interrupted`, `permission_request_too_large`, and `session_ended` (a prior
+runtime left an unmatched open). Existing closed JSON is preserved apart from `request_seq`.
+
+The `permission-decision` fixture shows open, `agent.decide` acknowledgement,
+then closed. The ack acknowledges admission; remove the card when the durable
+closed event arrives. Future or incompatible record shapes use the existing
+unknown-event wrapper, preserving their original payload.
+
+On session start or resume, the owner closes unmatched permission records with
+`session_ended` before processing new control requests, including interrupted
+automatic approvals. The closes use normal durable audit ordering; an I/O
+failure stops the owner. Repeated starts add no duplicate close. Old permission
+slots and exact grants are not restored. Legacy opens without `request_seq`
+use their durable stream position for the recovery close; an old close without
+a handle matches by ID. Unknown records remain untouched, and invalid permission
+headers are logged and preserved rather than failing the entire recovery scan.

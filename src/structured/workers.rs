@@ -1,7 +1,7 @@
 //! Owned workers for ADR-0036 S3a-3; no public start/admission route until #1843.
 //!
 //! Lease locks, preparation and supervision run off the app loop. Each launch has
-//! two bounded owner messages (ready/end) and the runtime's bounded stream queue.
+//! three bounded owner messages (lease/ready/end) and the runtime's bounded stream queue.
 //! Only `Received::state_input` adapts stream records, including book closes.
 //! Polling drains four records per agent and rearms the shared wake when full.
 //! Exact S4 deadlines share the app scheduler; silence never kills a process.
@@ -31,9 +31,13 @@ use std::{
 use tokio::sync::Notify;
 pub(crate) mod queue;
 const BATCH: usize = 4;
+mod admission;
+pub(crate) use admission::Admission;
 
 /// Internal launch policy, supplied by authenticated admission in #1843.
 pub struct Launch {
+    /// Attested starter and validated, nonce-framed MCP opening turn; CLI starts stay idle.
+    pub opening_turn: Option<(String, crate::spawn::prompt::SpawnPrompt)>,
     /// Stable registered identity.
     pub agent_id: String,
     /// Current registry epoch; replaced atomically by a fresh launch epoch.
@@ -42,6 +46,8 @@ pub struct Launch {
     pub leases: SessionLeases,
     /// Durable stream/supervision directory.
     pub state: PathBuf,
+    /// Caller-supplied `[sessions]` storage policy, captured for this launch.
+    pub storage: super::blobs::StorageConfig,
     /// Pinned flock executable and owning server socket for this session.
     pub mcp: SessionMcp,
     /// Caller-supplied sessions stall policy, with no guessed default.
@@ -50,6 +56,8 @@ pub struct Launch {
     pub queue_rewrite_bytes: std::num::NonZeroU64,
     /// Optional authenticated delegation lineage.
     pub lineage: Option<(String, u32)>,
+    /// Agent-caller policy; None is the already-attested operator exemption.
+    pub(crate) admission: Option<Admission>,
 }
 /// Completion available only after preceding stream records have been reduced.
 #[derive(Debug)]
@@ -60,6 +68,7 @@ pub struct Report {
     pub authority_retained: bool,
 }
 enum Message {
+    Leased,
     Ready(Runtime),
     End(Report),
 }
@@ -74,6 +83,7 @@ struct Worker {
     stall_after: Duration,
     queue_state: Option<queue::Snapshot>,
     queue_seq: u64,
+    lineage: Option<(String, u32)>,
     thread: Option<JoinHandle<()>>,
 }
 impl Worker {
@@ -118,6 +128,10 @@ impl Worker {
 /// discard confirmed completions, while uncertain ownership remains recoverable.
 pub struct Workers {
     entries: BTreeMap<String, Worker>,
+    history: BTreeMap<String, (u64, super::history::History)>,
+    pending: BTreeMap<String, Option<String>>,
+    #[cfg(test)]
+    before_reserve: Option<mpsc::Receiver<()>>,
     notify: Arc<Notify>,
     // Coalesced wake for teardown while the async server loop is quiescent.
     wake: mpsc::SyncSender<()>,
@@ -134,6 +148,10 @@ impl Workers {
             wakes,
             shutdown_result: None,
             entries: BTreeMap::new(),
+            history: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            #[cfg(test)]
+            before_reserve: None,
             notify,
         }
     }
@@ -142,9 +160,8 @@ impl Workers {
     /// and checked on both sides of the factory. Live/unconfirmed workers and
     /// unread terminal queue completions refuse replacement with session_busy.
     /// Failure may advance the observation epoch but never the record.
-    /// Until #1957/#1958 provide a production `Workers::queue_update` consumer,
-    /// relaunch with a queue returns session_busy even after process exit.
-    /// Tests and internal adapters must drain terminal completions first.
+    /// The app drains published completions before operator relaunch. Internal
+    /// adapters must likewise drain terminal completions first.
     pub fn start(
         &mut self,
         registry: &mut Registry,
@@ -152,14 +169,17 @@ impl Workers {
         prepare: impl FnOnce(&Record) -> Result<LaunchProfile, LaunchError> + Send + 'static,
     ) -> Result<u64, ErrorCode> {
         let Launch {
+            opening_turn,
             agent_id,
             generation: current,
             leases,
             state,
+            storage,
             mcp,
             stall_after,
             queue_rewrite_bytes,
             lineage,
+            admission,
         } = launch;
         if let Some(previous) = self.entries.get_mut(&agent_id) {
             previous.join_finished();
@@ -177,23 +197,58 @@ impl Workers {
                 return Err(ErrorCode::SessionBusy);
             }
         }
+        // Resume retains the original admission ancestry, including operator roots.
+        let lineage = self
+            .entries
+            .get(&agent_id)
+            .map_or(lineage, |w| w.lineage.clone());
+        let retained_lineage = lineage.clone();
         let record = registry
             .get(&agent_id)
             .filter(|(_, _, g)| *g == current)
             .map(|(r, _, _)| r.clone())
             .ok_or(ErrorCode::AgentNotFound)?;
-        let generation = registry
-            .begin_launch(&agent_id, current)
-            .map_err(|_| ErrorCode::AgentStartFailed)?;
-        let (tx, messages) = mpsc::sync_channel(2);
+        if registry
+            .get(&agent_id)
+            .is_some_and(|(_, p, _)| p.update.state.lifecycle == Lifecycle::Unknown)
+        {
+            return Err(ErrorCode::StructuredRecoveryRequired);
+        }
+        self.reserve_pending(
+            &agent_id,
+            lineage.as_ref().map(|(id, _)| id.as_str()),
+            &leases,
+            admission.as_ref(),
+        )?;
+        let generation = registry.begin_launch(&agent_id, current).map_err(|error| {
+            self.pending.remove(&agent_id);
+            match error {
+                super::registry::RegistryError::RecoveryRequired => {
+                    ErrorCode::StructuredRecoveryRequired
+                }
+                _ => ErrorCode::AgentStartFailed,
+            }
+        })?;
+        let (tx, messages) = mpsc::sync_channel(3);
         let stop = StopRequest::default();
         let cancelled = stop.clone();
         let notify = self.notify.clone();
         let wake = self.wake.clone();
+        #[cfg(test)]
+        let before_reserve = self.before_reserve.take();
         let thread = std::thread::Builder::new()
             .name("structured-launch".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(test)]
+                    if let Some(barrier) = before_reserve {
+                        barrier.recv_timeout(Duration::from_secs(10)).map_err(|_| {
+                            (
+                                ErrorCode::AgentStartFailed,
+                                "reservation barrier failed".into(),
+                            )
+                        })?;
+                    }
                     let lease = leases
                         .reserve(
                             &record.agent_id,
@@ -201,6 +256,9 @@ impl Workers {
                             lineage.as_ref().map(|(id, depth)| (id.as_str(), *depth)),
                         )
                         .map_err(|code| (code, code.as_str().to_owned()))?;
+                    let _ = tx.try_send(Message::Leased);
+                    notify.notify_one();
+                    let _ = wake.try_send(());
                     let prepare = || -> Result<_, LaunchError> {
                         if cancelled.requested() {
                             return Err(io::Error::new(
@@ -223,6 +281,7 @@ impl Workers {
                     let profile = prepare().map_err(|error| (error.code(), error.to_string()))?;
                     let location = StreamLocation {
                         data_dir: state.clone(),
+                        storage,
                         agent: record.agent_id.clone(),
                         session: record.session_id.clone(),
                     };
@@ -248,6 +307,7 @@ impl Workers {
                         runtime::Control {
                             stop: cancelled.clone(),
                             queue_rewrite_bytes: Some(queue_rewrite_bytes),
+                            opening_turn,
                         },
                     )
                     .map_err(|error| (error.code(), error.to_string()))
@@ -266,7 +326,10 @@ impl Workers {
                 notify.notify_one();
                 let _ = wake.try_send(());
             })
-            .map_err(|_| ErrorCode::AgentStartFailed)?;
+            .map_err(|_| {
+                self.pending.remove(&agent_id);
+                ErrorCode::AgentStartFailed
+            })?;
         self.shutdown_result = None;
         self.entries.insert(
             agent_id,
@@ -281,6 +344,7 @@ impl Workers {
                 stall_after,
                 queue_state: None,
                 queue_seq: 0,
+                lineage: retained_lineage,
                 thread: Some(thread),
             },
         );
@@ -292,6 +356,48 @@ impl Workers {
             .get(id)
             .filter(|w| w.generation == generation && !w.finished)
             .and_then(|w| w.runtime.as_ref())
+    }
+    /// Registry-fenced stored stream, retained after runtime exit. This handle
+    /// lives with runtime ownership, never inside the pure registry/AppState.
+    pub fn history(&self, registry: &Registry, id: &str) -> Option<&super::history::History> {
+        let (generation, source) = self.history.get(id)?;
+        let (_, _, current) = registry.get(id)?;
+        (*generation == current).then_some(source)
+    }
+    /// Cold recovery requires a joined producer without retained cleanup authority.
+    /// Existing canonical history remains readable while a worker is active.
+    /// A finished worker without a report can recover once its thread is joined.
+    /// An explicit report retaining authority still defers recovery.
+    pub(crate) fn history_recovery_allowed(&self, id: &str) -> bool {
+        self.entries.get(id).is_none_or(|worker| {
+            worker.finished
+                && worker.thread.is_none()
+                && worker
+                    .report
+                    .as_ref()
+                    .is_none_or(|report| !report.authority_retained)
+        })
+    }
+    /// Install a closed-file source recovered on an I/O worker. A changed epoch,
+    /// active producer or already installed source refuses stale recovery.
+    pub fn install_retained(
+        &mut self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+        source: super::history::History,
+    ) -> Result<(), ErrorCode> {
+        if registry.get(id).is_none_or(|(record, _, g)| {
+            g != generation || !source.belongs_to(&record.agent_id, &record.session_id)
+        }) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        if self.history(registry, id).is_some() || self.entries.get(id).is_some_and(|w| !w.finished)
+        {
+            return Err(ErrorCode::SessionBusy);
+        }
+        self.history.insert(id.into(), (generation, source));
+        Ok(())
     }
     /// Nonblocking queue request for the exact current generation. Completion,
     /// not buffer acceptance, acknowledges durable admission. Callers consume
@@ -374,12 +480,17 @@ impl Workers {
             {
                 worker.stop();
             }
-            for _ in 0..2 {
+            for _ in 0..3 {
                 if worker.report.is_some() {
                     break;
                 }
                 match worker.messages.try_recv() {
+                    Ok(Message::Leased) => {
+                        self.pending.remove(id);
+                    }
                     Ok(Message::Ready(runtime)) => {
+                        self.history
+                            .insert(id.clone(), (worker.generation, runtime.history.clone()));
                         if worker.stop.requested() {
                             runtime.stop();
                         }
@@ -392,8 +503,12 @@ impl Workers {
                             unix_ms,
                         );
                     }
-                    Ok(Message::End(report)) => worker.report = Some(report),
+                    Ok(Message::End(report)) => {
+                        self.pending.remove(id);
+                        worker.report = Some(report);
+                    }
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        self.pending.remove(id);
                         worker.stop();
                         worker.report = Some(Report {
                             result: Err((
@@ -483,6 +598,9 @@ impl Workers {
                 changed = true;
             }
         }
+        self.history.retain(|id, (generation, _)| {
+            registry.get(id).is_some_and(|(_, _, g)| g == *generation)
+        });
         // Removed records need no completed handle; uncertain ownership must survive.
         self.entries.retain(|id, worker| {
             worker.join_finished();

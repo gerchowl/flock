@@ -22,7 +22,7 @@ pub(super) trait FlockCall {
 }
 
 /// Production wire: talks to the local flock socket via [`ApiClient`].
-pub(super) struct LocalApi;
+pub(super) struct LocalApi(pub(super) ApiClient);
 
 impl FlockCall for LocalApi {
     fn call(&self, method: Method) -> Result<Value, ApiClientError> {
@@ -30,7 +30,7 @@ impl FlockCall for LocalApi {
             id: format!("mcp:{}", crate::mcp::next_call_seq()),
             method,
         };
-        ApiClient::local().request_value(&request)
+        self.0.request_value(&request)
     }
 }
 
@@ -166,6 +166,20 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
     };
 
     let method = (tool.build)(arguments.clone())?;
+    if matches!(&method, Method::AgentSpawn(p)
+        if p.runtime == crate::api::schema::AgentRuntime::Structured)
+    {
+        let pong = flock
+            .call(Method::Ping(crate::api::schema::PingParams::default()))
+            .map_err(McpError::transport)?;
+        if !crate::api::compatibility::advertises_structured(&pong) {
+            return Err(McpError::from_flock_error(
+                crate::api::compatibility::ERROR_CODE,
+                "structured admission requires a newer server",
+                crate::api::compatibility::EXIT_CODE,
+            ));
+        }
+    }
     // #1179 / #868: an older server would drop `questions` without a word and
     // start the child with no policy. An agent cannot read a stderr note, so
     // the call is refused before anything starts, and says why.
@@ -382,7 +396,7 @@ mod tests {
         let pane_id = app.state.public_pane_id(0, pane).unwrap();
         let terminal_id = ws.tabs[0].panes[&pane].attached_terminal_id.clone();
         let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
-        terminal.agent_name = Some("reviewer".into());
+        terminal.set_agent_name("reviewer".into()).unwrap();
         let agent_id = terminal.agent_id.to_string();
         let api = AppApi(RefCell::new(app));
         let unresolved_inbox = route(
@@ -450,7 +464,12 @@ mod tests {
                 .unwrap()
                 .attached_terminal_id
                 .clone();
-            app.state.terminals.get_mut(&other).unwrap().agent_name = Some("reviewer".into());
+            app.state
+                .terminals
+                .get_mut(&other)
+                .unwrap()
+                .set_agent_name("reviewer".into())
+                .unwrap();
         }
         for to in [
             json!("reviewer"),
@@ -1151,5 +1170,57 @@ mod tests {
             assert_eq!(data["retry"], "after_inspecting");
             assert_eq!(data["exit"], 8);
         }
+    }
+
+    #[test]
+    fn structured_start_never_sends_a_selector_to_an_old_server() {
+        for capability in [false, true] {
+            let api = MockApi::ok(
+                json!({"result":{"type":"pong","capabilities":{"structured_agents":capability}}}),
+            );
+            let result = route(
+                "tools/call",
+                json!({"name":"flock_agent_start","arguments":{
+                "runtime":"structured","agent":"claude","prompt":"review",
+                "location":{"kind":"workspace_id","workspace_id":"ws_fixture"}}}),
+                &api,
+                &ChannelOptions::off(),
+            );
+            assert_eq!(
+                api.calls
+                    .borrow()
+                    .iter()
+                    .filter(|m| matches!(m, Method::AgentSpawn(_)))
+                    .count(),
+                usize::from(capability)
+            );
+            if !capability {
+                assert_eq!(
+                    result.unwrap_err().data.unwrap()["refusal"],
+                    "server_version_gap"
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+    #[test]
+    fn structured_list_rows_are_mirrored_without_pty_placement() {
+        let row = json!({"runtime":"structured","agent_id":"agent_atlas_fixture","name":"worker"});
+        let api = MockApi::ok(
+            json!({"result":{"type":"agent_list","agents":[],"structured_agents":[row.clone()]}}),
+        );
+        let result = route(
+            "tools/call",
+            json!({"name":"flock_agent_list","arguments":{}}),
+            &api,
+            &ChannelOptions::off(),
+        )
+        .unwrap();
+        let result: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(result["agents"], json!([]));
+        assert_eq!(result["structured_agents"], json!([row]));
+        assert!(result["structured_agents"][0].get("pane_id").is_none());
     }
 }
