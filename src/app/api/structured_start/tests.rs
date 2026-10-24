@@ -499,7 +499,7 @@ async fn cli_socket_launch_persists_configured_blob_reference() {
         fixture.socket.to_string_lossy().as_ref()
     );
     let store = crate::structured::blobs::BlobStore::open(&crate::session::data_dir()).unwrap();
-    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+    assert_eq!(store.get(&reference.blob, reference.size).unwrap(), bytes);
 }
 
 /// Refused selectors and default run-as have no metadata, profile or process effects.
