@@ -30,6 +30,8 @@ pub enum AgentDecideErrorCode {
     PermissionRequestClosed,
     /// The caller is not a token-authenticated client principal.
     NotAuthorized,
+    /// The message exceeds the byte bound or carries forbidden control bytes.
+    InvalidParams,
 }
 
 /// Arguments for a token-authenticated client's agent.decide command.
@@ -48,7 +50,10 @@ pub struct AgentDecide {
     pub request_seq: u64,
     /// Permission choice admitted by S6-MVP.
     pub decision: PermissionDecision,
-    /// Optional explanation supplied with the answer.
+    /// Optional explanation: CRLF is normalized to LF, then trimmed.
+    /// At most 2048 UTF-8 bytes, using prompt_control_bytes rules (newlines and
+    /// tabs permitted). Invalid input returns invalid_params before reserving
+    /// the request. Empty and absent messages are allowed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub message: Option<String>,
@@ -167,6 +172,7 @@ mod tests {
                 "permission_request_closed",
             ),
             (AgentDecideErrorCode::NotAuthorized, "not_authorized"),
+            (AgentDecideErrorCode::InvalidParams, "invalid_params"),
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), spelling);
             assert_eq!(
@@ -208,6 +214,16 @@ mod tests {
         assert_eq!(value["row"]["state"]["phase"], "unknown");
         assert_eq!(value["row"]["state"]["turn"], "working");
         assert_eq!(value["row"]["state"]["lifecycle"], "live");
+    }
+
+    #[test]
+    fn generated_decide_message_documents_server_validation() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/client/src/gen");
+        let request = std::fs::read_to_string(root.join("AgentDecide.ts")).unwrap();
+        assert!(request.contains("2048 UTF-8 bytes"));
+        assert!(request.contains("trimmed"));
+        assert!(request.contains("invalid_params"));
+        assert!(request.contains("prompt_control_bytes"));
     }
 
     #[test]
