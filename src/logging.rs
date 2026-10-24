@@ -1909,6 +1909,18 @@ pub(crate) fn client_conn_hello_read_failed(client_id: u64, err: &str) {
     );
 }
 
+/// Structured tty-query failures distinguish confirmed loss from retention.
+pub(crate) fn client_geometry_query_failed(
+    stage: &'static str,
+    reason: &'static str,
+    outcome: &'static str,
+    error: &std::io::Error,
+) {
+    tracing::debug!(event = "client.geometry_query_failed", subsystem = "client", stage,
+        reason, outcome,
+        errno = error.raw_os_error(), kind = ?error.kind(), "terminal geometry query failed");
+}
+
 /// A terminal observer exhausted its no-progress write deadline.
 pub(crate) fn client_conn_write_stalled(client_id: u64) {
     tracing::warn!(
