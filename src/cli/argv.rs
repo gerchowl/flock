@@ -36,6 +36,8 @@ pub(crate) fn text_argument(index: usize, arg: OsString) -> Result<String, Inval
     arg.into_string().map_err(|_| InvalidUtf8Argument(index))
 }
 
+/// Decode command text after session and remote globals have been stripped.
+/// The normalized importer form alone reserves a native socket argument.
 pub(crate) fn collect(
     args: impl Iterator<Item = OsString>,
 ) -> Result<Arguments, InvalidUtf8Argument> {

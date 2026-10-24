@@ -23,17 +23,21 @@ pub struct SessionInfo {
     pub session_dir: String,
 }
 
-pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
+/// Apply session options while preserving native bytes in all other arguments.
+/// Option values must be UTF-8; decoding command arguments happens after globals.
+pub fn configure_from_args<T: AsRef<std::ffi::OsStr> + Clone>(
+    args: &[T],
+) -> Result<Vec<T>, String> {
     let mut cleaned = Vec::with_capacity(args.len());
     if let Some(program) = args.first() {
         cleaned.push(program.clone());
     }
 
-    if args.get(1).map(String::as_str) == Some("session")
-        && args.get(2).map(String::as_str) == Some("attach")
+    if args.get(1).and_then(|arg| arg.as_ref().to_str()) == Some("session")
+        && args.get(2).and_then(|arg| arg.as_ref().to_str()) == Some("attach")
     {
         if matches!(
-            args.get(3).map(String::as_str),
+            args.get(3).and_then(|arg| arg.as_ref().to_str()),
             Some("help" | "--help" | "-h")
         ) {
             return Ok(args.to_vec());
@@ -44,7 +48,9 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
         if args.len() != 4 {
             return Err("usage: flk session attach <name>".to_string());
         }
-        apply_explicit_name(name)?;
+        let name = crate::cli::argv::text_argument(3, name.as_ref().to_os_string())
+            .map_err(|err| err.to_string())?;
+        apply_explicit_name(&name)?;
         return Ok(cleaned);
     }
 
@@ -52,19 +58,23 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
     let mut index = 1;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--" {
+        let text = arg.as_ref().to_str();
+        if text == Some("--") {
             cleaned.extend_from_slice(&args[index..]);
             break;
         }
-        if arg == "--session" {
+        if text == Some("--session") {
             let Some(value) = args.get(index + 1) else {
                 return Err("missing value for --session".to_string());
             };
-            requested_session = Some(value.clone());
+            requested_session = Some(
+                crate::cli::argv::text_argument(index + 1, value.as_ref().to_os_string())
+                    .map_err(|err| err.to_string())?,
+            );
             index += 2;
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--session=") {
+        if let Some(value) = text.and_then(|arg| arg.strip_prefix("--session=")) {
             requested_session = Some(value.to_string());
             index += 1;
             continue;
