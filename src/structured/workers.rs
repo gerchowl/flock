@@ -29,14 +29,15 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
+pub(crate) mod queue;
 const BATCH: usize = 4;
 mod admission;
 pub(crate) use admission::Admission;
 
 /// Internal launch policy, supplied by authenticated admission in #1843.
 pub struct Launch {
-    /// Validated, nonce-framed MCP opening turn; CLI starts remain idle.
-    pub opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
+    /// Attested starter and validated, nonce-framed MCP opening turn; CLI starts stay idle.
+    pub opening_turn: Option<(String, crate::spawn::prompt::SpawnPrompt)>,
     /// Stable registered identity.
     pub agent_id: String,
     /// Current registry epoch; replaced atomically by a fresh launch epoch.
@@ -51,6 +52,8 @@ pub struct Launch {
     pub mcp: SessionMcp,
     /// Caller-supplied sessions stall policy, with no guessed default.
     pub stall_after: Duration,
+    /// Configured byte policy; changes require a server restart (#1975).
+    pub queue_rewrite_bytes: std::num::NonZeroU64,
     /// Optional authenticated delegation lineage.
     pub lineage: Option<(String, u32)>,
     /// Agent-caller policy; None is the already-attested operator exemption.
@@ -78,6 +81,8 @@ struct Worker {
     finished: bool,
     events_closed: bool,
     stall_after: Duration,
+    queue_state: Option<queue::Snapshot>,
+    queue_seq: u64,
     lineage: Option<(String, u32)>,
     thread: Option<JoinHandle<()>>,
 }
@@ -152,8 +157,9 @@ impl Workers {
     }
     /// Reserve before preparation, then bind the registered cwd/model before spawn.
     /// Preparation must be bounded by its owner. Stop during preparation is latched
-    /// and checked on both sides of the factory. Live/unconfirmed workers refuse
-    /// replacement. Failure may advance the observation epoch but never the record.
+    /// and checked on both sides of the factory. Live/unconfirmed workers and
+    /// unread terminal queue completions refuse replacement with session_busy.
+    /// Failure may advance the observation epoch but never the record.
     pub fn start(
         &mut self,
         registry: &mut Registry,
@@ -169,6 +175,7 @@ impl Workers {
             storage,
             mcp,
             stall_after,
+            queue_rewrite_bytes,
             lineage,
             admission,
         } = launch;
@@ -180,6 +187,10 @@ impl Workers {
                     .report
                     .as_ref()
                     .is_some_and(|r| r.authority_retained)
+                || previous
+                    .runtime
+                    .as_ref()
+                    .is_some_and(Runtime::queue_updates_pending)
             {
                 return Err(ErrorCode::SessionBusy);
             }
@@ -274,8 +285,7 @@ impl Workers {
                     };
                     let event_notify = notify.clone();
                     let event_wake = wake.clone();
-                    let mut input_failed = false;
-                    let result = runtime::run_controlled(
+                    runtime::run_controlled(
                         &state,
                         (profile, mcp),
                         lease,
@@ -283,14 +293,6 @@ impl Workers {
                         |runtime| {
                             if cancelled.requested() {
                                 runtime.stop();
-                            } else if let Some(prompt) = &opening_turn {
-                                let user = serde_json::json!({"type":"user", "message":{
-                                    "role":"user", "content":prompt.as_argv_element()},
-                                    "parent_tool_use_id":null,"session_id":""});
-                                if runtime.try_submit(&user).is_err() {
-                                    input_failed = true;
-                                    runtime.stop();
-                                }
                             }
                             let _ = tx.try_send(Message::Ready(runtime));
                             notify.notify_one();
@@ -300,14 +302,13 @@ impl Workers {
                             event_notify.notify_one();
                             let _ = event_wake.try_send(());
                         },
-                        cancelled.clone(),
+                        runtime::Control {
+                            stop: cancelled.clone(),
+                            queue_rewrite_bytes: Some(queue_rewrite_bytes),
+                            opening_turn,
+                        },
                     )
-                    .map_err(|error| (error.code(), error.to_string()));
-                    if input_failed {
-                        Err((ErrorCode::AgentStartFailed, "opening turn refused".into()))
-                    } else {
-                        result
-                    }
+                    .map_err(|error| (error.code(), error.to_string()))
                 }))
                 .unwrap_or_else(|_| {
                     Err((
@@ -339,6 +340,8 @@ impl Workers {
                 finished: false,
                 events_closed: false,
                 stall_after,
+                queue_state: None,
+                queue_seq: 0,
                 lineage: retained_lineage,
                 thread: Some(thread),
             },
@@ -393,6 +396,42 @@ impl Workers {
         }
         self.history.insert(id.into(), (generation, source));
         Ok(())
+    }
+    /// Nonblocking queue request for the exact current generation. Completion,
+    /// not buffer acceptance, acknowledges durable admission. Callers consume
+    /// queue updates to avoid backpressuring the bounded session event pump.
+    pub(crate) fn enqueue(
+        &self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+        request: queue::Request,
+    ) -> Result<(), ErrorCode> {
+        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        self.runtime(id, generation)
+            .ok_or(ErrorCode::AgentNotFound)?
+            .queue_enqueue(request)
+    }
+    /// Consume an immutable completion/cut from the current generation only.
+    /// Terminal cuts remain available after exit; drain before relaunch/removal.
+    /// A cancelled notification report requires durable replay through #1956.
+    pub(crate) fn queue_update(
+        &self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+    ) -> Option<queue::Update> {
+        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
+            return None;
+        }
+        self.entries
+            .get(id)
+            .filter(|w| w.generation == generation)?
+            .runtime
+            .as_ref()?
+            .queue_update()
     }
     /// Latch cancellation without blocking on preparation, process or I/O cleanup.
     pub fn stop(&self, id: &str, generation: u64) -> bool {
@@ -470,6 +509,7 @@ impl Workers {
                 };
                 match runtime.try_receive() {
                     Ok(received) => {
+                        worker.queue_seq = received.record.seq;
                         if let Some(input) = received.state_input() {
                             changed |= worker.reduce(
                                 registry,
@@ -494,6 +534,21 @@ impl Workers {
                 g == worker.generation && view.update.observe_at.is_some_and(|at| at <= now)
             }) {
                 changed |= worker.reduce(registry, id, Input::Observe, now, unix_ms);
+            }
+            if let Some((_, view, _)) = registry.get(id).filter(|(_, _, g)| *g == worker.generation)
+            {
+                let state = queue::Snapshot {
+                    state: view.update.state.clone(),
+                    through: worker.queue_seq,
+                };
+                if worker.queue_state.as_ref() != Some(&state)
+                    && worker
+                        .runtime
+                        .as_ref()
+                        .is_some_and(|runtime| runtime.queue_state(state.clone()))
+                {
+                    worker.queue_state = Some(state);
+                }
             }
             if let Some(report) = worker
                 .report
@@ -520,7 +575,8 @@ impl Workers {
                     continue;
                 }
                 worker.finished = true;
-                worker.runtime = None;
+                // Retain bounded terminal cuts until the consumer drains or relaunches.
+                // Runtime authority is already closed; runtime() refuses finished entries.
                 changed = true;
             }
         }
