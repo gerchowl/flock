@@ -1124,3 +1124,18 @@ with `structured_recovery_required` (retry `after_human`, CLI exit 1).
 Pane-only operations return `runtime_unsupported` (retry `never`, CLI exit 2).
 These contracts do not enable public structured start; that remains gated until
 all #1843 routing and #1734 credential protection land. Mesh VERSION remains 5.
+
+### Queue item lifecycle facts
+
+`queue_item_state` is a durable, local event emitted after an existing queue
+item changes state. It carries `agent`, `item_id`, optional `batch_id`, the typed
+`producer`, `from`, `to`, `stream` (`queue/<agent>`) and `stream_seq`. The last
+field identifies the original committed queue transition; the event log's `seq`
+is a separate cursor and orders facts across agents.
+
+Known states are `queued`, `held`, `stashed`, `delivered`, `done`, `cancelled` and
+`dropped`. A reader skips a fact with an unknown state, just as an older reader
+skips an unknown event kind, while preserving the global cursor high-water.
+Adding, editing, reordering or checkpointing items does not emit lifecycle
+facts. Recovery from `delivered` to `held` does. These facts use the existing
+event-log retention and rotation and are not relayed over the mesh.

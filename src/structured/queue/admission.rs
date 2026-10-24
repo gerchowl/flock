@@ -87,9 +87,18 @@ impl Admission {
         }
         Ok(Self { journal, max_batch })
     }
+    pub(super) fn take_facts(&mut self) -> Vec<crate::api::queue_event::QueueItemState> {
+        self.journal.take_facts()
+    }
     /// Immutable committed state/replay for the worker's serialized publisher.
     pub fn journal(&self) -> &Journal {
         &self.journal
+    }
+    pub(super) fn subscription(&mut self) -> Result<super::Cut, Failure> {
+        Ok(self.journal.subscription()?)
+    }
+    pub(super) fn checkpoint_if_required(&mut self) -> Result<Option<super::Cut>, Failure> {
+        self.journal.checkpoint_if_required().map_err(Into::into)
     }
     /// Append one new item and its gate before acknowledging acceptance. Operator
     /// authority creates human input; other origins cannot impersonate humans or
@@ -187,6 +196,13 @@ impl Admission {
             position: self.journal.items().len(),
         })?;
         Ok(())
+    }
+    /// Settle one retained item without rewriting its body or changing identity.
+    pub(super) fn fail_item(&mut self, item_id: String, reason: ErrorCode) -> Result<(), Failure> {
+        self.commit(Change::Fail {
+            item_id,
+            reason: reason.as_str().into(),
+        })
     }
     fn eligible(&self, item: &Item, now_ms: u64) -> bool {
         !self.journal.opaque.contains(&item.item_id)
@@ -405,6 +421,10 @@ fn nonce(
             return Ok(hex);
         }
     }
+}
+/// Mint a queue lifecycle UUID using the same entropy source as batch identities.
+pub(crate) fn lifecycle_id() -> Result<String, Failure> {
+    batch_uuid(&mut getrandom::fill)
 }
 fn batch_uuid(fill: Entropy<'_>) -> Result<String, Failure> {
     let mut h = nonce("", fill)?.into_bytes();

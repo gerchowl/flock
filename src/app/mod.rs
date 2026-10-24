@@ -48,6 +48,7 @@ pub(crate) mod notifications;
 pub(crate) mod owners;
 mod peer_checkout;
 pub(crate) mod questions;
+pub(crate) mod queue_events;
 mod runtime;
 mod session;
 pub mod state;
@@ -389,6 +390,7 @@ pub struct App {
         HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     pub(crate) input_writes: input_writes::InputWrites,
     pub(crate) structured_workers: crate::structured::workers::Workers,
+    queue_events: queue_events::QueueEvents,
     pub render_notify: Arc<Notify>,
     pub render_dirty: Arc<AtomicBool>,
     pub(crate) full_redraw_pending: bool,
@@ -1145,6 +1147,7 @@ impl App {
             last_terminal_size: terminal::size().ok(),
             input_writes: input_writes::InputWrites::default(),
             structured_workers: crate::structured::workers::Workers::new(render_notify.clone()),
+            queue_events: queue_events::QueueEvents::default(),
             render_notify,
             render_dirty,
             full_redraw_pending: false,
@@ -1935,6 +1938,12 @@ impl App {
 
         if !invalid_section("security") && config.security != self.state.config.security {
             diagnostics.push("security.agent_account changed: restart the server to apply socket account policy; keeping current policy".into());
+        }
+
+        if !invalid_section("sessions")
+            && config.sessions.queue_rewrite_bytes != self.state.config.sessions.queue_rewrite_bytes
+        {
+            diagnostics.push("sessions.queue_rewrite_bytes changed: restart required to apply the worker queue policy; keeping current threshold".into());
         }
 
         // Snapshot fields that need to detect a change relative to the
@@ -3120,6 +3129,31 @@ mod tests {
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         restore_xdg_state_home(original_xdg_state_home);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn queue_threshold_reload_reports_restart_required_and_keeps_worker_policy() {
+        let mut app = test_app();
+        let old = app.state.config.sessions.queue_rewrite_bytes;
+        let mut incoming = app.state.config.clone();
+        incoming.sessions.queue_rewrite_bytes = std::num::NonZeroU64::new(old.get() + 1).unwrap();
+        let report = app.apply_live_config(&incoming, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message
+                .contains("sessions.queue_rewrite_bytes changed: restart required")));
+        assert_eq!(app.state.config.sessions.queue_rewrite_bytes, old);
+        assert_eq!(
+            app.state.config_diagnostic.as_deref(),
+            Some(report.diagnostics[0].as_str())
+        );
+        let same = app.state.config.clone();
+        assert_eq!(
+            app.apply_live_config(&same, &[], &[], false).status,
+            crate::config::ConfigReloadStatus::Applied
+        );
     }
 
     #[test]
