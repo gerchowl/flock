@@ -322,7 +322,7 @@ fn an_unreachable_server_is_a_transport_envelope() {
 #[test]
 fn an_unconfirmed_send_is_the_stdout_document_under_json() {
     fn unconfirmed(_: &Value) -> Value {
-        json!({"result":{"type":"pane_send","outcome":"unconfirmed","reason":"confirm_timeout"}})
+        json!({"result":{"type":"paste","outcome":"unconfirmed","reason":"confirm_timeout","evidence":{}}})
     }
     let (socket, _server) = scripted_server("envelope-effect", unconfirmed);
     let output = flk(
