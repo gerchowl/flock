@@ -317,16 +317,18 @@ fn load_with_overlay(
     // merge.
     let mut env_diagnostics = Vec::new();
     let mut merged = env::env_override_table(&mut env_diagnostics);
+    let mut sources = source_table(&merged, "environment");
 
     if let Some(b) = base {
         let base_table = parse_config_table(b, &config_path())?;
         // ADR-0002 open question 1: base (file) beats env.
+        deep_merge_tables(&mut sources, source_table(&base_table, "base file"));
         deep_merge_tables(&mut merged, base_table);
     }
 
     let Some(overlay) = overlay else {
         // No overlay: env+base or env+defaults. Env diagnostics ride along.
-        let mut loaded = load_live_config_from_table(merged)?;
+        let mut loaded = load_live_config_with_sources(merged, &sources)?;
         loaded.diagnostics.splice(0..0, env_diagnostics);
         return Ok(loaded);
     };
@@ -334,8 +336,9 @@ fn load_with_overlay(
     match parse_config_table(overlay, overlay_path) {
         Ok(overlay_table) => {
             // ADR-0002 open question 1: overlay beats base beats env.
+            deep_merge_tables(&mut sources, source_table(&overlay_table, "overlay file"));
             deep_merge_tables(&mut merged, overlay_table);
-            let mut loaded = load_live_config_from_table(merged)?;
+            let mut loaded = load_live_config_with_sources(merged, &sources)?;
             loaded.diagnostics.splice(0..0, env_diagnostics);
             Ok(loaded)
         }
@@ -347,7 +350,7 @@ fn load_with_overlay(
                 overlay_path.display(),
                 diagnostics.join("; ")
             );
-            let mut loaded = load_live_config_from_table(merged)?;
+            let mut loaded = load_live_config_with_sources(merged, &sources)?;
             loaded.diagnostics.splice(0..0, env_diagnostics);
             loaded.diagnostics.push(overlay_diag);
             Ok(loaded)
@@ -364,13 +367,15 @@ fn load_with_overlay_diagnostic(
     // the overlay content is None; the diagnostic is threaded through.
     let mut env_diagnostics = Vec::new();
     let mut merged = env::env_override_table(&mut env_diagnostics);
+    let mut sources = source_table(&merged, "environment");
 
     if let Some(b) = base {
         let base_table = parse_config_table(b, &config_path())?;
+        deep_merge_tables(&mut sources, source_table(&base_table, "base file"));
         deep_merge_tables(&mut merged, base_table);
     }
 
-    let mut loaded = load_live_config_from_table(merged)?;
+    let mut loaded = load_live_config_with_sources(merged, &sources)?;
     loaded.diagnostics.splice(0..0, env_diagnostics);
     if let Some(diag) = overlay_diagnostic {
         loaded.diagnostics.push(diag);
@@ -427,8 +432,15 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
     load_live_config_from_table(parse_config_table(content, Path::new("config.toml"))?)
 }
 
-fn load_live_config_from_table(
+#[cfg(test)]
+fn load_live_config_from_table(table: toml::Table) -> Result<LoadedConfig, Vec<String>> {
+    let sources = source_table(&table, "base file");
+    load_live_config_with_sources(table, &sources)
+}
+
+fn load_live_config_with_sources(
     mut table: toml::map::Map<String, toml::Value>,
+    sources: &toml::Table,
 ) -> Result<LoadedConfig, Vec<String>> {
     let removed_key = |section: &str, key: &str| KeyDiagnostic {
         kind: KeyDiagnosticKind::Removed,
@@ -475,8 +487,9 @@ fn load_live_config_from_table(
     if let Some(value) = table.get("onboarding") {
         match value.clone().try_into::<Option<bool>>() {
             Ok(onboarding) => config.onboarding = onboarding,
-            Err(err) => diagnostics.push(format!(
-                "invalid onboarding setting: {err}; keeping current onboarding state"
+            Err(_) => diagnostics.push(format!(
+                "invalid onboarding setting: {}; keeping current onboarding state",
+                deserialization_diagnostic::<Option<bool>>("onboarding", None, sources)
             )),
         }
     }
@@ -484,8 +497,9 @@ fn load_live_config_from_table(
     if let Some(value) = table.get("name") {
         match value.clone().try_into::<String>() {
             Ok(name) => config.name = name,
-            Err(err) => diagnostics.push(format!(
-                "invalid name setting: {err}; keeping current node name"
+            Err(_) => diagnostics.push(format!(
+                "invalid name setting: {}; keeping current node name",
+                deserialization_diagnostic::<String>("name", None, sources)
             )),
         }
     }
@@ -498,9 +512,10 @@ fn load_live_config_from_table(
     if let Some(value) = table.get("icon") {
         match value.clone().try_into::<String>() {
             Ok(icon) => config.icon = Some(icon),
-            Err(err) => {
-                diagnostics.push(format!("invalid icon setting: {err}; keeping current icon"))
-            }
+            Err(_) => diagnostics.push(format!(
+                "invalid icon setting: {}; keeping current icon",
+                deserialization_diagnostic::<String>("icon", None, sources)
+            )),
         }
     }
 
@@ -511,8 +526,9 @@ fn load_live_config_from_table(
     if let Some(value) = table.get("thermal_command") {
         match value.clone().try_into::<String>() {
             Ok(command) => config.thermal_command = Some(command),
-            Err(err) => diagnostics.push(format!(
-                "invalid thermal_command setting: {err}; keeping current thermal command"
+            Err(_) => diagnostics.push(format!(
+                "invalid thermal_command setting: {}; keeping current thermal command",
+                deserialization_diagnostic::<String>("thermal_command", None, sources)
             )),
         }
     }
@@ -523,14 +539,15 @@ fn load_live_config_from_table(
     if let Some(value) = table.get("gpu_command") {
         match value.clone().try_into::<String>() {
             Ok(command) => config.gpu_command = Some(command),
-            Err(err) => diagnostics.push(format!(
-                "invalid gpu_command setting: {err}; keeping current gpu command"
+            Err(_) => diagnostics.push(format!(
+                "invalid gpu_command setting: {}; keeping current gpu command",
+                deserialization_diagnostic::<String>("gpu_command", None, sources)
             )),
         }
     }
 
     load_live_section(
-        &table,
+        (&table, sources),
         "security",
         "socket account policy",
         &mut diagnostics,
@@ -538,7 +555,7 @@ fn load_live_config_from_table(
         |section| config.security = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "structured",
         "structured launch config",
         &mut diagnostics,
@@ -546,7 +563,7 @@ fn load_live_config_from_table(
         |section| config.structured = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "theme",
         "theme config",
         &mut diagnostics,
@@ -554,7 +571,7 @@ fn load_live_config_from_table(
         |section| config.theme = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "keys",
         "keybinding config",
         &mut diagnostics,
@@ -562,7 +579,7 @@ fn load_live_config_from_table(
         |section| config.keys = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "terminal",
         "terminal config",
         &mut diagnostics,
@@ -570,7 +587,7 @@ fn load_live_config_from_table(
         |section| config.terminal = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "session",
         "session config",
         &mut diagnostics,
@@ -578,7 +595,7 @@ fn load_live_config_from_table(
         |section| config.session = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "update",
         "update config",
         &mut diagnostics,
@@ -586,7 +603,7 @@ fn load_live_config_from_table(
         |section| config.update = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "ui",
         "ui config",
         &mut diagnostics,
@@ -594,7 +611,7 @@ fn load_live_config_from_table(
         |section| config.ui = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "advanced",
         "advanced config",
         &mut diagnostics,
@@ -602,7 +619,7 @@ fn load_live_config_from_table(
         |section| config.advanced = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "worktrees",
         "worktree config",
         &mut diagnostics,
@@ -610,7 +627,7 @@ fn load_live_config_from_table(
         |section| config.worktrees = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "experimental",
         "experimental config",
         &mut diagnostics,
@@ -618,7 +635,7 @@ fn load_live_config_from_table(
         |section| config.experimental = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "remote",
         "remote config",
         &mut diagnostics,
@@ -626,7 +643,7 @@ fn load_live_config_from_table(
         |section| config.remote = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "peers",
         "peers config",
         &mut diagnostics,
@@ -634,7 +651,7 @@ fn load_live_config_from_table(
         |section| config.peers = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "slots",
         "slots config",
         &mut diagnostics,
@@ -642,7 +659,7 @@ fn load_live_config_from_table(
         |section| config.slots = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "web",
         "web config",
         &mut diagnostics,
@@ -650,7 +667,7 @@ fn load_live_config_from_table(
         |section| config.web = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "client",
         "client config",
         &mut diagnostics,
@@ -658,7 +675,7 @@ fn load_live_config_from_table(
         |section| config.client = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "title",
         "title config",
         &mut diagnostics,
@@ -666,7 +683,7 @@ fn load_live_config_from_table(
         |section| config.title = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "gossip",
         "gossip config",
         &mut diagnostics,
@@ -674,7 +691,7 @@ fn load_live_config_from_table(
         |section| config.gossip = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "systemone",
         "systemone config",
         &mut diagnostics,
@@ -682,7 +699,7 @@ fn load_live_config_from_table(
         |section| config.systemone = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "checks",
         "checks config",
         &mut diagnostics,
@@ -690,7 +707,7 @@ fn load_live_config_from_table(
         |section| config.checks = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "fleet",
         "fleet config",
         &mut diagnostics,
@@ -698,7 +715,7 @@ fn load_live_config_from_table(
         |section| config.fleet = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "spawn",
         "spawn config",
         &mut diagnostics,
@@ -706,7 +723,7 @@ fn load_live_config_from_table(
         |section| config.spawn = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "msg",
         "msg config",
         &mut diagnostics,
@@ -714,7 +731,7 @@ fn load_live_config_from_table(
         |section| config.msg = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "events",
         "events config",
         &mut diagnostics,
@@ -722,7 +739,7 @@ fn load_live_config_from_table(
         |section| config.events = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "questions",
         "questions config",
         &mut diagnostics,
@@ -730,7 +747,7 @@ fn load_live_config_from_table(
         |section| config.questions = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "channels",
         "channels config",
         &mut diagnostics,
@@ -738,7 +755,7 @@ fn load_live_config_from_table(
         |section| config.channels = section,
     );
     load_live_section(
-        &table,
+        (&table, sources),
         "sessions",
         "sessions config",
         &mut diagnostics,
@@ -839,8 +856,87 @@ pub(super) fn unknown_top_level_section_diagnostic(
     }
 }
 
+/// Mirror the value tree with layer labels, merged with exactly the same rules
+/// as config values, including appended array entries. Never retain payloads.
+fn source_table(table: &toml::Table, layer: &str) -> toml::Table {
+    table
+        .iter()
+        .map(|(key, value)| (key.clone(), source_value(value, layer)))
+        .collect()
+}
+
+fn source_value(value: &toml::Value, layer: &str) -> toml::Value {
+    match value {
+        toml::Value::Table(table) => toml::Value::Table(source_table(table, layer)),
+        toml::Value::Array(array) => {
+            toml::Value::Array(array.iter().map(|v| source_value(v, layer)).collect())
+        }
+        _ => toml::Value::String(layer.to_string()),
+    }
+}
+
+/// Only structural map keys and indices are safe to report. Enum segments may
+/// contain the rejected value, and deserializer messages always remain private.
+/// Expected types name the trusted section model, rather than parsing an error
+/// message for a leaf type or variant set. Container errors list all suppliers.
+fn deserialization_diagnostic<T>(
+    section: &str,
+    path: Option<&serde_path_to_error::Path>,
+    sources: &toml::Table,
+) -> String {
+    let mut key = section.to_string();
+    let mut source = sources.get(section);
+    if let Some(path) = path {
+        for segment in path.iter() {
+            match segment {
+                serde_path_to_error::Segment::Map { key: field } => {
+                    key.push('.');
+                    key.push_str(field);
+                    source = source.and_then(|s| s.get(field));
+                }
+                serde_path_to_error::Segment::Seq { index } => {
+                    key.push_str(&format!("[{index}]"));
+                    source = source.and_then(|s| s.get(*index));
+                }
+                _ => break,
+            }
+        }
+    }
+    fn layers(value: &toml::Value, names: &mut std::collections::BTreeSet<String>) {
+        match value {
+            toml::Value::String(layer) => {
+                names.insert(layer.clone());
+            }
+            toml::Value::Table(table) => {
+                for value in table.values() {
+                    layers(value, names);
+                }
+            }
+            toml::Value::Array(array) => {
+                for value in array {
+                    layers(value, names);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut names = std::collections::BTreeSet::new();
+    if let Some(source) = source {
+        layers(source, &mut names);
+    }
+    let layer = if names.is_empty() {
+        "unavailable".to_string()
+    } else {
+        names.into_iter().collect::<Vec<_>>().join(", ")
+    };
+    format!(
+        "invalid_config_type; key={key}; expected {}; supplying layer={layer}",
+        std::any::type_name::<T>()
+    )
+}
+
 fn load_live_section<T>(
-    table: &toml::map::Map<String, toml::Value>,
+    (table, sources): (&toml::Table, &toml::Table),
     section: &'static str,
     label: &str,
     diagnostics: &mut Vec<String>,
@@ -853,11 +949,12 @@ fn load_live_section<T>(
         return;
     };
 
-    match value.clone().try_into::<T>() {
+    match serde_path_to_error::deserialize::<_, T>(value.clone()) {
         Ok(section_config) => apply(section_config),
         Err(err) => {
             diagnostics.push(format!(
-                "invalid {label}: {err}; keeping current {section} settings"
+                "invalid {label}: {}; keeping current {section} settings",
+                deserialization_diagnostic::<T>(section, Some(err.path()), sources)
             ));
             invalid_sections.push(section.to_string());
         }
@@ -1047,6 +1144,67 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security2384_deserializer_diagnostics_attribute_the_winning_layer() {
+        let _guard = crate::config::test_config_env_guard();
+        let probe = "CONFIG2384_PRIVATE_ENUM_46b2";
+        std::env::set_var("FLOCK_UI_TAB_MODE", probe);
+        let bad = format!("[ui]\ntab_mode = '{probe}'\n");
+        for (base, overlay, layer) in [
+            (None, None, "environment"),
+            (Some(bad.as_str()), None, "base file"),
+            (
+                Some("[ui]\ntab_mode = 'tabs'"),
+                Some(bad.as_str()),
+                "overlay file",
+            ),
+        ] {
+            let loaded = load_with_overlay(base, overlay, Path::new("config.local.toml")).unwrap();
+            let text = loaded.diagnostics.join(" ");
+            assert!(!text.contains(probe));
+            assert!(text.contains("key=ui.tab_mode"), "{text}");
+            assert!(text.contains(&format!("supplying layer={layer}")), "{text}");
+            assert!(text.contains("expected") && text.contains("UiConfig"));
+            assert_eq!(loaded.invalid_sections, ["ui"]);
+        }
+        let valid = load_with_overlay(
+            Some("[ui]\ntab_mode = 'workspace'"),
+            None,
+            Path::new("config.local.toml"),
+        )
+        .unwrap();
+        assert!(valid.diagnostics.is_empty(), "{:?}", valid.diagnostics);
+    }
+
+    #[test]
+    fn security2384_layer_tree_follows_appended_arrays_and_container_errors() {
+        let mut values: toml::Table = toml::from_str("[[peers]]\nname='node-a.example'\n").unwrap();
+        let overlay = toml::from_str::<toml::Table>("[[peers]]\nname='node-b.example'\n").unwrap();
+        let mut sources = source_table(&values, "base file");
+        deep_merge_tables(&mut sources, source_table(&overlay, "overlay file"));
+        deep_merge_tables(&mut values, overlay);
+        assert_eq!(sources["peers"][0]["name"].as_str(), Some("base file"));
+        assert_eq!(sources["peers"][1]["name"].as_str(), Some("overlay file"));
+        let diagnostic = deserialization_diagnostic::<Vec<String>>("peers", None, &sources);
+        assert!(diagnostic.contains("supplying layer=base file, overlay file"));
+        for key in [
+            "onboarding",
+            "name",
+            "icon",
+            "thermal_command",
+            "gpu_command",
+        ] {
+            let loaded = load_live_config_from_str(&format!("{key} = ['PRIVATE_2384']")).unwrap();
+            assert!(!loaded.diagnostics.join(" ").contains("PRIVATE_2384"));
+            assert!(loaded
+                .diagnostics
+                .iter()
+                .any(|d| d.contains(&format!("key={key}"))
+                    && d.contains("expected")
+                    && d.contains("base file")));
+        }
+    }
 
     #[test]
     fn security2384_toml_diagnostics_do_not_echo_source() {

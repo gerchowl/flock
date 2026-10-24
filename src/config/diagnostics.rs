@@ -7,24 +7,32 @@ use super::{config_overlay_path, config_path, Config};
 /// Describe invalid TOML without displaying parser messages or source excerpts.
 ///
 /// Syntax errors identify the document root, not an unverified key. Positions
-/// are one-based byte line/columns from the parser span; a missing span is
+/// are one-based byte line/columns from the parser span; a missing or out-of-range span is
 /// reported explicitly rather than guessed. Paths identify the source file.
 pub(super) fn toml_syntax_error(error: &toml::de::Error, source: &str, path: &Path) -> String {
-    let position = match error.span() {
-        Some(span) => {
-            let prefix = &source.as_bytes()[..span.start.min(source.len())];
-            let line = prefix.iter().filter(|&&b| b == b'\n').count() + 1;
-            let column = prefix.len()
-                - prefix
-                    .iter()
-                    .rposition(|&b| b == b'\n')
-                    .map_or(0, |i| i + 1)
-                + 1;
+    let position = match syntax_position(source, error.span()) {
+        Some((line, column)) => {
             format!("{}:{line}:{column}", path.display())
         }
         None => format!("{} (location unavailable)", path.display()),
     };
     format!("config parse error: invalid_toml at {position}; key=document root; expected TOML document; keeping current config")
+}
+
+fn syntax_position(source: &str, span: Option<std::ops::Range<usize>>) -> Option<(usize, usize)> {
+    let span = span?;
+    if span.start > span.end || span.end > source.len() {
+        return None;
+    }
+    let prefix = &source.as_bytes()[..span.start];
+    let line = prefix.iter().filter(|&&b| b == b'\n').count() + 1;
+    let column = prefix.len()
+        - prefix
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1)
+        + 1;
+    Some((line, column))
 }
 
 /// Source warnings are independent of merging: even a shadowed obsolete key
@@ -203,6 +211,14 @@ mod tests {
             .into_iter()
             .map(|diagnostic| diagnostic.message)
             .collect()
+    }
+
+    #[test]
+    fn security2384_invalid_syntax_spans_are_unavailable() {
+        for span in [0..5, 5..5, std::ops::Range { start: 3, end: 1 }] {
+            assert_eq!(super::syntax_position("text", Some(span)), None);
+        }
+        assert_eq!(super::syntax_position("text", Some(4..4)), Some((1, 5)));
     }
 
     #[test]

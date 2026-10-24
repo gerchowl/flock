@@ -2400,6 +2400,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn security2384_enum_env_reload_diagnostics_do_not_echo_values() {
+        let _guard = config_env_guard();
+        struct RestorePath(Option<std::ffi::OsString>);
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+                    None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+                }
+            }
+        }
+        let _restore = RestorePath(std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR));
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        let mut app = test_app();
+        let original_ui = app.state.config.ui.tab_mode;
+        let probe = "CONFIG2384_ENUM_PRIVATE_7c39_never_echo_this_value";
+        std::env::set_var("FLOCK_UI_TAB_MODE", probe);
+        let mut returned = Vec::new();
+        let logs = crate::logging::capture_logs(|| {
+            let loaded = crate::config::load_live_config().unwrap();
+            returned.extend(loaded.diagnostics.clone());
+            let report = app.apply_config_from_disk(false);
+            assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+            returned.extend(report.diagnostics);
+        });
+        assert_eq!(app.state.config.ui.tab_mode, original_ui);
+        assert!(returned.iter().any(|d| d.contains("ui.tab_mode")
+            && d.contains("environment")
+            && d.contains("expected")));
+        assert!(!returned.is_empty());
+        assert!(
+            !returned.join(" ").contains(probe),
+            "returned diagnostics leaked enum value"
+        );
+        assert!(!logs.contains(probe), "logs leaked enum value");
+        assert!(!app
+            .state
+            .config_diagnostic
+            .as_deref()
+            .unwrap_or_default()
+            .contains(probe));
+    }
+
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(

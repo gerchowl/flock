@@ -66,6 +66,8 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 # Detect unknown config fields using the deserializer, including aliases and dynamic maps.
 serde_ignored = "0.1"
+# Report structural config error paths without value-bearing deserializer messages.
+serde_path_to_error = "0.1"
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.11"
 ts-rs = { version = "=12.0.1", optional = true, features = ["serde-json-impl"] }
