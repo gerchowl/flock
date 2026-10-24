@@ -208,7 +208,10 @@ fn agent_gap_and_persisted_unknown_provenance_blobs_and_permission_audits() {
         .await;
         let store = crate::structured::blobs::BlobStore::open(case.server._root.path()).unwrap();
         assert_eq!(store.put(payload.as_bytes(), 8192).unwrap(), reference);
-        assert_eq!(store.get(&reference.blob).unwrap(), payload.as_bytes());
+        assert_eq!(
+            store.get(&reference.blob, reference.size).unwrap(),
+            payload.as_bytes()
+        );
         let mut socket = case.open().await;
         case.sub(&mut socket, "s1", Some(2)).await;
         assert_eq!(
