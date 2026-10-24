@@ -257,7 +257,10 @@ fn automatic_reservations_hold_input_without_requesting_human_attention() {
         b.blocked(),
         "grant reservation must still hold user input until delivery"
     );
-    assert_eq!(answer.audit["grant_request_id"], "request-example");
+    assert_eq!(
+        serde_json::to_value(&answer.audit).unwrap()["grant_request_id"],
+        "request-example"
+    );
     b.aborted("automatic-request", sequence(&b, "automatic-request"));
     assert_eq!(
         b.waiting(),
@@ -385,7 +388,10 @@ fn session_grant_survives_eviction_of_its_originating_request_id() {
     );
     b.observe("exact-followup", request()).unwrap();
     let automatic = b.automatic("exact-followup").unwrap().unwrap();
-    assert_eq!(automatic.audit["grant_request_id"], "grant-origin");
+    assert_eq!(
+        serde_json::to_value(&automatic.audit).unwrap()["grant_request_id"],
+        "grant-origin"
+    );
     assert_eq!(
         automatic.response["response"]["response"]["behavior"],
         "allow"
@@ -462,10 +468,7 @@ fn decision_handles_are_required_and_closed_classification_matches_both_fields()
 fn request_sequence_exhaustion_never_wraps_or_reopens_a_handle() {
     let mut b = Book::new("fixture-agent".into());
     b.resume_after(u64::MAX - 1);
-    assert_eq!(
-        b.observe("last", request()).unwrap()["request_seq"],
-        u64::MAX
-    );
+    assert_eq!(b.observe("last", request()).unwrap().request_seq, u64::MAX);
     b.closed("last", u64::MAX);
     assert_eq!(
         b.observe("overflow", request()).err(),
@@ -507,4 +510,71 @@ fn queued_answer_for_an_evicted_handle_cannot_mutate_its_replacement() {
     b.written(current);
     assert!(b.grants.is_empty());
     assert!(!b.blocked());
+}
+
+#[test]
+fn typed_audits_preserve_existing_json_and_closed_without_open() {
+    use crate::structured::claude::{KnownSessionEvent, SessionEvent};
+    use crate::structured_wire::PermissionRecord;
+    fn check(record: &PermissionRecord, expected: Value) {
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value, expected);
+        let raw = value.to_string();
+        assert!(!matches!(
+            SessionEvent::parse(&raw, "fixture"),
+            SessionEvent::Unknown { .. }
+        ));
+        let known: KnownSessionEvent = serde_json::from_str(&raw).unwrap();
+        assert_eq!(serde_json::to_value(known).unwrap(), expected);
+    }
+    let mut b = Book::new("fixture-agent".into());
+    check(
+        &b.observe("p1", request()).unwrap(),
+        json!({"type":"flk_permission_request","state":"open","request_id":"p1","request_seq":1,"request":request()}),
+    );
+    let answer = b
+        .answer("p1", 1, Decision::Deny, None, "fixture-client", "token")
+        .unwrap();
+    check(
+        &answer.audit,
+        json!({"type":"flk_permission_request","state":"closed","request_id":"p1","request_seq":1,"decision":"deny","message":null,"principal":"fixture-client","source":"token"}),
+    );
+    for (reason, wire) in [
+        (CloseReason::Ended, "ended"),
+        (CloseReason::Cancelled, "cancelled"),
+        (CloseReason::Result, "result"),
+        (CloseReason::Interrupted, "interrupted"),
+        (CloseReason::SessionEnded, "session_ended"),
+    ] {
+        let mut b = book();
+        let closes = b.close(None, reason).unwrap();
+        check(
+            &closes[0].audit,
+            json!({"type":"flk_permission_request","state":"closed","request_id":"request-example","request_seq":1,"reason":wire}),
+        );
+    }
+    let mut b = Book::new("fixture-agent".into());
+    check(
+        &b.capacity_refusal("excess").unwrap().audit,
+        json!({"type":"flk_permission_request","state":"closed","request_id":"excess","request_seq":1,"decision":"deny","message":"permission_request_limit","principal":"flk","source":"limit","reason":"permission_request_limit","error_code":"permission_request_limit"}),
+    );
+}
+
+#[test]
+fn future_permission_shapes_remain_lossless_unknown_events() {
+    use crate::structured::claude::SessionEvent;
+    let base = serde_json::to_value(open_record("p1", 1, &request())).unwrap();
+    for (key, value) in [("future", json!(true)), ("state", json!("decided"))] {
+        let mut raw = base.clone();
+        raw[key] = value;
+        let text = raw.to_string();
+        let event = SessionEvent::parse(&text, "fixture");
+        assert!(matches!(event, SessionEvent::Unknown { .. }));
+        assert_eq!(serde_json::to_string(&event).unwrap(), text);
+    }
+    let raw = r#"{"type":"flk_permission_request","state":"closed","request_id":"p1","request_seq":1,"reason":"future"}"#;
+    assert!(matches!(
+        SessionEvent::parse(raw, "fixture"),
+        SessionEvent::Unknown { .. }
+    ));
 }

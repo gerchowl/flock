@@ -13,6 +13,7 @@ pub mod schema;
 pub(crate) mod scoped;
 pub(crate) mod server;
 mod status;
+pub mod structured_agent;
 mod subscriptions;
 mod wait;
 pub mod wait_predicate;

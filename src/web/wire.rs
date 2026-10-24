@@ -1,5 +1,6 @@
 //! Server-owned, opt-in structured transport; no PTY or model dispatch.
 mod commands;
+mod fleet;
 mod output;
 mod subscriptions;
 pub(crate) mod timing;
@@ -60,6 +61,7 @@ struct Client {
     revoke: watch::Sender<bool>,
 }
 struct Shared {
+    fleet: fleet::Client,
     histories: crate::structured::history::owner::Client,
     commands: commands::Client,
     store: Arc<TokenStore>,
@@ -124,6 +126,7 @@ impl Core {
     ) -> io::Result<Self> {
         let epoch = store.random::<16>().map_err(io::Error::other)?;
         let (stop, _) = watch::channel(false);
+        let fleet = fleet::Client::new(wake.clone(), stop.subscribe());
         let (commands, command_owner) = commands::channel(wake.clone());
         let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
@@ -132,6 +135,7 @@ impl Core {
             shared: Arc::new(Shared {
                 histories,
                 commands,
+                fleet,
                 store: Arc::new(store),
                 epoch,
                 clock,
@@ -151,6 +155,7 @@ impl Core {
         root: &std::path::Path,
     ) {
         self.owner.service(registry, workers, root);
+        self.shared.fleet.observe(registry, workers, root);
     }
     /// Mount only behind S2b-mount's loopback, Host/Origin and funnel guards.
     pub(crate) fn router(&self) -> Router {
@@ -160,13 +165,24 @@ impl Core {
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
         self.command_owner.service(app);
     }
+    /// Explicit principal revocation fan-out, also used by command admission.
+    // Commands use Shared directly; retain the existing owner-facing entry point.
+    #[allow(dead_code)]
+    pub(crate) fn revoke(&self, session: &Session) {
+        self.shared.revoke(session);
+    }
     /// Cancel transport work and wait for every connection lease, including hello.
     pub(crate) async fn shutdown(&self) -> Result<(), tokio::time::error::Elapsed> {
         self.shared.stop.send_replace(true);
-        tokio::time::timeout(
-            SHUTDOWN_WAIT,
-            self.shared.slots.clone().acquire_many_owned(CONNECTIONS),
-        )
+        tokio::time::timeout(SHUTDOWN_WAIT, async {
+            let _ = self
+                .shared
+                .slots
+                .clone()
+                .acquire_many_owned(CONNECTIONS)
+                .await;
+            self.shared.fleet.closed().await;
+        })
         .await
         .map(|_| ())
     }

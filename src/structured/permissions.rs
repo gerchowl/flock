@@ -32,7 +32,14 @@ pub(super) const MAX_GRANTS: usize = 16;
 
 use super::claude::ToolRequest;
 use crate::api::error_code::ErrorCode;
-use serde::{Deserialize, Serialize};
+use crate::structured_wire::{
+    IgnoredPermissionReason, IgnoredPermissionSuggestions, PermissionAnswer, PermissionClose,
+    PermissionRecord, PermissionState,
+};
+pub use crate::structured_wire::{
+    PermissionCloseReason as CloseReason, PermissionDecision as Decision,
+};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -58,18 +65,6 @@ impl Principal<'_> {
     }
 }
 
-/// The operator's decision, independent of a harness-specific response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Decision {
-    /// Approve only this control request.
-    AllowOnce,
-    /// Approve for this live runtime only (never persistent policy).
-    AllowAlways,
-    /// Reject through the measured stdio deny carrier (A.12).
-    Deny,
-}
-
 /// Server arguments for agent.decide; identity is never an argument.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,19 +85,6 @@ pub struct AgentDecide {
     pub message: Option<String>,
 }
 
-/// Why a host fact closes a request without an operator decision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CloseReason {
-    /// The live runtime ended, including cancellation and process exit.
-    Ended,
-    /// The harness cancelled this particular request.
-    Cancelled,
-    /// A top-level result retired the turn's requests, as in S4.
-    Result,
-    /// The host interrupted the turn.
-    Interrupted,
-}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
     Open,
@@ -128,13 +110,13 @@ pub(super) struct Answer {
     pub id: String,
     pub request_seq: u64,
     pub response: Value,
-    pub audit: Value,
+    pub audit: Box<PermissionRecord>,
     grant: Option<(String, Grant)>,
 }
 pub(super) struct Closing {
     pub id: String,
     pub request_seq: u64,
-    pub audit: Value,
+    pub audit: PermissionRecord,
     prior: Stage,
 }
 pub(super) struct Book {
@@ -146,8 +128,14 @@ pub(super) struct Book {
     last_request_seq: u64,
     grants: BTreeMap<String, Grant>,
 }
-pub(super) fn open_record(id: &str, request_seq: u64, request: &ToolRequest) -> Value {
-    json!({"type":"flk_permission_request","state":"open","request_id":id,"request_seq":request_seq,"request":request})
+pub(super) fn open_record(id: &str, request_seq: u64, request: &ToolRequest) -> PermissionRecord {
+    PermissionRecord::new(
+        id,
+        request_seq,
+        PermissionState::Open {
+            request: request.clone(),
+        },
+    )
 }
 
 impl Book {
@@ -199,7 +187,11 @@ impl Book {
         self.open.clear();
         self.grants.clear();
     }
-    pub fn observe(&mut self, id: &str, request: ToolRequest) -> Result<Value, ErrorCode> {
+    pub fn observe(
+        &mut self,
+        id: &str,
+        request: ToolRequest,
+    ) -> Result<PermissionRecord, ErrorCode> {
         if !self.active
             || id.is_empty()
             || id.len() > 256
@@ -247,8 +239,10 @@ impl Book {
                 if let Some(open) = self.open.get_mut(id) {
                     open.automatic = true;
                 }
-                answer.audit["grant_request_id"] = json!(grant.request_id);
-                answer.audit["grant_request_seq"] = json!(grant.request_seq);
+                if let Some(audit) = answer.audit.answer_mut() {
+                    audit.grant_request_id = Some(grant.request_id);
+                    audit.grant_request_seq = Some(grant.request_seq);
+                }
                 Ok(answer)
             })
             .transpose()
@@ -318,7 +312,10 @@ impl Book {
                 {
                     // The durable open record contains the complete bundle.
                     // Never interpret the harness rule grammar or forward rules.
-                    ignored_suggestions = Some(json!({"request_id":id,"reason":"not_forwarded"}));
+                    ignored_suggestions = Some(IgnoredPermissionSuggestions {
+                        request_id: id.into(),
+                        reason: IgnoredPermissionReason::NotForwarded,
+                    });
                 }
                 let k = key(&open.request);
                 let reserved: BTreeSet<_> = self
@@ -347,15 +344,25 @@ impl Book {
         let open = self.open.get_mut(id).ok_or(missing)?;
         open.grant = grant.as_ref().map(|(key, _)| key.clone());
         open.stage = Stage::Reserved;
-        let mut audit = json!({"type":"flk_permission_request","state":"closed","request_id":id,"request_seq":request_seq,"decision":decision,"message":message,"principal":subject,"source":source});
-        if let Some(ignored) = ignored_suggestions {
-            audit["ignored_suggestions"] = ignored;
-        }
+        let mut fields = PermissionAnswer::new(
+            decision,
+            message.map(str::to_owned),
+            subject.into(),
+            source.into(),
+        );
+        fields.ignored_suggestions = ignored_suggestions;
+        let audit = PermissionRecord::new(
+            id,
+            request_seq,
+            PermissionState::Closed {
+                outcome: PermissionClose::Answer(fields),
+            },
+        );
         Ok(Answer {
             id: id.into(),
             request_seq,
             response: json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":response}}),
-            audit,
+            audit: Box::new(audit),
             grant,
         })
     }
@@ -363,7 +370,7 @@ impl Book {
         &mut self,
         id: &str,
         request: ToolRequest,
-    ) -> Result<(Value, Answer), ErrorCode> {
+    ) -> Result<(PermissionRecord, Answer), ErrorCode> {
         let open = self.observe(id, request)?;
         let code = ErrorCode::PermissionRequestTooLarge.as_str();
         let request_seq = self
@@ -373,8 +380,10 @@ impl Book {
             .request_seq;
         let mut answer =
             self.answer(id, request_seq, Decision::Deny, Some(code), "flk", "limit")?;
-        answer.audit["reason"] = json!(code);
-        answer.audit["error_code"] = json!(code);
+        if let Some(audit) = answer.audit.answer_mut() {
+            audit.reason = Some(CloseReason::PermissionRequestTooLarge);
+            audit.error_code = audit.reason;
+        }
         Ok((open, answer))
     }
     pub fn aborted(&mut self, id: &str, request_seq: u64) {
@@ -451,12 +460,30 @@ impl Book {
         self.closing(None, CloseReason::Ended, true)
     }
     fn closing(&mut self, id: Option<&str>, reason: CloseReason, terminal: bool) -> Vec<Closing> {
-        self.open.iter_mut().filter(|(key,r)| id.is_none_or(|id|id==key.as_str()) && r.stage!=Stage::Closed
-            && (terminal || matches!(r.stage,Stage::Open|Stage::Reserved)))
-            .map(|(id,r)| {
-                let prior=r.stage;r.stage=Stage::Closing;
-                Closing {id:id.clone(),request_seq:r.request_seq,prior,audit:json!({"type":"flk_permission_request","state":"closed","request_id":id,"request_seq":r.request_seq,"reason":reason})}
-            }).collect()
+        self.open
+            .iter_mut()
+            .filter(|(key, r)| {
+                id.is_none_or(|id| id == key.as_str())
+                    && r.stage != Stage::Closed
+                    && (terminal || matches!(r.stage, Stage::Open | Stage::Reserved))
+            })
+            .map(|(id, r)| {
+                let prior = r.stage;
+                r.stage = Stage::Closing;
+                Closing {
+                    id: id.clone(),
+                    request_seq: r.request_seq,
+                    prior,
+                    audit: PermissionRecord::new(
+                        id,
+                        r.request_seq,
+                        PermissionState::Closed {
+                            outcome: PermissionClose::Reason { reason },
+                        },
+                    ),
+                }
+            })
+            .collect()
     }
     pub fn close_aborted(&mut self, closings: &[Closing]) {
         for close in closings {
@@ -495,12 +522,117 @@ impl Book {
         let request_seq = self.next_request_seq()?;
         let code = ErrorCode::PermissionRequestLimit.as_str();
         crate::logging::structured_permission_request_refused(&self.agent, id, request_seq, code);
+        let mut fields = PermissionAnswer::new(
+            Decision::Deny,
+            Some(code.into()),
+            "flk".into(),
+            "limit".into(),
+        );
+        fields.reason = Some(CloseReason::PermissionRequestLimit);
+        fields.error_code = fields.reason;
         Ok(Answer {
             id: id.into(),
             request_seq,
             response: json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":{"behavior":"deny","message":code}}}),
-            audit: json!({"type":"flk_permission_request","state":"closed","request_id":id,"request_seq":request_seq,"decision":"deny","message":code,"principal":"flk","source":"limit","reason":code,"error_code":code}),
+            audit: Box::new(PermissionRecord::new(
+                id,
+                request_seq,
+                PermissionState::Closed {
+                    outcome: PermissionClose::Answer(fields),
+                },
+            )),
             grant: None,
+        })
+    }
+}
+
+/// Minimal, forward-compatible recovery projection of host-owned permission audits.
+/// Keep only handles, not tool inputs. Legacy opens use their durable position
+/// as the handle; an unsequenced legacy close retires that request ID.
+#[derive(Default)]
+pub(super) struct Orphaned {
+    open: BTreeMap<String, BTreeSet<u64>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AuditState {
+    Open,
+    Closed,
+}
+
+#[derive(Deserialize)]
+struct AuditHeader {
+    request_id: String,
+    #[serde(default)]
+    request_seq: Option<u64>,
+    state: AuditState,
+}
+
+impl Orphaned {
+    /// Project stable lifecycle fields without interpreting newer close metadata.
+    /// Unknown kinds/states and invalid headers never fail the whole stream load.
+    pub fn observe(&mut self, record: &super::transport::StreamRecord) {
+        if record.origin != super::transport::RecordOrigin::Flk {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&record.raw) else {
+            return;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("flk_permission_request") {
+            return;
+        }
+        let has_sequence = value.get("request_seq").is_some();
+        let header = serde_json::from_value::<AuditHeader>(value);
+        let Ok(header) = header else {
+            crate::logging::structured_permission_recovery_skipped(record.seq);
+            return;
+        };
+        let handle = header.request_seq.unwrap_or(record.seq);
+        if header.request_id.is_empty()
+            || header.request_id.len() > 256
+            || (has_sequence && header.request_seq.is_none())
+            || handle == 0
+            || handle > record.seq
+        {
+            crate::logging::structured_permission_recovery_skipped(record.seq);
+            return;
+        }
+        match header.state {
+            AuditState::Open => {
+                self.open
+                    .entry(header.request_id)
+                    .or_default()
+                    .insert(handle);
+            }
+            AuditState::Closed => {
+                if let Some(seq) = header.request_seq {
+                    if let Some(handles) = self.open.get_mut(&header.request_id) {
+                        handles.remove(&seq);
+                        if handles.is_empty() {
+                            self.open.remove(&header.request_id);
+                        }
+                    }
+                } else {
+                    self.open.remove(&header.request_id);
+                }
+            }
+        }
+    }
+    /// Close unmatched handles without resurrecting old slots or session grants.
+    pub fn into_closes(self) -> impl Iterator<Item = PermissionRecord> {
+        self.open.into_iter().flat_map(|(id, handles)| {
+            handles.into_iter().map(move |seq| {
+                PermissionRecord::new(
+                    &id,
+                    seq,
+                    PermissionState::Closed {
+                        outcome: PermissionClose::Reason {
+                            reason: CloseReason::SessionEnded,
+                        },
+                    },
+                )
+            })
         })
     }
 }

@@ -98,8 +98,8 @@ impl Fixture {
                     &active,
                     None,
                     &Default::default(),
-                    &policy,
                     &crate::api::client_listener::Health::default(),
+                    &policy,
                 )
                 .unwrap();
             }
@@ -372,8 +372,8 @@ async fn attached_scoped_feed_closes_on_revocation() {
             &Arc::new(AtomicBool::new(true)),
             None,
             &Default::default(),
-            &policy,
             &crate::api::client_listener::Health::default(),
+            &policy,
         )
         .unwrap();
     });

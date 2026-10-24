@@ -5,8 +5,8 @@
  * - **fixture** replays the recorded session as the `fixture` agent, with
  *   sample rows and inbox cards, under the replay badge (the owner preview);
  * - **wire** connects to the configured server (G3a, #1747). Its agent list
- *   is fleet-lite (#1746); the inbox stays empty until G5 (#1597). Its
- *   token is, in order: one exchanged for the fragment's one-time code, the
+ *   is fleet-lite (#1746); its inbox lists the open permission prompts (#1749).
+ *   Its token is, in order: one exchanged for the fragment's one-time code, the
  *   one this tab already holds in `sessionStorage`, or the shell's (Tauri).
  *   With none it waits in NeedsToken (ADR-0038 §3, `src/wire/token.ts`).
  *
@@ -31,7 +31,7 @@ import { captureCode, type CodePage } from "./capture-code";
 import { EXCHANGE_FAILED, RUN_CLIENT_OPEN, createTokenStore, exchangeCode, type ExchangeRequest, type SessionLike } from "./wire/token";
 import { createWireTransport } from "./wire/transport";
 import { ConnectionBar } from "./workbench/ConnectionBar";
-import type { Sender } from "./workbench/Composer";
+import { createWireSender } from "./workbench/sender";
 import { SAMPLE_INBOX } from "./workbench/inbox";
 import { SAMPLE_AGENTS } from "./workbench/samples";
 import { Workbench } from "./workbench/Workbench";
@@ -108,12 +108,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   onCleanup(connection.onChange(refresh));
   const [revision, setRevision] = createSignal(0);
   onCleanup(connection.onChange(() => setRevision(revision() + 1)));
-  const sender: Sender = {
-    commands: () => (revision(), connection.commands()),
-    // `submit` sends the message, not only types it (`AgentSendParams`; S7a's agent-send script).
-    send: (agent, text) => connection.command("agent.send", { target: agent, text, submit: true }),
-    blocked: () => (revision(), connection.principal === null ? "Sending opens once the server has welcomed this client." : null),
-  };
+  const sender = createWireSender(connection, revision);
   onCleanup(connection.onTransition((state) => state === "NeedsToken" && tokens.clear()));
   let disposed = false;
   onCleanup(() => {

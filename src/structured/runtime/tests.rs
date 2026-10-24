@@ -151,8 +151,8 @@ impl Fixture {
         let persistent = profile.config_dir().to_owned();
         let state = self.root.path().to_owned();
         let location = StreamLocation {
-            storage: Default::default(),
             data_dir: state.clone(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: session.into(),
         };
@@ -575,8 +575,8 @@ fn failed_model_spawn_removes_armed_files_and_preserves_profile() {
             .reserve("fixture-agent", SESSION, None)
             .expect("lease"),
         StreamLocation {
-            storage: Default::default(),
             data_dir: fixture.root.path().to_owned(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
@@ -836,8 +836,8 @@ fn publication_panic_shuts_down_owned_process_and_retains_uncertain_files() {
             .reserve("fixture-agent", SESSION, None)
             .expect("lease"),
         StreamLocation {
-            storage: Default::default(),
             data_dir: fixture.root.path().to_owned(),
+            storage: Default::default(),
             agent: "fixture-agent".into(),
             session: SESSION.into(),
         },
@@ -1078,7 +1078,6 @@ fn scripted_stream_drives_session_state_through_the_keyed_sink() {
 }
 
 mod queue;
-
 #[test]
 fn accepted_stdin_then_silent_harness_reports_stall_without_started() {
     use crate::structured::claude::SessionEvent;
@@ -1264,6 +1263,55 @@ fn launch_metadata_refuses_invalid_cwd_or_empty_model() {
     }
 }
 
+#[tokio::test]
+async fn queue_stdin_failure_requests_stop_even_without_io_cancellation() {
+    use crate::structured::{
+        registry::Registry,
+        workers::{
+            tests::{wait, Case},
+            Workers,
+        },
+    };
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut registry = Registry::default();
+    let mut workers = Workers::new(notify.clone());
+    let case = Case::start(&mut registry, &mut workers, 245, "no-read", vec![]);
+    case.ready(&mut registry, &mut workers, &notify, Instant::now())
+        .await;
+    let runtime = workers.runtime(&case.id, case.generation).unwrap();
+    runtime.control.close_stdin();
+    assert!(
+        !runtime.control.cancelled(),
+        "the transport is closed, not cancelled"
+    );
+    case.submit(&workers);
+    let mut refused = false;
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        while let Some(update) = workers.queue_update(&registry, &case.id, case.generation) {
+            refused |= update
+                .offer
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.code == crate::api::error_code::ErrorCode::InputWriteFailed);
+        }
+        workers.report(&case.id, case.generation).is_some()
+    })
+    .await;
+    assert!(refused);
+    assert_eq!(
+        workers
+            .report(&case.id, case.generation)
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()
+            .outcome,
+        Outcome::Stopped
+    );
+    workers.shutdown(&mut registry).unwrap();
+}
+
 #[test]
 fn queue_cancelled_input_requests_stop_through_the_real_event_pump() {
     use crate::structured::{
@@ -1278,8 +1326,8 @@ fn queue_cancelled_input_requests_stop_through_the_real_event_pump() {
         File::from(OwnedFd::from(stdout)),
         File::from(OwnedFd::from(stdin)),
         StreamLocation {
-            storage: Default::default(),
             data_dir: root.path().into(),
+            storage: Default::default(),
             agent: "queue-cancel-fixture".into(),
             session: "fixture-session".into(),
         },
@@ -1347,8 +1395,8 @@ async fn queue_subscriptions_are_serviced_when_completion_channel_is_full() {
         File::from(OwnedFd::from(stdout)),
         File::from(OwnedFd::from(stdin)),
         StreamLocation {
-            storage: Default::default(),
             data_dir: root.path().into(),
+            storage: Default::default(),
             agent: "saturated-fixture".into(),
             session: "fixture-session".into(),
         },

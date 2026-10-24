@@ -238,8 +238,8 @@ async fn send_admission_cli_uses_actual_socket_dispatch_and_prints_lifecycle_id(
                 &Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 None,
                 &std::sync::Mutex::default(),
-                &policy,
                 &crate::api::client_listener::Health::default(),
+                &policy,
             )
             .unwrap();
         }

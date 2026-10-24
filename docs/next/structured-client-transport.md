@@ -11,23 +11,25 @@ bridge.
 The first data message is a generated `hello` frame containing a client token.
 The core opens the store once off the async executor, then verifies current
 private token storage using S2a's bounded blocking-I/O budget. Unproven hellos
-never take the exclusive management/cleanup lock. An absolute five-second deadline covers receipt, verification and the
-successful `welcome` write. Missing, malformed, removed or incorrect
-credentials and explicit authentication-scope refusals fail closed with 4401.
-If the first `hello` never arrives before the five-second deadline, the server
-closes 1001 and the client retains its token for reconnect. Initial hello
-verification also closes with 1001
-for a missing store worker, a deadline miss, store I/O failure or unsafe storage.
-The client retains its token and reconnects, without gaining admission.
-Close delivery is best effort within the failure ceiling; an unusable transport can end without a delivered close frame.
+never take the exclusive management/cleanup lock. An absolute five-second
+deadline covers receipt, verification and the successful `welcome` write.
+Missing, malformed, removed or incorrect credentials and explicit
+authentication-scope refusals fail closed with 4401. If the first `hello` never
+arrives before the five-second deadline, the server closes 1001 and the client
+retains its token for reconnect. Initial hello verification also closes with
+1001 for a missing store worker, a deadline miss, store I/O failure or unsafe
+storage. The client retains its token and reconnects, without gaining admission.
+Close delivery is best effort within the failure ceiling; an unusable transport
+can end without a delivered close frame.
 Credentials, raw frames and their parse errors do not enter diagnostics.
 
 `welcome` carries the wire version, server version, verified opaque principal,
 random server epoch and 24-hour idempotency-window metadata. The epoch is fresh
 per core and never resets durable cursors. A newer client receives the server's
-wire version and cannot execute commands (`server_version_gap`). Agent-history
-subscriptions and the two supported structured commands are described below.
-Binary frames and unknown protocol operations close with 1008.
+wire version and no command capability. No command capabilities are advertised; agent-history subscriptions are
+described below, and command dispatch remains assigned to later slices. Binary frames and other non-protocol post-hello
+data operations are policy violations and close with 1008.
+There is no command admission, structured start or claim of durable journaling.
 
 ## Structured commands
 
@@ -125,26 +127,28 @@ negotiated. A blocked write fails within 45 seconds; missing pongs retain their
 independent original ceiling. Saturated internal queues end the connection
 rather than growing a backlog. Oversized server output also ends the socket.
 
-The core owns verified token-to-socket identities until teardown. Command-time
-revocation flushes the triggering ack before the 4403 fan-out, within the
-existing write/liveness bound, leaving other principals alone.
+The core owns verified token-to-socket identities until teardown. The future
+command slice calls its 4403 fan-out only after the triggering auth_revoked ack
+has been written, within the existing write/liveness bound. The primitive closes
+all registered sockets for that principal, leaving other principals alone.
 A verified socket registers before welcome and rechecks current token storage
 after registration; revocation in that gap closes 4403 without welcome. A
 store failure or handshake deadline, during either verification, instead closes 1001,
 keeping the credential eligible for reconnect. A failed welcome encode or send drops the
 transport without another send or an auth close. Neither failure proves token
-revocation (ADR-0036 §5a). Command-time revalidation uses the token store,
-without a filesystem watcher.
+revocation (ADR-0036 §5a). No
+filesystem watcher or automatic command-time revocation route is added
+here; the command slice must recheck storage before dispatch as ADR-0036 requires.
 Closing the core cancels pending hellos and authenticated sockets. Explicit
 shutdown waits up to five seconds for connection leases and reports failure to
 release them; it never treats that ceiling as evidence of success.
 
 Transport tests use an isolated TCP adapter around the real router. Fixture
-vectors are selected by their machine-readable `covers` fields, remapping the
-fictional credential to an isolated deterministic token record. Command tests
-drive the `agent-send` and `token-revoked` scripts through real sockets and a
-fake structured harness. Full client recovery conformance still requires the
-durable command journal and S8's complete adapter.
+vectors are selected by their machine-readable `covers` fields. This slice
+exercises their hello, token refusal and heartbeat portions only, remapping the
+fictional credential to an isolated deterministic token record. It does not
+claim full client/subscription-script conformance before the later slices and
+S8's complete adapter have landed.
 
 The mounted listener accepts exactly `127.0.0.1`. Other addresses, including
 other members of IPv4's loopback block, receive a typed `NonLoopback` refusal
