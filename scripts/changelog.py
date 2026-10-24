@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -231,7 +232,12 @@ def infer_protocol_from_notes(notes: str) -> int | None:
     return int(match.group(1))
 
 
-def normalize_assets(value: Any, label: str) -> dict[str, str]:
+def asset_url(value: Any) -> str:
+    """Read either manifest generation without discarding checksum metadata."""
+    return str(value.get("url", "") if isinstance(value, dict) else value).strip()
+
+
+def normalize_assets(value: Any, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ChangelogError(f"{label} must be an object")
 
@@ -239,12 +245,19 @@ def normalize_assets(value: Any, label: str) -> dict[str, str]:
     if missing_targets:
         raise ChangelogError(f"{label} is missing asset URL for {', '.join(missing_targets)}")
 
-    normalized_assets: dict[str, str] = {}
+    normalized_assets: dict[str, Any] = {}
     for target in ASSET_TARGETS:
-        url = value.get(target)
+        asset = value.get(target)
+        url = asset.get("url") if isinstance(asset, dict) else asset
         if not isinstance(url, str) or not url.strip():
             raise ChangelogError(f"{label} is missing asset URL for {target}")
-        normalized_assets[target] = url.strip()
+        if isinstance(asset, dict):
+            digest = asset.get("sha256")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                raise ChangelogError(f"{label} has invalid sha256 for {target}")
+            normalized_assets[target] = {"url": url.strip(), "sha256": digest.lower()}
+        else:
+            normalized_assets[target] = url.strip()
     return normalized_assets
 
 
@@ -304,7 +317,7 @@ def normalize_releases(value: Any) -> dict[str, dict[str, Any]]:
 def build_latest_json(
     version: str,
     notes: str,
-    assets: dict[str, str],
+    assets: dict[str, Any],
     protocol: int | None = None,
     announcement: dict[str, str] | None = None,
     releases: dict[str, Any] | None = None,
@@ -391,7 +404,7 @@ def foreign_release_entries(releases: Any, repo: str = DEFAULT_RELEASE_REPO) -> 
         except ChangelogError:
             foreign.append(str(raw_version))
             continue
-        if any(str(assets.get(target, "")).strip() != expected[target] for target in ASSET_TARGETS):
+        if any(asset_url(assets.get(target, "")) != expected[target] for target in ASSET_TARGETS):
             foreign.append(str(raw_version))
     return sorted(foreign)
 
@@ -410,7 +423,7 @@ def ensure_manifest_assets_belong_to_repo(
 
     expected = default_release_assets(version, repo)
     for target in ASSET_TARGETS:
-        url = str(assets.get(target, "")).strip()
+        url = asset_url(assets.get(target, ""))
         if url != expected[target]:
             raise ChangelogError(
                 f"{label} advertises {target} for v{normalize_version(version)} as {url or '<missing>'}, "
@@ -641,7 +654,7 @@ def manifest_from_release_payload(
             if isinstance(name, str) and name not in release_assets:
                 release_assets[name] = asset
 
-    manifest_assets: dict[str, str] = {}
+    manifest_assets: dict[str, Any] = {}
     for target, asset_name in EXPECTED_ASSET_NAMES.items():
         asset = release_assets.get(asset_name)
         if not isinstance(asset, dict):
@@ -649,7 +662,8 @@ def manifest_from_release_payload(
         url = str(asset.get("url") or "").strip()
         if not url:
             raise ChangelogError(f"GitHub release asset {asset_name} is missing a download URL")
-        manifest_assets[target] = url
+        digest = asset.get("sha256")
+        manifest_assets[target] = {"url": url, "sha256": digest} if digest is not None else url
 
     return {
         "version": normalized_version,
@@ -805,6 +819,34 @@ def fetch_release_payload(version: str, repo: str) -> dict[str, Any]:
 
     if not isinstance(payload, dict):
         raise ChangelogError("unexpected GitHub release payload shape")
+    # Sidecars come from the same build artifacts that were published, not a
+    # second download of the binary. Old releases remain readable without them.
+    assets = payload.get("assets")
+    if not isinstance(assets, list):
+        raise ChangelogError("GitHub release response is missing assets")
+    names = {asset.get("name") for asset in assets if isinstance(asset, dict)}
+    sidecars = [name + ".sha256" for name in EXPECTED_ASSET_NAMES.values()]
+    if names.intersection(sidecars):
+        with tempfile.TemporaryDirectory(prefix="flock-release-sha-") as directory:
+            command = ["gh", "release", "download", f"v{normalized_version}",
+                       "--repo", repo, "--dir", directory]
+            for name in sidecars:
+                command.extend(["--pattern", name])
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                raise ChangelogError(f"failed to read release checksums: {result.stderr.strip()}")
+            digests = {}
+            for name in EXPECTED_ASSET_NAMES.values():
+                path = Path(directory) / (name + ".sha256")
+                if not path.is_file():
+                    raise ChangelogError(f"missing release checksum for {name}")
+                parts = path.read_text(encoding="utf-8").split()
+                if len(parts) != 2 or parts[1] != name or not re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+                    raise ChangelogError(f"invalid release checksum for {name}")
+                digests[name] = parts[0].lower()
+            for asset in assets:
+                if isinstance(asset, dict) and asset.get("name") in digests:
+                    asset["sha256"] = digests[asset["name"]]
     return payload
 
 
@@ -835,9 +877,9 @@ def fetch_remote_json(url: str, label: str) -> dict[str, Any]:
     return payload
 
 
-def verify_asset_urls_resolve(assets: dict[str, str], label: str) -> None:
+def verify_asset_urls_resolve(assets: dict[str, Any], label: str) -> None:
     for target in ASSET_TARGETS:
-        url = assets[target]
+        url = asset_url(assets[target])
         command = [
             "curl",
             "-fsSIL",
@@ -908,6 +950,8 @@ def cmd_sync_latest_json(args: argparse.Namespace) -> int:
 
     release_payload = fetch_release_payload(version, args.repo)
     new_manifest = manifest_from_release_payload(release_payload, version, args.protocol)
+    if any(not isinstance(asset, dict) for asset in new_manifest["assets"].values()):
+        raise ChangelogError("new stable releases must publish every asset's sha256 sidecar")
     announcement_path = Path(args.announcement)
     announcement = load_product_announcement(announcement_path)
 

@@ -408,6 +408,32 @@ impl TempDir {
     }
 }
 
+/// Fictional name payloads; failure reports use case ids rather than raw text.
+pub(crate) fn hostile_agent_names() -> Vec<(&'static str, String)> {
+    vec![
+        ("csi", "agent\u{1b}[2J".into()),
+        ("osc", "agent\u{1b}]52;c;Zml4dHVyZQ==\u{7}".into()),
+        ("newline", "agent\nnext".into()),
+        ("trimmed_control", "\tagent\r".into()),
+        ("c1", "agent\u{9b}2J".into()),
+        ("c1_osc", "agent\u{9d}52;c;Zml4dHVyZQ==\u{9c}".into()),
+        ("lrm", "agent\u{200e}".into()),
+        ("rlm", "agent\u{200f}".into()),
+        ("alm", "agent\u{061c}".into()),
+        ("line_separator", "agent\u{2028}next".into()),
+        ("zero_width", "reviewer\u{200b}".into()),
+        ("word_joiner", "reviewer\u{2060}".into()),
+        ("invisible_operator", "reviewer\u{2064}".into()),
+        ("bom", "reviewer\u{feff}".into()),
+        ("soft_hyphen", "reviewer\u{00ad}".into()),
+        ("deprecated_format", "reviewer\u{206f}".into()),
+        ("tag", "reviewer\u{e007f}".into()),
+        ("bidi", "agent\u{202e}other".into()),
+        ("isolate", "agent\u{2066}other\u{2069}".into()),
+        ("overlong", "界".repeat(65)),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

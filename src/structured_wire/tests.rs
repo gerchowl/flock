@@ -304,6 +304,7 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
         "clean",
         "agent-gap",
         "agent-send",
+        "permission-decision",
         "ping-pong",
         "token-refused",
         "token-revoked",

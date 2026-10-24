@@ -85,6 +85,7 @@ impl Client {
 pub(in crate::structured) struct Service {
     publisher: publication::Publisher,
     scheduler: Scheduler,
+    opening: Option<String>,
     requests: mpsc::Receiver<Request>,
     states: mpsc::Receiver<Snapshot>,
     updates: mpsc::SyncSender<Update>,
@@ -102,7 +103,8 @@ pub(in crate::structured) struct Service {
 impl Service {
     pub fn open(data: &Path, agent: &str, bytes: NonZeroU64) -> Result<(Self, Client), Failure> {
         let journal = Journal::open_with_policy(data, agent, RewritePolicy::new(bytes))?;
-        let scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH)?)?;
+        let mut scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH)?)?;
+        scheduler.fail_stale_openings()?;
         let (publisher, source) =
             publication::Publisher::new(agent, scheduler.journal().replay(0)?);
         let (tx, requests) = mpsc::sync_channel(1);
@@ -113,6 +115,7 @@ impl Service {
             Self {
                 publisher,
                 scheduler,
+                opening: None,
                 requests,
                 states,
                 updates,
@@ -135,6 +138,33 @@ impl Service {
                 peeked: RefCell::new(None),
             },
         ))
+    }
+    /// Commit the authenticated first message on the launch worker, before Ready.
+    /// Returning its lifecycle UUID acknowledges the same owner commit as enqueue.
+    pub fn admit_opening(
+        &mut self,
+        starter: String,
+        prompt: crate::spawn::prompt::SpawnPrompt,
+    ) -> Result<String, Failure> {
+        use crate::structured::queue::model::{Delivery, Kind, Priority, Producer, State};
+        let item_id = crate::structured::queue::admission::lifecycle_id()?;
+        let producer = Producer::Agent(starter);
+        let item = Item {
+            item_id: item_id.clone(),
+            producer: producer.clone(),
+            kind: Kind::Message,
+            state: State::Queued,
+            delivery: Delivery::AtIdle,
+            priority: Priority::Normal,
+            body: prompt.as_argv_element().to_owned(),
+            attachments: vec![],
+            metadata: [("opening_turn".into(), serde_json::Value::Bool(true))].into(),
+        };
+        self.policy()?;
+        self.scheduler
+            .enqueue(item, Principal::Origin(producer), Gate::Send)?;
+        self.opening = Some(item_id.clone());
+        Ok(item_id)
     }
     pub fn flush(&mut self, cancelled: bool, notify: &impl Fn()) -> bool {
         if let Some(update) = self.pending.take() {
@@ -248,7 +278,10 @@ impl Service {
                 self.blocked = Some(error.code);
             }
         }
-        if matches!(offer, Ok(Offer::Submitted { .. })) {
+        if let Ok(Offer::Submitted { batch_id }) = &offer {
+            if self.opening.as_ref() == Some(batch_id) {
+                self.opening = None;
+            }
             self.required = self.covered.saturating_add(1);
             self.state = AgentState::unknown();
         }
@@ -288,8 +321,18 @@ impl Service {
         }
         error.is_some_and(|e| e.0 == ErrorCode::InputWriteFailed)
     }
+    fn settle_opening(&mut self) -> Result<(), Failure> {
+        if let Some(id) = self.opening.take() {
+            self.scheduler.fail_item(id, ErrorCode::AgentStartFailed)?;
+        }
+        Ok(())
+    }
     pub fn finish(&mut self, input: &InputHandle, notify: &impl Fn()) -> bool {
-        let error = self.policy().and_then(|_| self.scheduler.exited()).err();
+        let error = self
+            .policy()
+            .and_then(|_| self.scheduler.exited())
+            .and_then(|_| self.settle_opening())
+            .err();
         self.publish(input, true, None, error);
         let blocked = self.blocked;
         self.publisher.finish(
@@ -303,6 +346,16 @@ impl Service {
         self.lost
     }
 }
+impl Drop for Service {
+    fn drop(&mut self) {
+        // Once stdin accepts the item, ordinary lifecycle/exit recovery owns it.
+        // Until then every launch failure must terminally settle its opening.
+        if let Err(error) = self.settle_opening() {
+            crate::logging::structured_queue_opening_settlement_failed(error.code);
+        }
+    }
+}
+
 fn failure(code: ErrorCode) -> Failure {
     Failure { code, source: None }
 }

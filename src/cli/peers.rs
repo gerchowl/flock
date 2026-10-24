@@ -578,6 +578,28 @@ fn relay_refusal(request: &str) -> Option<(String, &'static str, String)> {
         .unwrap_or_default()
         .to_string();
     let method = parsed.get("method").and_then(|method| method.as_str())?;
+    if matches!(method, "agent.rename" | "agent.start" | "agent.spawn")
+        && parsed
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+    {
+        return Some((
+            id,
+            "invalid_agent_name",
+            crate::terminal::agent_name::POLICY.into(),
+        ));
+    }
+    if matches!(method, "agent.start" | "agent.spawn")
+        && parsed.pointer("/params/runtime").and_then(|v| v.as_str()) == Some("structured")
+    {
+        return Some((
+            id,
+            "operator_only",
+            "structured starts require local caller attribution".into(),
+        ));
+    }
     STREAMING_METHODS.contains(&method).then(|| {
         (
             id,
@@ -1040,6 +1062,20 @@ mod tests {
     use super::PushDebounce;
 
     #[test]
+    fn security_agent_name_relay_refuses_before_forwarding() {
+        let mut failures = Vec::new();
+        for method in ["agent.rename", "agent.start", "agent.spawn"] {
+            for (case, name) in crate::test_support::hostile_agent_names() {
+                let request = serde_json::json!({"id":"name-relay","method":method,"params":{"target":"agent-fixture","name":name}}).to_string();
+                if relay_refusal(&request).map(|(_, code, _)| code) != Some("invalid_agent_name") {
+                    failures.push((method, case));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "forwarded hostile names: {failures:?}");
+    }
+
+    #[test]
     fn wake_subscription_retry_is_bounded_and_logs_once_per_outage() {
         let mut retry = super::WakeRetry::default();
         for (index, seconds) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
@@ -1358,5 +1394,18 @@ mod tests {
         assert!(parse_logs_args(&args(&["--lines"])).is_err());
         assert!(parse_logs_args(&args(&["--lines", "abc"])).is_err());
         assert!(parse_logs_args(&args(&["--bogus"])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod structured_relay_tests {
+    #[test]
+    fn structured_start_and_spawn_cannot_cross_a_mesh_relay() {
+        for method in ["agent.start", "agent.spawn"] {
+            let request = serde_json::json!({"id":"resume", "method":method, "params":{"runtime":"structured", "name":"existing"}}).to_string();
+            let (_, code, _) =
+                super::relay_refusal(&request).expect("structured relay must refuse");
+            assert_eq!(code, "operator_only");
+        }
     }
 }

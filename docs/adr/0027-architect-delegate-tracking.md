@@ -164,6 +164,40 @@ receipts addressed to nobody.
   can therefore at most remove a worktree whose work is already merged.
   `DelegateReassigned` records `by` for the audit.
 
+### 1b. Named dialogs and explicit conversation-lock choices (#1667)
+
+The existing CLI registry (§1) also records the latest explicit Codex lock
+choice in its JSON entry, without a new event kind or persistence format.
+`codex_conversation_locked` is a named human block in the harness dialog table,
+recognised only in the live screen tail by the lock notice, continuation
+instruction and retry/fork/exit footer. Quoted history above a later composer
+is not this state. Detection feeds ADR-0028 §1's human-attention axis.
+
+No automatic path answers the lock. A start blocked there retains its pane,
+checkout and round-0 record and returns `agent_blocked` (ADR-0029 exit 6).
+Status and wait name the same dialog at startup or later; wait exits 6. A plain
+brief send refuses with the registered `codex_conversation_locked` code.
+
+`delegate send --resolve-lock retry|fork` is the explicit choice, mutually
+exclusive with a brief or await. The CLI holds the existing delegate lock,
+subscribes before observing, durably records the intent, then calls guarded
+`pane.resolve_codex_lock`. That operation rechecks the live screen in the
+server's owner turn and admits exactly one `r` or `f` with no Enter. An older
+server rejects this method; it cannot silently ignore a guard and send a raw
+key. MCP exposes no new keyboard tool. Mesh VERSION remains 5.
+
+After admission the CLI confirms that the live screen left the lock, using
+status notifications and bounded condition polling within the existing
+readiness budget, never re-sending. The registry holds only the latest choice,
+its timestamp and confirmation bit; unknown future metadata is preserved raw.
+An unconfirmed intent is not proof of delivery. A silent producer, stream
+loss, or uncertain write returns registered `codex_lock_unconfirmed` with
+ADR-0029's after-inspection exit 8. The operator inspects before another choice.
+A pre-request registry durability failure sends nothing; a post-request write
+failure can leave confirmation false. Successful resolution leaves the round
+unchanged and does not promise that the next dialog is ready for a brief.
+Restoring a missing registry entry remains #1285.
+
 ### 2. `delegate.list` is the one read, and every surface is a projection of it
 
 A socket verb `delegate.list { architect: self | <AgentId> | all, branch?, repo? }`
