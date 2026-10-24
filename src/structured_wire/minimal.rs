@@ -232,6 +232,16 @@ mod tests {
         let row = std::fs::read_to_string(root.join("FleetAgentRow.ts")).unwrap();
         assert!(row.contains("state: AgentState,"));
         assert!(row.contains("activity?: string,"));
+        assert!(row.contains("route?: Route,"));
+        let route = std::fs::read_to_string(root.join("Route.ts")).unwrap();
+        for field in [
+            "node: string",
+            "name: string",
+            "next_hop: string",
+            "hops: number",
+        ] {
+            assert!(route.contains(field), "{route}");
+        }
         assert!(row.contains("waiting_on_human: Array<string>,"));
         let request = std::fs::read_to_string(root.join("AgentDecide.ts")).unwrap();
         assert!(request.contains("message?: string,"));

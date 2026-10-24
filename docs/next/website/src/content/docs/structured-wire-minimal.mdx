@@ -9,7 +9,7 @@ contracts for the GUI and server work in #1746. The opt-in S7 endpoint serves
 identity, delivery and heartbeat machinery. This stream does not execute commands.
 
 `FleetAgentRow` contains `id`, `label`, `state`, optional `activity`, and required
-`waiting_on_human: string[]`. State is the shared S4 `AgentState` object: axes, derived phase and sources.
+`waiting_on_human: string[]`, plus optional `route`. State is the shared S4 `AgentState` object: axes, derived phase and sources.
 Its per-field `or_unknown` deserializers follow ADR-0028 §3a, so an unknown
 phase from a newer server becomes `unknown` while the other axes survive and
 the fleet delta remains usable. The waiting IDs identify permission requests on `agent/<id>`;
@@ -17,6 +17,21 @@ there is no separate inbox stream in S7-min. Rows represent structured agents.
 The server omits optional `activity` until the structured producer in
 [#2243](https://github.com/gerchowl/flock/issues/2243) lands.
 `waiting_on_human` contains only open, non-automatic harness permission request IDs.
+
+### Fleet node and route metadata
+
+`route?: Route` reuses mesh's existing `{node, name, next_hop, hops}` record
+(ADR-0026; ADR-0038 §9). `node` is the SHA-256 hex digest of the owning node's
+Ed25519 public key, as returned by mesh `NodeIdentity::node_id()`, not a host
+label. `name` is its display name; `next_hop` is the first hop's node ID and
+`hops` is the actual mesh path length. Route metadata is informational and grants no dialing or control authority.
+
+The current local structured-agent producer omits `route`; its JSON remains
+byte-identical to the earlier row shape. Readers accept rows without it, and
+older clients ignore the additive field. The generated GUI contract reserves it
+for federated projection; remote fleet rows and remote command forwarding remain
+out of scope until [#1380](https://github.com/gerchowl/flock/issues/1380).
+The current GUI still presents a local flat fleet. Mesh protocol VERSION stays 5.
 
 The `fleet` stream carries the closed `FleetDelta` union inside `ev`:
 

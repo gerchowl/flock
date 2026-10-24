@@ -925,6 +925,13 @@ Public structured starts use the same lease-bound MCP registration. It does not 
 
 ### Addressing across hosts
 
+For the GUI's S7 `fleet` subscription, `FleetAgentRow` has optional mesh
+`route` metadata containing the owning node ID and actual path
+(`{node, name, next_hop, hops}`). Local rows omit it. This pre-wires the
+[generated fleet contract](../structured-wire-minimal/#fleet-node-and-route-metadata)
+for ADR-0038 §9; remote row projection and command forwarding await
+[#1380](https://github.com/gerchowl/flock/issues/1380).
+
 A pane id names a placement on **one** server, so it cannot address anything on another machine. An `agent_id` can: it is fleet-global and restart-stable (ADR-0008), and it is what `flock_agent_list`'s `fleet` rows report alongside the `host` the agent lives on and a `local` flag.
 
 The two-step is the whole story:
