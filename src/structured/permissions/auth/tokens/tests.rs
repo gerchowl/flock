@@ -760,7 +760,9 @@ fn intent_is_observed_by_an_independent_process_with_no_primary_lock_held() {
         "structured::permissions::auth::tokens::tests::priority_process_fixture",
         "--nocapture",
     ]);
-    for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("FLOCK_")) {
+    for (key, _) in std::env::vars_os()
+        .filter(|(key, _)| key.to_str().is_some_and(|name| name.starts_with("FLOCK_")))
+    {
         command.env_remove(key);
     }
     command.env("FLK_TOKEN_PRIORITY_FIXTURE", root.path());
