@@ -160,6 +160,8 @@ impl Workers {
     /// and checked on both sides of the factory. Live/unconfirmed workers and
     /// unread terminal queue completions refuse replacement with session_busy.
     /// Failure may advance the observation epoch but never the record.
+    /// The app drains published completions before operator relaunch. Internal
+    /// adapters must likewise drain terminal completions first.
     pub fn start(
         &mut self,
         registry: &mut Registry,
@@ -413,6 +415,22 @@ impl Workers {
         self.runtime(id, generation)
             .ok_or(ErrorCode::AgentNotFound)?
             .queue_enqueue(request)
+    }
+    /// Retained live-generation provider, fenced by the registry epoch.
+    /// Cold sources refuse with retryable queue_source_cold until #1956 part 2.
+    /// This never performs filesystem work or returns an empty successful source.
+    pub(crate) fn queue_source(
+        &self,
+        registry: &Registry,
+        id: &str,
+        generation: u64,
+    ) -> Result<queue::publication::Source, ErrorCode> {
+        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        self.runtime(id, generation)
+            .and_then(Runtime::queue_source)
+            .ok_or(ErrorCode::QueueSourceCold)
     }
     /// Consume an immutable completion/cut from the current generation only.
     /// Terminal cuts remain available after exit; drain before relaunch/removal.

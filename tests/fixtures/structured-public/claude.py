@@ -73,6 +73,7 @@ if model == "dogfood-parent":
                 control.sendall((json.dumps(response) + "\n").encode())
     finally:
         listener.close()
+        (root / "control").unlink()
         tool.stdin.close()
         try:
             assert tool.wait(timeout=10) == 0, "MCP exit failure"

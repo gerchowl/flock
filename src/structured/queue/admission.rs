@@ -91,6 +91,9 @@ impl Admission {
     pub fn journal(&self) -> &Journal {
         &self.journal
     }
+    pub(super) fn subscription(&mut self) -> Result<super::Cut, Failure> {
+        Ok(self.journal.subscription()?)
+    }
     pub(super) fn checkpoint_if_required(&mut self) -> Result<Option<super::Cut>, Failure> {
         self.journal.checkpoint_if_required().map_err(Into::into)
     }
