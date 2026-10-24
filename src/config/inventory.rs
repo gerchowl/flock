@@ -6,7 +6,7 @@
 // The catalog is deliberately internal and not exposed until #2384 is complete.
 #![allow(dead_code)]
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Static inventory data, rejected if its schema drifts.
@@ -31,6 +31,7 @@ pub(super) struct Field {
     pub default: DefaultRef,
     pub validation: Vec<Validation>,
     pub value_class: Sensitivity,
+    pub content_kind: ContentKind,
     pub key_class: Option<Sensitivity>,
     pub authority: Authority,
     pub reload: ReloadOwner,
@@ -59,6 +60,23 @@ pub(super) enum Sensitivity {
     RoutingMetadata,
     Aggregate,
     Opaque,
+}
+
+/// Why a value is hidden, independently of its read sensitivity or authority.
+/// Credential references are paths, never the credentials they designate.
+/// EnvironmentNames contains only routing names, never expanded env values.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ContentKind {
+    General,
+    CredentialReference,
+    EnvironmentNames,
+    Executable,
+    Repository,
+    Endpoint,
+    Command,
+    LiteralCredentials,
+    Identity,
 }
 
 /// Current local config ownership; future transport writes need separate gates.
@@ -151,6 +169,7 @@ pub(super) enum CompiledDefault {
 pub(super) struct Representation {
     pub model: String,
     pub members: Vec<String>,
+    pub map_wrapper: bool,
 }
 
 /// No source bytes or serde messages are carried by catalog failures.
@@ -318,7 +337,7 @@ fn map_value_type(field: &Field, catalog: &Catalog) -> Option<String> {
     let declared = catalog
         .representations
         .iter()
-        .find(|r| r.model == field.model_type && r.members.len() == 1)
+        .find(|r| r.model == field.model_type && r.map_wrapper && r.members.len() == 1)
         .and_then(|r| r.members.first())
         .and_then(|member| member.split_once(':'))
         .map_or(field.model_type.as_str(), |(_, ty)| ty);
@@ -343,3 +362,8 @@ fn collection_value_type(ty: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod projection_tests;
+
+pub(super) mod projection;

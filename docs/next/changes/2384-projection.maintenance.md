@@ -1,0 +1,1 @@
+- Add mandatory internal redacted configuration projections for defaults, candidate/running values and provenance, with explicit content categories and fail-closed handling of unknown content. No configuration read API or raw export is exposed; diagnostic sink completion follows in the next inventory slice.

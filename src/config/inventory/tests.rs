@@ -188,7 +188,13 @@ fn declared_shape(ty: &str, catalog: &Catalog, graph: &BTreeMap<String, syn::Ite
         .strip_prefix("Option<")
         .and_then(|ty| ty.strip_suffix('>'))
         .unwrap_or(ty);
-    if ty.starts_with("BTreeMap<") || ty.starts_with("HashMap<") || ty == "SpawnEnvConfig" {
+    if ty.starts_with("BTreeMap<")
+        || ty.starts_with("HashMap<")
+        || catalog
+            .representations
+            .iter()
+            .any(|r| r.model == ty && r.map_wrapper)
+    {
         return Shape::Map;
     }
     if let Some(inner) = ty.strip_prefix("Vec<").and_then(|ty| ty.strip_suffix('>')) {
@@ -363,6 +369,7 @@ fn core_coverage(
             }
         }
     }
+    assert_map_wrappers(catalog, graph);
     let mut found = BTreeSet::new();
     let mut reps = BTreeSet::new();
     let mut errors = Vec::new();
@@ -559,6 +566,7 @@ fn field_path(expr: &syn::Expr) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("::"),
         ),
+        syn::Expr::Index(index) => Some(format!("{}[]", field_path(&index.expr)?)),
         syn::Expr::Field(field) => {
             let syn::Member::Named(name) = &field.member else {
                 return None;
@@ -586,7 +594,7 @@ fn reload_evidence(source: &str) -> (BTreeSet<String>, bool) {
             };
             if let (Some(left), Some(right)) = (field_path(&assign.left), field_path(right)) {
                 if let Some(section) = left.strip_prefix("self.state.config.") {
-                    if !section.contains('.') && right == format!("config.{section}") {
+                    if right == format!("config.{section}") {
                         self.copied.insert(section.to_string());
                     }
                 }
@@ -627,7 +635,15 @@ fn reload_evidence(source: &str) -> (BTreeSet<String>, bool) {
         .unwrap();
     let mut evidence = Evidence::default();
     evidence.visit_block(&method.block);
-    (evidence.copied, evidence.event_hub)
+    let graph = declarations();
+    (
+        evidence
+            .copied
+            .into_iter()
+            .map(|p| canonical_copy_path(&graph, &p))
+            .collect(),
+        evidence.event_hub,
+    )
 }
 
 #[test]
@@ -821,9 +837,7 @@ fn copied_startup_sections(catalog: &Catalog, copied: &BTreeSet<String>) -> BTre
         .fields
         .iter()
         .filter(|f| {
-            !f.path.contains('.')
-                && copied.contains(&f.path)
-                && f.reload == ReloadOwner::ProcessStartup
+            f.reload == ReloadOwner::ProcessStartup && copied.iter().any(|p| covers(&f.path, p))
         })
         .map(|f| f.path.clone())
         .collect()
@@ -916,4 +930,176 @@ fn an_enum_cannot_omit_its_variant_inventory() {
     let mut catalog = core_catalog().unwrap();
     catalog.representations.retain(|r| r.model != "RunAs");
     let _ = core_coverage(&catalog, &declarations());
+}
+
+#[test]
+fn nested_incoming_copies_cannot_hide_startup_ownership() {
+    let source="impl App { fn apply_live_config(&mut self, config: &Config) { self.state.config.security.agent_account = config.security.agent_account; } }";
+    let (copied, _) = reload_evidence(source);
+    assert_eq!(copied, BTreeSet::from(["security.agent_account".into()]));
+    assert_eq!(
+        copied_startup_sections(&core_catalog().unwrap(), &copied),
+        BTreeSet::from(["security".into(), "security.agent_account".into()])
+    );
+}
+#[test]
+fn a_single_member_enum_is_not_a_map_wrapper() {
+    let mut catalog = core_catalog().unwrap();
+    catalog
+        .representations
+        .iter_mut()
+        .find(|r| r.model == "RunAs")
+        .unwrap()
+        .members = vec!["Claim:HashMap<String, String>".into()];
+    let field = catalog
+        .fields
+        .iter_mut()
+        .find(|f| f.path == "spawn.env")
+        .unwrap();
+    field.model_type = "RunAs".into();
+    let field = catalog
+        .fields
+        .iter()
+        .find(|f| f.path == "spawn.env")
+        .unwrap();
+    assert_eq!(map_value_type(field, &catalog), None);
+}
+
+fn covers(parent: &str, child: &str) -> bool {
+    parent == child
+        || child.strip_prefix(parent).is_some_and(|rest| {
+            rest.starts_with('.') || rest.starts_with('[') || rest.starts_with('<')
+        })
+}
+fn canonical_copy_path(graph: &BTreeMap<String, syn::Item>, path: &str) -> String {
+    let mut model = "Config".to_string();
+    let mut parts = Vec::new();
+    for part in path.split('.') {
+        let indexed = part.ends_with("[]");
+        let ident = part.trim_end_matches("[]");
+        let syn::Item::Struct(s) = graph.get(&model).unwrap() else {
+            panic!("copy through non-struct {model}")
+        };
+        let f = s
+            .fields
+            .iter()
+            .find(|f| f.ident.as_ref().is_some_and(|i| i == ident))
+            .unwrap();
+        let mut name = serde_name(&f.attrs, ident.to_string());
+        if indexed {
+            name.push_str("[]");
+        }
+        parts.push(name);
+        let mut ty = &f.ty;
+        loop {
+            let syn::Type::Path(p) = ty else {
+                panic!("unsupported copied type")
+            };
+            let last = p.path.segments.last().unwrap();
+            if !matches!(
+                last.ident.to_string().as_str(),
+                "Option" | "Vec" | "BTreeMap" | "HashMap"
+            ) {
+                break;
+            }
+            let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+                panic!()
+            };
+            ty = args
+                .args
+                .iter()
+                .rev()
+                .find_map(|a| {
+                    if let syn::GenericArgument::Type(t) = a {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+        }
+        model = model_type(ty);
+    }
+    parts.join(".")
+}
+fn serde_flag(attrs: &[syn::Attribute], name: &str) -> bool {
+    attrs
+        .iter()
+        .filter(|a| a.path().is_ident("serde"))
+        .any(|a| {
+            a.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .unwrap()
+            .iter()
+            .any(|m| m.path().is_ident(name))
+        })
+}
+fn assert_map_wrappers(catalog: &Catalog, graph: &BTreeMap<String, syn::Item>) {
+    for r in &catalog.representations {
+        let expected = match graph.get(&r.model).unwrap() {
+            syn::Item::Struct(s) if serde_flag(&s.attrs, "transparent") && s.fields.len() == 1 => {
+                let ty = model_type(&s.fields.iter().next().unwrap().ty);
+                ty.starts_with("BTreeMap<") || ty.starts_with("HashMap<")
+            }
+            _ => false,
+        };
+        assert_eq!(r.map_wrapper, expected, "map-wrapper drift {}", r.model);
+    }
+}
+#[test]
+#[should_panic(expected = "map-wrapper drift RunAs")]
+fn marking_an_enum_as_a_wrapper_is_rejected() {
+    let mut catalog = core_catalog().unwrap();
+    catalog
+        .representations
+        .iter_mut()
+        .find(|r| r.model == "RunAs")
+        .unwrap()
+        .map_wrapper = true;
+    assert_map_wrappers(&catalog, &declarations());
+}
+#[test]
+fn parent_absent_matches_every_default_context() {
+    let catalog = core_catalog().unwrap();
+    for f in &catalog.fields {
+        let expected = match f.default.factory {
+            Factory::Root => false,
+            Factory::CustomTheme
+            | Factory::KeyCommand
+            | Factory::Peer
+            | Factory::Script
+            | Factory::CronTz
+            | Factory::Action
+            | Factory::Sound
+            | Factory::DigestPath
+            | Factory::Required
+            | Factory::EmptyMap => true,
+            Factory::Restart => f.path.contains("<key>"),
+            Factory::EmptyArray => f.path.contains("[]") || f.path.contains("<key>"),
+            Factory::Opaque => panic!("opaque default {}", f.path),
+        };
+        assert_eq!(f.default.parent_absent, expected, "{}", f.path);
+        if let CompiledDefault::Value { parent_absent, .. } = f.compiled_default().unwrap() {
+            assert_eq!(parent_absent, expected, "{}", f.path);
+        }
+    }
+}
+#[test]
+fn renamed_collection_and_indexed_copies_use_canonical_paths() {
+    let source="impl App { fn apply_live_config(&mut self, config: &Config) { self.state.config.checks.scripts[0].program = config.checks.scripts[0].program.clone(); } }";
+    let (copied, _) = reload_evidence(source);
+    assert_eq!(copied, BTreeSet::from(["checks.script[].program".into()]));
+    assert!(copied_startup_sections(&core_catalog().unwrap(), &copied)
+        .contains("checks.script[].program"));
+}
+
+#[test]
+fn a_mixed_container_copy_does_not_claim_cached_consumer_retargeting() {
+    let catalog = core_catalog().unwrap();
+    assert!(copied_startup_sections(&catalog, &BTreeSet::from(["ui".into()])).is_empty());
+    assert_eq!(
+        copied_startup_sections(&catalog, &BTreeSet::from(["ui.disk_path".into()])),
+        BTreeSet::from(["ui.disk_path".into()])
+    );
 }

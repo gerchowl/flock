@@ -114,3 +114,63 @@ ownership references, not a claim that loading config executes scripts or
 opens a token file. `structured.token_file`, executable paths, script argv/env,
 issue-guard identifiers and channel free-form identities/targets are
 `PotentialSecret`; typed closed choices do not grant mutation authority.
+
+## Mandatory safe projection — slice 3a
+
+`projection` supplies opaque serializable defaults, candidate/running snapshots
+and provenance under ADR-0041 §4. Constructors for output nodes are private;
+there is no raw-value accessor, caller-role selector or raw-export option.
+Every caller uses the same redaction. No socket, mesh, CLI read or GUI API is
+exposed by this slice. The approved [3a → 3b split](https://github.com/gerchowl/flock/issues/2384#issuecomment-6390720190)
+keeps existing diagnostic producers, `key=` redaction, returned/logged/CLI
+sinks and final acceptance closure assigned to #2384 slice 3b. #2385 remains
+gated on that completion; this is not a claim that existing diagnostics are
+already content-safe.
+
+`content_kind` records semantic purpose separately from sensitivity and
+mutation authority: credential reference, names-only environment routing,
+executable selector, repository metadata, endpoint, free-form command,
+possible literal credentials, identity or general content. These categories
+never make a sensitive value readable. In particular, `structured.token_file`
+is a reference, not token bytes; `spawn.env` is names, not expanded values;
+and script argv/env may carry literal credentials. Channel/client token stores
+are outside Config and never traversed. A supplied unknown store key is
+redacted like any other unknown field.
+
+Sensitive/opaque values are replaced before serialization or Debug formatting.
+Sensitive maps are redacted as a whole, so neither user keys nor their values
+escape. Aggregate sections/arrays retain classified descendants. Unknown keys
+are not echoed: an object's `unclassified` flag means some unknown input was
+redacted. Public values must match a supported numeric/bool/nullable type or
+a closed unit representation. Public arrays validate each item. Unknown types,
+wrong shapes, out-of-range numbers, conflicting alias/canonical assignments and
+unvalidated custom scalar encodings are withheld rather than copied. This
+conservative handling can hide a valid custom scalar until its safe encoding
+is explicitly supported; no raw fallback exists.
+
+Defaults cover every declared schema path, including entry/variant contexts
+absent from the root and fields with no independent default (`Required`).
+`parent_absent` is checked across every factory, including global versus
+user-keyed restart policies. Candidate and running snapshots remain separate;
+callers must supply their actual respective states rather than assuming a
+successful parse applied every setting. Existing reload limits, including
+#2397 and cached consumers, remain unchanged.
+
+Provenance takes canonical schema paths (including `[]`/`<key>` patterns),
+not user instance keys. File paths and arbitrary source identifiers are never
+copied. Classified public fields retain closed winner/shadowed layer kinds;
+an env identifier is emitted only when it exactly matches the catalog's
+computed generic env name, and is rebuilt from that metadata. Sensitive fields
+hide their provenance. Unknown instance paths are withheld, not echoed.
+Neither references nor source identifiers are dereferenced, executed or
+expanded. Probes vary actual credential-file contents and process env values
+and check that serialized/Debug output is invariant and contains no marker.
+
+Map wrappers now require an explicit `map_wrapper` record, source-checked as a
+transparent one-field map struct; a single-member enum cannot qualify by
+accident. Reload evidence includes nested, renamed and indexed copy targets.
+The reverse ownership guard rejects a direct startup-only target or a copy
+inside a startup-only container. Copying a mixed parent does not claim that
+all cached child consumers retarget: the existing whole-UI copy does not move
+the sampler's startup-owned disk path. A direct disk-path copy still demands
+an ownership review.
