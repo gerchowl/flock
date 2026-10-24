@@ -72,6 +72,12 @@ while IFS= read -r command; do
         alternate)
             printf '\033[?47h\033[HSELECTA\r\nSELECTB\r\nDONE_alternate\r\n'
             ;;
+        split_primary)
+            printf '\033[?47lDONE_split_primary'
+            IFS= read -r release || exit 8
+            [ "$release" = finish_primary ] || exit 9
+            printf '\r\n'
+            ;;
         primary)
             printf '\033[?47l'
             printf 'DONE_primary\r\n'
@@ -186,6 +192,14 @@ impl Fixture {
             .unwrap()
     }
     async fn wait_for(&mut self, marker: &str) {
+        self.wait_for_output(marker, true).await;
+    }
+    async fn wait_for_output(&mut self, marker: &str, line_terminated: bool) {
+        // ADR-0040 §1 captures selection coordinates under a separate parser lock.
+        // A marker may be visible before its CR/LF scrolls the screen. A line
+        // command is complete only with the cursor at the start of the next row.
+        // The two unterminated script commands stop at their final marker byte.
+        let marker = marker.trim_end_matches('\n');
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let notified = self.notify.notified();
@@ -195,9 +209,20 @@ impl Fixture {
             let text = self.runtime().visible_text();
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "producer did not emit {marker}: {text:?}"
+                "producer did not complete {marker}: {text:?}"
             );
-            if text.contains(marker) {
+            let complete = text.contains(marker)
+                && (!line_terminated
+                    || self
+                        .runtime()
+                        .cursor_state(Rect::new(0, 0, u16::MAX, u16::MAX), true)
+                        .is_some_and(|cursor| {
+                            cursor.x == 0
+                                && text.lines().enumerate().any(|(row, line)| {
+                                    usize::from(cursor.y) == row + 1 && line.contains(marker)
+                                })
+                        }));
+            if complete {
                 return;
             }
             assert!(
@@ -206,14 +231,15 @@ impl Fixture {
             );
             tokio::time::timeout_at(deadline, notified)
                 .await
-                .unwrap_or_else(|_| panic!("producer did not emit {marker}: {text:?}"));
+                .unwrap_or_else(|_| panic!("producer did not complete {marker}: {text:?}"));
         }
     }
     async fn write_and_wait(&mut self, command: &str, marker: &str) {
         self.runtime()
             .try_send_bytes(Bytes::from(format!("{command}\n")))
             .unwrap();
-        self.wait_for(marker).await;
+        self.wait_for_output(marker, !matches!(command, "alt_history" | "decaln"))
+            .await;
     }
     fn mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) {
         self.state.handle_mouse(
@@ -591,4 +617,45 @@ async fn real_read_primary_survives_resize_with_inactive_alternate_history() {
         fixture.runtime().resize(8, 6, 0, 0);
         fixture.assert_copy();
     }
+}
+
+#[tokio::test]
+async fn completion_wait_requires_the_final_line_feed_before_selection() {
+    use std::{future::Future, task::Poll};
+    let mut fixture = Fixture::new().await;
+    fixture.write_and_wait("enter47", "DONE_enter47").await;
+    fixture.select();
+    fixture
+        .write_and_wait("alt_history", "DONE_alt_history")
+        .await;
+    fixture.assert_selected_history();
+    fixture
+        .runtime()
+        .try_send_bytes(Bytes::from_static(b"split_primary\n"))
+        .unwrap();
+    fixture.wait_for_output("DONE_split_primary", false).await;
+    let partial = fixture.runtime().visible_text();
+    let cursor = fixture
+        .runtime()
+        .cursor_state(Rect::new(0, 0, u16::MAX, u16::MAX), true);
+    {
+        let wait = fixture.wait_for("DONE_split_primary");
+        tokio::pin!(wait);
+        std::future::poll_fn(|cx| {
+            assert!(
+                wait.as_mut().poll(cx).is_pending(),
+                "marker text cannot complete the frame before its final line feed: {partial:?}, {cursor:?}"
+            );
+            Poll::Ready(())
+        })
+        .await;
+    }
+    fixture
+        .runtime()
+        .try_send_bytes(Bytes::from_static(b"finish_primary\n"))
+        .unwrap();
+    fixture.wait_for("DONE_split_primary").await;
+    fixture.select();
+    fixture.runtime().resize(8, 6, 0, 0);
+    fixture.assert_copy();
 }
