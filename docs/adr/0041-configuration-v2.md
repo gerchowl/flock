@@ -98,7 +98,7 @@ Today's credential-related and potentially secret-bearing surfaces are:
 
 | Key or family | Source and meaning | Classification work required before reads |
 | --- | --- | --- |
-| `structured.token_file` | `Config.structured` imports `StructuredConfig` from `src/structured/launch.rs`; an absolute setup-token path, not token bytes | Credential reference. Never dereference for config reads. Classify path disclosure and redact for read-scoped tokens. |
+| `structured.token_file` | `Config.structured` imports `StructuredConfig` from `src/structured/launch.rs`; an absolute setup-token path, not token bytes | Credential reference. Never dereference for config reads. Classify path disclosure; redacted for every caller. |
 | `structured.profile`, `structured.run_as`, `security.agent_account` | Profile selector and account/authority policy; file-only env policy | Security-sensitive metadata, not bearer secrets. Document read visibility separately from mutation authority. |
 | `spawn.env.<agent>` | `src/config/spawn_env.rs`: lists of env variable names carried to children, not their values | Credential-routing metadata. Never expand or return the referenced process environment. |
 | `checks.script[].env`, `checks.script[].args` | `Config.checks` imports `src/checks/config.rs`; arbitrary child env values and argv, unlike the names-only `spawn.env` | Potential literal credentials. Classify/redact values before reads; never infer safety from the env key or array shape. |
@@ -155,7 +155,10 @@ semantics, config-relative paths and explicit security policy. Every omission
 must be documented by the schema rather than inferred from missing entries.
 The web-only CSV mappings `FLOCK_WEB_ALLOWED_ORIGINS` and
 `FLOCK_WEB_ALLOWED_USERS` are also in the precedence flip: an admitted env
-list wins over a nonempty file list. Today `src/web/mod.rs` consults those
+list wins over a nonempty file list. A set-but-empty or whitespace-only
+value for either variable is treated as unset: the file list stays in force,
+so an empty env variable cannot disable identity or origin filtering.
+Today `src/web/mod.rs` consults those
 vars only when the file list is empty; that exception does not survive the
 owner's env-above-file decision. Preserve their CSV representation rather
 than pretending the generic scalar walker already handles them. Provenance
@@ -267,9 +270,14 @@ a running config. The web CSV env vars `FLOCK_WEB_ALLOWED_ORIGINS` and
 nonempty file lists, with the winning variable and shadowed file shown by
 `flk config get --provenance`. Call out that `allowed_users` controls connection
 authority; env replacement may change access even when the file is unchanged.
-Test and document unset and empty-list behavior too, including the existing
-meaning of an empty `allowed_users` list (no identity filtering). Operators
-must audit inherited service env before upgrading. No new project/system
+A set-but-empty or whitespace-only `FLOCK_WEB_ALLOWED_USERS` or
+`FLOCK_WEB_ALLOWED_ORIGINS` is treated as unset: the file list stays in force.
+An empty env variable must never switch off identity or origin filtering.
+Acceptance tests for each variable must pin file allowlist `[a]` plus env
+`""` to effective `[a]`, with the same result for whitespace-only and unset
+values. Provenance must continue to identify the file as the winning layer
+in those cases. An admitted nonempty env list still wins over the file.
+Operators must audit inherited service env before upgrading. No new project/system
 layer or relaxation of the generic env blocklist is part of this migration.
 Old binaries retain their old precedence; mixed versions must expose their own schema/capability and provenance, never imply
 that fleet members have identical effective configuration.
