@@ -109,6 +109,16 @@ describe("answering a prompt", () => {
     expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
   });
 
+  test("session_busy is visible and never resubmits a decision", () => {
+    const app = prompt();
+    button(app, "Allow once").click();
+    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: { code: "session_busy", message: "command refused: session_busy", exit: 1, retry: "later" } });
+    expect(status(app)).toBe(`${STATUS_LABELS.failed}: command refused: session_busy`);
+    for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(1);
+  });
+
   test("a request id that closes and reopens needs the review step before any button enables", () => {
     const app = prompt();
     app.close("atlas", "r1");

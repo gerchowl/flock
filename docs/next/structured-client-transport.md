@@ -68,6 +68,10 @@ mailbox holds 32 entries; it handles at most 32 requests per service turn. Full
 admission returns `session_busy`, including a race between the connection's
 capacity check and enqueue, without disconnecting a healthy socket. The shared
 send lane is retained but unmounted in this slice.
+Permission-book contention also refuses admission with `session_busy` (retry
+`later`, exit 1) before reserving a decision or writing harness input. The owner
+never waits on the transport's lock. The GUI displays the ack's refusal message
+and does not automatically resend it; this is not an accepted or lost decision.
 
 Duplicate detection is keyed by `(principal, cmd_id)` across that principal's
 sockets. The owner retains the last 1024 completed admissions across all
