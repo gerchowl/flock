@@ -87,9 +87,18 @@ impl Admission {
         }
         Ok(Self { journal, max_batch })
     }
+    pub(super) fn take_facts(&mut self) -> Vec<crate::api::queue_event::QueueItemState> {
+        self.journal.take_facts()
+    }
     /// Immutable committed state/replay for the worker's serialized publisher.
     pub fn journal(&self) -> &Journal {
         &self.journal
+    }
+    pub(super) fn subscription(&mut self) -> Result<super::Cut, Failure> {
+        Ok(self.journal.subscription()?)
+    }
+    pub(super) fn checkpoint_if_required(&mut self) -> Result<Option<super::Cut>, Failure> {
+        self.journal.checkpoint_if_required().map_err(Into::into)
     }
     /// Append one new item and its gate before acknowledging acceptance. Operator
     /// authority creates human input; other origins cannot impersonate humans or
@@ -406,6 +415,10 @@ fn nonce(
         }
     }
 }
+/// Allocate a lifecycle UUID using the same entropy and format as queue batches.
+pub(crate) fn item_uuid() -> Result<String, Failure> {
+    batch_uuid(&mut getrandom::fill)
+}
 fn batch_uuid(fill: Entropy<'_>) -> Result<String, Failure> {
     let mut h = nonce("", fill)?.into_bytes();
     h[12] = b'4';
@@ -431,7 +444,8 @@ fn serialization(error: serde_json::Error) -> Failure {
         source: Some(error.into()),
     }
 }
-fn canonical_uuid(id: &str) -> bool {
+/// Canonical lower-case UUID spelling used by admission identities.
+pub(crate) fn canonical_uuid(id: &str) -> bool {
     valid_id(id) && !id.bytes().any(|b| b.is_ascii_uppercase())
 }
 

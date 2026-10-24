@@ -23,6 +23,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "questions",
     "remote",
     "session",
+    "sessions",
     "security",
     "sessions",
     "slots",
@@ -565,6 +566,14 @@ fn load_live_config_from_table(
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.terminal = section,
+    );
+    load_live_section(
+        &table,
+        "sessions",
+        "sessions config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.sessions = section,
     );
     load_live_section(
         &table,

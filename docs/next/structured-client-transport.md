@@ -11,25 +11,92 @@ bridge.
 The first data message is a generated `hello` frame containing a client token.
 The core opens the store once off the async executor, then verifies current
 private token storage using S2a's bounded blocking-I/O budget. Unproven hellos
-never take the exclusive management/cleanup lock. An absolute five-second
-deadline covers receipt, verification and the successful `welcome` write.
-Missing, malformed, removed or incorrect credentials and explicit
-authentication-scope refusals fail closed with 4401. If the first `hello` never
-arrives before the five-second deadline, the server closes 1001 and the client
-retains its token for reconnect. Initial hello verification also closes with
-1001 for a missing store worker, a deadline miss, store I/O failure or unsafe
-storage. The client retains its token and reconnects, without gaining admission.
-Close delivery is best effort within the failure ceiling; an unusable transport
-can end without a delivered close frame.
+never take the exclusive management/cleanup lock. An absolute five-second deadline covers receipt, verification and the
+successful `welcome` write. Missing, malformed, removed or incorrect
+credentials and explicit authentication-scope refusals fail closed with 4401.
+If the first `hello` never arrives before the five-second deadline, the server
+closes 1001 and the client retains its token for reconnect. Initial hello
+verification also closes with 1001
+for a missing store worker, a deadline miss, store I/O failure or unsafe storage.
+The client retains its token and reconnects, without gaining admission.
+Close delivery is best effort within the failure ceiling; an unusable transport can end without a delivered close frame.
 Credentials, raw frames and their parse errors do not enter diagnostics.
 
 `welcome` carries the wire version, server version, verified opaque principal,
 random server epoch and 24-hour idempotency-window metadata. The epoch is fresh
 per core and never resets durable cursors. A newer client receives the server's
-wire version and no command capability. No command capabilities are advertised; agent-history subscriptions are
-described below, and command dispatch remains assigned to later slices. Binary frames and other non-protocol post-hello
-data operations are policy violations and close with 1008.
-There is no command admission, structured start or claim of durable journaling.
+wire version and cannot execute commands (`server_version_gap`). Agent-history
+subscriptions and the two supported structured commands are described below.
+Binary frames and unknown protocol operations close with 1008.
+
+## Structured commands
+
+S7-min routes `cmd agent.send` and `cmd agent.decide` on the app owner, using
+ADR-0036 sections 4/5/5a and the existing structured queue and S6 permission APIs.
+`agent.send` uses the socket API's `target`, `text`, `submit` and optional
+`item_id` fields. With `submit: true`, its success ack returns `{ item_id }`
+after durable queue admission. A single input carries that lifecycle identity
+into the harness turn; lifecycle events report subsequent progress. Admission
+does not mean the harness has started or completed the turn. `submit: false`
+returns `structured_submit_required` before queue or stdin work. Terminal-only
+raw/write options are unsupported for structured turns.
+
+`agent.decide` uses the generated `AgentDecide` contract. Echo both the
+`request_id` and flk-issued `request_seq` from the open permission record;
+never synthesize a sequence. Success returns `{ request_id, decision }` through
+the normal ack envelope after S6 reserves the named answer. The agent stream's
+closed record remains authoritative for dismissing a permission card. Unknown,
+closed, stale and unauthorized decisions keep S6's registered refusal codes.
+Neither verb allocates a runtime. Non-local or terminal targets and unsupported
+verbs return `unsupported_for_agent` before allocating a lifecycle item.
+
+Send requires `send` scope and decision requires `answer` scope; both shared
+services additionally require an `operate` token for operator authority. Every
+command rechecks the current token file and scopes while serializing admission
+with revocation. A removed/replaced token gets `auth_revoked`; its ack is flushed
+before all sockets for that token close 4403. Scope shrink instead returns
+`scope` and keeps the socket and allowed reads alive. Already admitted work is
+not cancelled by revocation. Deleting a token alone does not proactively close
+an idle read-only socket; the next command or reconnect detects it.
+
+Only `agent.send` and `agent.decide` are implemented on this wire surface.
+Other verbs, including `agent.interrupt`, receive `server_version_gap` (exit 78)
+before allocating a command task, owner request or permission check. Command
+IDs above 128 bytes receive `invalid_params`. Four pending commands are allowed
+per socket; a fifth receives `session_busy`, leaving the socket open. Writer
+backpressure still applies to refusal acks, including the existing 64 KiB
+encoded-message cap and 45-second blocked-writer ceiling.
+
+The app owner has independent 32-entry send and decision mailboxes. Full
+admission returns `session_busy`, including a race between the connection's
+capacity check and enqueue. It does not disconnect a healthy socket. At most
+32 durable-send receipts remain pending; decision admission is serviced first
+and does not consume receipt capacity. Each owner turn handles at most 32
+requests from each lane. The per-socket limit still applies to both verbs.
+
+Duplicate detection is keyed by `(principal, cmd_id)` across that principal's
+sockets. Pending send keys remain pinned until the receipt resolves, even if
+the original socket disconnects. The owner also retains the last 1024 completed
+admissions across all principals, evicting the oldest completed key in FIFO
+order. Refused commands do not claim a key. A retained duplicate returns
+`session_unconfirmed` after authorization, without dispatch. This is a bounded
+in-memory fence, not a recovery journal: eviction, restart and handoff can
+forget completed keys. Clients must never repeat a first send; uncertain
+resends must use `resume_only: true`, which cannot dispatch even if its key is
+absent. There is no cached outcome lookup in this slice.
+
+An unknown local agent receives `agent_not_found`; an advertised remote agent
+or a known terminal target receives `unsupported_for_agent`. Neither creates a
+runtime or lifecycle item. The decision `message` is currently bounded by the
+frame limit; its separate field limit is tracked in #2249.
+
+This slice implements first sends, not the durable command journal of ADR-0036
+section 5a. `resume_only: true` always returns `session_unconfirmed` without
+dispatch, even within the advertised recovery window. There is no cached ack
+lookup or automatic resend. After uncertain delivery, inspect the queue and
+permission state; never manufacture another first-send command to force a
+retry. Disconnecting a waiter does not cancel input already durably admitted.
+Structured process launch remains separate from this adapter.
 
 Application JSON pings run every 15 seconds independently of other traffic. Each
 nonce is unique to its epoch/socket and sequence. Keep at most three outstanding
@@ -58,28 +125,26 @@ negotiated. A blocked write fails within 45 seconds; missing pongs retain their
 independent original ceiling. Saturated internal queues end the connection
 rather than growing a backlog. Oversized server output also ends the socket.
 
-The core owns verified token-to-socket identities until teardown. The future
-command slice calls its 4403 fan-out only after the triggering auth_revoked ack
-has been written, within the existing write/liveness bound. The primitive closes
-all registered sockets for that principal, leaving other principals alone.
+The core owns verified token-to-socket identities until teardown. Command-time
+revocation flushes the triggering ack before the 4403 fan-out, within the
+existing write/liveness bound, leaving other principals alone.
 A verified socket registers before welcome and rechecks current token storage
 after registration; revocation in that gap closes 4403 without welcome. A
 store failure or handshake deadline, during either verification, instead closes 1001,
 keeping the credential eligible for reconnect. A failed welcome encode or send drops the
 transport without another send or an auth close. Neither failure proves token
-revocation (ADR-0036 §5a). No
-filesystem watcher or automatic command-time revocation route is added
-here; the command slice must recheck storage before dispatch as ADR-0036 requires.
+revocation (ADR-0036 §5a). Command-time revalidation uses the token store,
+without a filesystem watcher.
 Closing the core cancels pending hellos and authenticated sockets. Explicit
 shutdown waits up to five seconds for connection leases and reports failure to
 release them; it never treats that ceiling as evidence of success.
 
 Transport tests use an isolated TCP adapter around the real router. Fixture
-vectors are selected by their machine-readable `covers` fields. This slice
-exercises their hello, token refusal and heartbeat portions only, remapping the
-fictional credential to an isolated deterministic token record. It does not
-claim full client/subscription-script conformance before the later slices and
-S8's complete adapter have landed.
+vectors are selected by their machine-readable `covers` fields, remapping the
+fictional credential to an isolated deterministic token record. Command tests
+drive the `agent-send` and `token-revoked` scripts through real sockets and a
+fake structured harness. Full client recovery conformance still requires the
+durable command journal and S8's complete adapter.
 
 The mounted listener accepts exactly `127.0.0.1`. Other addresses, including
 other members of IPv4's loopback block, receive a typed `NonLoopback` refusal

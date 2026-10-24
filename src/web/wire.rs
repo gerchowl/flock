@@ -1,4 +1,5 @@
 //! Server-owned, opt-in structured transport; no PTY or model dispatch.
+mod commands;
 mod fleet;
 mod output;
 mod subscriptions;
@@ -40,6 +41,8 @@ const PRINCIPAL_CONNECTIONS: usize = 4;
 const PRIORITY_CAPACITY: usize = 4;
 /// Maximum queued data messages per socket.
 const DATA_CAPACITY: usize = 8;
+/// Maximum concurrent first-send commands on one socket.
+const COMMANDS_PER_SOCKET: usize = 4;
 /// Maximum buffered WebSocket output bytes.
 const WRITE_BUFFER_BYTES: usize = MAX_MESSAGE * 2;
 /// Failure ceiling for releasing all socket leases during shutdown.
@@ -53,15 +56,14 @@ const POLICY_VIOLATION_CLOSE: u16 = 1008;
 /// Socket identity remains owned until teardown; later dispatch uses this verified session.
 struct Client {
     session: Session,
-    // The command slice enforces version gating before allocation.
-    #[allow(dead_code)]
     read_only: bool,
     data: mpsc::Sender<output::Delivery>,
     revoke: watch::Sender<bool>,
 }
 struct Shared {
-    fleet: fleet::Client,
     histories: crate::structured::history::owner::Client,
+    commands: commands::Client,
+    fleet: fleet::Client,
     store: Arc<TokenStore>,
     epoch: String,
     clock: Arc<dyn Clock>,
@@ -70,6 +72,17 @@ struct Shared {
     clients: Mutex<HashMap<u64, Client>>,
     next: AtomicU64,
     stop: watch::Sender<bool>,
+}
+impl Shared {
+    fn revoke(&self, session: &Session) {
+        if let Ok(clients) = self.clients.lock() {
+            for client in clients.values() {
+                if client.session.info.principal == session.info.principal {
+                    let _ = client.revoke.send(true);
+                }
+            }
+        }
+    }
 }
 struct Lease {
     shared: Arc<Shared>,
@@ -87,6 +100,7 @@ impl Drop for Lease {
 /// Dropping the owner cancels every handshake and authenticated socket.
 pub(crate) struct Core {
     owner: crate::structured::history::owner::Owner,
+    command_owner: commands::Owner,
     shared: Arc<Shared>,
 }
 impl Drop for Core {
@@ -112,12 +126,15 @@ impl Core {
     ) -> io::Result<Self> {
         let epoch = store.random::<16>().map_err(io::Error::other)?;
         let (stop, _) = watch::channel(false);
+        let (commands, command_owner) = commands::channel(wake.clone());
         let fleet = fleet::Client::new(wake.clone(), stop.subscribe());
         let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
             owner,
+            command_owner,
             shared: Arc::new(Shared {
                 histories,
+                commands,
                 fleet,
                 store: Arc::new(store),
                 epoch,
@@ -143,6 +160,10 @@ impl Core {
     /// Mount only behind S2b-mount's loopback, Host/Origin and funnel guards.
     pub(crate) fn router(&self) -> Router {
         Router::new().route("/v1/ws", get(upgrade).with_state(self.shared.clone()))
+    }
+    /// Admit commands on the same owner that services structured workers.
+    pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
+        self.command_owner.service(app);
     }
     /// Later dispatch calls after writing the triggering auth_revoked acknowledgement.
     #[allow(dead_code)]
@@ -384,21 +405,33 @@ async fn connection(
     let (sink, mut stream) = socket.split();
     let writer = output::writer(sink, shared.clock.clone(), priority_rx, data_rx);
     tokio::pin!(writer);
-    let Some((data, session)) = shared.clients.lock().ok().and_then(|clients| {
-        clients
-            .get(&id)
-            .map(|client| (client.data.clone(), client.session.clone()))
+    let Some((data, session, read_only)) = shared.clients.lock().ok().and_then(|clients| {
+        clients.get(&id).map(|client| {
+            (
+                client.data.clone(),
+                client.session.clone(),
+                client.read_only,
+            )
+        })
     }) else {
         return;
     };
-    let mut subscriptions =
-        subscriptions::Subscriptions::new(shared.clone(), data, session, priority.clone());
+    let mut subscriptions = subscriptions::Subscriptions::new(
+        shared.clone(),
+        data.clone(),
+        session.clone(),
+        priority.clone(),
+    );
+    let mut running = tokio::task::JoinSet::new();
     let mut heartbeat = Heartbeat::new(shared.clock.now());
     let code = loop {
         tokio::select! { biased;
             _ = stop.changed() => return,
             _ = revoked.changed() => break AUTH_REVOKED_CLOSE,
             _ = &mut writer => return,
+            result = running.join_next(), if !running.is_empty() => {
+                if !matches!(result, Some(Ok(Ok(())))) { break GOING_AWAY_CLOSE; }
+            },
             _ = shared.clock.until(heartbeat.expires()) => break GOING_AWAY_CLOSE,
             _ = shared.clock.until(heartbeat.next_ping) => {
                 let Some(nonce) = heartbeat.ping(shared.clock.now(), &format!("{}/{id}", shared.epoch)) else { break GOING_AWAY_CLOSE };
@@ -412,6 +445,27 @@ async fn connection(
                         if !subscriptions.subscribe(sub_id, stream, after) { break GOING_AWAY_CLOSE }
                     }
                     Ok(ClientFrame::Unsub { sub_id }) => subscriptions.unsubscribe(&sub_id),
+                    Ok(ClientFrame::Cmd { cmd_id, verb, args, resume_only }) => {
+                        let refusal = if !matches!(verb.as_str(), "agent.send" | "agent.decide") || read_only {
+                            Some(crate::api::error_code::ErrorCode::ServerVersionGap)
+                        } else if cmd_id.len() > 128 {
+                            Some(crate::api::error_code::ErrorCode::InvalidParams)
+                        } else if running.len() == COMMANDS_PER_SOCKET || shared.commands.full(&verb) {
+                            Some(crate::api::error_code::ErrorCode::SessionBusy)
+                        } else { None };
+                        if let Some(code) = refusal {
+                            let Some(ack) = output::encode(commands::ack(cmd_id, Err(code))) else { break GOING_AWAY_CLOSE };
+                            tokio::select! { biased;
+                                _ = stop.changed() => return,
+                                _ = revoked.changed() => break AUTH_REVOKED_CLOSE,
+                                _ = &mut writer => return,
+                                _ = shared.clock.until(heartbeat.expires()) => break GOING_AWAY_CLOSE,
+                                sent = priority.send(ack) => if sent.is_err() { return },
+                            }
+                            continue;
+                        }
+                        running.spawn(commands::execute(shared.clone(), session.clone(), data.clone(), commands::Command { id: cmd_id, verb, args, resume_only, read_only }));
+                    }
                     _ => break POLICY_VIOLATION_CLOSE,
                 },
                 Some(Ok(Message::Binary(_))) => break POLICY_VIOLATION_CLOSE,

@@ -55,7 +55,8 @@ impl ErrorCode {
             ErrorCode::ServerVersionGap => exit::PROTOCOL_GAP,
             // ADR-0029 §2: the wrong operation requires a corrected call.
             // A parked restart needs resume; invalid wait parks need new predicates.
-            ErrorCode::RuntimeUnsupported
+            ErrorCode::StructuredSubmitRequired
+            | ErrorCode::RuntimeUnsupported
             | ErrorCode::StructuredMcpLeaseRequired
             | ErrorCode::Parked
             | ErrorCode::WaitPredicateInvalid
@@ -82,6 +83,7 @@ impl std::error::Error for ErrorCode {}
 
 error_codes! {
     Never:
+        Scope = "scope",
         TerminalUnavailable = "terminal_unavailable",
         RuntimeUnsupported = "runtime_unsupported",
         AgentHereUnavailable = "agent_here_unavailable",
@@ -169,7 +171,9 @@ error_codes! {
         PromptTooLong = "prompt_too_long",
         QueueItemConflict = "queue_item_conflict",
         QueueItemTooLarge = "queue_item_too_large",
+        StructuredSubmitRequired = "structured_submit_required",
         QueueModeUnsupported = "queue_mode_unsupported",
+        QueueNotFound = "queue_not_found",
         QuestionsWideningRefused = "questions_widening_refused",
         RecipientGone = "recipient_gone",
         RelayNotFromSsh = "relay_not_from_ssh",
@@ -238,6 +242,9 @@ error_codes! {
     Yes:
         Timeout = "timeout";
     Later:
+        // Registered generation has no live queue source yet. Retry after the
+        // I/O recovery provider installs it (#1956 part 2), without mutating it.
+        QueueSourceCold = "queue_source_cold",
         SessionBusy = "session_busy",
         InputWriteCancelled = "input_write_cancelled",
         AgentNotReady = "agent_not_ready",
@@ -264,6 +271,7 @@ error_codes! {
         WorktreeMergeUnknown = "worktree_merge_unknown",
         WorktreeOpenPr = "worktree_open_pr";
     AfterInspecting:
+        QueueRecoveryFailed = "queue_recovery_failed",
         InputWriteFailed = "input_write_failed",
         InputWriteUnknown = "input_write_unknown",
         AgentExitedAtStart = "agent_exited_at_start",
@@ -273,6 +281,7 @@ error_codes! {
         CodexLockUnconfirmed = "codex_lock_unconfirmed",
         SessionMismatch = "session_mismatch";
     AfterHuman:
+        AuthRevoked = "auth_revoked",
         StructuredEndpointRestartRequired = "structured_endpoint_restart_required",
         StructuredRecoveryRequired = "structured_recovery_required",
         WorktreeCheckoutUnreachable = "worktree_checkout_unreachable",
@@ -350,12 +359,12 @@ mod tests {
             })
             .collect();
         let expected: Vec<(&str, String)> = [
-            ("never", "agent_here_unavailable agent_name_taken agent_no_active_workspace agent_not_found agent_placement_conflict agent_placement_not_found agent_placement_required agent_profile_unresolved agent_spawn_disabled agent_target_ambiguous already_hibernated ambiguous_worktree_branch at_lineage_depth channel_not_owner channel_unauthorized check_not_found cursor_ahead dirty_worktree_requires_force goal_already_armed goal_caller_refused goal_not_armed goal_not_paused handoff_not_found handoff_too_large hibernate_unsupported hop_budget_exhausted identity_pin_conflict identity_unknown invalid_agent invalid_agent_argv invalid_agent_name invalid_custody_state invalid_envelope invalid_header_field invalid_key invalid_metadata_request invalid_params invalid_regex invalid_request invalid_session_name invalid_signature invalid_state_label lineage_not_found linked_worktree_source loop_detected mesh_collection_refused mesh_refused message_expired message_key_conflict message_not_found msg_not_allowed msg_target_ambiguous msg_target_not_found no_agent_session no_branch no_caller_pane no_checkout not_an_edge not_authorized not_found not_from_a_pane not_git_worktree not_hibernated not_implemented not_linked_worktree operator_only origin_mismatch owner_policy_changed owner_policy_unreadable pane_gone pane_not_found parked permission_decision_unsupported permission_grant_limit permission_input_already_held permission_request_closed permission_request_limit permission_request_too_large permission_request_unknown prompt_control_bytes prompt_empty prompt_too_long questions_widening_refused queue_item_conflict queue_item_too_large queue_mode_unsupported recipient_gone relay_not_from_ssh relay_unattestable reply_unavailable restart_disabled restart_unsupported runtime_unsupported self_compact_instructions_unsupported self_compact_unavailable self_kill_unconfirmed self_message_forbidden sender_unresolved spawn_caller_unknown stash_empty structured_mcp_lease_required submodule_worktree_requires_force tab_not_found target_pane_not_found terminal_unavailable too_many_header_fields transcript_not_found unknown_agent_kind unsafe_text unsupported_for_agent unsupported_in_app_mode wait_deadline_too_long wait_predicate_invalid wait_predicate_unsupported workspace_not_found worktree_not_found"),
+            ("never", "agent_here_unavailable agent_name_taken agent_no_active_workspace agent_not_found agent_placement_conflict agent_placement_not_found agent_placement_required agent_profile_unresolved agent_spawn_disabled agent_target_ambiguous already_hibernated ambiguous_worktree_branch at_lineage_depth channel_not_owner channel_unauthorized check_not_found cursor_ahead dirty_worktree_requires_force goal_already_armed goal_caller_refused goal_not_armed goal_not_paused handoff_not_found handoff_too_large hibernate_unsupported hop_budget_exhausted identity_pin_conflict identity_unknown invalid_agent invalid_agent_argv invalid_agent_name invalid_custody_state invalid_envelope invalid_header_field invalid_key invalid_metadata_request invalid_params invalid_regex invalid_request invalid_session_name invalid_signature invalid_state_label lineage_not_found linked_worktree_source loop_detected mesh_collection_refused mesh_refused message_expired message_key_conflict message_not_found msg_not_allowed msg_target_ambiguous msg_target_not_found no_agent_session no_branch no_caller_pane no_checkout not_an_edge not_authorized not_found not_from_a_pane not_git_worktree not_hibernated not_implemented not_linked_worktree operator_only origin_mismatch owner_policy_changed owner_policy_unreadable pane_gone pane_not_found parked permission_decision_unsupported permission_grant_limit permission_input_already_held permission_request_closed permission_request_limit permission_request_too_large permission_request_unknown prompt_control_bytes prompt_empty prompt_too_long questions_widening_refused queue_item_conflict queue_item_too_large queue_mode_unsupported queue_not_found recipient_gone relay_not_from_ssh relay_unattestable reply_unavailable restart_disabled restart_unsupported runtime_unsupported scope self_compact_instructions_unsupported self_compact_unavailable self_kill_unconfirmed self_message_forbidden sender_unresolved spawn_caller_unknown stash_empty structured_mcp_lease_required structured_submit_required submodule_worktree_requires_force tab_not_found target_pane_not_found terminal_unavailable too_many_header_fields transcript_not_found unknown_agent_kind unsafe_text unsupported_for_agent unsupported_in_app_mode wait_deadline_too_long wait_predicate_invalid wait_predicate_unsupported workspace_not_found worktree_not_found"),
             ("maybe", "agent_fork_failed agent_start_failed checkout_prepare_failed delegate_unreachable digest_write_failed handoff_failed handoff_unreadable integration_install_failed integration_uninstall_failed internal_error mail_store_unavailable mesh_delivery_refused mesh_store_unavailable pane_move_failed pane_send_failed pane_split_failed pause_persist_failed serialization_error server_unavailable session_broken session_delete_failed session_stop_failed spawn_failed spawn_location_unresolved tab_close_failed tab_create_failed transcript_unreadable transport workspace_create_failed worktree_create_failed worktree_list_failed worktree_open_failed worktree_prune_failed worktree_remove_failed write_failed"),
             ("yes", "timeout"),
-            ("later", "agent_not_ready at_agent_capacity at_fanout_limit channel_token_unavailable fleet_paused handoff_undrained injection_pending input_not_empty input_write_cancelled mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active restart_busy restart_pending restart_rate_limited session_busy session_unconfirmed too_many_waits unknown_composer worktree_merge_unknown worktree_open_pr"),
-            ("after_inspecting", "agent_exited_at_start agent_exited_before_ready codex_lock_unconfirmed input_write_failed input_write_unknown no_result self_submit_unconfirmed session_mismatch"),
-            ("after_human", "claude_folder_trust codex_conversation_locked codex_folder_trust codex_hook_review queue_journal_corrupt structured_endpoint_restart_required structured_harness_version_unsupported structured_needs_agent_user structured_recovery_required structured_worker_cleanup_failed structured_worker_panicked structured_worker_timeout worktree_checkout_unreachable"),
+            ("later", "agent_not_ready at_agent_capacity at_fanout_limit channel_token_unavailable fleet_paused handoff_undrained injection_pending input_not_empty input_write_cancelled mail_store_full mailbox_full mesh_not_enrolled msg_rate_limited no_local_server not_settled operator_active queue_source_cold restart_busy restart_pending restart_rate_limited session_busy session_unconfirmed too_many_waits unknown_composer worktree_merge_unknown worktree_open_pr"),
+            ("after_inspecting", "agent_exited_at_start agent_exited_before_ready codex_lock_unconfirmed input_write_failed input_write_unknown no_result queue_recovery_failed self_submit_unconfirmed session_mismatch"),
+            ("after_human", "auth_revoked claude_folder_trust codex_conversation_locked codex_folder_trust codex_hook_review queue_journal_corrupt structured_endpoint_restart_required structured_harness_version_unsupported structured_needs_agent_user structured_recovery_required structured_worker_cleanup_failed structured_worker_panicked structured_worker_timeout worktree_checkout_unreachable"),
             ("after_handoff", "mail_store_schema_too_new mesh_version_mismatch peer_incompatible queue_journal_newer server_version_gap"),
         ]
         .into_iter()
@@ -385,7 +394,8 @@ mod tests {
                 | ErrorCode::GoalCallerRefused
                 | ErrorCode::QuestionsWideningRefused
                 | ErrorCode::PermissionGrantLimit => 13,
-                ErrorCode::RuntimeUnsupported
+                ErrorCode::StructuredSubmitRequired
+                | ErrorCode::RuntimeUnsupported
                 | ErrorCode::StructuredMcpLeaseRequired
                 | ErrorCode::Parked
                 | ErrorCode::WaitPredicateInvalid

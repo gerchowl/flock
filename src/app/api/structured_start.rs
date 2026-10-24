@@ -139,6 +139,7 @@ impl App {
                 state,
                 mcp,
                 storage: self.state.config.sessions.storage(),
+                queue_rewrite_bytes: self.state.config.sessions.queue_rewrite_bytes,
                 stall_after: Duration::from_millis(self.state.config.sessions.stall_ms),
                 admission: lineage.as_ref().map(|l| Admission {
                     config: self.state.config.fleet,
