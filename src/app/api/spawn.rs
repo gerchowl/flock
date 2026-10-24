@@ -918,7 +918,7 @@ mod tests {
 
         let edges: Vec<_> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter_map(|(_, event)| match event.data {
                 crate::api::schema::EventData::AgentDelegated {

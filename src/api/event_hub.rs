@@ -473,7 +473,49 @@ impl EventHub {
         }
     }
 
-    pub fn events_after(&self, sequence: u64) -> Vec<(u64, EventEnvelope)> {
+    /// A complete continuation from the ring, or a typed refusal requiring resync.
+    /// Checking retention and capturing events share one lock.
+    pub fn events_after(
+        &self,
+        sequence: u64,
+    ) -> Result<Vec<(u64, EventEnvelope)>, super::schema::ErrorBody> {
+        use super::{
+            error_code::ErrorCode,
+            schema::{ErrorBody, ErrorData},
+        };
+        let state = self.inner.lock().map_err(|_| ErrorBody {
+            data: None,
+            code: ErrorCode::InternalError.as_str().into(),
+            message: "event ring is unavailable".into(),
+        })?;
+        let floor = state
+            .events
+            .first()
+            .map_or(state.next_sequence, |(seq, _)| seq.saturating_sub(1));
+        let oldest = floor.saturating_add(1);
+        if sequence < floor {
+            return Err(ErrorBody {
+                code: ErrorCode::EventsLost.as_str().into(),
+                message: "Events were lost. Resync with per-verb reads (workspace.list, pane.list, agent.list, msg.list); use events.read for retained durable history.".into(),
+                data: Some(Box::new(ErrorData {
+                    extra: [("requested_sequence".into(), sequence.into()),
+                        ("oldest_available_sequence".into(), oldest.into()),
+                        ("current_sequence".into(), state.next_sequence.into())].into_iter().collect(),
+                    ..Default::default()
+                })),
+            });
+        }
+        Ok(state
+            .events
+            .iter()
+            .filter(|(seq, _)| *seq > sequence)
+            .cloned()
+            .collect())
+    }
+
+    /// A bounded state-fold snapshot, without a completeness guarantee.
+    /// Continuation/subscription readers must use [`Self::events_after`].
+    pub fn ring_snapshot_after(&self, sequence: u64) -> Vec<(u64, EventEnvelope)> {
         let Ok(state) = self.inner.lock() else {
             return Vec::new();
         };
@@ -483,28 +525,6 @@ impl EventHub {
             .filter(|(event_sequence, _)| *event_sequence > sequence)
             .cloned()
             .collect()
-    }
-
-    /// The ring's events with `seq > sequence`, and the cursor a subscriber
-    /// that fell behind the ring skips to (#1030, ADR-0028 §3). The ring holds
-    /// everything newer than its oldest entry, so a cursor below that has
-    /// lost events, and the stream says so instead of dropping them silently.
-    pub(crate) fn events_since(&self, sequence: u64) -> (Option<u64>, Vec<(u64, EventEnvelope)>) {
-        let Ok(state) = self.inner.lock() else {
-            return (None, Vec::new());
-        };
-        let floor = state
-            .events
-            .first()
-            .map_or(state.next_sequence, |(first, _)| first.saturating_sub(1));
-        let lagged = (sequence < floor).then_some(floor);
-        let events = state
-            .events
-            .iter()
-            .filter(|(event_sequence, _)| *event_sequence > sequence.max(floor))
-            .cloned()
-            .collect();
-        (lagged, events)
     }
 
     /// Make the next persisted push rotate the active file, the way a full
@@ -758,6 +778,29 @@ mod tests {
                 workspace_id: label.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn ring_overflow_refuses_an_incomplete_event_read() {
+        let hub = EventHub::default();
+        hub.set_ring_cap(2);
+        for label in ["one", "two", "three"] {
+            hub.push(workspace_event(label));
+        }
+        let read = format!("{:?}", hub.events_after(0));
+        assert!(read.starts_with("Err("), "{read}");
+        let error = hub.events_after(0).unwrap_err();
+        assert_eq!(error.code, "events_lost");
+        assert_eq!(error.data.unwrap().extra["oldest_available_sequence"], 2);
+        assert_eq!(
+            hub.events_after(1)
+                .unwrap()
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(hub.events_after(3).unwrap().is_empty());
     }
 
     fn output_event() -> EventEnvelope {
@@ -1380,7 +1423,7 @@ mod tests {
         );
         assert_eq!(restarted.current_sequence(), 2, "torn tail dropped");
         assert_eq!(
-            restarted.events_after(0).len(),
+            restarted.ring_snapshot_after(0).len(),
             2,
             "ring is seeded from disk at boot"
         );
@@ -1499,7 +1542,7 @@ mod tests {
         let hub = EventHub::with_persistence(path.clone());
         hub.push(output_event());
         hub.push(workspace_event("w1"));
-        assert_eq!(hub.events_after(0).len(), 2, "ring sees both");
+        assert_eq!(hub.ring_snapshot_after(0).len(), 2, "ring sees both");
         let persisted = hub.persisted_events_after(0);
         assert_eq!(persisted.len(), 1, "disk sees only the persisted kind");
         assert_eq!(persisted[0].0, 2, "persisted event keeps its ring seq");
@@ -1656,7 +1699,7 @@ mod tests {
                         .iter()
                         .map(|(seq, _, _)| *seq)
                         .chain(
-                            hub.events_after(0)
+                            hub.ring_snapshot_after(0)
                                 .iter()
                                 .filter(|(_, e)| e.event.is_persisted())
                                 .map(|(seq, _)| *seq),
