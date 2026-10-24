@@ -133,7 +133,7 @@ pub(crate) fn start_server_for_mode(
             agent_start_label: true,
             agent_questions: true,
             structured_agents: true,
-            pane_input_write_ack: false,
+            pane_input_write_ack: true,
             events_live_start: true,
         }),
         uid_policy,
