@@ -1,7 +1,7 @@
-//! Core config classification, before any read API (ADR-0041 §2, #2384).
+//! Complete config classification, before any read API (ADR-0041 §2, #2384).
 //!
-//! The reviewed data follows declarations, not just populated defaults. Imported
-//! models are explicit unreadable boundaries for slice 2b. Classification grants
+//! The reviewed data follows core and imported declarations, including optional
+//! and collection-entry shapes, not just populated defaults. Classification grants
 //! no read or write authority. Slice 3 must redact values, keys and diagnostics.
 // The catalog is deliberately internal and not exposed until #2384 is complete.
 #![allow(dead_code)]
@@ -101,6 +101,10 @@ pub(super) enum Validation {
     ReconnectBounds,
     StorageLimits,
     ToastDelay,
+    ChecksPolicy,
+    CronExpression,
+    ChannelBindings,
+    StructuredLaunch,
     Opaque,
 }
 
@@ -121,14 +125,24 @@ pub(super) enum Factory {
     KeyCommand,
     Peer,
     EmptyArray,
+    EmptyMap,
+    Script,
+    Restart,
+    CronTz,
+    Action,
+    Sound,
+    DigestPath,
+    /// No independent default: the entry or selected variant requires this field.
+    Required,
     Opaque,
 }
 
-/// Distinguish absent parent context and unclassified imported defaults.
+/// Distinguish absent parent context, compiled values and required entry fields.
 #[derive(Debug, PartialEq)]
 pub(super) enum CompiledDefault {
     Value { value: Value, parent_absent: bool },
     Opaque,
+    Required,
 }
 
 /// Core enum/newtype representations pin serde shapes, including payload types.
@@ -176,7 +190,17 @@ impl Field {
     pub fn compiled_default(&self) -> Result<CompiledDefault, InventoryError> {
         let tree = match self.default.factory {
             Factory::Opaque => return Ok(CompiledDefault::Opaque),
+            Factory::Required => return Ok(CompiledDefault::Required),
             Factory::EmptyArray => Value::Array(Vec::new()),
+            Factory::EmptyMap => serde_json::json!({}),
+            Factory::Script => serialize(crate::checks::config::ScriptCheck::default())?,
+            Factory::Restart => serialize(crate::agent_restart::RestartPolicy::default())?,
+            Factory::CronTz => serialize(crate::checks::cron::CronTz::default())?,
+            Factory::Action => serialize(crate::checks::ActionSpec::default())?,
+            Factory::Sound => serialize(crate::api::schema::NotificationShowSound::default())?,
+            Factory::DigestPath => {
+                serialize(crate::checks::config::default_digest_path_template())?
+            }
             Factory::Root => serialize(super::Config::default())?,
             Factory::CustomTheme => serialize(super::CustomThemeColors::default())?,
             Factory::KeyCommand => serialize(super::CommandKeybindConfig::default())?,
@@ -241,6 +265,80 @@ impl Field {
 
 fn serialize(value: impl serde::Serialize) -> Result<Value, InventoryError> {
     serde_json::to_value(value).map_err(|_| InventoryError::InvalidCatalog)
+}
+
+/// Stable declared type at the failing field, without compiler type strings.
+/// Unknown keys retain the nearest declared container type. User map keys and
+/// array indices select a schema shape, never become catalog identifiers.
+pub(super) fn diagnostic_type(section: &str, path: Option<&serde_path_to_error::Path>) -> String {
+    let Ok(catalog) = core_catalog() else {
+        return "unclassified config field".into();
+    };
+    let mut canonical = section.to_string();
+    let mut current = catalog.fields.iter().find(|f| f.path == canonical);
+    let mut expected = current.map(|f| f.model_type.clone());
+    if let Some(path) = path {
+        for segment in path.iter() {
+            let next = match segment {
+                serde_path_to_error::Segment::Map { key } => {
+                    if current.is_some_and(|f| f.path == canonical && f.shape == Shape::Map) {
+                        expected = current.and_then(|f| map_value_type(f, &catalog));
+                        format!("{canonical}<key>")
+                    } else {
+                        format!("{canonical}.{key}")
+                    }
+                }
+                serde_path_to_error::Segment::Seq { .. } => {
+                    expected = expected.as_deref().and_then(collection_value_type);
+                    format!("{canonical}[]")
+                }
+                serde_path_to_error::Segment::Enum { variant } => format!("{canonical}.{variant}"),
+                _ => break,
+            };
+            // Collection/variant shapes do not necessarily have a separate
+            // record; descendants are still resolved from their canonical path.
+            canonical = next;
+            if let Some(field) = catalog
+                .fields
+                .iter()
+                .find(|f| f.path == canonical || f.file_aliases.contains(&canonical))
+            {
+                canonical = field.path.clone();
+                expected = Some(field.model_type.clone());
+                current = Some(field);
+            }
+        }
+    }
+    expected.unwrap_or_else(|| "unclassified config field".into())
+}
+
+fn map_value_type(field: &Field, catalog: &Catalog) -> Option<String> {
+    // Transparent map wrappers pin their storage type in the representation.
+    // The storage field is not an additional accepted file key.
+    let declared = catalog
+        .representations
+        .iter()
+        .find(|r| r.model == field.model_type && r.members.len() == 1)
+        .and_then(|r| r.members.first())
+        .and_then(|member| member.split_once(':'))
+        .map_or(field.model_type.as_str(), |(_, ty)| ty);
+    collection_value_type(declared)
+}
+
+fn collection_value_type(ty: &str) -> Option<String> {
+    let start = ty.find('<')? + 1;
+    let body = ty.get(start..ty.len().checked_sub(1)?)?;
+    let mut depth = 0;
+    let mut last = 0;
+    for (index, ch) in body.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => last = index + 1,
+            _ => {}
+        }
+    }
+    Some(body[last..].trim().to_string())
 }
 
 #[cfg(test)]

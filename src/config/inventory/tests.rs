@@ -8,6 +8,13 @@ fn declarations() -> BTreeMap<String, syn::Item> {
         include_str!("../sound.rs"),
         include_str!("../spawn_env.rs"),
         include_str!("../keybinds.rs"),
+        include_str!("../../structured/launch.rs"),
+        include_str!("../../checks/config.rs"),
+        include_str!("../../checks/cron.rs"),
+        include_str!("../../spawn/mod.rs"),
+        include_str!("../../channels.rs"),
+        include_str!("../../agent_restart.rs"),
+        include_str!("../../api/schema.rs"),
     ]
     .into_iter()
     .flat_map(|source| syn::parse_file(source).unwrap().items)
@@ -16,7 +23,13 @@ fn declarations() -> BTreeMap<String, syn::Item> {
         syn::Item::Enum(e) => Some((e.ident.to_string(), item)),
         _ => None,
     })
-    .collect()
+    .fold(BTreeMap::new(), |mut graph, (name, item)| {
+        assert!(
+            graph.insert(name.clone(), item).is_none(),
+            "ambiguous declared model: {name}"
+        );
+        graph
+    })
 }
 
 /// Comparisons retain every path segment; only graph lookup uses model names.
@@ -170,25 +183,7 @@ fn members(item: &syn::Item) -> Vec<String> {
     }
 }
 
-/// The approved 2b boundaries are exact, not a general unknown-type escape.
-const BOUNDARIES: &[(&str, &str)] = &[
-    ("structured", "src/structured/launch.rs::StructuredConfig"),
-    ("checks", "src/checks/config.rs::ChecksConfig"),
-    ("fleet", "src/spawn/mod.rs::FleetConfig"),
-    ("channels", "src/channels.rs::ChannelBinding"),
-    ("session.restart", "src/agent_restart.rs::RestartPolicy"),
-    (
-        "session.restart_agents",
-        "src/agent_restart.rs::RestartPolicy",
-    ),
-];
-
-fn declared_shape(
-    ty: &str,
-    boundary: bool,
-    catalog: &Catalog,
-    graph: &BTreeMap<String, syn::Item>,
-) -> Shape {
+fn declared_shape(ty: &str, catalog: &Catalog, graph: &BTreeMap<String, syn::Item>) -> Shape {
     let ty = ty
         .strip_prefix("Option<")
         .and_then(|ty| ty.strip_suffix('>'))
@@ -197,14 +192,11 @@ fn declared_shape(
         return Shape::Map;
     }
     if let Some(inner) = ty.strip_prefix("Vec<").and_then(|ty| ty.strip_suffix('>')) {
-        return if boundary || matches!(graph.get(inner), Some(syn::Item::Struct(_))) {
+        return if matches!(graph.get(inner), Some(syn::Item::Struct(_))) {
             Shape::SectionArray
         } else {
             Shape::Array
         };
-    }
-    if boundary {
-        return Shape::Opaque;
     }
     match ty {
         "BindingConfig" => Shape::StringOrArray,
@@ -234,140 +226,140 @@ fn core_coverage(
         if let Some(rep) = catalog.representations.iter().find(|r| r.model == model) {
             assert_eq!(members(item), rep.members, "representation drift: {model}");
             reps.insert(model.to_string());
-            return;
+            if !matches!(item, syn::Item::Enum(_)) {
+                return;
+            }
         }
-        let syn::Item::Struct(s) = item else {
-            panic!("unclassified enum: {model}")
-        };
-        for f in &s.fields {
-            let key = serde_name(&f.attrs, f.ident.as_ref().unwrap().to_string());
-            let path = if prefix.is_empty() {
-                key
-            } else {
-                format!("{prefix}.{key}")
-            };
-            let Some(spec) = catalog.fields.iter().find(|spec| spec.path == path) else {
-                errors.push(format!("unclassified core field: {path}"));
-                continue;
-            };
+        if matches!(item, syn::Item::Enum(_)) {
             assert!(
-                found.insert(path.clone()),
-                "duplicate declared path: {path}"
+                catalog.representations.iter().any(|r| r.model == model),
+                "unclassified enum: {model}"
             );
-            let parent = prefix;
-            let aliases: Vec<_> = serde_strings(&f.attrs, "alias")
-                .into_iter()
-                .map(|alias| {
-                    if parent.is_empty() {
-                        alias
-                    } else {
-                        format!("{parent}.{alias}")
-                    }
-                })
-                .collect();
-            assert_eq!(spec.file_aliases, aliases, "file aliases: {path}");
-            let ty = type_name(&f.ty);
-            assert_eq!(spec.model_type, ty, "type drift: {path}");
-            assert_eq!(spec.declaring_model, model);
-            assert_eq!(
-                spec.nullable,
-                model_type(&f.ty).starts_with("Option<"),
-                "optionality drift: {path}"
-            );
-            let expected_boundary = BOUNDARIES
+        }
+        let groups: Vec<(&syn::Fields, String)> = match item {
+            syn::Item::Struct(s) => vec![(&s.fields, prefix.to_string())],
+            syn::Item::Enum(e) => e
+                .variants
                 .iter()
-                .find(|(p, _)| *p == path)
-                .map(|(_, source)| *source);
-            assert_eq!(
-                spec.boundary.as_deref(),
-                expected_boundary,
-                "boundary drift: {path}"
-            );
-            assert_eq!(
-                spec.shape,
-                declared_shape(
-                    &model_type(&f.ty),
-                    expected_boundary.is_some(),
-                    catalog,
-                    graph
-                ),
-                "shape drift: {path}"
-            );
-            assert_eq!(
-                spec.key_class.is_some(),
-                spec.shape == Shape::Map,
-                "key policy: {path}"
-            );
-            if expected_boundary.is_none()
-                && matches!(spec.shape, Shape::Section | Shape::SectionArray)
-            {
-                assert_eq!(spec.value_class, Sensitivity::Aggregate);
-            }
-            if expected_boundary.is_some() {
-                assert_eq!(spec.value_class, Sensitivity::Opaque);
-                assert_eq!(spec.reload, ReloadOwner::Opaque);
-                assert!(matches!(
-                    spec.compiled_default().unwrap(),
-                    CompiledDefault::Opaque
-                ));
-                continue;
-            }
-            let mut inner = &f.ty;
-            let mut child_path = path;
-            loop {
-                let syn::Type::Path(t) = inner else {
-                    panic!("unclassified shape")
+                .map(|v| (&v.fields, format!("{prefix}.{}", variant_name(e, v))))
+                .collect(),
+            _ => panic!("unclassified declaration: {model}"),
+        };
+        for (fields, prefix) in groups {
+            let prefix = prefix.as_str();
+            for (index, f) in fields.iter().enumerate() {
+                let key = serde_name(
+                    &f.attrs,
+                    f.ident
+                        .as_ref()
+                        .map_or_else(|| index.to_string(), ToString::to_string),
+                );
+                let path = if prefix.is_empty() {
+                    key
+                } else {
+                    format!("{prefix}.{key}")
                 };
-                let last = t.path.segments.last().unwrap();
-                if !matches!(
-                    last.ident.to_string().as_str(),
-                    "Option" | "Vec" | "HashMap" | "BTreeMap"
-                ) {
-                    break;
-                }
-                if last.ident == "Vec" {
-                    child_path.push_str("[]");
-                }
-                if last.ident == "HashMap" || last.ident == "BTreeMap" {
-                    child_path.push_str("<key>");
-                }
-                let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
-                    panic!("generic shape")
+                let Some(spec) = catalog.fields.iter().find(|spec| spec.path == path) else {
+                    errors.push(format!("unclassified core field: {path}"));
+                    continue;
                 };
-                inner = args
-                    .args
-                    .iter()
-                    .rev()
-                    .find_map(|arg| {
-                        if let syn::GenericArgument::Type(ty) = arg {
-                            Some(ty)
+                assert!(
+                    found.insert(path.clone()),
+                    "duplicate declared path: {path}"
+                );
+                let parent = prefix;
+                let aliases: Vec<_> = serde_strings(&f.attrs, "alias")
+                    .into_iter()
+                    .map(|alias| {
+                        if parent.is_empty() {
+                            alias
                         } else {
-                            None
+                            format!("{parent}.{alias}")
                         }
                     })
-                    .unwrap();
-            }
-            let inner = model_type(inner);
-            if graph.contains_key(&inner) {
-                walk(&inner, &child_path, catalog, graph, found, reps, errors);
-            } else {
-                assert!(
-                    [
-                        "String",
-                        "bool",
-                        "u16",
-                        "u64",
-                        "u32",
-                        "usize",
-                        "f64",
-                        "PathBuf",
-                        "NonZeroUsize",
-                        "NonZeroU64",
-                        "SocketAddr"
-                    ]
-                    .contains(&inner.as_str()),
-                    "unclassified imported type: {inner}"
+                    .collect();
+                assert_eq!(spec.file_aliases, aliases, "file aliases: {path}");
+                let ty = type_name(&f.ty);
+                assert_eq!(spec.model_type, ty, "type drift: {path}");
+                assert_eq!(spec.declaring_model, model);
+                assert_eq!(
+                    spec.nullable,
+                    model_type(&f.ty).starts_with("Option<"),
+                    "optionality drift: {path}"
                 );
+                assert!(spec.boundary.is_none(), "unresolved boundary: {path}");
+                assert_eq!(
+                    spec.shape,
+                    declared_shape(&model_type(&f.ty), catalog, graph),
+                    "shape drift: {path}"
+                );
+                assert_eq!(
+                    spec.key_class.is_some(),
+                    spec.shape == Shape::Map,
+                    "key policy: {path}"
+                );
+                if matches!(spec.shape, Shape::Section | Shape::SectionArray) {
+                    assert_eq!(spec.value_class, Sensitivity::Aggregate);
+                }
+                let mut inner = &f.ty;
+                let mut child_path = path;
+                loop {
+                    let syn::Type::Path(t) = inner else {
+                        panic!("unclassified shape")
+                    };
+                    let last = t.path.segments.last().unwrap();
+                    if !matches!(
+                        last.ident.to_string().as_str(),
+                        "Option" | "Vec" | "HashMap" | "BTreeMap"
+                    ) {
+                        break;
+                    }
+                    if last.ident == "Vec" {
+                        child_path.push_str("[]");
+                    }
+                    if last.ident == "HashMap" || last.ident == "BTreeMap" {
+                        child_path.push_str("<key>");
+                    }
+                    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+                        panic!("generic shape")
+                    };
+                    inner = args
+                        .args
+                        .iter()
+                        .rev()
+                        .find_map(|arg| {
+                            if let syn::GenericArgument::Type(ty) = arg {
+                                Some(ty)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap();
+                }
+                let inner = model_type(inner);
+                if graph.contains_key(&inner) {
+                    walk(&inner, &child_path, catalog, graph, found, reps, errors);
+                } else {
+                    assert!(
+                        [
+                            "String",
+                            "bool",
+                            "u16",
+                            "u64",
+                            "u32",
+                            "usize",
+                            "f64",
+                            "f32",
+                            "u8",
+                            "PathBuf",
+                            "NonZeroUsize",
+                            "NonZeroU64",
+                            "SocketAddr"
+                        ]
+                        .contains(&inner.as_str()),
+                        "unclassified imported type: {inner}"
+                    );
+                }
             }
         }
     }
@@ -441,26 +433,6 @@ use syn::parse::Parser;
 fn core_defaults_include_optional_parents_and_empty_entry_models() {
     let catalog = core_catalog().unwrap();
     for field in &catalog.fields {
-        let relative = match field.default.factory {
-            Factory::Root => Some(field.path.as_str()),
-            Factory::Peer => field.path.strip_prefix("peers[]."),
-            Factory::KeyCommand => field.path.strip_prefix("keys.command[]."),
-            Factory::CustomTheme => field.path.strip_prefix("theme.custom."),
-            Factory::EmptyArray | Factory::Opaque => Some(""),
-        };
-        assert_eq!(
-            relative,
-            Some(field.default.path.as_str()),
-            "factory path: {}",
-            field.path
-        );
-        assert_eq!(
-            field.default.parent_absent,
-            matches!(
-                field.default.factory,
-                Factory::Peer | Factory::KeyCommand | Factory::CustomTheme
-            )
-        );
         field
             .compiled_default()
             .unwrap_or_else(|_| panic!("unresolved compiled default: {}", field.path));
@@ -532,7 +504,7 @@ fn sources_match_the_loader_without_reading_env_values() {
         get("experimental.cjk_ime_agents").env,
         EnvSupport::CollectionOrSection
     );
-    assert_eq!(get("checks").env, EnvSupport::Opaque);
+    assert_eq!(get("checks").env, EnvSupport::CollectionOrSection);
     assert_eq!(get("name").deprecated_alias, Some("FLOCK_HOST_NAME"));
     assert_eq!(
         get("ui.sound.enabled").deprecated_alias,
@@ -662,6 +634,10 @@ fn reload_evidence(source: &str) -> (BTreeSet<String>, bool) {
 fn app_live_claims_match_actual_incoming_config_copies() {
     let catalog = core_catalog().unwrap();
     let (copied, _) = reload_evidence(include_str!("../../app/mod.rs"));
+    assert!(
+        copied_startup_sections(&catalog, &copied).is_empty(),
+        "copied section classified ProcessStartup"
+    );
     let unsupported: BTreeSet<_> = catalog
         .fields
         .iter()
@@ -773,4 +749,171 @@ fn flattened_fields_require_explicit_inventory_review() {
         .attrs
         .push(syn::parse_quote!(#[serde(flatten)]));
     let _ = core_coverage(&catalog, &graph);
+}
+
+#[test]
+fn imported_secrets_and_user_keys_are_not_public() {
+    let catalog = core_catalog().unwrap();
+    for field in &catalog.fields {
+        if field.path == "structured.token_file"
+            || field.path.starts_with("checks.issue_guard.")
+                && ["owner", "repos", "gh_bin"]
+                    .iter()
+                    .any(|k| field.path.ends_with(k))
+            || [
+                "checks.script[].program",
+                "checks.script[].args",
+                "checks.script[].env",
+                "channels[].name",
+                "channels[].owner_node",
+                "channels[].target",
+            ]
+            .contains(&field.path.as_str())
+            || field.path.ends_with(".notify.title")
+            || field.path.ends_with(".event.label")
+            || field.path.ends_with(".write_digest.path_template")
+        {
+            assert_eq!(
+                field.value_class,
+                Sensitivity::PotentialSecret,
+                "{}",
+                field.path
+            );
+        }
+        if field.shape == Shape::Map {
+            assert_eq!(
+                field.key_class,
+                Some(Sensitivity::PotentialSecret),
+                "{}",
+                field.path
+            );
+        }
+        assert!(field.boundary.is_none());
+        assert_ne!(field.value_class, Sensitivity::Opaque);
+    }
+}
+
+#[test]
+fn reverse_reload_evidence_rejects_copied_startup_sections() {
+    let mut catalog = core_catalog().unwrap();
+    let (mut copied, _) = reload_evidence(include_str!("../../app/mod.rs"));
+    assert!(copied_startup_sections(&catalog, &copied).is_empty());
+    copied.insert("security".into());
+    assert_eq!(
+        copied_startup_sections(&catalog, &copied),
+        BTreeSet::from(["security".into()])
+    );
+    copied.remove("security");
+    catalog
+        .fields
+        .iter_mut()
+        .find(|f| f.path == "session")
+        .unwrap()
+        .reload = ReloadOwner::ProcessStartup;
+    assert_eq!(
+        copied_startup_sections(&catalog, &copied),
+        BTreeSet::from(["session".into()])
+    );
+}
+
+fn copied_startup_sections(catalog: &Catalog, copied: &BTreeSet<String>) -> BTreeSet<String> {
+    catalog
+        .fields
+        .iter()
+        .filter(|f| {
+            !f.path.contains('.')
+                && copied.contains(&f.path)
+                && f.reload == ReloadOwner::ProcessStartup
+        })
+        .map(|f| f.path.clone())
+        .collect()
+}
+
+#[test]
+fn an_unclassified_imported_leaf_is_rejected() {
+    let catalog = core_catalog().unwrap();
+    let mut graph = declarations();
+    let syn::Item::Struct(s) = graph.get_mut("StructuredConfig").unwrap() else {
+        unreachable!()
+    };
+    let syn::Fields::Named(fields) = &mut s.fields else {
+        unreachable!()
+    };
+    fields.named.push(
+        syn::Field::parse_named
+            .parse_str("pub private_probe: Option<String>")
+            .unwrap(),
+    );
+    assert_eq!(
+        core_coverage(&catalog, &graph),
+        Err(vec![
+            "unclassified core field: structured.private_probe".into()
+        ])
+    );
+}
+
+#[test]
+#[should_panic(expected = "representation drift: ActionSpec")]
+fn an_unclassified_imported_variant_is_rejected() {
+    let catalog = core_catalog().unwrap();
+    let mut graph = declarations();
+    let syn::Item::Enum(e) = graph.get_mut("ActionSpec").unwrap() else {
+        unreachable!()
+    };
+    e.variants
+        .push(syn::parse_str("PrivateProbe { value: String }").unwrap());
+    let _ = core_coverage(&catalog, &graph);
+}
+
+#[test]
+fn compiled_default_factories_keep_their_declared_context() {
+    let catalog = core_catalog().unwrap();
+    for field in &catalog.fields {
+        let path = &field.path;
+        let expected = match field.default.factory {
+            Factory::Root => Some(path.as_str()),
+            Factory::Peer => path.strip_prefix("peers[]."),
+            Factory::KeyCommand => path.strip_prefix("keys.command[]."),
+            Factory::CustomTheme => path.strip_prefix("theme.custom."),
+            Factory::Script => path.strip_prefix("checks.script[]."),
+            Factory::Restart => path
+                .strip_prefix("session.restart.")
+                .or_else(|| path.strip_prefix("session.restart_agents<key>.")),
+            Factory::EmptyArray
+            | Factory::EmptyMap
+            | Factory::Required
+            | Factory::CronTz
+            | Factory::Action
+            | Factory::Sound
+            | Factory::DigestPath => Some(""),
+            Factory::Opaque => panic!("unresolved default: {path}"),
+        };
+        assert_eq!(expected, Some(field.default.path.as_str()), "{path}");
+    }
+    let get = |path: &str| {
+        catalog
+            .fields
+            .iter()
+            .find(|f| f.path == path)
+            .unwrap()
+            .compiled_default()
+            .unwrap()
+    };
+    assert_eq!(get("checks.cron[].expr"), CompiledDefault::Required);
+    assert_eq!(get("channels[].name"), CompiledDefault::Required);
+    assert_eq!(
+        get("checks.script[].on_fire.write_digest.path_template"),
+        CompiledDefault::Value {
+            value: serde_json::json!("{date}.html"),
+            parent_absent: true
+        }
+    );
+}
+
+#[test]
+#[should_panic(expected = "unclassified enum: RunAs")]
+fn an_enum_cannot_omit_its_variant_inventory() {
+    let mut catalog = core_catalog().unwrap();
+    catalog.representations.retain(|r| r.model != "RunAs");
+    let _ = core_coverage(&catalog, &declarations());
 }

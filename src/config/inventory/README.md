@@ -1,20 +1,26 @@
 # Core config inventory — ADR-0041 §2
 
-This is internal classification data for #2384 slice 2a, not a read API or a
-redaction projection. `core.json` records 276 canonical fields/container nodes
-and 21 core enum/newtype representations. The source-based test walks `Config`
-through the five core declaration files. It rejects missing, orphaned or
-duplicate records, changed field types/optionality, new enum payloads and
-unclassified imported types. A serialized default alone is not coverage.
+This is internal classification data for #2384 slices 2a/2b, not a read API or
+redaction projection. `core.json` records 504 fields/container and payload nodes
+and 29 enum/newtype representations. The source-based test walks `Config`
+through core declarations and their imported structured-launch, check, cron,
+fleet, channel, restart-policy and notification-sound declarations. Every
+reachable field and variant must be classified, including entries absent from
+defaults. Missing, orphaned, duplicate, changed-type and changed-representation
+records fail coverage. Unsupported flattening fails explicitly.
 
-The six exact opaque boundaries are `structured`, `checks`, `fleet`,
-`channels`, `session.restart` and the values of `session.restart_agents`.
-Their source/model references are explicit; defaults remain opaque and no
-child is made readable. Slice 2b of #2384 follows those imported declarations,
-replaces the boundaries, completes whole-graph coverage and connects stable
-per-field type names to deserializer diagnostics. Slice 3 implements the safe
-projections before any config API ships. Neither the existing diagnostic audit
-nor its remaining CLI/key/map/error paths is claimed complete here.
+The six former opaque boundaries are fully traversed. Collections use `[]`
+and `<key>` in schema paths; externally tagged enum payloads use their serde
+variant spelling. Manual/untagged representations use structural variant and
+payload indices, not invented accepted TOML keys. File support means the value
+is accepted through that representation, not that a structural path is itself
+a file key. Custom scalar serializers (cron expressions and channel targets)
+pin their Rust representation and classify the entire serialized value.
+
+No catalog classification grants read visibility. Slice 3 of #2384 still owns
+safe projections, including sensitive user-chosen diagnostic keys and the
+remaining CLI/key/map/error sinks recorded on that issue. No config API ships
+before that work is complete.
 
 ## Record meaning
 
@@ -33,8 +39,11 @@ nor its remaining CLI/key/map/error paths is claimed complete here.
   fields when a collection entry exists. `parent_absent` distinguishes entry
   defaults from an entry or optional section actually present in the root.
   An empty, skip-serialized command array is explicit. A declared Option
-  omitted by serde is normalized to null at its checked factory path. Opaque defaults cannot
-  be resolved by this catalog. Defaults are not read from a user file, and
+  omitted by serde is normalized to null at its checked factory path. Imported
+  entry factories use the actual compiled script/restart/action defaults and
+  serde field-default functions. `Required` means an entry or selected variant
+  requires a value; it does not invent a null default. Variant payload defaults
+  are independent of a containing section's default-selected variant. Defaults are not read from a user file, and
   paths, executables and carried env names are never dereferenced or expanded.
 - Sources report the current loader, not the ADR's future precedence migration:
   base and adjacent overlay files, the actual generic env scalar walk and its
@@ -53,7 +62,7 @@ nor its remaining CLI/key/map/error paths is claimed complete here.
   `RoutingMetadata` includes listener addresses and the names-only spawn env
   map, never its referenced values. `Public` is restricted to typed numbers, booleans and closed choices;
   it grants no read capability. `Aggregate` requires descendant projection.
-  `Opaque` is unreadable pending 2b. User-chosen map keys have their own
+  `Opaque` remains fail-closed but no current record uses it. User-chosen map keys have their own
   `PotentialSecret` class, including `ui.agent_aliases`,
   `session.restart_agents` and `spawn.env`; key spelling is not safe metadata.
 - `LocalOperatorFile` describes current file ownership, not permission for a
@@ -72,9 +81,12 @@ nor its remaining CLI/key/map/error paths is claimed complete here.
   startup values because reload does not copy them into the running config;
   their `reload_issue: 2397` records the existing product bug (#2397). This
   inventory corrects the claim and does not fix that reload behavior.
-  `CommandStartup` covers listener/command startup settings. `ReadOnUse` is
+  The reverse copy-set check also rejects a startup-only root section that
+  gains a live copy without an ownership review. `checks`, `fleet` and
+  `structured` remain startup-owned; session restart policy and channels follow
+  their existing section copies. `CommandStartup` covers listener/command startup settings. `ReadOnUse` is
   the advertised icon's config lookup. `Mixed` is a container with multiple
-  owners; `Opaque` is unresolved until 2b. Ownership is not a claim that every
+  owners. Ownership is not a claim that every
   cached downstream consumer hot-reloads. Peer-row reconciliation also depends
   on the app's valid-UI gate. Existing ownership limitations stay tracked by
   #2384 rather than being silently changed in this inventory slice.
@@ -82,3 +94,23 @@ nor its remaining CLI/key/map/error paths is claimed complete here.
 The JSON is reviewed record data, not generated at build time. A declaration
 change requires an explicit classification/default/source/owner review; never
 regenerate a public classification for an unknown field merely to pass coverage.
+
+## Diagnostics and imported validation
+
+Deserializer errors resolve expected types through catalog paths, array item
+shapes and user-map value shapes, never `std::any::type_name`. Unknown fields
+retain the nearest declared container type; an unknown classification reports
+`unclassified config field`. Alias spellings resolve to canonical fields. Transparent map entry types
+resolve through the checked wrapper representation without inventing a storage
+field in the file schema.
+No parser message is mined for a type or variant name. Diagnostic paths still
+include user-map keys today: the probes demonstrate their independent
+`PotentialSecret` key policy; slice 3 must redact them before API exposure.
+
+`ChecksPolicy` names `ChecksConfig::diagnostics`; `CronExpression` names the
+cron custom deserializer; `ChannelBindings` names channel validation; and
+`StructuredLaunch` names launch admission/private-file checks. These are
+ownership references, not a claim that loading config executes scripts or
+opens a token file. `structured.token_file`, executable paths, script argv/env,
+issue-guard identifiers and channel free-form identities/targets are
+`PotentialSecret`; typed closed choices do not grant mutation authority.

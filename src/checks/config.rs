@@ -293,7 +293,7 @@ pub enum ActionSpec {
     },
 }
 
-fn default_digest_path_template() -> String {
+pub(crate) fn default_digest_path_template() -> String {
     "{date}.html".to_string()
 }
 

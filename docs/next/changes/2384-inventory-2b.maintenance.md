@@ -1,0 +1,1 @@
+- Complete the internal configuration catalog through imported models and enum payloads, including secret-bearing check settings and user-map keys; use stable declared field types in deserializer diagnostics. No configuration read API is exposed.
