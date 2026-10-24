@@ -211,11 +211,45 @@ impl ApiClient {
         Ok((parse_response_value(ack)?, stream))
     }
 
+    /// Check the capability with a bounded ping before an `after_sequence`
+    /// subscription. Missing support is a typed refusal, never a live fallback.
+    /// Legacy `after` and omitted cursors do not require the probe.
     pub fn subscribe_value(
         &self,
         request: &Request,
         read_timeout: Option<Duration>,
     ) -> Result<(serde_json::Value, EventStream), ApiClientError> {
+        if let Method::EventsSubscribe(params) = &request.method {
+            let refusal = if params.after.is_some() && params.after_sequence.is_some() {
+                Some((
+                    super::error_code::ErrorCode::InvalidParams,
+                    "after and after_sequence are mutually exclusive",
+                ))
+            } else if params.after_sequence.is_some() {
+                let ping = Request {
+                    id: "api-client:events-capability".into(),
+                    method: Method::Ping(PingParams::default()),
+                };
+                let response = self.request_value_with_timeout(
+                    &ping,
+                    read_timeout.unwrap_or(Duration::from_secs(5)),
+                )?;
+                (response.pointer("/result/capabilities/events_live_start").and_then(serde_json::Value::as_bool) != Some(true))
+                    .then_some((super::error_code::ErrorCode::ServerVersionGap, "after_sequence requires events_live_start; update the server before subscribing"))
+            } else {
+                None
+            };
+            if let Some((code, message)) = refusal {
+                return Err(ApiClientError::ErrorResponse(ErrorResponse {
+                    id: request.id.clone(),
+                    error: super::schema::ErrorBody {
+                        data: None,
+                        code: code.as_str().into(),
+                        message: message.into(),
+                    },
+                }));
+            }
+        }
         let mut stream = self.connect()?;
         write_request(&mut stream, request, self.credential.as_deref())?;
         if let Some(timeout) = read_timeout {
@@ -458,6 +492,86 @@ pub(crate) fn parse_response_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opted_in_subscription_checks_capability_then_sends_distinct_cursor() {
+        let path = std::path::PathBuf::from(format!("/tmp/f473ok-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let ping: serde_json::Value = read_json_line(&mut reader).unwrap();
+            assert_eq!(ping["method"], "ping");
+            writeln!(reader.get_mut(), "{}", serde_json::json!({"id":ping["id"], "result":{"type":"pong","version":"fixture","protocol":crate::protocol::PROTOCOL_VERSION,"capabilities":{"events_live_start":true}}})).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let request: serde_json::Value = read_json_line(&mut reader).unwrap();
+            writeln!(
+                reader.get_mut(),
+                "{}",
+                serde_json::json!({"id":request["id"], "result":{"type":"subscription_started"}})
+            )
+            .unwrap();
+            request
+        });
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let request: Request = serde_json::from_value(serde_json::json!({"id":"resume","method":"events.subscribe","params":{"subscriptions":[],"after_sequence":7}})).unwrap();
+        let (ack, _) = client
+            .subscribe_value(&request, Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(ack["result"]["type"], "subscription_started");
+        let sent = server.join().unwrap();
+        assert_eq!(sent["params"]["after_sequence"], 7);
+        assert!(sent["params"].get("after").is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn opted_in_subscription_refuses_a_server_without_the_capability() {
+        for advertised in [None, Some(false)] {
+            let dir = std::path::PathBuf::from("/tmp").join(format!(
+                "f473cap-{}-{:?}",
+                std::process::id(),
+                advertised
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("s.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let request: serde_json::Value = read_json_line(&mut reader).unwrap();
+                let mut response = serde_json::json!({"id":request["id"],"result":{"type":"pong","version":"fixture","protocol":crate::protocol::PROTOCOL_VERSION}});
+                if let Some(value) = advertised {
+                    response["result"]["capabilities"] =
+                        serde_json::json!({"events_live_start":value});
+                }
+                writeln!(reader.get_mut(), "{response}").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                (request, listener)
+            });
+            let request:Request=serde_json::from_value(serde_json::json!({"id":"new","method":"events.subscribe","params":{"subscriptions":[],"after_sequence":0}})).unwrap();
+            let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+            let result = client.subscribe_value(&request, Some(Duration::from_secs(5)));
+            let (probe, listener) = server.join().unwrap();
+            assert!(
+                matches!(result,Err(ApiClientError::ErrorResponse(ref e)) if e.error.code=="server_version_gap"),
+                "expected a typed capability refusal"
+            );
+            assert_eq!(probe["method"], "ping");
+            assert!(matches!(listener.accept(),Err(e) if e.kind()==io::ErrorKind::WouldBlock));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[test]
     fn allocation_dry_run_refuses_old_server_before_sending_allocation() {
