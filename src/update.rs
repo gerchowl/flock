@@ -2678,6 +2678,7 @@ mod tests {
                     agent_questions: true,
                     structured_agents: true,
                     pane_input_write_ack: false,
+                    events_live_start: false,
                 }),
                 session_health: None,
                 api_listener: None,

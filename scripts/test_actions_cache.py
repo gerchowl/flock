@@ -91,9 +91,7 @@ class ActionsCachePolicy(unittest.TestCase):
             ('preview.yml', 'build'), ('release.yml', 'build'),
         })
 
-    def test_ci_lint_uses_the_dev_shell_and_bounded_dev_only_store_cache(self):
-        document = workflow('ci-leg.yml')
-        job = document['jobs']['lint']
+    def assert_ci_dev_shell_cache(self, document, job, command):
         install, = [s for s in job['steps']
                     if s.get('uses', '').startswith('cachix/install-nix-action@')]
         cache, = [s for s in job['steps']
@@ -107,19 +105,39 @@ class ActionsCachePolicy(unittest.TestCase):
         self.assertFalse(inputs.get('purge', False))
         for platform in ('linux', 'macos'):
             self.assertEqual(inputs[f'gc-max-store-size-{platform}'], '2G')
-        self.assertIn('runner.os', inputs['primary-key'])
-        self.assertIn("hashFiles('flake.lock', 'flake.nix', 'nix/**')", inputs['primary-key'])
+        self.assertEqual(cache['uses'],
+                         'nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569')
+        self.assertEqual(inputs['primary-key'],
+                         "nix-v1-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}")
         for unstable in ('github.run', 'github.sha', 'github.ref'):
             self.assertNotIn(unstable, inputs['primary-key'])
         self.assertEqual(inputs['restore-prefixes-first-match'], 'nix-v1-${{ runner.os }}-')
+        run = next(step for step in job['steps'] if step.get('run') == command)
+        self.assertLess(job['steps'].index(install), job['steps'].index(cache))
+        self.assertLess(job['steps'].index(cache), job['steps'].index(run))
+
+    def test_ci_lint_uses_the_dev_shell_and_bounded_dev_only_store_cache(self):
+        document = workflow('ci-leg.yml')
+        job = document['jobs']['lint']
+        self.assert_ci_dev_shell_cache(document, job, 'nix develop -c just lint')
         commands = {step['run'] for step in job['steps'] if 'run' in step}
         self.assertEqual(commands, {
             'nix develop -c just lint', 'nix develop -c just doc-check',
             'nix develop -c just script-tests',
         })
-        lint = next(step for step in job['steps'] if step.get('run') == 'nix develop -c just lint')
-        self.assertLess(job['steps'].index(install), job['steps'].index(cache))
-        self.assertLess(job['steps'].index(cache), job['steps'].index(lint))
+
+    def test_archived_shards_run_in_the_dev_shell_on_every_platform(self):
+        document = workflow('ci-leg.yml')
+        job = document['jobs']['test']
+        steps = job['steps']
+        run, = [s for s in steps if s.get('name') == 'Run shard']
+        self.assertEqual(run['run'],
+                         "nix develop -c just ci-shard '${{ inputs.leg }}' "
+                         "'${{ matrix.shard.name }}' nextest-archive.tar.zst")
+        self.assertNotIn('if', run)
+        # The Nix installer otherwise points TMPDIR under the runner's HOME.
+        self.assertEqual(run.get('env', {}).get('TMPDIR'), '/tmp')
+        self.assert_ci_dev_shell_cache(document, job, run['run'])
 
     def test_nix_cache_is_bounded_pinned_and_written_only_by_dev(self):
         document = workflow('nix.yml')
