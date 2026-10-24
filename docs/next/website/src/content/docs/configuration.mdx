@@ -96,8 +96,11 @@ An already running `flk mcp serve` is a separate process: it keeps its startup c
 push capability, body limit and reconnect interval. Restart that MCP process to apply
 `msg.channel_push`, `msg.channel_push_body_max_bytes` or
 `msg.channel_push_reconnect_secs` there; server reload does not renegotiate an existing
-MCP session.
-
+MCP session. A reload that changes these effective channel options returns `partial`
+with a `restart_required` diagnostic naming the existing MCP sessions and the
+`flk mcp serve` process to restart. Server-side message policy still applies live.
+Unrelated message changes do not produce this diagnostic, and rejected `[msg]`
+sections only report their validation diagnostics.
 
 ## Terminal defaults
 
