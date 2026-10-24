@@ -10,8 +10,8 @@
 //! Lost/corrupt snapshots recover empty at that floor with a typed diagnostic.
 //! Missing/corrupt cursor evidence cannot silently authorize a reset to zero.
 #![deny(missing_docs)]
-// #1832 slice 6b adds the product caller after subscription machinery lands.
-#![allow(dead_code)]
+// The non-web binary has no stream consumer.
+#![cfg_attr(not(feature = "web"), allow(dead_code))]
 
 use super::registry::Record;
 use crate::api::agent_state::AgentState;
@@ -329,6 +329,11 @@ impl Store {
         })
     }
 
+    /// Durable allocation floor, including reserved checkpoint positions.
+    pub fn high_water(&self) -> u64 {
+        self.high_water
+    }
+
     /// Recovery facts from opening, retained until this owner is dropped.
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
@@ -398,7 +403,7 @@ impl Store {
     /// Create and persist an initial/recovery checkpoint. The returned owned cut
     /// remains stable through later mutations. Every row consumes a new seq per
     /// ADR-0036 §4; an empty checkpoint retains its nonzero head across restart.
-    /// 6b must serialize publication of the whole cut with live deltas.
+    /// 6b serializes cut capture with live registration, then delivers it privately.
     pub fn snapshot(&mut self) -> io::Result<Snapshot> {
         let rows = self.number(
             self.rows

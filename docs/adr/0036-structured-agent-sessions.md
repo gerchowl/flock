@@ -1243,7 +1243,10 @@ existing inline gap/checkpoint path. Fleet `ev` payloads are the closed tagged
 
 S7-min slice 6a (#1832) supplies only the provider core: structured registry
 identity/label, S4 state, current activity and S6 waiting IDs project into these
-rows. Amendment #1976 adds an independent durable cursor reservation record:
+rows. Slice 6b omits optional `activity`: the structured registry and S4 have no
+activity producer yet. [#2243](https://github.com/gerchowl/flock/issues/2243)
+tracks that producer; no value is inferred from transcripts or PTY state.
+Amendment #1976 adds an independent durable cursor reservation record:
 under the same exclusive lock, fsync/rename/fsync-dir the cursor first, then
 atomically replace the rows/high-water snapshot by the same discipline, before
 returning changes or checkpoint cuts. The snapshot still mirrors its high-water
@@ -1261,9 +1264,25 @@ than resetting it. A valid legacy snapshot with an unmarked lock seeds the new
 cursor durably; thereafter a durable marker on the locked inode makes cursor
 loss a refusal, not a migration from an older snapshot. When both records are
 valid, the maximum high-water wins. Any uncertain write requires reopening the
-store before another publication. Slice 6b on #1832 wires the provider into
-subscriptions and serializes each checkpoint batch with live deltas; 6a has no
-product caller or transport. Before serving after cold boot, 6b refreshes the
+store before another publication. Slice 6b (#2225) wires the provider into
+authenticated `fleet` subscriptions.
+Its single owner serializes refresh, durable checkpoint allocation, pending live
+publication, and new-cut registration. Each checkpoint belongs only to its
+requesting subscription, using that cut's acknowledged replay path. The shared
+ring carries only live deltas, so one reader's resnapshot cannot lag another
+reader. Checkpoint positions remain globally reserved: another cut's next live
+sequence can jump past those private positions without missing a mutation.
+Storage and frame preparation run off the executor; live publication
+yields between frames. Replay retains an immutable cut while later mutations
+enter its live continuation. Owner-turn
+observations coalesce to the latest materialization; the agent journal, not
+fleet-lite, retains every intermediate harness event. The live ring holds sixteen
+frames, each preflighted once with the maximum escaped subscription-ID overhead
+within the endpoint's existing 64 KiB message limit; overflow retires
+only the affected subscription ID. A fresh ID requests a complete snapshot, and
+absent rows disappear only at its advertised completion. Permission IDs come from
+the runtime book's open, non-automatic requests, never S4 phase inference. Before
+serving after cold boot, 6b refreshes the
 registry/S4/S6 provider cut; persisted observation state grants no process lease
 or resume authority. Local file locking does not implement S7-rest's
 single-writer handoff protocol.
