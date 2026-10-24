@@ -10,6 +10,8 @@ use tokio::{
 const ACTIVE: usize = 8;
 /// Lifetime identity budget. Exhaustion ends the socket without forgetting IDs.
 const IDS: usize = 1024;
+/// Maximum subscription ID length in UTF-8 bytes, also reserved by fleet frames.
+pub(super) const ID_BYTES: usize = 128;
 /// Global queued/running page jobs. Cancelled waiters retain their job's permit.
 pub(super) static IO: Semaphore = Semaphore::const_new(32);
 pub(super) struct Hint {
@@ -62,7 +64,7 @@ impl Subscriptions {
     }
     /// False requests a resource close. Refusals consume the ID too.
     pub(super) fn subscribe(&mut self, id: String, stream: String, after: Option<u64>) -> bool {
-        if id.len() > 128 || stream.len() > 256 {
+        if id.len() > ID_BYTES || stream.len() > 256 {
             return false;
         }
         self.active.retain(|_, sub| !sub.task.is_finished());
@@ -102,7 +104,9 @@ impl Subscriptions {
                     .await
                 {
                     Some(Ok(())) => {
-                        if stream.starts_with("agent/") {
+                        if stream == "fleet" {
+                            super::fleet::replay(&shared.fleet, &data, &fence, &id, after).await
+                        } else if stream.starts_with("agent/") {
                             replay(&owner, &data, &fence, &hints, &id, &stream, after).await
                         } else {
                             Err(Some(SubfailCode::UnknownStream))
@@ -135,7 +139,7 @@ impl Subscriptions {
         true
     }
 }
-async fn deliver(
+pub(super) async fn deliver(
     data: &mpsc::Sender<Delivery>,
     live: &Arc<AtomicBool>,
     frame: ServerFrame,
