@@ -1129,3 +1129,149 @@ fn opening_recovery_preserves_opaque_future_items_and_bytes() {
     drop(service);
     assert_eq!(fs::read(path(&case)).unwrap(), before);
 }
+
+#[tokio::test]
+async fn worker_queue_needs_human_and_result_burst_rejects_stale_idle() {
+    let mut r = Run::new(230, "queue", default_policy).await;
+    r.control(json!({"op":"result"}));
+    r.until(|r| r.registry.get(&r.case.id).unwrap().1.update.state.turn == Turn::Idle)
+        .await;
+    r.admit(1).await;
+    r.until(|r| !r.inputs().is_empty()).await;
+    r.admit(2).await;
+    let stale = owner_queue::Snapshot {
+        state: r.registry.get(&r.case.id).unwrap().1.update.state.clone(),
+        through: r.workers.entries[&r.case.id].queue_seq,
+    };
+    let mut started = event("command_lifecycle");
+    started["command_uuid"] = json!(id(1));
+    pump_burst(
+        &mut r,
+        vec![started, event("control_request"), event("result")],
+        false,
+    )
+    .await;
+    assert!(r.latest_item(2).unwrap().get("awaiting_result").is_none());
+    let notify = r.notify.clone();
+    wait(&notify, || {
+        r.workers
+            .runtime(&r.case.id, r.case.generation)
+            .unwrap()
+            .queue_state(stale.clone())
+    })
+    .await;
+    r.workers
+        .enqueue(&r.registry, &r.case.id, r.case.generation, request(3))
+        .unwrap();
+    wait(&notify, || {
+        while let Some(update) = r
+            .workers
+            .queue_update(&r.registry, &r.case.id, r.case.generation)
+        {
+            r.updates.push(update);
+        }
+        r.updates
+            .iter()
+            .any(|u| u.admitted.as_ref().is_some_and(|(key, _)| key == &id(3)))
+    })
+    .await;
+    assert!(
+        r.latest_item(2).unwrap().get("awaiting_result").is_none(),
+        "NeedsHuman/result crossed the stale Idle gate"
+    );
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn worker_queue_cold_subscription_is_typed_and_generation_fenced() {
+    let (mut registry, workers, _, _) = owner();
+    let (case, _, _) = Case::prepare(&mut registry, 231, "queue", vec![]);
+    let mut journal = Journal::open(case.fixture.root.path(), &case.id).unwrap();
+    journal
+        .append(Change::Upsert {
+            item: Box::new(request(1).item),
+            position: 0,
+        })
+        .unwrap();
+    drop(journal);
+    let before = fs::read(path(&case)).unwrap();
+    let refusal = workers
+        .queue_source(&registry, &case.id, case.generation)
+        .err()
+        .unwrap();
+    assert_eq!(refusal.as_str(), "queue_source_cold");
+    assert_eq!(refusal.retry(), crate::cli::exit::Retry::Later);
+    assert!(matches!(
+        workers.queue_source(&registry, &case.id, case.generation + 1),
+        Err(ErrorCode::AgentNotFound)
+    ));
+    assert_eq!(fs::read(path(&case)).unwrap(), before);
+}
+
+#[tokio::test]
+async fn worker_queue_admission_is_published_by_its_live_owner_and_retained_after_exit() {
+    use crate::structured::{
+        publication::{Provider, Subscription},
+        workers::queue::publication::Page,
+    };
+    let mut r = Run::new(232, "queue", default_policy).await;
+    let source = r
+        .workers
+        .queue_source(&r.registry, &r.case.id, r.case.generation)
+        .unwrap();
+    let mut reader = source.subscribe(None).unwrap();
+    let wake = reader.waker();
+    let mut observed = vec![];
+    wait(&wake, || {
+        r.pump();
+        loop {
+            match reader.page() {
+                Page::Pending => return false,
+                Page::Synced(n) => {
+                    observed.push(n);
+                    return true;
+                }
+                Page::Refused(e) => panic!("bootstrap refused {e:?}"),
+                _ => (),
+            }
+        }
+    })
+    .await;
+    r.admit(1).await;
+    wait(&wake, || {
+        r.pump();
+        loop {
+            match reader.page() {
+                Page::Record(v)
+                    if v["item"]["item_id"] == id(1)
+                        || v["items"]
+                            .as_array()
+                            .is_some_and(|items| items.iter().any(|i| i["item_id"] == id(1))) =>
+                {
+                    return true
+                }
+                Page::Pending => return false,
+                Page::Refused(e) => panic!("publication refused {e:?}"),
+                _ => (),
+            }
+        }
+    })
+    .await;
+    r.stop().await;
+    let mut terminal = source.subscribe(None).unwrap();
+    let mut saw_snapshot = false;
+    let mut ended = false;
+    for _ in 0..100 {
+        match terminal.page() {
+            Page::Gap(_) => saw_snapshot = true,
+            Page::End => {
+                ended = true;
+                break;
+            }
+            Page::Refused(e) => panic!("terminal refused {e:?}"),
+            _ => (),
+        }
+    }
+    assert!(saw_snapshot && ended);
+    assert!(!observed.is_empty());
+}

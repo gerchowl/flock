@@ -196,18 +196,34 @@ max_spawn_fanout = {fanout}
                 refusal = json.loads(channel.readline())
                 assert refusal["exit"] == 13, refusal
                 assert refusal["response"]["error"]["code"] == "operator_only", refusal
-            # Until #1956 consumes terminal queue cuts, unread completions fence resume.
-            resumed = cli("agent", "start", "dogfood-child", "--runtime", "structured", "--", "claude", code=1)
-            assert resumed["error"]["code"] == "session_busy", resumed
+            resumed = cli("agent", "start", "dogfood-child", "--runtime", "structured", "--", "claude")["result"]["agent"]
+            assert resumed["agent_id"] == child_id and resumed["session_id"] == child["session_id"]
+            assert select.select([resume_ready], [], [], 10)[0], "opening session resume missing"
+            assert os.read(resume_ready, 1) == b"R"
+            assert tool("flock_agent_start", extra)["error"]["data"]["refusal"] == expected
+            cli("agent", "stop", child_id)
+            observe(child_id, "offline")
             control.sendall(b'"close"\n')
             channel.close()
             channel = None
             control.close()
             cli("agent", "stop", parent_id)
+            observe(parent_id, "offline")
+            resumed_parent = cli("agent", "start", "dogfood-parent", "--runtime", "structured", "--", "claude")["result"]["agent"]
+            assert resumed_parent["session_id"] == created["session_id"]
+            assert select.select([ready], [], [], 10)[0], "idle session resume missing"
+            assert os.read(ready, 1) == b"R"
+            with socket.socket(socket.AF_UNIX) as resumed_control:
+                resumed_control.settimeout(10)
+                resumed_control.connect(str(root / "control"))
+                resumed_control.sendall(b'"close"\n')
+            cli("agent", "stop", parent_id)
+            observe(parent_id, "offline")
             cli("server", "stop")
             assert server.wait(timeout=15) == 0
             return {"scenario":scenario,"status":"passed", "public_cli":True,"real_mcp":True,
-                    "scoped_identity":True,"framed_opening_turn":True,"isolated_home":True}
+                    "scoped_identity":True,"framed_opening_turn":True,"isolated_home":True,
+                    "operator_resume_with_opening":True,"operator_resume_without_opening":True}
         finally:
             if channel is not None:
                 channel.close()

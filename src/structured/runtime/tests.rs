@@ -1311,3 +1311,151 @@ async fn queue_stdin_failure_requests_stop_even_without_io_cancellation() {
     );
     workers.shutdown(&mut registry).unwrap();
 }
+
+#[test]
+fn queue_cancelled_input_requests_stop_through_the_real_event_pump() {
+    use crate::structured::{
+        queue::admission::{Gate, Principal},
+        workers::queue,
+    };
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (stdout, _producer) = UnixStream::pair().unwrap();
+    let (_consumer, stdin) = UnixStream::pair().unwrap();
+    let transport = Transport::start(
+        File::from(OwnedFd::from(stdout)),
+        File::from(OwnedFd::from(stdin)),
+        StreamLocation {
+            data_dir: root.path().into(),
+            storage: Default::default(),
+            agent: "queue-cancel-fixture".into(),
+            session: "fixture-session".into(),
+        },
+        "fixture-version".into(),
+    )
+    .unwrap();
+    let (service, client) = queue::Service::open(
+        root.path(),
+        "queue-cancel-fixture",
+        std::num::NonZeroU64::new(u64::MAX).unwrap(),
+    )
+    .unwrap();
+    let mut idle = crate::api::agent_state::AgentState::unknown();
+    idle.lifecycle = crate::api::agent_state::Lifecycle::Live;
+    idle.turn = crate::api::agent_state::Turn::Idle;
+    idle.attention = crate::api::agent_state::Attention::None;
+    assert!(client.state(queue::Snapshot {
+        state: idle,
+        through: 0
+    }));
+    client
+        .enqueue(queue::Request {
+            item: crate::structured::queue::tests::item("00000000-0000-4000-8000-000000000001"),
+            principal: Principal::Operator,
+            gate: Gate::Send,
+        })
+        .unwrap();
+    let stop = StopRequest::default();
+    let control = transport.stop_handle();
+    control.cancel();
+    let (tx, _rx) = mpsc::sync_channel(4);
+    let facts = collect(&transport, &stop, &control, tx, &|| {}, Some(service));
+    let mut outcomes = vec![];
+    let mut saw_write_failure = false;
+    while let Some(update) = client.update() {
+        outcomes.push(format!("{update:?}"));
+        saw_write_failure |= update
+            .offer
+            .is_err_and(|e| e.code == crate::api::error_code::ErrorCode::InputWriteFailed);
+    }
+    assert!(
+        saw_write_failure,
+        "queue never exercised cancelled stdin admission: {outcomes:?}, stop={}, error={:?}",
+        stop.requested(),
+        facts.error
+    );
+    assert!(
+        stop.requested(),
+        "queue cancellation only closed pipes without requesting stop"
+    );
+}
+
+#[tokio::test]
+async fn queue_subscriptions_are_serviced_when_completion_channel_is_full() {
+    use crate::structured::{
+        publication::{Provider, Subscription},
+        queue::admission::{Gate, Principal},
+        workers::queue::{self, publication::Page},
+    };
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (stdout, _producer) = UnixStream::pair().unwrap();
+    let (_consumer, stdin) = UnixStream::pair().unwrap();
+    let transport = Transport::start(
+        File::from(OwnedFd::from(stdout)),
+        File::from(OwnedFd::from(stdin)),
+        StreamLocation {
+            data_dir: root.path().into(),
+            storage: Default::default(),
+            agent: "saturated-fixture".into(),
+            session: "fixture-session".into(),
+        },
+        "fixture-version".into(),
+    )
+    .unwrap();
+    let (mut service, client) = queue::Service::open(
+        root.path(),
+        "saturated-fixture",
+        std::num::NonZeroU64::new(u64::MAX).unwrap(),
+    )
+    .unwrap();
+    for n in 0..5 {
+        client
+            .enqueue(queue::Request {
+                item: crate::structured::queue::tests::item(&format!(
+                    "00000000-0000-4000-8000-{n:012}"
+                )),
+                principal: Principal::Operator,
+                gate: Gate::Send,
+            })
+            .unwrap();
+        service.tick(&transport.input_handle(), false, &|| {});
+        assert_eq!(service.flush(false, &|| {}), n < 4);
+    }
+    let mut reader = client.source.subscribe(None).unwrap();
+    let wake = reader.waker();
+    let control = transport.stop_handle();
+    let cancel = transport.stop_handle();
+    let (tx, _rx) = mpsc::sync_channel(4);
+    let worker = std::thread::spawn(move || {
+        collect(
+            &transport,
+            &StopRequest::default(),
+            &control,
+            tx,
+            &|| {},
+            Some(service),
+        )
+    });
+    let observed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match reader.page() {
+                Page::Synced(_) => break Ok(()),
+                Page::Pending => notified.await,
+                Page::Refused(code) => return Err(format!("subscription refused: {code:?}")),
+                Page::End | Page::Lagged(_) => return Err("subscription closed before sync".into()),
+                _ => (),
+            }
+        }
+    })
+    .await;
+    cancel.cancel();
+    worker.join().unwrap();
+    assert!(
+        matches!(observed, Ok(Ok(()))),
+        "completion saturation stranded the subscription: {observed:?}"
+    );
+}

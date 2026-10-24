@@ -109,6 +109,9 @@ impl Runtime {
     pub(super) fn queue_updates_pending(&self) -> bool {
         self.queue.as_ref().is_some_and(|q| q.has_updates())
     }
+    pub(super) fn queue_source(&self) -> Option<super::workers::queue::publication::Source> {
+        Some(self.queue.as_ref()?.source.clone())
+    }
     pub(super) fn queue_update(&self) -> Option<super::workers::queue::Update> {
         self.queue.as_ref()?.update()
     }
@@ -575,6 +578,7 @@ fn collect(
         }
         let input = transport.input_handle();
         let queue_ready = queue.as_mut().is_none_or(|queue| {
+            queue.capture();
             if !queue.flush(control.cancelled(), notify) {
                 return false;
             }

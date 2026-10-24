@@ -422,14 +422,7 @@ async fn cli_socket_launch_observes_configured_stall_without_changing_phase() {
             json!({"name":"fixture-launch", "runtime":"structured", "argv":["claude"]}),
         )
         .unwrap();
-        let blocked = fixture.request(Method::AgentStart(resume.clone())).await;
-        assert_eq!(blocked["error"]["code"], "session_busy", "{blocked}");
-        while fixture
-            .app
-            .structured_workers
-            .queue_update(&fixture.app.state.structured_agents, &id, generation)
-            .is_some()
-        {}
+        fixture.app.service_structured_workers(Instant::now());
         let resumed = fixture.request(Method::AgentStart(resume)).await;
         assert_eq!(resumed["result"]["agent"]["agent_id"], id, "{resumed}");
         assert_eq!(
