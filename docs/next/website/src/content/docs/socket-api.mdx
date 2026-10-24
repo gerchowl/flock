@@ -1092,6 +1092,17 @@ Remove these settings and callers:
 
 Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown keys with file and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
 
+### Explicit Codex lock resolution
+
+`pane.resolve_codex_lock {pane_id, choice: "retry" | "fork", write_timeout_ms?}`
+checks the pane's live `codex_conversation_locked` screen before admitting one
+`r` or `f` without Enter. `write_timeout_ms` has the same 1..=30000 validation
+and 10000 ms default as `pane.send_keys`. A pane no longer showing the lock
+refuses with `agent_not_ready`, without input. This is an explicit keyboard
+operation, not an automatic reply or an MCP tool. Use `delegate send
+--resolve-lock` for a recorded choice and bounded screen confirmation. Older
+servers reject the method; clients must not fall back to raw keys.
+
 ### Structured session read/control contracts
 
 `agent.list` adds `structured_agents` (defaulting to `[]` when absent in an older

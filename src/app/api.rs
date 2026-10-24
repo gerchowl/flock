@@ -1705,6 +1705,9 @@ impl App {
             Method::PaneStashRestore(target) => {
                 return self.handle_pane_stash_restore(request.id, target)
             }
+            Method::PaneResolveCodexLock(params) => {
+                return self.handle_resolve_codex_lock(request.id, params)
+            }
             Method::PaneSendKeys(params) | Method::PaneWriteKeys(params) => {
                 return self.handle_pane_send_keys(request.id, params)
             }
