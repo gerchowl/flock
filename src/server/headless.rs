@@ -4237,19 +4237,16 @@ fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
     clippy::print_stderr,
     reason = "startup fatal errors (socket already in use) must surface on the launching process's stderr before tracing is bootstrapped for the user"
 )]
-pub fn run_server() -> io::Result<()> {
+pub fn run_server(args: &[String], handoff_socket: Option<PathBuf>) -> io::Result<()> {
     crate::platform::raise_server_nofile_limit();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(2).map(String::as_str) == Some("--handoff-import") {
-        let socket_path = args
-            .get(3)
-            .map(PathBuf::from)
+    if args.first().map(String::as_str) == Some("--handoff-import") {
+        let socket_path = handoff_socket
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff socket"))?;
         // Old running exporters use the positional channel. Keep import compatible
         // across upgrades; new exporters supply only the environment channel.
         let token = std::env::var(crate::server::handoff::HANDOFF_TOKEN_ENV)
-            .or_else(|_| args.get(4).cloned().ok_or(std::env::VarError::NotPresent))
+            .or_else(|_| args.get(1).cloned().ok_or(std::env::VarError::NotPresent))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
         // Consume before starting threads or children, so panes cannot inherit it.
         std::env::remove_var(crate::server::handoff::HANDOFF_TOKEN_ENV);

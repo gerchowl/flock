@@ -9,6 +9,11 @@ Most commands print JSON responses. Use them from scripts when you want determin
 
 When an existing status ping, submission guard, or failed command reveals a different server protocol, the CLI prints one warning to stderr per invocation. Read-only commands add no status probe; a state-changing command adds one ping per invocation, cached for the rest of it (see below). Unknown-method errors from older-protocol servers become `server_version_gap`, with the server version, protocol, required client protocol, and recovery command: `flk server live-handoff` (or restart the server). Surfaced failures return **exit code 78**; optional lookups that consume the error preserve the command's successful exit. Equal or newer protocols retain the original API error. Every state-changing command (`delegate start` and `send`, `agent start`, `restart` and `send`, `pane send-*` and `submit`, `worktree create`, `msg send` and `reply`, and the rest) checks the server protocol before its first state-changing request and refuses an older server with `server flk X (protocol N) is incompatible with client flk Y (protocol M)` and exit 78, so nothing is half-created. That check costs one ping per invocation. Read-only commands, `flk status` and `flk server` (including `live-handoff` and `stop`) still reach an older server, since handing it off is the fix. Diagnosis probes have a 500 ms timeout and reuse a server identity already obtained during the invocation. An unavailable probe leaves the original error intact. MCP tools return the same skew message with `error.data.refusal: "server_version_gap"`.
 
+CLI text arguments must be valid UTF-8. Invalid encoding is refused before command
+execution with `invalid_params` and usage exit 2, rather than panicking. This early
+parse error prints on stderr before output-format selection. Native socket paths
+used by the internal handoff importer retain their original OS bytes.
+
 ## Exit codes
 
 `flk --help` lists every exit code, what it means and whether retrying is safe, from one registry (`src/cli/exit.rs`). Four cases moved in #1025, and for one release each prints `note: exit code is now N (was M); see CHANGELOG` on stderr when it returns its new code. stdout, `--json` output included, is unchanged.
