@@ -271,6 +271,38 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn reload_msg_allowlist_changes_mesh_admission_and_keeps_invalid_policy() {
+        let _env = crate::config::test_config_env_guard();
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("config.toml");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = app();
+        assert_eq!(app.check_mesh_import(&delivery(), "hub.example"), Ok(None));
+        std::fs::write(&path, "[msg]\nallow_from = [\"hub.example\"]\n").unwrap();
+        let report = app.apply_config_from_disk(false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        // The configured hub is the forwarder, not the authenticated origin.
+        assert_eq!(
+            app.check_mesh_import(&delivery(), "hub.example"),
+            Err("msg_not_allowed".into())
+        );
+        std::fs::write(&path, "[msg]\nallow_from = 42\n").unwrap();
+        let report = app.apply_config_from_disk(false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("msg")));
+        assert_eq!(app.state.config.msg.allow_from, ["hub.example"]);
+        assert!(app.state.config.msg.enabled);
+        assert_eq!(
+            app.check_mesh_import(&delivery(), "hub.example"),
+            Err("msg_not_allowed".into())
+        );
+    }
+
+    #[tokio::test]
     async fn narrowed_allow_from_refuses_origin_with_no_configured_name() {
         let _store = crate::mesh::runtime_store::TestStore::new();
         let mut app = app();

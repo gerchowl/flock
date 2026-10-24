@@ -1974,6 +1974,14 @@ impl App {
             self.state.config.channels = config.channels.clone();
             crate::channels::issue_tokens(&config.channels, &short_host_name());
         }
+        // ADR-0041 decision 4: these server policies are read at use time.
+        // Existing admissions and process environment snapshots stay intact.
+        if !invalid_section("msg") {
+            self.state.config.msg = config.msg.clone();
+        }
+        if !invalid_section("spawn") {
+            self.state.config.spawn = config.spawn.clone();
+        }
         // Sections without an explicit invalidation gate always follow the
         // incoming config.
         self.state.config.name = config.name.clone();

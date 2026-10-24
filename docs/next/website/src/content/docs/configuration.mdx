@@ -79,6 +79,26 @@ You can also open the global menu in Flock and choose `reload config`.
 
 Reload applies most UI settings without restarting panes. Startup-only settings still need a restart.
 
+Valid `[msg]` settings apply to subsequent server operations immediately, including
+`enabled`, the authenticated-origin `allow_from` policy, message limits and idle-wake
+policy. Tightening the allowlist does not remove messages already admitted to an inbox.
+
+Valid `[spawn.env]` declarations apply to subsequent starts, forks, profile recording
+and resumes. Existing agent processes keep their environments. Recorded launch
+snapshots are retained; resume filters them through the newly declared keys. Newly
+declared values cannot be reconstructed for an already-hibernated agent if they were
+never recorded. Hibernating a running agent records its profile using the current
+declarations before stopping it.
+Invalid `[msg]` or `[spawn]` sections retain their last running values and produce reload
+diagnostics, while other valid sections can still apply.
+
+An already running `flk mcp serve` is a separate process: it keeps its startup channel
+push capability, body limit and reconnect interval. Restart that MCP process to apply
+`msg.channel_push`, `msg.channel_push_body_max_bytes` or
+`msg.channel_push_reconnect_secs` there; server reload does not renegotiate an existing
+MCP session.
+
+
 ## Terminal defaults
 
 Set the executable Flock uses for newly created interactive panes:

@@ -222,6 +222,53 @@ mod tests {
     }
 
     #[test]
+    fn reload_spawn_env_changes_resume_selection_and_keeps_launch_snapshot() {
+        let _env = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("config.toml");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let snapshot = vec![
+            ("CLAUDE_CONFIG_DIR".into(), "old-profile".into()),
+            ("TEST_PROFILE_DIR".into(), "new-profile".into()),
+        ];
+        let (mut app, terminal_id) = app_with_claude_pane(snapshot.clone());
+        let plan = crate::agent_resume::AgentResumePlan {
+            agent: "claude".into(),
+            argv: vec!["claude".into()],
+            dedupe_key: "reload-fixture".into(),
+        };
+        assert_eq!(
+            app.resume_profile_env(&terminal_id, &plan),
+            vec![snapshot[0].clone()]
+        );
+        std::fs::write(&path, "[spawn.env]\nclaude = [\"TEST_PROFILE_DIR\"]\n").unwrap();
+        let report = app.apply_config_from_disk(false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(
+            app.resume_profile_env(&terminal_id, &plan),
+            vec![snapshot[1].clone()]
+        );
+        assert!(
+            crate::spawn::allowlist::for_argv(&plan.argv, &app.state.config.spawn.env)
+                .keys()
+                .contains(&"TEST_PROFILE_DIR".to_string())
+        );
+        assert_eq!(app.state.terminals[&terminal_id].launch_env, snapshot);
+        std::fs::write(&path, "[spawn.env]\nclaude = 42\n").unwrap();
+        let report = app.apply_config_from_disk(false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("spawn")));
+        assert_eq!(
+            app.resume_profile_env(&terminal_id, &plan),
+            vec![snapshot[1].clone()]
+        );
+        assert_eq!(app.state.terminals[&terminal_id].launch_env, snapshot);
+    }
+
+    #[test]
     fn resume_reexports_the_recorded_profile_and_nothing_undeclared() {
         let (app, terminal_id) = app_with_claude_pane(vec![
             ("CLAUDE_CONFIG_DIR".into(), "/p/eth".into()),
