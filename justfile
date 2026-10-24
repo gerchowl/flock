@@ -61,9 +61,12 @@ lint: ts-check
 doc-check:
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
 
+# Shipped feature set shared by local CI and the archived shard inventory.
+ci_features := "web,ts"
+
 # Run PR CI checks
 ci filter='all()': lint
-    cargo nextest run --locked --features ts -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+    cargo nextest run --locked --features {{ci_features}} -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
 
 # Build both feature variants with an explicit fixture input, proving GUI
 # embedding and exclusion without the independent frontend build (#1826).
@@ -75,11 +78,12 @@ gui-check:
 # fail unless the shards in .config/ci-shards.toml partition `leg`'s tests
 # exactly (#991). Writes the shard matrix to $GITHUB_OUTPUT when set.
 ci-archive leg archive:
-    cargo nextest archive --locked --features ts --archive-file "{{archive}}"
+    cargo nextest archive --locked --features {{ci_features}} --archive-file "{{archive}}"
     python3 scripts/ci_shards.py verify --leg "{{leg}}" --archive-file "{{archive}}"
 
 # Run one CI shard, named in .config/ci-shards.toml, from an
-# archive made by `ci-archive`. It is extracted into this checkout's target/
+# web/ts archive made by `ci-archive`, with its feature set already compiled.
+# It is extracted into this checkout's target/
 # because the integration tests bake `env!("CARGO_BIN_EXE_flk")` in at compile
 # time, so the binary must sit where the build put it. JUnit lands in
 # target/nextest/ci/junit.xml.
