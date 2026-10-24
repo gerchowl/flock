@@ -29,6 +29,9 @@ pub const MAX_OPEN_PERMISSION_REQUESTS: usize = 16;
 /// and session grants. Beyond this FIFO window, late decisions are unknown.
 pub const CLOSED_PERMISSION_REQUEST_WINDOW: usize = 1024;
 pub(super) const MAX_GRANTS: usize = 16;
+/// Maximum UTF-8 bytes in an operator decision message after CRLF normalization
+/// and trimming. Invalid messages are refused before reserving any request.
+pub const MAX_PERMISSION_DECISION_MESSAGE_BYTES: usize = 2048;
 
 use super::claude::ToolRequest;
 use crate::api::error_code::ErrorCode;
@@ -80,7 +83,10 @@ pub struct AgentDecide {
     pub request_seq: u64,
     /// One of the three permission decisions.
     pub decision: Decision,
-    /// Optional reason, carried verbatim in a deny response and audit.
+    /// Optional reason, normalized from CRLF to LF and trimmed before delivery.
+    /// At most [`MAX_PERMISSION_DECISION_MESSAGE_BYTES`] UTF-8 bytes. Uses
+    /// `prompt_control_bytes` rules: newlines and tabs survive; other controls
+    /// are refused with `invalid_params` before reserving the request.
     #[serde(default)]
     pub message: Option<String>,
 }
@@ -272,11 +278,22 @@ impl Book {
         if args.agent != self.agent {
             return Err(ErrorCode::AgentNotFound);
         }
+        let normalized = args
+            .message
+            .as_deref()
+            .map(|text| text.replace("\r\n", "\n"));
+        let message = normalized.as_deref().map(str::trim);
+        if message.is_some_and(|text| {
+            text.len() > MAX_PERMISSION_DECISION_MESSAGE_BYTES
+                || crate::control_bytes::carries_any(text)
+        }) {
+            return Err(ErrorCode::InvalidParams);
+        }
         self.answer(
             &args.request_id,
             args.request_seq,
             args.decision,
-            args.message.as_deref(),
+            message,
             subject,
             "token",
         )
