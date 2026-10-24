@@ -40,6 +40,13 @@ impl QueueEvents {
     fn publish(workers: &Workers, hub: &EventHub, terminal: bool) -> bool {
         let mut changed = false;
         for (_, _, update) in workers.queue_completions(terminal) {
+            changed = true;
+            if let Err(error) = &update.offer {
+                tracing::warn!(
+                    code = error.code.as_str(),
+                    "structured queue operation refused"
+                );
+            }
             for fact in update.facts {
                 hub.push(EventEnvelope {
                     event: EventKind::QueueItemState,

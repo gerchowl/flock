@@ -85,15 +85,15 @@ available after process exit. Relaunch refuses with `session_busy` while any
 completion remains unread. An unchanged storage refusal does not generate another
 completion per harness event.
 
-Until #1957/#1958 supply a production `Workers::queue_update` consumer, relaunch
-with a queue returns `session_busy` even after the process exits. Tests and
-internal adapters explicitly drain those terminal completions first. Shutdown
-cancellation explicitly reports incomplete notification delivery and requires durable replay. Final persisted records drain
-before reservation retirement. Producer routing is #1957/#1958 and queue/global
-publication is #1956, without new queue deadlines or public endpoints here.
+The app drains bounded completion notifications after the owner publishes each
+committed cut. Operator resume therefore works after cleanup, including sessions
+started with an MCP opening turn. Internal adapters must drain completions too.
+Shutdown cancellation reports incomplete notification delivery and requires durable
+replay. Producer routing remains #1957/#1958; global facts follow in #1956.
 
-The worker machinery in #1955 is not production enforcement by itself. The
-production launch path is #1843; #1928 remains open until that path exists.
+The landed production launch path in #1843 now supplies the configured policy to
+these worker-owned queues, enforcing the production checkpoint requirement in
+#1928.
 
 The internal [queue publication provider](structured-queue-publication.md) exposes
 committed cuts without competing for the Runtime receiver. Cold recovery and

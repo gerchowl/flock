@@ -271,7 +271,14 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   requests by `request_id`, and the agent stays `waiting_on_human` until
   every one of them is answered. Working is `system/status: requesting` or
   an open `message_start`. A stall is an accepted or started input with no stdout event for
-  `[sessions] stall_ms` while no control request and no tool call is open;
+  `[sessions] stall_ms` while no control request and no tool call is open.
+  This optional setting defaults to **120000 ms** (2 minutes), with an inclusive
+  range of **5000..=3600000 ms**. Out-of-range values, including zero, are config
+  validation errors; there is no disabled value or silent clamping. A stall is
+  an observation that leaves the phase unchanged, so false positives are cheap.
+  Provider retries and rate-limit backoff can produce tens of seconds of silence;
+  two minutes avoids reporting those as stalls while exposing a hung harness.
+  The production worker caller passes the loaded value, without another default;
   a long-running tool is not a stall (its `tool_use` is open). A stall is
   reported as `agent.session_stalled{since}` and leaves the phase as it is
   (ADR-0028 §1 derivation is unchanged); it is an observation, not a timeout
@@ -309,6 +316,18 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   are paid per process, so "together" means one first, then the rest).
 
 ### 1a. Identity and the operator boundary for structured agents
+
+**Resume authority (#2047 review amendment).** Resuming an existing structured
+record is operator-only (`operator_only`), including an agent resuming itself.
+The original parent and depth survive every resume and lease generation; resume
+never re-parents a conversation. This rule is adjacent to the `may_stop` policy:
+stop remains available only to the operator and the structured agent itself.
+MCP spawn is fresh-only. Mesh relays cannot carry structured start/spawn, and the
+server independently refuses recorded mesh edges. Client token scopes, including
+`operate`, grant permission decisions, not local socket operator identity or
+resume authority. The current WebSocket terminal bridge does not dispatch the
+structured `cmd` frame; future command admission must preserve this boundary.
+The cooperative same-UID limitation of #1177 still applies.
 
 `caller_is_local_operator()` (`src/app/api/mesh.rs:182`) treats a local
 caller with no flk pane in its process ancestry as the operator. A
@@ -363,6 +382,14 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   identity: the operator's own browser is a client with an `operator`-scoped
   token that only the local operator can mint over the unix socket, and the
   `principal` in `welcome` names the token, never the address.
+
+**Scoped session MCP requests (#1734).** Every structured-session MCP API request carries a server-issued credential scoped to one lease reservation generation. The server verifies it against current kernel peer identity and the live bound lease root, and derives only an agent principal. Failed or revoked session authentication never falls back to operator ancestry classification. This applies independently to every connection, queued request and channel attachment; lease/root loss refuses subsequent admission. Already admitted work never acquires operator authority. Parent-change exit is defense in depth. Unscoped arbitrary same-UID programs retain the explicitly cooperative #1177 limitation; dedicated-account policy remains mandatory unless the operator opts out.
+
+Slice A adds the scoped local request envelope and server admission. Slice B of #1734 supplies mandatory generated MCP credentials and immutable transport propagation; public structured starts remain gated until both land. Legacy unscoped CLI/MCP requests retain their existing policy. Credentials are not operator/client tokens and never appear in logs, errors or status. Failed scoped decoding or authentication cannot be retried through legacy dispatch. Revocation precedes cleanup and lease removal; scoped subscriptions close on revoked or unreadable identity. Operations admitted before root loss may finish with agent authority only. The scoped verifier requires a living kernel process, not merely a matching birth time: zombies cannot authorize admission. The local envelope is `{"request": <Request>, "credential": <LeaseCredential>}`; malformed scoped envelopes return `invalid_request`, authentication failures return `not_authorized`, and neither path retries as a legacy request.
+
+Slice B of #1734 provisions each generation credential only in the generated private MCP configuration's child environment (`FLOCK_MCP_LEASE_CREDENTIAL`), alongside an explicit `mcp serve --structured` mode. It never enters Claude's launch environment or process arguments. Before reading stdin, the MCP child captures that mode, the absolute socket endpoint and the credential into immutable client state. Calls, compatibility probes, subscriptions and reconnects use that same state. Missing, malformed or inconsistent configuration fails startup; authentication failure never selects unscoped transport. Ordinary unscoped MCP remains compatible. Public structured starts still require the registry/start slice (#1439).
+
+Scoped verification never waits for the lease registry lock: contention has a typed refusal and no snapshot fallback. Each admission performs at most sixteen kernel process-fact reads, refusing ancestry beyond that budget. This is a bounded supported ancestry depth, not permission to trust partial evidence. Credential comparison uses opaque accumulation (`core::hint::black_box`) to prevent optimizer replacement with an early-exit comparison. Encoded credential length is public format information. Legacy unscoped malformed requests retain serde diagnosis; scoped schema failures keep their fixed, secret-free error. JSON syntax diagnostics contain no field values.
 
 ### 2. Mapping session events onto flk state, questions and waits
 
@@ -433,7 +460,44 @@ Unknown pane runtime tags also survive restore/save and disable automatic agent
 resume for that pane only; its hibernation request and shell placement survive,
 and other panes retain normal resume behavior. A registry-only session remains
 persistable even when it contains only inactive raw entries and no terminal
-workspaces; #1853 tracks the lifetime of retained-only records. Both the temporary
+workspaces.
+
+**Retained-record lifetime (corrected owner decision, #1853).** DEAD classification
+is version-independent: an element is **DEAD** only when it is not a JSON object,
+or its canonical digest equals a record already kept, live or retained (an exact
+duplicate). Canonical JSON here sorts object keys and preserves JSON value types.
+Everything else this build cannot use is **FORWARD**, never automatically pruned:
+supported-tag parse failures (including future field shapes), unknown runtime or
+harness values, empty/odd identity strings, and non-identical conflicting records
+sharing an agent ID, name or session ID. Current-build parsing/validation failure
+is never evidence that another version cannot use an object (ADR-0028 §3a).
+On save, prune DEAD records strictly older than `RETAINED_DEAD_MAX_AGE` (30 days)
+and then enforce `RETAINED_DEAD_MAX` (256), oldest first. Equal timestamps use
+original array order. The injected clock determines age; a backward clock never
+ages a record early. Missing stamps receive the next capture/save time, not an
+invented historical age. Every capture runs stamp-only preparation on its snapshot copy
+with an injected clock; undo/test captures never prune or mutate live state.
+Only actual save/export boundaries prune the live registry. A failed wall clock
+or an unknown sidecar collection format logs a warning and refuses automatic
+retention maintenance, preserving data.
+
+`first_seen_ms` is Unix milliseconds in the additive `structured_retention`
+sidecar field, never a property inserted into preserved record JSON. Each entry
+binds a timestamp to the serialized slot and a SHA-256 digest of the record's
+JSON representation. Mismatched or invalid sidecar entries are logged and kept
+raw; matching entries preserve extra fields. Recognized stamps precede opaque
+entries so stale duplicates cannot replace the active timestamp. Cold restore,
+compaction, subsequent saves and live handoff carry these stamps. Older binaries
+may drop this new sidecar on save; missing stamps then restart conservatively on
+the next new-binary save. Retention timestamps never supply runtime observations,
+lease evidence or authority.
+
+A non-array `structured_agents` collection remains raw and inactive and refuses
+admission with typed `RegistryError::UnsupportedCollectionShape`, naming the
+session-state repair guide. Never discard the whole session because of a bad
+entry. The operator list/purge commands and doctor counts/hints are the separate
+second PR of #1853; they are not enabled by this policy/persistence slice.
+Both the temporary
 snapshot file before rename and its parent directory after rename are fsynced.
 A directory sync failure after successful replacement is logged as a durability
 warning and the save reports success because the new file is already installed.
@@ -496,6 +560,36 @@ have landed. The default remains the agent user (#1177); the owner-approved
 MVP exception permits explicit operator-mode opt-in only. #1843 supplies the
 public admission wiring and isolated manual dogfood runbook for that exception.
 
+#1843 part 1 amendment (owner-approved three-part split): read/control contracts
+land before public launch. `agent.list` adds a default-empty `structured_agents`
+array, preserving the existing PTY `agents` and `fleet` fields. A
+`StructuredAgentInfo` carries `runtime: structured`, `agent_id`, optional `name`,
+`harness`, `lifecycle`, presentation `status`, the canonical ADR-0028 `state`,
+`session_id`, `cwd`, optional `model`, and `lease_state`. The optional `view`
+contains workspace/tab/pane placement only when an attached view exists; it is
+omitted until S10. No PTY placement, process id or caller credential is fabricated.
+`lease_state` is nonblocking binding evidence (`absent`, `reserved`, `bound`,
+`uncertain`), never proof of liveness or authority. Contention is uncertain.
+
+`agent.get` and its `agent.status` alias resolve registered identity/name, refusing
+cross-runtime ambiguity. `agent.stop` accepts only a structured target and is
+restricted to the operator and the structured agent itself only. PTY callers
+and lineage parents receive no stop authority. Stop latches cancellation and
+returns current facts; it does not promise immediate Offline. Offline stop is
+idempotent. A restored Unknown record refuses launch before epoch advancement or
+profile preparation, and refuses stop without process ownership, with
+`structured_recovery_required` (retry `after_human`, CLI exit 1). The operator must
+confirm cleanup and clear/re-register the record before explicit launch; no
+public recovery/force bypass is introduced. Pane-only operations, including
+attach and PTY readiness/settled waits, return `runtime_unsupported` (retry
+`never`, CLI exit 2). Required PTY `AgentInfo` fields remain unchanged.
+
+A committed successful handoff exits successfully even when its worker teardown
+cached a diagnostic. The diagnostic remains logged and carried through handoff as Unknown;
+ordinary quit still returns its typed shutdown error. Public structured start
+remains gated until part 3 and #1734 land. Part 2 owns atomic owner-thread pending
+admission; part 3 owns narrowed MCP start and the complete isolated dogfood runbook.
+
 Accepted-input silence (#1903): successful transport admission of a user
 stdin envelope supplies `Input::Accepted { at, at_ms }` through
 `Received::state_input`, using monotonic and Unix clocks captured at admission.
@@ -508,9 +602,10 @@ stall reporting exactly as for started turns. The transport serializes its host
 fast response. This is an internal stream fact, not an EventHub event kind or
 mesh frame. Its monotonic stamp belongs only to the current launch and cannot
 be reconstructed on replay; a raw host record without that stamp is skipped.
-Admission is not proof of a successful pipe write or provider turn. A cancelled
-admission requests process shutdown as well as pipe cancellation. Transport
-failure remains an explicit worker failure, and output backpressure delays
+Admission is not proof of a successful pipe write or provider turn. An unavailable
+acceptance observer requests process shutdown as well as pipe cancellation.
+Ordinary I/O cancellation does not record stop intent or change the observed exit
+outcome. Transport failure remains an explicit worker failure, and output backpressure delays
 notification rather than dropping it. No queue/scheduler feed is needed.
 
 The caller supplies monotonic observation time and its configured `stall_ms`;
@@ -1048,7 +1143,23 @@ The fsync-temp, rename, fsync-directory rule below is unchanged.
   `<data dir>/blobs/<sha256>` and the stored line keeps `{blob: sha256,
   size, preview}` in its place. Partial deltas (`stream_event`) are relayed
   live and not persisted; the complete `assistant` event that follows carries
-  the same content.
+  the same content. A corrupt object is repaired by a verified put. Only repairs
+  attempt serialization across stores/processes using an advisory directory lock;
+  first writes never lock, since racing Missing writers publish identical verified
+  bytes without repair events. Contended nonblocking acquisition backs off on
+  the supplied monotonic clock: sleep 1 ms, doubling thereafter and clipping each
+  request to the remaining 20 ms budget. Elapsed time bounds normal contention;
+  eight attempts only guard against a clock/sleeper that fails to advance.
+  Clock expiry reports `TimedOut`; attempt exhaustion reports `WouldBlock`.
+  The bounds apply to requested sleeps, not OS scheduling or filesystem latency.
+  On a lock error or exhaustion, one `structured.blob.repair_lock_unavailable`
+  warning names only the error kind
+  and blob hash, then publication proceeds without the lock. The current object
+  is reverified before rename; coordinated writers emit `structured.blob.repaired`
+  only when replacing corrupt bytes, after directory fsync, with hash and size,
+  never content. Fallback may duplicate that diagnostic but must not lose a blob
+  or stop the pump because locking failed. Other filesystem I/O failures remain
+  explicit. Direct filesystem mutations outside the lock are not coordinated.
 - **Rehydrate.** The native transcript Claude writes under the profile is a
   disposable working copy. A byte prefix of it (E11) is the only thing flk
   ever writes back, under a new session uuid, and only for a fork behind a
@@ -1128,6 +1239,10 @@ server → client
   ack     { cmd_id, ok, result? | error{ code, message, exit, retry } }
 ```
 
+Agent replay preserves the receive-time `known`/`shape` provenance of §5a/§8.
+Legacy records without it produce `provenance_missing` history gaps while later
+records continue. Replay never reclassifies using the current harness version.
+
 **S7-min fleet and permission contracts (#1746).** The `fleet` snapshot stream
 lists structured agents as `FleetAgentRow { id, label, state: AgentState,
 activity?, waiting_on_human: string[] }`. `AgentState` is the shared S4 object,
@@ -1137,6 +1252,72 @@ other axes survive; it must not discard the fleet delta. Snapshot rows use §5a'
 existing inline gap/checkpoint path. Fleet `ev` payloads are the closed tagged
 `FleetDelta` union: `{ type:"fleet.upsert", row: FleetAgentRow }` or
 `{ type:"fleet.remove", id }`, rather than session `WireEvent` payloads.
+
+S7-min slice 6a (#1832) supplies only the provider core: structured registry
+identity/label, S4 state, current activity and S6 waiting IDs project into these
+rows. Slice 6b omits optional `activity`: the structured registry and S4 have no
+activity producer yet. [#2243](https://github.com/gerchowl/flock/issues/2243)
+tracks that producer; no value is inferred from transcripts or PTY state.
+Amendment #1976 adds an independent durable cursor reservation record:
+under the same exclusive lock, fsync/rename/fsync-dir the cursor first, then
+atomically replace the rows/high-water snapshot by the same discipline, before
+returning changes or checkpoint cuts. The snapshot still mirrors its high-water
+as §4 requires; the independent floor can run ahead after a failed snapshot
+write, but never goes backwards or authorizes reuse of reserved positions.
+Snapshot reads allocate dense positions for their complete upserts; empty
+snapshots preserve the existing head, including across restart. Invalid row
+entries are skipped, warned with array index and unsupported/invalid/duplicate
+reason, and retained raw. Unchanged rows retain unknown top-level fields;
+changed rows serialize a fresh projection and drop them, since future fields may
+no longer agree with the changed facts. A missing or corrupt snapshot opens with
+no rows at the independent floor and a typed recovery diagnostic. Corrupt cursor
+metadata, or loss of both records from an initialized store, refuses loading rather
+than resetting it. A valid legacy snapshot with an unmarked lock seeds the new
+cursor durably; thereafter a durable marker on the locked inode makes cursor
+loss a refusal, not a migration from an older snapshot. When both records are
+valid, the maximum high-water wins. Any uncertain write requires reopening the
+store before another publication. Slice 6b (#2225) wires the provider into
+authenticated `fleet` subscriptions.
+Its single owner serializes refresh, durable checkpoint allocation, pending live
+publication, and new-cut registration. Each checkpoint belongs only to its
+requesting subscription, using that cut's acknowledged replay path. The shared
+ring carries only live deltas, so one reader's resnapshot cannot lag another
+reader. Checkpoint positions remain globally reserved: another cut's next live
+sequence can jump past those private positions without missing a mutation.
+Storage and frame preparation run off the executor; live publication
+yields between frames. Replay retains an immutable cut while later mutations
+enter its live continuation. Owner-turn
+observations coalesce to the latest materialization; the agent journal, not
+fleet-lite, retains every intermediate harness event. The live ring holds sixteen
+frames, each preflighted once with the maximum escaped subscription-ID overhead
+within the endpoint's existing 64 KiB message limit; overflow retires
+only the affected subscription ID. A fresh ID requests a complete snapshot, and
+absent rows disappear only at its advertised completion. Permission IDs come from
+the runtime book's open, non-automatic requests, never S4 phase inference. Before
+serving after cold boot, 6b refreshes the
+registry/S4/S6 provider cut; persisted observation state grants no process lease
+or resume authority. Local file locking does not implement S7-rest's
+single-writer handoff protocol.
+
+**Fleet-lite operator recovery (#1976).** For a store at `fleet.json`, preserve
+`fleet.cursor` (a small `{"high_water":N}` record) and `fleet.lock`. Do not
+delete them to repair snapshot corruption. Opening leaves damaged snapshot bytes
+intact for inspection; save a copy before a subsequent refresh/checkpoint
+replaces them. With a valid cursor, refresh the registry provider and publish a
+recovery snapshot at or above its floor. Unpublished reservations left by a
+failed write are covered by the next inline gap/checkpoint, not reused. If the
+cursor is missing after initialization or damaged, or both records are lost from an initialized store,
+repair offline with the owning store closed: restore a trusted cursor backup or
+atomically replace the cursor with a floor at least as high as both the
+surviving snapshot head and the highest cursor clients have observed. Use
+temp-file fsync, rename, then directory fsync. Never guess zero when that floor
+is unavailable; keep the store closed until trusted recovery evidence exists.
+
+An empty, unmarked lock with neither data record safely retries initialization
+at zero: cursor durability always precedes the initialization marker.
+`fleet.lock` carries that marker, so deleting it together with `fleet.cursor`
+while an older `fleet.json` survives reopens at that older head. The operator
+must never delete the lock.
 
 `cmd agent.decide` takes `AgentDecide { agent, request_id, decision, message? }`,
 where decision is `allow_once`, `allow_always` or `deny`. Only a token-authenticated
@@ -1214,6 +1395,11 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   infeasible. Keep the store bounded at 128 live codes and request bodies at
   1024 bytes. Cross-origin and non-loopback requests are refused, and neither
   codes nor tokens enter diagnostic logs.
+  The opener's URL argument is an explicit credential-in-argv exception:
+  `open`/`xdg-open` have no stdin or environment URL channel. The exchange code
+  is visible through `ps` for the opener's lifetime. Single use, the 60-second
+  TTL and fragment-only transport bound this known exposure; process logging
+  masks the code. This exception does not permit long-lived tokens in argv.
   The token then travels in the unchanged normal `hello` frame.
   The served client derives its server and transport from its own location
   (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.
@@ -1250,7 +1436,7 @@ local use, and its types precede G3 in S7a. No deployment is authorized here.
 | Parameter | Proposed value | Rationale |
 | --- | --- | --- |
 | Connect deadline | 10 s per attempt, from attempt start through name resolution, TCP/TLS and HTTP upgrade | Bounds a black-holed route without waiting for operating-system timeouts; allows mobile connection setup. |
-| Handshake deadline | 5 s from WebSocket open to authenticated `welcome`; server closes if valid `hello` is absent within 5 s | Hello is local validation, not model work. Neither side can hold an unauthenticated socket indefinitely. |
+| Handshake deadline | 5 s from WebSocket open to authenticated `welcome`; server closes 1001 if `hello` is absent within 5 s | Hello is local validation, not model work. Neither side can hold an unauthenticated socket indefinitely. |
 | Handoff deadline | 10 s from handoff request, across producer quiescence, claim settlement, flush and readiness for exclusive transfer | This is local coordination, not model work. Bound a stuck producer or flush without releasing ownership; fail and continue serving from the old owner rather than half-transfer. |
 | Heartbeat interval | 15 s from `welcome`, independent of other traffic | Detects suspended or half-open peers even during long quiet turns; four round trips/minute per connected client. |
 | Liveness window | 45 s | Three heartbeat intervals tolerate brief scheduling delays while bounding stale display and server resource retention. |
@@ -1309,12 +1495,45 @@ policy does not retry a condition assertion or declare a command successful.
 WS close **4401** means auth refused during hello; **4403** means token revoked
 mid-session. Both enter NeedsToken, holding the outbox without reconnecting until
 a new token arrives. These codes differ from protocol failures (visible error,
-capped reconnect) and network loss (reconnect).
+capped reconnect) and network loss (reconnect). During initial hello and the
+post-registration recheck, a handshake deadline miss, unavailable token-store
+worker, store I/O failure or unsafe storage closes with **1001**, preserving the
+credential for reconnect. Unsafe storage is not evidence that a bearer is invalid.
+An unauthorized or revoked credential, an explicit authentication-scope
+refusal, or a malformed/tokenless hello justifies **4401** during hello.
+If no initial hello arrives within the handshake deadline, close **1001** and
+retain the token for reconnect; absence alone is not an auth refusal.
+A failed welcome encode or send drops the transport without attempting another
+close send; it cannot establish revocation. Only a credential that no longer authenticates, a changed verified principal,
+or a revocation signal justifies **4403** after registration.
 Frames for a closed subscription ID are silently dropped. A frame for an ID
 never opened on the current connection is a protocol error, not a closed-ID case.
 Protocol errors close with a visible diagnosis and capped reconnect (a server
 upgrade can cure them). A newer client follows §5's ReadOnly capabilities and
 holds commands; it can keep reading and detecting stale transport.
+
+**Session replay provenance (S7-min slice 3, #1829).** New session-store
+`StreamRecord`s add optional `known` (boolean) and `shape` (the original
+`ShapeKey` string). The receive-time adapter sets `known`; unknown events retain
+the original sender's harness/version-scoped `shape`. Known records keep their
+stored blob projection. Readers ignore additive envelope fields under ADR-0028
+§3a. Replay never invokes the current parser to reconstruct classification or
+shape. A legacy record without classification, or an unknown without its shape,
+yields a typed history gap with reason `provenance_missing`; later records still
+replay. It is neither a whole-replay refusal nor an entity snapshot. A missing
+retained prefix uses the same gap path with reason `retained_prefix`.
+
+The registry's runtime stream owner registers bounded continuation and captures
+its durable head under one publication lock. An owned file cut pages through that
+head before exactly one `synced`; subsequent publications cannot fall between
+registration and the barrier. Capture and registration are one operation over
+the locked book; constructing the owned cut afterwards cannot open a hole.
+Replay retains unread page bytes. Runtime-only, source-fenced byte checkpoints
+let a consumer resume its applied cursor after lag without rescanning the prefix;
+they are neither new wire fields nor durable cursor authority. Lag terminates
+unfinished replay on its next page. Terminal permission audits use this same source,
+even when runtime notification delivery is cancelled. Partial deltas consume no
+durable cursor and do not enter this source. The S4 reader remains singular.
 
 **Replay and resync.** Reconnect authenticates again, then sends each seq
 stream's `sub { after:last_applied_seq }`, preserving any unfinished resync
@@ -1325,7 +1544,10 @@ the client silently drops late frames for it. Re-subscribe with a fresh ID from
 the applied cursor, never `skipped_to`; no `unsub` is needed for the closed ID.
 A snapshot gap uses §4's inline checkpoint; no snapshot gap may omit `snapshot_to`.
 A history gap on `agent/<id>` or `events` leaves an explicit missing-range marker
-and continues from `to+1`, without implying complete history.
+and continues from `to+1`, without implying complete history. A persisted known
+payload that no longer parses follows that same inline history-gap path over
+its original sequence; it does not close the socket or retry the same bad
+payload on reconnect.
 
 `terminal/<pane>` is a **snapshot stream**, not history-only. Its snapshot
 contains the complete terminal frame and rendering state for that pane; keep its
@@ -1368,6 +1590,7 @@ the wire enum; implementation registers any new API error codes where needed):
 | --- | --- |
 | `cursor_ahead` | Stored cursor exceeds the stream head. Clear only that stream's entities, cursor and resync marker, then re-subscribe with a fresh ID without `after` through bootstrap; do not silently clamp. |
 | `operator_only` | Subscription requires the operator principal. Show refusal and stop that subscription until the principal changes; other streams stay up. |
+| `invalid_agent` | Unsafe or reserved stored agent namespace. Retry class `never`: select a valid subject rather than retrying unchanged. |
 | `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
 | `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
 | `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
@@ -1476,7 +1699,10 @@ that the existing implementation already enforces these rules.
 scopes on **every cmd**, before claiming an idempotency key, returning a cached
 ack or dispatching a verb; cached hello authorization is insufficient. Serialize
 this authorization/admission boundary with operator revocation, so a command
-cannot be newly admitted after revocation. On detection of a removed/replaced
+cannot be newly admitted after revocation. Each admission or management operation
+explicitly unlocks its owned file description at scope exit, including completion
+or cancellation of lock-helper transfers. An inherited pre-exec descriptor in a
+child cannot extend that critical section. On detection of a removed/replaced
 token, return an error ack for the triggering cmd with `code:"auth_revoked"`
 before closing **all sockets for that token with 4403**; clients enter NeedsToken.
 Order that ack before the close on the triggering socket, without waiting for
@@ -1491,7 +1717,8 @@ is chosen because it does not rely on portable filesystem-watch delivery. Its
 limit is explicit: deletion alone does not proactively close a read-only idle
 socket; the next cmd or reconnect detects it. Read scopes are checked at sub
 registration (`subfail scope`), not continuously on existing subscriptions;
-shrinking read scope alone does not terminate those subscriptions.
+shrinking read scope alone does not terminate those subscriptions (continuous
+enforcement is tracked in #2042).
 Revocation prevents subsequent admission, not cancellation of an already admitted command; report its outcome
 through the journal and existing state rather than implying it was rolled back.
 
@@ -1558,6 +1785,24 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | Ack timeout and delayed original | Missing ack marks only that cmd uncertain; no same-socket resend or teardown. A late current-socket ack resolves it. After reconnect, deliver resume-only lookup before buffered original: show unknown outcome while the original may later execute once; never manufacture a new ID. Verify retry:later remains harmless with resume_only. |
 | Mobile suspend and remote outage | Foreground invalidates old socket and resumes. Local heartbeat does not clear remote stale state; cross-node cmd still refuses under VERSION 5. |
 
+#### S7-min agent subscription resource bounds (§5a implementation)
+
+The agent subscription implementation uses at most eight active cuts and 1024
+lifetime-used IDs per connection. IDs are limited to 128 bytes and stream names
+to 256 bytes; exceeding these caps closes 1001. Each cut has one outstanding
+writer delivery, with per-ID cancellation fencing and flush acknowledgement.
+History page work has 32 global I/O slots; abandoned work retains its slot until
+it returns. Storage/resource failures close 1001, distinct from authorization
+refusals. Current read scope is rechecked before owner lookup.
+
+An encoded agent event above the 65,536-byte message cap closes that subscription
+with `lagged`, without truncation, silent cursor advancement or sibling failure.
+Resuming from the applied cursor encounters that event again while it remains
+retained. The retained History limits, inline gaps, persisted provenance and
+single replay barrier remain authoritative. Exact-cursor offset hints are bounded
+and source-fenced; stale hints are discarded and cursor paging is used instead.
+
+
 ### 6. One schema, generated TypeScript
 
 The Rust types are the schema: the session event enum (§8), the wire
@@ -1582,7 +1827,7 @@ reach clients only through §8's `UnknownEvent` wrapper and use §8's rendering.
 S7a (#1604) defines separate `ClientFrame` and `ServerFrame` enums tagged by
 `t`, with unknown transport tags rejected as protocol errors and additive fields
 ignored. `WireEvent = UnknownEvent | KnownSessionEvent | JsonValue`: the known-only
-projection is the S8a catalogue type supplied by #1723. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
+projection is the S8a catalogue type defined by the adapter’s `events!` macro. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
 client-version-ineligible event uses `{type:"unknown", raw, shape}`. `raw` is
 the exact original line as a string (including non-JSON diagnostics); `shape`
 is the sender's §8 canonical key, never recomputed with the client version.
@@ -1616,8 +1861,13 @@ only reads files, so a normal test run cannot repair stale generated output.
 The generator normalises trailing whitespace, and checks the complete TS file
 inventory as well as contents. ts-rs reports unsupported custom deserializers;
 these affect lenient input reading, while the emitted types describe serialization.
+The stored `SessionEvent` and wire `WireEvent` are distinct contracts.
 The adapter's `Unknown.raw` retains the exact line; its `shape` is Rust metadata
-until the server constructs the explicit wire wrapper. The existing serde_json
+until the server constructs §5/§8's explicit
+`UnknownEvent = {type:"unknown", raw:string, shape:string}` wrapper.
+A bare stored unknown is never an agent-stream wire payload. The wire alias
+remains `UnknownEvent | KnownSessionEvent | JsonValue`; `JsonValue` supports
+non-agent streams and does not remove the agent-stream wrapper requirement. The existing serde_json
 serializer preserves JSON token spelling and interior whitespace, trims surrounding whitespace, and
 encodes non-JSON diagnostics as a JSON string.
 
@@ -1670,6 +1920,11 @@ encodes non-JSON diagnostics as a JSON string.
   discriminators distinguish SSE and control envelopes that otherwise share
   the same top-level shape. Missing discriminators are null. This refines the
   key's representation without changing the owner decision.
+- **Replay provenance.** The §5 session-store `known`/`shape` metadata fixes
+  the sender's original classification and version-scoped key across restarts
+  and parser upgrades. A now-known payload originally classified unknown still
+  uses its original unknown wrapper. Missing legacy provenance emits the
+  `provenance_missing` history gap and replay continues, without recomputation.
 - **Rendering.** Every frontend renders `Unknown` (and a known event's
   `extra`) as a collapsible JSON dump with the shape key as its title. That
   rendering is part of the reference client and of the TUI's structured view.
@@ -1896,6 +2151,65 @@ P16 and P17 have no source in the stream today and are not promised;
   closing the request or sending a response. The operator may still allow
   once or deny that request. Token authorization still applies to manual
   decisions after a grant exists.
+- **Permission request bounds and handles (S6, #1813).** There is no lifetime
+  request-ID cap. `MAX_OPEN_PERMISSION_REQUESTS = 16` keeps live requests in full,
+  including reserved/audited responses until stdin delivery completes. The
+  harness blocks per request, so more than a few concurrent prompts is
+  pathological; 16 leaves headroom for parallel tool calls. An excess valid new
+  request is denied individually with `permission_request_limit` (retry never),
+  a structured warning and a durable closed audit carrying that code, with no
+  matching open audit. It consumes no live slot and does not end the session or
+  close other requests. The deny uses existing bounded, cancel-aware writer
+  delivery: backpressure delays it, while disk failure, cancellation or a
+  disconnected writer remains an explicit I/O failure.
+  Every request receives a flk-issued `request_seq: u64`, strictly increasing
+  and never reused within the session. The book seeds allocation from the durable
+  stream cursor when a runtime resumes; each issued handle precedes at least one
+  durable stream record before being surfaced. Exhaustion fails closed without
+  wrapping. The open audit, authenticated stdout envelope and S4 snapshot carry
+  `(request_id, request_seq)`. `AgentDecide` requires both; only an exact live
+  pair can reserve an answer or a session grant. S7 slice 5 must carry the
+  sequence end to end in its request display, command and decision routing.
+  `CLOSED_PERMISSION_REQUEST_WINDOW = 1024` retains closed sequences with their
+  request IDs in FIFO order of durable closure, including capacity denials.
+  A decide for a retained closed pair gets `permission_request_closed`; an
+  evicted or never-seen pair gets `permission_request_unknown` (both retry never).
+  A mismatching sequence never approves the currently open request. Live/in-flight
+  handles remain independently correlated when older closed handles are evicted.
+  Invalid IDs and duplicates still live or in the window retain fail-closed
+  transport behavior. Reusing an evicted harness ID is harmless: the new request
+  has a new sequence and no delayed decision for the old handle can approve it.
+  Bookkeeping never expires or changes session-only exact-match `allow_always`
+  grants; their audits retain the originating request ID and sequence.
+- **Permission wire records (S6/S7, #2224).** `flk_permission_request` is a
+  known typed agent-stream event, generated from the producer's `PermissionRecord`.
+  Its `state` union is `open | closed`, never `decided`. Both states carry
+  `request_id` and `request_seq`; only `open` carries `request: ToolRequest`.
+  Closed records carry `decision`, nullable `message`, `principal` and `source`,
+  or a typed `reason`: `ended`, `cancelled`, `result`, `interrupted`,
+  `permission_request_limit`, `permission_request_too_large`, or `session_ended`.
+  Policy denies retain their existing reason/error-code fields alongside the
+  decision. Capacity refusals can close without a prior open. Existing closed
+  JSON stays unchanged apart from the handle. An `agent.decide` ack acknowledges
+  admission, while the durable close retires the card. Unknown fields or future
+  reasons retain the lossless unknown-event wrapper instead of being discarded.
+  `session_ended` marks the restart sweep in #2236.
+- **Startup permission recovery (S6, #2236).** The stream owner projects host
+  audit headers while scanning the existing stream. Before admitting any new
+  control request, it appends a `closed` / `session_ended` record without a
+  decision for each unmatched `(request_id, request_seq)`. All recovery closes
+  use ordinary audit writes and fsyncs, and all are durable before the first
+  notification. A failed write/fsync stops the owner before control admission.
+  Repeated starts append nothing once every open has a matching close. Old
+  live slots and exact grants are never restored. An interrupted automatic or
+  oversized answer is handled exactly like any other unmatched open.
+  The projection ignores unknown kinds and preserves opaque metadata, including
+  newer close reasons. Invalid permission headers are warned and preserved raw,
+  not fatal to the whole scan (ADR-0028 §3a). For legacy audits without handles,
+  an open's durable stream position supplies its recovery handle; a legacy close
+  without a handle matches by ID. New closes match both ID and handle, so a
+  reused ID cannot close another generation. Recovery retains handles, not tool
+  inputs, until the scan completes.
 - **Delivery and audit ordering.** A permission closes for attention only
   after its decision audit is durable, and user input remains gated until
   the control response is fully written. Admission success reserves a
@@ -1906,8 +2220,9 @@ P16 and P17 have no source in the stream today and are not promised;
   Harness cancellation closes its named request; top-level result and host
   interruption also produce reasoned closes. A cancelled reservation cannot
   deliver a stale answer. Disk errors are surfaced; failed persistence cannot
-  promise a durable close. Unknown and already accepted or closed request IDs are distinct `permission_request_unknown` and
-  `permission_request_closed` refusals, both retry never.
+  promise a durable close. Unknown IDs, including evicted closed IDs, yield
+  `permission_request_unknown`. An already accepted decision or an ID still in
+  the closed window yields `permission_request_closed`; both are retry never.
 
 ### 11. Harness neutrality
 
@@ -2971,3 +3286,119 @@ Operator cleanup is explicit: inspect the retained directory and associated
 processes, establish that none still uses it, then remove the directory by hand.
 No automatic PID-only reaping and no cleanup CLI is introduced in this slice;
 operator tooling is a follow-up owned by the architect.
+
+### Amendment: Atomic structured admission (#1843 part 2a)
+
+The Workers owner is the single admission authority for structured launches. It
+checks limits and reserves a pending slot keyed by agent id in one owner
+operation before starting a producer. Counts combine live leases with pending
+slots, deduplicated by agent id. Agent-started launches count toward capacity
+and parent fanout; the attested operator exemption is unchanged. Admission reads
+the published lease copy nonblockingly, falling back to the live copy. If both
+copies are busy, `session_busy` is a typed retryable refusal. Neither path waits
+on the App thread or changes caller identity.
+
+A pending slot ends on lease acquisition or launch failure, never on elapsed
+time alone. Pending metadata grants neither caller identity nor signaling
+rights. Preparation remains off-thread and bounded by its owner. Part 2b adds
+the production CLI/socket caller and its loaded session policy; public client
+and server start remain gated until part 3 completes narrowed MCP admission.
+
+### Amendment: Shared structured CLI/socket launch (#1843 part 2b)
+
+The local `agent.start` contract adds the closed selector `runtime` (`pty` by
+absence, `structured` by explicit request) and the optional structured `model`.
+The CLI and socket share App admission and the Workers owner's atomic pending
+reservation. The listener supplies the immutable MCP endpoint. Relative listener
+paths are resolved to absolute paths once at listener bind time. Endpoint
+resolution is optional at server startup: failure emits a typed
+`structured_endpoint_restart_required` warning with fixed reason `exe` or
+`socket`, without private resolution details, and a structured start refuses
+with that code before registering metadata or reserving capacity. Endpoint
+recovery takes effect on the next listener initialization. Ordinary server
+startup and PTY routes remain available. The caller cannot supply a binary, MCP
+endpoint, credential or harness flags: the only accepted structured argv is
+`claude`. `cwd` must resolve to an existing absolute directory. A resumed
+identity keeps its native session, cwd and model; launch overrides on resume are
+refused. Structured launches create no pane placement. Pane-only placement,
+focus, dry-run and readiness options are refused rather than ignored. Unknown
+restored ownership remains fenced before any start.
+
+Default `run_as = "flk-agent"` refuses until the dedicated-user launcher exists.
+Operator execution requires the explicit `run_as = "operator"` opt-in and
+retains #1177's cooperative same-UID limitation. Preparation and bounded version
+verification run off the owner thread; startup/cleanup facts remain asynchronous
+worker observations. The first production Workers caller forwards the loaded
+`sessions` storage policy and `stall_ms` together, without substituting
+defaults.
+
+Both production start gates stay closed until part 3 supplies narrowed MCP
+admission and capability negotiation: a client must not send this selector to an
+older server that might silently ignore it and launch a PTY. Existing PTY
+`AgentInfo` fields and the `agents` list are unchanged. Structured read/control
+continues to use the additive `structured_agents` and `StructuredAgentInfo`
+contracts. Refusals use registered error codes and their retry/exit mappings.
+
+Endpoint provisioning failures require operator recovery: correct executable or
+socket resolution, then restart or hand off the listener. The registered
+`structured_endpoint_restart_required` refusal has retry `after_human`, exit 1.
+Ordinary routes remain available. Repeating start alone cannot repair it.
+
+### Amendment: Public structured routing (#1843 part 3)
+
+The public CLI/socket gate opens with narrowed MCP admission. Servers advertise
+`structured_agents`; CLI and MCP refuse absent or malformed capability evidence
+before transmitting a structured selector, avoiding a legacy PTY launch.
+`agent.spawn` adds default-PTY `runtime` and optional structured `model`. MCP's
+`flock_agent_start` continues to build only that narrowed verb, never raw
+`agent.start`. Structured Claude resolves a tracked checkout, validates and
+nonce-frames the opening prompt (ADR-0014 §4). There is no prompt in launch argv.
+
+The MCP opening turn follows the single queue owner (ADR-0036 §3/S5, #1955).
+Before Ready, the launch worker commits one lifecycle-UUID item with
+`Producer::Agent` bound to the server-attested starter and `Kind::Message`.
+Its validated `SpawnPrompt` nonce frame is preserved byte for byte inside the
+queue's message frame. It never uses direct stdin or command admission.
+CLI starts enqueue no opening turn. Refused admission reports the queue's typed
+refusal code, or `agent_start_failed` for other launch failures, and publishes
+no Ready runtime or partial harness process.
+Until stdin accepts that item, the owner retains a settlement guard. Startup
+failure terminally fails it with `agent_start_failed` through the existing queue
+Fail record. Its internal `opening_turn` metadata also fences an unresolved
+queued opening on reopen: settlement must commit before that generation may
+serve input. Failed settlement is logged with its typed code; reopening attempts
+the terminal write before delivery rather than replaying an old opening prompt.
+After accepted input, ordinary result and unresolved-turn recovery apply.
+A failed stdin offer requests supervisor stop even if transport cancellation has
+not yet happened (ADR-0036 §3/§4); busy and uncertain-turn pending remain waits.
+
+Both routes share App admission and the Workers owner reservation from parts
+2a/2b. MCP uses Spawn policy, including explicit node opt-in and attested caller
+identity. Lineage, depth, fanout, capacity and pending accounting remain intact.
+An unattested MCP caller never receives the operator exemption. #1734's scoped
+credential remains only in generated private MCP configuration and immutable MCP
+client context, never the model environment. Verification and revocation at
+effect admission apply equally to these newly public verbs.
+
+MCP mirrors the additive `structured_agents` list and typed get result, with no
+invented placement. `flock_agent_stop` wraps typed stop; authority remains the
+operator and the structured agent itself, never its lineage parent. Public start
+never accepts caller-selected binaries, harness flags or MCP endpoints. Unknown
+restored ownership remains fenced, and default agent-user execution still
+refuses until #1208. The operator-mode #1177 cooperative limitation and #1629
+detachment limitation remain explicit. Permission decisions and question routing
+remain S6 (#1307); explicit structured question policies are refused. Pane-only
+read/control operations retain registered `runtime_unsupported` (retry `never`,
+exit 2). PTY fields/contracts and mesh VERSION 5 are unchanged.
+
+The executable dogfood is `tests/probes/structured_public.py`, documented in
+`tests/probes/structured-public.md` and run by nextest's `structured_public`
+integration binary. It owns a separate server and HOME, fake Claude and real
+scoped MCP child, readiness pipes and finite failure ceilings. No live server,
+profile, model, sleeps or retry loops participate.
+
+The current live-reload whitelist does not apply `[structured]` or `[fleet]`
+changes (#2043); use a fresh server after changing launch/admission policy.
+`[sessions]` live-reload semantics remain tracked by #1975. The dogfood isolates
+its policy cases in fresh servers rather than assuming a successful reload
+report changed these startup values.

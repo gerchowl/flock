@@ -1,0 +1,4 @@
+■ Selected model is at capacity. Please try a different model.
+  🔒  This conversation is open in another app
+      Close it there and press R to continue here.
+   r retry   f fork   esc/ctrl+c/q exit   ctrl+t transcript
