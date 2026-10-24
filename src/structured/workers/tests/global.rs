@@ -21,9 +21,9 @@ pub(crate) struct AppQueue {
     pub(crate) app: App,
     pub(crate) case: Case,
     pub(crate) notify: Arc<Notify>,
-    pub(crate) driver: UnixStream,
-    pub(crate) hub: EventHub,
-    pub(crate) log: std::path::PathBuf,
+    pub(super) driver: UnixStream,
+    pub(super) hub: EventHub,
+    pub(super) log: std::path::PathBuf,
 }
 impl AppQueue {
     pub(crate) async fn new(n: u32, seed: impl FnOnce(&Case) -> NonZeroU64) -> Self {
@@ -93,7 +93,7 @@ impl AppQueue {
         })
         .await;
     }
-    pub(crate) fn facts(&self) -> Vec<(u64, QueueItemState)> {
+    pub(super) fn facts(&self) -> Vec<(u64, QueueItemState)> {
         self.hub
             .events_after(0)
             .into_iter()
@@ -124,7 +124,7 @@ impl AppQueue {
 pub(crate) fn max_policy() -> NonZeroU64 {
     NonZeroU64::new(u64::MAX).unwrap()
 }
-pub(crate) fn id(n: u32) -> String {
+pub(super) fn id(n: u32) -> String {
     format!("00000000-0000-4000-8000-{n:012}")
 }
 

@@ -26,79 +26,60 @@ Credentials, raw frames and their parse errors do not enter diagnostics.
 `welcome` carries the wire version, server version, verified opaque principal,
 random server epoch and 24-hour idempotency-window metadata. The epoch is fresh
 per core and never resets durable cursors. A newer client receives the server's
-wire version and no command capability. No command capabilities are advertised; agent-history subscriptions are
-described below, and command dispatch remains assigned to later slices. Binary frames and other non-protocol post-hello
-data operations are policy violations and close with 1008.
-There is no command admission, structured start or claim of durable journaling.
+wire version and cannot execute commands (`server_version_gap`). No command
+capabilities are advertised. Agent-history subscriptions and the send-only
+command adapter are described below. Binary frames and other non-protocol
+post-hello data operations are policy violations and close with 1008.
+There is no durable command journal in this slice.
 
-## Structured commands
+## Structured send commands
 
-S7-min routes `cmd agent.send` and `cmd agent.decide` on the app owner, using
-ADR-0036 sections 4/5/5a and the existing structured queue and S6 permission APIs.
-`agent.send` uses the socket API's `target`, `text`, `submit` and optional
-`item_id` fields. With `submit: true`, its success ack returns `{ item_id }`
-after durable queue admission. A single input carries that lifecycle identity
-into the harness turn; lifecycle events report subsequent progress. Admission
-does not mean the harness has started or completed the turn. `submit: false`
-returns `structured_submit_required` before queue or stdin work. Terminal-only
-raw/write options are unsupported for structured turns.
+This send-only half of #1831 routes `cmd agent.send` on the app owner through
+#2065's shared lifecycle-ID queue admission API (ADR-0036 sections 4/5/5a).
+The parameter contract uses `target`, `text`, `submit` and optional `item_id`.
+With `submit: true`, the success ack returns `{ item_id }` after durable queue
+admission. One user turn carries that lifecycle identity into the harness;
+lifecycle facts describe execution later. Admission does not mean the harness
+has started or completed the turn. `submit: false` returns
+`structured_submit_required` before queue or stdin work. Terminal raw/write
+options remain unsupported for structured turns.
 
-`agent.decide` uses the generated `AgentDecide` contract. Echo both the
-`request_id` and flk-issued `request_seq` from the open permission record;
-never synthesize a sequence. Success returns `{ request_id, decision }` through
-the normal ack envelope after S6 reserves the named answer. The agent stream's
-closed record remains authoritative for dismissing a permission card. Unknown,
-closed, stale and unauthorized decisions keep S6's registered refusal codes.
-Neither verb allocates a runtime. Non-local or terminal targets and unsupported
-verbs return `unsupported_for_agent` before allocating a lifecycle item.
+Structured identity is resolved independently of the pane-only resolver.
+Exact IDs and names shared with terminal IDs, agent IDs, names or effective
+labels remain `agent_target_ambiguous`. Unknown local agents receive
+`agent_not_found`; advertised remote agents and terminal-only targets receive
+`unsupported_for_agent`. No command creates a runtime. Browser `agent.decide`
+routing lives separately in #2370 and is not implemented by this send slice.
+Until that separate slice is merged, it retains its existing close-1008 policy
+refusal.
 
-Send requires `send` scope and decision requires `answer` scope; both shared
-services additionally require an `operate` token for operator authority. Every
-command rechecks the current token file and scopes while serializing admission
-with revocation. A removed/replaced token gets `auth_revoked`; its ack is flushed
-before all sockets for that token close 4403. Scope shrink instead returns
-`scope` and keeps the socket and allowed reads alive. Already admitted work is
-not cancelled by revocation. Deleting a token alone does not proactively close
-an idle read-only socket; the next command or reconnect detects it.
+Send requires `send` scope and the shared queue service additionally requires
+an `operate` token for operator authority. Every command rechecks the current
+token file and scopes under the revocation lock. The triggering `auth_revoked`
+ack flushes before all sockets for that token close 4403. Scope shrink returns
+`scope` without closing the socket or disrupting allowed reads. Already admitted
+work is not cancelled. Removing the file alone is detected at next admission
+or reconnect; it does not proactively close idle sockets.
 
-Only `agent.send` and `agent.decide` are implemented on this wire surface.
-Other verbs, including `agent.interrupt`, receive `server_version_gap` (exit 78)
-before allocating a command task, owner request or permission check. Command
-IDs above 128 bytes receive `invalid_params`. Four pending commands are allowed
-per socket; a fifth receives `session_busy`, leaving the socket open. Writer
-backpressure still applies to refusal acks, including the existing 64 KiB
-encoded-message cap and 45-second blocked-writer ceiling.
+Unsupported verbs receive `server_version_gap` (exit 78) before command-task,
+owner-request or permission-check allocation. Command IDs above 128 bytes get
+`invalid_params`. The existing encoded-frame cap still applies to a refusal
+with an oversized echoed ID (#2296). There are four pending commands per socket,
+independent 32-entry send/decision mailbox lanes and at most 32 pending send
+receipts. The decision lane is retained for #2370. Full admission returns
+`session_busy` without closing a healthy socket; the post-check enqueue race
+uses the same typed refusal. No model or stdin completion blocks the owner.
 
-The app owner has independent 32-entry send and decision mailboxes. Full
-admission returns `session_busy`, including a race between the connection's
-capacity check and enqueue. It does not disconnect a healthy socket. At most
-32 durable-send receipts remain pending; decision admission is serviced first
-and does not consume receipt capacity. Each owner turn handles at most 32
-requests from each lane. The per-socket limit still applies to both verbs.
-
-Duplicate detection is keyed by `(principal, cmd_id)` across that principal's
-sockets. Pending send keys remain pinned until the receipt resolves, even if
-the original socket disconnects. The owner also retains the last 1024 completed
-admissions across all principals, evicting the oldest completed key in FIFO
-order. Refused commands do not claim a key. A retained duplicate returns
-`session_unconfirmed` after authorization, without dispatch. This is a bounded
-in-memory fence, not a recovery journal: eviction, restart and handoff can
-forget completed keys. Clients must never repeat a first send; uncertain
-resends must use `resume_only: true`, which cannot dispatch even if its key is
-absent. There is no cached outcome lookup in this slice.
-
-An unknown local agent receives `agent_not_found`; an advertised remote agent
-or a known terminal target receives `unsupported_for_agent`. Neither creates a
-runtime or lifecycle item. The decision `message` is currently bounded by the
-frame limit; its separate field limit is tracked in #2249.
-
-This slice implements first sends, not the durable command journal of ADR-0036
-section 5a. `resume_only: true` always returns `session_unconfirmed` without
-dispatch, even within the advertised recovery window. There is no cached ack
-lookup or automatic resend. After uncertain delivery, inspect the queue and
-permission state; never manufacture another first-send command to force a
-retry. Disconnecting a waiter does not cancel input already durably admitted.
-Structured process launch remains separate from this adapter.
+Duplicate detection is keyed by `(principal, cmd_id)` across sockets. Pending
+send keys stay pinned until their receipt resolves, including after disconnect.
+The last 1024 completed keys across all principals are retained in FIFO order;
+other principals can evict a recent completed key (#2296). Refused commands
+claim no key. A retained duplicate returns `session_unconfirmed` without
+dispatch. This volatile fence is not the deferred durable journal: eviction,
+restart and handoff can forget keys. `resume_only: true` always refuses with
+`session_unconfirmed` (exit 8, retry later), never dispatches, and does not look
+up a cached outcome. Inspect queue facts after uncertainty rather than issuing
+another first-send command.
 
 Application JSON pings run every 15 seconds independently of other traffic. Each
 nonce is unique to its epoch/socket and sequence. Keep at most three outstanding

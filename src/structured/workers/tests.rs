@@ -23,7 +23,7 @@ pub(crate) fn event(kind: &str) -> Value {
 pub(crate) struct Case {
     pub fixture: Arc<Fixture>,
     pub id: String,
-    pub(crate) session: String,
+    session: String,
     pub generation: u64,
     leases: SessionLeases,
 }

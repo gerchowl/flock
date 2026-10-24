@@ -96,7 +96,17 @@ impl Case {
                 .path()
                 .join("sessions")
                 .join(&self.queue.case.id)
-                .join(format!("{}.jsonl", self.queue.case.session)),
+                .join(format!(
+                    "{}.jsonl",
+                    self.queue
+                        .app
+                        .state
+                        .structured_agents
+                        .get(&self.queue.case.id)
+                        .unwrap()
+                        .0
+                        .session_id
+                )),
         )
         .unwrap()
         .lines()
@@ -166,7 +176,16 @@ fn agent_send_fixture_ack_matches_one_durable_user_turn() {
                     .path()
                     .join("sessions")
                     .join(&r.case.id)
-                    .join(format!("{}.jsonl", r.case.session));
+                    .join(format!(
+                        "{}.jsonl",
+                        r.app
+                            .state
+                            .structured_agents
+                            .get(&r.case.id)
+                            .unwrap()
+                            .0
+                            .session_id
+                    ));
                 fs::read_to_string(path).unwrap().contains("fixture_input")
             })
             .await;
@@ -235,11 +254,6 @@ fn draft_unknown_remote_verb_and_resume_only_refuse_before_mutation() {
             (
                 "agent.send",
                 json!({"target":"unknown-local","text":"missing","submit":true}),
-                "agent_not_found",
-            ),
-            (
-                "agent.decide",
-                json!({"agent":"unknown-local","request_id":"missing","request_seq":1,"decision":"deny"}),
                 "agent_not_found",
             ),
             (
@@ -333,121 +347,6 @@ fn scope_shrink_refuses_send_and_preserves_allowed_agent_reads() {
         case.stop().await;
     });
 }
-#[test]
-fn permission_decisions_use_the_named_request_handle_and_typed_refusals() {
-    runtime(async {
-        let mut case = Case::new(183105).await;
-        let mut socket = case.open().await;
-        for id in ["first-request", "other-request"] {
-            let mut request = crate::structured::workers::tests::event("control_request");
-            request["request_id"] = json!(id);
-            case.queue.control(json!({"op":"event","event":request}));
-        }
-        case.queue
-            .until(|r| {
-                r.app
-                    .structured_workers
-                    .runtime(&r.case.id, r.case.generation)
-                    .unwrap()
-                    .waiting_on_human()
-                    .unwrap()
-                    .len()
-                    == 2
-            })
-            .await;
-        let handles = case
-            .queue
-            .app
-            .structured_workers
-            .runtime(&case.queue.case.id, case.queue.case.generation)
-            .unwrap()
-            .waiting_on_human()
-            .unwrap();
-        let seq = handles
-            .iter()
-            .find(|(id, _)| id == "first-request")
-            .unwrap()
-            .1;
-        let args = json!({"agent":case.queue.case.id,"request_id":"first-request","request_seq":seq,"decision":"deny"});
-        case.scopes(json!(["answer", "read"]));
-        assert_eq!(
-            case.command(&mut socket, "agent.decide", args.clone())
-                .await["error"]["code"],
-            "not_authorized"
-        );
-        case.scopes(json!(["answer", "read", "operate"]));
-        let mut unknown = args.clone();
-        unknown["request_id"] = json!("missing-request");
-        assert_eq!(
-            case.command(&mut socket, "agent.decide", unknown).await["error"]["code"],
-            "permission_request_unknown"
-        );
-        let mut stale = args.clone();
-        stale["request_seq"] = json!(seq + 100);
-        assert_eq!(
-            case.command(&mut socket, "agent.decide", stale).await["error"]["code"],
-            "permission_request_unknown"
-        );
-        let ack = case
-            .command(&mut socket, "agent.decide", args.clone())
-            .await;
-        assert_eq!(
-            ack["result"],
-            json!({"request_id":"first-request","decision":"deny"})
-        );
-        case.queue
-            .until(|r| {
-                r.app
-                    .structured_workers
-                    .runtime(&r.case.id, r.case.generation)
-                    .unwrap()
-                    .waiting_on_human()
-                    .unwrap()
-                    .len()
-                    == 1
-            })
-            .await;
-        let remaining = case
-            .queue
-            .app
-            .structured_workers
-            .runtime(&case.queue.case.id, case.queue.case.generation)
-            .unwrap()
-            .waiting_on_human()
-            .unwrap();
-        assert_eq!(remaining[0].0, "other-request");
-        assert_eq!(
-            case.command(&mut socket, "agent.decide", args).await["error"]["code"],
-            "permission_request_closed"
-        );
-        case.queue
-            .until(|r| {
-                let path = r
-                    .case
-                    .fixture
-                    .root
-                    .path()
-                    .join("sessions")
-                    .join(&r.case.id)
-                    .join(format!("{}.jsonl", r.case.session));
-                fs::read_to_string(path)
-                    .unwrap()
-                    .contains("fixture_control_input")
-            })
-            .await;
-        let inputs: Vec<_> = case
-            .events()
-            .into_iter()
-            .filter(|v| v["type"] == "fixture_control_input")
-            .collect();
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(
-            inputs[0]["input"]["response"]["request_id"],
-            "first-request"
-        );
-        case.stop().await;
-    });
-}
 
 async fn enqueue_without_owner(server: &Server, socket: &mut Socket, id: String, target: &str) {
     let admitted = server.wake.notified();
@@ -524,7 +423,7 @@ fn fifth_concurrent_command_is_busy_and_keeps_the_socket_open() {
     });
 }
 #[test]
-fn full_owner_queue_refuses_other_principals_without_closing_or_blocking_decisions() {
+fn full_owner_queue_refuses_other_principals_without_closing() {
     runtime(async {
         let mut case = Case::new(183113).await;
         let mut producers = Vec::new();
@@ -554,12 +453,12 @@ fn full_owner_queue_refuses_other_principals_without_closing_or_blocking_decisio
             "session_busy",
             crate::cli::exit::FAILURE,
         );
-        let args = json!({"agent":case.queue.case.id,"request_id":"missing","request_seq":1,"decision":"deny"});
-        let result = case.command(&mut socket, "agent.decide", args).await;
-        refusal(
-            result,
-            "permission_request_unknown",
-            crate::cli::exit::FAILURE,
+        // Queued drafts settle as refusals; the same healthy socket can then send.
+        case.service();
+        let args = json!({"target":case.queue.case.id,"text":"after-pressure","submit":true});
+        assert_eq!(
+            case.command(&mut socket, "agent.send", args).await["ok"],
+            true
         );
         drop(producers);
         case.stop().await;
@@ -610,5 +509,92 @@ fn oversized_command_id_is_a_typed_refusal_without_owner_admission() {
         assert_eq!(frame["cmd_id"], id);
         refusal(frame, "invalid_params", crate::cli::exit::FAILURE);
         case.stop().await;
+    });
+}
+
+#[test]
+fn structured_name_routes_to_queue_without_a_terminal() {
+    runtime(async {
+        let mut case = Case::new(183117).await;
+        let name = case
+            .queue
+            .app
+            .state
+            .structured_agents
+            .get(&case.queue.case.id)
+            .unwrap()
+            .0
+            .name
+            .clone()
+            .unwrap();
+        let mut socket = case.open().await;
+        let before = case.journal();
+        let result = case
+            .command(
+                &mut socket,
+                "agent.send",
+                json!({"target":name,"text":"named send","submit":true}),
+            )
+            .await;
+        assert_eq!(result["ok"], true);
+        let item = result["result"]["item_id"].as_str().unwrap();
+        assert_ne!(case.journal(), before);
+        assert!(String::from_utf8(case.journal()).unwrap().contains(item));
+        case.stop().await;
+    });
+}
+
+#[test]
+fn cross_runtime_id_and_name_collisions_refuse_before_queue_mutation() {
+    runtime(async {
+        for exact in [false, true] {
+            let mut case = Case::new(if exact { 183118 } else { 183119 }).await;
+            let target = if exact {
+                case.queue.case.id.clone()
+            } else {
+                case.queue
+                    .app
+                    .state
+                    .structured_agents
+                    .get(&case.queue.case.id)
+                    .unwrap()
+                    .0
+                    .name
+                    .clone()
+                    .unwrap()
+            };
+            case.queue.app.state.workspaces =
+                vec![crate::workspace::Workspace::test_new("send-wire-collision")];
+            case.queue.app.state.ensure_test_terminals();
+            let pane = case.queue.app.state.workspaces[0]
+                .focused_pane_id()
+                .unwrap();
+            let terminal = case.queue.app.state.workspaces[0]
+                .pane_state(pane)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            case.queue
+                .app
+                .state
+                .terminals
+                .get_mut(&terminal)
+                .unwrap()
+                .set_agent_name(target.clone())
+                .unwrap();
+            let before = case.journal();
+            let mut socket = case.open().await;
+            let result = case
+                .command(
+                    &mut socket,
+                    "agent.send",
+                    json!({"target":target,"text":"collision","submit":true}),
+                )
+                .await;
+            assert_eq!(result["error"]["code"], "agent_target_ambiguous");
+            assert_eq!(case.journal(), before);
+            assert!(!case.events().iter().any(|v| v["type"] == "fixture_input"));
+            case.stop().await;
+        }
     });
 }
