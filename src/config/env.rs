@@ -75,13 +75,13 @@ const BLOCKLIST_PREFIXES: &[&str] = &[
     "ui.sound.all_clear_path",
 ];
 
-fn is_blocklisted(path: &str) -> bool {
+pub(super) fn is_blocklisted(path: &str) -> bool {
     BLOCKLIST_PREFIXES
         .iter()
         .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}.")))
 }
 
-fn env_var_name_for(path: &[String]) -> String {
+pub(super) fn env_var_name_for(path: &[String]) -> String {
     let mut name = String::from("FLOCK");
     for segment in path {
         name.push('_');
@@ -167,7 +167,7 @@ fn path_has_value(root: &toml::map::Map<String, Value>, path: &[String]) -> bool
     cursor.contains_key(last)
 }
 
-fn walk_scalar_leaves<F>(
+pub(super) fn walk_scalar_leaves<F>(
     schema: &toml::map::Map<String, Value>,
     path: &mut Vec<String>,
     visit: &mut F,

@@ -1,0 +1,1 @@
+- Add an internal typed core config inventory with declaration-based coverage, compiled default and source metadata, conservative value/map-key sensitivity, and explicit unreadable imported boundaries. This adds no config read or write API; imported coverage and safe projections remain tracked by #2384.
