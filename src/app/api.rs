@@ -2592,7 +2592,7 @@ mod tests {
 
         let published: Vec<crate::api::schema::EventEnvelope> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .map(|(_, envelope)| envelope)
             .collect();
@@ -2951,15 +2951,16 @@ mod tests {
             });
         }
 
-        let reports_done = |app: &App| {
-            app.event_hub.events_after(0).iter().any(|(_, event)| {
+        let reports_done =
+            |app: &App| {
+                app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| {
                 matches!(
                     &event.data,
                     crate::api::schema::EventData::PaneAgentStatusChanged { agent_status, .. }
                         if *agent_status == crate::api::schema::AgentStatus::Done
                 )
             })
-        };
+            };
         // At the deferring edge the pane is Idle but `seen` is still true → it
         // reports `Idle`, never `Done`.
         assert!(

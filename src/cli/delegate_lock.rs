@@ -75,6 +75,7 @@ pub(super) fn resolve(name: &str, choice: CodexLockChoice, flags: &SendFlags) ->
         id: "cli:delegate:lock".into(),
         method: Method::EventsSubscribe(EventsSubscribeParams {
             after: None,
+            after_sequence: None,
             subscriptions: vec![
                 Subscription::PaneAgentStatusChanged {
                     pane_id: entry.pane_id.clone(),
