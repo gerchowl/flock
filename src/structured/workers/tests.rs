@@ -413,6 +413,7 @@ async fn explicit_stop_closes_open_request_and_releases_only_after_completion() 
     crate::app::queue_events::QueueEvents::default().poll(&workers, &registry, &hub);
     assert!(
         hub.events_after(0)
+            .expect("fixture event history is retained")
             .iter()
             .any(|(_, event)| event.event == crate::api::schema::EventKind::QueueItemState),
         "committed exit fact must precede retirement"

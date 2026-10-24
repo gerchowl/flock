@@ -2364,11 +2364,13 @@ pub enum ReadFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsSubscribeParams {
     pub subscriptions: Vec<Subscription>,
-    /// ADR-0028 §3 (#1030): stream events with `seq > after`. Absent means
-    /// from now, never a replay of the ring. A cursor older than the ring
-    /// gets a `lagged { skipped_to }` line first.
+    /// Legacy replay cursor. Loss retains the `lagged` wire frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<u64>,
+    /// Explicit opt-in to typed loss and resumable sequences, strictly after
+    /// this cursor. Requires `events_live_start`; mutually exclusive with `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2998,6 +3000,10 @@ pub struct PeersEnrollResetParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerCapabilities {
+    /// Explicit `after_sequence` opt-in, resumable stream sequences and
+    /// typed ring loss.
+    #[serde(default)]
+    pub events_live_start: bool,
     /// Complete structured CLI/socket and narrowed MCP admission contract.
     #[serde(default)]
     pub structured_agents: bool,
@@ -3580,7 +3586,12 @@ pub enum ResponseResult {
     PaneRead {
         read: PaneReadResult,
     },
-    SubscriptionStarted {},
+    SubscriptionStarted {
+        /// Initial cursor shared by all accepted filters. New servers always
+        /// include it; absence identifies an older acknowledgement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_sequence: Option<u64>,
+    },
     WaitMatched {
         event: EventEnvelope,
     },
@@ -5721,6 +5732,16 @@ mod tests {
     }
 
     #[test]
+    fn subscription_accepts_explicit_after_sequence() {
+        let params: EventsSubscribeParams = serde_json::from_value(serde_json::json!({
+            "subscriptions": [], "after_sequence": 7
+        }))
+        .unwrap();
+        assert_eq!(params.after, None);
+        assert_eq!(params.after_sequence, Some(7));
+    }
+
+    #[test]
     fn subscribe_request_parses_parameterized_subscriptions() {
         let json = r#"
         {
@@ -5811,6 +5832,7 @@ mod tests {
                     agent_questions: true,
                     structured_agents: true,
                     pane_input_write_ack: false,
+                    events_live_start: false,
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
@@ -6024,6 +6046,7 @@ mod tests {
         assert!(!json.contains("label"), "{json}");
 
         let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+        assert!(!old.events_live_start);
         assert!(!old.agent_start_label);
     }
 
@@ -6460,6 +6483,7 @@ mod pr_info_tests {
     #[test]
     fn s3a_write_capability_defaults_false_and_negative_counts_are_invalid() {
         let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+        assert!(!old.events_live_start);
         assert!(!old.pane_input_write_ack);
         assert_eq!(
             serde_json::to_value(old).unwrap()["pane_input_write_ack"],

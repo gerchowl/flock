@@ -3859,6 +3859,7 @@ fn delegate_wait_for_ready(
         id: "cli:delegate:ready".into(),
         method: Method::EventsSubscribe(EventsSubscribeParams {
             after: None,
+            after_sequence: None,
             subscriptions: vec![
                 Subscription::PaneAgentStatusChanged {
                     pane_id: pane_id.to_owned(),

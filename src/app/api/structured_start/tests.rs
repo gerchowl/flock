@@ -133,6 +133,7 @@ impl AdmissionFixture {
             hub.clone(),
             Some(crate::api::schema::ServerCapabilities {
                 structured_agents: true,
+                events_live_start: false,
                 live_handoff: false,
                 pane_input_write_ack: false,
                 node_id: None,
