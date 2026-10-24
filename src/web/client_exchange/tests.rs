@@ -257,8 +257,8 @@ fn unix_socket_client_open_produces_a_redeemable_code_in_the_mounted_router() {
                 &Arc::new(AtomicBool::new(true)),
                 None,
                 &Mutex::default(),
-                &Default::default(),
                 &crate::api::client_listener::Health::default(),
+                &Default::default(),
             )
             .unwrap();
         });

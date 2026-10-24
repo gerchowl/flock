@@ -101,6 +101,9 @@ mod render_prof;
 mod report;
 #[cfg(any(test, feature = "web"))]
 mod structured_wire;
+#[cfg(not(any(test, feature = "web")))]
+#[path = "structured_wire/production.rs"]
+mod structured_wire;
 #[cfg(test)]
 mod test_support;
 // #175 phase 5 / S3 commit 4 (ops): `flk revert-run` trailer-scan.

@@ -107,6 +107,8 @@ impl AgentKind {
 /// (ADR-0014 §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnRefusal {
+    /// Both live and published admission views are busy. Retry is safe.
+    RegistryBusy,
     /// Structured process attribution is unresolved; it grants no operator exemption.
     CallerUnknown,
     /// Retry is safe once something exits.
@@ -129,6 +131,7 @@ impl SpawnRefusal {
     /// The stable `data.refusal` tag.
     pub fn code(&self) -> &'static str {
         match self {
+            Self::RegistryBusy => "session_busy",
             Self::CallerUnknown => "spawn_caller_unknown",
             Self::AtCapacity { .. } => "at_agent_capacity",
             Self::AtFanout { .. } => "at_fanout_limit",
@@ -144,7 +147,10 @@ impl SpawnRefusal {
     /// split exists to prevent.
     pub fn retryable(&self) -> bool {
         match self {
-            Self::AtCapacity { .. } | Self::AtFanout { .. } | Self::FleetPaused => true,
+            Self::RegistryBusy
+            | Self::AtCapacity { .. }
+            | Self::AtFanout { .. }
+            | Self::FleetPaused => true,
             Self::AtDepth { .. } | Self::NotEnabled | Self::CallerUnknown => false,
             // Delegated rather than restated: whether a profile refusal can be
             // retried is a property of the profile failure, not of this enum.
@@ -154,6 +160,7 @@ impl SpawnRefusal {
 
     pub fn message(&self) -> String {
         match self {
+            Self::RegistryBusy => "session admission registry is busy; retry the request".into(),
             Self::CallerUnknown => "structured caller identity is unresolved".into(),
             Self::AtCapacity { current, limit } => format!(
                 "at agent capacity ({current}/{limit} agent-started agents live); retry when one exits"

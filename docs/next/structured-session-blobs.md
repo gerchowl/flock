@@ -7,11 +7,19 @@ under `<data dir>/blobs/<sha256>`. The persisted message replaces each block wit
 `stream_event` deltas remain live-only and do not consume durable sequence numbers.
 Consumers must check `Received.persisted` before advancing a durable cursor.
 
+Registry-worker admission supplies the `[sessions]` storage settings explicitly
+in `Launch.storage` (ADR-0036 §4). Each launch owns its policy snapshot; config
+changes affect subsequent launches.
+
 The shared content store stores bytes only, without content type or other metadata.
 `put(reader,max_bytes)` hashes exactly the bytes it writes and enforces a per-call
-cap independently of the persistence threshold. `get(hash)` verifies the digest
-and distinguishes Missing from Corrupt; `stat(hash)` returns size without reading
-content. References resolve to the encoded JSON block, preserving its values.
+cap independently of the persistence threshold. `get(hash,max_bytes)` stats the
+opened descriptor first and refuses an oversized object before reading content.
+Its bounded read also handles growth after stat, reading at most the cap plus one
+detection byte. `TooLarge` takes precedence over digest verification; within the
+cap, `get` verifies the digest and distinguishes Missing from Corrupt.
+`stat(hash)` returns size without reading content. References resolve to the encoded
+JSON block, preserving its values.
 Only projected messages are reserialized; unmodified lines retain exact spelling.
 Previews are lossy UTF-8, bounded to 80 characters, and are not complete content.
 
@@ -24,10 +32,26 @@ file. If an existing object's bytes fail hash verification, the next put of the
 same content replaces it with the verified, synced temp file by atomic rename,
 then syncs the directory. Only after that sync does the typed logging helper emit
 `structured.blob.repaired` with `blob` (SHA-256) and `size` (bytes), never content.
+Only corrupt-object repairs attempt an advisory lock on the pinned directory.
+First writes never lock: racing Missing writers rename identical verified bytes
+and emit no repair event. On contention, nonblocking acquisition sleeps on the
+supplied monotonic clock: 1 ms initially, doubling thereafter, with each request
+clipped to the remaining 20 ms budget. Normal contention is bounded by elapsed
+time; an eight-attempt cap only guards against a clock/sleeper that does not
+advance. `TimedOut` means the clock budget expired; `WouldBlock` means the attempt
+guard fired. Requested sleeps are bounded; filesystem and OS scheduling latency
+can exceed the budget. Unsupported locking, other lock errors, or exhaustion emit one
+`structured.blob.repair_lock_unavailable` warning carrying the error kind and
+blob hash, never content or OS error text. The put then proceeds without the lock,
+so these diagnostic-coordination failures cannot lose content or stop the pump.
+The current object is reverified before rename. Coordinated writers emit one
+repair event; fallback can emit duplicate repair diagnostics. Direct filesystem
+writes that do not take the lock are outside this coordination.
 The transport continues streaming after a successful repair. A read still returns
 Corrupt for damaged content; unsafe entries and read/write/sync failures remain
-explicit errors. A crash before rename leaves the old entry and an owned temp
-file, never a partially overwritten blob. Crash-temp sweeping is tracked in #1824.
+explicit errors. A real OS permission denial is `Io`; owner, mode and entry-type
+validation failures are `UnsafePath`. A crash before rename leaves the old entry and an owned temp
+file, never a partially overwritten blob. Coordinated crash-temp cleanup is tracked in #1712.
 A failed directory sync may leave a complete object published;
 retrying the same content verifies it and syncs the directory again.
 
@@ -38,6 +62,11 @@ the transport recognizes their top-level type header in its bounded prefix.
 This slice does not enable public structured-session start. Retention, shared roots
 and concurrent GC are undecided in §4 and tracked in #1712; there is no GC or
 public delete-by-hash API.
+
+Crash-leftover `.tmp-*` files are kept. Opening the store does not sweep them:
+another writer may still be publishing. Coordinated cleanup requires the
+shared-writer/exclusive-cleanup fence deferred to #1712 (ADR-0036 §4), which owns
+cleanup. This store does not implement that fence or automatic temp-file cleanup.
 
 ## Stored history and publication
 

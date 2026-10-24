@@ -725,7 +725,11 @@ pub fn relayed_entry_from_wire(
                     ws.workspace = strip(ws.workspace);
                     ws.project_label = ws.project_label.map(strip);
                     ws.branch = ws.branch.map(strip);
-                    ws.agent = ws.agent.map(strip);
+                    ws.agent = crate::terminal::agent_name::received(ws.agent, "relay");
+                    for agent in &mut ws.agents {
+                        agent.agent =
+                            crate::terminal::agent_name::received(agent.agent.take(), "relay");
+                    }
                     ws
                 })
                 .collect(),
@@ -1636,6 +1640,51 @@ mod tests {
             proxy_jump: proxy_jump.map(Into::into),
             icon: None,
         }
+    }
+
+    #[test]
+    fn security_agent_name_typed_relay_rows_drop_bad_labels() {
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut row = wire_peer("spoke.invalid", None);
+            let mut ws: crate::api::schema::PeerWorkspaceSummary = serde_json::from_value(
+                serde_json::json!({"id":"fixture-workspace", "workspace":"fixture", "status":"idle"})
+            ).unwrap();
+            ws.agent = Some(name.clone());
+            ws.agents.push(crate::api::schema::PeerAgentSummary {
+                agent_id: "fixture-agent".into(),
+                pane_id: "fixture-pane".into(),
+                agent: Some(name),
+                status: crate::api::schema::AgentStatus::Idle,
+            });
+            row.workspaces.push(ws);
+            let accepted = relayed_entry_from_wire(row).unwrap();
+            assert!(
+                accepted.peer.workspaces[0].agent.is_none(),
+                "workspace name retained: {case}"
+            );
+            assert!(
+                accepted.peer.workspaces[0].agents[0].agent.is_none(),
+                "agent name retained: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_agent_name_peer_json_drops_only_the_bad_name() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let response = serde_json::json!({"id":"name-peer","result":{"host":"fixture.example","workspaces":[{"id":"workspace-fixture","workspace":"fixture","agent":name,"status":"idle","agents":[{"agent_id":"agent-fixture","pane_id":"pane-fixture","agent":name,"status":"idle"}]}]}}).to_string();
+            let payload = parse_summary_response(&response, 0).unwrap();
+            let ws = &payload.workspaces[0];
+            if ws.agent.is_some() || ws.agents[0].agent.is_some() {
+                failures.push(case);
+            }
+            assert_eq!(ws.agents[0].agent_id, "agent-fixture");
+        }
+        assert!(
+            failures.is_empty(),
+            "retained peer name cases: {failures:?}"
+        );
     }
 
     #[test]

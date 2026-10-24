@@ -35,6 +35,7 @@ fn entry(round: u64) -> Entry {
         base: None,
         base_sha: None,
         agent_id: None,
+        lock_resolution: None,
     }
 }
 
@@ -268,4 +269,13 @@ fn a_still_running_turn_keeps_waiting_until_it_ends() {
     // what paces the loop, not a timer.
     assert_eq!((io.settled, io.polled), (3, 3));
     assert_eq!(io.slept(), Duration::ZERO);
+}
+
+#[test]
+fn future_lock_resolution_metadata_survives_registry_round_trip() {
+    let mut entry = entry(0);
+    let future = json!({"choice":"future-choice", "future":{"raw":true}});
+    entry.lock_resolution = Some(future.clone());
+    let decoded: Entry = serde_json::from_value(serde_json::to_value(entry).unwrap()).unwrap();
+    assert_eq!(decoded.lock_resolution, Some(future));
 }

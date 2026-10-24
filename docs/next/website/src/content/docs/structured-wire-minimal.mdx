@@ -4,8 +4,9 @@ description: Generated fleet and permission-decision contracts for GUI clients.
 ---
 
 The S7-min types are generated from Rust into `web/client/src/gen/`. They define
-contracts for the GUI and server work in #1746; this types slice does not enable
-a WebSocket endpoint or execute commands.
+contracts for the GUI and server work in #1746. The opt-in S7 endpoint serves
+`fleet` subscriptions to read-scoped clients through its existing subscription
+identity, delivery and heartbeat machinery. This stream does not execute commands.
 
 `FleetAgentRow` contains `id`, `label`, `state`, optional `activity`, and required
 `waiting_on_human: string[]`. State is the shared S4 `AgentState` object: axes, derived phase and sources.
@@ -13,11 +14,14 @@ Its per-field `or_unknown` deserializers follow ADR-0028 §3a, so an unknown
 phase from a newer server becomes `unknown` while the other axes survive and
 the fleet delta remains usable. The waiting IDs identify permission requests on `agent/<id>`;
 there is no separate inbox stream in S7-min. Rows represent structured agents.
+The server omits optional `activity` until the structured producer in
+[#2243](https://github.com/gerchowl/flock/issues/2243) lands.
+`waiting_on_human` contains only open, non-automatic harness permission request IDs.
 
 The `fleet` stream carries the closed `FleetDelta` union inside `ev`:
 
 ```json
-{"type":"fleet.upsert","row":{"id":"example-agent","label":"Example","state":{"turn":"idle","background":"none","attention":{"needs_human":{"reason":"permission"}},"waiting":"none","lifecycle":"live","phase":"needs_human","source":{}},"activity":"Permission needed","waiting_on_human":["request-one"]}}
+{"type":"fleet.upsert","row":{"id":"example-agent","label":"Example","state":{"turn":"idle","background":"none","attention":{"needs_human":{"reason":"permission"}},"waiting":"none","lifecycle":"live","phase":"needs_human","source":{}},"waiting_on_human":["request-one"]}}
 {"type":"fleet.remove","id":"example-agent"}
 ```
 
@@ -33,7 +37,79 @@ a gap/snapshot and its own synced barrier. Every subscription uses a fresh
 ID on the connection, including recovery. After unsub, subfail or lagged, late frames
 for the retired ID are silently dropped; frames for never-opened IDs are protocol
 errors. Reusing a live or closed ID is refused with subfail code `sub_id_reused`. The `fleet-lite.jsonl` fixture pins
-bootstrap, live updates/removal and recovery.
+bootstrap, live updates/removal and recovery on the client.
+`tests/fixtures/structured-wire/fleet-server.jsonl` separately drives the real
+server owner and endpoint, including absent-row completion.
+
+### Fleet-lite store recovery
+
+An empty, unmarked lock with neither data record opens at zero. This includes an
+empty legacy lock from the snapshot-only layout (#1974). Legacy locks were always
+unmarked, even after positions had been published through `fleet.json`. That
+layout's only high-water floor was `fleet.json`; if it is lost, there is no better
+floor to recover. Opening at zero preserves the old behavior.
+
+In the cursor-based layout, cursor durability precedes the initialization marker.
+If an unmarked lock already has a matching cursor, opening fsyncs the cursor's
+parent directory again before
+marking the lock. This completes a previous initialization whose rename succeeded
+but directory fsync failed. A directory-fsync error refuses opening and leaves
+the lock unmarked for a later retry.
+`fleet.lock` carries that marker, so deleting it together with `fleet.cursor`
+while an older `fleet.json` survives reopens at that older head. The operator
+must never delete the lock.
+
+The stream owner persists `<data dir>/fleet.cursor` before replacing
+`<data dir>/fleet.json`, under the existing exclusive `fleet.lock`.
+It refreshes registry/S4/S6 observations before serving a cut. Checkpoint
+allocation, publication of pending live deltas and registration of the new
+subscriber are serialized off the app and heartbeat executors. Each checkpoint
+is delivered only to its requesting subscription, through that cut's acknowledged
+replay path. Concurrent mutations follow the immutable replay cut, after its
+single synced barrier. Another reader's checkpoint cannot overflow the live ring.
+
+The live ring holds sixteen frames within the existing 64 KiB message limit,
+shared across cuts and carrying only live deltas. Row preflight reserves the
+maximum JSON-escaped subscription-ID overhead within that limit, so a row near
+the limit can lag even with a shorter actual ID. Each socket retains the existing eight-active-subscription
+and 1024-lifetime-ID limits. A slow cut may lag even during initial replay;
+resubscribe under a fresh ID from the applied cursor. Oversized rows also yield
+lagged rather than truncated payloads; recovery cannot make an oversized row fit.
+Captured checkpoints retain memory proportional to the fleet row count per
+replay, under those cut limits. The latest coherent owner-turn materialization
+may replace an unprocessed one;
+use the agent journal for every intermediate event.
+
+An unavailable permission-book observation leaves stored rows intact and fails
+its readers instead of publishing an empty attention list. This includes a
+preparing worker or one with unconfirmed cleanup: an absent Runtime book is
+empty only when no worker exists or its producer is joined and its authority
+released. A later coherent
+observation can serve fresh readers. Storage failure stops the fleet owner,
+logs the I/O kind and closes its readers. Repair the durable records as below
+and restart the owner; no cursor is reset or write retried silently.
+
+For a store named `fleet.json`, preserve `fleet.cursor` and `fleet.lock` during
+recovery. A lost or corrupt snapshot opens with no rows at the cursor's preserved
+high-water and exposes a typed `SnapshotMissing` or `SnapshotCorrupt` diagnostic.
+Refresh the authoritative registry/S4/S6 provider before serving a recovery
+snapshot. A failed snapshot write may reserve positions that were never published;
+the recovery checkpoint covers those positions instead of reusing them.
+
+Opening leaves damaged snapshot bytes untouched. Copy them before a refresh or
+checkpoint replaces the file. If the cursor is missing after initialization or corrupt, or both recovery records
+are missing from an initialized store, opening refuses a zero reset. With the owning
+store closed, restore a trusted cursor backup or atomically replace its
+`{"high_water":N}` record using temp-file fsync, rename and directory fsync.
+Choose `N` at least as high as the surviving snapshot head and every cursor clients
+have observed. If that floor is unknown, keep the store closed rather than guess.
+A legacy valid snapshot with an unmarked lock seeds the cursor. A durable lock
+marker then prevents a missing cursor from being mistaken for legacy migration
+from an older snapshot. When both records are valid, the maximum high-water wins.
+
+Skipped rows log their array index and `unsupported`, `invalid` or `duplicate`
+reason without their contents. Unknown top-level row fields survive unchanged
+rows and checkpoints, but are dropped when a fresh projection changes the row.
 
 `agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, required `request_seq`, `decision`
 (`allow_once`, `allow_always` or `deny`), and optional `message`. Only a
@@ -71,3 +147,29 @@ FIFO closure order. A decision for a retained closed pair returns
 `permission_request_unknown`. A reused harness ID receives a new sequence:
 a delayed decision for its old handle cannot approve the new request or install
 an `allow_always` grant. Session grants remain exact matches for this live runtime.
+
+## Permission lifecycle records
+
+`flk_permission_request` is a known agent-stream event, exported as the generated
+`PermissionRecord` type. Its `state` is `open` or `closed`; there is no `decided`
+state. Both carry `request_id` and the flk-issued `request_seq`. Only `open`
+carries `request: ToolRequest`, from which the client renders the tool summary.
+A close carries `decision`, nullable `message`, `principal` and `source`, or a
+closed reason enum. Capacity refusals use `permission_request_limit` and may
+have no preceding open. Other reasons include `ended`, `cancelled`, `result`,
+`interrupted`, `permission_request_too_large`, and `session_ended` (a prior
+runtime left an unmatched open). Existing closed JSON is preserved apart from `request_seq`.
+
+The `permission-decision` fixture shows open, `agent.decide` acknowledgement,
+then closed. The ack acknowledges admission; remove the card when the durable
+closed event arrives. Future or incompatible record shapes use the existing
+unknown-event wrapper, preserving their original payload.
+
+On session start or resume, the owner closes unmatched permission records with
+`session_ended` before processing new control requests, including interrupted
+automatic approvals. The closes use normal durable audit ordering; an I/O
+failure stops the owner. Repeated starts add no duplicate close. Old permission
+slots and exact grants are not restored. Legacy opens without `request_seq`
+use their durable stream position for the recovery close; an old close without
+a handle matches by ID. Unknown records remain untouched, and invalid permission
+headers are logged and preserved rather than failing the entire recovery scan.

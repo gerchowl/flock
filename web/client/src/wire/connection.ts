@@ -118,7 +118,7 @@ export function isHistoryStream(stream: string): boolean {
  */
 export interface StreamHandler {
   /** An event to apply. The cursor advances once this returns. */
-  event(seq: number, ev: WireEvent): void;
+  event(seq: number, ev: WireEvent, tsMs: number): void;
   /** History-stream `gap`: seqs `from`–`to` are no longer stored. */
   gap(from: number, to: number): void;
   /** The `synced` barrier: the stream is Current. Once per `sub`. */
@@ -354,17 +354,18 @@ export class WireConnection {
 
   /**
    * Queues a command (ADR-0038 §3's outbox). It is persisted as `pending`
-   * before any send, and sent in Live. Returns its `cmd_id`.
+   * before any send, and sent in Live. Returns its `cmd_id`. `echoAfter`
+   * is stored with it as `echo_after` (`outbox.ts`), and never sent.
    *
    * @throws if no principal is known yet: a command is stored with the
    *   principal that queued it, so none can be queued before a first
    *   `welcome`.
    */
-  command(verb: string, args: JsonValue, cmdId?: string): string {
+  command(verb: string, args: JsonValue, cmdId?: string, echoAfter?: number): string {
     const principal = this.principal;
     if (principal === null) throw new Error("no principal yet: connect once before sending commands");
     const id = cmdId ?? this.#options.newCommandId?.() ?? uuidv7(this.#options.clock.wallNow());
-    this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending" });
+    this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending", ...(echoAfter === undefined ? {} : { echo_after: echoAfter }) });
     this.#flush();
     return id;
   }
@@ -609,7 +610,7 @@ export class WireConnection {
         if (frame.seq === undefined) return this.#protocolError(`ev without seq on ${sub.stream}`);
         if (sub.snapshot !== null) return this.#snapshotLine(sub, sub.snapshot, frame.seq, frame.ev);
         if (sub.cursor !== null && frame.seq <= sub.cursor) return;
-        sub.handler.event(frame.seq, frame.ev);
+        sub.handler.event(frame.seq, frame.ev, frame.ts_ms);
         if (this.#subs.get(sub.id) !== sub) return this.#changed();
         this.#advance(sub, frame.seq);
         return;

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import { readShellConfig, SHELL_CONFIG_GLOBAL } from "../src/config";
+import { pageSearch, readShellConfig, SHELL_CONFIG_GLOBAL } from "../src/config";
+import { locationReads } from "./location-guard";
 import { endpointUrl } from "../src/wire/env";
 import { exchangeUrl } from "../src/wire/token";
 
@@ -9,7 +10,7 @@ function scope(config: unknown): object {
 }
 
 describe("readShellConfig", () => {
-  test("a missing config is an explicit error, not a default", () => {
+  test("with no config global and no page, the error is explicit and names the global", () => {
     const result = readShellConfig({});
     expect(result.ok).toBe(false);
     if (!result.ok) {
@@ -61,12 +62,43 @@ describe("readShellConfig", () => {
     }
   });
 
-  test("the guard still catches a location read anywhere but the allowed fallback", () => {
-    expect(forbiddenReads("src/App.tsx", "const here = window.location.origin;")).toEqual(["location"]);
-    expect(forbiddenReads("src/config.ts", "export function readShellConfig() { return location.host; }")).toEqual(["location"]);
-    expect(forbiddenReads("src/config.ts", "export function sameOriginDefaults(scope) {\n  return scope.location.origin;\n}\n")).toEqual([]);
-    expect(forbiddenReads("src/wire/token.ts", "export function sameOriginDefaults(scope) {\n  return scope.location.origin;\n}\n")).toEqual(["location"]);
+  test("the guard catches every spelling of a location read outside the allowed functions", () => {
+    const spellings = [
+      "const here = window.location.origin;",
+      "const s = location.search;",
+      "const p = location.protocol;",
+      "const { origin } = location;",
+      "const { location: here } = window;",
+      "const here = document.location;",
+      "const here = globalThis['location'];",
+      "const here = self?.location;",
+      "export const read = (scope) => scope.location.origin;",
+      "export function readShellConfig() { return location.host; }",
+    ];
+    for (const spelling of spellings) expect({ spelling, reads: locationReads("src/App.tsx", spelling).length }).toEqual({ spelling, reads: 1 });
+    expect(locationReads("src/config.ts", "export function readShellConfig() { return location.host; }")).toHaveLength(1);
+    // The old regex guard saw only `location.origin|host|href` and `document.location`.
+    for (const spelling of spellings.slice(1, 5)) expect(oldGuardMisses(spelling)).toBe(true);
+  });
+
+  test("the guard allows the named functions, names the module declared itself, and ignores prose and types", () => {
+    const fallback = "export function sameOriginDefaults(scope) {\n  return scope.location.origin;\n}\n";
+    expect(locationReads("src/config.ts", fallback)).toEqual([]);
+    expect(locationReads("src/config.ts", "export function pageSearch(scope) { return scope.location.search; }")).toEqual([]);
+    expect(locationReads("src/wire/token.ts", fallback)).toHaveLength(1);
+    expect(locationReads("src/capture-code.ts", "export function captureCode(page) { return page.location; }")).toEqual([]);
+    expect(locationReads("src/x.ts", "export function takeCode(location: L) { return location.hash; }")).toEqual([]);
+    expect(locationReads("src/x.ts", "// location.origin\n/** window.location */\nexport type P = { readonly location: L };\nconst s = 'location.href';")).toEqual([]);
+  });
+
+  test("the guard still finds a relative fetch", () => {
     expect(forbiddenReads("src/x.ts", "void fetch(url);")).toEqual(["fetch"]);
+  });
+
+  test("pageSearch is the page's query string, or empty when there is no page", () => {
+    expect(pageSearch({ location: { search: "?preview=phone" } })).toBe("?preview=phone");
+    expect(pageSearch({ location: {} })).toBe("");
+    expect(pageSearch({})).toBe("");
   });
 
   test("with no config global, the browser shell takes same-origin defaults", () => {
@@ -91,18 +123,16 @@ describe("readShellConfig", () => {
   });
 });
 
-/**
- * Where a module reads the page's location or fetches relatively. Exactly
- * one place may read `location`: `sameOriginDefaults` in `src/config.ts`,
- * the browser shell's fallback when no config global exists (main's
- * decision on #1880: `flk` serves no config script). Doc comments may name
- * the forbidden APIs; only code counts.
- */
+/** Whether the guard this test replaced would have let `source` through (it matched only these reads). */
+function oldGuardMisses(source: string): boolean {
+  return !/location\.(origin|host|href)|document\.location/.test(source);
+}
+
+/** Where a module reads the page's location (see `./location-guard`) or fetches relatively. */
 function forbiddenReads(path: string, source: string): string[] {
-  let text = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-  if (path === "src/config.ts") text = text.replace(/export function sameOriginDefaults\([\s\S]*?\n\}\n/, "");
+  const text = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
   const reads: string[] = [];
-  if (/location\.(origin|host|href)|document\.location/.test(text)) reads.push("location");
+  if (locationReads(path, source).length > 0) reads.push("location");
   if (/\bfetch\s*\(/.test(text)) reads.push("fetch");
   return reads;
 }

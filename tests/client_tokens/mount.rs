@@ -531,12 +531,12 @@ fn real_legacy_importer_refuses_descriptor_extension_before_any_commit() {
     let importer = server.root.join("legacy-importer");
     let program=r#"#!/bin/sh
 exec python3 - "$@" <<'PY'
-import json,socket,sys
+import json,os,socket,sys
 from pathlib import Path
 peer=socket.socket(socket.AF_UNIX)
 peer.settimeout(5)
 peer.connect(sys.argv[3])
-peer.sendall(sys.argv[4].encode()+b'\n')
+peer.sendall(os.environ.pop('FLOCK_HANDOFF_TOKEN').encode()+b'\n')
 manifest=json.loads(peer.makefile('rb').readline(65536))
 Path(OBSERVATION).write_text(json.dumps({'version':manifest['version'],'listener':manifest.get('client_listener',False),'panes':len(manifest['panes'])}))
 if manifest['version'] != 1:
@@ -549,7 +549,10 @@ PY
     fs::set_permissions(&importer, fs::Permissions::from_mode(0o700)).unwrap();
     let response = server.api("server.live_handoff", json!({"import_exe":importer}));
     assert_eq!(response["error"]["code"], "handoff_failed");
-    assert_eq!(response["error"]["data"]["kind"], "import_refused");
+    assert_eq!(
+        response["error"]["data"]["kind"], "import_refused",
+        "{response}"
+    );
     assert!(response["error"]["message"]
         .as_str()
         .unwrap()

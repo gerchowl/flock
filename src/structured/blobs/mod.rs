@@ -5,8 +5,19 @@ use crate::platform::blobs::Directory;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// Guard against a supplied clock/sleeper that fails to advance. Normal
+/// contention is bounded by elapsed time after backoff, not by attempt count.
+const MAX_REPAIR_LOCK_ATTEMPTS: usize = 8;
+/// Start with a short sleep, doubling only up to the remaining clock budget.
+const REPAIR_LOCK_BACKOFF: Duration = Duration::from_millis(1);
+/// Stop retrying contention after this much supplied monotonic time. Individual
+/// filesystem operations retain their ordinary I/O failure behavior.
+const REPAIR_LOCK_WAIT: Duration = Duration::from_millis(20);
 
 /// Session persistence settings; the threshold is independent of each put's cap.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,13 +25,28 @@ use std::path::Path;
 pub struct StorageConfig {
     /// Replace eligible JSON blocks strictly larger than this many encoded bytes.
     pub blob_min_bytes: usize,
+    /// Silence observation policy in milliseconds, inclusive range 5000..=3600000.
+    #[serde(deserialize_with = "stall_ms")]
+    pub stall_ms: u64,
 }
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             blob_min_bytes: 2048,
+            stall_ms: 120_000,
         }
     }
+}
+/// Shared validation for the session silence threshold.
+pub(crate) fn stall_ms<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if !(5_000..=3_600_000).contains(&value) {
+        return Err(serde::de::Error::invalid_value(
+            serde::de::Unexpected::Unsigned(value),
+            &"sessions.stall_ms in 5000..=3600000 milliseconds",
+        ));
+    }
+    Ok(value)
 }
 /// Explicit failures, retained as the source when transport wraps them in io::Error.
 #[derive(Debug)]
@@ -33,9 +59,9 @@ pub enum BlobError {
     Missing,
     /// Stored bytes do not match their address.
     Corrupt,
-    /// A put exceeded its caller-supplied byte cap.
+    /// A read or put exceeded its caller-supplied byte cap.
     TooLarge,
-    /// An underlying read, write, rename or sync failed.
+    /// An underlying metadata, read, write, rename or sync operation failed.
     Io(io::Error),
 }
 impl std::fmt::Display for BlobError {
@@ -105,15 +131,34 @@ impl BlobStore {
             .metadata()?
             .len())
     }
-    /// Read and verify content, distinguishing absence from hash corruption.
-    pub fn get(&self, hash: &str) -> Result<Vec<u8>, BlobError> {
+    /// Read at most `max_bytes` of verified content, distinguishing absence from
+    /// hash corruption. Oversized metadata is refused before reading or allocating
+    /// content. A bounded read also detects growth after stat, consuming at most
+    /// one extra byte. Size refusal precedes digest verification.
+    pub fn get(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BlobError> {
+        self.get_after_stat(hash, max_bytes, |_| {})
+    }
+    // Test seam: the callback observes the opened descriptor after stat, before reading.
+    // Production supplies an empty closure.
+    fn get_after_stat(
+        &self,
+        hash: &str,
+        max_bytes: u64,
+        after_stat: impl FnOnce(&File),
+    ) -> Result<Vec<u8>, BlobError> {
         Self::check(hash)?;
+        let file = self.0.file(hash, false).map_err(Self::lookup_error)?;
+        if file.metadata()?.len() > max_bytes {
+            return Err(BlobError::TooLarge);
+        }
+        after_stat(&file);
         let mut bytes = Vec::new();
-        self.0
-            .file(hash, false)
-            .map_err(Self::lookup_error)?
+        file.take(max_bytes.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(BlobError::Io)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(BlobError::TooLarge);
+        }
         if Sha256::digest(&bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -126,11 +171,36 @@ impl BlobStore {
     }
     /// Hash precisely the bytes read and written, atomically publishing only a
     /// complete, synced object. Cap failures clean up the private temporary file.
-    /// An existing corrupt object is repaired with the verified new bytes and a
-    /// structured repair event after the directory sync. Unsafe entries and I/O
-    /// failures still fail explicitly; reads continue to report corruption.
-    /// Concurrent identical puts may replace an identical inode, never partial data.
-    pub fn put(&self, mut reader: impl Read, max_bytes: u64) -> Result<BlobRef, BlobError> {
+    /// Only corrupt-object repair attempts advisory serialization and rechecks
+    /// the current bytes before rename. Missing objects publish without locking:
+    /// racing writers have identical verified bytes and emit no repair event.
+    /// On contention the supplied clock sleeps for 1 ms, then doubles the
+    /// backoff, clipping every request to the remaining 20 ms budget. Eight
+    /// attempts guard only against a clock/sleeper that fails to advance.
+    /// Clock expiry warns with TimedOut; attempt exhaustion warns with WouldBlock.
+    /// Other lock errors warn immediately. Each warns once and falls back to
+    /// unlocked publication; duplicate diagnostics are then possible, but locking
+    /// never loses content. Sleep requests are bounded, not OS scheduling or I/O.
+    /// Non-cooperating filesystem mutations are outside this advisory lock.
+    /// Read/write/rename/sync failures remain explicit; reads report corruption.
+    pub fn put(&self, reader: impl Read, max_bytes: u64) -> Result<BlobRef, BlobError> {
+        self.put_with_repair_lock(
+            reader,
+            max_bytes,
+            &mut Instant::now,
+            &mut std::thread::sleep,
+            &mut || self.0.try_publication_lock(),
+        )
+    }
+    // Keep time and lock acquisition injectable for filesystem failure tests.
+    fn put_with_repair_lock(
+        &self,
+        mut reader: impl Read,
+        max_bytes: u64,
+        now: &mut impl FnMut() -> Instant,
+        sleep: &mut impl FnMut(Duration),
+        lock: &mut impl FnMut() -> io::Result<File>,
+    ) -> Result<BlobRef, BlobError> {
         let mut entropy = [0; 16];
         getrandom::fill(&mut entropy).map_err(io::Error::other)?;
         let name = format!(".tmp-{:x}", u128::from_ne_bytes(entropy));
@@ -165,12 +235,32 @@ impl BlobStore {
                 size,
                 preview: String::from_utf8_lossy(&preview).chars().take(80).collect(),
             };
-            match self.get(&reference.blob) {
+            match self.get(&reference.blob, max_bytes) {
                 Ok(_) => self.0.sync()?,
                 Err(BlobError::Missing) => self.publish(&name, &reference.blob)?,
                 Err(BlobError::Corrupt) => {
-                    self.publish(&name, &reference.blob)?;
-                    crate::logging::structured_blob_repaired(&reference);
+                    #[cfg(test)]
+                    tests::corrupt_observed();
+                    let _publication = match Self::repair_lock(now, sleep, lock) {
+                        Ok(guard) => Some(guard),
+                        Err(error) => {
+                            crate::logging::structured_blob_repair_lock_unavailable(
+                                &reference,
+                                error.kind(),
+                            );
+                            None
+                        }
+                    };
+                    // Recheck even on fallback: another writer may have repaired it.
+                    match self.get(&reference.blob, max_bytes) {
+                        Ok(_) => self.0.sync()?,
+                        Err(BlobError::Missing) => self.publish(&name, &reference.blob)?,
+                        Err(BlobError::Corrupt) => {
+                            self.publish(&name, &reference.blob)?;
+                            crate::logging::structured_blob_repaired(&reference);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -183,6 +273,37 @@ impl BlobStore {
             Err(error) => return Err(BlobError::Io(error)),
         }
         result
+    }
+    /// A bounded, best-effort wait using the caller's matching now/sleep pair.
+    /// Only contention backs off; unsupported locking immediately falls back.
+    fn repair_lock(
+        now: &mut impl FnMut() -> Instant,
+        sleep: &mut impl FnMut(Duration),
+        lock: &mut impl FnMut() -> io::Result<File>,
+    ) -> io::Result<File> {
+        let started = now();
+        let mut backoff = REPAIR_LOCK_BACKOFF;
+        for attempt in 0..MAX_REPAIR_LOCK_ATTEMPTS {
+            match lock() {
+                Ok(guard) => return Ok(guard),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                Err(error) => return Err(error),
+            }
+            let elapsed = now().saturating_duration_since(started);
+            let remaining = REPAIR_LOCK_WAIT.saturating_sub(elapsed);
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            if attempt + 1 == MAX_REPAIR_LOCK_ATTEMPTS {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            sleep(backoff.min(remaining));
+            if now().saturating_duration_since(started) >= REPAIR_LOCK_WAIT {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            backoff = backoff.saturating_mul(2).min(REPAIR_LOCK_WAIT);
+        }
+        Err(io::ErrorKind::WouldBlock.into())
     }
     fn publish(&self, temporary: &str, blob: &str) -> Result<(), BlobError> {
         #[cfg(test)]
