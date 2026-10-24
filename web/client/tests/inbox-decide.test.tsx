@@ -96,11 +96,20 @@ describe("the card's state is the outbox entry's", () => {
 });
 
 describe("answering a prompt", () => {
-  test("a refusal code outside AgentDecideErrorCode, like invalid_params, shows its message, is never retried, and waits for a new seq", () => {
+  test("invalid_params renders the trimmed UTF-8 message limit and control-byte guidance", () => {
+    const app = prompt();
+    button(app, "Deny").click();
+    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("invalid_params") });
+    expect(status(app)).toBe(`The trimmed message must be at most ${MESSAGE_MAX_BYTES} UTF-8 bytes and contain no control bytes other than newlines or tabs.`);
+    expect(button(app, "Deny").hasAttribute("disabled")).toBe(true);
+    expect(cmds(app)).toHaveLength(1);
+  });
+
+  test("a refusal code outside AgentDecideErrorCode, like future_refusal, shows its message, is never retried, and waits for a new seq", () => {
     const app = prompt();
     button(app, "Allow once").click();
-    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("invalid_params") });
-    expect(status(app)).toBe(`${STATUS_LABELS.failed}: server said invalid_params`);
+    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("future_refusal") });
+    expect(status(app)).toBe(`${STATUS_LABELS.failed}: server said future_refusal`);
     for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
     button(app, "Allow once").click();
     expect(cmds(app)).toHaveLength(1);
@@ -129,7 +138,7 @@ describe("answering a prompt", () => {
     button(app, "Deny").click();
     ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("not_authorized") });
     expect(status(app)).toBe(REFUSALS.not_authorized);
-    expect(Object.keys(REFUSALS)).toEqual(["permission_request_unknown", "permission_request_closed", "not_authorized"]);
+    expect(Object.keys(REFUSALS)).toEqual(["permission_request_unknown", "permission_request_closed", "not_authorized", "invalid_params"]);
   });
 
   test("an untyped refusal shows the server's message", () => {
