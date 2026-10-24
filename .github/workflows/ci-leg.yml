@@ -170,6 +170,15 @@ jobs:
             experimental-features = nix-command flakes
             always-allow-substitutes = true
 
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-
+          save: ${{ github.ref == 'refs/heads/dev' }}
+          gc-max-store-size-linux: 2G
+          gc-max-store-size-macos: 2G
+
       - name: Download test archive
         uses: actions/download-artifact@v8
         with:
