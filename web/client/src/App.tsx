@@ -18,7 +18,7 @@
 import { Match, Show, Switch, createSignal, onCleanup, type JSX } from "solid-js";
 
 import { ReplayBadge } from "./components/ReplayBadge";
-import type { ConfigResult, FixtureShellConfig, WireShellConfig } from "./config";
+import { pageSearch, type ConfigResult, type FixtureShellConfig, type WireShellConfig } from "./config";
 import { createFixtureFleet } from "./fleet";
 import { emptyLayout } from "./layout/model";
 import { createLayoutStore } from "./layout/persistence";
@@ -28,7 +28,7 @@ import { WireConnection, type ConnectionOptions } from "./wire/connection";
 import { browserClock, browserSockets, endpointUrl } from "./wire/env";
 import { createWireFleet } from "./wire/fleet";
 import { captureCode, type CodePage } from "./capture-code";
-import { EXCHANGE_FAILED, RUN_CLIENT_OPEN, createTokenStore, exchangeCode, type ExchangeRequest, type SessionLike } from "./wire/token";
+import { EXCHANGE_FAILED, RUN_CLIENT_OPEN, createTokenStore, exchangeCode, isCode, type ExchangeRequest, type SessionLike } from "./wire/token";
 import { createWireTransport } from "./wire/transport";
 import { ConnectionBar } from "./workbench/ConnectionBar";
 import { createWireSender } from "./workbench/sender";
@@ -76,7 +76,7 @@ function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element
         layout={layout}
         saveLayout={(next) => store.save(next)}
         status={() => notice}
-        mode={previewMode(location.search)}
+        mode={previewMode(pageSearch(globalThis))}
         source="replay"
       />
     </>
@@ -109,7 +109,19 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const [revision, setRevision] = createSignal(0);
   onCleanup(connection.onChange(() => setRevision(revision() + 1)));
   const sender = createWireSender(connection, revision);
-  onCleanup(connection.onTransition((state) => state === "NeedsToken" && tokens.clear()));
+  /** True while a failed code settles: its own move into NeedsToken keeps the message. */
+  let settling = false;
+  onCleanup(
+    connection.onTransition((state) => {
+      if (state !== "NeedsToken") return;
+      tokens.clear();
+      // A later NeedsToken (the server refused the token) is a new reason: the old link's message is stale.
+      if (!settling) {
+        setFailed(false);
+        setLinkNotice(null);
+      }
+    }),
+  );
   let disposed = false;
   onCleanup(() => {
     disposed = true;
@@ -123,38 +135,55 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
     if (token !== null) connection.setToken(token);
     if (connection.state === "Disconnected") connection.connect();
   };
+  /** A code that failed, or never was one: keeps the token and a working session as they are. */
+  const failExchange = (): void => {
+    setExchanging(false);
+    if (connection.state === "Disconnected" || connection.state === "NeedsToken") {
+      setFailed(true);
+      // Nothing works on yet: fall back on a held token, or wait in NeedsToken.
+      const fallback = held();
+      if (fallback !== null) setLinkNotice(EXCHANGE_FAILED);
+      settling = true;
+      try {
+        use(fallback);
+      } finally {
+        settling = false;
+      }
+    } else setLinkNotice(EXCHANGE_FAILED);
+    refresh();
+  };
   /**
    * Exchanges `code`, exactly once: a failed code is never retried
    * (ADR-0038 §3). A new code replaces the stored token only on success; a
-   * failure leaves the token and a working session as they are.
+   * failure leaves the token and a working session as they are. A malformed
+   * code is a failure without an exchange, and never supersedes one in flight.
    */
   let latest = 0;
   const signInWith = (code: string): void => {
+    if (!isCode(code)) {
+      // A bad paste must not discard a good exchange that already consumed its code.
+      if (!exchanging()) failExchange();
+      return;
+    }
     // Only the latest code's result counts: a slower, older exchange is ignored.
     const generation = ++latest;
     setExchanging(true);
     refresh();
     void exchangeCode(code, props.config.serverUrl, request).then((exchanged) => {
       if (disposed || generation !== latest) return;
+      if (exchanged === null) return failExchange();
       setExchanging(false);
-      if (exchanged !== null) {
-        tokens.set(exchanged);
-        setFailed(false);
-        setLinkNotice(null);
-        // A new token is a new identity (a changed principal drops the outbox).
-        use(exchanged);
-      } else if (connection.state === "Disconnected" || connection.state === "NeedsToken") {
-        setFailed(true);
-        // Nothing works on yet: fall back on a held token, or wait in NeedsToken.
-        const fallback = held();
-        if (fallback !== null) setLinkNotice(EXCHANGE_FAILED);
-        use(fallback);
-      } else setLinkNotice(EXCHANGE_FAILED);
+      tokens.set(exchanged);
+      setFailed(false);
+      setLinkNotice(null);
+      // A new token is a new identity (a changed principal drops the outbox).
+      use(exchanged);
       refresh();
     });
   };
   if (props.code === null) connection.connect();
-  else signInWith(props.code);
+  else if (isCode(props.code)) signInWith(props.code);
+  else failExchange();
   // A pasted `flk client open` link changes only the fragment: take its code the same way.
   const onHashChange = (): void => {
     const code = captureCode(page);
@@ -188,7 +217,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
         layout={layout}
         saveLayout={(next) => store.save(next)}
         status={() => [notice, status()].filter((part) => part !== null).join(" · ")}
-        mode={previewMode(location.search)}
+        mode={previewMode(pageSearch(globalThis))}
         source="live"
       />
     </>
