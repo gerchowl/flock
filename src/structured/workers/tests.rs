@@ -75,13 +75,31 @@ impl Case {
             storage: Default::default(),
             mcp: fixture.mcp(),
             stall_after: STALL,
+            queue_rewrite_bytes: crate::config::Config::default()
+                .sessions
+                .queue_rewrite_bytes,
             lineage: None,
             admission: None,
         };
-        let f = fixture.clone();
-        let authority = leases.clone();
+        let case = Self {
+            fixture,
+            id,
+            session,
+            generation,
+            leases,
+        };
+        let factory = case.factory(mode, events);
+        (case, launch, factory)
+    }
+    fn factory(
+        &self,
+        mode: &str,
+        events: Vec<Value>,
+    ) -> impl FnOnce(&Record) -> Result<LaunchProfile, LaunchError> + Send + 'static {
+        let f = self.fixture.clone();
+        let authority = self.leases.clone();
         let mode = mode.to_owned();
-        let factory = move |record: &Record| {
+        move |record: &Record| {
             assert!(
                 authority.is_reserved(&record.session_id).unwrap(),
                 "reserve precedes profile factory"
@@ -112,18 +130,7 @@ impl Case {
                 0o600,
             );
             Ok(profile)
-        };
-        (
-            Self {
-                fixture,
-                id,
-                session,
-                generation,
-                leases,
-            },
-            launch,
-            factory,
-        )
+        }
     }
     pub(crate) fn assert_shutdown(&self, registry: &Registry, workers: &Workers) {
         assert!(workers.entries[&self.id].thread.is_none(), "worker joined");
@@ -182,6 +189,8 @@ impl Case {
                 finished: false,
                 events_closed: false,
                 stall_after: STALL,
+                queue_state: None,
+                queue_seq: 0,
                 lineage: None,
                 thread: Some(std::thread::spawn(|| {})),
             },
@@ -199,7 +208,17 @@ impl Case {
         worker.report = None;
     }
     pub fn submit(&self, workers: &Workers) {
-        workers.runtime(&self.id, self.generation).unwrap().try_submit(&json!({"type":"user","message":{"role":"user","content":"fixture turn"},"parent_tool_use_id":null,"session_id":""})).unwrap();
+        let mut item = crate::structured::queue::tests::item(&self.session);
+        item.body = "fixture turn".into();
+        workers
+            .runtime(&self.id, self.generation)
+            .unwrap()
+            .queue_enqueue(super::queue::Request {
+                item,
+                principal: crate::structured::queue::admission::Principal::Operator,
+                gate: crate::structured::queue::admission::Gate::Send,
+            })
+            .unwrap();
     }
     pub async fn ready(
         &self,
@@ -648,6 +667,8 @@ async fn missing_worker_completion_retains_uncertain_authority_and_refuses_resta
             finished: false,
             events_closed: false,
             stall_after: STALL,
+            queue_state: None,
+            queue_seq: 0,
             lineage: None,
             thread: Some(std::thread::spawn(|| {})),
         },
@@ -1220,6 +1241,7 @@ async fn owner_lease_acquisition_retires_pending_without_double_counting() {
     assert_eq!(count_after, Ok((1, 1)));
 }
 
+mod queue;
 /// A new lease generation must preserve ancestry even when the operator resumes.
 #[tokio::test]
 async fn operator_resume_preserves_original_lease_lineage() {
@@ -1228,6 +1250,9 @@ async fn operator_resume_preserves_original_lease_lineage() {
     launch.lineage = Some(("original-parent".into(), 2));
     let template = Launch {
         opening_turn: None,
+        queue_rewrite_bytes: crate::config::Config::default()
+            .sessions
+            .queue_rewrite_bytes,
         agent_id: case.id.clone(),
         generation: case.generation,
         leases: case.leases.clone(),
@@ -1289,3 +1314,5 @@ async fn finished_without_report_allows_retained_recovery() {
     worker.report = None;
     assert!(workers.history_recovery_allowed(&case.id));
 }
+
+mod recovery;
