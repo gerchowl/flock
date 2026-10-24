@@ -17,6 +17,10 @@ import type { WireEvent } from "../gen/WireEvent";
 import type { AgentRow, FleetSource } from "../fleet";
 import type { WireConnection } from "./connection";
 
+/** Parse the generated fields presentation consumes; newer S4 axes stay opaque. */
+type RowView = Pick<FleetAgentRow, "id" | "label" | "activity" | "waiting_on_human"> & { readonly state: { readonly phase?: unknown } };
+type DeltaView = (Omit<Extract<FleetDelta, { type: "fleet.upsert" }>, "row"> & { readonly row: RowView }) | Extract<FleetDelta, { type: "fleet.remove" }>;
+
 /** Typed against {@link Phase}, so a new state fails `tsc` until listed. */
 const PHASES: { readonly [P in Phase]: true } = {
   gone: true,
@@ -37,30 +41,29 @@ type Json = { readonly [key: string]: unknown };
 const isObject = (value: unknown): value is Json => typeof value === "object" && value !== null && !Array.isArray(value);
 const isStrings = (value: unknown): value is string[] => Array.isArray(value) && value.every((item) => typeof item === "string");
 
-/** Checks only what {@link agentRow} reads; `state` is the generated `AgentState` object. */
-function isRow(row: unknown): row is FleetAgentRow {
-  if (!isObject(row) || !isObject(row["state"])) return false;
-  const phase = row["state"]["phase"];
+function isRow(row: unknown): row is RowView {
   return (
+    isObject(row) &&
     typeof row["id"] === "string" &&
     typeof row["label"] === "string" &&
-    typeof phase === "string" &&
-    Object.hasOwn(PHASES, phase) &&
+    isObject(row["state"]) &&
     (row["activity"] === undefined || typeof row["activity"] === "string") &&
     isStrings(row["waiting_on_human"])
   );
 }
 
 /** Reads one payload as a {@link FleetDelta}, or `null`. */
-export function fleetDelta(ev: WireEvent): FleetDelta | null {
+export function fleetDelta(ev: WireEvent): DeltaView | null {
   if (!isObject(ev)) return null;
   if (ev["type"] === "fleet.upsert" && isRow(ev["row"])) return { type: "fleet.upsert", row: ev["row"] };
   if (ev["type"] === "fleet.remove" && typeof ev["id"] === "string") return { type: "fleet.remove", id: ev["id"] };
   return null;
 }
 
-function agentRow(row: FleetAgentRow): AgentRow {
-  return { id: row.id, label: row.label, state: row.state.phase, activity: row.activity ?? "", waitingOnHuman: row.waiting_on_human };
+function agentRow(row: RowView): AgentRow {
+  const phase = row.state.phase;
+  const state = typeof phase === "string" && Object.hasOwn(PHASES, phase) ? phase as Phase : "unknown";
+  return { id: row.id, label: row.label, state, activity: row.activity ?? "", waitingOnHuman: row.waiting_on_human };
 }
 
 /** Creates a {@link FleetSource} whose subscriptions run on `connection`. */

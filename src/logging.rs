@@ -14,6 +14,18 @@ const DEFAULT_MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 // cap, and the failure being diagnosed usually lived in the tail just dropped.
 const DEFAULT_RETAINED_LOG_FILES: usize = 2;
 
+/// Fleet storage failures expose only the typed I/O kind.
+#[cfg(feature = "web")]
+pub(crate) fn structured_fleet_stopped(error: &io::Error) {
+    tracing::error!(event = "structured.fleet.stopped", kind = ?error.kind(), "fleet stream owner stopped");
+}
+
+/// Recovery facts contain only a closed variant and a durable cursor floor.
+#[cfg(feature = "web")]
+pub(crate) fn structured_fleet_recovered(diagnostic: &crate::structured::fleet_lite::Diagnostic) {
+    tracing::warn!(event = "structured.fleet.recovered", diagnostic = ?diagnostic, "fleet snapshot recovered");
+}
+
 /// Surface retained recovery entries without reading session contents.
 pub(crate) fn structured_sweep_outcome(entry: &crate::structured::supervision::SweepEntry) {
     use crate::structured::supervision::SweepOutcome;
@@ -5176,6 +5188,25 @@ pub(crate) fn selection_content_unavailable(pane_closed: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "web")]
+    #[test]
+    fn structured_fleet_diagnostics_exclude_error_payloads() {
+        let out = capture_logs(|| {
+            structured_fleet_stopped(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private fixture error payload",
+            ));
+            structured_fleet_recovered(
+                &crate::structured::fleet_lite::Diagnostic::SnapshotCorrupt { high_water: 9 },
+            );
+        });
+        assert!(out.contains("structured.fleet.stopped"), "{out}");
+        assert!(out.contains("PermissionDenied"), "{out}");
+        assert!(out.contains("structured.fleet.recovered"), "{out}");
+        assert!(out.contains("SnapshotCorrupt"), "{out}");
+        assert!(!out.contains("private fixture error payload"), "{out}");
+    }
 
     #[test]
     fn remote_bridge_started_logs_full_command_shape() {
