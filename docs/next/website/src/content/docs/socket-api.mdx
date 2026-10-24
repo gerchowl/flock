@@ -1088,6 +1088,9 @@ record while cancellation and cleanup run asynchronously. It requires operator
 or structured-self authority. Offline stop is idempotent; Unknown ownership refuses
 with `structured_recovery_required` (retry `after_human`, CLI exit 1).
 Pane-only operations return `runtime_unsupported` (retry `never`, CLI exit 2).
+`agent.send` instead uses structured queue admission: `submit:false` returns
+`structured_submit_required`; `submit:true` acknowledges the durable lifecycle ID.
+A name or ID shared with a terminal still returns `agent_target_ambiguous`.
 These contracts do not enable public structured start; that remains gated until
 all #1843 routing and #1734 credential protection land. Mesh VERSION remains 5.
 

@@ -148,10 +148,13 @@ impl App {
             return Ok(None);
         }
         if matches.len() != 1
-            || !matches!(
-                self.resolve_terminal_target(target),
-                Err(crate::app::terminal_targets::TerminalTargetError::NotFound { .. })
-            )
+            || self.parse_pane_id(target).is_some()
+            || self.state.terminals.values().any(|terminal| {
+                terminal.id.to_string() == target
+                    || terminal.agent_id.to_string() == target
+                    || terminal.agent_name() == Some(target)
+                    || terminal.effective_agent_label() == Some(target)
+            })
         {
             return Err(ErrorCode::AgentTargetAmbiguous);
         }
