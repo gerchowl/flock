@@ -193,7 +193,7 @@ deserialize_named_enum!(Delivery { AtIdle => "at_idle", Steer => "steer", Interr
 /// optional fields across an older writer's checkpoint without interpreting them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
-    /// Server-minted message UUID.
+    /// Canonical lifecycle UUID, stable across admission retries.
     pub item_id: String,
     /// Trusted origin.
     pub producer: Producer,
@@ -230,7 +230,7 @@ pub enum Change {
         /// Final zero-based queue position.
         position: usize,
     },
-    /// Fail an unbounded existing item without rewriting its oversized payload.
+    /// Permanently refuse a retained item without rewriting its payload.
     Fail {
         /// Existing identity whose position and body remain unchanged.
         item_id: String,
