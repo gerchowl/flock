@@ -798,7 +798,7 @@ fn unknown_post_hello_operations_and_binary_frames_execute_nothing() {
     runtime(async {
         let server = Server::new().await;
         for frame in [
-            json!({"t":"cmd","cmd_id":"fixture","verb":"agent.send","args":{"agent":"fiction","text":"no-dispatch","submit":true},"resume_only":false}),
+            json!({"t":"cmd","cmd_id":"fixture","verb":"agent.decide","args":{"agent":"fiction","text":"no-dispatch","submit":true},"resume_only":false}),
             json!({"t":"new-operation"}),
             json!({"t":"hello","protocol":1,"client":{"name":"f","version":"1"},"token":"a".repeat(64)}),
         ] {
@@ -1372,3 +1372,5 @@ fn subscriptions_are_accepted_on_the_actual_socket() {
 mod subscriptions;
 
 mod fleet;
+
+mod commands;

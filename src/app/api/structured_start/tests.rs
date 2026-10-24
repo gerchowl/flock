@@ -252,7 +252,29 @@ impl AdmissionFixture {
         (id, generation)
     }
     fn submit(&self, id: &str, generation: u64) {
-        self.app.structured_workers.runtime(id, generation).unwrap().try_submit(&json!({"type":"user","message":{"role":"user","content":"fixture turn"},"parent_tool_use_id":null,"session_id":""})).unwrap();
+        use crate::structured::{
+            queue::{
+                admission::{Gate, Principal},
+                tests::item,
+            },
+            workers::queue::Request,
+        };
+        let item_id = crate::structured::queue::admission::lifecycle_id().unwrap();
+        let mut input = item(&item_id);
+        input.body = "fixture turn".into();
+        self.app
+            .structured_workers
+            .enqueue(
+                &self.app.state.structured_agents,
+                id,
+                generation,
+                Request {
+                    item: input,
+                    principal: Principal::Operator,
+                    gate: Gate::Send,
+                },
+            )
+            .unwrap();
     }
 }
 impl Drop for AdmissionFixture {
@@ -399,8 +421,9 @@ async fn cli_socket_launch_observes_configured_stall_without_changing_phase() {
             json!({"name":"fixture-launch", "runtime":"structured", "argv":["claude"]}),
         )
         .unwrap();
+        fixture.app.service_structured_workers(Instant::now());
         let resumed = fixture.request(Method::AgentStart(resume)).await;
-        assert_eq!(resumed["result"]["agent"]["agent_id"], id);
+        assert_eq!(resumed["result"]["agent"]["agent_id"], id, "{resumed}");
         assert_eq!(
             resumed["result"]["agent"]["session_id"],
             read["result"]["agent"]["session_id"]

@@ -1130,10 +1130,20 @@ richer question routing remain ADR-0036 S6 work (#1307).
 The server attests the caller and enforces spawn opt-in, pause, depth, fanout and
 capacity through the same owner admission. An unrelated MCP process cannot use
 operator authority to spawn. An opening prompt is validated and nonce-framed
-before it reaches stream stdin; it never becomes harness argv. Unknown restored
+before it reaches stream stdin; it never becomes harness argv. The queue owner
+commits the first item before Ready, with a lifecycle UUID, `Kind::Message` and
+`Producer::Agent` from the attested starter. The existing nonce frame is preserved
+inside the queue's message frame. CLI starts enqueue no opening item. Admission
+refusal reports the queue's typed code (otherwise `agent_start_failed`) before
+Ready or harness spawn, so no partial runtime remains. Startup failure after
+admission terminally settles the opening with `agent_start_failed`. Reopen fences
+an unresolved queued opening until that settlement commits, so operator resume
+cannot deliver the previous failed launch's prompt. Unknown restored
 records remain fenced. Resuming an existing record through CLI/socket is
 operator-only, even when an agent targets itself (`operator_only`, exit 13).
-Resume keeps the original parent and depth. MCP spawn cannot resume records;
+After cleanup, operator resume works for both idle CLI starts and MCP opening
+turns; publication drains the terminal queue completions. Resume keeps the
+original parent and depth. MCP spawn cannot resume records;
 mesh relays refuse structured start/spawn. Browser token scopes do not confer
 socket operator identity. The structured WebSocket command endpoint is not yet
 implemented (#1828/#1677). Scoped transport verifies the live lease on each request
