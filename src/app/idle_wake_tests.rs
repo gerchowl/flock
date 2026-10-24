@@ -1254,7 +1254,7 @@ async fn guarded_dispatch_requires_consuming_deferred_attempt() {
         panic!("expected submit event")
     };
     runtime(&app).test_stamp_operator_input_at(Instant::now());
-    app.advance_guarded_request(request_id, pane_id, attempt, respond_to);
+    app.advance_guarded_request(request_id, pane_id, *attempt, respond_to);
     assert!(!app.active_submissions.contains(&pane));
     let response: serde_json::Value = serde_json::from_str(&receiver.recv().unwrap()).unwrap();
     assert_eq!(response["result"]["outcome"], "unconfirmed");
@@ -1604,7 +1604,10 @@ async fn delivery_attempt_handoff_import_restores_interrupted_evidence() {
     assert!(!drain(&mut pty).is_empty());
     let id = app.delivery_attempts()[0].attempt_id.clone();
     let snapshot = crate::persist::capture(
-        &app.state.structured_agents,
+        crate::persist::RegistryCapture {
+            registry: &app.state.structured_agents,
+            now_ms: Some(42),
+        },
         &[],
         &Default::default(),
         &Default::default(),

@@ -328,6 +328,7 @@ fn entry_for(name: &str) -> Entry {
         base: None,
         base_sha: None,
         agent_id: None,
+        lock_resolution: None,
     }
 }
 

@@ -58,6 +58,7 @@ fn api(r: &mut AppQueue, params: AgentSendParams) -> mpsc::Receiver<String> {
                 method: Method::AgentSend(params),
             },
             respond_to: tx,
+            scope: None,
             peer_pid: Some(std::process::id()),
             peer_birth: crate::platform::process_start_time(std::process::id()),
             peer_uid: Some(crate::platform::peer::effective_uid()),
@@ -237,6 +238,7 @@ async fn send_admission_cli_uses_actual_socket_dispatch_and_prints_lifecycle_id(
                 &Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 None,
                 &std::sync::Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &policy,
             )
             .unwrap();

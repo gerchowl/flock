@@ -86,31 +86,76 @@ class RefreshTests(unittest.TestCase):
         return command, env, original
 
     def test_interrupt_restores_original_manifest(self):
+        self.interrupt_restores_original_manifest()
+
+    def test_repeated_term_during_exit_restores_original_manifest(self):
+        self.interrupt_restores_original_manifest(gate_restore=True)
+
+    def interrupt_restores_original_manifest(self, gate_restore=False):
         for phase in ['probe', 'verify']:
-            for sig in [signal.SIGINT, signal.SIGTERM]:
+            signals = [signal.SIGTERM] if gate_restore else [signal.SIGINT, signal.SIGTERM]
+            for sig in signals:
                 with self.subTest(phase=phase, signal=sig), tempfile.TemporaryDirectory() as name:
                     root = Path(name)
                     command, env, original = self.fixture(root)
                     read_fd, write_fd = os.pipe()
                     env.update(BLOCK_PHASE=phase, READY_FD=str(write_fd))
+                    extra_fds = []
+                    if gate_restore:
+                        restore_read, restore_write = os.pipe()
+                        release_read, release_write = os.pipe()
+                        extra_fds = [restore_read, restore_write, release_read, release_write]
+                        bash_env = root / 'bash-env'
+                        # DEBUG gates entry to the EXIT callback, before its first command.
+                        bash_env.write_text('''set -T
+trap 'if [[ ${FUNCNAME[0]-} == restore && ${restore_gated-} != yes ]]; then
+    restore_gated=yes
+    printf "restore\\n" >&"$RESTORE_READY_FD"
+    IFS= read -r -t 10 -u "$RESTORE_RELEASE_FD" release
+fi' DEBUG
+''')
+                        env.update(BASH_ENV=str(bash_env), RESTORE_READY_FD=str(restore_write),
+                                   RESTORE_RELEASE_FD=str(release_read))
                     # This private session contains only our recipe and fake tools.
+                    child_fds = (write_fd, *(extra_fds[1:3] if gate_restore else []))
                     child = subprocess.Popen(command, cwd=root, env=env, start_new_session=True,
-                                             pass_fds=(write_fd,), stdout=subprocess.PIPE,
+                                             pass_fds=child_fds, stdout=subprocess.PIPE,
                                              stderr=subprocess.PIPE, text=True)
                     os.close(write_fd)
+                    if gate_restore:
+                        os.close(restore_write)
+                        os.close(release_read)
+                        extra_fds = [restore_read, release_write]
                     try:
                         ready, _, _ = select.select([read_fd], [], [], 10)
                         self.assertTrue(ready, 'fake fetch failed to reach the requested stage')
                         self.assertEqual(os.read(read_fd, 64), b'ready\n')
                         os.killpg(child.pid, sig)
+                        if gate_restore:
+                            ready, _, _ = select.select([restore_read], [], [], 10)
+                            self.assertTrue(ready, 'recipe never entered its restore callback')
+                            self.assertEqual(os.read(restore_read, 64), b'restore\n',
+                                             'restore gate must fire before the duplicate TERM')
+                            # A group TERM also reaches just, which forwards it to Bash.
+                            # Deliver the duplicate while EXIT is active, then proceed.
+                            os.killpg(child.pid, signal.SIGTERM)
+                            try:
+                                os.write(release_write, b'continue\n')
+                            except BrokenPipeError:
+                                # Only gate release may race the duplicate TERM closing
+                                # its reader after reentrant restoration. communicate below
+                                # must still prove exit and the original manifest.
+                                pass
                         stdout, stderr = child.communicate(timeout=10)
                         self.assertNotEqual(child.returncode, 0, stdout + stderr)
                         self.assertEqual((root / 'nix/client-deps.json').read_bytes(), original)
                     finally:
                         if child.poll() is None:
                             os.killpg(child.pid, signal.SIGKILL)
-                            child.communicate(timeout=5)
+                        child.communicate(timeout=5)
                         os.close(read_fd)
+                        for fd in extra_fds:
+                            os.close(fd)
 
     def test_success_records_lock_bun_and_hash(self):
         with tempfile.TemporaryDirectory() as name:

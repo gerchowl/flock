@@ -230,7 +230,7 @@ pub enum Change {
         /// Final zero-based queue position.
         position: usize,
     },
-    /// Fail an unbounded existing item without rewriting its oversized payload.
+    /// Permanently refuse a retained item without rewriting its payload.
     Fail {
         /// Existing identity whose position and body remain unchanged.
         item_id: String,

@@ -17,6 +17,7 @@ async fn socket(r: &mut AppQueue, p: AgentSendParams) -> Value {
             &Arc::new(std::sync::atomic::AtomicBool::new(true)),
             None,
             &std::sync::Mutex::default(),
+            &crate::api::client_listener::Health::default(),
             &policy,
         )
         .unwrap();
@@ -74,7 +75,7 @@ fn pane(r: &mut AppQueue, name: &str) -> String {
         .clone();
     let state = r.app.state.terminals.get_mut(&terminal).unwrap();
     state.launch_argv = Some(vec!["claude".into()]);
-    state.agent_name = Some(name.into());
+    state.set_agent_name(name.into()).unwrap();
     let id = state.agent_id.to_string();
     // Existing ancestry fixture seam binds the kernel-attested socket process.
     r.app.test_pane_child_pids.insert(pane, std::process::id());

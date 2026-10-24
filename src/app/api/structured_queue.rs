@@ -190,7 +190,9 @@ impl App {
         );
         let item_id = match params.item_id {
             Some(id) => id,
-            None => crate::structured::queue::admission::item_uuid().map_err(|error| error.code)?,
+            None => {
+                crate::structured::queue::admission::lifecycle_id().map_err(|error| error.code)?
+            }
         };
         if !crate::structured::queue::admission::canonical_uuid(&item_id) {
             return Err(ErrorCode::InvalidRequest);

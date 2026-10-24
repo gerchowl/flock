@@ -498,7 +498,7 @@ pub fn validated_prompt_float_lines(lines: u16) -> u16 {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientConfig {
-    /// Explicit IPv4 loopback address with a nonzero port, e.g. `127.0.0.1:7682`.
+    /// IPv4 loopback address; port 0 selects an OS-assigned port reported by `client open`.
     pub bind: Option<std::net::SocketAddr>,
 }
 
@@ -657,6 +657,11 @@ pub const DEFAULT_QUEUE_REWRITE_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SessionsConfig {
+    /// Replace eligible JSON blocks strictly larger than this many encoded bytes.
+    pub blob_min_bytes: usize,
+    /// Silence observation policy in milliseconds, inclusive range 5000..=3600000.
+    #[serde(deserialize_with = "crate::structured::blobs::stall_ms")]
+    pub stall_ms: u64,
     /// Rewrite before the next append when committed bytes exceed this value.
     /// Zero is invalid: checkpointing cannot be disabled for writable journals.
     pub queue_rewrite_bytes: std::num::NonZeroU64,
@@ -664,8 +669,20 @@ pub struct SessionsConfig {
 impl Default for SessionsConfig {
     fn default() -> Self {
         Self {
+            blob_min_bytes: crate::structured::blobs::StorageConfig::default().blob_min_bytes,
+            stall_ms: crate::structured::blobs::StorageConfig::default().stall_ms,
             queue_rewrite_bytes: std::num::NonZeroU64::new(DEFAULT_QUEUE_REWRITE_BYTES)
                 .expect("nonzero queue rewrite default"),
+        }
+    }
+}
+
+impl SessionsConfig {
+    /// Project the persistence and silence settings consumed by runtime workers.
+    pub fn storage(&self) -> crate::structured::blobs::StorageConfig {
+        crate::structured::blobs::StorageConfig {
+            blob_min_bytes: self.blob_min_bytes,
+            stall_ms: self.stall_ms,
         }
     }
 }
@@ -673,7 +690,7 @@ impl Default for SessionsConfig {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
-    /// Per-session durable queue storage policy.
+    /// Per-session durable queue and blob storage policy.
     pub sessions: SessionsConfig,
     /// Local socket identity policy (ADR-0036 §1a).
     pub security: SecurityConfig,

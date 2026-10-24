@@ -62,12 +62,17 @@ impl App {
         &mut self,
         msg: crate::api::ApiRequestMessage,
     ) -> bool {
+        if self.respond_scope_probe(&msg) {
+            return false;
+        }
         let previous_mode = self.state.mode;
         let changed = crate::api::request_changes_ui(&msg.request);
+        self.current_api_scope = msg.scope;
         self.current_api_peer_pid = msg.peer_pid;
         self.current_api_peer_birth = Some(msg.peer_birth);
         self.current_api_peer_uid = Some(msg.peer_uid);
         let response = self.handle_api_request(msg.request);
+        self.current_api_scope = None;
         self.current_api_peer_pid = None;
         self.current_api_peer_birth = None;
         self.current_api_peer_uid = None;
@@ -647,10 +652,12 @@ impl App {
         let workspaces = self.workspace_git_refresh_items();
 
         if workspaces.is_empty() {
+            self.git_refresh_idle = Some(crate::api::schema::PollerReason::NoEligibleWorkspaces);
             self.last_git_remote_status_refresh = now;
             return;
         }
 
+        self.git_refresh_idle = None;
         self.git_refresh_in_flight = true;
         self.git_refresh_health.mark_started(now);
         let event_tx = self.event_tx.clone();
@@ -665,6 +672,7 @@ impl App {
     }
 
     pub(crate) fn mark_git_status_refresh_due(&mut self, now: Instant) {
+        self.git_refresh_idle = None;
         if self.git_refresh_in_flight {
             self.git_refresh_due_after_in_flight = true;
             return;
@@ -780,6 +788,9 @@ impl App {
             .filter_map(|ws| {
                 let cwd =
                     ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)?;
+                if cwd.as_os_str().is_empty() {
+                    return None;
+                }
                 let git_key = crate::workspace::git_status_cache_key(&cwd);
                 let cache_key = git_key.unwrap_or_else(|| cwd.clone());
                 Some(WorkspaceGitRefreshItem {

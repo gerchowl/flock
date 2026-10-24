@@ -11,6 +11,25 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io;
 
+impl crate::structured::permissions::Principal<'_> {
+    /// Admission authority from authenticated dispatcher context (ADR-0036 §3).
+    /// Claimed producer names are never accepted as operator capabilities.
+    pub(crate) fn queue_origin(
+        &self,
+    ) -> Result<crate::structured::queue::admission::Principal, crate::api::error_code::ErrorCode>
+    {
+        use crate::structured::queue::{admission::Principal as QueuePrincipal, model::Producer};
+        match self {
+            Self::Operator => Ok(QueuePrincipal::Operator),
+            Self::Token(_) if self.decision_subject().is_ok() => Ok(QueuePrincipal::Operator),
+            Self::Agent(id) | Self::Lease(id) if !id.is_empty() => {
+                Ok(QueuePrincipal::Origin(Producer::Agent((*id).into())))
+            }
+            _ => Err(crate::api::error_code::ErrorCode::NotAuthorized),
+        }
+    }
+}
+
 type Entropy<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>;
 
 /// One persisted admission decision; no automatic re-gating exists.
@@ -196,6 +215,13 @@ impl Admission {
             position: self.journal.items().len(),
         })?;
         Ok(())
+    }
+    /// Settle one retained item without rewriting its body or changing identity.
+    pub(super) fn fail_item(&mut self, item_id: String, reason: ErrorCode) -> Result<(), Failure> {
+        self.commit(Change::Fail {
+            item_id,
+            reason: reason.as_str().into(),
+        })
     }
     fn eligible(&self, item: &Item, now_ms: u64) -> bool {
         !self.journal.opaque.contains(&item.item_id)
@@ -415,8 +441,8 @@ fn nonce(
         }
     }
 }
-/// Allocate a lifecycle UUID using the same entropy and format as queue batches.
-pub(crate) fn item_uuid() -> Result<String, Failure> {
+/// Mint a queue lifecycle UUID using the same entropy source as batch identities.
+pub(crate) fn lifecycle_id() -> Result<String, Failure> {
     batch_uuid(&mut getrandom::fill)
 }
 fn batch_uuid(fill: Entropy<'_>) -> Result<String, Failure> {
