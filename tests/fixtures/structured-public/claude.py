@@ -95,7 +95,7 @@ else:
     line = sys.stdin.readline()
     assert line, "opening turn was never delivered"
     user = json.loads(line)
-    content = user["message"]["content"]
+    content = "".join(block["text"] for block in user["message"]["content"])
     assert "UNTRUSTED TASK" in content and "dogfood-task" in content, "missing framed opening turn"
     init = json.loads((root / "init.json").read_text())
     init["session_id"] = session

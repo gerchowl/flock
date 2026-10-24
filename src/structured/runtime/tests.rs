@@ -1262,3 +1262,52 @@ fn launch_metadata_refuses_invalid_cwd_or_empty_model() {
         assert!(matches!(result, Err(LaunchError::Io(_))));
     }
 }
+
+#[tokio::test]
+async fn queue_stdin_failure_requests_stop_even_without_io_cancellation() {
+    use crate::structured::{
+        registry::Registry,
+        workers::{
+            tests::{wait, Case},
+            Workers,
+        },
+    };
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut registry = Registry::default();
+    let mut workers = Workers::new(notify.clone());
+    let case = Case::start(&mut registry, &mut workers, 245, "no-read", vec![]);
+    case.ready(&mut registry, &mut workers, &notify, Instant::now())
+        .await;
+    let runtime = workers.runtime(&case.id, case.generation).unwrap();
+    runtime.control.close_stdin();
+    assert!(
+        !runtime.control.cancelled(),
+        "the transport is closed, not cancelled"
+    );
+    case.submit(&workers);
+    let mut refused = false;
+    wait(&notify, || {
+        workers.poll(&mut registry, Instant::now(), 1000);
+        while let Some(update) = workers.queue_update(&registry, &case.id, case.generation) {
+            refused |= update
+                .offer
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.code == crate::api::error_code::ErrorCode::InputWriteFailed);
+        }
+        workers.report(&case.id, case.generation).is_some()
+    })
+    .await;
+    assert!(refused);
+    assert_eq!(
+        workers
+            .report(&case.id, case.generation)
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()
+            .outcome,
+        Outcome::Stopped
+    );
+    workers.shutdown(&mut registry).unwrap();
+}
