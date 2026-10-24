@@ -962,7 +962,7 @@ async fn registry_worker_launch_uses_configured_blob_threshold() {
             .expect("configured threshold must project this block");
     let store = crate::structured::blobs::BlobStore::open(case.fixture.root.path()).unwrap();
     assert_eq!(reference.size, bytes.len() as u64);
-    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+    assert_eq!(store.get(&reference.blob, reference.size).unwrap(), bytes);
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), block);
 }
 
