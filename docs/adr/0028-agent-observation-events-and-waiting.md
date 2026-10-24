@@ -1139,9 +1139,21 @@ the one log, not a second event system.
   `delegate.list`, which is the current state). Silent loss is a bug.
 - **Back-pressure is pull.** `events.read` is request/response with a `limit`;
   a slow consumer only slows itself. The streaming `events.subscribe` stays for
-  the TUI and the sidebar, gets the same cursor semantics (start at `after`, or
-  at "now" when omitted, never at 0), and reports `lagged { skipped_to }`
-  instead of dropping silently.
+  the TUI and the sidebar, starts at "now" when omitted (#1030). Legacy `after`
+  and omitted cursors keep `lagged { skipped_to }` loss notices. Under the #473
+  owner decision, distinct `after_sequence` explicitly opts into typed
+  `events_lost` with requested, oldest available and current sequences. A client
+  checks `events_live_start` before sending it and refuses missing support with
+  `server_version_gap`; both cursor fields together are `invalid_params`.
+  No protocol bump is needed. Every stream event carries `seq`; events and loss
+  notices identify the subscription index and descriptor. The acknowledgement
+  supplies `start_sequence`, the initial cursor for every filter. Initialize an
+  applied cursor per subscription to it, advance only the emitting subscription,
+  and resume from the minimum, including quiet filters. Current-state predicate
+  watermarks never advance other filters. Loss continues at the
+  retained boundary after resync using existing per-verb reads; `session.snapshot`
+  remains #2163. A reply wait folds the retained ring again and continues on gaps.
+  Internal bounded state folds use a distinct API and do not claim complete replay.
 - **Coalescing happens at delivery to a recipient, never in the log.** The log
   records each fact once. A recipient that is an agent (the ADR-0027 digest),
   or a channel adapter (§8), gets a per-recipient buffer that keeps the latest
@@ -1725,7 +1737,7 @@ in ADR-0030 §8.
 | E3 | Derived durable kinds `agent.phase_changed`, `agent.needs_human`, `agent.limit_reached`, `agent.gone` after the server settle window | E1a (E1b, E1c enrich it) | #663 A (event half) | New persisted kinds: first verify the last released server skips unknown kinds in the log, fix the reader if not | A status that flips back inside the window emits nothing; a real `PaneAgentStatusChanged` sequence produces exactly one `agent.phase_changed` |
 | E4a | `events.read { after, kinds, subjects, limit, wait_ms }` on the socket: ring-then-disk replay, `gap`, server-side long-poll on the hub condvar | — | `EventsWait` schema stub | New method, protocol bump. Old server: exit 78 via `normalize` | Property test: random rotations and restarts, a reader resuming from any retained cursor sees every event once or more, never a silent gap; a reader past retention gets `gap` |
 | E4b | `flk events read` / `flk events wait` and MCP `flock_events_read`; watch-nudge text and the `watch-job` skill point at them | E4a | — | Client side only; against an old server the verbs exit 78 | `flk events wait --kinds agent.phase_changed --subject <agent> --timeout 5s` returns the event, or exits 124 |
-| E4c | `events.subscribe` takes `after`, starts at now when omitted, reports `lagged`; `delegate wait` and `agent wait --status settled` re-based on `events.read` | E4a | — | Changes `events.subscribe` defaults (changelog line); a new client detects support from the `protocol` number in the server's `ping` reply (the probe #868's `begin_cli` already makes and caches per invocation; MCP probes once per process): at or above the protocol E4a bumps to it uses `events.read`, below it keeps today's 200 ms polling | `delegate wait` makes one request per state change instead of 5 per second; existing wait exit codes unchanged |
+| E4c | `events.subscribe` keeps live-start (#1030) and legacy `after`/`lagged`; distinct `after_sequence` opts into typed `events_lost` after checking `events_live_start` (#473); `delegate wait` and `agent wait --status settled` re-based on `events.read` | E4a | — | Changes `events.subscribe` defaults (changelog line); a new client detects support from the `protocol` number in the server's `ping` reply (the probe #868's `begin_cli` already makes and caches per invocation; MCP probes once per process): at or above the protocol E4a bumps to it uses `events.read`, below it keeps today's 200 ms polling | `delegate wait` makes one request per state change instead of 5 per second; existing wait exit codes unchanged |
 | E5 | Wait registry: blocking and `park` waits recorded against the attested caller, `state.waiting`, `phase: waiting_on_event`, deadline expiry event | E1a, E4a | — | `wait.park` is state-changing: gated, exit 78 against an old server | A parked agent reads `waiting_on_event`; a `flk events wait` started under Claude `run_in_background` makes the pane `waiting_on_event`, not `finished_with_background` |
 | E6 | Wake-follows-wait: a message or event that opens a registered wait wakes regardless of intent; idle wake for Codex and opencode where the inbox tool is configured | E2, E5 | ADR-0027 §3 wake gap (#961) | Server-internal. Mail relayed from an older peer is woken by the local rule, since the rule runs at the recipient | An architect parked on its delegates is woken by an `fyi` digest within one injection; an unparked one is not; a Codex agent with the flock MCP server is woken |
 | E7 | PR poller adds check-run conclusions; `pr.ci_completed`, `pr.merged`, `pr.closed` kinds | — | #663 B | New persisted kinds (same reader check as E3) | One `pr.ci_completed` per head SHA with failed check names; no added per-worktree `gh` exec |
