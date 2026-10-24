@@ -277,32 +277,51 @@ impl ActiveSubscription {
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
     ) -> Option<serde_json::Value> {
-        match self {
+        let mut event = match self {
             Self::Event(subscription) => subscription.poll(event_hub),
             Self::MsgQueued(subscription) => subscription.poll(event_hub),
             Self::OutputMatched(subscription) => {
                 serde_json::to_value(subscription.poll(api_tx)?).ok()
             }
-            Self::AgentStatusChanged(subscription) => {
-                serde_json::to_value(subscription.poll(api_tx, event_hub)?).ok()
-            }
+            Self::AgentStatusChanged(subscription) => subscription.poll(api_tx, event_hub),
+        }?;
+        if event.get("error").is_none() {
+            let sequence = match self {
+                Self::Event(s) => s.last_sequence,
+                Self::MsgQueued(s) => s.last_sequence,
+                Self::AgentStatusChanged(s) => s.last_sequence,
+                Self::OutputMatched(_) => event_hub.current_sequence(),
+            };
+            event["seq"] = sequence.into();
         }
+        Some(event)
     }
 }
 
-/// The stream line for a subscriber the ring left behind (#1030): it
-/// resumes after `skipped_to`, and everything before that is gone.
-fn lagged(last_sequence: &mut u64, skipped_to: u64) -> Option<serde_json::Value> {
-    *last_sequence = skipped_to;
-    Some(serde_json::json!({"event": "lagged", "data": {"skipped_to": skipped_to}}))
+/// Loss is explicit; continue at the retained boundary after reporting it.
+fn subscription_events(
+    hub: &EventHub,
+    cursor: &mut u64,
+) -> Result<Vec<(u64, crate::api::schema::EventEnvelope)>, serde_json::Value> {
+    hub.events_after(*cursor).map_err(|error| {
+        if let Some(oldest) = error
+            .data
+            .as_ref()
+            .and_then(|d| d.extra.get("oldest_available_sequence"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            *cursor = oldest.saturating_sub(1);
+        }
+        serde_json::json!({"error": error})
+    })
 }
 
 impl ActiveEventSubscription {
     fn poll(&mut self, event_hub: &EventHub) -> Option<serde_json::Value> {
-        let (skipped_to, events) = event_hub.events_since(self.last_sequence);
-        if let Some(skipped_to) = skipped_to {
-            return lagged(&mut self.last_sequence, skipped_to);
-        }
+        let events = match subscription_events(event_hub, &mut self.last_sequence) {
+            Ok(events) => events,
+            Err(error) => return Some(error),
+        };
         for (sequence, event) in events {
             self.last_sequence = sequence;
             if event.event == self.event_kind {
@@ -327,10 +346,10 @@ impl ActiveSubscription {
 
 impl ActiveMsgQueuedSubscription {
     fn poll(&mut self, event_hub: &EventHub) -> Option<serde_json::Value> {
-        let (skipped_to, events) = event_hub.events_since(self.last_sequence);
-        if let Some(skipped_to) = skipped_to {
-            return lagged(&mut self.last_sequence, skipped_to);
-        }
+        let events = match subscription_events(event_hub, &mut self.last_sequence) {
+            Ok(events) => events,
+            Err(error) => return Some(error),
+        };
         for (sequence, event) in events {
             self.last_sequence = sequence;
             if event.event != crate::api::schema::EventKind::MessageQueued {
@@ -388,9 +407,13 @@ impl ActiveAgentStatusChangedSubscription {
         &mut self,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
-    ) -> Option<SubscriptionEventEnvelope> {
+    ) -> Option<serde_json::Value> {
         let mut saw_status_event = false;
-        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+        let events = match subscription_events(event_hub, &mut self.last_sequence) {
+            Ok(events) => events,
+            Err(error) => return Some(error),
+        };
+        for (sequence, event) in events {
             self.last_sequence = sequence;
             let crate::api::schema::EventData::PaneAgentStatusChanged {
                 pane_id,
@@ -429,7 +452,7 @@ impl ActiveAgentStatusChangedSubscription {
             }
 
             self.initial_event = None;
-            return Some(SubscriptionEventEnvelope {
+            return serde_json::to_value(SubscriptionEventEnvelope {
                 event: SubscriptionEventKind::PaneAgentStatusChanged,
                 data: SubscriptionEventData::PaneAgentStatusChanged(PaneAgentStatusChangedEvent {
                     pane_id,
@@ -441,7 +464,8 @@ impl ActiveAgentStatusChangedSubscription {
                     custom_status,
                     state_labels,
                 }),
-            });
+            })
+            .ok();
         }
 
         if saw_status_event {
@@ -449,10 +473,11 @@ impl ActiveAgentStatusChangedSubscription {
         } else if event_hub.current_sequence() != self.last_sequence {
             return None;
         } else if let Some(event) = self.initial_event.take() {
-            return Some(SubscriptionEventEnvelope {
+            return serde_json::to_value(SubscriptionEventEnvelope {
                 event: SubscriptionEventKind::PaneAgentStatusChanged,
                 data: SubscriptionEventData::PaneAgentStatusChanged(event),
-            });
+            })
+            .ok();
         }
 
         let before_snapshot_sequence = self.last_sequence;
@@ -471,7 +496,7 @@ impl ActiveAgentStatusChangedSubscription {
         if event.is_some() {
             self.last_sequence = after_snapshot_sequence;
         }
-        event
+        serde_json::to_value(event?).ok()
     }
 
     fn event_from_snapshot(
@@ -618,6 +643,35 @@ mod tests {
     use super::*;
     use crate::api::schema::{AgentStatus, EventData, EventEnvelope, EventKind};
 
+    #[test]
+    fn ordinary_event_subscription_reports_loss_then_retained_records() {
+        let hub = EventHub::default();
+        hub.set_ring_cap(2);
+        for label in ["one", "two", "three"] {
+            hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::WorkspaceClosed,
+                data: crate::api::schema::EventData::WorkspaceClosed {
+                    workspace_id: label.into(),
+                },
+            });
+        }
+        let tx = tokio::sync::mpsc::unbounded_channel().0;
+        let mut subscription =
+            ActiveSubscription::new(Subscription::WorkspaceClosed {}, "loss", 0, 0, &tx, &hub)
+                .unwrap();
+        let lost = subscription.poll(&tx, &hub).unwrap();
+        assert_eq!(lost["error"]["code"], "events_lost");
+        assert_eq!(
+            subscription.poll(&tx, &hub).unwrap()["data"]["workspace_id"],
+            "two"
+        );
+        assert_eq!(
+            subscription.poll(&tx, &hub).unwrap()["data"]["workspace_id"],
+            "three"
+        );
+        assert!(subscription.poll(&tx, &hub).is_none());
+    }
+
     fn probe_error(read: bool, response: serde_json::Value) -> ErrorResponse {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
         let responder = std::thread::spawn(move || {
@@ -731,6 +785,7 @@ mod tests {
         let set_event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
             .expect("set event");
+        let set_event: SubscriptionEventEnvelope = serde_json::from_value(set_event).unwrap();
         let SubscriptionEventData::PaneAgentStatusChanged(set_data) = set_event.data else {
             panic!("wrong event data");
         };
@@ -739,6 +794,7 @@ mod tests {
         let expiry_event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
             .expect("expiry event");
+        let expiry_event: SubscriptionEventEnvelope = serde_json::from_value(expiry_event).unwrap();
         let SubscriptionEventData::PaneAgentStatusChanged(expiry_data) = expiry_event.data else {
             panic!("wrong event data");
         };
@@ -778,6 +834,7 @@ mod tests {
         let set_event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
             .expect("set event");
+        let set_event: SubscriptionEventEnvelope = serde_json::from_value(set_event).unwrap();
         let SubscriptionEventData::PaneAgentStatusChanged(set_data) = set_event.data else {
             panic!("wrong event data");
         };
@@ -786,6 +843,7 @@ mod tests {
         let expiry_event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
             .expect("expiry event");
+        let expiry_event: SubscriptionEventEnvelope = serde_json::from_value(expiry_event).unwrap();
         let SubscriptionEventData::PaneAgentStatusChanged(expiry_data) = expiry_event.data else {
             panic!("wrong event data");
         };
@@ -824,6 +882,7 @@ mod tests {
         let event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
             .expect("setup-window event");
+        let event: SubscriptionEventEnvelope = serde_json::from_value(event).unwrap();
         let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
             panic!("wrong event data");
         };

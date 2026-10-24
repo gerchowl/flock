@@ -168,7 +168,7 @@ fn idle(rig: &mut Rig, now: Instant, draft: &str) {
 }
 
 fn has_phase(rig: &Rig, phase: &str) -> bool {
-    rig.app.event_hub.events_after(0).iter().any(|(_, envelope)| matches!(&envelope.data, EventData::AgentRestart { phase: value, .. } if value == phase))
+    rig.app.event_hub.ring_snapshot_after(0).iter().any(|(_, envelope)| matches!(&envelope.data, EventData::AgentRestart { phase: value, .. } if value == phase))
 }
 
 async fn advance_until_verifying(rig: &mut Rig) {
@@ -370,7 +370,7 @@ async fn restart_api_refuses_fresh_session_and_reports_stuck_without_continuing(
             .value,
         "wrong-session"
     );
-    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, detail, .. } if phase == "restart_stuck" && detail.contains("requester's session restart-session"))));
+    assert!(rig.app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, detail, .. } if phase == "restart_stuck" && detail.contains("requester's session restart-session"))));
     rig.app
         .terminal_runtimes
         .get(&rig.id)
@@ -470,7 +470,7 @@ async fn restart_api_grace_expiry_forces_a_busy_agent_and_reports_reason() {
     let now = Instant::now() + TICK;
     idle(&mut rig, now, "");
     rig.app.tick_agent_restarts(now);
-    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, forced: true, reason, .. } if phase == "restarted" && reason.contains("restart_grace"))));
+    assert!(rig.app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, forced: true, reason, .. } if phase == "restarted" && reason.contains("restart_grace"))));
 }
 
 #[tokio::test]
@@ -553,7 +553,7 @@ async fn restart_automatic_rss_limit_stops_without_waiting_for_idle() {
     rig.app.state.config.session.restart.hard_rss_cap = 1;
     rig.app.state.terminals.get_mut(&rig.id).unwrap().state = AgentState::Working;
     advance_until_verifying(&mut rig).await;
-    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, forced: true, reason, .. } if phase == "restart_stopping" && reason.contains("hard_rss_cap"))));
+    assert!(rig.app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, forced: true, reason, .. } if phase == "restart_stopping" && reason.contains("hard_rss_cap"))));
 }
 
 #[tokio::test]
@@ -574,7 +574,7 @@ async fn restart_api_unknown_startup_dialog_times_out_without_continuing() {
     rig.app.tick_agent_restarts(Instant::now() + TICK);
     assert!(has_phase(&rig, "restart_stuck"));
     assert_eq!(rig.app.mailboxes.wake_count(&rig.pane), 0);
-    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, detail, .. } if phase == "restart_stuck" && detail.contains("Unknown startup question") && detail.contains("unknown_composer"))));
+    assert!(rig.app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, detail, .. } if phase == "restart_stuck" && detail.contains("Unknown startup question") && detail.contains("unknown_composer"))));
 }
 
 #[tokio::test]
@@ -737,7 +737,7 @@ async fn restart_resumed_agent_exit_retains_output_and_retry_plan() {
     let terminal = rig.app.state.terminals.get(&rig.id).unwrap();
     assert!(!terminal.restart_in_progress);
     assert!(terminal.hibernated_resume_plan.is_some());
-    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, detail, .. } if phase == "restart_stuck" && detail.contains("No conversation found") && detail.contains("flk agent resume"))));
+    assert!(rig.app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::AgentRestart { phase, detail, .. } if phase == "restart_stuck" && detail.contains("No conversation found") && detail.contains("flk agent resume"))));
     let pane = rig.app.state.workspaces[0].focused_pane_id().unwrap();
     assert!(rig.app.resume_hibernated_pane(0, pane).is_ok());
 }
@@ -781,7 +781,7 @@ async fn restart_handoff_cancels_pending_and_verifying_requests() {
                 .restart_in_progress
         );
         assert!(has_phase(&rig, "restart_cancelled"));
-        let events = rig.app.event_hub.events_after(0);
+        let events = rig.app.event_hub.ring_snapshot_after(0);
         let mut notifications = super::super::notifications::NotificationLog::default();
         notifications.seed_from_events(events.iter().map(|(_, event)| event));
         assert!(notifications
@@ -943,7 +943,7 @@ async fn restart_lost_process_report_excludes_harness_and_mcp_subtrees() {
     rig.app
         .report_restart(&rig.id, &request, "restarted", "verified".into());
     rig.app.drain_pending_ui_events();
-    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::NotificationFiled { body: Some(body), .. } if body.contains("Lost background") && body.contains("fixture background watcher") && body.contains(&format!("pid {background})")))));
+    assert!(rig.app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| matches!(&event.data, EventData::NotificationFiled { body: Some(body), .. } if body.contains("Lost background") && body.contains("fixture background watcher") && body.contains(&format!("pid {background})")))));
 }
 
 #[tokio::test]
@@ -1163,7 +1163,7 @@ async fn restart_claude_draft_reports_composer_not_empty_without_continuing() {
     rig.app.tick_agent_restarts(now);
     assert!(!has_phase(&rig, "restarted"));
     assert_eq!(rig.app.mailboxes.wake_count(&rig.pane), 0);
-    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(
+    assert!(rig.app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| matches!(
         &event.data, EventData::AgentRestart { phase, detail, .. }
         if phase == "restart_stuck" && detail.contains("verification timed out (composer_not_empty)")
     )));
@@ -1181,7 +1181,7 @@ async fn restart_claude_empty_composer_timeout_reports_missing_idle_observation(
     rig.app.tick_agent_restarts(Instant::now() + TICK);
     assert!(!has_phase(&rig, "restarted"));
     assert_eq!(rig.app.mailboxes.wake_count(&rig.pane), 0);
-    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(
+    assert!(rig.app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| matches!(
         &event.data, EventData::AgentRestart { phase, detail, .. }
         if phase == "restart_stuck" && detail.contains("verification timed out (idle_observation_missing)")
     )));
@@ -1234,7 +1234,7 @@ async fn restart_optional_1109_reports_drops_and_launches_same_session() {
     idle(&mut rig, now, "");
     rig.app.tick_agent_restarts(now);
     assert!(has_phase(&rig, "restarted"));
-    assert!(rig.app.event_hub.events_after(0).iter().any(|(_, event)| matches!(
+    assert!(rig.app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| matches!(
         &event.data, EventData::AgentRestart { phase, detail, .. }
         if phase == "restarted" && detail.contains("--worktree") && detail.contains("--from-pr") && detail.contains("existing cwd")
     )));
