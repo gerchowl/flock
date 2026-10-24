@@ -18,11 +18,15 @@ nor its remaining CLI/key/map/error paths is claimed complete here.
 
 ## Record meaning
 
-- `type` is the stable, canonical declared model name, including generic
+- `type` is the stable declared model name, preserving qualified paths and generic
   arguments; it never uses compiler-produced `std::any::type_name` strings.
   `nullable` describes the field's `Option`, separately from collection or
-  section shape. `representations` pins core enum payloads and the private
-  implementation fields of scalar/transparent wrappers.
+  section shape. `file_aliases` lists additional accepted file keys, including
+  `keys.fullscreen` and `advanced.scrollback_lines`. `representations` uses
+  serde rename/rename_all spellings, including `blocked&done`, and pins payload
+  types and private scalar/transparent-wrapper fields. Untagged/manual serde
+  enums describe their structural variants rather than inventing wire tags.
+  Unsupported `serde(flatten)` fails coverage until explicitly inventoried.
 - A default reference names only a compiled factory and a relative path.
   `Root` uses `Config::default`; `CustomTheme` describes a field when the
   otherwise absent optional theme exists; `KeyCommand` and `Peer` describe
@@ -56,12 +60,18 @@ nor its remaining CLI/key/map/error paths is claimed complete here.
   future socket/mesh write. Transport writes need the ADR's separate authority
   gates. This catalog changes no mutation behavior.
 - Reload ownership records the current application entry point: `AppLive`
-  follows `App::apply_live_config`; `AppAndClient` also follows the local
+  requires an incoming-value copy in `App::apply_live_config`, checked against
+  that method's syntax tree rather than trusting the JSON. `EventHubLive`
+  specifically updates the event hub's read-wait bound, not `state.config`.
+  `AppAndClient` also follows the local
   client's sound/focus reload; `ClientLive` is the client's window-title gate;
   `FuturePane` applies terminal policy to subsequently created panes.
   `ProcessStartup` includes the socket account policy, storage, system-one
   settings, reporter commands and the sampler disk path, which that app reload
-  does not retarget.
+  does not retarget. `msg` and `spawn` (including `spawn.env`) also stay at
+  startup values because reload does not copy them into the running config;
+  their `reload_issue: 2397` records the existing product bug (#2397). This
+  inventory corrects the claim and does not fix that reload behavior.
   `CommandStartup` covers listener/command startup settings. `ReadOnUse` is
   the advertised icon's config lookup. `Mixed` is a container with multiple
   owners; `Opaque` is unresolved until 2b. Ownership is not a claim that every

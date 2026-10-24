@@ -26,6 +26,7 @@ pub(super) struct Field {
     #[serde(rename = "type")]
     pub model_type: String,
     pub nullable: bool,
+    pub file_aliases: Vec<String>,
     pub shape: Shape,
     pub default: DefaultRef,
     pub validation: Vec<Validation>,
@@ -33,6 +34,7 @@ pub(super) struct Field {
     pub key_class: Option<Sensitivity>,
     pub authority: Authority,
     pub reload: ReloadOwner,
+    pub reload_issue: Option<u64>,
     pub boundary: Option<String>,
 }
 
@@ -69,6 +71,7 @@ pub(super) enum Authority {
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub(super) enum ReloadOwner {
     AppLive,
+    EventHubLive,
     AppAndClient,
     ClientLive,
     FuturePane,
