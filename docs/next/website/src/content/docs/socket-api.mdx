@@ -695,7 +695,75 @@ Subscribe to events when you need a long-lived stream:
 
 The first response acknowledges the subscription. Later lines are pushed events.
 
-A subscription starts at the moment of subscribing: it streams events that happen after it attached, never a replay of what the server already holds. Pass `"after": <seq>` next to `subscriptions` to start from a cursor instead. If the server no longer holds events that far back, the first line is `{"event":"lagged","data":{"skipped_to":<seq>}}` and the stream resumes after `skipped_to`, so a consumer that falls behind learns it rather than missing events silently. A cursor past the newest event is refused with `cursor_ahead`. Use `events.read` when the consumer must see every durable event from a cursor.
+A subscription without a cursor starts at `event_hub.current_sequence()` when it
+attaches, as it already did on dev since #1030. It streams subsequent events
+without replaying retained events. Current-state predicates, such as an
+already-matching agent status, still report current state.
+
+For retained events, `after` requests events strictly after that cursor using the
+legacy contract. An omitted cursor or `after` keeps the documented loss frame:
+
+```json
+{"event":"lagged","data":{"skipped_to":19},"subscription_index":0,"subscription":{"type":"msg.queued","pane":"ws_1:p1"}}
+```
+
+Before sending `after_sequence`, check
+`ping.result.capabilities.events_live_start`. Missing or false support must
+produce a typed `server_version_gap` refusal; never silently omit the cursor or
+start live. The shared Rust client performs this bounded capability check.
+`after_sequence` is a distinct, explicit opt-in to typed loss, not an alias for
+`after`. Supplying both returns `invalid_params`. Either cursor past the newest
+event returns `cursor_ahead`. No protocol version bump is required.
+
+An opted-in request whose cursor falls behind the 4,096-entry ring receives:
+
+```json
+{"id":"sub_1","subscription_index":0,"subscription":{"type":"msg.queued","pane":"ws_1:p1"},"error":{"code":"events_lost","message":"Events were lost. Resync with per-verb reads ...","data":{"requested_sequence":12,"oldest_available_sequence":20,"current_sequence":4115}}}
+```
+
+Each loss notice and event identifies its zero-based `subscription_index` and
+original `subscription` descriptor, including when a stream has several
+subscriptions of the same type. Every event also carries `seq`, the hub sequence
+it covers. Hub events use their committed sequence; current-state predicates
+carry their observation cursor and do not provide historical predicate replay.
+The acknowledgement includes `result.start_sequence`, the common initial cursor
+captured for every accepted filter before polling begins. For example:
+
+```json
+{"id":"sub_1","result":{"type":"subscription_started","start_sequence":49}}
+```
+
+Initialize **one applied cursor per subscription** to that acknowledged floor,
+including filters that have emitted nothing. After applying an event, advance
+only the cursor named by its `subscription_index` to that line's `seq`. Resume
+with `after_sequence` equal to the **minimum** of these applied cursors. Keep the
+same filter positions, or associate saved cursors with the corresponding
+original descriptors. Never use the maximum sequence seen across the stream:
+filters poll independently and one can emit sequence 100 before another emits
+sequence 50. A quiet filter retains the floor until it emits an applied event;
+if that conservative cursor is evicted, resumption reports loss and requires
+resync, even when no matching event was known to be lost. A client relying on
+resumable live-start must require the acknowledged floor; an older acknowledgement
+without it cannot supply a safe initial cursor.
+
+For hub-backed facts, deduplicate by subscription and `seq`. A current-state
+predicate is an observation, not historical replay: its `seq` is an observation
+watermark rather than a unique observation id. In particular,
+`pane.output_matched` samples `current_sequence()` but advances only its own
+applied cursor; the minimum rule protects events not yet applied by the other
+filters. Loss notices are not applied event cursors.
+
+`events_lost` has retry class `after_inspecting`: resync before treating the stream
+as complete. Use `workspace.list`, `pane.list`, `agent.list` and `msg.list` as
+appropriate. The unified `session.snapshot` resync remains #2163. Both loss
+contracts continue at the retained boundary; later overflow produces another
+notice. Other ring errors close the stream after the diagnostic.
+`msg.wait_reply` rereads retained facts into its existing state on a ring gap and
+continues waiting, so a retained or later reply still completes the wait.
+
+Use `events.read` for durable history from a cursor; its disk retention and `gap`
+contract are unchanged. In-process bounded state folds are explicitly named
+`ring_snapshot_after`; they do not claim complete history.
 
 Workspace event subscriptions include `workspace.created`, `workspace.updated`, `workspace.renamed`, `workspace.closed`, and `workspace.focused`.
 
