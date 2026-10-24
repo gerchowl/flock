@@ -79,6 +79,11 @@ capacity check and enqueue. It does not disconnect a healthy socket. At most
 and does not consume receipt capacity. Each owner turn handles at most 32
 requests from each lane. The per-socket limit still applies to both verbs.
 
+Permission-book contention also refuses admission with `session_busy` (retry
+`later`, exit 1) before reserving a decision or writing harness input. The owner
+never waits on the transport's lock. The GUI displays the ack's refusal message
+and does not automatically resend it; this is not an accepted or lost decision.
+
 Duplicate detection is keyed by `(principal, cmd_id)` across that principal's
 sockets. Pending send keys remain pinned until the receipt resolves, even if
 the original socket disconnects. The owner also retains the last 1024 completed

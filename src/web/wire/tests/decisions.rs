@@ -159,12 +159,17 @@ impl Case {
         fs::write(path, record.to_string()).unwrap();
     }
     fn handles(&self) -> Vec<(String, u64)> {
+        // Read the owner snapshot populated by real permission records, not the
+        // live book whose reader/writer may still be publishing another prompt.
         self.app
-            .structured_workers
-            .runtime(&self.worker.id, self.worker.generation)
+            .state
+            .structured_agents
+            .get(&self.worker.id)
             .unwrap()
-            .waiting_on_human()
-            .unwrap()
+            .1
+            .update
+            .permission_requests
+            .clone()
     }
     async fn until(&mut self, mut condition: impl FnMut(&Self) -> bool) {
         let notify = self.notify.clone();
@@ -191,6 +196,11 @@ impl Case {
             )
             .await
             .unwrap();
+            // The Python driver selects its fd before buffered readline. Send
+            // the next stage only after this record reached the owner, so a
+            // second line cannot hide in its userspace buffer behind select.
+            self.until(|r| r.handles().iter().any(|(request, _)| request == id))
+                .await;
         }
         self.until(|r| r.handles().len() == 2).await;
         let seq = self

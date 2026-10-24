@@ -623,11 +623,13 @@ fn send_and_decide_both_ack_on_the_same_socket() {
         case.queue
             .until(|r| {
                 r.app
-                    .structured_workers
-                    .runtime(&r.case.id, r.case.generation)
+                    .state
+                    .structured_agents
+                    .get(&r.case.id)
                     .unwrap()
-                    .waiting_on_human()
-                    .unwrap()
+                    .1
+                    .update
+                    .permission_requests
                     .iter()
                     .any(|(id, _)| id == "union-request")
             })
@@ -635,11 +637,14 @@ fn send_and_decide_both_ack_on_the_same_socket() {
         let seq = case
             .queue
             .app
-            .structured_workers
-            .runtime(&case.queue.case.id, case.queue.case.generation)
+            .state
+            .structured_agents
+            .get(&case.queue.case.id)
             .unwrap()
-            .waiting_on_human()
-            .unwrap()
+            .1
+            .update
+            .permission_requests
+            .clone()
             .into_iter()
             .find(|(id, _)| id == "union-request")
             .unwrap()
