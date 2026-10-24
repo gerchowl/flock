@@ -2211,6 +2211,13 @@ fn assert_exact_suggestion_fallback(
     assert!(response["response"]["response"]
         .get("updatedPermissions")
         .is_none());
+    // Pipe readability does not acknowledge Book::written: the stdin worker
+    // still owns that final state update (ADR-0036 §10b, delivery ordering).
+    // Wait for its slot release before querying or sending the next request.
+    wait(transport, || {
+        let book = transport.input.permissions.try_lock()?;
+        (!book.blocked()).then_some(())
+    });
     assert!(transport.waiting_on_human().unwrap().is_empty());
     assert_eq!(
         call_decide(
