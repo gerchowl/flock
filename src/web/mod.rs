@@ -378,12 +378,7 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
     // inherited `FLOCK_*` (the set grows over time, so blanket-strip rather
     // than enumerate) except the user's config pointer, then set only what the
     // bridge needs below.
-    const KEEP_FLOCK_ENV: &[&str] = &[crate::config::CONFIG_PATH_ENV_VAR];
-    for (key, _) in std::env::vars() {
-        if key.starts_with("FLOCK_") && !KEEP_FLOCK_ENV.contains(&key.as_str()) {
-            cmd.env_remove(&key);
-        }
-    }
+    strip_inherited_flock_env(&mut cmd);
     // Server-side ANSI diff encoding — the whole reason this bridge exists.
     cmd.env("FLOCK_RENDER_ENCODING", "terminal-ansi");
     cmd.env("TERM", "xterm-256color");
@@ -518,6 +513,20 @@ async fn pump(socket: WebSocket, state: AppState, idle: Option<Duration>) -> any
     ws_to_pty_abort.abort();
     resize_task.abort();
     Ok(())
+}
+
+fn strip_inherited_flock_env(cmd: &mut CommandBuilder) {
+    for (key, _) in std::env::vars_os() {
+        // Match our ASCII keys without decoding foreign values or keys.
+        let Some(name) = key.to_str() else {
+            continue;
+        };
+        if name.starts_with("FLOCK_")
+            && key.as_os_str() != std::ffi::OsStr::new(crate::config::CONFIG_PATH_ENV_VAR)
+        {
+            cmd.env_remove(&key);
+        }
+    }
 }
 
 fn pty_reader_loop(mut reader: Box<dyn std::io::Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
@@ -880,6 +889,48 @@ fn print_web_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_environment_survives_non_utf8_inherited_entries() {
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = OsString::from_vec(vec![b'x', 0xff]);
+        let invalid_key = OsString::from_vec(b"FLOCK_\xff".to_vec());
+        if std::env::var_os("FLK_BRIDGE_ENV_FIXTURE").is_some() {
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            strip_inherited_flock_env(&mut cmd);
+            assert_eq!(cmd.get_env("FLK_FOREIGN_VALUE"), Some(invalid.as_os_str()));
+            assert_eq!(cmd.get_env(&invalid_key), Some(OsStr::new("retained")));
+            assert_eq!(
+                cmd.get_env(crate::config::CONFIG_PATH_ENV_VAR),
+                Some(invalid.as_os_str())
+            );
+            assert_eq!(cmd.get_env("FLOCK_ENV"), None);
+            assert_eq!(cmd.get_env("FLOCK_FOREIGN_VALUE"), None);
+        } else {
+            let output =
+                crate::process::TracedCommand::new(std::env::current_exe().unwrap(), "test")
+                    .args([
+                        "--exact",
+                        "web::tests::bridge_environment_survives_non_utf8_inherited_entries",
+                        "--nocapture",
+                    ])
+                    .env("FLK_BRIDGE_ENV_FIXTURE", "1")
+                    .env("FLK_FOREIGN_VALUE", &invalid)
+                    .env(&invalid_key, "retained")
+                    .env(crate::config::CONFIG_PATH_ENV_VAR, &invalid)
+                    .env("FLOCK_ENV", "1")
+                    .env("FLOCK_FOREIGN_VALUE", &invalid)
+                    .output_traced_with_timeout(Duration::from_secs(10))
+                    .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn origin_absent_is_allowed() {
