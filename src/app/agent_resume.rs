@@ -157,6 +157,9 @@ impl App {
         pane_infos
     }
 
+    /// Make one explicit retry by terminal ID, bypassing automatic `resume_failed`
+    /// suppression (ADR-0028 §1/§3). Failure keeps the plan and returns `false`.
+    /// A successful launch clears the failure flag and pending plan.
     pub(crate) fn start_pending_agent_resume_for_terminal(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
@@ -531,23 +534,23 @@ mod tests {
             let sequence = app.event_hub.current_sequence();
             // Theme deferral cannot claim that a live execution exists.
             assert!(!app.start_pending_agent_resumes(false));
-            assert!(app.event_hub.events_after(sequence).is_empty());
+            assert!(app.event_hub.ring_snapshot_after(sequence).is_empty());
             let launched = if explicit {
                 app.resume_hibernated_pane(0, pane).is_ok()
             } else {
                 app.start_pending_agent_resumes(true)
             };
             let live_status = app.pane_info(0, pane).unwrap().agent_status;
-            let events = app.event_hub.events_after(sequence);
+            let events = app.event_hub.ring_snapshot_after(sequence);
             let repeated = app.start_pending_agent_resumes(true);
-            let repeated_events = app.event_hub.events_after(sequence);
+            let repeated_events = app.event_hub.ring_snapshot_after(sequence);
             // Reap the owned fake shell before any assertions can panic.
             for (_, runtime) in app.terminal_runtimes.drain() {
                 runtime.shutdown();
             }
             drop(app);
             let reopened = crate::api::EventHub::with_persistence(log.clone());
-            let replayed = reopened.events_after(sequence);
+            let replayed = reopened.ring_snapshot_after(sequence);
             drop(reopened);
             std::fs::remove_file(log).unwrap();
             assert_eq!(
@@ -731,6 +734,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operator_retry_by_terminal_id_rechecks_failed_plan_and_starts_after_repair() {
+        // ADR-0028 §1/§3: failed plans retain their identity for explicit retry.
+        let mut app = test_app();
+        app.state.default_shell = "/bin/sh".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        let workspace = crate::workspace::Workspace::test_new("operator-retry");
+        let pane = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane).cloned().unwrap();
+        app.state.view.terminal_area = Rect::new(0, 0, 80, 24);
+        app.state.view.pane_infos = workspace.tabs[0].layout.panes(app.state.view.terminal_area);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal
+            .set_agent_name("retry-agent".into())
+            .expect("the retry fixture uses a valid agent name");
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("retry-session").unwrap(),
+        });
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "codex".into(),
+            argv: Vec::new(),
+            dedupe_key: "operator-retry".into(),
+        });
+        assert!(!app.start_pending_agent_resumes(true));
+        assert!(app.state.terminals[&terminal_id].resume_failed);
+        let info = app.agent_info_for_target("retry-agent").unwrap();
+        assert_eq!(info.blocked_reason.as_deref(), Some("resume_failed"));
+        assert!(info.resumable);
+
+        let logs = crate::logging::capture_logs(|| {
+            assert!(!app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+        });
+        assert_eq!(logs.matches("reason=\"empty_argv\"").count(), 1, "{logs}");
+        assert!(app.state.terminals[&terminal_id].resume_failed);
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_some());
+        assert_eq!(app.terminal_runtimes.len(), 0);
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .pending_agent_resume_plan
+            .as_mut()
+            .unwrap()
+            .argv = vec!["/bin/sh".into(), "-c".into(), "read -r fixture".into()];
+        assert!(!app.start_pending_agent_resumes(true));
+        assert_eq!(
+            app.terminal_runtimes.len(),
+            0,
+            "repair alone does not enable automatic retry"
+        );
+        assert!(app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+        assert_eq!(app.terminal_runtimes.len(), 1);
+        assert!(!app.state.terminals[&terminal_id].resume_failed);
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none());
+        assert_eq!(
+            app.agent_info_for_target("retry-agent")
+                .unwrap()
+                .blocked_reason,
+            None
+        );
+        app.terminal_runtimes
+            .remove(&terminal_id)
+            .unwrap()
+            .shutdown();
+    }
+
+    #[tokio::test]
     async fn failed_deferred_resume_cold_restore_allows_one_automatic_attempt() {
         // #661: failed resume must retain the identity and retry plan for pending mail.
         let mut app = test_app();
@@ -762,7 +841,7 @@ mod tests {
                 .terminals
                 .get_mut(&terminal_id)
                 .expect("test terminal should exist");
-            terminal.set_agent_name("reviewer".into());
+            terminal.set_agent_name("reviewer".into()).unwrap();
             terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
                 source: "flock:codex".into(),
                 agent: "codex".into(),
@@ -791,7 +870,7 @@ mod tests {
         assert!(!app.start_pending_agent_resumes(false));
         assert!(
             app.event_hub
-                .events_after(sequence)
+                .ring_snapshot_after(sequence)
                 .iter()
                 .all(|(_, event)| !matches!(
                     event.data,
@@ -809,7 +888,7 @@ mod tests {
             .terminals
             .get(&terminal_id)
             .expect("terminal should survive a failed resume");
-        assert_eq!(terminal.agent_name.as_deref(), Some("reviewer"));
+        assert_eq!(terminal.agent_name(), Some("reviewer"));
         assert!(terminal.resume_failed);
         assert!(terminal.pending_agent_resume_plan.is_some());
         assert!(terminal.hibernated_resume_plan.is_none());

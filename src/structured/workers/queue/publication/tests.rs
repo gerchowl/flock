@@ -70,6 +70,7 @@ fn transport(root: &SessionConfigDir) -> (Transport, [UnixStream; 2]) {
         std::fs::File::from(OwnedFd::from(stdin)),
         StreamLocation {
             data_dir: root.path().into(),
+            storage: Default::default(),
             agent: "input-fixture".into(),
             session: "input-session".into(),
         },

@@ -93,6 +93,7 @@ fn request(r: &mut AppQueue, d: Deliver) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     r.app
         .handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "relay".into(),
                 method: Method::MeshDeliver(Box::new(d)),
@@ -516,6 +517,7 @@ fn relay_queue_reply_routes_by_verified_custody_origin_not_claimed_host() {
         let (tx, rx) = mpsc::channel();
         r.app
             .handle_api_request_message(crate::api::ApiRequestMessage {
+                scope: None,
                 request: Request {
                     id: "reply".into(),
                     method: Method::MsgReply(crate::api::schema::MsgReplyParams {

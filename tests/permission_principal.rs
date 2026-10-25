@@ -124,3 +124,24 @@ fn permission_local_operator_compile_fail() {
         ],
     );
 }
+
+/// Browser scopes, including operate, never mint the local operator witness.
+#[test]
+fn websocket_token_cannot_become_local_operator() {
+    let auth = include_str!("../src/structured/permissions/auth.rs");
+    let boundary = "\npub(crate) mod tokens;";
+    assert_eq!(auth.matches(boundary).count(), 1);
+    let api = include_str!("../src/app/api.rs");
+    let start = api.find("pub(crate) struct LocalOperator<'a> {").unwrap();
+    let length = api[start..].find("\n}").unwrap() + 2;
+    let declaration = &api[start..start + length];
+    syn::parse_str::<syn::ItemStruct>(declaration).unwrap();
+    let context = format!(
+        "mod auth {{ {} }} mod app {{ pub struct App; mod api {{ use super::App; {declaration} }} pub(crate) use api::LocalOperator; }}",
+        auth.replace(boundary, "")
+    );
+    check_probes(&context, &[
+        ("fn keep(token: auth::VerifiedToken<'static>) -> auth::VerifiedToken<'static> { token }", None),
+        ("fn elevate(token: auth::VerifiedToken<'static>) -> app::LocalOperator<'static> { token.into() }", Some("E0277")),
+    ]);
+}

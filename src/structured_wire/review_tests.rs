@@ -84,10 +84,12 @@ syntax!(
 #[test]
 fn wire_error_constants_match_registered_and_subscription_spellings() {
     use crate::api::error_code::ErrorCode;
+    assert_eq!(ErrorCode::InvalidAgent.retry().as_str(), "never");
     assert_eq!(CURSOR_AHEAD, ErrorCode::CursorAhead.as_str());
     assert_eq!(OPERATOR_ONLY, ErrorCode::OperatorOnly.as_str());
     assert_eq!(SESSION_UNCONFIRMED, ErrorCode::SessionUnconfirmed.as_str());
     for (code, spelling) in [
+        (SubfailCode::InvalidAgent, ErrorCode::InvalidAgent.as_str()),
         (SubfailCode::CursorAhead, CURSOR_AHEAD),
         (SubfailCode::OperatorOnly, OPERATOR_ONLY),
         (SubfailCode::UnknownStream, UNKNOWN_STREAM),

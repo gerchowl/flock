@@ -1,0 +1,2 @@
+- Prepare listener error recovery and typed health reporting, and prevent received handoff descriptors from leaking into child processes. The structured listener remains unmounted.
+- Validate transferred listener address family, socket type and listening state with typed refusals; isolate listener health per server and back off unclassified accept failures. Linux receives handoff descriptors atomically close-on-exec.

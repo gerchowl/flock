@@ -113,6 +113,34 @@ GitHub user drive flock into acting on a public repo. The spawn carries a
 system-owned preamble the caller cannot displace, and refuses control-sequence
 bytes as `msg_send` already does.
 
+#### Agent identity text (#317)
+
+Agent names, hook-reported agent labels and manual pane labels are untrusted
+renderer input. Reject C0/C1 controls, ESC/CSI/OSC introducers, line breaks,
+Unicode line separators, and Unicode format characters (category Cf), except
+ZWJ (U+200D). Variation selectors U+FE00–FE0F remain allowed. Reject the entire
+Unicode tag block U+E0000–E007F and labels longer than 64 Unicode scalar values
+before trimming. This also prevents zero-width lookalikes from evading name
+uniqueness checks.
+
+`TerminalState::set_agent_name`, the manual-label setter and hook/metadata
+setters validate before mutation. Rename, creation, report-agent and metadata
+APIs return `invalid_agent_name` without echoing rejected text. The pane rename
+modal displays a refusal and preserves its input and previous label. Safe empty
+names retain the existing clear-name behavior; creation and agent reports
+require a nonempty name.
+
+Older mesh v5 peers and saved PTY sessions can carry invalid labels. Receivers
+drop the invalid identity field and warn with a typed code and fixed source,
+without its content. Restore drops any invalid manual pane label, independently
+of the agent name. Invalid structured records remain inactive with raw data
+retained (ADR-0028 §3a). Navigator, agent-panel, toast and desktop-notification
+labels escape unsafe text at the final display boundary. Overlong legacy
+labels display a truncated prefix with a visible `…` marker. Pane/agent JSON
+and GUI status events drop invalid agent labels rather than forwarding them.
+This does not change the wire layout or mesh version. The separate delegate
+filename restriction remains narrower than the general Unicode display rule.
+
 ### 5. The ceiling is lineage-aware, not a single global counter
 
 A flat `max_concurrent_agents` is a footgun on its own: an adversarial or

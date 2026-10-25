@@ -541,7 +541,7 @@ impl App {
         for (seq, _, event) in self.event_hub.persisted_events_after(0) {
             events.insert(seq, event);
         }
-        events.extend(self.event_hub.events_after(0));
+        events.extend(self.event_hub.ring_snapshot_after(0));
         let mut restored = std::collections::BTreeMap::new();
         for event in events.into_values() {
             if let crate::api::schema::EventData::DeliveryAttemptUpdated { attempt } = event.data {

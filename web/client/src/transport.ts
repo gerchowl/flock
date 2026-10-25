@@ -44,11 +44,12 @@ export type Cursor = number | null;
 /**
  * One delivered entry of a session stream (client-side; not a wire frame).
  * A `gap` entry marks seqs `from`–`to` as no longer stored (ADR-0038 §3); its
- * `seq` is `to`, and the stream continues after it.
+ * `seq` is `to`, and the stream continues after it. `tsMs` is the `ev` frame's
+ * server timestamp, where the adapter has one (the wire does; a recording does not).
  */
 export type SessionEntry =
-  | { readonly seq: number; readonly kind: "known"; readonly event: KnownSessionEvent }
-  | { readonly seq: number; readonly kind: "unknown"; readonly unknown: UnknownInput }
+  | { readonly seq: number; readonly tsMs?: number; readonly kind: "known"; readonly event: KnownSessionEvent }
+  | { readonly seq: number; readonly tsMs?: number; readonly kind: "unknown"; readonly unknown: UnknownInput }
   | { readonly seq: number; readonly kind: "gap"; readonly from: number; readonly to: number };
 
 /** Why a subscription ended; shown to the user as-is. */

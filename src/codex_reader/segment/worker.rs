@@ -16,7 +16,8 @@ use std::time::Duration;
 pub(crate) const STEP_INTERVAL: Duration = Duration::from_millis(10);
 /// Idle between complete verification passes; never inserted between chunks.
 pub(crate) const EOF_INTERVAL: Duration = Duration::from_millis(250);
-/// One dispatch-to-delivery budget, including any notification wait.
+/// Diagnose an outstanding unit with no queued reply after this budget.
+/// Controller scheduling delay cannot invalidate work that is already ready.
 pub(crate) const WORK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard process-wide limit, including abandoned threads blocked in kernel I/O.
 const MAX_READERS: usize = 128;
@@ -224,12 +225,6 @@ impl Worker {
             return Err(Fault::Revoked);
         }
         self.writer_live()?;
-        if self
-            .flight
-            .is_some_and(|at| now.saturating_duration_since(at) >= WORK_TIMEOUT)
-        {
-            return Err(Fault::Stalled);
-        }
         match self.replies.try_recv() {
             Ok(reply) => {
                 let (mut work, eof) = reply?;
@@ -278,7 +273,16 @@ impl Worker {
                 self.due = now + if eof { EOF_INTERVAL } else { STEP_INTERVAL };
             }
             Err(TryRecvError::Disconnected) => return Err(Fault::Disconnected),
-            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Empty) => {
+                // A delayed controller must consume ready work before diagnosing
+                // a silent producer. Source/capability checks still run first.
+                if self
+                    .flight
+                    .is_some_and(|at| now.saturating_duration_since(at) >= WORK_TIMEOUT)
+                {
+                    return Err(Fault::Stalled);
+                }
+            }
         }
         if self.flight.is_none() && now >= self.due {
             let work = self.work.take().ok_or(Fault::Stopped)?;
@@ -300,28 +304,11 @@ impl Worker {
         }
         Ok(())
     }
-    /// Optional bounded notification wait, sharing the original dispatch budget.
-    /// Supply the same monotonic clock as tick; no deadline is reset by a wake.
-    pub fn wait(
-        &mut self,
-        binding: &mut Binding,
-        owners: &mut Ownership,
-        clock: impl Fn() -> Instant,
-    ) -> Result<Option<&Evidence>, Fault> {
-        self.tick(binding, owners, clock())?;
-        if let Some(at) = self.flight {
-            let remaining = WORK_TIMEOUT.saturating_sub(clock().saturating_duration_since(at));
-            match self.wakes.recv_timeout(remaining) {
-                Ok(()) => {}
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(self.fail(Fault::Stalled, binding, owners))
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(self.fail(Fault::Disconnected, binding, owners))
-                }
-            }
-        }
-        self.tick(binding, owners, clock())
+    /// Nonblocking, coalesced scheduling hint. Call tick even without a wake
+    /// at next_due to check pending work health and producer disconnection.
+    /// Consuming a wake alone never authorizes or accepts lifecycle evidence.
+    pub fn poll_wake(&self) -> bool {
+        self.wakes.try_recv().is_ok()
     }
     fn fail(&mut self, fault: Fault, binding: &mut Binding, owners: &mut Ownership) -> Fault {
         if fault == Fault::Writer {

@@ -47,7 +47,7 @@ sub_id: string,
 stream: string,
 /**
  * JSON number; exact in JavaScript below 2^53.
- * Seq streams only; agent/<id>/live omits seq and never advances a cursor.
+ * Seq streams only; `agent/<id>/live` omits seq and never advances a cursor.
  */
 seq?: number,
 /**
