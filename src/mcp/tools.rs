@@ -213,9 +213,7 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_msg_list",
-            description: "List messages that are still queued (not yet \
-                          delivered). Pass `pane` to restrict to one \
-                          recipient (bare-pane target grammar). Includes wake attempt evidence and failure reasons.",
+            description: "Peek at unread messages. Omit `pane` for your attested structured inbox; the operator's global list is unchanged. A native target may only name your own identity. Includes local wake attempt evidence.",
             input_schema: schema_msg_list,
             build: build_msg_list,
         },
@@ -229,8 +227,7 @@ pub(super) fn table() -> &'static [Tool] {
             name: "flock_msg_read",
             description: "Read (and consume) the messages waiting for you from \
                           other agents. This is how agent-to-agent messages \
-                          arrive — they are NOT typed into your session. Omit \
-                          `pane` to read your own inbox. Each message carries \
+                          arrive. Omit `pane` for your attested pane or structured inbox. Structured reads consume the delivered projection once without another harness delivery. Each message carries \
                           its sender, body, `intent`, and whether a durable return binding lets you \
                           reply even while offline. `reply_contract` discloses best-effort older messages. `intent: needs_reply` means the sender is \
                           waiting on an answer — send one with \
@@ -841,7 +838,7 @@ fn schema_msg_list() -> Value {
         "properties": {
             "pane": {
                 "type": "string",
-                "description": "Optional recipient pane target (bare-pane grammar).",
+                "description": "Optional recipient target. Omit for structured self or the operator global list.",
             },
         },
         "additionalProperties": false,
@@ -854,7 +851,7 @@ fn schema_msg_read() -> Value {
         "properties": {
             "pane": {
                 "type": "string",
-                "description": "Whose inbox to read. Omit for your own pane.",
+                "description": "Whose inbox to read. Omit for your attested pane or structured self; another native inbox is refused.",
             },
         },
         "additionalProperties": false,
@@ -1608,6 +1605,24 @@ pub(super) fn find(name: &str) -> Option<&'static Tool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_inbox_tools_bind_omitted_targets_and_describe_structured_self() {
+        for name in ["flock_msg_list", "flock_msg_read"] {
+            let tool = find(name).unwrap();
+            assert!(
+                tool.descriptor()["inputSchema"]["properties"]["pane"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("structured")
+            );
+            assert!(matches!(
+                (tool.build)(json!({})).unwrap(),
+                Method::MsgList(MsgListParams { pane: None })
+                    | Method::MsgRead(crate::api::schema::MsgReadParams { pane: None })
+            ));
+        }
+    }
 
     #[test]
     fn worktree_kill_defaults_to_dry_run_with_self_guard_armed() {

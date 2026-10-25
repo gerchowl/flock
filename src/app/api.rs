@@ -30,6 +30,8 @@ pub(crate) mod mesh_routes;
 mod mesh_spokes;
 pub(super) mod messages;
 mod native_inbox;
+#[cfg(test)]
+mod native_inbox_caller_tests;
 mod owner;
 mod owners;
 mod panes;

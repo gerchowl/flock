@@ -1657,12 +1657,12 @@ pub struct MsgReplyParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MsgListParams {
-    /// Restrict to one recipient pane (any bare-pane target shape).
+    /// Recipient target. Omitted means structured self or the operator global list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
 }
 
-/// `msg.read` — CONSUME a pane's inbox (ADR-0008).
+/// `msg.read` — CONSUME the attested caller's inbox (ADR-0008, ADR-0036 §3).
 ///
 /// Deliberately a separate verb from `msg.list` rather than a flag on it:
 /// peeking and consuming differ in their side effects, and a boolean that
@@ -1671,8 +1671,8 @@ pub struct MsgListParams {
 /// non-destructive view; this is the recipient's read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgReadParams {
-    /// Whose inbox. Omitted means the caller's own pane, resolved from the
-    /// connection the way `msg.send` resolves its sender.
+    /// Omitted means the caller's own pane or structured identity, attested from
+    /// the connection. A native target cannot claim another agent's inbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
 }
