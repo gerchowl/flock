@@ -696,16 +696,21 @@ An **artifact** is agent-authored content that a person looks at and answers: an
 
 **Holds: what keeps an artifact.** An artifact is **held**, and is never expired or evicted, while any of these is true:
 1. A person has pinned it.
-2. A tile shows it. The client sends `artifact.viewing { artifact_id, version, open: bool }`. The server keeps a viewing lease per client session and drops it when that session disconnects.
+2. A tile shows it. The client sends `artifact.viewing { artifact_id, version, open: bool }` from a client session holding at least `read` scope.
+   - The server keeps a **viewing lease** per client session. The client renews it by heartbeat every 30 s, and the lease lapses after 90 s without one, after **8 h** in any case, and on disconnect.
+   - A principal holds at most **8** viewing leases at once.
+   - A viewing lease defers expiry and eviction. It **never** migrates a blob (§7c) and never exempts an agent's versions from that agent's own quota, so a token-holding agent cannot keep its artifacts alive by viewing them.
 3. An open question has the artifact as its `about`.
 
 When a hold ends, the artifact follows the persistent idle rule from that moment. It is never deleted at once.
 - **A withdrawn question.** If the asker's identity is replaced, its open questions are withdrawn with `subject_replaced` (§5b). The hold then ends, and the artifact turns idle-persistent. A replaced identity therefore never deletes what a person was asked about.
 
 **Quotas.**
-- `[artifacts] quota_bytes_per_agent` (default 64 MiB) counts one agent's stored versions. A publish over it evicts that agent's **oldest idle, unheld** versions first. It never evicts another agent's.
-- `[artifacts] quota_bytes_total` (default 1 GiB) never evicts. A publish over it is refused.
-- If eviction cannot make room, the publish is refused with `artifact_quota_exceeded` (`scope: agent | total`).
+- `[artifacts] quota_bytes_per_agent` (default **32 MiB**) counts one agent's stored versions. A publish over it evicts that agent's **oldest idle, unheld** versions first. It never evicts another agent's.
+- `[artifacts] quota_bytes_total` (default **2 GiB**, which fits 64 agents at their full quota) never evicts across agents. A publish that would exceed it first evicts **the publisher's own** idle, unheld versions. If the total is still full, it is refused with `scope: total`.
+- **Pressure is visible.** At 80 % and at 100 % of the total, the operator gets an inbox notice naming the largest holders, with a one-click purge of idle, unpinned artifacts. So a full store is never a silent block for 14 days.
+- Most artifacts are `session` and die with their agent, so the idle TTL only governs persistent and held ones.
+- If eviction cannot make room, the publish is refused with `artifact_quota_exceeded` (`scope: agent | total`; retry classes in §7e).
 
 **Pinning.**
 - A person pins or unpins through a client token with `answer` or `operate` scope, or through the local CLI. This is recorded as `artifact.pinned` / `artifact.unpinned`.
@@ -718,20 +723,22 @@ When a hold ends, the artifact follows the persistent idle rule from that moment
 - **What an operator purge removes.**
   - It also removes every anchor excerpt for the purged versions: the `quote.exact`, `prefix` and `suffix` of §7d are replaced by `[purged]`, so no text of the content survives.
   - Automatic purges (idle, session_end, quota, blob_missing) keep the excerpts, as part of the comments.
+- **Purge versus deduplication.** A purge drops **this version's reference** to its blob. The bytes are removed only when no record references them (§7c). Identical content that a stream line also holds stays, as part of that line. A purge therefore removes the artifact, not every copy of its bytes; erasing those is S16's retention work.
 - **A §5b fork** that is asked about a purged artifact reads the `artifact.purged` record, not the content.
   - A fork's kept transcript (owner decision 13) is not rewritten by a purge, so text that it already read stays in the lineage.
   - Removing that text is S16's retention work.
 
 **Configuration (new keys this ADR introduces).** They join ADR-0041's inventory (#2384) as plain, non-secret values:
 
-| Key | Type | Default |
-|---|---|---|
-| `[artifacts] max_bytes` | bytes | 2 MiB per version |
-| `[artifacts] max_versions` | int | 50 per artifact |
-| `[artifacts] idle_ttl` | duration | 14 d |
-| `[artifacts] quota_bytes_per_agent` | bytes | 64 MiB |
-| `[artifacts] quota_bytes_total` | bytes | 1 GiB |
-| `[blobs] session_backend` | enum | `session_tmp` |
+| Key | Type | Default | Classification (ADR-0041 §2) |
+|---|---|---|---|
+| `[artifacts] max_bytes` | bytes | 2 MiB per version | non-sensitive operational limit; operator write; reload: server |
+| `[artifacts] max_versions` | int | 50 per artifact | non-sensitive operational limit; operator write; reload: server |
+| `[artifacts] idle_ttl` | duration | 14 d | non-sensitive operational limit; operator write; reload: server |
+| `[artifacts] quota_bytes_per_agent` | bytes | 32 MiB | non-sensitive operational limit; operator write; reload: server |
+| `[artifacts] quota_bytes_total` | bytes | 2 GiB | non-sensitive operational limit; operator write; reload: server |
+| `[artifacts] allow_stream_grants` | bool | false | security policy (enables an accepted exfiltration residual, §7e); operator write only; reload: server |
+| `[blobs] session_backend` | enum | `session_tmp` | non-sensitive selector; operator write; reload: restart. A future backend's credentials are secret references, never values |
 
 Any future backend credential (for example S3) must use ADR-0041's secret-reference shape, never an inline value.
 
@@ -784,7 +791,11 @@ Blobs stay in ADR-0036 §4's content-addressed store (`<data dir>/blobs/<sha256>
 
 - **Reference counting.** A blob lives while any record references it: any artifact version, stream line or other record. The store counts references. Purging a record drops its reference, and the blob is removed when the count reaches zero.
 - **The session temp backend.** The owner asked for "tmp folder sessions" now. A blob may live in the publishing agent's session temp directory (`[blobs] session_backend = "session_tmp"`) **only while every record that references it is a `session`, unheld artifact version of that agent**. It is removed when that agent's session ends.
-- **Migration.** When a referencing artifact is pinned, made persistent, held past its session, or referenced by anything else, its blob **migrates** to the durable store before that change is acknowledged. If the migration fails, the change is refused with `blob_migration_failed`, and nothing is half-moved.
+- **Migration.** A pin, a change to `persistent`, a question hold or a reference from anything else migrates the blob to the durable store before that change is acknowledged.
+  - **Order:** copy the bytes, fsync, verify the sha256, add the durable reference, then drop the temp reference and copy.
+  - The session-end sweep **skips** any blob with a migration in progress.
+  - If migration fails, the triggering change is refused with `blob_migration_failed`, and the blob stays where it was, whole.
+  - A **viewing** lease never triggers migration. While a viewed blob's session has ended, the sweep defers deleting it until the lease ends.
 - **What the GUI relies on.** Records carry only the hash and size, and their shape never depends on the backend. A blob that is gone reads as `artifact.purged { reason: blob_missing }` (§7a).
 
 The backend trait and its config are ADR-0036 §4 / S3b #1426, owned by the server.
@@ -817,14 +828,18 @@ Anchor = {
 - v1 defines one kind: `{ kind: "flock_stream", stream, access: "read" }`, a read-only subscription to a named flock stream that the viewer could open anyway.
 - External origins are a later kind, behind a server proxy with a per-artifact scoped token, and are not defined yet.
 
-**The navigation beacon cannot be closed, so it is disclosed and bounded.**
-- §7's residual risk applies: an interactive frame can navigate itself and leak data in the URL, as one outbound GET. Browsers ship no `navigate-to`, so no sandbox flag or CSP can stop it.
-- With a stream grant, what can leak is live flock data the viewer can read. The grant prompt therefore states it in plain words: *"This artifact runs code. It can send what it reads from \<stream\> to the internet."* The person grants knowing that.
-- **The parent bounds it.**
-  - The parent watches the frame's `load` events. A second load means the frame navigated itself.
-  - On that, the parent tears down the frame and revokes every grant on that version for that viewer (`artifact.grant_revoked { reason: navigated }`).
-  - It shows why. A version that navigates once cannot be re-granted without a new version.
-  - So at most what the frame held at that moment leaks, once.
+**Exfiltration through a stream grant is an accepted residual, disclosed and off by default.**
+- **What can leak.** An interactive frame that holds a stream grant **can send out what it reads**, and no sandbox flag or CSP can stop it:
+  - it can navigate itself to a URL that answers 204/205, which fires no `load` and can repeat;
+  - with `allow-scripts`, WebRTC STUN/ICE reaches the network without any navigation, because `connect-src` doesn't cover it;
+  - browsers ship no `navigate-to`.
+- **Why live data still runs as interactive code.** A non-interactive render cannot consume a stream: drawing live data needs script. A **declarative binding**, where the parent fills stream values into a static, script-free frame, would avoid this residual. It is the preferred later kind, and v1 does not define it.
+- **Off by default.** Stream grants need `[artifacts] allow_stream_grants = true` (default **false**) set by the operator. Each grant is explicit, per version.
+- **The grant prompt says it in plain words:** *"This artifact runs code. It can send anything it reads from \<stream\> to the internet. Grant only if you trust the agent that wrote it."*
+- **A best-effort tripwire, not a bound.**
+  - The parent counts the frame's `load` events, resetting the counter whenever the parent itself (re)loads the frame, for example on a version change.
+  - An unexpected extra load tears the frame down and revokes that viewer's grants on the version (`artifact.grant_revoked { reason: navigated }`).
+  - It catches careless code, not a determined frame.
 
 **Grants belong to a person, per artifact, per version.**
 - A person grants a declared capability through a client token with `operate` scope. This is recorded as `artifact.granted { artifact_id, version, capability, by, at }`, and revoked as `artifact.grant_revoked { reason }`.
@@ -842,17 +857,18 @@ Anchor = {
 
   Over a limit, the call is refused and the parent's own session is never flooded.
 
-**Refusals (registered codes, each with its retry class):**
+**Refusals.** Each code is registered in the error-code registry (`src/api/error_code.rs`) with one of its retry classes:
 
 | Code | Retry | Meaning |
 |---|---|---|
 | `capability_not_declared` | `never` | not in the version's declaration |
-| `capability_not_granted` | `never` (the parent may prompt) | no grant from the current viewer |
-| `capability_unsupported` | `never` | the kind is not implemented (v1: all of them) |
+| `capability_not_granted` | `after_human` | no grant from the current viewer; the parent may prompt |
+| `capability_unsupported` | `never` | the kind is not implemented, or stream grants are disabled (v1: all) |
 | `rpc_too_large` | `never` | over the size limit |
-| `rpc_rate_limited` | `after: 1s` | over the rate or subscription cap |
-| `artifact_quota_exceeded` | `never` | §7a |
-| `blob_migration_failed` | `retryable` | §7c |
+| `rpc_rate_limited` | `later` | over the rate or subscription cap |
+| `artifact_quota_exceeded` (`scope: agent`) | `after_human` | only pinned or held versions remain; a person must unpin or close |
+| `artifact_quota_exceeded` (`scope: total`) | `later` | the server total is full; expiry frees space |
+| `blob_migration_failed` | `maybe` | §7c; the triggering change was refused, nothing is half-moved |
 
 A refused call is never retried automatically by the parent.
 
@@ -885,7 +901,11 @@ A refused call is never retried automatically by the parent.
 - **Network.**
   - No artifact reaches the network or the listener, with or without a declaration.
   - Every `flock.rpc` gets `capability_unsupported` in G6/G7.
-  - The broker tests come later: a viewer-B frame with only A's grant is refused, the limits refuse, and a self-navigation revokes the grants.
+  - With `allow_stream_grants = false` (the default), a grant is refused.
+  - The broker tests come later: a viewer-B frame with only A's grant is refused, the limits refuse, an unexpected extra load revokes the grants, and a parent reload resets the counter.
+- **Quota pressure.** The 80 % and 100 % notices are emitted. The total quota evicts only the publisher's own versions, and then refuses with `later`.
+- **Migration.** A sweep during an in-progress migration skips that blob. A failed hash verification refuses the pin and leaves the blob whole.
+- **Viewing lease.** It lapses without a heartbeat and at 8 h, at most 8 are held per principal, and it never protects an agent's versions from that agent's quota.
 
 ### 8. Goals and work
 
