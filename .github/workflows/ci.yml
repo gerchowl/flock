@@ -50,11 +50,46 @@ jobs:
       # job still reports success so it can stay a required context, which the
       # queue needs in order to gate on it.
 
+  # Fail-safe change detection (scripts/ci_changes.py). Only an ordinary
+  # pull_request touching nothing but docs/website/markdown or the web client
+  # may skip the Rust legs; any other path, a `land/` batch head, merge_group,
+  # push, or a detection failure leaves `skip_rust` != 'true' and runs
+  # everything. The check jobs below still report either way.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      skip_rust: ${{ steps.decide.outputs.skip_rust }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            echo "skip_rust=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only "$BASE_SHA...$HEAD_SHA" > changed.txt
+          python3 scripts/ci_changes.py "$EVENT" "$HEAD_REF" < changed.txt >> "$GITHUB_OUTPUT"
+
   # One platform each, split into lint, build and parallel test-shard jobs
   # (ci-leg.yml, #991). Each OS is its own reusable-workflow call so its
   # result can be judged alone in the check jobs below.
   ubuntu:
     name: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}
     uses: ./.github/workflows/ci-leg.yml
     with:
       leg: ubuntu-latest
@@ -103,6 +138,8 @@ jobs:
   # builds on. Revisit when zig gains macOS 26 SDK support.
   macos:
     name: macos-15
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}
     uses: ./.github/workflows/ci-leg.yml
     with:
       leg: macos-15
@@ -120,7 +157,7 @@ jobs:
   # run the result gate and fail explicitly, rather than permit an untested merge.
   check-ubuntu:
     name: check (ubuntu-latest)
-    needs: ubuntu
+    needs: [changes, ubuntu]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -145,7 +182,14 @@ jobs:
         if: always()
         env:
           RESULT: ${{ needs.ubuntu.result }}
+          SKIP_RUST: ${{ needs.changes.outputs.skip_rust }}
         run: |
+          # `skipped` is acceptable only when change detection succeeded and
+          # chose to skip (docs/web-only PR); every other state fails.
+          if [ "$RESULT" = skipped ] && [ "$SKIP_RUST" = true ]; then
+            echo "ubuntu-latest leg skipped: docs/web-only change"
+            exit 0
+          fi
           if [ "$RESULT" != success ]; then
             echo "ubuntu-latest leg ended as $RESULT" >&2
             exit 1
@@ -153,7 +197,7 @@ jobs:
 
   check-macos:
     name: check (macos-15)
-    needs: macos
+    needs: [changes, macos]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -178,7 +222,14 @@ jobs:
         if: always()
         env:
           RESULT: ${{ needs.macos.result }}
+          SKIP_RUST: ${{ needs.changes.outputs.skip_rust }}
         run: |
+          # `skipped` is acceptable only when change detection succeeded and
+          # chose to skip (docs/web-only PR); every other state fails.
+          if [ "$RESULT" = skipped ] && [ "$SKIP_RUST" = true ]; then
+            echo "macos-15 leg skipped: docs/web-only change"
+            exit 0
+          fi
           if [ "$RESULT" != success ]; then
             echo "macos-15 leg ended as $RESULT" >&2
             exit 1

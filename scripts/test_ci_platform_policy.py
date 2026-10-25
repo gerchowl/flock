@@ -70,17 +70,18 @@ class PlatformPolicy(unittest.TestCase):
                                  ('push', '', 'refs/heads/dev'), ('push', '', 'refs/heads/main')]:
             for platform, gate_name in [('macos', 'check-macos'), ('ubuntu', 'check-ubuntu')]:
                 gate = self.ci['jobs'][gate_name]
-                self.assertEqual(gate['needs'], platform)
+                self.assertEqual(gate['needs'], ['changes', platform])
                 self.assertEqual(gate['if'], 'always()')
                 self.assertFalse(gate.get('continue-on-error', False))
                 step = next(step for step in gate['steps'] if step['name'] == 'Require every job of the leg')
                 self.assertEqual(step.get('if'), 'always()')
                 self.assertEqual(step['env']['RESULT'], '${{ needs.' + platform + '.result }}')
                 self.assertFalse(step.get('continue-on-error', False))
+                self.assertEqual(step['env']['SKIP_RUST'], '${{ needs.changes.outputs.skip_rust }}')
                 for result in ['success', 'failure', 'cancelled', 'skipped', '']:
                     with self.subTest(event=event, head=head, platform=platform, result=result):
                         outcome = subprocess.run(['/bin/sh', '-c', step['run']],
-                                                 env={**os.environ, 'RESULT': result},
+                                                 env={**os.environ, 'RESULT': result, 'SKIP_RUST': 'false'},
                                                  capture_output=True, text=True, timeout=10)
                         self.assertEqual(outcome.returncode, 0 if result == 'success' else 1)
                         if result != 'success':
@@ -110,3 +111,28 @@ class PlatformPolicy(unittest.TestCase):
         self.assertEqual(run('true', three, 0), 1)
         self.assertEqual(run('true', '', 0), 1)
         self.assertEqual(run('false', three, 0), 0)
+
+    def test_rust_legs_skip_only_when_detection_says_so_and_gates_still_report(self):
+        for platform in ['ubuntu', 'macos']:
+            job = self.ci['jobs'][platform]
+            self.assertEqual(job['needs'], 'changes')
+            self.assertEqual(job['if'], "${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}")
+        gate = self.ci['jobs']['check-macos']
+        step = next(step for step in gate['steps'] if step['name'] == 'Require every job of the leg')
+        for result, skip, code in [('skipped', 'true', 0), ('skipped', 'false', 1), ('skipped', '', 1),
+                                   ('failure', 'true', 1), ('cancelled', 'true', 1), ('success', 'true', 0),
+                                   ('success', '', 0)]:
+            with self.subTest(result=result, skip=skip):
+                outcome = subprocess.run(['/bin/sh', '-c', step['run']], capture_output=True, text=True,
+                                         env={**os.environ, 'RESULT': result, 'SKIP_RUST': skip}, timeout=10)
+                self.assertEqual(outcome.returncode, code)
+
+    def test_changes_job_never_skips_outside_ordinary_prs(self):
+        job = self.ci['jobs']['changes']
+        decide = next(step for step in job['steps'] if step.get('id') == 'decide')
+        self.assertIn('scripts/ci_changes.py', decide['run'])
+        self.assertEqual(decide['env']['HEAD_REF'], '${{ github.head_ref }}')
+        self.assertEqual(job['steps'][0]['with']['fetch-depth'], 0)
+        out = subprocess.run(['/bin/sh', '-c', decide['run'].split('fi\n')[0] + 'fi'], capture_output=True,
+                             text=True, env={**os.environ, 'EVENT': 'push', 'GITHUB_OUTPUT': '/dev/stdout'})
+        self.assertEqual(out.stdout.strip(), 'skip_rust=false')
