@@ -264,7 +264,10 @@ fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
         let welcome = first.hello(WIRE_JSON_VERSION, &"a".repeat(64)).await;
         assert_eq!(welcome["protocol"], WIRE_JSON_VERSION);
         assert_eq!(welcome["principal"], "c".repeat(32));
-        assert_eq!(welcome["capabilities"], json!([]));
+        assert_eq!(
+            welcome["capabilities"],
+            json!(["read", "send", "answer", "operate"])
+        );
         assert_eq!(welcome["idempotency_window_ms"], 86_400_000);
         assert!(!welcome["server_version"].as_str().unwrap().is_empty());
         assert_eq!(welcome["server_epoch"].as_str().unwrap().len(), 32);
@@ -274,7 +277,7 @@ fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
         ));
         let mut newer = Socket::open(&server).await;
         let newer_welcome = newer.hello(WIRE_JSON_VERSION + 1, &"d".repeat(64)).await;
-        assert_eq!(newer_welcome["capabilities"], json!([]));
+        assert_eq!(newer_welcome["capabilities"], json!(["read"]));
         assert_eq!(newer_welcome["server_epoch"], welcome["server_epoch"]);
         server.clock.deadline(15_000).await;
         {
@@ -283,6 +286,60 @@ fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
             assert_eq!(clients.values().filter(|c| c.read_only).count(), 1);
         }
         server.finish().await;
+    });
+}
+fn assert_welcome_grants(scopes: Value, expected: Value) {
+    runtime(async {
+        let server = Server::new().await;
+        let path = server._root.path().join("client-tokens/one.token");
+        let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        token["scopes"] = scopes;
+        fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
+        let mut socket = Socket::open(&server).await;
+        let welcome = socket.hello(WIRE_JSON_VERSION, &"a".repeat(64)).await;
+        server.finish().await;
+        assert_eq!(welcome["capabilities"], expected);
+    });
+}
+#[test]
+fn welcome_grants_read_only() {
+    assert_welcome_grants(json!(["read"]), json!(["read"]));
+}
+#[test]
+fn welcome_grants_read_and_send() {
+    assert_welcome_grants(json!(["send", "read"]), json!(["read", "send"]));
+}
+#[test]
+fn welcome_grants_all_scopes_in_enum_order() {
+    assert_welcome_grants(
+        json!(["operate", "answer", "send", "read"]),
+        json!(["read", "send", "answer", "operate"]),
+    );
+}
+#[test]
+fn welcome_grants_operate_does_not_imply_other_scopes() {
+    assert_welcome_grants(json!(["operate"]), json!(["operate"]));
+}
+#[test]
+fn newer_protocol_welcome_advertises_only_explicit_read() {
+    runtime(async {
+        for (scopes, expected) in [
+            (
+                json!(["read", "send", "answer", "operate"]),
+                json!(["read"]),
+            ),
+            (json!(["send", "answer", "operate"]), json!([])),
+        ] {
+            let server = Server::new().await;
+            let path = server._root.path().join("client-tokens/one.token");
+            let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            token["scopes"] = scopes;
+            fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
+            let mut socket = Socket::open(&server).await;
+            let welcome = socket.hello(WIRE_JSON_VERSION + 1, &"a".repeat(64)).await;
+            server.finish().await;
+            assert_eq!(welcome["capabilities"], expected);
+        }
     });
 }
 #[test]
@@ -711,6 +768,7 @@ fn covers_selected_fixture_handshake_vectors_run_against_the_core() {
             }
             let server = Server::new().await;
             let mut client = Socket::open(&server).await;
+            let newer_protocol = matches!(&hello, ClientFrame::Hello { protocol, .. } if *protocol > WIRE_JSON_VERSION);
             client.send(serde_json::to_value(hello).unwrap()).await;
             if auth_refusal {
                 assert!(matches!(
@@ -724,8 +782,12 @@ fn covers_selected_fixture_handshake_vectors_run_against_the_core() {
                 assert_eq!(welcome["protocol"], WIRE_JSON_VERSION);
                 assert_eq!(
                     welcome["capabilities"],
-                    json!([]),
-                    "later slices advertise stream/command capabilities"
+                    if newer_protocol {
+                        json!(["read"])
+                    } else {
+                        json!(["read", "send", "answer", "operate"])
+                    },
+                    "welcome advertises the authenticated token grants with protocol gating"
                 );
                 if script.iter().any(|line| {
                     matches!(
