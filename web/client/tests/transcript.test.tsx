@@ -145,21 +145,26 @@ test("permission audit open and closed render as known transcript entries", asyn
 });
 
 
-test("reserved and unknown queue kinds render as generic JSON without breaking later rows", async () => {
+test("raw JSON fallback preserves reserved item kinds as well as their queue record wrappers", async () => {
   const kinds = ["finding", "delegate_result", "reload_notice", { future_queue_kind: { version: 1 } }];
   const records = kinds.map((kind, index) => ({ seq: index + 1, kind: "upsert", position: index, item: {
     item_id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
     producer: { system: "fixture" }, kind, state: "queued", delivery: "at_idle", priority: "normal",
     body: "<script>queue payload</script>", attachments: [],
   } }));
+  // There is no queue transport or renderer yet. Exercise the session fallback
+  // with the items themselves too, independently of the upsert discriminator.
+  const raw = records.flatMap((record) => [record, record.item]);
   const next = { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "following event still renders" }] } };
-  const { transport, synced } = whenSynced(createFixtureTransport([...records, next].map((record) => JSON.stringify(record)).join("\n")));
+  const { transport, synced } = whenSynced(createFixtureTransport([...raw, next].map((record) => JSON.stringify(record)).join("\n")));
   const root = mount(() => <Transcript transport={transport} stream={FIXTURE_STREAM} source="replay" />);
   await synced;
   const generic = [...root.querySelectorAll('[data-testid="unknown-event"]')];
-  expect(generic).toHaveLength(4);
+  expect(generic).toHaveLength(8);
   for (const [index, block] of generic.entries()) {
-    expect(JSON.parse(block.querySelector("pre")?.textContent ?? "null")).toEqual(records[index]);
+    const rendered = JSON.parse(block.querySelector("pre")?.textContent ?? "null");
+    expect(rendered).toEqual(raw[index]);
+    expect(index % 2 === 0 ? rendered.item.kind : rendered.kind).toEqual(kinds[Math.floor(index / 2)]);
     expect((block as HTMLDetailsElement).open).toBe(false);
   }
   expect(root.querySelector("script")).toBeNull();

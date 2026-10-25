@@ -64,6 +64,9 @@ admission paths, including operator and server origins, refuse them with
 `queue_kind_reserved` (retry `never`, CLI exit 2), before mutation. Choosing a
 different gate does not enable them. Retained records remain inspectable; queued
 reserved records fail formation with that reason and never reach harness stdin.
-The generic client JSON view can display reserved or future kinds without
-claiming specialized support. Producer admission opens only with the linked
+On restart, unresolved reserved records are durably failed before the supported
+records are held; failure clears the result flag, making recovery idempotent.
+The session transcript's raw JSON fallback can display exported records and
+items, but there is no queue GUI renderer or transport and no queue-kind-specific
+GUI coverage. Producer admission opens only with the linked
 implementation and its authenticated policy (ADR-0036 S5 amendment, #2364).

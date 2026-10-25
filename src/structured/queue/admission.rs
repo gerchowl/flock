@@ -358,7 +358,7 @@ impl Admission {
 }
 // Intake and edits share the same validation. Rendering repeats it so legacy
 // or otherwise malformed durable items are failed instead of wedging a worker.
-fn validate_kind(kind: &Kind) -> Result<(), Failure> {
+pub(super) fn validate_kind(kind: &Kind) -> Result<(), Failure> {
     if matches!(
         kind,
         Kind::Finding | Kind::DelegateResult | Kind::ReloadNotice

@@ -3422,7 +3422,20 @@ Retained reserved records remain readable and round-trip with their known kind;
 loading never deletes or reinterprets them. Edits cannot release them for delivery.
 Formation durably fails a queued reserved head with the same typed reason while
 preserving its payload, rather than sending it or wedging later supported work.
-Unknown future kinds retain the existing ADR-0028 §3a behavior. The GUI's generic
-collapsed JSON renderer accepts reserved and unknown queue records without
-specialized cards or interpretation. This reservation adds no producer, queue
+Unknown future kinds retain the existing ADR-0028 §3a behavior. The session
+transcript's raw JSON fallback preserves exported queue records and items, but
+there is no queue GUI renderer or transport yet. Its fallback test is not
+queue-kind-specific GUI coverage. This reservation adds no producer, queue
 command or live GUI transport.
+
+
+### Amendment: S5 unresolved reserved records on restart (#2364)
+
+Before holding unresolved records for a fresh generation, the scheduler durably
+fails reserved kinds with `queue_kind_reserved`, preserving identity, body and
+FIFO position. The terminal failure clears `awaiting_result`, so reconstructing
+the scheduler again adds no duplicate failure. Supported unresolved records keep
+the existing hold behavior. Admission and edits still refuse reserved kinds;
+recovery uses the existing durable `fail` transition, not renewed admission.
+Later supported queued inputs remain deliverable after construction. Read-only
+and opaque future records retain their existing inspection-only behavior.

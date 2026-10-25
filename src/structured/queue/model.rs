@@ -298,6 +298,7 @@ impl Change {
                     .find(|item| &item.item_id == item_id)
                     .ok_or_else(|| std::io::Error::other("failed item does not exist"))?;
                 item.state = State::Failed;
+                item.metadata.remove("awaiting_result");
                 item.metadata
                     .insert("refusal".into(), Value::String(reason.clone()));
                 return Ok(());
