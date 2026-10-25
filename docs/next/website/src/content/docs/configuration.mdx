@@ -28,6 +28,26 @@ A separate random `0700` per-session directory holds flock's generated `0600` JS
 
 Permission requests will only be streamed by #1438 and remain open until S6 supplies answers. The deny carrier for deferred questions belongs to S6b and is not a launch setting. The session-directory guard removes only generated settings/MCP files and their temporary directory on drop, including unwinding; the runtime must retain it until descendants have exited. The persistent harness profile is retained. Abrupt termination such as SIGKILL or a filesystem failure can prevent cleanup, and removal errors are logged.
 
+## Structured session queue journal
+
+```toml
+[sessions]
+queue_rewrite_bytes = 8388608 # 8 MiB, the default
+```
+
+`queue_rewrite_bytes` is a positive integer byte count. A structured worker
+checkpoints its queue journal when the file exceeds this threshold, before
+further appends. Checkpoint and append share one worker and writer lease;
+replacement uses fsync, rename and directory fsync. This is a rewrite trigger,
+not a maximum snapshot size. Zero is invalid.
+
+A changed value requires a **server restart**. Live reload keeps the active
+threshold and reports a partial reload with a `restart required` diagnostic;
+it does not claim to reconfigure existing queues. On reopen the configured
+threshold is checked again. Torn-tail bytes count toward this check: if unknown
+data block a required checkpoint, the journal opens with a typed read-only
+refusal and the torn suffix is preserved for operator recovery.
+
 ## Config file
 
 Flock reads config from:

@@ -15,6 +15,7 @@ mod api;
 pub(crate) use api::mesh_mail::RecoveredMessage;
 pub(crate) use api::mesh_routes::Completion as MeshRoutesCompletion;
 pub(crate) use api::responses::encode_error_with_data;
+pub(crate) use api::structured_queue::SendParams as StructuredSendParams;
 pub(crate) use api::LocalOperator;
 pub(crate) mod fleet_pause;
 pub(crate) mod guarded_submit;
@@ -48,6 +49,7 @@ pub(crate) mod notifications;
 pub(crate) mod owners;
 mod peer_checkout;
 pub(crate) mod questions;
+pub(crate) mod queue_events;
 mod runtime;
 mod session;
 pub mod state;
@@ -389,6 +391,8 @@ pub struct App {
         HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     pub(crate) input_writes: input_writes::InputWrites,
     pub(crate) structured_workers: crate::structured::workers::Workers,
+    queue_events: queue_events::QueueEvents,
+    pub(crate) structured_sends: api::structured_queue::Sends,
     pub render_notify: Arc<Notify>,
     pub render_dirty: Arc<AtomicBool>,
     pub(crate) full_redraw_pending: bool,
@@ -1145,6 +1149,8 @@ impl App {
             last_terminal_size: terminal::size().ok(),
             input_writes: input_writes::InputWrites::default(),
             structured_workers: crate::structured::workers::Workers::new(render_notify.clone()),
+            queue_events: queue_events::QueueEvents::default(),
+            structured_sends: api::structured_queue::Sends::default(),
             render_notify,
             render_dirty,
             full_redraw_pending: false,
@@ -1937,6 +1943,12 @@ impl App {
             diagnostics.push("security.agent_account changed: restart the server to apply socket account policy; keeping current policy".into());
         }
 
+        if !invalid_section("sessions")
+            && config.sessions.queue_rewrite_bytes != self.state.config.sessions.queue_rewrite_bytes
+        {
+            diagnostics.push("sessions.queue_rewrite_bytes changed: restart required to apply the worker queue policy; keeping current threshold".into());
+        }
+
         // ADR-0041 decision 4: server reload cannot renegotiate MCP sessions.
         if !invalid_section("msg")
             && crate::mcp::channel::ChannelOptions::from_config(&config.msg)
@@ -2414,6 +2426,55 @@ mod tests {
             scroll: 0,
             preview: true,
         }
+    }
+
+    #[test]
+    fn security2384_enum_env_reload_diagnostics_do_not_echo_values() {
+        let _guard = config_env_guard();
+        struct RestorePath(Option<std::ffi::OsString>);
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+                    None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+                }
+            }
+        }
+        let _restore = RestorePath(std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR));
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        let mut app = test_app();
+        let original_ui = app.state.config.ui.tab_mode;
+        let probe = "CONFIG2384_ENUM_PRIVATE_7c39_never_echo_this_value";
+        std::env::set_var("FLOCK_UI_TAB_MODE", probe);
+        let mut returned = Vec::new();
+        let logs = crate::logging::capture_logs(|| {
+            let loaded = crate::config::load_live_config().unwrap();
+            returned.extend(loaded.diagnostics.clone());
+            let report = app.apply_config_from_disk(false);
+            assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+            returned.extend(report.diagnostics);
+        });
+        assert_eq!(app.state.config.ui.tab_mode, original_ui);
+        assert!(returned.iter().any(|d| d.contains("ui.tab_mode")
+            && d.contains("environment")
+            && d.contains("expected")));
+        assert!(!returned.is_empty());
+        assert!(
+            !returned.join(" ").contains(probe),
+            "returned diagnostics leaked enum value"
+        );
+        assert!(!logs.contains(probe), "logs leaked enum value");
+        assert!(!app
+            .state
+            .config_diagnostic
+            .as_deref()
+            .unwrap_or_default()
+            .contains(probe));
     }
 
     fn test_app() -> App {
@@ -3201,6 +3262,31 @@ mod tests {
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
         assert_eq!(report.diagnostics, ["invalid msg section"]);
         assert!(!app.state.config.msg.channel_push);
+    }
+
+    #[test]
+    fn queue_threshold_reload_reports_restart_required_and_keeps_worker_policy() {
+        let mut app = test_app();
+        let old = app.state.config.sessions.queue_rewrite_bytes;
+        let mut incoming = app.state.config.clone();
+        incoming.sessions.queue_rewrite_bytes = std::num::NonZeroU64::new(old.get() + 1).unwrap();
+        let report = app.apply_live_config(&incoming, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message
+                .contains("sessions.queue_rewrite_bytes changed: restart required")));
+        assert_eq!(app.state.config.sessions.queue_rewrite_bytes, old);
+        assert_eq!(
+            app.state.config_diagnostic.as_deref(),
+            Some(report.diagnostics[0].as_str())
+        );
+        let same = app.state.config.clone();
+        assert_eq!(
+            app.apply_live_config(&same, &[], &[], false).status,
+            crate::config::ConfigReloadStatus::Applied
+        );
     }
 
     #[test]

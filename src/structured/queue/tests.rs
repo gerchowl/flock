@@ -50,7 +50,7 @@ impl Drop for Root {
         fs::remove_dir_all(&self.0).unwrap();
     }
 }
-fn item(id: &str) -> Item {
+pub(crate) fn item(id: &str) -> Item {
     Item {
         item_id: id.into(),
         producer: Producer::Human,
@@ -1389,3 +1389,153 @@ fn assert_first_corruption(first: &[u8], reason: &'static str, seq: Option<u64>)
 }
 
 mod policy;
+
+#[test]
+fn queue_global_facts_only_capture_committed_state_transitions() {
+    use crate::api::queue_event::QueueState;
+    let root = Root::new();
+    let mut j = root.open();
+    let mut a = item("a");
+    a.producer = Producer::Agent("sender-fixture".into());
+    j.append(Change::Upsert {
+        item: Box::new(a.clone()),
+        position: 0,
+    })
+    .unwrap();
+    a.body = "edited".into();
+    j.append(Change::Upsert {
+        item: Box::new(a.clone()),
+        position: 0,
+    })
+    .unwrap();
+    j.append(upsert("b", 1)).unwrap();
+    j.append(Change::Upsert {
+        item: Box::new(a.clone()),
+        position: 1,
+    })
+    .unwrap();
+    j.checkpoint().unwrap();
+    assert!(
+        j.take_facts().is_empty(),
+        "add/edit/reorder/checkpoint are not facts"
+    );
+    a.state = State::Delivered;
+    a.metadata.insert(
+        "batch_id".into(),
+        json!("00000000-0000-4000-8000-000000000001"),
+    );
+    let line = j
+        .append(Change::Upsert {
+            item: Box::new(a),
+            position: 1,
+        })
+        .unwrap();
+    let facts = j.take_facts();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(
+        (facts[0].from, facts[0].to),
+        (QueueState::Queued, QueueState::Delivered)
+    );
+    assert_eq!(facts[0].producer, Producer::Agent("sender-fixture".into()));
+    assert_eq!(facts[0].stream, "queue/fixture-agent");
+    assert_eq!(facts[0].stream_seq, line.seq);
+    assert!(facts[0].batch_id.is_some());
+    assert!(j.take_facts().is_empty(), "completion owns each fact once");
+    j.append(Change::Remove {
+        item_id: "a".into(),
+    })
+    .unwrap();
+    assert!(j.take_facts().is_empty());
+}
+
+#[test]
+fn queue_global_facts_keep_original_transition_sequences_across_rewrite() {
+    use crate::api::queue_event::QueueState;
+    let root = Root::new();
+    let mut j = root.open();
+    j.append(upsert("a", 0)).unwrap();
+    let mut a = item("a");
+    a.state = State::Delivered;
+    let delivered = j
+        .append(Change::Upsert {
+            item: Box::new(a.clone()),
+            position: 0,
+        })
+        .unwrap()
+        .seq;
+    a.state = State::Done;
+    let done = j
+        .append(Change::Upsert {
+            item: Box::new(a.clone()),
+            position: 0,
+        })
+        .unwrap()
+        .seq;
+    let checkpoint = j.checkpoint().unwrap();
+    a.state = State::Held;
+    let held = j
+        .append(Change::Upsert {
+            item: Box::new(a),
+            position: 0,
+        })
+        .unwrap()
+        .seq;
+    let facts = j.take_facts();
+    assert_eq!(
+        facts.iter().map(|f| f.stream_seq).collect::<Vec<_>>(),
+        [delivered, done, held]
+    );
+    assert_eq!(
+        facts.iter().map(|f| f.to).collect::<Vec<_>>(),
+        [QueueState::Delivered, QueueState::Done, QueueState::Held]
+    );
+    assert!(checkpoint.through > done);
+    assert!(j
+        .replay(0)
+        .unwrap()
+        .records
+        .iter()
+        .all(|v| v["seq"] != delivered));
+    drop(j);
+    let mut reopened = root.open();
+    assert!(
+        reopened.take_facts().is_empty(),
+        "loading snapshots must not invent transitions"
+    );
+    assert_eq!(reopened.replay(0).unwrap().through, held);
+}
+
+#[test]
+fn queue_global_facts_never_publish_failed_write_or_sync() {
+    for fail_sync in [false, true] {
+        let root = Root::new();
+        let mut j = root.open();
+        j.append(upsert("a", 0)).unwrap();
+        let mut a = item("a");
+        a.state = State::Delivered;
+        j.append(Change::Upsert {
+            item: Box::new(a.clone()),
+            position: 0,
+        })
+        .unwrap();
+        assert_eq!(j.take_facts().len(), 1);
+        let peer = if fail_sync {
+            let (file, peer) = socket_file();
+            j.file = file;
+            Some(peer)
+        } else {
+            j.file = File::open(root.path()).unwrap();
+            None
+        };
+        a.state = State::Done;
+        assert!(j
+            .append(Change::Upsert {
+                item: Box::new(a),
+                position: 0
+            })
+            .is_err());
+        assert!(j.take_facts().is_empty());
+        assert_eq!(j.items()[0].state, State::Delivered);
+        drop(peer);
+    }
+}

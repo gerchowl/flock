@@ -6,9 +6,10 @@
 //! A failed write/sync/rename poisons the handle: reopen under the lease to learn
 //! which bytes committed. No success or in-memory change precedes durability.
 //! Optional configured checkpoint policy is available through open_with_policy.
-//! Production worker/event-loop wiring belongs to #1955 under #1803.
+//! The worker exposes committed cuts and transitions through one completion owner.
 #![deny(missing_docs)]
 pub(crate) mod admission;
+mod facts;
 pub mod model;
 mod policy;
 pub use policy::RewritePolicy;
@@ -31,7 +32,7 @@ pub const FORMAT_VERSION: u64 = 2;
 const LINE_LIMIT: u64 = 2 * 1024 * 1024;
 
 /// Snapshot gap followed inline by the retained records (ADR-0036 §4).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Gap {
     /// Requested cursor plus one.
     pub from: u64,
@@ -41,7 +42,7 @@ pub struct Gap {
     pub snapshot_to: u64,
 }
 /// Immutable replay cut; subsequent mutations cannot interleave its records.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Cut {
     /// Present when the requested history was replaced by a checkpoint.
     pub gap: Option<Gap>,
@@ -57,6 +58,7 @@ pub struct Journal {
     directory: File,
     file: File,
     items: Vec<Item>,
+    facts: Vec<crate::api::queue_event::QueueItemState>,
     records: Vec<Value>,
     seq: u64,
     checkpoint: Option<(u64, u64)>,
@@ -115,9 +117,14 @@ impl Journal {
     /// Unknown data are logged and preserved raw, never interpreted for delivery.
     /// Only a supported journal's unterminated final tail is repaired.
     pub fn open(data: &Path, agent: &str) -> io::Result<Self> {
-        Self::open_inner(data, agent, None)
+        Self::open_inner(data, agent, None, true)
     }
-    fn open_inner(data: &Path, agent: &str, rewrite: Option<RewritePolicy>) -> io::Result<Self> {
+    fn open_inner(
+        data: &Path,
+        agent: &str,
+        rewrite: Option<RewritePolicy>,
+        create: bool,
+    ) -> io::Result<Self> {
         if agent.is_empty()
             || !agent
                 .bytes()
@@ -127,7 +134,17 @@ impl Journal {
         }
         let root = data.canonicalize()?;
         let sessions = root.join("sessions");
-        private_fs::ensure_private_dir(&sessions)?;
+        let directory = if create {
+            private_fs::ensure_private_dir
+        } else {
+            private_fs::check_private_dir
+        };
+        let open = if create {
+            open_file
+        } else {
+            private_fs::open_append_file
+        };
+        directory(&sessions)?;
         let component: String = agent
             .chars()
             .map(|c| {
@@ -139,14 +156,14 @@ impl Journal {
             })
             .collect();
         let dir = sessions.join(component);
-        private_fs::ensure_private_dir(&dir)?;
-        let lease = open_file(&dir.join(".queue.lock"))?;
+        directory(&dir)?;
+        let lease = open(&dir.join(".queue.lock"))?;
         lease.try_lock().map_err(|error| match error {
             fs::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
             fs::TryLockError::Error(error) => error,
         })?;
         let path = dir.join("queue.jsonl");
-        let file = open_file(&path)?;
+        let file = open(&path)?;
         for path in [&root, &sessions, &dir] {
             File::open(path)?.sync_all()?;
         }
@@ -156,6 +173,7 @@ impl Journal {
             directory: File::open(dir)?,
             file,
             items: Vec::new(),
+            facts: Vec::new(),
             records: Vec::new(),
             seq: 0,
             checkpoint: None,
@@ -278,6 +296,12 @@ impl Journal {
             this.file.write_all(&bytes)?;
             this.file.sync_data()
         })?;
+        self.facts.extend(facts::transitions(
+            &self.agent,
+            &self.items,
+            &items,
+            record.seq,
+        ));
         self.items = items;
         track_opaque(
             &record.change,
@@ -288,6 +312,14 @@ impl Journal {
         self.seq = record.seq;
         self.records.push(value);
         Ok(record)
+    }
+    /// Persist the first subscription's snapshot before serving it. Read-only
+    /// storage returns its typed refusal without claiming a bootstrap succeeded.
+    pub(crate) fn subscription(&mut self) -> io::Result<Cut> {
+        if self.checkpoint.is_none() {
+            self.checkpoint()?;
+        }
+        self.replay(0)
     }
     /// Capture replay under the writer's serialization point. New/empty queues
     /// publish an empty gap; a checkpoint gap always includes snapshot_to.

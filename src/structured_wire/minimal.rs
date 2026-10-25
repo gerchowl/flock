@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::structured::fleet_lite::wire::{FleetAgentRow, FleetDelta};
 
+pub use crate::api::schema::AgentSendResult;
+
 /// Successful agent.decide ack result, echoing the applied answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -73,6 +75,14 @@ mod tests {
     fn state(phase: &str) -> Value {
         serde_json::to_value(serde_json::from_value::<AgentState>(json!({"phase":phase})).unwrap())
             .unwrap()
+    }
+
+    #[test]
+    fn structured_send_result_is_the_lifecycle_identity_contract() {
+        let value = json!({"item_id":"00000000-0000-4000-8000-000000001107"});
+        let result: crate::structured_wire::AgentSendResult =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap(), value);
     }
 
     #[test]
@@ -232,6 +242,16 @@ mod tests {
         let row = std::fs::read_to_string(root.join("FleetAgentRow.ts")).unwrap();
         assert!(row.contains("state: AgentState,"));
         assert!(row.contains("activity?: string,"));
+        assert!(row.contains("route?: Route,"));
+        let route = std::fs::read_to_string(root.join("Route.ts")).unwrap();
+        for field in [
+            "node: string",
+            "name: string",
+            "next_hop: string",
+            "hops: number",
+        ] {
+            assert!(route.contains(field), "{route}");
+        }
         assert!(row.contains("waiting_on_human: Array<string>,"));
         let request = std::fs::read_to_string(root.join("AgentDecide.ts")).unwrap();
         assert!(request.contains("message?: string,"));

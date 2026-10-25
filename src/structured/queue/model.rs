@@ -43,13 +43,13 @@ pub enum Kind {
     Message,
     /// Answer to a question.
     Reply,
-    /// Delegate completion.
+    /// Reserved structured delegate completion/receipt producer ([#2419](https://github.com/gerchowl/flock/issues/2419)).
     DelegateResult,
     /// Registered wait wakeup.
     Wake,
-    /// Runtime reload notice.
+    /// Reserved S11 runtime reload-notice producer ([#2420](https://github.com/gerchowl/flock/issues/2420)).
     ReloadNotice,
-    /// Fork finding.
+    /// Reserved S13 fork-return finding producer ([#2365](https://github.com/gerchowl/flock/issues/2365)).
     Finding,
     /// Isolated harness command.
     Command,
@@ -193,7 +193,7 @@ deserialize_named_enum!(Delivery { AtIdle => "at_idle", Steer => "steer", Interr
 /// optional fields across an older writer's checkpoint without interpreting them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
-    /// Server-minted message UUID.
+    /// Canonical lifecycle UUID, stable across admission retries.
     pub item_id: String,
     /// Trusted origin.
     pub producer: Producer,
@@ -230,7 +230,7 @@ pub enum Change {
         /// Final zero-based queue position.
         position: usize,
     },
-    /// Fail an unbounded existing item without rewriting its oversized payload.
+    /// Permanently refuse a retained item without rewriting its payload.
     Fail {
         /// Existing identity whose position and body remain unchanged.
         item_id: String,
@@ -298,6 +298,7 @@ impl Change {
                     .find(|item| &item.item_id == item_id)
                     .ok_or_else(|| std::io::Error::other("failed item does not exist"))?;
                 item.state = State::Failed;
+                item.metadata.remove("awaiting_result");
                 item.metadata
                     .insert("refusal".into(), Value::String(reason.clone()));
                 return Ok(());
