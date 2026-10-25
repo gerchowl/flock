@@ -687,6 +687,107 @@ An **artifact** is agent-authored content that a person looks at and answers: an
   - Comments and confirmed interactive posts go through the **queue** (ADR-0036 §3) as input items. They are unsolicited information the agent should take at its next idle point, and the queue's gate and FIFO rules already apply.
   - Answers to a feedback request go through the **question** path (`inbox.answer`). They resolve something the agent asked, possibly while blocked, and need the atomic verify-then-apply.
 
+### 7a. Artifact lifecycle: nothing piles up (#1598, owner decision 17)
+
+**Lifetimes.** `flock_artifact_publish` gains `lifetime?: "session" | "persistent"`, **default `session`**.
+- **A `session` artifact** ends with the publishing agent's identity: when the agent is stopped, or its identity is replaced (ADR-0028 §8a). A restart or compaction does not end it.
+- **A `persistent` artifact** is kept until it has been idle for `[artifacts] idle_ttl` (ADR-0041; default 14 days). Idle time counts from the last view, comment or answer.
+- **What keeps a session artifact alive past its session.** A person can pin it (below). An open question whose `about` is the artifact holds it until the question closes. When either ends, the artifact follows the persistent rule.
+
+**Quotas.** `[artifacts] quota_bytes_per_agent` (default 64 MiB) and `quota_bytes_total` (default 1 GiB) count every stored version.
+- A publish that would exceed a quota first evicts the **oldest idle, unpinned** versions.
+- If only pinned or held versions remain, the publish is refused with `artifact_quota_exceeded` (retry `never`). The agent is told; nothing is evicted silently beyond the rule.
+
+**Pinning.**
+- A person pins or unpins an artifact through a client token with `answer` or `operate` scope, or through the local CLI. This is recorded as `artifact.pinned` / `artifact.unpinned`.
+- A pinned artifact is never evicted and never expires. Only an explicit operator purge removes it.
+- Agents cannot pin.
+
+**Purge is a record, not a hole.**
+- Every removal writes `artifact.purged { artifact_id, version?, reason: idle | session_end | quota | operator | blob_missing }`.
+- The records, comments and questions stay. The tile shows "content expired" in place of the frame. An open question about a purged artifact stays open and answerable; its card says the content expired.
+- A blob that is missing for any reason (§7c) reads as `blob_missing` the same way.
+
+### 7b. Question sets inside an artifact (#1599, owner decision 17)
+
+`flock_artifact_request_feedback` generalises `choices?` into a **typed question set**. `choices?` stays, as shorthand for one single-choice question.
+
+```
+questions: [{
+  id,                                   // stable within the set
+  prompt,
+  kind: "single" | "multi" | "free",
+  options?: [{ id, label }],            // single and multi only
+  other?: bool,                         // single and multi: adds a free-form "other"
+  anchor?: Anchor,                      // §7d: the block or text the question is about
+}]
+blocking?: bool                         // for the set as a whole
+```
+
+**One question, one record.**
+- Each question in the set is one ADR-0036 §2a question record. Its `about` is `{ artifact_id, version, set_id, question_id, anchor? }`. That is a new `about` shape for the backend to type; the question machinery itself is unchanged.
+- Routing (ADR-0034), answer authority (§5b), `question_closed` and "exactly one reply" all apply per question.
+
+**Answers keep the main context lean.**
+- Each answered question queues **its own** `reply` item at once, so a long set does not arrive as one large message.
+- A **blocking** set releases the asker when its last question is answered.
+- An "other" answer is free text within the question's answer limit.
+
+**Comments and threads on each question.**
+- **A comment thread** can sit on any question or option. It is an `artifact.comment` whose anchor names `question_id` and, optionally, `option_id`, and it is queued to the agent as §7's comments are.
+- **Threads.** Any question can be taken as a **thread** through §5b unchanged:
+  - the asker is forked at the question;
+  - the person discusses it with the fork;
+  - only the fork's final proposal comes back, and it is applied after review (owner decision 12).
+- That is the "fork and chat with an ultimate final reply" the owner asked for, per question. The main agent sees one answer, not the discussion.
+
+**Rendering.** The question set is drawn by the **client**, in trusted chrome beside the frame, not inside the untrusted frame. An artifact cannot draw its own answer buttons, which keeps the phishing defence of the failure modes.
+
+### 7c. Blob storage backend (pointer)
+
+The blob store is a configured backend behind one trait: `[blobs] backend`, defaulting to a per-session temp directory that is removed with the session. That is ADR-0036 §4 / S3b #1426 and ADR-0041 `[blobs]`, owned by the server.
+
+What the GUI relies on:
+- records carry only the hash and size, and their shape never depends on the backend;
+- a blob that is gone reads as `artifact.purged { reason: blob_missing }` (§7a).
+
+### 7d. Text-range anchors (#1599, owner decision 17)
+
+Comments and questions anchor to a block, or to text inside it:
+
+```
+Anchor = {
+  block_id,                                             // data-block-id, ADR-0036 §12 item 2
+  quote?: { exact, prefix?, suffix? },                  // W3C Web Annotation TextQuoteSelector
+  position?: { start, end },                            // character offsets in the block's text, a hint only
+}
+```
+
+- **Selecting.** The client computes the anchor from the person's selection. It takes up to 32 characters of prefix and suffix, enough to make the quote unique in the block.
+- **Re-anchoring across versions.** When a newer version is shown, the client maps each older anchor:
+  1. **Re-anchored.** The same `block_id` still exists and `exact` occurs in it. Pick the occurrence that best matches `prefix`/`suffix`, then the nearest to `position`.
+  2. **Detached (text).** The block exists but the quote is gone. The comment attaches to the block, marked "text changed".
+  3. **Detached.** The block is gone. The comment is listed beside the frame with its quoted text.
+- **The server keeps the original anchor and its version and never rewrites them.** Re-anchoring is a view, recomputed per version.
+
+### 7e. Network for artifacts: default deny now, the grant shape fixed now (#1599, owner decision 17)
+
+`connect-src 'none'` stays the default for every artifact, interactive or not. Live data later must not need a new security model, so its shape is fixed now.
+
+- **Declared capabilities.**
+  - Only an interactive artifact may declare `capabilities?` at publish. The declaration is part of the version and is shown under its badge.
+  - v1 defines one kind: `{ kind: "flock_stream", stream, access: "read" }`, a read-only subscription to a named flock stream that the viewer could open anyway.
+  - External origins are a later kind, served by a server proxy with a per-artifact scoped token. They are not defined yet.
+- **Grants are per person, per artifact, per version.**
+  - A person grants a declared capability through a client token with `operate` scope. This is recorded as `artifact.granted { artifact_id, version, capability, by, at }`, and revoked as `artifact.grant_revoked`.
+  - A new version needs a new grant, because what the code does may have changed.
+- **The only channel is parent-brokered.**
+  - The frame posts `{ type: "flock.rpc", id, capability, request }`.
+  - The parent identifies the frame by `event.source` (§7), checks the declaration and the grant, and does the work itself over its existing `/v1/ws` session. It answers with `{ type: "flock.rpc.result", id, ok | error }`.
+  - **The frame never receives the `/v1` token or any credential,** and its CSP keeps `connect-src 'none'` even when a grant exists. All data arrives by postMessage, so there is no ambient network and no way to the listener (see the `Origin: null` rule in §6).
+- **Refusals** are typed: `capability_not_declared`, `capability_not_granted`, `capability_unsupported`, `rpc_too_large`. A refused call is never retried by the parent.
+- **G6/G7 ship default deny only.** Every `flock.rpc` is answered `capability_unsupported`. Tests prove an artifact cannot reach the network or the listener, with or without a declaration. The grant record and the broker land with the live-data slice.
+
 ### 8. Goals and work
 
 - **Phase 1** (read-only, no new records). The `work` stream is a projection the server computes from:
@@ -751,7 +852,7 @@ The first end-to-end milestone is **"a structured agent in a browser tile"**: G1
 
 ### 11. Owner decisions (decided by the owner, 2026-10-16, recorded on #1591)
 
-Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day. Item 11 was added on 2026-10-17, when the owner chose between two wireframe directions after rejecting the first preview. Items 12–14 were added on 2026-10-18 with §5b (#1717) and decided by the owner on 2026-10-19 (recorded on #1717). Item 15 was added and decided by the owner on 2026-10-19 (recorded on #1717).
+Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day. Item 11 was added on 2026-10-17, when the owner chose between two wireframe directions after rejecting the first preview. Items 12–14 were added on 2026-10-18 with §5b (#1717) and decided by the owner on 2026-10-19 (recorded on #1717). Item 15 was added and decided by the owner on 2026-10-19 (recorded on #1717). Item 17 records the owner's typed artifact requirements of 2026-10-25 (on #1598).
 
 | # | Decision | Outcome | Consequence |
 |---|---|---|---|
@@ -770,6 +871,7 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 | 13 | What happens to a thread's fork after the merge-back? (§5b) | **Decided: yes** ("stop fork but keep transcript"). The fork is stopped, and its transcript is kept in the lineage (the `AgentForked` edge); the sidebar folds ended threads. | Stored transcripts, and lineage rows to fold. No retention limit is stated yet: ADR-0036 S16 owns it. A rehydrated copy is deleted when the fork ends either way (ADR-0036 owner decision 14). |
 | 14 | A thread fork's tools (§5b) | **Decided: read-only now, through the general machinery** ("machinery first … but with read only as per now"). The fork runs under ADR-0036 S19's permission tiers (#1321) with a read-only tier, never a thread-specific flag. | A fork that would have to run a command to answer must say so in its proposal. Widening is #1321's follow-up: tiers selectable per model, and a fork that requests more, which the person grants. |
 | 15 | Does S6e retake ADR-0036 owner decision 3a, so that the asker decides blocking, with a reason, instead of S6d's System-One check? (§5b decision 5) | **Decided: yes** (the owner typed "y" on 2026-10-19, recorded on #1717), following the owner's #1717 words "not vlocking [sic] unless there is literally nothing else to work on". | The server stops catching a wrongly held or wrongly continued turn, and an agent that over-uses `blocking: true` only costs itself and puts its card first. S6d no longer holds a turn; any later use of its check is advisory only (the backend ruling on #1717). |
+| 17 | Artifact lifecycle, question sets, blob backend, anchors and network (§7a–§7e; added 2026-10-25, recorded on #1598) | **Decided: these requirements**, typed by the owner, scheduled after the `-p` MVP: purge handling so that artifacts do not pile up; questions of several types inside an artifact, each with comments and its own fork-and-merge-back thread; a configurable blob backend, defaulting to temp-folder sessions; comments on blocks and text; network access "if wanted" for live data, a "future feature, but get framework correct for it already now". | §7a–§7e give the design. The defaults (`session` lifetime, the quotas, the 14-day idle TTL) are proposals that the review may change. The server owns the blob trait, the lifecycle records and the grant record. |
 
 ## Failure modes and known limits
 
