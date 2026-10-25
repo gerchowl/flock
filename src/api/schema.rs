@@ -2727,6 +2727,8 @@ pub enum EventMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
+    /// ADR-0036 §4: committed queue item transition, linked to its queue cursor.
+    QueueItemState,
     MeshRoutesChanged,
     MeshOutboundPending,
     WorkspaceCreated,
@@ -2860,7 +2862,8 @@ impl EventKind {
     /// story; every lifecycle + lineage kind persists.
     pub fn is_persisted(self) -> bool {
         match self {
-            Self::WorkspaceCreated
+            Self::QueueItemState
+            | Self::WorkspaceCreated
             | Self::WorkspaceUpdated
             | Self::WorkspaceClosed
             | Self::WorkspaceRenamed
@@ -4366,6 +4369,8 @@ pub struct AgentPhaseEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
+    /// ADR-0036 §4: only state changes, never adds, edits or checkpoints.
+    QueueItemState(crate::api::queue_event::QueueItemState),
     MeshRoutesChanged {},
     MeshOutboundPending {},
     WorkspaceCreated {

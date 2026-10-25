@@ -45,6 +45,9 @@ struct Live {
     refusal: Option<ErrorCode>,
     ended: bool,
 }
+/// RawMutex is an intentional lock-witness seam: tests exercise this same
+/// registration implementation at each reader unlock. Production uses the
+/// default native mutex; the seam adds no alternate registration path.
 struct Book<R: parking_lot::lock_api::RawMutex = parking_lot::RawMutex> {
     retained: Arc<Cut>,
     bootstrapped: bool,
@@ -317,12 +320,13 @@ impl Publisher {
         &mut self,
         snapshot: impl FnOnce() -> Result<Cut, Failure>,
         status: Option<Pending>,
-    ) {
+    ) -> bool {
         let Ok(Capture(after, live)) = self.1.try_recv() else {
-            return;
+            return false;
         };
         capture_locked(&self.0 .1, Capture(after, live), snapshot, status);
         self.0 .2.notify_waiters();
+        true
     }
     pub fn finish(
         &mut self,
