@@ -2,10 +2,11 @@
 //! The HTTP endpoint exists only in web-enabled builds; both CI legs enable it.
 #![cfg(feature = "web")]
 
+mod support;
+
 #[test]
-#[allow(clippy::disallowed_methods)] // The bounded Python supervisor supplies the full isolated environment.
 fn s7_public_server_browser_dogfood_and_causal_controls() {
-    let output = std::process::Command::new("python3")
+    let output = support::environment::Command::new("python3")
         .arg("-I")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
