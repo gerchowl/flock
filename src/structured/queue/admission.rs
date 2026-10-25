@@ -11,6 +11,25 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io;
 
+impl crate::structured::permissions::Principal<'_> {
+    /// Admission authority from authenticated dispatcher context (ADR-0036 §3).
+    /// Claimed producer names are never accepted as operator capabilities.
+    pub(crate) fn queue_origin(
+        &self,
+    ) -> Result<crate::structured::queue::admission::Principal, crate::api::error_code::ErrorCode>
+    {
+        use crate::structured::queue::{admission::Principal as QueuePrincipal, model::Producer};
+        match self {
+            Self::Operator => Ok(QueuePrincipal::Operator),
+            Self::Token(_) if self.decision_subject().is_ok() => Ok(QueuePrincipal::Operator),
+            Self::Agent(id) | Self::Lease(id) if !id.is_empty() => {
+                Ok(QueuePrincipal::Origin(Producer::Agent((*id).into())))
+            }
+            _ => Err(crate::api::error_code::ErrorCode::NotAuthorized),
+        }
+    }
+}
+
 type Entropy<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>;
 
 /// One persisted admission decision; no automatic re-gating exists.
@@ -110,6 +129,7 @@ impl Admission {
         gate: Gate,
     ) -> Result<(), Failure> {
         self.journal.writable()?;
+        validate_kind(&item.kind)?;
         if item.delivery != Delivery::AtIdle || item.priority != Priority::Normal {
             return Err(refuse(ErrorCode::QueueModeUnsupported));
         }
@@ -197,6 +217,13 @@ impl Admission {
         })?;
         Ok(())
     }
+    /// Settle one retained item without rewriting its body or changing identity.
+    pub(super) fn fail_item(&mut self, item_id: String, reason: ErrorCode) -> Result<(), Failure> {
+        self.commit(Change::Fail {
+            item_id,
+            reason: reason.as_str().into(),
+        })
+    }
     fn eligible(&self, item: &Item, now_ms: u64) -> bool {
         !self.journal.opaque.contains(&item.item_id)
             && item.state == State::Queued
@@ -260,7 +287,9 @@ impl Admission {
                     Err(error)
                         if matches!(
                             error.code,
-                            ErrorCode::InvalidRequest | ErrorCode::QueueItemTooLarge
+                            ErrorCode::InvalidRequest
+                                | ErrorCode::QueueItemTooLarge
+                                | ErrorCode::QueueKindReserved
                         ) =>
                     {
                         error.code
@@ -351,7 +380,17 @@ impl Admission {
 }
 // Intake and edits share the same validation. Rendering repeats it so legacy
 // or otherwise malformed durable items are failed instead of wedging a worker.
+pub(super) fn validate_kind(kind: &Kind) -> Result<(), Failure> {
+    if matches!(
+        kind,
+        Kind::Finding | Kind::DelegateResult | Kind::ReloadNotice
+    ) {
+        return Err(refuse(ErrorCode::QueueKindReserved));
+    }
+    Ok(())
+}
 fn validate_content(item: &Item) -> Result<(), Failure> {
+    validate_kind(&item.kind)?;
     if !valid_id(&item.item_id)
         || (item.kind == Kind::Reply
             && metadata(item, "anchor")["question_id"]
@@ -415,8 +454,8 @@ fn nonce(
         }
     }
 }
-/// Allocate a lifecycle UUID using the same entropy and format as queue batches.
-pub(crate) fn item_uuid() -> Result<String, Failure> {
+/// Mint a queue lifecycle UUID using the same entropy source as batch identities.
+pub(crate) fn lifecycle_id() -> Result<String, Failure> {
     batch_uuid(&mut getrandom::fill)
 }
 fn batch_uuid(fill: Entropy<'_>) -> Result<String, Failure> {

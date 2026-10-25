@@ -57,6 +57,7 @@ pub fn project(agent: StructuredAgent<'_>) -> FleetAgentRow {
         state: agent.state.clone(),
         activity: agent.activity.map(str::to_owned),
         waiting_on_human: agent.waiting_on_human.to_vec(),
+        route: None,
     }
 }
 

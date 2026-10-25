@@ -21,9 +21,9 @@ pub(crate) struct AppQueue {
     pub(crate) app: App,
     pub(crate) case: Case,
     pub(crate) notify: Arc<Notify>,
-    pub(crate) driver: UnixStream,
-    pub(crate) hub: EventHub,
-    pub(crate) log: std::path::PathBuf,
+    pub(super) driver: UnixStream,
+    pub(super) hub: EventHub,
+    pub(super) log: std::path::PathBuf,
 }
 impl AppQueue {
     pub(crate) async fn new(n: u32, seed: impl FnOnce(&Case) -> NonZeroU64) -> Self {
@@ -93,9 +93,10 @@ impl AppQueue {
         })
         .await;
     }
-    pub(crate) fn facts(&self) -> Vec<(u64, QueueItemState)> {
+    pub(super) fn facts(&self) -> Vec<(u64, QueueItemState)> {
         self.hub
             .events_after(0)
+            .expect("fixture event history is retained")
             .into_iter()
             .filter_map(|(seq, e)| match e.data {
                 EventData::QueueItemState(fact) => Some((seq, fact)),
@@ -124,7 +125,7 @@ impl AppQueue {
 pub(crate) fn max_policy() -> NonZeroU64 {
     NonZeroU64::new(u64::MAX).unwrap()
 }
-pub(crate) fn id(n: u32) -> String {
+pub(super) fn id(n: u32) -> String {
     format!("00000000-0000-4000-8000-{n:012}")
 }
 
@@ -202,7 +203,12 @@ async fn queue_global_real_app_admission_publishes_only_lifecycle_and_provider_s
         .into_iter()
         .map(|(seq, _, e)| (seq, e))
         .collect::<Vec<_>>();
-    assert_eq!(replay, r.hub.events_after(0));
+    assert_eq!(
+        replay,
+        r.hub
+            .events_after(0)
+            .expect("fixture event history is retained")
+    );
     assert!(restarted.persisted_events_after(2).is_empty());
     assert!(replay
         .iter()

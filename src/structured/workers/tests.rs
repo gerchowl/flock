@@ -23,7 +23,7 @@ pub(crate) fn event(kind: &str) -> Value {
 pub(crate) struct Case {
     pub fixture: Arc<Fixture>,
     pub id: String,
-    pub(crate) session: String,
+    session: String,
     pub generation: u64,
     leases: SessionLeases,
 }
@@ -418,6 +418,7 @@ async fn explicit_stop_closes_open_request_and_releases_only_after_completion() 
     );
     assert!(
         hub.events_after(0)
+            .expect("fixture event history is retained")
             .iter()
             .any(|(_, event)| event.event == crate::api::schema::EventKind::QueueItemState),
         "committed exit fact must precede retirement"
@@ -1255,6 +1256,7 @@ async fn owner_lease_acquisition_retires_pending_without_double_counting() {
     assert_eq!(count_after, Ok((1, 1)));
 }
 
+mod queue;
 /// A new lease generation must preserve ancestry even when the operator resumes.
 #[tokio::test]
 async fn operator_resume_preserves_original_lease_lineage() {
@@ -1263,6 +1265,9 @@ async fn operator_resume_preserves_original_lease_lineage() {
     launch.lineage = Some(("original-parent".into(), 2));
     let template = Launch {
         opening_turn: None,
+        queue_rewrite_bytes: crate::config::Config::default()
+            .sessions
+            .queue_rewrite_bytes,
         agent_id: case.id.clone(),
         generation: case.generation,
         leases: case.leases.clone(),
@@ -1270,9 +1275,6 @@ async fn operator_resume_preserves_original_lease_lineage() {
         mcp: case.fixture.mcp(),
         storage: Default::default(),
         stall_after: STALL,
-        queue_rewrite_bytes: crate::config::Config::default()
-            .sessions
-            .queue_rewrite_bytes,
         lineage: None,
         admission: None,
     };
@@ -1327,7 +1329,6 @@ async fn finished_without_report_allows_retained_recovery() {
     worker.report = None;
     assert!(workers.history_recovery_allowed(&case.id));
 }
-mod queue;
 
 mod recovery;
 

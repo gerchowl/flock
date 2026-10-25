@@ -61,9 +61,9 @@ struct Client {
     revoke: watch::Sender<bool>,
 }
 struct Shared {
+    fleet: fleet::Client,
     histories: crate::structured::history::owner::Client,
     commands: commands::Client,
-    fleet: fleet::Client,
     store: Arc<TokenStore>,
     epoch: String,
     clock: Arc<dyn Clock>,
@@ -126,8 +126,8 @@ impl Core {
     ) -> io::Result<Self> {
         let epoch = store.random::<16>().map_err(io::Error::other)?;
         let (stop, _) = watch::channel(false);
-        let (commands, command_owner) = commands::channel(wake.clone());
         let fleet = fleet::Client::new(wake.clone(), stop.subscribe());
+        let (commands, command_owner) = commands::channel(wake.clone());
         let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
             owner,
@@ -164,17 +164,6 @@ impl Core {
     /// Admit commands on the same owner that services structured workers.
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
         self.command_owner.service(app);
-    }
-    /// Later dispatch calls after writing the triggering auth_revoked acknowledgement.
-    #[allow(dead_code)]
-    pub(crate) fn revoke(&self, session: &Session) {
-        if let Ok(clients) = self.shared.clients.lock() {
-            for client in clients.values() {
-                if client.session.info.principal == session.info.principal {
-                    let _ = client.revoke.send(true);
-                }
-            }
-        }
     }
     /// Cancel transport work and wait for every connection lease, including hello.
     pub(crate) async fn shutdown(&self) -> Result<(), tokio::time::error::Elapsed> {

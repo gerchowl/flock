@@ -36,8 +36,8 @@ pub(crate) use admission::Admission;
 
 /// Internal launch policy, supplied by authenticated admission in #1843.
 pub struct Launch {
-    /// Validated, nonce-framed MCP opening turn; CLI starts remain idle.
-    pub opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
+    /// Attested starter and validated, nonce-framed MCP opening turn; CLI starts stay idle.
+    pub opening_turn: Option<(String, crate::spawn::prompt::SpawnPrompt)>,
     /// Stable registered identity.
     pub agent_id: String,
     /// Current registry epoch; replaced atomically by a fresh launch epoch.
@@ -299,8 +299,7 @@ impl Workers {
                     };
                     let event_notify = notify.clone();
                     let event_wake = wake.clone();
-                    let mut input_failed = false;
-                    let result = runtime::run_controlled(
+                    runtime::run_controlled(
                         &state,
                         (profile, mcp),
                         lease,
@@ -308,14 +307,6 @@ impl Workers {
                         |runtime| {
                             if cancelled.requested() {
                                 runtime.stop();
-                            } else if let Some(prompt) = &opening_turn {
-                                let user = serde_json::json!({"type":"user", "message":{
-                                    "role":"user", "content":prompt.as_argv_element()},
-                                    "parent_tool_use_id":null,"session_id":""});
-                                if runtime.try_submit(&user).is_err() {
-                                    input_failed = true;
-                                    runtime.stop();
-                                }
                             }
                             let _ = tx.try_send(Message::Ready(Box::new(runtime)));
                             notify.notify_one();
@@ -328,14 +319,10 @@ impl Workers {
                         runtime::Control {
                             stop: cancelled.clone(),
                             queue_rewrite_bytes: Some(queue_rewrite_bytes),
+                            opening_turn,
                         },
                     )
-                    .map_err(|error| (error.code(), error.to_string()));
-                    if input_failed {
-                        Err((ErrorCode::AgentStartFailed, "opening turn refused".into()))
-                    } else {
-                        result
-                    }
+                    .map_err(|error| (error.code(), error.to_string()))
                 }))
                 .unwrap_or_else(|_| {
                     Err((
@@ -441,6 +428,7 @@ impl Workers {
             .ok_or(ErrorCode::AgentNotFound)?
             .queue_enqueue(request)
     }
+
     /// Consume an immutable completion/cut from the current generation only.
     /// Terminal cuts remain available after exit; drain before relaunch/removal.
     /// A cancelled notification report requires durable replay through #1956.
@@ -469,9 +457,14 @@ impl Workers {
         self.entries
             .iter()
             .flat_map(|(id, worker)| {
-                (0..budget)
+                let updates: Vec<_> = (0..budget)
                     .map_while(|_| worker.runtime.as_ref()?.queue_update())
                     .map(|update| (id.clone(), worker.generation, update))
+                    .collect();
+                if !terminal && updates.len() == budget {
+                    self.notify.notify_one();
+                }
+                updates
             })
             .collect()
     }
@@ -629,6 +622,7 @@ impl Workers {
             registry.get(id).is_some_and(|(_, _, g)| g == *generation)
         });
         // Keep committed completions after metadata removal; uncertain ownership survives.
+
         self.entries.retain(|id, worker| {
             worker.join_finished();
             worker.thread.is_some()

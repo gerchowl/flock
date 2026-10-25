@@ -9,7 +9,7 @@ contracts for the GUI and server work in #1746. The opt-in S7 endpoint serves
 identity, delivery and heartbeat machinery. This stream does not execute commands.
 
 `FleetAgentRow` contains `id`, `label`, `state`, optional `activity`, and required
-`waiting_on_human: string[]`. State is the shared S4 `AgentState` object: axes, derived phase and sources.
+`waiting_on_human: string[]`, plus optional `route`. State is the shared S4 `AgentState` object: axes, derived phase and sources.
 Its per-field `or_unknown` deserializers follow ADR-0028 §3a, so an unknown
 phase from a newer server becomes `unknown` while the other axes survive and
 the fleet delta remains usable. The waiting IDs identify permission requests on `agent/<id>`;
@@ -17,6 +17,21 @@ there is no separate inbox stream in S7-min. Rows represent structured agents.
 The server omits optional `activity` until the structured producer in
 [#2243](https://github.com/gerchowl/flock/issues/2243) lands.
 `waiting_on_human` contains only open, non-automatic harness permission request IDs.
+
+### Fleet node and route metadata
+
+`route?: Route` reuses mesh's existing `{node, name, next_hop, hops}` record
+(ADR-0026; ADR-0038 §9). `node` is the SHA-256 hex digest of the owning node's
+Ed25519 public key, as returned by mesh `NodeIdentity::node_id()`, not a host
+label. `name` is its display name; `next_hop` is the first hop's node ID and
+`hops` is the actual mesh path length. Route metadata is informational and grants no dialing or control authority.
+
+The current local structured-agent producer omits `route`; its JSON remains
+byte-identical to the earlier row shape. Readers accept rows without it, and
+older clients ignore the additive field. The generated GUI contract reserves it
+for federated projection; remote fleet rows and remote command forwarding remain
+out of scope until [#1380](https://github.com/gerchowl/flock/issues/1380).
+The current GUI still presents a local flat fleet. Mesh protocol VERSION stays 5.
 
 The `fleet` stream carries the closed `FleetDelta` union inside `ev`:
 
@@ -113,7 +128,12 @@ rows and checkpoints, but are dropped when a fresh projection changes the row.
 
 `agent.decide` takes `AgentDecide` arguments: `agent`, `request_id`, required `request_seq`, `decision`
 (`allow_once`, `allow_always` or `deny`), and optional `message`. Only a
-token-authenticated client principal can submit this command. The ack uses the
+token-authenticated client principal can submit this command. The optional message
+is normalized from CRLF to LF and trimmed, then limited to 2048 UTF-8 bytes
+(`MAX_PERMISSION_DECISION_MESSAGE_BYTES`). The `prompt_control_bytes` rules
+permit newlines and tabs and refuse other controls. Invalid messages return
+`invalid_params` before any reservation, grant, audit or harness input. Empty
+and absent messages are allowed. The ack uses the
 same envelope as `agent.send`, echoes `cmd_id`, and on success returns
 `AgentDecideResult`, echoing the applied request ID and decision:
 
@@ -123,7 +143,7 @@ same envelope as `agent.send`, echoes `cmd_id`, and on success returns
 
 Failures use `ok: false` and the existing `WireError` envelope without `result`.
 `AgentDecideErrorCode` names `permission_request_unknown`,
-`permission_request_closed` and `not_authorized`, with retry class `never`.
+`permission_request_closed`, `not_authorized` and `invalid_params`, with retry class `never`.
 These names are contracts for S6 (#1429) to register before serving them; this
 slice adds no API error registrations or authorization behavior.
 

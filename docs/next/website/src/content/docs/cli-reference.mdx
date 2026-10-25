@@ -9,6 +9,11 @@ Most commands print JSON responses. Use them from scripts when you want determin
 
 When an existing status ping, submission guard, or failed command reveals a different server protocol, the CLI prints one warning to stderr per invocation. Read-only commands add no status probe; a state-changing command adds one ping per invocation, cached for the rest of it (see below). Unknown-method errors from older-protocol servers become `server_version_gap`, with the server version, protocol, required client protocol, and recovery command: `flk server live-handoff` (or restart the server). Surfaced failures return **exit code 78**; optional lookups that consume the error preserve the command's successful exit. Equal or newer protocols retain the original API error. Every state-changing command (`delegate start` and `send`, `agent start`, `restart` and `send`, `pane send-*` and `submit`, `worktree create`, `msg send` and `reply`, and the rest) checks the server protocol before its first state-changing request and refuses an older server with `server flk X (protocol N) is incompatible with client flk Y (protocol M)` and exit 78, so nothing is half-created. That check costs one ping per invocation. Read-only commands, `flk status` and `flk server` (including `live-handoff` and `stop`) still reach an older server, since handing it off is the fix. Diagnosis probes have a 500 ms timeout and reuse a server identity already obtained during the invocation. An unavailable probe leaves the original error intact. MCP tools return the same skew message with `error.data.refusal: "server_version_gap"`.
 
+CLI text arguments must be valid UTF-8. Invalid encoding is refused before command
+execution with `invalid_params` and usage exit 2, rather than panicking. This early
+parse error prints on stderr before output-format selection. Native socket paths
+used by the internal handoff importer retain their original OS bytes.
+
 ## Exit codes
 
 `flk --help` lists every exit code, what it means and whether retrying is safe, from one registry (`src/cli/exit.rs`). Four cases moved in #1025, and for one release each prints `note: exit code is now N (was M); see CHANGELOG` on stderr when it returns its new code. stdout, `--json` output included, is unchanged.
@@ -650,6 +655,18 @@ flk events wait [--kinds K1,K2] [--subject ID]... [--after CURSOR] --timeout DUR
 
 `events read` prints one JSON line per event (`seq`, `event`, `data`), oldest first, and `next_after: N` on stderr; resume with `--after N` and dedupe on `seq`. `--json` prints the whole reply. A `gap` on stderr means the cursor is older than what the server still retains. `--kinds` takes durable kind names (`message_queued`, or `message.queued`); `--subject` matches an id the event's data carries as a top-level value (a pane, workspace, agent or message id). `events wait` prints the first matching event after `--after` (default: now) and exits 0, or exits 124 at `--timeout` (`500ms`, `5s`, `2m`). The wait is held on the server, not polled. Against a server without `events.read` both exit 78. Prefer `events wait` over a loop around `agent get`. While it is held, `events wait` is a registered wait: an agent running it (in the foreground or as a background task) reads `phase: waiting_on_event`. See [Registered waits](/socket-api/#registered-waits). To follow agents, wait on the derived kinds: `flk events wait --kinds agent.phase_changed --subject <agent id>`, or `agent.needs_human`, `agent.limit_reached` and `agent.gone` (see [Supervisor events](/docs/socket-api/#supervisor-events)). To catch a question dialog, wait on `agent.question_opened`; `agent.question_closed` follows it (see [Open questions](/docs/socket-api/#open-questions)).
 
+The socket streaming API starts live by default: a new `events.subscribe` does
+not replay retained events unless a cursor is supplied. Clients must check the
+`events_live_start` capability before sending distinct `after_sequence` requests
+and using structured `events_lost` notices. Legacy `after` and omitted cursors
+keep `lagged` notices. Stream events carry `seq` plus subscription identity. Resumable clients initialize
+a cursor for every filter from the acknowledgement's `start_sequence`, advance
+only the emitting filter, and reconnect from the minimum, including quiet filters. This does not change these CLI cursor defaults: `events
+read` still requests durable history from `--after` (default 0), and `events wait`
+starts at now unless `--after` is explicit. MCP `flock_events_read` keeps its
+explicit durable cursor (default 0). A streaming loss requires per-verb state
+reads to resync until `session.snapshot` (#2163) is available.
+
 Park yourself on a registered wait and end your turn:
 
 ```bash
@@ -913,6 +930,13 @@ Public structured starts use the same lease-bound MCP registration. It does not 
 
 ### Addressing across hosts
 
+For the GUI's S7 `fleet` subscription, `FleetAgentRow` has optional mesh
+`route` metadata containing the owning node ID and actual path
+(`{node, name, next_hop, hops}`). Local rows omit it. This pre-wires the
+[generated fleet contract](../structured-wire-minimal/#fleet-node-and-route-metadata)
+for ADR-0038 §9; remote row projection and command forwarding await
+[#1380](https://github.com/gerchowl/flock/issues/1380).
+
 A pane id names a placement on **one** server, so it cannot address anything on another machine. An `agent_id` can: it is fleet-global and restart-stable (ADR-0008), and it is what `flock_agent_list`'s `fleet` rows report alongside the `host` the agent lives on and a `local` flag.
 
 The two-step is the whole story:
@@ -1130,10 +1154,20 @@ richer question routing remain ADR-0036 S6 work (#1307).
 The server attests the caller and enforces spawn opt-in, pause, depth, fanout and
 capacity through the same owner admission. An unrelated MCP process cannot use
 operator authority to spawn. An opening prompt is validated and nonce-framed
-before it reaches stream stdin; it never becomes harness argv. Unknown restored
+before it reaches stream stdin; it never becomes harness argv. The queue owner
+commits the first item before Ready, with a lifecycle UUID, `Kind::Message` and
+`Producer::Agent` from the attested starter. The existing nonce frame is preserved
+inside the queue's message frame. CLI starts enqueue no opening item. Admission
+refusal reports the queue's typed code (otherwise `agent_start_failed`) before
+Ready or harness spawn, so no partial runtime remains. Startup failure after
+admission terminally settles the opening with `agent_start_failed`. Reopen fences
+an unresolved queued opening until that settlement commits, so operator resume
+cannot deliver the previous failed launch's prompt. Unknown restored
 records remain fenced. Resuming an existing record through CLI/socket is
 operator-only, even when an agent targets itself (`operator_only`, exit 13).
-Resume keeps the original parent and depth. MCP spawn cannot resume records;
+After cleanup, operator resume works for both idle CLI starts and MCP opening
+turns; publication drains the terminal queue completions. Resume keeps the
+original parent and depth. MCP spawn cannot resume records;
 mesh relays refuse structured start/spawn. Browser token scopes do not confer
 socket operator identity. The structured WebSocket command endpoint is not yet
 implemented (#1828/#1677). Scoped transport verifies the live lease on each request

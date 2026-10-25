@@ -975,6 +975,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
             id: "cli:agent:wait".into(),
             method: Method::EventsSubscribe(crate::api::schema::EventsSubscribeParams {
                 after: None,
+                after_sequence: None,
                 subscriptions,
             }),
         },

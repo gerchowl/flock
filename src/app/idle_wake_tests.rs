@@ -1562,7 +1562,7 @@ async fn delivery_attempt_disable_resets_tracker_and_digest_reports_uncertainty(
     let attempts = app.delivery_attempts();
     assert_eq!(attempts[0].state, "unconfirmed");
     assert_eq!(attempts[0].reason.as_deref(), Some("paste_written"));
-    let events = app.event_hub.events_after(0);
+    let events = app.event_hub.ring_snapshot_after(0);
     let digest = crate::digest::categorize(events.iter().map(|(seq, event)| (*seq, 0, event)));
     let row = digest
         .yellow
