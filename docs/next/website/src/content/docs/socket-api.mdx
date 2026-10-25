@@ -69,6 +69,22 @@ make a new advert older than its predecessor.
 relayed directory rows carry the owning node ID. Last-known agent owners are
 retained across restart as offline hints.
 
+`peers.summary` optionally includes `structured_agents` beside `workspaces`.
+Each row carries `agent_id`, `agent` (harness label), `status`, and
+`runtime: "structured"`; `pane_id` is absent because these identities have no
+pane placement. The list is omitted when empty and defaults to empty when
+reading older peers. Supporting hubs preserve it in their JSON `relayed_fleet`
+and `peers.hub_fleet` rows. Remote `agent.list.fleet` and MCP `flock_agent_list`
+include these identities with the same runtime tag and no `pane_id`.
+Address them by agent ID through ordinary `msg.send`; mesh delivery uses the
+native inbox and the existing reply wake path.
+
+This is additive JSON gossip under ADR-0008 identity/location separation.
+Mesh VERSION stays 5: older summary decoders ignore the field. Binary attach
+snapshots keep their existing format; live JSON gossip supplies the structured
+directory. An older peer or hub that does not export/forward the field cannot
+advertise these identities, so its absence is not evidence that none exist.
+
 `peers.enroll_reset { "peer": "<peer>", "source": "configured", "preview": true }`
 shows the affected pin. Repeat with `preview: false` and the returned `node_id`
 as `expected_node_id` to clear it and invalidate its enrollment. Source defaults

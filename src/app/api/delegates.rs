@@ -475,6 +475,7 @@ mod handler_tests {
                 peer: "hub.example".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: if relayed {

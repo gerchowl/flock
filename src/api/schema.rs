@@ -1173,6 +1173,7 @@ pub struct AgentRenameParams {
 /// Execution mode; omitted selectors preserve the terminal start contract.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum AgentRuntime {
     /// Traditional terminal-backed launch.
     #[default]
@@ -3205,6 +3206,9 @@ pub enum ResponseResult {
         /// status-line sampler (no extra sampling cost).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system: Option<PeerSystemSummary>,
+        /// Pane-free identities; optional for mixed-version fleets (mesh v5).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        structured_agents: Vec<PeerAgentSummary>,
         workspaces: Vec<PeerWorkspaceSummary>,
         /// Gossip v3 (#101): the answering server's OWN polled peers, so the
         /// polling hub can render two-hop fleet visibility (hub polls spoke2,
@@ -3894,7 +3898,9 @@ pub struct FleetAgentInfo {
     pub host: String,
     /// Public pane id **on that host**. A routing detail, not an address:
     /// meaningless as a `{"type":"pane"}` target unless `local` is true.
-    pub pane_id: String,
+    /// Absent for a pane-free structured identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
     /// `true` when the agent is on the server that answered. Only these are
     /// addressable by pane id; the rest need `agent_id`.
     pub local: bool,
@@ -3910,6 +3916,9 @@ pub struct FleetAgentInfo {
     /// convenience and does not travel with the gossip summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Pane-free remote agents report structured; older summaries omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<AgentRuntime>,
     pub status: AgentStatus,
     /// The agent's `state` (#1019). A local row carries the full record's
     /// value. A remote row is all `unknown`: the mesh summary carries no
@@ -5239,11 +5248,15 @@ pub struct PeerWorkspaceSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerAgentSummary {
     pub agent_id: String,
-    /// Public pane id on the owning server. A routing detail, not a name.
+    /// Public pane id on the owning server; absent for pane-free structured identities.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
+    /// Present for pane-free structured agents; legacy workspace rows omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<AgentRuntime>,
     pub status: AgentStatus,
 }
 
@@ -5301,6 +5314,9 @@ pub struct RelayedFleetPeer {
     pub system: Option<PeerSystemSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+    /// Pane-free agent directory, relayed unchanged by supporting peers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structured_agents: Vec<PeerAgentSummary>,
     #[serde(default)]
     pub workspaces: Vec<PeerWorkspaceSummary>,
     /// Seconds since the origin's last successful poll, at relay capture time.

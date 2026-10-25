@@ -535,6 +535,7 @@ impl App {
                     }
                     summary.latency_ms = Some(payload.latency_ms);
                     summary.workspaces = payload.workspaces;
+                    summary.structured_agents = payload.structured_agents;
                     summary.last_ok = Some(std::time::Instant::now());
                     summary.error = None;
                     if let crate::peers::DialLog::Recovered {
@@ -2028,6 +2029,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),
@@ -2189,6 +2191,7 @@ mod tests {
                 crate::peers::PeerSummaryFetch {
                     peer: "atlas".into(),
                     result: Ok(crate::peers::PeerSummaryPayload {
+                        structured_agents: Vec::new(),
                         node_id: None,
                         outbound_pending: false,
                         host: "atlas".into(),
@@ -2254,6 +2257,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),
@@ -3548,6 +3552,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: "kiln-host".into(),

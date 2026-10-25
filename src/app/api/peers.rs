@@ -42,6 +42,7 @@ impl App {
                 icon: configured_node_icon(),
                 system: self.state.system_stats.as_ref().map(system_summary),
                 workspaces: self.self_workspace_summaries(),
+                structured_agents: self.self_structured_summaries(),
                 // Gossip v3 (#101): relay this server's OWN polled peers only —
                 // never the cache we received via relay ourselves. That bounds
                 // hop count to one and precludes gossip loops.
@@ -264,6 +265,7 @@ impl App {
     pub(crate) fn hub_self_row(&self) -> RelayedFleetPeer {
         let us = short_host_name();
         RelayedFleetPeer {
+            structured_agents: self.self_structured_summaries(),
             node_id: self.node_id.clone(),
             name: us.clone(),
             // Never dialled by the spoke (hub-pushed rows are display-only),
@@ -294,6 +296,7 @@ impl App {
             .map(|peer| {
                 let age_secs = peer.last_ok.map(|at| at.elapsed().as_secs());
                 RelayedFleetPeer {
+                    structured_agents: peer.structured_agents.clone(),
                     // Gossip carries the ingress-validated report, not a local
                     // sidebar binding that could recreate a rejected claim.
                     node_id: peer.node_id.clone(),
@@ -390,6 +393,24 @@ impl App {
             ),
             Err(err) => encode_error(id, "checkout_prepare_failed", err),
         }
+    }
+
+    fn self_structured_summaries(&self) -> Vec<crate::api::schema::PeerAgentSummary> {
+        self.state
+            .structured_agents
+            .observations()
+            .map(
+                |(record, projection)| crate::api::schema::PeerAgentSummary {
+                    agent_id: record.agent_id.clone(),
+                    pane_id: String::new(),
+                    agent: Some(record.harness.clone()),
+                    status: super::structured_agents::structured_status(
+                        projection.update.state.phase,
+                    ),
+                    runtime: Some(crate::api::schema::AgentRuntime::Structured),
+                },
+            )
+            .collect()
     }
 
     /// This server's own workspaces in the federated summary shape — the same
@@ -1091,6 +1112,7 @@ fn workspace_peer_summary(
                 }
                 let pane_number = ws.public_pane_number(detail.pane_id)?;
                 Some(crate::api::schema::PeerAgentSummary {
+                    runtime: None,
                     agent_id: terminal.agent_id.to_string(),
                     pane_id: crate::workspace::public_pane_id_for_number(&ws.id, pane_number),
                     agent: Some(agent_label_on_the_wire(&detail)),
@@ -1146,6 +1168,7 @@ mod tests {
 
     fn summary(name: &str, ssh_target: &str) -> crate::peers::PeerSummaryState {
         crate::peers::PeerSummaryState {
+            structured_agents: Vec::new(),
             node_id: None,
             dial: Default::default(),
             stream_error: None,
@@ -1398,6 +1421,7 @@ mod tests {
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                structured_agents: Vec::new(),
                 node_id: None,
                 dial: None,
                 name: "spoke2.invalid".into(),
@@ -1450,6 +1474,7 @@ mod tests {
     /// A row `kiln` relays about `node-b`, with the target only kiln resolves.
     fn relayed_by_anvil(name: &str, ssh_target: &str) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            structured_agents: Vec::new(),
             node_id: None,
             dial: None,
             name: name.into(),
@@ -1637,6 +1662,7 @@ mod tests {
 
     fn hub_row(name: &str, ssh_target: &str, age: u64) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            structured_agents: Vec::new(),
             node_id: None,
             dial: None,
             name: name.into(),
@@ -1794,6 +1820,7 @@ mod tests {
         app.state.relayed_fleet_cache.insert(
             "spoke2.invalid".to_string(),
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                structured_agents: Vec::new(),
                 node_id: None,
                 dial: None,
                 name: "spoke2.invalid".into(),
@@ -1846,6 +1873,7 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
                     node_id: None,
                     outbound_pending: false,
                     host: "kiln".into(),
@@ -1855,6 +1883,7 @@ mod tests {
                     latency_ms: 5,
                     workspaces: Vec::new(),
                     relayed_fleet: vec![crate::api::schema::RelayedFleetPeer {
+                        structured_agents: Vec::new(),
                         node_id: None,
                         dial: None,
                         name: "loop-back".into(),
