@@ -77,10 +77,11 @@ before that work is complete.
   `FuturePane` applies terminal policy to subsequently created panes.
   `ProcessStartup` includes the socket account policy, storage, system-one
   settings, reporter commands and the sampler disk path, which that app reload
-  does not retarget. `msg` and `spawn` (including `spawn.env`) also stay at
-  startup values because reload does not copy them into the running config;
-  their `reload_issue: 2397` records the existing product bug (#2397). This
-  inventory corrects the claim and does not fix that reload behavior.
+  does not retarget. `msg` and `spawn` (including `spawn.env`) are `AppLive`:
+  #2399 copies each valid section for subsequent server operations and process
+  starts. Invalid sections retain their running values. Existing child
+  environments, stored launch snapshots and MCP session options remain captured
+  at their own admission/startup boundaries; reload does not rewrite them.
   The reverse copy-set check also rejects a startup-only root section that
   gains a live copy without an ownership review. `checks`, `fleet` and
   `structured` remain startup-owned; session restart policy and channels follow
