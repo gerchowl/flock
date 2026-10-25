@@ -12,7 +12,8 @@ import sys
 # Pure docs / website / markdown, and the web client (covered by the `client` job).
 ALLOW_PREFIXES = ("docs/", "website/", "web/client/")
 # Read by Rust or script tests, or by release tooling: never skippable.
-DENY_PREFIXES = ("docs/next/", "web/client/test/fixtures/", "web/client/src/gen/", "website/scripts/")
+DENY_PREFIXES = ("docs/next/", "web/client/test/fixtures/", "web/client/src/gen/", "web/client/src/wire/",
+                 "web/client/src/fleet", "web/client/tests/wire/", "website/scripts/")
 DENY_FILES = {"website/latest.json", "CHANGELOG.md"}
 
 
