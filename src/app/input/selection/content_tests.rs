@@ -61,6 +61,7 @@ while IFS= read -r command; do
             printf '\033[?%sh\033[HSELECTA\r\nSELECTB\r\nDONE_%s\r\n' "$mode" "$command"
             ;;
         alt_history)
+            # No trailing CR/LF: keep the write_and_wait alt_history opt-out below.
             printf '\033[22J\033[6;1HDONE_alt_history'
             ;;
         reset_alt)
@@ -109,6 +110,7 @@ while IFS= read -r command; do
             printf '\033[?40h\033[?3%s\033[HOTHER_A\r\nOTHER_B\r\nDONE_%s\r\n' "$final" "$command"
             ;;
         decaln)
+            # No trailing CR/LF: keep the write_and_wait decaln opt-out below.
             printf '\033#8\033[6;1HDONE_decaln'
             ;;
         erase2)
@@ -211,6 +213,8 @@ impl Fixture {
                 tokio::time::Instant::now() < deadline,
                 "producer did not complete {marker}: {text:?}"
             );
+            // visible_text() preserves physical rows, trimming only trailing blank rows.
+            // A marker-bearing lines() index therefore equals its screen y coordinate.
             let complete = text.contains(marker)
                 && (!line_terminated
                     || self
@@ -238,6 +242,7 @@ impl Fixture {
         self.runtime()
             .try_send_bytes(Bytes::from(format!("{command}\n")))
             .unwrap();
+        // Keep these opt-outs paired with the unterminated SCRIPT branches above.
         self.wait_for_output(marker, !matches!(command, "alt_history" | "decaln"))
             .await;
     }
