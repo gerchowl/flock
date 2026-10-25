@@ -2,6 +2,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 mod diagnostics;
 mod env;
+mod inventory;
 mod io;
 mod keybinds;
 pub(crate) mod model;

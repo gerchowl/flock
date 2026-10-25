@@ -1686,6 +1686,7 @@ the wire enum; implementation registers any new API error codes where needed):
 | `invalid_agent` | Unsafe or reserved stored agent namespace. Retry class `never`: select a valid subject rather than retrying unchanged. |
 | `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
 | `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
+| `session_busy` | Token mutation is pending. Retry class `later`: retry only this stream with fresh IDs after 250, 500 and 1000 ms (three automatic same-socket retries since the last `synced`), then remain visibly Refused until reopened or a later reconnect supplies a new welcome. Sibling subscriptions and the authenticated socket stay connected. |
 | `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
 
 Start the 30 s progress deadline at sub registration, or when a new gap starts
@@ -1895,6 +1896,17 @@ retained. The retained History limits, inline gaps, persisted provenance and
 single replay barrier remain authoritative. Exact-cursor offset hints are bounded
 and source-fenced; stale hints are discarded and cursor paging is used instead.
 
+
+#### Amendment: token admission locks and subscription contention (#2450)
+
+The authorization/admission boundary above uses shared file-token locks through
+the recheck and bounded callback, with exclusive locks for token mutation.
+Revocation intent fences new admissions before waiting for existing callbacks;
+readers check it again after shared acquisition. Revoke cannot return while an
+admitted callback remains in flight. This preserves S6 decision fencing and is
+the same shared/exclusive split recorded in ADR-0038 §6. A subscription's typed
+`session_busy` is retryable `later`, not a transport failure; unsafe storage and
+I/O failures retain their connection-close behavior.
 
 ### 6. One schema, generated TypeScript
 
@@ -2564,6 +2576,15 @@ decision by the owner.
 Tracked in #1307. Ordered; each is at most about 400 production lines (tests and doc comments
 excluded; TypeScript counts the same as Rust) and lands behind `runtime: structured` or the `web` feature.
 
+The S7-min rows refine the original S7 endpoint slice. Execution follows
+1 → 7b → 2 → 3 → 4 → 5 → 6 → 8; the GUI bundle router (7a) is built
+independently. Artifact, inbox and mesh streams, full outbox/resume-only
+semantics, single-writer handoff and operator-only outcomes remain S7-rest;
+their fixture labels stay explicit under the ADR tracker #1307. #2369 proves
+isolated browser dogfood and
+metadata-selected welcomes, not full selected-script trace execution. That
+remaining slice-8 acceptance is tracked in #2467; #1833 and #1746 stay open.
+
 | # | Slice | Depends on | Est. lines |
 |---|---|---|---|
 | S0 | Complete (2026-10-14): the probes landed (#1356); the A.13 controls and token-path re-runs, the concurrency-safe call behind an open permission, and A.16 are recorded (#1404). Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
@@ -2578,6 +2599,16 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S6 | Control requests: `can_use_tool` → `hook.decide` and §8a questions, `AskUserQuestion` answers, `ExitPlanMode` | S4, S5 | 350 |
 | S7a | Wire message Rust types with ts derives: hello/welcome recovery metadata, sub/unsub/cmd/ev/ack, subfail, ping/pong, synced on every seq stream, gap with snapshot_to, lagged (§5/§5a); scripted fake-server fixture format, types only with no endpoint. Before S3, as ADR-0038 §10 | #1546 settled | 200 |
 | S7 | Wire endpoint implementing S7a, §5a deadlines, heartbeat, durable command journal, resume/checkpoint and single-writer rules, `/v1/blob`, client tokens, `WIRE_JSON_VERSION` gate, `web` on in release builds; refuse remote-agent cmd until #1380 | S3 (S3a #1518/#1439, S3b #1426), S7a | 350 |
+| S7-min 1 (#1825) | Client-token authority and verification | S7a, #1798 | ≤400 |
+| S7-min 7b (#1827) | Operator token CLI/socket entry and dogfood URL | Slice 1 | ≤400 |
+| S7-min 2 (#1828) | Loopback WebSocket transport and liveness | Slices 1, 7b | ≤400 |
+| S7-min 3 (#1829) | Stored session replay and live publication | Slice 2, S3 | ≤400 |
+| S7-min 4 (#1830) | Agent subscriptions, identities and bounded delivery | Slice 3 | ≤400 |
+| S7-min 5 (#1831) | Send and permission-decision routing | Slice 4, S5, S6 | ≤400 |
+| S7-min 6a (#1832) | Durable fleet-lite projection and cursor core | S4, S6 | ≤400 |
+| S7-min 6b (#2225) | Fleet stream on the endpoint; activity omitted until #2243 | Slices 4, 6a | ≤400 |
+| S7-min 7a (#1826) | GUI bundle serving router | Loopback listener, GUI build | ≤400 |
+| S7-min 8 (#1833) | Real-server conformance and isolated browser dogfood proof | Preceding minimal slices; #1734 before public start | 0 (tests/docs) |
 | S8 | `ts` feature, `ts-rs` derives, generated `web/client/src/gen`, drift test, `just gen-ts` | S7 | 200 |
 | S9a | Bun reference client in Solid: connect, follow an agent from a cursor, render P1–P4, unknown JSON dump, lazy blobs | S8 | 400 (TS) |
 | S9b | Bun reference client: P12–P15, P19, P20, queue view with edit, reorder, stashes, send now and relevance marks | S9a, S5c | 400 (TS) |
@@ -3658,7 +3689,11 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
 The internal projection uses the same admitted MessageKey, body and native
 agent/session binding. It never admits another input, writes stdin, changes a
 custody outcome or renews a reply deadline. Its first harness-delivery observation
-starts a persisted read window (`msg.inbox_retention_ms`, default 24 hours).
+starts a persisted read window. The caller supplies its retention policy;
+#2452 introduces `msg.inbox_retention_ms` (default 24 hours) with its actual
+harness-delivery consumer.
+Idle sweeps and non-consuming reads project logical time without writing the
+clock or opening a write transaction; only acknowledgements persist changes.
 Delivery replay, custody settlement and restart cannot renew that window. Queue
 journal checkpoint/pruning cannot delete this independently retained projection.
 Unread projected bodies pin custody storage until read or expiry acknowledgement;
@@ -3671,3 +3706,18 @@ queue-delivery binding and CLI/socket/MCP wiring. It must supply actual harness
 delivery, not custody admission, and decode payloads before consumption. Existing
 queue snapshots and custody labels are not backfilled as fresh delivery. Existing
 custody expiry cannot restore an already deleted body or extend reply recovery.
+
+### Amendment: Welcome capability grants (#2461)
+
+Clarification of §5's protocol gating and §6's operation advertisement:
+`welcome.capabilities` is the authenticated token's exact granted scopes, using
+`api::client_tokens::Scope` wire spellings in enum order: `read`, `send`,
+`answer`, `operate`. Missing scopes are omitted; `operate` implies no other
+scope. A client whose `hello.protocol` exceeds `WIRE_JSON_VERSION` receives
+only `read` when explicitly granted, or an empty array otherwise. It receives
+no command capability.
+
+The welcome is an advisory snapshot, not an authorization lease. Every command
+and subscription still checks current authority at admission, including scope
+changes and revocation after the welcome. Browser command holding according to
+this advertisement is tracked separately in [#2464](https://github.com/gerchowl/flock/issues/2464).

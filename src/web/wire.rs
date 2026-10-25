@@ -5,7 +5,7 @@ mod output;
 mod subscriptions;
 pub(crate) mod timing;
 use crate::{
-    api::client_tokens::Bearer,
+    api::client_tokens::{Bearer, Scope},
     structured::permissions::auth::tokens::{Session, TokenError, TokenStore},
     structured_wire::*,
 };
@@ -336,6 +336,22 @@ async fn connection(
             return;
         }
     };
+    // ADR-0036 §5/§6: advertise exact grants, while admission rechecks authority.
+    let capabilities = session
+        .info
+        .scopes
+        .iter()
+        .filter(|scope| !read_only || **scope == Scope::Read)
+        .map(|scope| {
+            match scope {
+                Scope::Read => "read",
+                Scope::Send => "send",
+                Scope::Answer => "answer",
+                Scope::Operate => "operate",
+            }
+            .to_owned()
+        })
+        .collect();
     let principal = session.info.principal.clone();
     let (priority, priority_rx) = mpsc::channel(PRIORITY_CAPACITY);
     let (data, data_rx) = mpsc::channel(DATA_CAPACITY);
@@ -365,7 +381,7 @@ async fn connection(
     let welcome = ServerFrame::Welcome {
         protocol: WIRE_JSON_VERSION,
         server_version: crate::build_info::version(),
-        capabilities: vec![],
+        capabilities,
         principal: principal.clone(),
         server_epoch: shared.epoch.clone(),
         idempotency_window_ms: IDEMPOTENCY_WINDOW_MS,

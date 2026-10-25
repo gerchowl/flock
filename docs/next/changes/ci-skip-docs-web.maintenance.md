@@ -1,0 +1,1 @@
+- Pull requests that touch only docs, the website or the web client skip the Rust build/test legs; detection fails safe and the required checks still report.

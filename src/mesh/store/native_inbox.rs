@@ -27,13 +27,19 @@ impl<D: DiskSpace> Store<D> {
     /// and returned separately for the existing sweep event. A missing recipient
     /// sweeps every inbox without consuming live mail. Opaque bodies stay opaque.
     /// Invalid persisted entries are logged/skipped and preserved (ADR-0028 §3a).
+    /// Queries with no acknowledgements neither persist the clock nor open a write transaction.
     pub(crate) fn native_inbox(
         &mut self,
         recipient: Option<(&str, &str)>,
         consume: bool,
         wall_ms: i64,
     ) -> Result<(Vec<Envelope>, Vec<Envelope>)> {
-        let now = self.writable(wall_ms)?;
+        // Query against a projected clock; only acknowledgements may persist it.
+        let mut clock = self.clock()?;
+        if clock.paused {
+            return Err(Error::Paused);
+        }
+        let now = clock.advance(wall_ms);
         let keys = {
             let mut stmt = self.connection.prepare(
                 "SELECT n.origin,n.id,n.until_ms FROM native_inbox_reads n
@@ -89,6 +95,10 @@ impl<D: DiskSpace> Store<D> {
                 live.push(record.envelope);
             }
         }
+        if acknowledgements.is_empty() {
+            return Ok((live, expired));
+        }
+        self.writable(wall_ms)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
