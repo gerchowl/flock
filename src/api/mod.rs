@@ -6,6 +6,7 @@ pub(crate) mod compatibility;
 pub(crate) mod error_code;
 mod event_hub;
 mod events_read;
+pub(crate) mod peer_discovery;
 pub mod question;
 pub mod queue_event;
 mod reply_wait;

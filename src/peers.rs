@@ -1603,9 +1603,7 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
         structured_agents: result
             .get("structured_agents")
             .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|err| format!("summary structured_agents parse error: {err}"))?
+            .map(crate::api::peer_discovery::decode)
             .unwrap_or_default(),
         node_id: result
             .get("node_id")
@@ -2410,6 +2408,104 @@ mod tests {
             assert_eq!(summary.latency_ms, 7);
         }
         assert_eq!(crate::mesh::hello::VERSION, 5);
+    }
+
+    #[test]
+    fn structured_discovery_unknown_enums_are_contained_to_their_row() {
+        for field in ["runtime", "status"] {
+            for unknown_in_relay in [false, true] {
+                let known = serde_json::json!({"agent_id":"known-native", "runtime":"structured", "status":"idle"});
+                let mut unknown = known.clone();
+                unknown["agent_id"] = serde_json::json!("future-native");
+                unknown[field] = serde_json::json!("future_value");
+                let mut last = known.clone();
+                last["agent_id"] = serde_json::json!("last-native");
+                let rows = serde_json::json!([known, unknown, last]);
+                let ordinary = serde_json::json!([known]);
+                let workspace = serde_json::json!({"workspace":"fixture", "status":"idle", "agents":[
+                    {"agent_id":"known-terminal", "pane_id":"", "status":"idle"}
+                ]});
+                let relay = serde_json::json!({"name":"fixture.example", "ssh_target":"fixture.example", "origin":"hub.example",
+                    "workspaces":[workspace], "structured_agents":if unknown_in_relay {&rows} else {&ordinary}});
+                let result = serde_json::json!({"type":"peers_summary", "host":"hub.example", "workspaces":[workspace],
+                    "structured_agents":if unknown_in_relay {&ordinary} else {&rows}, "relayed_fleet":[relay]});
+                let parsed =
+                    parse_summary_response(&serde_json::json!({"result":result}).to_string(), 0)
+                        .unwrap();
+                let ids = |rows: &[crate::api::schema::PeerStructuredAgentSummary]| {
+                    rows.iter()
+                        .map(|row| row.agent_id.clone())
+                        .collect::<Vec<_>>()
+                };
+                let expected = vec!["known-native".to_owned(), "last-native".to_owned()];
+                assert_eq!(
+                    ids(if unknown_in_relay {
+                        &parsed.relayed_fleet[0].structured_agents
+                    } else {
+                        &parsed.structured_agents
+                    }),
+                    expected
+                );
+                assert_eq!(parsed.workspaces[0].agents[0].agent_id, "known-terminal");
+                assert_eq!(
+                    parsed.relayed_fleet[0].workspaces[0].agents[0].agent_id,
+                    "known-terminal"
+                );
+                let typed: crate::api::schema::ResponseResult =
+                    serde_json::from_value(result).unwrap();
+                let crate::api::schema::ResponseResult::PeersSummary {
+                    structured_agents,
+                    relayed_fleet,
+                    ..
+                } = typed
+                else {
+                    panic!("wrong summary kind")
+                };
+                assert_eq!(structured_agents, parsed.structured_agents);
+                assert_eq!(
+                    relayed_fleet[0].structured_agents,
+                    parsed.relayed_fleet[0].structured_agents
+                );
+                let pushed: crate::api::schema::PeersHubFleetParams = serde_json::from_value(
+                    serde_json::json!({"hub":"hub.example", "fleet":[relay]}),
+                )
+                .unwrap();
+                assert_eq!(
+                    pushed.fleet[0].structured_agents,
+                    parsed.relayed_fleet[0].structured_agents
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_structured_list_does_not_discard_workspace_summary() {
+        for malformed in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!(7),
+        ] {
+            let result = serde_json::json!({"type":"peers_summary", "host":"fixture.example", "workspaces":[
+                {"workspace":"fixture", "status":"idle"}
+            ], "structured_agents":malformed});
+            let parsed =
+                parse_summary_response(&serde_json::json!({"result":result}).to_string(), 0)
+                    .unwrap();
+            assert!(parsed.structured_agents.is_empty());
+            assert_eq!(parsed.workspaces.len(), 1);
+            let decoded: crate::api::schema::ResponseResult =
+                serde_json::from_value(result).unwrap();
+            let crate::api::schema::ResponseResult::PeersSummary {
+                structured_agents,
+                workspaces,
+                ..
+            } = decoded
+            else {
+                panic!("wrong summary kind")
+            };
+            assert!(structured_agents.is_empty());
+            assert_eq!(workspaces.len(), 1);
+        }
     }
 
     #[test]

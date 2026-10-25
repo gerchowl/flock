@@ -3207,7 +3207,11 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system: Option<PeerSystemSummary>,
         /// Pane-free identities; optional for mixed-version fleets (mesh v5).
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "crate::api::peer_discovery::deserialize"
+        )]
         structured_agents: Vec<PeerStructuredAgentSummary>,
         workspaces: Vec<PeerWorkspaceSummary>,
         /// Gossip v3 (#101): the answering server's OWN polled peers, so the
@@ -5323,7 +5327,11 @@ pub struct RelayedFleetPeer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
     /// Pane-free agent directory, relayed unchanged by supporting peers.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::api::peer_discovery::deserialize"
+    )]
     pub structured_agents: Vec<PeerStructuredAgentSummary>,
     #[serde(default)]
     pub workspaces: Vec<PeerWorkspaceSummary>,

@@ -74,7 +74,10 @@ Each row carries `agent_id`, `agent` (harness label), `status`, and
 `runtime: "structured"`; `pane_id` is absent because these identities have no
 pane placement. Workspace agent rows keep their required `pane_id` field,
 including an empty string; a separate structured row type omits it. The list is omitted when empty and defaults to empty when
-reading older peers. Supporting hubs preserve it in their JSON `relayed_fleet`
+reading older peers. Readers skip individual unsupported or invalid structured
+rows (including unknown `runtime` or `status` values) with a diagnostic, keeping
+the other rows and workspaces. A malformed structured collection is treated as
+empty. Supporting hubs preserve supported rows in their JSON `relayed_fleet`
 and `peers.hub_fleet` rows. Remote `agent.list.fleet` and MCP `flock_agent_list`
 include these identities with the same runtime tag and no `pane_id`.
 Address them by agent ID through ordinary `msg.send`; mesh delivery uses the
