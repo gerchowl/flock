@@ -408,6 +408,69 @@ impl TempDir {
     }
 }
 
+/// An isolated, scripted NDJSON peer with bounded accept/read failure ceilings.
+pub(crate) struct ScriptedApi {
+    directory: TempDir,
+    worker: std::thread::JoinHandle<Vec<serde_json::Value>>,
+}
+impl ScriptedApi {
+    pub(crate) fn new(script: Vec<(&'static str, Option<serde_json::Value>)>) -> Self {
+        use std::io::{BufRead, Write};
+        use std::os::fd::AsRawFd;
+        let directory = TempDir::socket();
+        let listener =
+            std::os::unix::net::UnixListener::bind(directory.path().join("api.sock")).unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (method, response) in script {
+                let mut poll = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll owns one initialized descriptor for this call.
+                assert_eq!(
+                    unsafe { libc::poll(&mut poll, 1, 5000) },
+                    1,
+                    "request never arrived"
+                );
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], method);
+                if let Some(mut response) = response {
+                    if response.is_object() && response.get("id").is_none() {
+                        response["id"] = request["id"].clone();
+                    }
+                    writeln!(reader.get_mut(), "{response}").unwrap();
+                }
+                requests.push(request);
+            }
+            requests
+        });
+        Self { directory, worker }
+    }
+    pub(crate) fn path(&self) -> std::path::PathBuf {
+        self.directory.path().join("api.sock")
+    }
+    pub(crate) fn client(&self) -> crate::api::client::ApiClient {
+        crate::api::client::ApiClient::for_target(crate::api::client::ConnectionTarget::SocketPath(
+            self.path(),
+        ))
+    }
+    pub(crate) fn finish(self) -> Vec<serde_json::Value> {
+        self.worker.join().expect("scripted peer")
+    }
+}
+
 /// Fictional name payloads; failure reports use case ids rather than raw text.
 pub(crate) fn hostile_agent_names() -> Vec<(&'static str, String)> {
     vec![
