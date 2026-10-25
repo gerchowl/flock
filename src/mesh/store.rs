@@ -6,6 +6,7 @@ use super::{clock::Clock, key::MessageKey};
 mod collection;
 pub(crate) mod delivery_attempts;
 mod hub_outcomes;
+mod native_inbox;
 mod quarantine;
 mod queue_custody;
 use queue_custody::{COMMITMENT_UNKNOWN_AT_EXPIRY, COMMITMENT_UNKNOWN_PREFIX};

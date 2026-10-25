@@ -3652,3 +3652,16 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
 - `same-site` is refused for every unregistered origin.
 - The pre-auth caps refuse at 17 concurrent connections and at the 11th failed
   `hello` within 1 s, and an authenticated session is unaffected.
+
+### Amendment: Recipient tool-inbox projection (#2363)
+
+A lease-attested structured caller owns `msg.list` and consume-once `msg.read`
+without a pane. An explicit target must identify that same recipient; other
+inboxes refuse `not_authorized` (retry `never`) before target resolution.
+The projection reuses admitted custody identity and body, without another queue
+admission or stdin write. Its durable acknowledgement is separate from custody.
+Bulk reads return live unread messages once; expired entries produce the existing
+`dropped_undeliverable` sweep event once and do not block live mail. There is no
+selector or partial-error envelope. Single-message reply expiry remains typed.
+`msg.inbox_retention_ms` defaults to the pane mailbox window (24 hours), measured
+from durable queue settlement. Operator global listing retains its pane semantics.

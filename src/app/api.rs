@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod native_inbox_tests;
+#[cfg(test)]
 mod peer_uid_tests;
 #[cfg(test)]
 mod scoped_mcp_tests;
@@ -29,6 +31,7 @@ mod mesh_replies;
 pub(crate) mod mesh_routes;
 mod mesh_spokes;
 pub(super) mod messages;
+mod native_inbox;
 mod owner;
 mod owners;
 mod panes;
