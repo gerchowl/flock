@@ -87,6 +87,10 @@ fn registry_s4_and_s6_project_into_the_generated_structured_only_contract() {
         activity: Some("Reading source"),
         waiting_on_human: &waiting,
     });
+    assert!(
+        row.route.is_none(),
+        "local projection must omit routing metadata"
+    );
     assert_eq!(row.state, update.state);
     assert_eq!(row.waiting_on_human, vec!["p1"]);
     assert_eq!(row.label, "label-a");
