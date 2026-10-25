@@ -636,6 +636,7 @@ mod tests {
             "fleet" => include_str!("fleet.rs"),
             "owner" => include_str!("owner.rs"),
             "goal" => include_str!("goal.rs"),
+            "structured" => include_str!("grants.rs"),
             "events" => include_str!("events.rs"),
             "adapter" => include_str!("adapter.rs"),
             // `wait park` shares the `events` parser.
@@ -811,6 +812,8 @@ mod tests {
                         include_str!("delegate_list.rs"),
                     ],
                     "wait" => vec![DISPATCH_SOURCE, include_str!("events.rs")],
+                    // The group routes grants inline; its nested parser owns flags.
+                    "structured" => vec![DISPATCH_SOURCE, group_parser_source(group)],
                     _ => vec![group_parser_source(group)],
                 };
                 sources
