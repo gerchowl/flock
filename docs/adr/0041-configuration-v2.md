@@ -232,13 +232,18 @@ sessions' admitted snapshots and security boundaries. Exact classifications
 for every section are verified in the implementation inventory, not guessed
 by this ADR.
 
-The server inventory classifies `msg`, `spawn` and their descendants as
-`AppLive` following #2399: `apply_live_config` copies each valid section for
-subsequent operations. Invalid sections retain their running values. This is
-server policy ownership, not retroactive mutation of existing admissions:
-child environments, stored launch snapshots and MCP session options retain
-what they captured. Restart the MCP process to refresh its startup options,
-as described in the configuration guide.
+The inventory follows consumers, not just section copies. Following #2399,
+`spawn` and `spawn.env` are `AppLive`. The `msg` section is `Mixed`: server
+policy leaves are live, while `msg.channel_push_body_max_bytes` and
+`msg.channel_push_reconnect_secs` are `CommandStartup`, consumed only by
+`ChannelOptions` from the MCP command's startup `Config::load`.
+`msg.channel_push` is also `Mixed`: the server reads it live but MCP sessions
+capture their capability at startup. Each leaf's classification is guarded by
+consumer syntax evidence, with live owners also requiring the section copy in
+`apply_live_config`. Invalid sections retain their running values. Child
+environments and stored launch snapshots remain captured. Restart the MCP
+process to refresh its captured options, as described in the configuration
+guide.
 
 ### 6. Per-node ownership and GUI
 
