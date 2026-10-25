@@ -19,6 +19,15 @@ use crate::{
 };
 use serde_json::json;
 
+/// Conversation metadata retained until the native journal admits a reply.
+pub(super) struct Reply {
+    /// The original request's caller-visible conversation label.
+    pub correlation: String,
+    /// Root label used by the existing round-trip counter.
+    pub root: String,
+    /// Original enqueue time, preserving pane-path latency semantics.
+    pub enqueued: u64,
+}
 /// Deferred response and custody settlement for the owner's admission outcome.
 pub(super) struct Ack {
     key: MessageKey,
@@ -28,6 +37,7 @@ pub(super) struct Ack {
     message: PendingMessage,
     request: Option<MessageKey>,
     warnings: Vec<String>,
+    pub(super) reply: Option<Reply>,
 }
 impl Ack {
     fn custody(signed: &Envelope, mut message: PendingMessage, remote: bool) -> Self {
@@ -48,6 +58,7 @@ impl Ack {
                 signed.request_key.clone()
             },
             warnings: vec![],
+            reply: None,
         }
     }
     pub(super) fn refusal(
@@ -353,12 +364,17 @@ impl App {
                 _ => (),
             }
         }
-        for ack in std::mem::take(&mut self.structured_sends.acknowledged) {
+        for mut ack in std::mem::take(&mut self.structured_sends.acknowledged) {
             let current = stored(|s| s.get(&ack.key));
             if matches!(&current, Ok(Some(r)) if matches!(r.state.as_str(), "refused" | "recipient_gone"))
             {
                 self.structured_sends.retries.remove(&ack.key);
                 continue;
+            }
+            // The journal has admitted this local reply. Publish at the same
+            // acceptance boundary as pane replies, even if custody saving fails.
+            if let Some(reply) = ack.reply.take() {
+                self.emit_reply_observation(reply, &ack.message.correlation_id, false);
             }
             let settled =
                 matches!(&current, Ok(Some(r)) if matches!(r.state.as_str(), "delivered" | "read"));
