@@ -77,16 +77,28 @@ before that work is complete.
   `FuturePane` applies terminal policy to subsequently created panes.
   `ProcessStartup` includes the socket account policy, storage, system-one
   settings, reporter commands and the sampler disk path, which that app reload
-  does not retarget. `msg` and `spawn` (including `spawn.env`) are `AppLive`:
-  #2399 copies each valid section for subsequent server operations and process
-  starts. Invalid sections retain their running values. Existing child
-  environments, stored launch snapshots and MCP session options remain captured
-  at their own admission/startup boundaries; reload does not rewrite them.
-  The reverse copy-set check also rejects a startup-only root section that
-  gains a live copy without an ownership review. `checks`, `fleet` and
-  `structured` remain startup-owned; session restart policy and channels follow
-  their existing section copies. `CommandStartup` covers listener/command startup settings. `ReadOnUse` is
-  the advertised icon's config lookup. `Mixed` is a container with multiple
+  does not retarget. `spawn` and `spawn.env` are `AppLive`:
+  #2399 copies valid policy for subsequent starts and resumes, without changing
+  existing process environments or stored launch snapshots. `msg` is `Mixed`:
+  most leaves are read live by server operations, but
+  `msg.channel_push_body_max_bytes` and `msg.channel_push_reconnect_secs` are
+  `CommandStartup`, read only into `ChannelOptions` at MCP startup.
+  `msg.channel_push` is itself `Mixed`: server operations read it live, while
+  an existing MCP session retains its startup capability. Invalid sections keep
+  their running values. Restart the MCP process to refresh captured options.
+  The msg/spawn consumer guard follows production App/MCP modules, reference
+  aliases and reachable config helper methods, deriving each leaf's owner from
+  actual readers and requiring the section's live copy where applicable.
+  A field read both live and at command startup is `Mixed`. The guard verifies
+  the MCP constructor receives its section from `Config::load` at command
+  startup. It is a focused syntax audit, not general Rust type/dataflow
+  inference: new reader shapes require evidence support rather than a guessed
+  owner. The reverse copy-set check rejects a startup-only root section that
+  gains a live copy without review. `checks`, `fleet` and `structured` remain
+  startup-owned; session restart policy and channels follow their existing
+  section copies.
+  `CommandStartup` covers listener/command startup settings. `ReadOnUse` is
+  the advertised icon's config lookup. `Mixed` is a value or container with multiple
   owners. Ownership is not a claim that every
   cached downstream consumer hot-reloads. Peer-row reconciliation also depends
   on the app's valid-UI gate. Existing ownership limitations stay tracked by

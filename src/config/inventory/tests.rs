@@ -1,6 +1,9 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "reload_readers.rs"]
+mod reload_readers;
+
 fn declarations() -> BTreeMap<String, syn::Item> {
     [
         include_str!("../model.rs"),
