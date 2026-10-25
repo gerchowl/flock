@@ -1,7 +1,7 @@
 # ADR-0038: The GUI is a tiled workbench over one wire: a client that holds only presentation state, artifacts in opaque-origin sandboxes with feedback through questions, and goals and work as records on the same log
 
-- Status: Proposed; the §11 owner decisions 1–11 were taken on 2026-10-16 and 2026-10-17 (recorded on #1591), and 12–15 (§5b) on 2026-10-19 (recorded on #1717)
-- Date: 2026-10-15, amended 2026-10-16 (#1606; then #1641: the client side of ADR-0036 §5a's transport recovery), and 2026-10-18 (#1717: §5b, question threads)
+- Status: Proposed; the §11 owner decisions 1–11 were taken on 2026-10-16 and 2026-10-17 (recorded on #1591), 12–15 (§5b) on 2026-10-19 (recorded on #1717), and 16–17 on 2026-10-25 (recorded on #1601 and #1598)
+- Date: 2026-10-15, amended 2026-10-16 (#1606; then #1641: the client side of ADR-0036 §5a's transport recovery), 2026-10-18 (#1717: §5b, question threads), and 2026-10-25 (#1601: §6 shell tokens and origins; #1598: §7a–§7f artifact lifecycle; #2443: §7 residuals)
 - Issues: [#1307](https://github.com/gerchowl/flock/issues/1307) (ADR-0036 slices), [#1310](https://github.com/gerchowl/flock/issues/1310), [#1323](https://github.com/gerchowl/flock/issues/1323) (superseded by the vigil decision), [#1614](https://github.com/gerchowl/flock/issues/1614), [#1380](https://github.com/gerchowl/flock/issues/1380), [#1401](https://github.com/gerchowl/flock/issues/1401), [#1402](https://github.com/gerchowl/flock/issues/1402), [#1546](https://github.com/gerchowl/flock/issues/1546) (settled by ADR-0036 §5a), [#1641](https://github.com/gerchowl/flock/issues/1641), [#1076](https://github.com/gerchowl/flock/issues/1076), [#1717](https://github.com/gerchowl/flock/issues/1717) (question threads, §5b), [#1719](https://github.com/gerchowl/flock/issues/1719), [#1673](https://github.com/gerchowl/flock/issues/1673)
 - Builds on: ADR-0036 §5–§8, §10a, §12 (wire contract, generated types, reference client, unknown events, collapsible turns, reserved extension points); ADR-0011 (conversation-first GUI, Accepted, not built); ADR-0012 (read model); ADR-0026 (mesh); ADR-0027 (delegate edges); ADR-0030 and ADR-0031 (goals); ADR-0034 (question routing); ADR-0035 (repo owner)
 - Wireframes: [`0038-gui/wireframes.html`](0038-gui/wireframes.html) (static, self-contained; open it in a browser)
@@ -758,7 +758,7 @@ An **artifact** is agent-authored content that a person looks at and answers: an
 **Lifetimes.** `flock_artifact_publish` gains `lifetime?: "session" | "persistent"`, **default `session`**.
 - **The session** is the **publishing agent's** identity, not the server's. A `session` artifact's session ends when that agent is stopped or its identity is replaced (ADR-0028 §8a). A restart, a handoff or a compaction does not end it.
 - **Persistent.** A `persistent` artifact, and a `session` artifact whose session has ended but which is still held (below), expires after it has been **idle** for `[artifacts] idle_ttl` (default 14 days).
-- **Idle** means no view, comment or answer, and no open tile, for that long. A view or open tile counts only within its principal's lease budget (Holds, below).
+- **Idle** means no view, comment or answer, and no open tile, for that long. A non-operator principal's view or open tile counts only within its lease budget (Holds, below).
 
 **Holds: what keeps an artifact.** An artifact is **held**, and is never expired or evicted, while any of these is true:
 1. A person has pinned it.
@@ -766,7 +766,9 @@ An **artifact** is agent-authored content that a person looks at and answers: an
    - The server keeps a **viewing lease** per client session. The client renews it by heartbeat every 30 s, and the lease lapses after 90 s without one, after **8 h** in any case, and on disconnect.
    - A principal holds at most **8** viewing leases at once.
    - A viewing lease defers expiry and eviction under both quotas. It **never** migrates a blob (§7c), and a held version's bytes still count against its publisher's quota and the total: a hold makes a publish refuse, never frees room.
-   - **Lease budget.** Leases from one principal hold one version for at most **8 h in total** over that version's lifetime. Past the budget, the principal's leases still drive its viewing record, but they neither hold the version nor count as a view for the idle clock. So a token-holding agent cannot keep its artifacts alive by re-leasing them, and a person who wants to keep one pins it.
+   - **Lease budget, for non-operator principals only.** A lease from the **operator principal** (ADR-0036 §5: an `operate`-scoped token *is* the operator's identity, which covers the operator's client token and an app-session token, §6) holds for as long as it is renewed, so a version a person has open is never expired or evicted, however long or often they view it.
+   - A lease from **any other principal**, such as a read-scope token given to an agent, holds one version for at most **8 h in total** over that version's lifetime. Past that budget, the server still accepts the lease and the tile still shows the version, but the lease neither holds the version nor counts as a view for the idle clock. So an agent cannot keep its artifacts alive by re-leasing them.
+   - A process that obtains an operator token is outside this bound; that is ADR-0036's named residual (#1177).
 3. An open question has the artifact as its `about`.
 
 When a hold ends, the artifact follows the persistent idle rule from that moment. It is never deleted at once.
@@ -972,7 +974,7 @@ A refused call is never retried automatically by the parent.
   - The broker tests come later: a viewer-B frame with only A's grant is refused, the limits refuse, an unexpected extra load revokes the grants, and a parent reload resets the counter.
 - **Quota pressure.** The 80 % and 100 % notices are emitted. The total quota evicts only the publisher's own versions, and then refuses with `later`.
 - **Migration.** A sweep during an in-progress migration skips that blob. A failed hash verification refuses the pin and leaves the blob whole.
-- **Viewing lease.** It lapses without a heartbeat and at 8 h, at most 8 are held per principal, and a held version's bytes still count against its publisher's quota. Re-leasing past one principal's 8 h budget on a version neither holds it nor resets its idle clock.
+- **Viewing lease.** It lapses without a heartbeat and at 8 h, at most 8 are held per principal, and a held version's bytes still count against its publisher's quota. An operator lease renewed past 8 h of total viewing still holds the version, and the version is not evicted. A non-operator principal re-leasing past its 8 h budget on a version neither holds it nor resets its idle clock.
 
 ### 8. Goals and work
 
