@@ -10,9 +10,9 @@ use std::fs::{File, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-#[allow(dead_code)] // Private #2442 PR1a foundation, consumed by PR1b.
 pub(crate) mod app_sessions;
 mod priority;
+pub(crate) mod server;
 use std::time::Duration;
 use zeroize::Zeroize;
 

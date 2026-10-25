@@ -1,6 +1,6 @@
 use super::*;
 use std::{
-    io::Read,
+    io::{BufRead, BufReader, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     process::{Child, Stdio},
     time::Duration,
@@ -29,6 +29,9 @@ pub(crate) struct Peer {
 }
 impl Peer {
     pub(crate) fn spawn() -> Self {
+        Self::request(None)
+    }
+    pub(crate) fn request(request: Option<&str>) -> Self {
         let root = crate::test_support::TempDir::socket();
         let path = root.path().join("exit.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -42,6 +45,9 @@ impl Peer {
             "--nocapture",
         ]);
         command.env("FLOCK_TEST_PROCESS_EXIT_SOCKET", &path);
+        if let Some(request) = request {
+            command.env("FLOCK_TEST_PROCESS_EXIT_REQUEST", request);
+        }
         for key in ["FLOCK_SOCKET_PATH", "FLOCK_PANE_ID", "FLOCK_AGENT_ID"] {
             command.env_remove(key);
         }
@@ -66,6 +72,10 @@ impl Peer {
         peer._stream = Some(stream);
         peer
     }
+    #[cfg(feature = "web")]
+    pub(crate) fn take_stream(&mut self) -> UnixStream {
+        self._stream.take().unwrap()
+    }
     pub(crate) fn exit(&mut self) {
         drop(self.child.stdin.take());
     }
@@ -81,7 +91,12 @@ fn peer_child() {
     let Some(path) = std::env::var_os("FLOCK_TEST_PROCESS_EXIT_SOCKET") else {
         return;
     };
-    let _socket = UnixStream::connect(path).unwrap();
+    let mut socket = UnixStream::connect(path).unwrap();
+    if let Ok(request) = std::env::var("FLOCK_TEST_PROCESS_EXIT_REQUEST") {
+        writeln!(socket, "{request}").unwrap();
+        let mut reply = String::new();
+        BufReader::new(&socket).read_line(&mut reply).unwrap();
+    }
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input).unwrap();
 }
@@ -137,4 +152,31 @@ fn failed_kernel_arm_never_reads_a_later_process_identity() {
         uid: None,
     };
     assert!(ExitWatch::checked(peer, |_| panic!("identity read before kernel arm")).is_err());
+}
+
+#[test]
+fn async_kernel_exit_wait_is_observable_by_exited() {
+    let mut peer = Peer::spawn();
+    let watch = std::sync::Arc::new(ExitWatch::arm(peer.credentials).unwrap());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let waiting = watch.clone().wait();
+            tokio::pin!(waiting);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(!watch.exited().unwrap());
+            peer.exit();
+            tokio::time::timeout(Duration::from_secs(5), &mut waiting)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(watch.exited().unwrap());
+            assert!(watch.exited().unwrap());
+        });
 }

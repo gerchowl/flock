@@ -1,5 +1,5 @@
 //! Private ephemeral app-session credentials (ADR-0038 §6, #2442 PR1a).
-//! No socket mint or file-token authenticate routing is enabled here; PR1b owns it.
+//! The server owner shares this source with socket minting and transport admission.
 use super::*;
 use crate::platform::process_exit::ExitWatch;
 use std::{collections::HashMap, sync::Arc, time::Instant};
@@ -62,8 +62,7 @@ type Entries = HashMap<[u8; 32], Entry>;
 /// Fresh owners (restart/handoff successors) cannot authenticate predecessor tokens.
 /// Mutations share the backing file store's exclusive lock and revocation intent.
 /// Admissions retain its shared lock through the callback, with no map lock held.
-/// At most 128 entries live; owners must schedule sweep on expiry/exit in PR1b.
-#[allow(dead_code)] // #2442 PR1b wires this private store into the socket and transport.
+/// At most 128 entries live; transport owners retire them after expiry/exit readiness.
 pub(crate) struct Store {
     files: Arc<TokenStore>,
     entries: Mutex<Entries>,
@@ -84,7 +83,6 @@ impl Mutation<'_> {
         change(&mut entries)
     }
 }
-#[allow(dead_code)] // Scope intentionally exposes no production mint path until #2442 PR1b.
 impl Store {
     /// Bind a fresh memory-only domain to the shared/exclusive file admission lock.
     pub(crate) fn new(files: Arc<TokenStore>, clock: Arc<dyn Clock>) -> Self {
@@ -105,10 +103,28 @@ impl Store {
     }
     /// Arm the attested process before reading its identity or generating a bearer.
     /// The caller must hold LocalOperator authority; this is not an exposed mint API.
+    #[cfg(test)]
     pub(crate) fn issue(&self, authority: &LocalOperator<'_>) -> Result<Issued, IssueError> {
-        let process = Arc::new(
+        self.issue_watched(
+            authority,
             ExitWatch::arm(authority.peer_credentials()).map_err(IssueError::PeerProcessChanged)?,
-        );
+        )
+    }
+    /// Consume evidence armed before LocalOperator's ancestry/start-time checks.
+    /// A registration for any other connection cannot authorize this issuance.
+    pub(crate) fn issue_watched(
+        &self,
+        authority: &LocalOperator<'_>,
+        watch: ExitWatch,
+    ) -> Result<Issued, IssueError> {
+        if !watch.matches(authority.peer_credentials())
+            || watch.exited().map_err(IssueError::PeerProcessChanged)?
+        {
+            return Err(IssueError::PeerProcessChanged(io::Error::other(
+                "peer watch does not match authority",
+            )));
+        }
+        let process = Arc::new(watch);
         let _guard = self.files.lock()?;
         let mut entries = self.entries.lock().map_err(|_| TokenError::Unsafe)?;
         Self::sweep_entries(&mut entries, self.clock.now())?;
@@ -205,6 +221,7 @@ impl Store {
     }
     /// Owners invoke this after kernel/clock readiness, off the app executor.
     /// Watch I/O errors fail closed; no uncertain observation is silently discarded.
+    #[cfg_attr(not(test), allow(dead_code))] // Automatic per-session retirement uses revoke; bulk sweep remains tested.
     pub(crate) fn sweep(&self) -> Result<(), TokenError> {
         self.mutation()?
             .finish(|entries| Self::sweep_entries(entries, self.clock.now()))

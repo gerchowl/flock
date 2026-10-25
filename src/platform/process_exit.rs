@@ -5,9 +5,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// Owned, close-on-exec exit registration; callers still enforce LocalOperator.
 /// Readiness is persistent until drop, so adapters may await this fd off the app loop.
-#[allow(dead_code)] // #2442 PR1b consumes this private foundation in production.
-pub(crate) struct ExitWatch(OwnedFd);
-#[allow(dead_code)] // No public mint or runtime consumer until #2442 PR1b.
+pub(crate) struct ExitWatch(OwnedFd, Credentials);
 impl ExitWatch {
     /// Register first, then compare the start identity captured at socket accept.
     /// Missing evidence, exited processes and unsupported kernels fail closed.
@@ -16,11 +14,31 @@ impl ExitWatch {
     }
     fn checked(peer: Credentials, birth: impl FnOnce(u32) -> Option<u64>) -> io::Result<Self> {
         let pid = peer.pid.ok_or_else(changed)?;
-        let watch = Self(kernel_watch(pid)?);
+        let watch = Self(kernel_watch(pid)?, peer);
         if peer.birth.is_none() || birth(pid) != peer.birth || watch.exited()? {
             return Err(changed());
         }
         Ok(watch)
+    }
+    /// Prove this registration belongs to the exact accepted connection evidence.
+    pub(crate) fn matches(&self, peer: Credentials) -> bool {
+        self.1.pid == peer.pid && self.1.uid == peer.uid && self.1.birth == peer.birth
+    }
+    /// Await persistent kernel readiness without polling or occupying a blocking worker.
+    #[cfg(any(feature = "web", test))]
+    pub(crate) async fn wait(self: std::sync::Arc<Self>) -> io::Result<()> {
+        // Each waiter owns a distinct descriptor; reactor registrations cannot replace
+        // each other, and no waiter consumes the shared persistent exit evidence.
+        let descriptor = self.0.try_clone()?;
+        // SAFETY: AsyncFd owns this immutable OwnedFd for its complete registration.
+        let fd = unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(
+                descriptor,
+                tokio::io::Interest::READABLE,
+            )?
+        };
+        drop(fd.readable().await?);
+        Ok(())
     }
     /// Nonblocking inspection of the kernel registration, never PID liveness polling.
     /// Errors withhold authorization; they are not treated as proof of a live peer.

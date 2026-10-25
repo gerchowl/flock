@@ -279,3 +279,66 @@ fn exact_revocation_keeps_a_renewed_credential_independent() {
     ));
     assert!(store.admit(&second_session, Scope::Read, |_| ()).is_ok());
 }
+
+#[test]
+fn revoke_all_cannot_cross_an_inflight_admission() {
+    let (_root, _files, store, _clock, mut app) = fixture();
+    let issued = store.issue(&app.client_token_authority().unwrap()).unwrap();
+    let session = store.authenticate(&issued.token).unwrap();
+    let store = Arc::new(store);
+    let (entered, ready) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let worker = std::thread::spawn({
+        let store = store.clone();
+        let session = session.clone();
+        move || {
+            store.admit(&session, Scope::Read, |_| {
+                entered.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            })
+        }
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The existing acquisition ceiling fails while the earlier callback remains live.
+    let result = store.revoke_all();
+    let signalled_early = *session.revoked.borrow();
+    release.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+    assert!(matches!(result, Err(TokenError::Io(e)) if e.kind() == io::ErrorKind::TimedOut));
+    assert!(!signalled_early);
+    assert!(store.admit(&session, Scope::Read, |_| ()).is_ok());
+    store.revoke_all().unwrap();
+    assert!(*session.revoked.borrow());
+    assert!(matches!(
+        store.admit(&session, Scope::Read, |_| ()),
+        Err(TokenError::Revoked)
+    ));
+}
+
+#[test]
+fn a_watch_for_another_peer_cannot_be_substituted_for_the_mint_authority() {
+    let (_root, _files, store, _clock, mut app) = fixture();
+    let peer = Peer::spawn();
+    let watch = ExitWatch::arm(peer.credentials).unwrap();
+    let result = store.issue_watched(&app.client_token_authority().unwrap(), watch);
+    assert!(matches!(result, Err(IssueError::PeerProcessChanged(_))));
+    assert!(store.entries.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_exited_prearmed_peer_cannot_receive_a_credential() {
+    let (_root, _files, store, _clock, mut app) = fixture();
+    let mut peer = Peer::spawn();
+    app.current_api_peer_pid = peer.credentials.pid;
+    app.current_api_peer_uid = Some(peer.credentials.uid);
+    app.current_api_peer_birth = Some(peer.credentials.birth);
+    let watch = ExitWatch::arm(peer.credentials).unwrap();
+    let authority = app.client_token_authority().unwrap();
+    peer.exit();
+    assert!(readable(watch.as_raw_fd(), Duration::from_secs(5)));
+    assert!(matches!(
+        store.issue_watched(&authority, watch),
+        Err(IssueError::PeerProcessChanged(_))
+    ));
+    assert!(store.entries.lock().unwrap().is_empty());
+}

@@ -1216,3 +1216,33 @@ skips an unknown event kind, while preserving the global cursor high-water.
 Adding, editing, reordering or checkpointing items does not emit lifecycle
 facts. Recovery from `delivered` to `held` does. These facts use the existing
 event-log retention and rotation and are not relayed over the mesh.
+
+
+## App-session credentials
+
+A native operator console can mint a process-bound bearer with
+`{"id":"mint","method":"client.app.mint","params":{}}`. The response is
+`{"id":"mint","result":{"type":"client_token_issued","issued":{"info":{"name":"app:…","principal":"…","scopes":["read","send","answer","operate"]},"token":"…"}}}`.
+The server chooses all scopes and identity. Supplying scopes, PID, origin port
+or any other parameter returns `invalid_params`.
+
+Minting requires LocalOperator: the socket's kernel-attested operator UID and
+PID, no flk pane (including a shell pane) in its ancestry, and no mesh edge or
+agent lease. The exit watch is armed before the accepted process start identity
+is rechecked. Unknown operator evidence returns `operator_only`; changed birth
+or an unavailable exit watch returns `peer_process_changed` (never retry stale
+connection evidence). The native process must mint directly: a short-lived
+subprocess's exit revokes its credential.
+
+The credential lives only in server memory, is not listed among file tokens,
+and grants exactly `read`, `send`, `answer`, `operate` for a fixed 12 hours.
+Renewal issues an independent credential. There are at most 128 live entries;
+capacity/contention returns `session_busy`, and storage failures return
+`internal_error`. Store the bearer only in memory and never log it.
+
+Use the bearer in the structured WebSocket `hello`. Idle sockets close with
+the existing authentication close 4403 at expiry, process exit, revocation,
+restart or handoff; there are no new authentication error names. A command that detects revocation receives its
+`auth_revoked` error acknowledgement before closure. Persistent file tokens
+are unaffected. The existing same-UID secret-extraction risk remains (#1177).
+Shell-origin admission is a separate #2442 slice.

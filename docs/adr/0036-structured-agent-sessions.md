@@ -3523,8 +3523,10 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
   matrix row "Restart, handoff…".
 - **Revocation.** On process exit, TTL expiry, restart or handoff,
   `authenticate` stops accepting the token. Every live `/v1/ws` session
-  authenticated by it is closed with a typed auth close: `token_revoked` or
-  `token_expired`.
+  authenticated by it uses the existing close 4403. A command that detects
+  revocation receives its `auth_revoked` error acknowledgement before the close;
+  idle expiry and exit also close without waiting for a command. No new auth
+  error names are introduced (#2442).
 
 **Shell origins, on `/v1/ws` only.**
 - **The allow-list.** The listener guard (`origin_allowed`,
