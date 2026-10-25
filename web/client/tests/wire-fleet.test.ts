@@ -4,6 +4,8 @@
  */
 import { describe, expect, test } from "bun:test";
 
+import type { AgentState } from "../src/gen/AgentState";
+import type { Phase } from "../src/gen/Phase";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import type { AgentRow } from "../src/fleet";
 import { fixtureExamples } from "../src/gen/FixtureExamples";
@@ -12,7 +14,7 @@ import { Harness, live, sentFrames, step } from "./wire/harness";
 
 type Seen = { readonly rows: readonly string[] } | { readonly failed: string };
 
-const agentState = (phase: string): object => ({ turn: "idle", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase, source: {} });
+const agentState = (phase: Phase): AgentState => ({ turn: "idle", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase, source: {} });
 const row = (id: string, extra: object = {}): object => ({ id, label: id.toUpperCase(), state: agentState("working"), waiting_on_human: [], ...extra });
 const upsert = (seq: number, value: object): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { type: "fleet.upsert", row: value } as never });
 const remove = (seq: number, id: string): ServerFrame => ({ t: "ev", sub_id: "s1", stream: "fleet", seq, ts_ms: 0, ev: { type: "fleet.remove", id } });
@@ -97,7 +99,7 @@ describe("wire fleet", () => {
   });
 
   test("a payload that is not a fleet delta ends the list visibly", () => {
-    for (const bad of [{ type: "fleet.upsert", row: row("a", { state: agentState("dancing") }) }, { type: "fleet.upsert", row: row("a", { state: "working" }) }, { type: "fleet.upsert", row: { id: "a" } }, { type: "fleet.rename", id: "a" }, "atlas"]) {
+    for (const bad of [{ type: "fleet.upsert", row: row("a", { state: "working" }) }, { type: "fleet.upsert", row: { id: "a" } }, { type: "fleet.rename", id: "a" }, "atlas"]) {
       const { h, seen } = subscribed();
       send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 0 });
       send(h, { t: "ev", sub_id: "s1", stream: "fleet", seq: 1, ts_ms: 0, ev: bad as never });
@@ -148,4 +150,18 @@ test("fleet sources on one connection never reuse a sub id, and a closed one's l
   send(h, upsert(1, row("stale")));
   expect(h.connection.state).toBe("Live");
   expect(seen).toEqual([["kite"]]);
+});
+
+test("generated S4 fleet state reaches presentation without discarding the row", () => {
+  const { h, last } = subscribed();
+  send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+  send(h, upsert(1, row("fixture-agent", { state: { turn: "working", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} } })));
+  expect(last().map((value) => [value.id, value.state])).toEqual([["fixture-agent", "working"]]);
+});
+
+test("a newer phase keeps the fleet row and renders unknown", () => {
+  const { h, last } = subscribed();
+  send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+  send(h, upsert(1, row("fixture-agent", { state: agentState("dancing" as Phase) })));
+  expect(last().map((value) => [value.id, value.state])).toEqual([["fixture-agent", "unknown"]]);
 });

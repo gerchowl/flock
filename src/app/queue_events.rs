@@ -45,9 +45,15 @@ impl QueueEvents {
     ) -> bool {
         let mut changed = false;
         for (agent, generation, update) in workers.queue_completions(terminal) {
+            changed = true;
+            if let Err(error) = &update.offer {
+                tracing::warn!(
+                    code = error.code.as_str(),
+                    "structured queue operation refused"
+                );
+            }
             if let Some((id, result)) = update.admitted {
                 sends.complete(agent, generation, id, result);
-                changed = true;
             }
             for fact in update.facts {
                 hub.push(EventEnvelope {

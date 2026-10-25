@@ -246,7 +246,7 @@ mod tests {
         let pane = app.state.workspaces[0].focused_pane_id().unwrap();
         let id = app.state.terminal_id_for_pane(0, pane).unwrap();
         let terminal = app.state.terminals.get_mut(&id).unwrap();
-        terminal.set_agent_name("fixture".into());
+        terminal.set_agent_name("fixture".into()).unwrap();
         let removal = capture(terminal, RemovalEvent::Exit).unwrap();
         app.state.session_dirty = false;
         app.record_agent_removal(removal.clone());
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(app.state.terminals[&id].agent_id, replacement);
         let terminal = app.state.terminals.get_mut(&id).unwrap();
         terminal.clear_agent_runtime_identity_after_respawn();
-        terminal.set_agent_name("replacement".into());
+        terminal.set_agent_name("replacement".into()).unwrap();
         assert_eq!(
             capture(terminal, RemovalEvent::Exit).unwrap().agent,
             replacement.to_string()

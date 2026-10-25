@@ -8,7 +8,8 @@ use std::time::Instant;
 impl App {
     pub(super) fn handle_client_token(&mut self, id: String, method: Method) -> String {
         let codes = self.client_codes.clone();
-        let endpoint = crate::client_open::endpoint(self.state.config.client.bind);
+        let endpoint =
+            crate::client_open::endpoint(codes.bound_endpoint().or(self.state.config.client.bind));
         let authority = match self.client_token_authority() {
             Ok(authority) => authority,
             Err(code) => {

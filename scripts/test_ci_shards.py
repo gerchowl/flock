@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shlex
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,6 +36,27 @@ class RealTree(unittest.TestCase):
         # nextest.toml but to no shard would land in the unit job, serial
         # behind everything else there, and quietly rebuild the long chain.
         self.assertEqual(check_assignment(load_config(), serial_group_binaries()), [])
+
+    def test_local_ci_and_archive_build_the_shipped_web_test_set(self):
+        # The web package must share CI's exact test inventory, including code
+        # compiled only under the combination of cfg(test) and feature web.
+        root = Path(__file__).resolve().parents[1]
+        for recipe in (("ci",), ("ci-archive", "macos-15", "fixture.tar.zst")):
+            with self.subTest(recipe=recipe[0]):
+                plan = subprocess.run(
+                    ["just", "--dry-run", *recipe], cwd=root,
+                    capture_output=True, text=True, check=True,
+                )
+                commands = [shlex.split(line) for line in plan.stderr.splitlines()]
+                command, = [parts for parts in commands if parts[:2] == ["cargo", "nextest"]]
+                self.assertEqual(command[command.index("--features") + 1], "web,ts")
+        plan = subprocess.run(
+            ["just", "--dry-run", "ci-shard", "macos-15", "unit-1", "fixture.tar.zst"],
+            cwd=root, capture_output=True, text=True, check=True,
+        )
+        # Shards consume that archive rather than rebuilding a narrower feature set.
+        self.assertIn('--archive-file "fixture.tar.zst"', plan.stderr)
+        self.assertNotIn("--features", plan.stderr)
 
     def test_the_serial_group_is_read_from_nextest_toml(self):
         self.assertIn("mesh_step1", serial_group_binaries())

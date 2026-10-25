@@ -81,7 +81,7 @@ pub fn write_clipboard(_bytes: &[u8]) -> bool {
 }
 
 /// Unsupported platform stub.
-pub fn open_url(_url: &str) -> std::io::Result<()> {
+pub(super) fn open_validated_url(_url: &str) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "opening URLs is not supported on this platform",

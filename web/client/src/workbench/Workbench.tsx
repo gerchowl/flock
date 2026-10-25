@@ -22,7 +22,8 @@ import { Transcript, type TranscriptSource } from "../views/Transcript";
 import type { InboxCard } from "./inbox";
 import { Composer, createComposerState, type Sender } from "./Composer";
 import { Palette } from "./Palette";
-import { AgentRowButton, AgentTitle, InboxCards, Waits } from "./parts";
+import { createPermissionInbox } from "./permissions";
+import { AgentRowButton, AgentTitle, InboxCards, Waits, createClosedIds } from "./parts";
 import { PhoneWorkbench } from "./Phone";
 import "./workbench.css";
 
@@ -60,15 +61,22 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
   const composer = createComposerState();
   const [rows, setRows] = createSignal<readonly AgentRow[]>([]);
   const [fleetNote, setFleetNote] = createSignal<string | null>("Loading the agent list…");
+  // Live, the inbox is the open permission prompts the fleet lists; fixture mode keeps its samples.
+  const permissions = props.source === "live" ? createPermissionInbox(props.transport) : null;
+  onCleanup(() => permissions?.close());
+  const cards = (): readonly InboxCard[] => permissions?.cards() ?? props.inbox;
+  const closed = createClosedIds(cards);
   onCleanup(
     props.fleet.subscribe({
       rows: (next) => {
         setRows(next);
         setFleetNote(next.length === 0 ? "No agents on this server yet." : null);
+        permissions?.track(next);
       },
       failed: (message) => {
         setRows([]);
         setFleetNote(message);
+        permissions?.track([]);
       },
     }),
   );
@@ -139,7 +147,7 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
       </main>
       <aside class="inbox" aria-label="Inbox" data-testid="inbox">
         <h2 class="inbox__title">Inbox</h2>
-        <InboxCards cards={props.inbox} />
+        <InboxCards cards={cards()} closed={closed} source={props.source} sender={props.sender} />
       </aside>
     </div>
   );
@@ -155,7 +163,8 @@ export function Workbench(props: WorkbenchProps): JSX.Element {
         widened={() => !phone()}
         transport={props.transport}
         source={props.source}
-        inbox={props.inbox}
+        inbox={cards()}
+        closed={closed}
         sender={props.sender}
         composer={composer}
       />

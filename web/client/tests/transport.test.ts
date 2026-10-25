@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { permissionLifecycle } from "../src/gen/FixtureExamples";
 import type { KnownSessionEvent } from "../src/gen/KnownSessionEvent";
 import type { SessionEntry } from "../src/transport";
 import { FIXTURE_STREAM, classifyStoredLine, createFixtureTransport } from "../src/transport/fixture";
@@ -8,6 +9,8 @@ import { readFixture, readVariants, replay } from "./fixture-replay";
 /** The variant name `variants.txt` uses, by narrowing the generated union. */
 function variant(event: KnownSessionEvent): string {
   switch (event.type) {
+    case "flk_permission_request":
+      return "PermissionRequest";
     case "assistant":
       return "Assistant";
     case "user":
@@ -127,4 +130,15 @@ describe("fixture transport", () => {
     expect(classifyStoredLine(5, "not json")).toEqual({ seq: 5, kind: "unknown", unknown: { raw: "not json", shape: null } });
     expect(classifyStoredLine(6, "").kind).toBe("unknown");
   });
+});
+
+test("permission audit fixtures classify as known open and standalone closed records", () => {
+  for (const payload of permissionLifecycle) {
+    if (!("state" in payload)) continue;
+    const entry = classifyStoredLine(1, JSON.stringify(payload));
+    expect(entry.kind).toBe("known");
+    if (entry.kind !== "known") throw new Error("permission record classified as unknown");
+    expect(variant(entry.event)).toBe("PermissionRequest");
+  }
+  expect(classifyStoredLine(1, JSON.stringify({ type: "flk_permission_request", state: "decided" })).kind).toBe("unknown");
 });

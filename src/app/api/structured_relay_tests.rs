@@ -694,7 +694,7 @@ fn custody_completion_permanent_recovery_refusal_is_terminal_and_visible() {
                 .state,
             "refused"
         );
-        assert!(r.hub.events_after(0).iter().any(|(_,event)| matches!(&event.data,crate::api::schema::EventData::MessageDelivered { correlation_id,delivered:false,.. } if correlation_id==&d.envelope.correlation_id)));
+        assert!(r.hub.events_after(0).expect("fixture event history is retained").iter().any(|(_,event)| matches!(&event.data,crate::api::schema::EventData::MessageDelivered { correlation_id,delivered:false,.. } if correlation_id==&d.envelope.correlation_id)));
         r.stop().await;
     });
 }
@@ -1026,17 +1026,25 @@ fn custody_completion_settled_unknown_recipient_does_not_emit_a_refusal() {
             .structured_agents
             .remove(&r.case.id, r.case.generation)
             .unwrap();
-        let cursor = r.hub.events_after(0).last().map_or(0, |(seq, _)| *seq);
+        let cursor = r
+            .hub
+            .events_after(0)
+            .expect("fixture event history is retained")
+            .last()
+            .map_or(0, |(seq, _)| *seq);
         r.app.restore_mesh_mail().unwrap();
-        assert!(
-            !r.hub.events_after(cursor).iter().any(|(_, event)| matches!(
+        assert!(!r
+            .hub
+            .events_after(cursor)
+            .expect("fixture event cursor is retained")
+            .iter()
+            .any(|(_, event)| matches!(
                 &event.data,
                 crate::api::schema::EventData::MessageDelivered {
                     delivered: false,
                     ..
                 }
-            ))
-        );
+            )));
         assert_eq!(
             with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
                 .unwrap()

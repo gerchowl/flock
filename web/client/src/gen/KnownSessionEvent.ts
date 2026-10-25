@@ -18,6 +18,7 @@ import type { MessageStart } from "./MessageStart";
 import type { MessageStop } from "./MessageStop";
 import type { PeerMessageHold } from "./PeerMessageHold";
 import type { PermissionDenied } from "./PermissionDenied";
+import type { PermissionRecord } from "./PermissionRecord";
 import type { RateLimit } from "./RateLimit";
 import type { Status } from "./Status";
 import type { Success } from "./Success";
@@ -32,4 +33,4 @@ import type { User } from "./User";
  * Deserialization uses the adapter parser and rejects unknown payloads;
  * those require the separate unknown wrapper, including its shape key.
  */
-export type KnownSessionEvent = Assistant | User | CommandLifecycle | Init | Status | ThinkingTokens | CompactBoundary | PermissionDenied | HookStarted | HookResponse | PeerMessageHold | RateLimit | CanUseTool | ControlCancel | ControlSuccess | ControlError | MessageStart | ContentBlockStart | ContentBlockDelta | ContentBlockStop | MessageDelta | MessageStop | Success | ExecutionError;
+export type KnownSessionEvent = PermissionRecord | Assistant | User | CommandLifecycle | Init | Status | ThinkingTokens | CompactBoundary | PermissionDenied | HookStarted | HookResponse | PeerMessageHold | RateLimit | CanUseTool | ControlCancel | ControlSuccess | ControlError | MessageStart | ContentBlockStart | ContentBlockDelta | ContentBlockStop | MessageDelta | MessageStop | Success | ExecutionError;

@@ -496,8 +496,12 @@ fn restore_tab(
             }
         };
 
-        let saved_label = saved_pane.and_then(|p| p.label.clone());
-        let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
+        let saved_name = saved_pane.and_then(|p| p.agent_name.clone());
+        let saved_label = crate::terminal::agent_name::received(
+            saved_pane.and_then(|p| p.label.clone()),
+            "manual_label_restore",
+        );
+        let saved_agent_name = crate::terminal::agent_name::received(saved_name, "session_restore");
         // #332: a restored agent keeps the run id it was spawned under. Its
         // commits keep their `Agent-Run:` trailers across a restart either
         // way, so an agent that forgot its own run id would strand them.
@@ -577,10 +581,14 @@ fn restore_tab(
             terminal.last_prompt = saved_last_prompt.clone();
             terminal.header_reserved = saved_header_reserved;
             if let Some(label) = saved_label {
-                terminal.set_manual_label(label);
+                if terminal.set_manual_label(label).is_err() {
+                    crate::logging::agent_name_dropped("manual_label_restore");
+                }
             }
             if let Some(agent_name) = saved_agent_name {
-                terminal.set_agent_name(agent_name);
+                if terminal.set_agent_name(agent_name).is_err() {
+                    crate::logging::agent_name_dropped("session_restore");
+                }
             }
             terminal.run_id = saved_run_id.clone();
             terminal.spawn_depth = saved_spawn_depth;
@@ -657,10 +665,14 @@ fn restore_tab(
                     }
                 }
                 if let Some(label) = saved_label {
-                    terminal.set_manual_label(label);
+                    if terminal.set_manual_label(label).is_err() {
+                        crate::logging::agent_name_dropped("manual_label_restore");
+                    }
                 }
                 if let Some(agent_name) = saved_agent_name {
-                    terminal.set_agent_name(agent_name);
+                    if terminal.set_agent_name(agent_name).is_err() {
+                        crate::logging::agent_name_dropped("session_restore");
+                    }
                 }
                 terminal.run_id = saved_run_id.clone();
                 terminal.spawn_depth = saved_spawn_depth;
@@ -1606,6 +1618,102 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = runtime.try_send_bytes(bytes::Bytes::from_static(b"exit\n"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_agent_name_restore_drops_names_in_shell_and_native_paths() {
+        let mut failures = Vec::new();
+        for native in [false, true] {
+            for (case, name) in crate::test_support::hostile_agent_names() {
+                let (mut snapshot, _) = snapshot_with_saved_pane_history();
+                let pane = snapshot.workspaces[0].tabs[0]
+                    .panes
+                    .values_mut()
+                    .next()
+                    .unwrap();
+                pane.agent_name = Some(name.clone());
+                pane.label = Some(name.clone());
+                if native {
+                    pane.agent_session = Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                        source: "flock:codex".into(),
+                        agent: "codex".into(),
+                        kind: crate::agent_resume::AgentSessionRefKind::Id,
+                        value: "fixture-session".into(),
+                    });
+                }
+                let shell = crate::test_support::no_op_program();
+                let (events, _rx) = mpsc::channel(64);
+                let mut retained = false;
+                let logs = crate::logging::capture_logs(|| {
+                    let (_, terminals, mut runtimes) = restore(
+                        &snapshot,
+                        None,
+                        5,
+                        40,
+                        4096,
+                        &shell,
+                        crate::config::ShellModeConfig::NonLogin,
+                        true,
+                        events,
+                        Arc::new(Notify::new()),
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    retained = terminals.values().any(|terminal| {
+                        terminal.agent_name().is_some() || terminal.manual_label.is_some()
+                    });
+                    for (_, runtime) in runtimes.drain() {
+                        runtime.shutdown();
+                    }
+                });
+                if retained || !logs.contains("code=\"invalid_agent_name\"") {
+                    failures.push((native, case));
+                }
+                assert!(
+                    !logs.contains(&name),
+                    "rejected name must not reach logs: {case}"
+                );
+            }
+        }
+        assert!(failures.is_empty(), "unsafe restore cases: {failures:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_label_restore_drops_unmirrored_manual_label() {
+        for (case, label) in crate::test_support::hostile_agent_names() {
+            let (mut snapshot, _) = snapshot_with_saved_pane_history();
+            let pane = snapshot.workspaces[0].tabs[0]
+                .panes
+                .values_mut()
+                .next()
+                .unwrap();
+            pane.label = Some(label.clone());
+            assert!(pane.agent_name.is_none());
+            let (events, _rx) = mpsc::channel(64);
+            let shell = crate::test_support::no_op_program();
+            let mut retained = false;
+            let logs = crate::logging::capture_logs(|| {
+                let (_, terminals, mut runtimes) = restore(
+                    &snapshot,
+                    None,
+                    5,
+                    40,
+                    4096,
+                    &shell,
+                    crate::config::ShellModeConfig::NonLogin,
+                    false,
+                    events,
+                    Arc::new(Notify::new()),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                retained = terminals.values().any(|t| t.manual_label.is_some());
+                for (_, runtime) in runtimes.drain() {
+                    runtime.shutdown();
+                }
+            });
+            assert!(!retained, "manual label retained: {case}");
+            assert!(logs.contains("invalid_agent_name"));
+            assert!(!logs.contains(&label));
+        }
     }
 
     fn snapshot_with_saved_pane_history() -> (SessionSnapshot, SessionHistorySnapshot) {

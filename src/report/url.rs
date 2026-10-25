@@ -186,15 +186,9 @@ fn encode(value: &str) -> String {
     out
 }
 
-/// Gate for anything handed to the platform URL opener.
-///
-/// `crate::platform::open_url` passes its argument straight to `open`/
-/// `xdg-open` with no `--` separator, so a value beginning with `-` would be
-/// read as an option (`open` honours `-a`, `-b`, `-g`). Refusing anything that
-/// is not an `https://github.com/` URL closes that off at this call site
-/// regardless of what the opener does.
+/// Apply the platform link policy, narrowed to report's HTTPS GitHub destination.
 pub fn is_safe_to_open(url: &str) -> bool {
-    url.starts_with("https://github.com/") && !url.contains(['\n', '\r', '\0', ' '])
+    crate::platform::validate_url(url).is_ok() && url.starts_with("https://github.com/")
 }
 
 /// Which fields carry human prose, paired with the values supplied.
@@ -332,6 +326,17 @@ mod tests {
                     assert!(index + 2 < bytes.len(), "dangling escape in {}", built.url);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn report_gate_inherits_platform_control_and_whitespace_policy() {
+        for url in [
+            "https://github.com/o/r\tbad",
+            "https://github.com/o/r\u{7f}bad",
+            "https://github.com/o/r\u{a0}bad",
+        ] {
+            assert!(!is_safe_to_open(url));
         }
     }
 
