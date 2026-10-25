@@ -721,8 +721,20 @@ fn custody_completion_unknown_retries_in_process_with_the_same_key() {
     run(async {
         let _store = crate::mesh::runtime_store::TestStore::new();
         let mut r = setup(2504).await;
+        let admission = r
+            .app
+            .structured_workers
+            .runtime(&r.case.id, r.case.generation)
+            .unwrap()
+            .hold_queue_admission();
         let d = mail(&r);
         let rx = request(&mut r, d.clone());
+        assert_eq!(
+            r.app
+                .structured_workers
+                .queue_custody_committed(&r.case.id, &d.envelope.key),
+            Err(crate::structured::queue::custody::Unknown::AdmissionPending)
+        );
         r.app.structured_sends.complete(
             r.case.id.clone(),
             r.case.generation,
@@ -732,9 +744,10 @@ fn custody_completion_unknown_retries_in_process_with_the_same_key() {
                 source: None,
             }),
         );
-        // Keep the owner unavailable until the failed receipt is processed.
-        // Its real commit may finish, but cannot race the unknown observation.
-        let mut owner = std::mem::replace(
+        // Deliberate fault injection: hide the live owner from the App while
+        // processing the uncertain receipt. The admission gate keeps the original
+        // journal commit pending, rather than merely hiding a completed commit.
+        let owner = std::mem::replace(
             &mut r.app.structured_workers,
             crate::structured::workers::Workers::new(r.notify.clone()),
         );
@@ -757,45 +770,70 @@ fn custody_completion_unknown_retries_in_process_with_the_same_key() {
                 .is_some(),
             "unknown custody must have a recovery deadline"
         );
-        let notify = r.notify.clone();
-        // Observe owner facts without running custody recovery, which could
-        // enqueue another admission while the original commit is still pending.
-        crate::structured::workers::tests::wait(&notify, || {
-            owner.poll(
-                &mut r.app.state.structured_agents,
-                std::time::Instant::now(),
-                crate::app::notifications::now_ms(),
-            );
-            r.app.queue_events.poll(
-                &owner,
-                &r.app.state.structured_agents,
-                &r.app.event_hub,
-                &mut r.app.structured_sends,
-            );
-            assert!(
-                owner.report(&r.case.id, r.case.generation).is_none(),
-                "journal owner exited before commit proof"
-            );
-            owner.queue_custody_committed(&r.case.id, &d.envelope.key) == Ok(true)
-        })
-        .await;
         r.app.structured_workers = owner;
         let due = r
             .app
             .structured_sends
             .recovery_deadline(std::time::Instant::now())
-            .expect("committed custody still awaits App settlement");
+            .expect("unknown custody must have a recovery deadline");
         r.app.service_structured_workers(due);
         assert_eq!(
+            r.app
+                .structured_workers
+                .queue_custody_committed(&r.case.id, &d.envelope.key),
+            Err(crate::structured::queue::custody::Unknown::AdmissionPending),
+            "recovery must run while the original admission is unresolved"
+        );
+        assert!(r
+            .app
+            .structured_sends
+            .recovering
+            .iter()
+            .any(|signed| signed.key == d.envelope.key));
+        drop(admission);
+        let notify = r.notify.clone();
+        // This runtime uses real time. Drive the custody scheduler's supplied
+        // Instant to each retry deadline, as the production event loop does,
+        // while continuing real worker frames until a later receipt settles it.
+        crate::structured::workers::tests::wait(&notify, || {
+            r.app.service_structured_workers(std::time::Instant::now());
+            if let Some(due) = r
+                .app
+                .structured_sends
+                .recovery_deadline(std::time::Instant::now())
+            {
+                r.app.finish_structured_messages(false, due);
+            }
+            assert!(
+                r.app
+                    .structured_workers
+                    .report(&r.case.id, r.case.generation)
+                    .is_none(),
+                "owner exited before custody settled"
+            );
             with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
                 .unwrap()
                 .unwrap()
-                .state,
-            "delivered",
-            "positive proof settles on the current recovery frame"
+                .state
+                == "delivered"
+        })
+        .await;
+        assert_eq!(
+            r.app
+                .structured_workers
+                .queue_custody_committed(&r.case.id, &d.envelope.key),
+            Ok(true)
         );
         r.until(|r| !r.inputs().is_empty()).await;
-        assert_eq!(r.inputs().len(), 1);
+        let inputs = r.inputs();
+        assert_eq!(inputs.len(), 1);
+        let text = inputs[0]["input"]["message"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            text.contains(&format!("(item {}):", d.envelope.key.lifecycle_id())),
+            "{text}"
+        );
         r.stop().await;
     });
 }

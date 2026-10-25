@@ -27,6 +27,18 @@ struct CustodyIndex {
     items: Arc<Vec<Item>>,
     pending: std::collections::HashMap<crate::mesh::key::MessageKey, usize>,
     uncertain: Option<Unknown>,
+    #[cfg(test)]
+    hold_admission: bool,
+}
+/// Instance-scoped test fault: keep requests pending before their journal commit.
+/// Dropping the guard always lets the owner resume, including on assertion failure.
+#[cfg(test)]
+pub(crate) struct AdmissionHold(CommittedCustody);
+#[cfg(test)]
+impl Drop for AdmissionHold {
+    fn drop(&mut self) {
+        self.0.lock().hold_admission = false;
+    }
 }
 impl CustodyIndex {
     fn finish(&mut self, key: crate::mesh::key::MessageKey, unknown: Option<Unknown>) {
@@ -94,6 +106,15 @@ pub(in crate::structured) struct Client {
     committed_custody: CommittedCustody,
 }
 impl Client {
+    /// Pause this test instance before commit until its admission guard drops.
+    #[cfg(test)]
+    pub(crate) fn hold_admission(&self) -> AdmissionHold {
+        let mut index = self.committed_custody.lock();
+        assert!(!index.hold_admission, "admission is already held");
+        index.hold_admission = true;
+        AdmissionHold(self.committed_custody.clone())
+    }
+
     pub fn custody_committed(&self, key: &crate::mesh::key::MessageKey) -> Result<bool, Unknown> {
         // Only clone the committed fold under the lock; lookup is linear in
         // retained items, with no file I/O or extra historical-key allocation.
@@ -227,6 +248,8 @@ impl Service {
             items: scheduler.journal().item_snapshot(),
             pending: Default::default(),
             uncertain: scheduler.journal().commitment_unknown(),
+            #[cfg(test)]
+            hold_admission: false,
         }));
         Ok((
             Self {
@@ -336,6 +359,10 @@ impl Service {
     /// Whether this operation failed at the stdin boundary.
     pub fn tick(&mut self, input: &InputHandle, stopped: bool, notify: &impl Fn()) -> bool {
         self.capture(notify);
+        #[cfg(test)]
+        if self.committed_custody.lock().hold_admission {
+            return false;
+        }
         let mut changed = self.initial;
         if let Ok(state) = self.states.try_recv() {
             if state.through >= self.required {
