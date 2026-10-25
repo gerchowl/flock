@@ -20,6 +20,14 @@ class CiChanges(unittest.TestCase):
                       ["CHANGELOG.md"], ["nested/NOTES.md"], ["flake.nix"], [], [""]):
             self.assertFalse(self.skip(paths), paths)
 
+    def test_rename_generated_and_script_tested_paths_run_everything(self):
+        # `--no-renames` lists both sides of a rename: the old path is outside the allow-list.
+        self.assertFalse(self.skip(["src/x.rs", "docs/x.rs"]))
+        self.assertFalse(self.skip(["web/client/src/gen/types.ts"]))
+        self.assertFalse(self.skip(["website/scripts/prepare-docs.mjs"]))
+        # Safe only because script-tests run in a job that is never skipped.
+        self.assertTrue(self.skip(["README.md"]))
+
     def test_never_on_batches_or_non_pr_events(self):
         self.assertFalse(self.skip(["docs/a.md"], head="land/b231"))
         self.assertFalse(self.skip(["docs/a.md"], head="LAND/b231"))

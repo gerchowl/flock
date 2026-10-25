@@ -70,7 +70,7 @@ class PlatformPolicy(unittest.TestCase):
                                  ('push', '', 'refs/heads/dev'), ('push', '', 'refs/heads/main')]:
             for platform, gate_name in [('macos', 'check-macos'), ('ubuntu', 'check-ubuntu')]:
                 gate = self.ci['jobs'][gate_name]
-                self.assertEqual(gate['needs'], ['changes', platform])
+                self.assertEqual(gate['needs'], ['changes', platform] + (['script-tests'] if platform == 'ubuntu' else []))
                 self.assertEqual(gate['if'], 'always()')
                 self.assertFalse(gate.get('continue-on-error', False))
                 step = next(step for step in gate['steps'] if step['name'] == 'Require every job of the leg')
@@ -131,8 +131,27 @@ class PlatformPolicy(unittest.TestCase):
         job = self.ci['jobs']['changes']
         decide = next(step for step in job['steps'] if step.get('id') == 'decide')
         self.assertIn('scripts/ci_changes.py', decide['run'])
+        self.assertIn('git diff --no-renames --name-only', decide['run'])
         self.assertEqual(decide['env']['HEAD_REF'], '${{ github.head_ref }}')
         self.assertEqual(job['steps'][0]['with']['fetch-depth'], 0)
         out = subprocess.run(['/bin/sh', '-c', decide['run'].split('fi\n')[0] + 'fi'], capture_output=True,
                              text=True, env={**os.environ, 'EVENT': 'push', 'GITHUB_OUTPUT': '/dev/stdout'})
         self.assertEqual(out.stdout.strip(), 'skip_rust=false')
+
+    def test_script_tests_run_in_a_job_that_is_never_skipped_and_gate_the_ubuntu_check(self):
+        job = self.ci['jobs']['script-tests']
+        self.assertNotIn('if', job)
+        self.assertIn('nix develop -c just script-tests', [s.get('run') for s in job['steps']])
+        self.assertIn('script-tests', self.ci['jobs']['check-ubuntu']['needs'])
+        lint_runs = [s.get('run', '') for s in self.leg['jobs']['lint']['steps']]
+        self.assertFalse(any('script-tests' in r for r in lint_runs))
+
+    def test_ubuntu_gate_fails_unless_script_tests_succeeded(self):
+        gate = self.ci['jobs']['check-ubuntu']
+        step = next(step for step in gate['steps'] if step['name'] == 'Require the maintenance script tests')
+        self.assertEqual(step['if'], 'always()')
+        self.assertEqual(step['env']['SCRIPT_TESTS'], '${{ needs.script-tests.result }}')
+        for result, code in [('success', 0), ('failure', 1), ('cancelled', 1), ('skipped', 1), ('', 1)]:
+            outcome = subprocess.run(['/bin/sh', '-c', step['run']], capture_output=True, text=True,
+                                     env={**os.environ, 'SCRIPT_TESTS': result}, timeout=10)
+            self.assertEqual(outcome.returncode, code, result)

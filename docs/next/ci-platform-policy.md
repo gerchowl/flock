@@ -42,7 +42,11 @@ paths. An ordinary pull request touching only `docs/`, `website/`, `web/client/`
 or root-level Markdown skips the Rust legs (both `ubuntu-latest` and `macos-15`
 build/lint/test); the `client` job still runs. Paths read by Rust or script tests
 or release tooling are never skippable: `docs/next/`, `web/client/test/fixtures/`,
-`website/latest.json`, `CHANGELOG.md`. Detection fails safe: any other path, an
+`web/client/src/gen/` (generated TS checked by a Rust test), `website/scripts/`,
+`website/latest.json`, `CHANGELOG.md`. Changed paths come from
+`git diff --no-renames`, so a rename lists both sides. The maintenance script tests
+(which read some README/docs files) run in their own `script-tests` job on every
+event, and `check (ubuntu-latest)` requires it, so they are never skipped. Detection fails safe: any other path, an
 empty diff, a `land/` head, `merge_group`, push, or a failed `changes` job runs
 everything. The `check (...)` gates still run with `always()`; they accept a
 `skipped` leg only when `changes` explicitly reported `skip_rust=true`.

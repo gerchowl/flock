@@ -80,8 +80,40 @@ jobs:
             echo "skip_rust=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git diff --name-only "$BASE_SHA...$HEAD_SHA" > changed.txt
+          git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA" > changed.txt
           python3 scripts/ci_changes.py "$EVENT" "$HEAD_REF" < changed.txt >> "$GITHUB_OUTPUT"
+
+  # Maintenance-script tests and the platform test-gap ratchet (#597). Some of
+  # them read docs/website/README files, so they run on EVERY event, outside
+  # the skippable Rust legs, and `check (ubuntu-latest)` requires them.
+  script-tests:
+    name: script-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            always-allow-substitutes = true
+
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-
+          save: ${{ github.ref == 'refs/heads/dev' }}
+          gc-max-store-size-linux: 2G
+          gc-max-store-size-macos: 2G
+
+      - name: Run maintenance script tests
+        run: nix develop -c just script-tests
 
   # One platform each, split into lint, build and parallel test-shard jobs
   # (ci-leg.yml, #991). Each OS is its own reusable-workflow call so its
@@ -157,7 +189,7 @@ jobs:
   # run the result gate and fail explicitly, rather than permit an untested merge.
   check-ubuntu:
     name: check (ubuntu-latest)
-    needs: [changes, ubuntu]
+    needs: [changes, ubuntu, script-tests]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -177,6 +209,16 @@ jobs:
       - name: Summarize shards
         continue-on-error: true
         run: python3 scripts/ci_shards.py summary --title 'check (ubuntu-latest)' --strip-prefix junit-ubuntu-latest- junit >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require the maintenance script tests
+        if: always()
+        env:
+          SCRIPT_TESTS: ${{ needs.script-tests.result }}
+        run: |
+          if [ "$SCRIPT_TESTS" != success ]; then
+            echo "script-tests ended as $SCRIPT_TESTS" >&2
+            exit 1
+          fi
 
       - name: Require every job of the leg
         if: always()
