@@ -681,7 +681,7 @@ fn reload_evidence_rejects_self_copies_and_does_not_scan_other_methods() {
 }
 
 #[test]
-fn startup_limit_2397_and_event_hub_owner_match_reload_evidence() {
+fn live_copy_and_event_hub_owners_match_reload_evidence() {
     let catalog = core_catalog().unwrap();
     let (copied, event_hub) = reload_evidence(include_str!("../../app/mod.rs"));
     assert!(
@@ -689,26 +689,16 @@ fn startup_limit_2397_and_event_hub_owner_match_reload_evidence() {
         "event hub must receive config.events.read_max_wait_ms"
     );
     for field in &catalog.fields {
-        if field.reload_issue == Some(2397) {
-            assert_eq!(field.reload, ReloadOwner::ProcessStartup);
-            assert!(
-                !copied.contains(field.path.split('.').next().unwrap()),
-                "#2397 changed: {} needs owner review",
-                field.path
-            );
+        // Use the same incoming-copy evidence as the general AppLive guard.
+        // Mixed containers can still own cached children, such as ui.disk_path.
+        if copied.contains(&field.path) {
+            assert_ne!(field.reload, ReloadOwner::ProcessStartup, "{}", field.path);
+            assert_eq!(field.reload_issue, None, "{}", field.path);
         }
         if field.path == "events" || field.path.starts_with("events.") {
             assert_eq!(field.reload, ReloadOwner::EventHubLive);
         }
     }
-    assert_eq!(
-        catalog
-            .fields
-            .iter()
-            .filter(|f| f.reload_issue == Some(2397))
-            .count(),
-        15
-    );
 }
 
 #[test]
