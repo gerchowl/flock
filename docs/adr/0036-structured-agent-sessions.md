@@ -3398,3 +3398,31 @@ changes (#2043); use a fresh server after changing launch/admission policy.
 `[sessions]` live-reload semantics remain tracked by #1975. The dogfood isolates
 its policy cases in fresh servers rather than assuming a successful reload
 report changed these startup values.
+
+### Amendment: S5 reserved queue kinds (#2364)
+
+`finding`, `delegate_result` and `reload_notice` are reserved known queue kinds,
+not currently enabled producers. Keep their typed serialized names and lossless
+round trips so retained data and future clients can be inspected today:
+
+| Kind | Future producer | Tracker |
+| --- | --- | --- |
+| `finding` | S13 fork-return channel into the parent's queue | #2365 |
+| `delegate_result` | Server-owned structured delegate completion and receipt | #2419 |
+| `reload_notice` | S11 structured reload lifecycle and init-difference notice | #2420 |
+
+Until those producers exist, shared admission refuses every reserved kind from
+every principal/producer and gate with registered `queue_kind_reserved` (retry
+`never`, CLI exit 2). No journal append, cursor advance or queue mutation occurs.
+There is no operator override. Enabling one requires its producer slice and
+explicit authenticated admission policy; merely sending the enum name is not
+permission to create it.
+
+Retained reserved records remain readable and round-trip with their known kind;
+loading never deletes or reinterprets them. Edits cannot release them for delivery.
+Formation durably fails a queued reserved head with the same typed reason while
+preserving its payload, rather than sending it or wedging later supported work.
+Unknown future kinds retain the existing ADR-0028 §3a behavior. The GUI's generic
+collapsed JSON renderer accepts reserved and unknown queue records without
+specialized cards or interpretation. This reservation adds no producer, queue
+command or live GUI transport.

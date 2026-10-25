@@ -1491,3 +1491,46 @@ fn assert_review_readonly_admission(mode: &str) {
     ));
     assert_eq!(fs::read(root.path()).unwrap(), bytes);
 }
+
+#[test]
+fn reserved_kinds_refuse_every_producer_before_any_mutation() {
+    let root = Root::new();
+    let mut q = queue(&root);
+    let before = fs::read(root.path()).unwrap();
+    for kind in [Kind::Finding, Kind::DelegateResult, Kind::ReloadNotice] {
+        for producer in [
+            Producer::Human,
+            Producer::Agent("sender".into()),
+            Producer::Channel {
+                binding: "fixture".into(),
+                user: "user".into(),
+            },
+            Producer::System("source".into()),
+            Producer::Fork("child".into()),
+            Producer::Unknown(json!("future_source")),
+        ] {
+            for operator in [true, false] {
+                for gate in [
+                    Gate::Send,
+                    Gate::Hold,
+                    Gate::Stash("later".into()),
+                    Gate::Drop,
+                ] {
+                    let mut candidate = input(2364);
+                    candidate.kind = kind.clone();
+                    let principal = if operator {
+                        Principal::Operator
+                    } else {
+                        Principal::Origin(producer.clone())
+                    };
+                    let failure = q.enqueue(candidate, principal, gate).unwrap_err();
+                    assert_eq!(failure.code.as_str(), "queue_kind_reserved");
+                    assert!(failure.source.is_none());
+                    assert!(q.journal().items().is_empty());
+                    assert_eq!(q.journal().replay(0).unwrap().through, 0);
+                    assert_eq!(fs::read(root.path()).unwrap(), before);
+                }
+            }
+        }
+    }
+}
