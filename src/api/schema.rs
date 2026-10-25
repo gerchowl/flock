@@ -1106,8 +1106,20 @@ pub const AGENT_HISTORY_DEFAULT_TURNS: u32 = 20;
 /// poll and a response nobody can read.
 pub const AGENT_HISTORY_MAX_TURNS: u32 = 200;
 
+/// Durable `agent.send` acknowledgement shared with the operator queue API.
+/// This lifecycle UUID names custody; execution is reported by queue facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AgentSendResult {
+    /// Canonical queue item identity, stable across identical admission retries.
+    pub item_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSendParams {
+    /// Optional canonical UUID for idempotent structured admission retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
     /// Raw-write milliseconds: integer 1..=30000, default 10000. Not a submit budget.
     #[serde(
         default,
@@ -1117,7 +1129,9 @@ pub struct AgentSendParams {
     pub write_timeout_ms: Option<serde_json::Value>,
     pub target: String,
     pub text: String,
-    /// Guard an empty idle composer, send delayed Enter and confirm with one retry.
+    /// Terminal: guard the composer, send delayed Enter and confirm the submit.
+    /// Structured: admit one durable at-idle item and acknowledge its lifecycle UUID.
+    /// False is refused for structured targets before queue or stdin work.
     #[serde(default)]
     pub submit: bool,
     /// Without `submit`, type even when the target is an agent pane whose composer holds a
@@ -2735,6 +2749,8 @@ pub enum EventMatch {
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     StructuredGrantRevoked,
+    /// ADR-0036 §4: committed queue item transition, linked to its queue cursor.
+    QueueItemState,
     MeshRoutesChanged,
     MeshOutboundPending,
     WorkspaceCreated,
@@ -2869,6 +2885,7 @@ impl EventKind {
     pub fn is_persisted(self) -> bool {
         match self {
             Self::StructuredGrantRevoked
+            | Self::QueueItemState
             | Self::WorkspaceCreated
             | Self::WorkspaceUpdated
             | Self::WorkspaceClosed
@@ -3060,6 +3077,10 @@ pub enum ResponseResult {
         grants: Vec<crate::structured::permissions::grants::SessionGrant>,
         #[serde(skip_serializing_if = "Option::is_none")]
         revoked: Option<crate::structured::permissions::grants::GrantHandle>,
+    },
+    /// Durable structured admission, before eventual harness delivery.
+    AgentQueued {
+        item_id: String,
     },
     ClientTokenIssued {
         issued: super::client_tokens::Issued,
@@ -4389,6 +4410,8 @@ pub enum EventData {
         request_seq: u64,
         principal: String,
     },
+    /// ADR-0036 §4: only state changes, never adds, edits or checkpoints.
+    QueueItemState(crate::api::queue_event::QueueItemState),
     MeshRoutesChanged {},
     MeshOutboundPending {},
     WorkspaceCreated {

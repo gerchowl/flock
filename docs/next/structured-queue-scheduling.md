@@ -85,11 +85,13 @@ available after process exit. Relaunch refuses with `session_busy` while any
 completion remains unread. An unchanged storage refusal does not generate another
 completion per harness event.
 
-The app drains bounded completion notifications after the owner publishes each
-committed cut. Operator resume therefore works after cleanup, including sessions
-started with an MCP opening turn. Internal adapters must drain completions too.
-Shutdown cancellation reports incomplete notification delivery and requires durable
-replay. Producer routing remains #1957/#1958; global facts follow in #1956.
+The application drains completions for lifecycle publication and durable send
+acknowledgements before relaunch. Shutdown cancellation explicitly reports
+incomplete notification delivery and requires durable replay. Final persisted
+records drain before reservation retirement. Operator admission uses the shared
+send service (#1957); authenticated message custody routing remains #1958.
+Operator resume works after cleanup for idle starts and MCP opening turns.
+
 
 The landed production launch path in #1843 now supplies the configured policy to
 these worker-owned queues, enforcing the production checkpoint requirement in

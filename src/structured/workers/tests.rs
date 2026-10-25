@@ -409,9 +409,24 @@ async fn explicit_stop_closes_open_request_and_releases_only_after_completion() 
     assert!(workers.runtime(&a.id, a.generation).is_none());
     registry.remove(&a.id, a.generation).unwrap();
     workers.poll(&mut registry, now, 1000);
+    let hub = crate::api::EventHub::default();
+    crate::app::queue_events::QueueEvents::default().poll(
+        &workers,
+        &registry,
+        &hub,
+        &mut Default::default(),
+    );
+    assert!(
+        hub.events_after(0)
+            .expect("fixture event history is retained")
+            .iter()
+            .any(|(_, event)| event.event == crate::api::schema::EventKind::QueueItemState),
+        "committed exit fact must precede retirement"
+    );
+    workers.poll(&mut registry, now, 1000);
     assert!(
         !workers.entries.contains_key(&a.id),
-        "removed agents cannot accumulate completed workers"
+        "removed agents cannot accumulate completed workers after their facts drain"
     );
 }
 
@@ -1314,3 +1329,9 @@ async fn finished_without_report_allows_retained_recovery() {
     worker.report = None;
     assert!(workers.history_recovery_allowed(&case.id));
 }
+
+mod recovery;
+
+pub(crate) mod global;
+
+mod send;

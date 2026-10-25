@@ -36,7 +36,9 @@ mod revert;
 mod spawn;
 mod structured_agents;
 mod structured_grants;
+pub(crate) mod structured_queue;
 mod structured_start;
+
 mod tabs;
 pub(crate) mod workspaces;
 mod worktrees;
@@ -1454,6 +1456,13 @@ impl App {
                 .uid_policy
                 .refusal(uid, attributed, &request.method)
         }?;
+        let code = if matches!(&request.method, Method::AgentSend(p)
+            if matches!(self.structured_send_target(&p.target), Ok(Some(_))))
+        {
+            ErrorCode::NotAuthorized
+        } else {
+            code
+        };
         Some(responses::encode_error(
             request.id.clone(),
             code.as_str(),
@@ -1465,6 +1474,7 @@ impl App {
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
+        self.structured_sends.staged = None;
         self.input_writes.abandon_staged();
         self.pending_integration_install = None;
         self.detach_pending_message_relay();

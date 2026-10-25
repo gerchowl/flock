@@ -57,7 +57,8 @@ impl App {
         changed
     }
 
-    pub(super) fn handle_api_request_message(
+    /// Dispatch one socket request with its captured credentials and response owner.
+    pub(crate) fn handle_api_request_message(
         &mut self,
         msg: crate::api::ApiRequestMessage,
     ) -> bool {
@@ -218,39 +219,17 @@ impl App {
 
     /// Drain structured facts on an owner wake or exact reducer boundary.
     pub(crate) fn service_structured_workers(&mut self, now: Instant) -> bool {
-        let mut changed = self.structured_workers.poll(
+        let changed = self.structured_workers.poll(
             &mut self.state.structured_agents,
             now,
             crate::app::notifications::now_ms(),
         );
-        // The I/O owner publishes each committed cut before its completion.
-        // Drain bounded notifications here so idle/terminal workers can progress.
-        for record in self.state.structured_agents.records() {
-            let Some((_, _, generation)) = self.state.structured_agents.get(&record.agent_id)
-            else {
-                continue;
-            };
-            for index in 0..4 {
-                let Some(update) = self.structured_workers.queue_update(
-                    &self.state.structured_agents,
-                    &record.agent_id,
-                    generation,
-                ) else {
-                    break;
-                };
-                if let Err(error) = update.offer {
-                    tracing::warn!(
-                        code = error.code.as_str(),
-                        "structured queue operation refused"
-                    );
-                }
-                changed = true;
-                if index == 3 {
-                    self.render_notify.notify_one();
-                }
-            }
-        }
-        changed
+        self.queue_events.poll(
+            &self.structured_workers,
+            &self.state.structured_agents,
+            &self.event_hub,
+            &mut self.structured_sends,
+        ) || changed
     }
 
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
