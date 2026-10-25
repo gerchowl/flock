@@ -469,6 +469,58 @@ fn unknown_verbs_and_oversized_ids_refuse_without_owner_or_read_scope() {
         case.stop().await;
     });
 }
+#[test]
+fn unsupported_command_ack_keeps_socket_open_for_next_valid_decision() {
+    use crate::api::error_code::ErrorCode;
+    runtime(async {
+        let mut case = Case::new(236100).await;
+        let mut socket = case.open().await;
+        let args = case.prompt().await;
+        let before = case.handles();
+        socket.send(json!({"t":"cmd","cmd_id":"unsupported-2361","verb":"future.command","args":{},"resume_only":false})).await;
+        let frame = socket.text().await;
+        let ServerFrame::Ack {
+            cmd_id,
+            ok,
+            result,
+            error: Some(error),
+        } = serde_json::from_value(frame).unwrap()
+        else {
+            panic!("unsupported command must return a typed error ack")
+        };
+        assert_eq!(cmd_id, "unsupported-2361");
+        assert!(!ok);
+        assert!(result.is_none());
+        assert_eq!(
+            ErrorCode::from_code(&error.code),
+            Some(ErrorCode::ServerVersionGap)
+        );
+        assert_eq!(error.exit, crate::cli::exit::PROTOCOL_GAP);
+        assert_eq!(error.retry, WireRetry::AfterHandoff);
+        assert_eq!(
+            ErrorCode::ServerVersionGap.retry(),
+            crate::cli::exit::Retry::AfterHandoff
+        );
+        assert_eq!(
+            case.handles(),
+            before,
+            "unsupported verb must not answer a request"
+        );
+
+        let accepted = case
+            .command(&mut socket, "agent.decide", args.clone())
+            .await;
+        assert_eq!(accepted["cmd_id"], "command-1");
+        assert_eq!(accepted["ok"], true);
+        assert_eq!(accepted["result"]["request_id"], args["request_id"]);
+        assert_eq!(accepted["result"]["decision"], args["decision"]);
+        assert!(accepted.get("error").is_none());
+        case.until(|r| r.handles().len() == 1).await;
+        assert_eq!(case.handles()[0].0, "other-request");
+        case.stop().await;
+    });
+}
+
 async fn enqueue_without_owner(server: &Server, socket: &mut Socket, id: String, target: &str) {
     let admitted = server.wake.notified();
     tokio::pin!(admitted);
