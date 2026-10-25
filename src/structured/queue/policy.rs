@@ -27,7 +27,17 @@ impl Journal {
     /// before tail repair. Supported crash-torn tails otherwise retain repair.
     /// Known journals wait until an explicit check or append to rewrite.
     pub fn open_with_policy(data: &Path, agent: &str, policy: RewritePolicy) -> io::Result<Self> {
-        Self::open_inner(data, agent, Some(policy))
+        Self::open_inner(data, agent, Some(policy), true)
+    }
+    /// Recover an existing private journal and lease without creating either.
+    /// This applies the same policy, identity checks and supported tail repair
+    /// as a writer open. Cold providers must call it on their I/O worker.
+    pub(crate) fn open_existing_with_policy(
+        data: &Path,
+        agent: &str,
+        policy: RewritePolicy,
+    ) -> io::Result<Self> {
+        Self::open_inner(data, agent, Some(policy), false)
     }
     /// Check the named byte trigger under exclusive ownership and return the
     /// complete atomic publication cut. No successful cut is returned on refusal.

@@ -45,17 +45,21 @@ struct Live {
     refusal: Option<ErrorCode>,
     ended: bool,
 }
-struct Book {
+struct Book<R: parking_lot::lock_api::RawMutex = parking_lot::RawMutex> {
     retained: Arc<Cut>,
     bootstrapped: bool,
     status: Option<Pending>,
     error: Option<ErrorCode>,
     ended: bool,
     refusal: Option<ErrorCode>,
-    readers: Vec<Weak<Mutex<Live>>>,
+    readers: Vec<Weak<parking_lot::lock_api::Mutex<R, Live>>>,
 }
-impl Book {
-    fn register(&mut self, after: Option<u64>, live: Arc<Mutex<Live>>) -> Result<(), ErrorCode> {
+impl<R: parking_lot::lock_api::RawMutex> Book<R> {
+    fn register(
+        &mut self,
+        after: Option<u64>,
+        live: Arc<parking_lot::lock_api::Mutex<R, Live>>,
+    ) -> Result<(), ErrorCode> {
         if let Some(code) = self.refusal {
             live.lock().refusal = Some(code);
             return Ok(());
@@ -63,17 +67,16 @@ impl Book {
         if after.is_some_and(|n| n > self.retained.through) {
             return Err(ErrorCode::CursorAhead);
         }
-        register_live(
-            &live,
-            Packet(
-                self.retained.clone(),
-                self.status.clone(),
-                self.error,
-                true,
-                after.unwrap_or(0),
-            ),
-            self.ended,
-        );
+        let mut state = live.lock();
+        state.packets.push_back(Packet(
+            self.retained.clone(),
+            self.status.clone(),
+            self.error,
+            true,
+            after.unwrap_or(0),
+        ));
+        state.ended = self.ended;
+        drop(state);
         self.readers.retain(|r| r.strong_count() != 0);
         self.readers.push(Arc::downgrade(&live));
         Ok(())
@@ -123,7 +126,7 @@ impl Book {
         });
         if cut.gap.is_some() {
             self.retained = cut.clone();
-        } else if !cut.records.is_empty() || self.retained.through != cut.through {
+        } else if !cut.records.is_empty() || cut.through > self.retained.through {
             // A still-unread replay shares the old cut. Only an actual append
             // needs copy-on-write; status-only updates never copy its prefix.
             let retained = Arc::make_mut(&mut self.retained);
@@ -146,21 +149,46 @@ impl Book {
         });
     }
 }
-// Generic locking lets the test unlock witness observe the actual registration
-// critical section without a production test hook.
-fn register_live<R: parking_lot::lock_api::RawMutex>(
-    live: &parking_lot::lock_api::Mutex<R, Live>,
-    packet: Packet,
-    ended: bool,
-) {
-    let mut live = live.lock();
-    live.packets.push_back(packet);
-    live.ended = ended;
-}
 struct Capture(Option<u64>, Arc<Mutex<Live>>);
-/// Retained live-generation source. Cold recovery belongs to part 2 of #1956.
+/// Retained generation source. Cold opening belongs exclusively on an I/O worker.
 #[derive(Clone)]
-pub(crate) struct Source(mpsc::SyncSender<Capture>, Arc<Mutex<Book>>, Arc<Notify>);
+pub(crate) struct Source(
+    mpsc::SyncSender<Capture>,
+    Arc<Mutex<Book>>,
+    Arc<Notify>,
+    String,
+);
+impl Source {
+    /// Blocking recovery for an I/O worker only, never the server loop. The
+    /// exclusive journal lease rejects a concurrent writer. This source is ended
+    /// at its recovered cut; install must recheck the registry generation.
+    pub(super) fn open_retained(
+        data: &Path,
+        agent: &str,
+        policy: RewritePolicy,
+    ) -> Result<Self, Failure> {
+        use super::recovery::{open_error, storage_error};
+        let mut journal =
+            Journal::open_existing_with_policy(data, agent, policy).map_err(open_error)?;
+        let (mut publisher, source) =
+            Publisher::new(agent, journal.replay(0).map_err(storage_error)?);
+        publisher.finish(
+            || {
+                if let Some(reason) = journal.read_only() {
+                    return Err(Failure::from(io::Error::from(reason)));
+                }
+                journal.subscription().map_err(storage_error)
+            },
+            None,
+        );
+        drop(publisher);
+        drop(journal);
+        Ok(source)
+    }
+    pub(in crate::structured) fn belongs_to(&self, agent: &str) -> bool {
+        self.3 == agent
+    }
+}
 impl Provider for Source {
     type Error = ErrorCode;
     type Subscription = Reader;
@@ -267,7 +295,7 @@ impl Subscription for Reader {
 /// Sole writer's publication half; capture and registration share its book lock.
 pub(super) struct Publisher(Source, mpsc::Receiver<Capture>);
 impl Publisher {
-    pub fn new(cut: Cut) -> (Self, Source) {
+    pub fn new(agent: &str, cut: Cut) -> (Self, Source) {
         let (tx, rx) = mpsc::sync_channel(1);
         let source = Source(
             tx,
@@ -281,6 +309,7 @@ impl Publisher {
                 readers: Vec::new(),
             })),
             Arc::new(Notify::new()),
+            agent.into(),
         );
         (Self(source.clone(), rx), source)
     }
@@ -380,4 +409,4 @@ fn capture_locked<R: parking_lot::lock_api::RawMutex>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::structured::workers) mod tests;
