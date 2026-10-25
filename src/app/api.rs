@@ -165,6 +165,18 @@ pub(crate) struct LocalOperator<'a> {
     _app: &'a mut App,
 }
 
+impl LocalOperator<'_> {
+    /// Accepted kernel evidence from this proof's connection, never a caller argument.
+    #[allow(dead_code)] // Private #2442 PR1a store; PR1b exposes the mint adapter.
+    pub(crate) fn peer_credentials(&self) -> crate::platform::peer::Credentials {
+        crate::platform::peer::Credentials {
+            pid: self._app.current_api_peer_pid,
+            uid: self._app.current_api_peer_uid.flatten(),
+            birth: self._app.current_api_peer_birth.flatten(),
+        }
+    }
+}
+
 impl App {
     /// Mint token-management authority only from the existing kernel/lease policy.
     pub(crate) fn client_token_authority(
