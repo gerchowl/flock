@@ -96,6 +96,7 @@ impl AppQueue {
     pub(crate) fn facts(&self) -> Vec<(u64, QueueItemState)> {
         self.hub
             .events_after(0)
+            .expect("fixture event history is retained")
             .into_iter()
             .filter_map(|(seq, e)| match e.data {
                 EventData::QueueItemState(fact) => Some((seq, fact)),
@@ -132,11 +133,13 @@ impl AppQueue {
         let listener = UnixListener::bind(socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let launch = Launch {
+            opening_turn: None,
+            storage: Default::default(),
+            admission: None,
             agent_id: self.case.id.clone(),
             generation: self.case.generation,
             leases: self.case.leases.clone(),
             state: self.case.fixture.root.path().to_owned(),
-            storage: Default::default(),
             mcp: self.case.fixture.mcp(),
             stall_after: STALL,
             queue_rewrite_bytes: max_policy(),
@@ -261,7 +264,12 @@ async fn queue_global_real_app_admission_publishes_only_lifecycle_and_provider_s
         .into_iter()
         .map(|(seq, _, e)| (seq, e))
         .collect::<Vec<_>>();
-    assert_eq!(replay, r.hub.events_after(0));
+    assert_eq!(
+        replay,
+        r.hub
+            .events_after(0)
+            .expect("fixture event history is retained")
+    );
     assert!(restarted.persisted_events_after(2).is_empty());
     assert!(replay
         .iter()

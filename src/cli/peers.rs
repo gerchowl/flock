@@ -591,6 +591,15 @@ fn relay_refusal(request: &str) -> Option<(String, &'static str, String)> {
             crate::terminal::agent_name::POLICY.into(),
         ));
     }
+    if matches!(method, "agent.start" | "agent.spawn")
+        && parsed.pointer("/params/runtime").and_then(|v| v.as_str()) == Some("structured")
+    {
+        return Some((
+            id,
+            "operator_only",
+            "structured starts require local caller attribution".into(),
+        ));
+    }
     STREAMING_METHODS.contains(&method).then(|| {
         (
             id,
@@ -937,7 +946,7 @@ const SUMMARY_PUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_sec
 /// they were down: mail queued during a 1-30 s resubscribe backoff, and the
 /// change that should make the first push on connect. Stream lines carry no
 /// `seq` to resume from, so they replay what the server still holds, as every
-/// subscription did before; past its retention they get `lagged`, which
+/// subscription did before; past its retention they get a loss notice (`events_lost` on a capable server), which
 /// wakes them the same way.
 const REPLAY_FROM: u64 = 0;
 
@@ -1385,5 +1394,18 @@ mod tests {
         assert!(parse_logs_args(&args(&["--lines"])).is_err());
         assert!(parse_logs_args(&args(&["--lines", "abc"])).is_err());
         assert!(parse_logs_args(&args(&["--bogus"])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod structured_relay_tests {
+    #[test]
+    fn structured_start_and_spawn_cannot_cross_a_mesh_relay() {
+        for method in ["agent.start", "agent.spawn"] {
+            let request = serde_json::json!({"id":"resume", "method":method, "params":{"runtime":"structured", "name":"existing"}}).to_string();
+            let (_, code, _) =
+                super::relay_refusal(&request).expect("structured relay must refuse");
+            assert_eq!(code, "operator_only");
+        }
     }
 }

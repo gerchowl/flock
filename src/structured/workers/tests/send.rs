@@ -36,12 +36,12 @@ fn api(r: &mut AppQueue, params: AgentSendParams) -> mpsc::Receiver<String> {
     };
     r.app
         .handle_api_request_message(crate::api::ApiRequestMessage {
-            scope: None,
             request: Request {
                 id: "send-fixture".into(),
                 method: Method::AgentSend(params),
             },
             respond_to: tx,
+            scope: None,
             peer_pid: Some(std::process::id()),
             peer_birth: crate::platform::process_start_time(std::process::id()),
             peer_uid: Some(crate::platform::peer::effective_uid()),

@@ -25,13 +25,28 @@ const REPAIR_LOCK_WAIT: Duration = Duration::from_millis(20);
 pub struct StorageConfig {
     /// Replace eligible JSON blocks strictly larger than this many encoded bytes.
     pub blob_min_bytes: usize,
+    /// Silence observation policy in milliseconds, inclusive range 5000..=3600000.
+    #[serde(deserialize_with = "stall_ms")]
+    pub stall_ms: u64,
 }
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             blob_min_bytes: 2048,
+            stall_ms: 120_000,
         }
     }
+}
+/// Shared validation for the session silence threshold.
+pub(crate) fn stall_ms<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if !(5_000..=3_600_000).contains(&value) {
+        return Err(serde::de::Error::invalid_value(
+            serde::de::Unexpected::Unsigned(value),
+            &"sessions.stall_ms in 5000..=3600000 milliseconds",
+        ));
+    }
+    Ok(value)
 }
 /// Explicit failures, retained as the source when transport wraps them in io::Error.
 #[derive(Debug)]
@@ -44,9 +59,9 @@ pub enum BlobError {
     Missing,
     /// Stored bytes do not match their address.
     Corrupt,
-    /// A put exceeded its caller-supplied byte cap.
+    /// A read or put exceeded its caller-supplied byte cap.
     TooLarge,
-    /// An underlying read, write, rename or sync failed.
+    /// An underlying metadata, read, write, rename or sync operation failed.
     Io(io::Error),
 }
 impl std::fmt::Display for BlobError {
@@ -116,15 +131,34 @@ impl BlobStore {
             .metadata()?
             .len())
     }
-    /// Read and verify content, distinguishing absence from hash corruption.
-    pub fn get(&self, hash: &str) -> Result<Vec<u8>, BlobError> {
+    /// Read at most `max_bytes` of verified content, distinguishing absence from
+    /// hash corruption. Oversized metadata is refused before reading or allocating
+    /// content. A bounded read also detects growth after stat, consuming at most
+    /// one extra byte. Size refusal precedes digest verification.
+    pub fn get(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BlobError> {
+        self.get_after_stat(hash, max_bytes, |_| {})
+    }
+    // Test seam: the callback observes the opened descriptor after stat, before reading.
+    // Production supplies an empty closure.
+    fn get_after_stat(
+        &self,
+        hash: &str,
+        max_bytes: u64,
+        after_stat: impl FnOnce(&File),
+    ) -> Result<Vec<u8>, BlobError> {
         Self::check(hash)?;
+        let file = self.0.file(hash, false).map_err(Self::lookup_error)?;
+        if file.metadata()?.len() > max_bytes {
+            return Err(BlobError::TooLarge);
+        }
+        after_stat(&file);
         let mut bytes = Vec::new();
-        self.0
-            .file(hash, false)
-            .map_err(Self::lookup_error)?
+        file.take(max_bytes.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(BlobError::Io)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(BlobError::TooLarge);
+        }
         if Sha256::digest(&bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -201,7 +235,7 @@ impl BlobStore {
                 size,
                 preview: String::from_utf8_lossy(&preview).chars().take(80).collect(),
             };
-            match self.get(&reference.blob) {
+            match self.get(&reference.blob, max_bytes) {
                 Ok(_) => self.0.sync()?,
                 Err(BlobError::Missing) => self.publish(&name, &reference.blob)?,
                 Err(BlobError::Corrupt) => {
@@ -218,7 +252,7 @@ impl BlobStore {
                         }
                     };
                     // Recheck even on fallback: another writer may have repaired it.
-                    match self.get(&reference.blob) {
+                    match self.get(&reference.blob, max_bytes) {
                         Ok(_) => self.0.sync()?,
                         Err(BlobError::Missing) => self.publish(&name, &reference.blob)?,
                         Err(BlobError::Corrupt) => {

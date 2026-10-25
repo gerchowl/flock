@@ -99,7 +99,7 @@ describe("wire fleet", () => {
   });
 
   test("a payload that is not a fleet delta ends the list visibly", () => {
-    for (const bad of [{ type: "fleet.upsert", row: row("a", { state: agentState("dancing" as Phase) }) }, { type: "fleet.upsert", row: row("a", { state: "working" }) }, { type: "fleet.upsert", row: { id: "a" } }, { type: "fleet.rename", id: "a" }, "atlas"]) {
+    for (const bad of [{ type: "fleet.upsert", row: row("a", { state: "working" }) }, { type: "fleet.upsert", row: { id: "a" } }, { type: "fleet.rename", id: "a" }, "atlas"]) {
       const { h, seen } = subscribed();
       send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 0 });
       send(h, { t: "ev", sub_id: "s1", stream: "fleet", seq: 1, ts_ms: 0, ev: bad as never });
@@ -150,4 +150,18 @@ test("fleet sources on one connection never reuse a sub id, and a closed one's l
   send(h, upsert(1, row("stale")));
   expect(h.connection.state).toBe("Live");
   expect(seen).toEqual([["kite"]]);
+});
+
+test("generated S4 fleet state reaches presentation without discarding the row", () => {
+  const { h, last } = subscribed();
+  send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+  send(h, upsert(1, row("fixture-agent", { state: { turn: "working", background: "none", attention: "none", waiting: "none", lifecycle: "live", phase: "working", source: {} } })));
+  expect(last().map((value) => [value.id, value.state])).toEqual([["fixture-agent", "working"]]);
+});
+
+test("a newer phase keeps the fleet row and renders unknown", () => {
+  const { h, last } = subscribed();
+  send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+  send(h, upsert(1, row("fixture-agent", { state: agentState("dancing" as Phase) })));
+  expect(last().map((value) => [value.id, value.state])).toEqual([["fixture-agent", "unknown"]]);
 });

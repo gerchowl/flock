@@ -144,6 +144,9 @@ impl App {
                     .into(),
             ));
         }
+        if let Some(error) = self.structured_terminal_error(&params.target) {
+            return Err(self.agent_target_error_body(error));
+        }
         let (ws_idx, pane_id) = if params.target == "self" {
             self.parse_pane_id_or_peer("", self.current_api_peer_pid)
                 .ok_or_else(|| {

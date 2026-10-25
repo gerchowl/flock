@@ -15,6 +15,17 @@ pub(crate) const INJECTION_LEASE: Duration = Duration::from_secs(5 + CONFIRM_WIN
 /// How long clearing a draft, or reading it back, may take before flock stops
 /// and keeps the draft in the pane's stash.
 const DRAFT_STEP: Duration = Duration::from_secs(1);
+/// Conservative configured wait bound: draft clear, restore-ready and restore-read
+/// (3 steps), paste write and two Enter confirmations (3 windows), the post-write
+/// Enter gap, and one poll overshoot per wait. This is 9470 ms, independent of
+/// the shorter injection lease. OS/app scheduling stalls can exceed these waits
+/// and must still be reported as unknown if the client loses the final receipt.
+pub(crate) const SUBMIT_WAIT_BOUND: Duration = DRAFT_STEP
+    .saturating_mul(3)
+    .saturating_add(CONFIRM_WINDOW.saturating_mul(3))
+    .saturating_add(crate::cli::pane::PANE_RUN_SUBMIT_GAP)
+    .saturating_add(POLL.saturating_mul(7));
+
 /// Backspaces past the draft's visible length, for whitespace the composer
 /// read trims. Extra ones on an empty composer do nothing.
 const CLEAR_SLACK: usize = 8;

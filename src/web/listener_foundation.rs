@@ -9,8 +9,6 @@ use std::{future::Future, io, time::Duration};
 pub(crate) const ACCEPT_RESOURCE_BACKOFF: Duration = Duration::from_millis(100);
 /// Accept the next connection, recovering peer errors and backing off resource failures.
 /// Invalid listener descriptors publish failure and return once, leaving the server owner alive.
-// The real lifecycle owner mounts this helper in #1894, after foundation review.
-#[allow(dead_code)]
 pub(crate) async fn accept_next<T, A, F>(
     accept: &mut A,
     clock: &dyn Clock,

@@ -16,6 +16,21 @@ pub(crate) fn close_on_exec(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Pin Linux's atomic inheritance guarantee at a caller's pre-fcntl observation point.
+#[cfg(test)]
+pub(crate) fn assert_kernel_received_flags(flags: &[libc::c_int]) {
+    for flag in flags {
+        assert!(*flag >= 0, "received descriptor must still be owned");
+        if cfg!(target_os = "linux") {
+            assert_ne!(
+                *flag & libc::FD_CLOEXEC,
+                0,
+                "Linux handoff recvmsg must set CLOEXEC before fcntl"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

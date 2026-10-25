@@ -830,17 +830,66 @@ fn input_line(transport: &Transport, input: &mut File) -> Value {
     private_fs::set_nonblocking(input).unwrap();
     let mut bytes = Vec::new();
     wait(transport, || {
-        let mut byte = [0];
-        match input.read(&mut byte) {
-            Ok(1) if byte[0] == b'\n' => Some(serde_json::from_slice(&bytes).unwrap()),
-            Ok(1) => {
-                bytes.push(byte[0]);
-                None
+        // Drain ready bytes instead of paying a worker-completion wait per byte.
+        // Bounded batches retain the deadline and worker-liveness checks even
+        // when a producer continuously writes without terminating its line.
+        for _ in 0..256 {
+            let mut byte = [0];
+            match input.read(&mut byte) {
+                Ok(1) if byte[0] == b'\n' => {
+                    return Some(serde_json::from_slice(&bytes).unwrap());
+                }
+                Ok(1) => bytes.push(byte[0]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return None,
+                other => panic!("unexpected harness stdin: {other:?}"),
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => None,
-            other => panic!("unexpected harness stdin: {other:?}"),
         }
+        None
     })
+}
+
+#[test]
+fn permission_message_transport_refusal_keeps_open_audit_and_stdin() {
+    // Escaped tabs double the wire bytes without exceeding the permitted message bound.
+    for expected in [
+        "é".repeat(1024),
+        format!(
+            "a{}z",
+            "\t".repeat(permissions::MAX_PERMISSION_DECISION_MESSAGE_BYTES - 2)
+        ),
+    ] {
+        let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (transport, mut output, mut input) = start(&root);
+        permission(&mut output, "request-example");
+        receive_after_accepted(&transport);
+        receive_after_accepted(&transport);
+        let request_seq = permission_handle(&transport, "request-example");
+        let mut request = decide("request-example", permissions::Decision::Deny, request_seq);
+        request.message = Some(format!("{}x", "é".repeat(1024)));
+        assert_eq!(
+            call_decide(&transport, &owner(), &request),
+            Err(ErrorCode::InvalidParams)
+        );
+        assert_eq!(waiting_ids(&transport), vec!["request-example"]);
+        assert_eq!(records(&root).len(), 2);
+        private_fs::set_nonblocking(&input).unwrap();
+        assert_eq!(
+            input.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        request.message = Some(format!("  {expected}  "));
+        call_decide(&transport, &owner(), &request).unwrap();
+        let response = input_line(&transport, &mut input);
+        assert_eq!(response["response"]["response"]["message"], expected);
+        let closed = receive(&transport).record;
+        assert_eq!(closed.origin, RecordOrigin::Flk);
+        let audit: Value = serde_json::from_str(&closed.raw).unwrap();
+        assert_eq!(audit["state"], "closed");
+        assert_eq!(audit["message"], expected);
+        drop(output);
+        reader_done(&transport).unwrap();
+        assert_eq!(records(&root).len(), 3);
+    }
 }
 
 #[test]
@@ -2162,6 +2211,13 @@ fn assert_exact_suggestion_fallback(
     assert!(response["response"]["response"]
         .get("updatedPermissions")
         .is_none());
+    // Pipe readability does not acknowledge Book::written: the stdin worker
+    // still owns that final state update (ADR-0036 §10b, delivery ordering).
+    // Wait for its slot release before querying or sending the next request.
+    wait(transport, || {
+        let book = transport.input.permissions.try_lock()?;
+        (!book.blocked()).then_some(())
+    });
     assert!(transport.waiting_on_human().unwrap().is_empty());
     assert_eq!(
         call_decide(
@@ -2542,7 +2598,7 @@ fn blob_references_resolve_while_partial_deltas_are_live_only_and_restart_seq_is
         serde_json::from_value(projected["message"]["content"][0].clone()).unwrap();
     let bytes = super::super::blobs::BlobStore::open(root.path())
         .unwrap()
-        .get(&reference.blob)
+        .get(&reference.blob, reference.size)
         .unwrap();
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), block);
     drop(stdout);
@@ -2808,7 +2864,7 @@ fn corrupt_blob_is_repaired_while_the_session_keeps_streaming() {
     assert_eq!(stored.len(), 2);
     let projected: Value = serde_json::from_str(&stored[0].raw).unwrap();
     assert_eq!(projected["message"]["content"][0]["blob"], reference.blob);
-    assert_eq!(store.get(&reference.blob).unwrap(), bytes);
+    assert_eq!(store.get(&reference.blob, reference.size).unwrap(), bytes);
 }
 
 #[test]
@@ -2945,7 +3001,9 @@ fn write_permission_crash_prefix(
     let (mut file, mut seq) = (opened.0, opened.1);
     let blobs = super::super::blobs::BlobStore::open(root.path()).unwrap();
     let history = super::super::history::History::default();
-    history.initialize(&file, seq).unwrap();
+    history
+        .initialize(&file, seq, file.metadata().unwrap().len())
+        .unwrap();
     for audit in audits {
         let line = serde_json::to_vec(&serde_json::to_value(audit).unwrap()).unwrap();
         persist(

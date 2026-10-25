@@ -20,6 +20,9 @@ use tracing::info;
 
 #[cfg(unix)]
 const HANDOFF_VERSION: u32 = 1;
+/// Descriptor extension: old receivers must refuse before ready, even with zero PTYs.
+#[cfg(unix)]
+pub(crate) const CLIENT_LISTENER_HANDOFF_VERSION: u32 = 2;
 /// Import-only credential channel, consumed before the importer starts children.
 #[cfg(unix)]
 pub(crate) const HANDOFF_TOKEN_ENV: &str = "FLOCK_HANDOFF_TOKEN";
@@ -68,6 +71,9 @@ pub(crate) struct HandoffManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structured_unknown: Vec<String>,
     pub panes: Vec<crate::handoff_runtime::HandoffRuntimeState>,
+    /// One listening TCP descriptor follows the PTY descriptors when present.
+    #[serde(default)]
+    pub client_listener: bool,
     /// Operator drafts kept in panes' stashes (#850), so a handoff does not
     /// drop them. Absent from an older server's manifest.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -459,7 +465,9 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
     let manifest_line = read_line_unbuffered(stream)?;
     let manifest: HandoffManifest = serde_json::from_str(&manifest_line)
         .map_err(|err| io::Error::other(format!("handoff manifest deserialize failed: {err}")))?;
-    if manifest.version != HANDOFF_VERSION {
+    if ![HANDOFF_VERSION, CLIENT_LISTENER_HANDOFF_VERSION].contains(&manifest.version)
+        || manifest.client_listener != (manifest.version == CLIENT_LISTENER_HANDOFF_VERSION)
+    {
         return Err(io::Error::other(format!(
             "unsupported handoff version {}",
             manifest.version
@@ -486,6 +494,12 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
             crate::build_info::version()
         )));
     }
+    if manifest.client_listener && !cfg!(feature = "web") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "handoff listener requires a web-enabled replacement",
+        ));
+    }
     stream.write_all(b"validated\n")?;
     stream.flush()?;
     if cfg!(debug_assertions)
@@ -499,7 +513,10 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
             manifest.panes.len()
         )));
     }
-    let fds = recv_fds(stream, manifest.panes.len())?;
+    let fds = recv_fds(
+        stream,
+        manifest.panes.len() + usize::from(manifest.client_listener),
+    )?;
     Ok((manifest, fds))
 }
 
@@ -549,6 +566,7 @@ pub(crate) fn manifest_for(
         structured_unknown: Vec::new(),
         panes,
         kept_drafts: Default::default(),
+        client_listener: false,
     }
 }
 
@@ -688,6 +706,17 @@ fn close_fds(fds: &[RawFd]) {
 
 #[cfg(unix)]
 fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> io::Result<()> {
+    recv_fds_into_observing(stream, expected, out, |_| {})
+}
+
+/// Observe kernel-installed descriptor flags before the portable fcntl fallback.
+#[cfg(unix)]
+fn recv_fds_into_observing(
+    stream: &UnixStream,
+    expected: usize,
+    out: &mut Vec<RawFd>,
+    mut received: impl FnMut(&[RawFd]),
+) -> io::Result<()> {
     // Sized well past one batch, so a batch carrying more than the remainder,
     // or more than the batch limit, arrives whole and is refused by count.
     // Truncation is not a safe way to refuse: on macOS the kernel installs
@@ -741,6 +770,7 @@ fn recv_fds_into(stream: &UnixStream, expected: usize, out: &mut Vec<RawFd>) -> 
             return Err(io::Error::other("handoff fd control message was truncated"));
         }
         collected?;
+        received(&out[before..]);
         // Set every received PTY/listener descriptor before any importer child can be spawned.
         for fd in &out[before..] {
             crate::platform::received_fd::close_on_exec(*fd)?;
@@ -1227,6 +1257,31 @@ mod tests {
         assert_eq!(batch_sizes_on_the_wire(64), vec![64]);
         assert_eq!(batch_sizes_on_the_wire(65), vec![64, 1]);
         assert_eq!(batch_sizes_on_the_wire(150), vec![64, 64, 22]);
+    }
+
+    #[test]
+    fn handoff_receive_passes_platform_flags_before_fcntl() {
+        let (reads, writes) = pipes(1);
+        let (sender, receiver) = pair_with_timeout();
+        send_fds(&sender, &writes).unwrap();
+        let mut received = Vec::new();
+        let mut observed = Vec::new();
+        let result = recv_fds_into_observing(&receiver, 1, &mut received, |fds| {
+            observed.extend(
+                fds.iter()
+                    .map(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) }),
+            );
+        });
+        close_fds(&received);
+        close_fds(&writes);
+        assert_all_write_ends_closed(&reads);
+        result.unwrap();
+        assert_eq!(
+            observed.len(),
+            1,
+            "inspect before fallback can mask a missing receive flag"
+        );
+        crate::platform::received_fd::assert_kernel_received_flags(&observed);
     }
 
     #[test]

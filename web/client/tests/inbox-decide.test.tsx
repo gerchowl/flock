@@ -96,11 +96,20 @@ describe("the card's state is the outbox entry's", () => {
 });
 
 describe("answering a prompt", () => {
-  test("a refusal code outside AgentDecideErrorCode, like invalid_params, shows its message, is never retried, and waits for a new seq", () => {
+  test("invalid_params renders the trimmed UTF-8 message limit and control-byte guidance", () => {
+    const app = prompt();
+    button(app, "Deny").click();
+    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("invalid_params") });
+    expect(status(app)).toBe(`The trimmed message must be at most ${MESSAGE_MAX_BYTES} UTF-8 bytes and contain no control bytes other than newlines or tabs.`);
+    expect(button(app, "Deny").hasAttribute("disabled")).toBe(true);
+    expect(cmds(app)).toHaveLength(1);
+  });
+
+  test("a refusal code outside AgentDecideErrorCode, like future_refusal, shows its message, is never retried, and waits for a new seq", () => {
     const app = prompt();
     button(app, "Allow once").click();
-    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("invalid_params") });
-    expect(status(app)).toBe(`${STATUS_LABELS.failed}: server said invalid_params`);
+    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("future_refusal") });
+    expect(status(app)).toBe(`${STATUS_LABELS.failed}: server said future_refusal`);
     for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
     button(app, "Allow once").click();
     expect(cmds(app)).toHaveLength(1);
@@ -108,6 +117,56 @@ describe("answering a prompt", () => {
     button(app, "Review new request").click();
     expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
   });
+
+  test("session_busy is visible and never resubmits a decision", () => {
+    const app = prompt();
+    button(app, "Allow once").click();
+    ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: { code: "session_busy", message: "command refused: session_busy", exit: 1, retry: "later" } });
+    expect(status(app)).toBe(`${STATUS_LABELS.failed}: command refused: session_busy`);
+    for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(1);
+  });
+
+  test("a request id that closes and reopens needs the review step before any button enables", () => {
+    const app = prompt();
+    app.close("atlas", "r1");
+    expect(cards(app.root)).toHaveLength(0);
+    // The server may reuse an id once it is outside its retained-closed window (permissions.rs).
+    app.event("atlas", "r1", "Bash", { command: "rm -rf build" }, 50);
+    expect(cards(app.root)).toHaveLength(1);
+    expect(status(app)).toBe("Request changed — review it.");
+    for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(0);
+    button(app, "Review new request").click();
+    expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
+    button(app, "Allow once").click();
+    expect(cmds(app)).toHaveLength(1);
+    expect(cmds(app)[0]?.args).toMatchObject({ request_id: "r1", request_seq: 50 });
+  });
+
+  for (const closeWhileAway of [false, true]) {
+    test(`a closed id that reopens after leaving the phone Inbox tab still needs review (closed ${closeWhileAway ? "while away" : "before leaving"})`, () => {
+      const app = prompt("phone");
+      const tab = (label: string): HTMLButtonElement => {
+        const found = [...app.root.querySelectorAll<HTMLButtonElement>(".tabbar button")].find((b) => b.textContent?.startsWith(label));
+        if (found === undefined) throw new Error(`no ${label} tab`);
+        return found;
+      };
+      if (!closeWhileAway) app.close("atlas", "r1");
+      tab("Agents").click();
+      expect(cards(app.root)).toHaveLength(0);
+      if (closeWhileAway) app.close("atlas", "r1");
+      app.event("atlas", "r1", "Bash", { command: "rm -rf build" }, 50);
+      tab("Inbox").click();
+      expect(cards(app.root)).toHaveLength(1);
+      expect(status(app)).toBe("Request changed — review it.");
+      for (const label of ["Allow once", "Always allow", "Deny"]) expect(button(app, label).hasAttribute("disabled")).toBe(true);
+      button(app, "Review new request").click();
+      expect(button(app, "Allow once").hasAttribute("disabled")).toBe(false);
+    });
+  }
 
   test("a caught send error covers the status only until the status changes", () => {
     const app = prompt();
@@ -129,7 +188,7 @@ describe("answering a prompt", () => {
     button(app, "Deny").click();
     ack(app, { cmd_id: cmds(app)[0]?.cmd_id ?? "", ok: false, error: refusal("not_authorized") });
     expect(status(app)).toBe(REFUSALS.not_authorized);
-    expect(Object.keys(REFUSALS)).toEqual(["permission_request_unknown", "permission_request_closed", "not_authorized"]);
+    expect(Object.keys(REFUSALS)).toEqual(["permission_request_unknown", "permission_request_closed", "not_authorized", "invalid_params"]);
   });
 
   test("an untyped refusal shows the server's message", () => {

@@ -36,9 +36,12 @@ pub(crate) mod peers;
 pub(super) mod responses;
 mod revert;
 mod spawn;
+mod structured_agents;
 pub(crate) mod structured_messages;
 pub(crate) mod structured_queue;
 mod structured_relay;
+mod structured_start;
+
 mod tabs;
 pub(crate) mod workspaces;
 mod worktrees;
@@ -1606,6 +1609,7 @@ impl App {
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
+            Method::AgentStop(target) => return self.handle_structured_stop(request.id, target),
             Method::AgentFocus(target) => return self.handle_agent_focus(request.id, target),
             Method::AgentRename(params) => return self.handle_agent_rename(request.id, params),
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
@@ -1714,6 +1718,9 @@ impl App {
             }
             Method::PaneStashRestore(target) => {
                 return self.handle_pane_stash_restore(request.id, target)
+            }
+            Method::PaneResolveCodexLock(params) => {
+                return self.handle_resolve_codex_lock(request.id, params)
             }
             Method::PaneSendKeys(params) | Method::PaneWriteKeys(params) => {
                 return self.handle_pane_send_keys(request.id, params)
@@ -2599,7 +2606,7 @@ mod tests {
 
         let published: Vec<crate::api::schema::EventEnvelope> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .map(|(_, envelope)| envelope)
             .collect();
@@ -2958,15 +2965,16 @@ mod tests {
             });
         }
 
-        let reports_done = |app: &App| {
-            app.event_hub.events_after(0).iter().any(|(_, event)| {
+        let reports_done =
+            |app: &App| {
+                app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| {
                 matches!(
                     &event.data,
                     crate::api::schema::EventData::PaneAgentStatusChanged { agent_status, .. }
                         if *agent_status == crate::api::schema::AgentStatus::Done
                 )
             })
-        };
+            };
         // At the deferring edge the pane is Idle but `seen` is still true → it
         // reports `Idle`, never `Done`.
         assert!(

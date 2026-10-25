@@ -8,9 +8,12 @@ bind = "127.0.0.1:7682"
 ```
 
 The endpoint is off by default and separate from `[web]`, the terminal bridge.
-Only IPv4 `127.0.0.1` with a nonzero port is accepted. This slice supplies the
-exchange router; #1828 mounts it and the GUI on the configured listener.
-Until that listener is delivered, opening its URL cannot connect.
+Only IPv4 `127.0.0.1` is accepted. Port 0 selects a free port; `client open`
+reports the actual live endpoint even after configuration reload. The server
+mounts the GUI, exchange and WebSocket core on this listener. A working bounded
+`tailscale serve status --json` probe is required: active public funnel, unknown
+status or probe failure refuses startup. See `structured-client-transport.md`
+for CSP, connection quotas, shutdown and handoff behavior.
 
 Run these commands outside agent panes as the local operator:
 

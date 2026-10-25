@@ -460,7 +460,7 @@ mod tests {
         let (mut app, agent_id) = settled_claude_with_a_background_shell();
         let announced = |app: &App| -> Vec<Phase> {
             app.event_hub
-                .events_after(0)
+                .ring_snapshot_after(0)
                 .into_iter()
                 .filter_map(|(_, event)| match event.data {
                     EventData::AgentPhaseChanged(change) if change.agent_id == agent_id => {
@@ -522,7 +522,7 @@ mod tests {
 
         let expired: Vec<_> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter(|(_, event)| event.event == EventKind::WaitExpired)
             .collect();
@@ -696,7 +696,7 @@ mod tests {
 
         let expired: Vec<_> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter(|(_, event)| event.event == EventKind::WaitExpired)
             .collect();

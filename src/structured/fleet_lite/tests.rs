@@ -260,7 +260,7 @@ fn unknown_invalid_duplicate_rows_are_skipped_warned_and_preserved_on_save() {
     let updated = disk(&path);
     assert!(updated["rows"].as_array().unwrap().contains(&duplicate));
     assert!(updated["rows"].as_array().unwrap().contains(&unknown));
-    assert_eq!(updated["rows"][0]["future_field"], json!({"keep":true}));
+    assert!(updated["rows"][0].get("future_field").is_none());
     drop(store);
     let mut restored = Store::open(path.clone()).unwrap();
     assert_eq!(restored.snapshot().unwrap().rows.len(), 1);
@@ -310,12 +310,12 @@ fn failed_write_publishes_nothing_and_requires_reopen() {
     let path = path();
     let mut store = Store::open(path.clone()).unwrap();
     store.snapshot().unwrap();
-    fs::create_dir(path.with_extension("tmp")).unwrap();
+    fs::create_dir(path.with_extension("json.tmp")).unwrap();
     assert!(store.refresh(&Source(vec![agent("a")])).is_err());
     assert_eq!(disk(&path)["high_water"], 0);
     assert!(store.rows.is_empty());
     assert!(store.snapshot().is_err());
-    fs::remove_dir(path.with_extension("tmp")).unwrap();
+    fs::remove_dir(path.with_extension("json.tmp")).unwrap();
     assert!(store.refresh(&Source(vec![agent("a")])).is_err());
     drop(store);
     assert_eq!(
@@ -324,7 +324,7 @@ fn failed_write_publishes_nothing_and_requires_reopen() {
             .refresh(&Source(vec![agent("a")]))
             .unwrap()[0]
             .seq,
-        1
+        2
     );
 }
 
@@ -358,4 +358,287 @@ fn unavailable_or_invalid_provider_does_not_remove_existing_members() {
     assert!(store.refresh(&Source(vec![invalid])).is_err());
     assert_eq!(disk(&path)["high_water"], 1);
     assert_eq!(store.snapshot().unwrap().rows.len(), 1);
+}
+
+fn committed_path() -> PathBuf {
+    let path = path();
+    let mut store = Store::open(path.clone()).unwrap();
+    store.refresh(&Source(vec![agent("a")])).unwrap();
+    assert_eq!(store.snapshot().unwrap().snapshot_to, 2);
+    path
+}
+
+#[test]
+fn missing_snapshot_recovers_no_rows_without_resetting_the_cursor() {
+    let path = committed_path();
+    fs::remove_file(&path).unwrap();
+    let mut recovered = Store::open(path.clone()).unwrap();
+    assert_eq!(
+        recovered.diagnostics(),
+        &[Diagnostic::SnapshotMissing { high_water: 2 }]
+    );
+    let cut = recovered.snapshot().unwrap();
+    assert_eq!((cut.to, cut.snapshot_to), (2, 2));
+    assert!(cut.rows.is_empty());
+    assert_eq!(
+        recovered.refresh(&Source(vec![agent("b")])).unwrap()[0].seq,
+        3
+    );
+}
+
+#[test]
+fn corrupt_snapshot_recovers_no_rows_at_the_preserved_cursor() {
+    for corrupt in [
+        "{broken-json",
+        r#"{"high_water":"broken","rows":[]}"#,
+        r#"{"high_water":0,"rows":null}"#,
+    ] {
+        let path = committed_path();
+        fs::write(&path, corrupt).unwrap();
+        let mut recovered = Store::open(path.clone()).unwrap();
+        assert_eq!(
+            recovered.diagnostics(),
+            &[Diagnostic::SnapshotCorrupt { high_water: 2 }]
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            corrupt,
+            "opening preserves the damaged source for operator inspection"
+        );
+        let cut = recovered.snapshot().unwrap();
+        assert_eq!((cut.to, cut.snapshot_to), (2, 2));
+        assert!(cut.rows.is_empty());
+    }
+}
+
+#[test]
+fn skipped_row_diagnostics_include_index_and_content_free_reason() {
+    let path = path();
+    let source = Source(vec![agent("a")]);
+    let known = serde_json::to_value(project(source.agents().unwrap().remove(0))).unwrap();
+    fs::write(
+        &path,
+        json!({"high_water":7,"rows":[known.clone(),
+        {"future_kind":"sensitive payload"}, {"id":"broken","label":12},known]})
+        .to_string(),
+    )
+    .unwrap();
+    let logs = crate::logging::capture_logs(|| {
+        Store::open(path.clone()).unwrap();
+    });
+    for (index, reason) in [(1, "unsupported"), (2, "invalid"), (3, "duplicate")] {
+        assert!(
+            logs.contains(&format!("index={index} reason=\"{reason}\"")),
+            "{logs}"
+        );
+    }
+    assert!(!logs.contains("sensitive payload"));
+}
+
+#[test]
+fn cursor_and_snapshot_reconcile_to_the_maximum_and_never_lower_it() {
+    for (cursor_head, snapshot_head, expected) in [(1, 2, 2), (10, 2, 10), (2, 0, 2)] {
+        let path = committed_path();
+        fs::write(
+            path.with_extension("cursor"),
+            json!({"high_water":cursor_head}).to_string(),
+        )
+        .unwrap();
+        let mut snapshot = disk(&path);
+        snapshot["high_water"] = json!(snapshot_head);
+        fs::write(&path, snapshot.to_string()).unwrap();
+        let mut store = Store::open(path.clone()).unwrap();
+        assert_eq!(store.high_water, expected);
+        assert_eq!(disk(&path.with_extension("cursor"))["high_water"], expected);
+        assert_eq!(store.snapshot().unwrap().to, expected);
+    }
+}
+
+#[test]
+fn legacy_snapshot_seeds_cursor_before_it_can_be_lost() {
+    let path = path();
+    fs::write(path.with_extension("lock"), b"").unwrap();
+    assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
+    fs::write(&path, json!({"high_water":23,"rows":[]}).to_string()).unwrap();
+    let store = Store::open(path.clone()).unwrap();
+    assert!(store.diagnostics().is_empty());
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 23);
+    drop(store);
+    fs::remove_file(&path).unwrap();
+    assert_eq!(Store::open(path).unwrap().snapshot().unwrap().to, 23);
+}
+
+#[test]
+fn corrupt_cursor_refuses_reset_and_operator_can_restore_a_trusted_floor() {
+    let path = committed_path();
+    fs::write(path.with_extension("cursor"), "{bad cursor").unwrap();
+    assert!(Store::open(path.clone()).is_err());
+    assert_eq!(disk(&path)["high_water"], 2);
+    fs::write(
+        path.with_extension("cursor"),
+        json!({"high_water":42}).to_string(),
+    )
+    .unwrap();
+    let mut recovered = Store::open(path.clone()).unwrap();
+    assert_eq!(recovered.snapshot().unwrap().to, 42);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 43);
+}
+
+#[test]
+fn loss_of_both_records_is_not_mistaken_for_a_new_empty_store() {
+    let path = committed_path();
+    fs::remove_file(&path).unwrap();
+    fs::remove_file(path.with_extension("cursor")).unwrap();
+    assert_eq!(
+        Store::open(path.clone()).err().unwrap().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert!(!path.exists());
+    assert!(!path.with_extension("cursor").exists());
+}
+
+#[test]
+fn cursor_reservation_precedes_snapshot_replacement_and_is_not_reused() {
+    let path = committed_path();
+    let mut store = Store::open(path.clone()).unwrap();
+    fs::create_dir(path.with_extension("json.tmp")).unwrap();
+    assert!(store.refresh(&Source(vec![agent("b")])).is_err());
+    assert_eq!(disk(&path)["high_water"], 2);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 4);
+    drop(store);
+    fs::remove_dir(path.with_extension("json.tmp")).unwrap();
+    let mut reopened = Store::open(path).unwrap();
+    assert_eq!(
+        reopened.refresh(&Source(vec![agent("b")])).unwrap()[0].seq,
+        5
+    );
+}
+
+#[test]
+fn failed_cursor_reservation_never_replaces_the_snapshot() {
+    let path = committed_path();
+    let original = fs::read(&path).unwrap();
+    let mut store = Store::open(path.clone()).unwrap();
+    fs::create_dir(path.with_extension("cursor.tmp")).unwrap();
+    assert!(store.refresh(&Source(Vec::new())).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 2);
+    assert!(store.snapshot().is_err());
+}
+
+#[test]
+fn only_changed_rows_drop_their_future_top_level_fields() {
+    let path = path();
+    let mut source = Source(vec![agent("a"), agent("b")]);
+    let raw: Vec<_> = source
+        .agents()
+        .unwrap()
+        .into_iter()
+        .map(|a| {
+            let mut value = serde_json::to_value(project(a)).unwrap();
+            value["future_field"] = json!({"keep":true});
+            value
+        })
+        .collect();
+    fs::write(
+        &path,
+        json!({"high_water":7,"future_header":true,"rows":raw}).to_string(),
+    )
+    .unwrap();
+    let mut store = Store::open(path.clone()).unwrap();
+    source.0[1].activity = Some("Changed b".into());
+    assert_eq!(store.refresh(&source).unwrap().len(), 1);
+    let saved = disk(&path);
+    assert_eq!(saved["future_header"], true);
+    assert_eq!(saved["rows"][0]["future_field"], json!({"keep":true}));
+    assert!(saved["rows"][1].get("future_field").is_none());
+    drop(store);
+    let mut reopened = Store::open(path.clone()).unwrap();
+    assert!(reopened.refresh(&source).unwrap().is_empty());
+    reopened.snapshot().unwrap();
+    assert_eq!(disk(&path)["rows"][0]["future_field"], json!({"keep":true}));
+}
+
+#[test]
+fn lost_cursor_after_failed_snapshot_does_not_migrate_the_older_snapshot() {
+    let path = committed_path();
+    let mut store = Store::open(path.clone()).unwrap();
+    fs::create_dir(path.with_extension("json.tmp")).unwrap();
+    assert!(store.refresh(&Source(vec![agent("b")])).is_err());
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 4);
+    drop(store);
+    fs::remove_file(path.with_extension("cursor")).unwrap();
+    assert_eq!(
+        Store::open(path.clone()).err().unwrap().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(disk(&path)["high_water"], 2);
+    assert!(!path.with_extension("cursor").exists());
+}
+
+#[test]
+fn empty_unmarked_lock_without_records_restarts_initialization_at_zero() {
+    let path = path();
+    fs::write(path.with_extension("lock"), b"").unwrap();
+    assert!(!path.exists());
+    assert!(!path.with_extension("cursor").exists());
+    let mut store = Store::open(path.clone()).unwrap();
+    assert!(store.diagnostics().is_empty());
+    assert_eq!(store.snapshot().unwrap().to, 0);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 0);
+    assert_eq!(fs::read(path.with_extension("lock")).unwrap(), b"1");
+    assert_eq!(store.refresh(&Source(vec![agent("a")])).unwrap()[0].seq, 1);
+    drop(store);
+    assert_eq!(Store::open(path).unwrap().snapshot().unwrap().to, 1);
+}
+
+// The failed open leaves the real renamed cursor present but the lock unmarked.
+fn interrupted_cursor_initialization() -> PathBuf {
+    let path = path();
+    let error = Store::open_with_parent_sync(path.clone(), |cursor_path| {
+        assert_eq!(cursor_path, path.with_extension("cursor"));
+        assert_eq!(disk(cursor_path)["high_water"], 0);
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    })
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
+    path
+}
+
+#[test]
+fn matching_cursor_retry_propagates_directory_sync_failure_without_marking() {
+    let path = interrupted_cursor_initialization();
+    let error = Store::open_with_parent_sync(path.clone(), |_| {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    })
+    .err()
+    .expect("retry must propagate the directory-sync error");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 0);
+}
+
+#[test]
+fn matching_cursor_retry_syncs_directory_before_marking() {
+    let path = interrupted_cursor_initialization();
+    let mut synced = false;
+    let mut store = Store::open_with_parent_sync(path.clone(), |record_path| {
+        assert_eq!(parent(record_path), parent(&path));
+        assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
+        assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 0);
+        sync_parent(record_path)?;
+        synced = true;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        synced,
+        "the renamed cursor's directory must be synced again"
+    );
+    assert_eq!(fs::read(path.with_extension("lock")).unwrap(), b"1");
+    assert_eq!(store.snapshot().unwrap().to, 0);
+    drop(store);
+    assert_eq!(Store::open(path).unwrap().snapshot().unwrap().to, 0);
 }

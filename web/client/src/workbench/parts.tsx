@@ -46,8 +46,30 @@ export function AgentRowButton(props: { readonly row: AgentRow; readonly focused
   );
 }
 
+const keyOf = (card: InboxCard): string => `${card.agent}\u0000${card.id}`;
+
+/** The request ids that have closed in this session (see {@link createClosedIds}). */
+export type ClosedIds = { readonly has: (card: InboxCard) => boolean };
+
+/**
+ * Remembers, for the session (the Workbench's lifetime), every request id that left `cards`. The
+ * server may reuse an id once it falls out of its retained-closed window, so a card that comes
+ * back under one starts unacknowledged. It lives above the views: a phone/desktop switch or a tab
+ * change unmounts `InboxCards`, and a close or reopen can happen while it is away. Unbounded on purpose.
+ */
+export function createClosedIds(cards: () => readonly InboxCard[]): ClosedIds {
+  const closed = new Set<string>();
+  let live = new Set<string>();
+  createEffect(() => {
+    const next = new Set(cards().map(keyOf));
+    for (const key of live) if (!next.has(key)) closed.add(key);
+    live = next;
+  });
+  return { has: (card) => closed.has(keyOf(card)) };
+}
+
 /** The inbox's cards, blocking first. */
-export function InboxCards(props: { readonly cards: readonly InboxCard[]; readonly source: "replay" | "live"; readonly sender: Sender | null }): JSX.Element {
+export function InboxCards(props: { readonly cards: readonly InboxCard[]; readonly closed: ClosedIds; readonly source: "replay" | "live"; readonly sender: Sender | null }): JSX.Element {
   const note = (): string | null =>
     props.source === "live"
       ? props.cards.length === 0
@@ -59,17 +81,20 @@ export function InboxCards(props: { readonly cards: readonly InboxCard[]; readon
   // A card is rebuilt on every record, so what the person typed lives here, by request.
   const uis = new Map<string, DecideUi>();
   const uiFor = (card: InboxCard): DecideUi => {
-    const key = `${card.agent}\u0000${card.id}`;
+    const key = keyOf(card);
     const found = uis.get(key);
     if (found !== undefined) return found;
-    const fresh = createDecideUi();
+    const fresh = createDecideUi(props.closed.has(card));
     uis.set(key, fresh);
     return fresh;
   };
   // No state leaks: an entry goes when its request closes or is delisted.
   createEffect(() => {
-    const live = new Set(props.cards.map((card) => `${card.agent}\u0000${card.id}`));
-    for (const key of [...uis.keys()]) if (!live.has(key)) uis.delete(key);
+    const live = new Set(props.cards.map(keyOf));
+    for (const key of [...uis.keys()])
+      if (!live.has(key)) {
+        uis.delete(key);
+      }
   });
   return (
     <>

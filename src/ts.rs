@@ -50,6 +50,7 @@ fn contracts() -> BTreeMap<PathBuf, String> {
     collector.add::<QuestionForm>();
     collector.add::<QuestionCloseReason>();
     collector.add::<AgentInfo>();
+    collector.add::<crate::api::structured_agent::StructuredAgentInfo>();
     collector.add::<FleetAgentInfo>();
     collector.add::<WorkspaceInfo>();
     collector.add::<PaneInfo>();

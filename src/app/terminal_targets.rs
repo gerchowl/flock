@@ -32,6 +32,9 @@ pub(crate) struct TerminalTargetCandidate {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TerminalTargetError {
+    RuntimeUnsupported {
+        target: String,
+    },
     NotFound {
         target: String,
     },
@@ -52,12 +55,29 @@ pub(crate) const PANE_TARGET_EXPECTED: &[&str] = &[
 ];
 
 impl App {
+    /// Reject pane-only contracts before their historical/self fallback paths.
+    pub(super) fn structured_terminal_error(&self, target: &str) -> Option<TerminalTargetError> {
+        match self.structured_target(target) {
+            Ok(Some(_)) => Some(TerminalTargetError::RuntimeUnsupported {
+                target: target.into(),
+            }),
+            Err(_) => Some(TerminalTargetError::Ambiguous {
+                target: target.into(),
+                candidates: Vec::new(),
+            }),
+            Ok(None) => None,
+        }
+    }
+
     /// The one target resolver (ADR-0029 §5): `self`, terminal id, pane id,
     /// agent id, then unique agent name or label.
     pub(crate) fn resolve_terminal_target(
         &self,
         target: &str,
     ) -> Result<TerminalTarget, TerminalTargetError> {
+        if let Some(error) = self.structured_terminal_error(target) {
+            return Err(error);
+        }
         // `self` is the API caller's own pane, from its process ancestry.
         if target == "self" {
             return self

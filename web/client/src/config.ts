@@ -3,7 +3,8 @@
  * (ADR-0038 §6).
  *
  * The bundle never issues a relative `fetch`, and reads the page's location
- * in exactly one place, {@link sameOriginDefaults}. A shell that hosts it
+ * only in this module, in {@link sameOriginDefaults} and {@link pageSearch}
+ * (plus the fragment capture in `src/capture-code.ts`). A shell that hosts it
  * may set one global, {@link SHELL_CONFIG_GLOBAL}, before the bundle's
  * module script runs, and a present global always wins:
  *
@@ -76,9 +77,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /**
  * The browser shell's configuration when no global is set: the server is
  * the page's own origin (main's decision on #1880: `flk` serves no config
- * script, so the page it serves configures itself). This is the only place
- * the bundle reads the page's location; `tests/config.test.ts` allows it
- * here and nowhere else.
+ * script, so the page it serves configures itself). With {@link pageSearch}
+ * it is the only place the bundle reads the page's location;
+ * `tests/location-guard.ts` allows it here and nowhere else.
  */
 export function sameOriginDefaults(scope: object): ConfigResult {
   const page = scope as { readonly location?: { readonly origin?: unknown } };
@@ -90,6 +91,16 @@ export function sameOriginDefaults(scope: object): ConfigResult {
     return refuse(`No shell configuration: the shell did not set ${SHELL_CONFIG_GLOBAL}, and the page is not served over http(s).`);
   }
   return { ok: true, config: { transport: "wire", serverUrl: origin } };
+}
+
+/**
+ * The page's query string (`?preview=…`), or "" when there is no page. The
+ * sibling of {@link sameOriginDefaults} for the one other thing the bundle
+ * takes from the location, so no other module reads it.
+ */
+export function pageSearch(scope: object): string {
+  const search = (scope as { readonly location?: { readonly search?: unknown } }).location?.search;
+  return typeof search === "string" ? search : "";
 }
 
 /**

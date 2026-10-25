@@ -13,7 +13,7 @@ import type { Transport } from "../transport";
 import { Transcript, type TranscriptSource } from "../views/Transcript";
 import { Composer, type ComposerState, type Sender } from "./Composer";
 import type { InboxCard } from "./inbox";
-import { AgentRowButton, AgentTitle, InboxCards, Waits } from "./parts";
+import { AgentRowButton, AgentTitle, InboxCards, Waits, type ClosedIds } from "./parts";
 
 /** What the phone screens show, and what they can do. */
 export type PhoneProps = {
@@ -30,6 +30,7 @@ export type PhoneProps = {
   readonly transport: Transport;
   readonly source: TranscriptSource;
   readonly inbox: readonly InboxCard[];
+  readonly closed: ClosedIds;
   readonly sender: Sender | null;
   readonly composer: ComposerState;
 };
@@ -95,7 +96,7 @@ export function PhoneWorkbench(props: PhoneProps): JSX.Element {
                 <p class="phone__headline" data-testid="inbox-headline">
                   {headline()}
                 </p>
-                <InboxCards cards={props.inbox} source={props.source} sender={props.sender} />
+                <InboxCards cards={props.inbox} closed={props.closed} source={props.source} sender={props.sender} />
               </Match>
               <Match when={tab() === "agents"}>
                 <h1 class="phone__title">Agents</h1>

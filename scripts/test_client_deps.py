@@ -134,20 +134,18 @@ fi' DEBUG
                         if gate_restore:
                             ready, _, _ = select.select([restore_read], [], [], 10)
                             self.assertTrue(ready, 'recipe never entered its restore callback')
-                            notice = os.read(restore_read, 64)
-                            self.assertIn(notice, [b'restore\n', b''])
-                            if notice:
-                                # A group TERM also reaches just, which forwards it to Bash.
-                                # Deliver the duplicate while EXIT is active, then proceed.
-                                os.killpg(child.pid, signal.SIGTERM)
-                                try:
-                                    os.write(release_write, b'continue\n')
-                                except BrokenPipeError:
-                                    # A reentrant handler may finish before this gate opens.
-                                    # The manifest assertion still requires restoration.
-                                    pass
-                            # EOF means the signal handler restored directly and exited,
-                            # without entering EXIT's callback. Both paths must restore.
+                            self.assertEqual(os.read(restore_read, 64), b'restore\n',
+                                             'restore gate must fire before the duplicate TERM')
+                            # A group TERM also reaches just, which forwards it to Bash.
+                            # Deliver the duplicate while EXIT is active, then proceed.
+                            os.killpg(child.pid, signal.SIGTERM)
+                            try:
+                                os.write(release_write, b'continue\n')
+                            except BrokenPipeError:
+                                # Only gate release may race the duplicate TERM closing
+                                # its reader after reentrant restoration. communicate below
+                                # must still prove exit and the original manifest.
+                                pass
                         stdout, stderr = child.communicate(timeout=10)
                         self.assertNotEqual(child.returncode, 0, stdout + stderr)
                         self.assertEqual((root / 'nix/client-deps.json').read_bytes(), original)
