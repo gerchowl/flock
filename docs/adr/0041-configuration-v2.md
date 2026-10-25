@@ -232,6 +232,14 @@ sessions' admitted snapshots and security boundaries. Exact classifications
 for every section are verified in the implementation inventory, not guessed
 by this ADR.
 
+The server inventory classifies `msg`, `spawn` and their descendants as
+`AppLive` following #2399: `apply_live_config` copies each valid section for
+subsequent operations. Invalid sections retain their running values. This is
+server policy ownership, not retroactive mutation of existing admissions:
+child environments, stored launch snapshots and MCP session options retain
+what they captured. Restart the MCP process to refresh its startup options,
+as described in the configuration guide.
+
 ### 6. Per-node ownership and GUI
 
 Config belongs to one node, not to a synchronized fleet-wide document. The
