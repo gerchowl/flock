@@ -79,6 +79,7 @@ fn oversized_permission_row_is_lagged_before_it_enters_the_live_ring() {
                 label: "Example".into(),
                 state: crate::api::agent_state::AgentState::unknown(),
                 activity: None,
+                route: None,
                 waiting_on_human: vec!["r".repeat(MAX_MESSAGE)],
             },
         },
@@ -146,6 +147,7 @@ fn fleet_frame_bound_reserves_the_maximum_escaped_subscription_id() {
         label: "Example".into(),
         state: crate::api::agent_state::AgentState::unknown(),
         activity: None,
+        route: None,
         waiting_on_human: vec![String::new()],
     };
     let envelope = ServerFrame::Ev {

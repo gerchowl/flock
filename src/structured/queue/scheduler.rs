@@ -3,7 +3,7 @@
 //! One fresh runtime generation owns this scheduler and all stdin submissions.
 //! Feed persisted events in order, publish cuts only after successful operations,
 //! and drain final events before exited(). No disk work runs on the server loop.
-use super::admission::{Admission, Failure, Gate, Principal};
+use super::admission::{validate_kind, Admission, Failure, Gate, Principal};
 use super::model::State;
 use super::{Item, Journal, QueueJournalCorrupt, ReadOnly};
 use crate::api::agent_state::{AgentState, Attention, Lifecycle, Turn};
@@ -87,8 +87,9 @@ pub(crate) struct Scheduler {
 impl Scheduler {
     /// Start a fresh runtime generation; unresolved old offers become held.
     /// Unknown result-flag encodings are unresolved, never treated as idle.
+    /// Reserved kinds fail durably instead of re-entering admission through hold.
     pub fn new(admission: Admission) -> Result<Self, Failure> {
-        let pending = admission
+        let pending: Vec<_> = admission
             .journal()
             .items()
             .iter()
@@ -107,7 +108,15 @@ impl Scheduler {
             virgin: true,
         };
         if this.journal().read_only().is_none() {
-            this.hold(pending, ErrorCode::SessionUnconfirmed)?;
+            let mut supported = Vec::new();
+            for item in pending {
+                if let Err(failure) = validate_kind(&item.kind) {
+                    this.admission.fail_item(item.item_id, failure.code)?;
+                } else {
+                    supported.push(item);
+                }
+            }
+            this.hold(supported, ErrorCode::SessionUnconfirmed)?;
         }
         Ok(this)
     }
