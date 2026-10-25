@@ -42,6 +42,7 @@ async fn serve<A, F>(
     router: Router,
     clock: Arc<dyn Clock>,
     health: Health,
+    budget: Arc<super::preauth::Budget>,
 ) -> io::Result<()>
 where
     A: FnMut() -> F,
@@ -52,10 +53,29 @@ where
     loop {
         while clients.try_join_next().is_some() {}
         let (socket, peer) = accept_next(&mut accept, clock.as_ref(), &health).await?;
+        let local = socket.local_addr()?;
+        let uid = super::store_io::shared()
+            .run(move || crate::platform::tcp_uid::lookup(peer, local))
+            .await
+            .flatten();
+        let (ticket, client_router) = match budget.acquire(uid) {
+            Ok(ticket) => (ticket, router.clone()),
+            Err(code) => {
+                let Some(ticket) = budget.reject(uid) else {
+                    continue;
+                };
+                (
+                    ticket,
+                    Router::new().fallback(move || async move { super::preauth::refusal(code) }),
+                )
+            }
+        };
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             continue;
         };
-        let service = router.clone().layer(Extension(ConnectInfo(peer)));
+        let service = client_router
+            .layer(Extension(ConnectInfo(peer)))
+            .layer(Extension(ticket));
         clients.spawn(async move {
             let _permit = permit;
             let mut builder = hyper::server::conn::http1::Builder::new();
@@ -97,6 +117,7 @@ impl Listener {
         inherited: Option<TcpListener>,
         health: Health,
         wake: Arc<tokio::sync::Notify>,
+        credentials: crate::structured::permissions::auth::tokens::server::Owner,
     ) -> io::Result<Option<Self>> {
         let Some(bind) = bind else {
             return if inherited.is_none() {
@@ -135,7 +156,7 @@ impl Listener {
             .map_err(io::Error::other)??;
         socket.set_nonblocking(true)?;
         let acceptor = tokio::net::TcpListener::from_std(socket.try_clone()?)?;
-        let core = Core::new(data.clone(), wake).await?;
+        let core = Core::new_shared(data.clone(), wake, credentials).await?;
         let csp = HeaderValue::from_str(&format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://{actual}/v1/ws; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")).map_err(io::Error::other)?;
         let router = core
             .router()
@@ -168,8 +189,16 @@ impl Listener {
         if let Some((socket, router)) = self.prepared.take() {
             self.health.publish(Status::Listening);
             let health = self.health.clone();
+            let budget = self.core.preauth();
             self.task = Some(tokio::spawn(async move {
-                serve(|| socket.accept(), router, Arc::new(SystemClock), health).await
+                serve(
+                    || socket.accept(),
+                    router,
+                    Arc::new(SystemClock),
+                    health,
+                    budget,
+                )
+                .await
             }));
         }
     }
@@ -191,7 +220,8 @@ async fn guard(
     let authority = bind.to_string();
     let headers = request.headers();
     if peer.ip() != Ipv4Addr::LOCALHOST
-        || !gui::origin_allowed(headers, &authority)
+        || !(gui::origin_allowed(headers, &authority)
+            || (request.uri().path() == "/v1/ws" && gui::shell_origin_allowed(headers, &authority)))
         || (request.uri().path().starts_with("/v1/") && !headers.contains_key(header::ORIGIN))
     {
         return StatusCode::FORBIDDEN.into_response();

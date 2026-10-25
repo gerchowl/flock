@@ -3501,8 +3501,8 @@ unchanged.
 - **Scopes.** It takes no scope parameter. It grants exactly `{read, send,
   answer, operate}`, the set `ClientOpen` hands out. A request naming scopes is
   refused with `invalid_params`.
-- **Optional parameter.** It takes one optional parameter, `origin_port`
-  (below).
+- **Parameters.** Empty. The captured macOS/Linux shell origin requires no
+  `origin_port`; extra fields are refused with `invalid_params` (#2442).
 
 **What the token is.** A bearer secret. With `operate` it **is** the
 operator's identity for ADR-0014's operator-only verbs, as §5 says of an
@@ -3542,8 +3542,10 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
   matrix row "Restart, handoff…".
 - **Revocation.** On process exit, TTL expiry, restart or handoff,
   `authenticate` stops accepting the token. Every live `/v1/ws` session
-  authenticated by it is closed with a typed auth close: `token_revoked` or
-  `token_expired`.
+  authenticated by it uses the existing close 4403. A command that detects
+  revocation receives its `auth_revoked` error acknowledgement before the close;
+  idle expiry and exit also close without waiting for a command. No new auth
+  error names are introduced (#2442).
 
 **Shell origins, on `/v1/ws` only.**
 - **The allow-list.** The listener guard (`origin_allowed`,
@@ -3555,27 +3557,26 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
 - **Unchanged.** Every other origin and path keeps today's checks.
   `/v1/client/exchange` keeps its strict same-origin rule.
 - **`null` is never admitted.**
-- **A registered loopback origin** replaces `null` for a platform whose shell
-  would send it.
-  - The mint carries `origin_port`, and the server builds exactly
-    `http://127.0.0.1:<port>`.
-  - It checks that the port is a listening TCP socket held by the minting
-    process (macOS `proc_pidfdinfo` socket info; Linux: the socket inode in
-    `/proc/<pid>/net/tcp`, matched to one of the PID's fds). If it is not,
-    the mint is refused with `origin_port_not_owned`.
-  - The origin is bound to that one token. The guard admits the upgrade from
-    it provisionally, and `hello` must present the bound token; any other
-    token closes the connection.
-  - For this origin only, the guard accepts `Sec-Fetch-Site: same-site`.
-  - The origin is removed when its token is revoked or expires.
-- **Pre-auth limits.**
-  - At most 16 concurrent unauthenticated `/v1/ws` connections per listener;
-    beyond that, `preauth_capacity`.
-  - One `hello` per connection; a failed `hello` closes it.
-  - After 10 failed `hello`s within 1 s, new upgrades are refused with
-    `auth_rate_limited` for the rest of that second.
-  - Authenticated sessions are unaffected.
-  - The §5a handshake deadline still applies.
+- **Captured local origin (#2442).** Exactly `tauri://localhost` with
+  `Sec-Fetch-Site: cross-site`, only on `/v1/ws`. The capture supersedes the
+  registered-loopback design: there is no `origin_port` or port-ownership
+  check, and no `origin_port_not_owned` code. Windows remains remote-only.
+- **Pre-auth isolation.** Budgets key on kernel-attributed UID. Linux matches
+  the connecting IPv4 tuple in `/proc/net/tcp`; macOS uses the corresponding
+  `pcblist_n` socket's `so_uid`. The bounded I/O worker performs lookup before
+  HTTP admission. Unknown evidence shares a separate bucket, never the
+  operator bucket. UID evidence grants no authentication authority.
+  Each UID has 16 pending HTTP/hello leases; global backstops are 32 HTTP and
+  128 upgraded transports, with the authenticated session cap unchanged at 16.
+  One peer cannot fill either pending global backstop. Authenticated sessions
+  release their pre-auth lease. Same-UID processes share the bucket (#1177).
+  Ten failed hellos per UID exhaust a fixed one-second window anchored at
+  first admission/failure. `preauth_capacity` is HTTP 503/retry `later`;
+  `auth_rate_limited` is HTTP 429/retry `later`. Existing hello deadlines apply.
+- **Linux native refusal.** G9a refuses local mint at `ptrace_scope=0`, explains
+  that another process could read the operator credential from app memory,
+  and offers remote pairing or administrator-enabled `ptrace_scope ≥ 1`.
+  No silent remote fallback or Origin-based exemption is permitted.
 
 **Tests that must fail first.**
 - A captured shell origin is admitted on `/v1/ws` and refused on the exchange.
@@ -3587,11 +3588,11 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
   process, no polling).
 - TTL expiry does the same (an injected clock).
 - Restart and handoff each revoke every app-session token.
-- `origin_port` held by another process is refused.
-- A registered origin with another token's `hello` is closed.
-- `same-site` is refused for every unregistered origin.
-- The pre-auth caps refuse at 17 concurrent connections and at the 11th failed
-  `hello` within 1 s, and an authenticated session is unaffected.
+- Shell lookalikes, duplicate headers, `same-site` and non-WS paths are refused.
+- One exhausted UID/unknown bucket cannot lock out another UID/operator.
+- The tenth failed hello exhausts only its UID's window; the exact one-second
+  boundary restores admission. Authenticated sessions remain unaffected.
+- Shutdown still stops and drains if app-session revocation fails (#2496).
 
 ### Amendment: Welcome capability grants (#2461)
 

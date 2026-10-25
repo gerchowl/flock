@@ -8,6 +8,7 @@ mod url;
 pub use url::{open_url, validate_url, OpenUrlError};
 
 pub(crate) mod peer;
+pub(crate) mod process_exit;
 pub(crate) mod received_fd;
 pub(crate) mod socket;
 pub(crate) mod structured;
@@ -269,3 +270,6 @@ pub(crate) mod client_tokens;
 
 #[cfg(test)]
 pub(crate) mod socket_test_support;
+
+#[cfg(any(feature = "web", test))]
+pub(crate) mod tcp_uid;
