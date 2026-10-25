@@ -165,8 +165,8 @@ impl Workers {
     /// and checked on both sides of the factory. Live/unconfirmed workers and
     /// unread terminal queue completions refuse replacement with session_busy.
     /// Failure may advance the observation epoch but never the record.
-    /// The app drains published completions before operator relaunch. Internal
-    /// adapters must likewise drain terminal completions first.
+    /// The application drains terminal completions for lifecycle facts and send
+    /// acknowledgements. Internal adapters must likewise drain before relaunch.
     pub fn start(
         &mut self,
         registry: &mut Registry,

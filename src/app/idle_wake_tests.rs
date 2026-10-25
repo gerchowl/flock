@@ -1738,6 +1738,7 @@ async fn plain_paste_retains_missing_runtime_error_codes() {
         };
         let method = if agent_send {
             Method::AgentSend(crate::api::schema::AgentSendParams {
+                item_id: None,
                 write_timeout_ms: None,
                 raw: false,
                 target: pane,
