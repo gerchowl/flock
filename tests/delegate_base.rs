@@ -7,13 +7,15 @@ use support::environment::Command;
 fn peer(request: &serde_json::Value) -> serde_json::Value {
     match request["method"].as_str().unwrap() {
         "ping" => {
-            serde_json::json!({"result":{"type":"pong", "version":"fixture", "protocol":support::PROTOCOL_VERSION}})
+            serde_json::json!({"result":{"type":"pong", "version":"fixture", "protocol":support::PROTOCOL_VERSION,"capabilities":{"pane_input_write_ack":true,"live_handoff":false}}})
         }
         "agent.get" => serde_json::json!({"result":{"agent":{
             "terminal_id":"term_fixture", "pane_id":"w1:p1", "agent_status":"idle",
             "turn_cursor":"term_fixture:0:0:0:i"
         }}}),
-        "pane.submit" => serde_json::json!({"result":{"outcome":"accepted"}}),
+        "pane.submit" => {
+            serde_json::json!({"result":{"type":"guarded_submit","outcome":"accepted","reason":null,"retried":false}})
+        }
         other => panic!("unexpected delegate request: {other}"),
     }
 }
