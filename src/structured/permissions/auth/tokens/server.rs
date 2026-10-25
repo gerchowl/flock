@@ -52,20 +52,19 @@ impl Store {
     }
     /// Authenticate either source; uncertain store failures never fall back silently.
     pub(crate) fn authenticate(&self, token: &Bearer) -> Result<Session, TokenError> {
-        match self.apps.authenticate(token) {
-            Ok(s) => Ok(Session {
-                info: s.info.clone(),
-                source: Source::App(s),
-            }),
-            Err(TokenError::Revoked | TokenError::Unauthorized) => {
-                self.files.authenticate(token).map(|s| Session {
-                    info: s.info.clone(),
-                    source: Source::File(s),
-                })
-            }
-            Err(e) => Err(e),
+        if self.apps.contains(token)? {
+            let session = self.apps.authenticate(token)?;
+            return Ok(Session {
+                info: session.info.clone(),
+                source: Source::App(session),
+            });
         }
+        self.files.authenticate(token).map(|session| Session {
+            info: session.info.clone(),
+            source: Source::File(session),
+        })
     }
+
     /// Recheck the original source under its shared fence through bounded dispatch.
     pub(crate) fn admit<T>(
         &self,

@@ -166,6 +166,15 @@ impl Store {
         }
         Ok(entry.session.clone())
     }
+    /// Membership selects the source without imposing an app admission lock on file hello.
+    pub(super) fn contains(&self, token: &Bearer) -> Result<bool, TokenError> {
+        let digest: [u8; 32] = Sha256::digest(token.0.as_bytes()).into();
+        Ok(self
+            .entries
+            .lock()
+            .map_err(|_| TokenError::Unsafe)?
+            .contains_key(&digest))
+    }
     /// Lookup only in this private memory domain; file-token authentication is unchanged.
     pub(crate) fn authenticate(&self, token: &Bearer) -> Result<Session, TokenError> {
         let _guard = self.files.lock_with(LockFile::try_lock_shared)?;
