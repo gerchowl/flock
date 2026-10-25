@@ -1,6 +1,6 @@
 //! Single journal owner on the session event pump (ADR-0036 §3/§4, #1955).
 //! Each bounded completion must be consumed. Saturation backpressures admissions
-//! and event delivery. Shutdown cancellation explicitly requires durable replay.
+//! and event delivery. Shutdown retains facts; abandoned cuts require replay.
 use crate::api::{agent_state::AgentState, error_code::ErrorCode};
 use crate::structured::{
     queue::{
@@ -11,7 +11,17 @@ use crate::structured::{
     transport::{InputHandle, Received},
 };
 pub(crate) mod publication;
-use std::{cell::RefCell, io, num::NonZeroU64, path::Path, sync::mpsc};
+pub(crate) mod recovery;
+use std::{
+    cell::RefCell,
+    io,
+    num::NonZeroU64,
+    path::Path,
+    sync::{mpsc, Arc},
+};
+/// Fixed notification bound, separate from one peek and the terminal fact tail.
+pub(crate) const COMPLETION_CAPACITY: usize = 4;
+type FinalFacts = Arc<parking_lot::Mutex<Vec<crate::api::queue_event::QueueItemState>>>;
 
 /// S4 projection after reducing every session record through this sequence.
 #[derive(Clone, PartialEq, Eq)]
@@ -34,13 +44,16 @@ pub(crate) struct Request {
 /// One immutable completion/cut, ready for the #1956 publication adapter.
 #[derive(Debug)]
 pub(crate) struct Update {
+    /// Already committed transitions, including startup re-hold, before compaction.
+    pub facts: Vec<crate::api::queue_event::QueueItemState>,
     /// Admission acknowledgement, correlated by lifecycle item identity.
     pub admitted: Option<(String, Result<(), Failure>)>,
     /// Actual delivery or typed refusal, never an unlabelled pending state.
     pub offer: Result<Offer, Failure>,
     /// Reservation/read-only status, including after a failed offer.
     pub pending: Option<Pending>,
-    /// Committed cut only; uncertain durability instead requires reopening.
+    /// Committed cut only. Uncertain durability requires reopening; a terminal
+    /// facts-only completion also has no cut and makes no candidate offer.
     pub cut: Option<Cut>,
 }
 /// Bounded, nonblocking server-side endpoint. It never owns a file or writer.
@@ -50,6 +63,7 @@ pub(in crate::structured) struct Client {
     states: mpsc::SyncSender<Snapshot>,
     updates: mpsc::Receiver<Update>,
     peeked: RefCell<Option<Box<Update>>>,
+    final_facts: FinalFacts,
 }
 impl Client {
     /// Full returns session_busy; disconnection returns agent_not_found. Success
@@ -69,7 +83,28 @@ impl Client {
         if peeked.is_none() {
             *peeked = self.updates.try_recv().ok().map(Box::new);
         }
-        peeked.is_some()
+        peeked.is_some() || !self.final_facts.lock().is_empty()
+    }
+    /// After producer completion, discard obsolete notification cuts while
+    /// retaining committed facts in order until the app consumes them.
+    pub fn retire_facts(&self) -> bool {
+        let mut facts = self
+            .peeked
+            .borrow_mut()
+            .take()
+            .map_or_else(Vec::new, |update| update.facts);
+        for _ in 0..COMPLETION_CAPACITY {
+            let Ok(update) = self.updates.try_recv() else {
+                break;
+            };
+            facts.extend(update.facts);
+        }
+        let mut pending = self.final_facts.lock();
+        if !facts.is_empty() {
+            facts.append(&mut pending);
+            *pending = facts;
+        }
+        !pending.is_empty()
     }
     pub fn update(&self) -> Option<Update> {
         self.peeked
@@ -77,6 +112,16 @@ impl Client {
             .take()
             .map(|update| *update)
             .or_else(|| self.updates.try_recv().ok())
+            .or_else(|| {
+                let facts = std::mem::take(&mut *self.final_facts.lock());
+                (!facts.is_empty()).then_some(Update {
+                    facts,
+                    admitted: None,
+                    offer: Ok(Offer::NoEligibleItems),
+                    pending: None,
+                    cut: None,
+                })
+            })
     }
 }
 /// Constructed on the launch worker, then moved once to the session event pump.
@@ -89,6 +134,7 @@ pub(in crate::structured) struct Service {
     states: mpsc::Receiver<Snapshot>,
     updates: mpsc::SyncSender<Update>,
     pending: Option<Update>,
+    final_facts: FinalFacts,
     state: AgentState,
     covered: u64,
     required: u64,
@@ -104,11 +150,13 @@ impl Service {
         let journal = Journal::open_with_policy(data, agent, RewritePolicy::new(bytes))?;
         let mut scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH)?)?;
         scheduler.fail_stale_openings()?;
-        let (publisher, source) = publication::Publisher::new(scheduler.journal().replay(0)?);
+        let (publisher, source) =
+            publication::Publisher::new(agent, scheduler.journal().replay(0)?);
         let (tx, requests) = mpsc::sync_channel(1);
         let (state_tx, states) = mpsc::sync_channel(1);
         // Same four-completion bound as the session stream; no unbounded spool.
-        let (updates, rx) = mpsc::sync_channel(4);
+        let (updates, rx) = mpsc::sync_channel(COMPLETION_CAPACITY);
+        let final_facts = Arc::new(parking_lot::Mutex::new(Vec::new()));
         Ok((
             Self {
                 publisher,
@@ -117,6 +165,7 @@ impl Service {
                 requests,
                 states,
                 updates,
+                final_facts: final_facts.clone(),
                 pending: None,
                 state: AgentState::unknown(),
                 covered: 0,
@@ -133,6 +182,7 @@ impl Service {
                 requests: tx,
                 states: state_tx,
                 updates: rx,
+                final_facts,
                 peeked: RefCell::new(None),
             },
         ))
@@ -165,23 +215,36 @@ impl Service {
         Ok(item_id)
     }
     pub fn flush(&mut self, cancelled: bool, notify: &impl Fn()) -> bool {
-        if let Some(update) = self.pending.take() {
+        if let Some(mut update) = self.pending.take() {
+            // Once fallback begins, newer facts follow its older transitions.
+            let mut final_facts = self.final_facts.lock();
+            if !final_facts.is_empty() {
+                final_facts.append(&mut update.facts);
+            }
+            drop(final_facts);
             match self.updates.try_send(update) {
                 Ok(()) => notify(),
                 Err(mpsc::TrySendError::Full(update)) if !cancelled => {
                     self.pending = Some(update);
                     return false;
                 }
-                Err(_) => self.lost = true,
+                Err(
+                    mpsc::TrySendError::Full(update) | mpsc::TrySendError::Disconnected(update),
+                ) => {
+                    // Retain committed facts even when shutdown abandons notification cuts.
+                    self.final_facts.lock().extend(update.facts);
+                    self.lost = true;
+                    notify();
+                }
             }
         }
         true
     }
     /// Service replay requests independently of completion backpressure.
-    pub fn capture(&mut self) {
+    pub fn capture(&mut self, notify: &impl Fn()) {
         let blocked = &mut self.blocked;
         let scheduler = &mut self.scheduler;
-        self.publisher.capture(
+        if self.publisher.capture(
             || {
                 let result = match *blocked {
                     Some(code) => Err(failure(code)),
@@ -193,11 +256,13 @@ impl Service {
                 result
             },
             self.status.clone(),
-        );
+        ) {
+            notify();
+        }
     }
     /// Whether this operation failed at the stdin boundary.
     pub fn tick(&mut self, input: &InputHandle, stopped: bool, notify: &impl Fn()) -> bool {
-        self.capture();
+        self.capture(notify);
         let mut changed = self.initial;
         if let Ok(state) = self.states.try_recv() {
             if state.through >= self.required {
@@ -283,7 +348,10 @@ impl Service {
             self.required = self.covered.saturating_add(1);
             self.state = AgentState::unknown();
         }
-        let pending = self.scheduler.status_on(input);
+        let pending = self.scheduler.status_on(input).or_else(|| match &offer {
+            Ok(Offer::Pending(pending)) => Some(pending.clone()),
+            _ => None,
+        });
         let cut = match self.scheduler.journal().replay(self.cursor) {
             Ok(cut) => Some(cut),
             Err(error) => {
@@ -296,7 +364,9 @@ impl Service {
             .as_ref()
             .err()
             .map(|e| (e.code, e.source.as_ref().map(|s| (s.kind(), s.to_string()))));
-        let changed = self.initial
+        let facts = self.scheduler.take_facts();
+        let changed = !facts.is_empty()
+            || self.initial
             || cut.as_ref().is_some_and(|c| c.through != self.cursor)
             || pending != self.status
             || admitted.is_some()
@@ -309,6 +379,7 @@ impl Service {
             self.error = error.clone();
             self.status = pending.clone();
             let update = Update {
+                facts,
                 admitted,
                 offer,
                 pending,
@@ -326,11 +397,13 @@ impl Service {
         Ok(())
     }
     pub fn finish(&mut self, input: &InputHandle, notify: &impl Fn()) -> bool {
+        self.flush(true, notify);
         let error = self
             .policy()
             .and_then(|_| self.scheduler.exited())
             .and_then(|_| self.settle_opening())
             .err();
+
         self.publish(input, true, None, error);
         let blocked = self.blocked;
         self.publisher.finish(
