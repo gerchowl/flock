@@ -99,8 +99,9 @@ relinquishing the global log. Provider
 status preserves reservation and S4/S6 gate Pending, read-only errors and explicit
 lagged closure; it does
 not auto-retry mutations or start cold recovery. A new generation discards the
-previous provider observation. Admission routing and acknowledgements remain
-#1957/#1958, and the external subscription adapter remains #1830.
+previous provider observation. Operator admission acknowledgements use this same
+completion consumer (#1957); authenticated message custody remains #1958, and
+the external subscription adapter remains #1830.
 
 The queue and global log are separate durability domains: facts are ordered
 after their queue commit, not in a shared transaction. Global append failures
