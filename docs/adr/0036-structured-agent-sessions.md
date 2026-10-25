@@ -3439,3 +3439,67 @@ the existing hold behavior. Admission and edits still refuse reserved kinds;
 recovery uses the existing durable `fail` transition, not renewed admission.
 Later supported queued inputs remain deliverable after construction. Read-only
 and opaque future records retain their existing inspection-only behavior.
+
+
+### Amendment: App-session tokens and shell origins (#1601)
+
+ADR-0038 owner decision 16 (decided 2026-10-25, recorded on #1601) gives a
+Tauri shell on the server's own machine a zero-touch token. ADR-0038 §6 has the
+shell's side. This section is the server contract. §5's other auth rules are
+unchanged.
+
+**Mint verb.** A new socket method mints an **app-session token**.
+- **Who may call it.** It is admitted only from the LocalOperator (the same
+  `client_token_authority()` guard as `ClientOpen`): the peer UID and PID
+  checked by the kernel, a non-empty PID, no flk pane in the caller's
+  ancestry, and no mesh edge.
+- **Scopes.** It takes no scope parameter. It grants exactly `{read, send,
+  answer, operate}`, the set `ClientOpen` hands out. A request naming scopes
+  is refused with `invalid_params`.
+- **The token is a bearer secret.** Any local process that reads it can use
+  `/v1/ws` until it is revoked or expires. A process of the same UID could
+  mint its own anyway, so the binding below bounds the token's lifetime; it
+  does not confine it.
+
+**Binding and lifetime.**
+- **Where the PID comes from.** The bound PID and its process start time are
+  taken from the **minting connection's peer credentials** (`LOCAL_PEERPID` /
+  `SO_PEERCRED`, `src/platform/peer.rs`), never from a parameter.
+- **Exit detection.** It uses kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS and a
+  pidfd on Linux. It never polls with `kill(pid, 0)`, which PID reuse defeats.
+  If the watch cannot be armed, the mint is refused.
+- **Storage.** App-session tokens live in server memory only. They are never
+  written under `client-tokens/` and never listed as file tokens, so a server
+  restart revokes them all.
+- **TTL.** A fixed 12 hours from the mint, with no sliding renewal. The shell
+  renews by minting again.
+- **Revocation.** On process exit, TTL expiry or server restart, `authenticate`
+  stops accepting the token. Every live `/v1/ws` session authenticated by it is
+  closed with a typed auth close: `token_revoked` or `token_expired`.
+
+**Shell origins, on `/v1/ws` only.**
+- **The allow-list.** The listener guard (`origin_allowed`,
+  `src/web/gui.rs`; `src/web/client_listener.rs`) admits an exact allow-list
+  of shell origins on the `/v1/ws` upgrade. For those origins only, it accepts
+  the `Sec-Fetch-Site` value the shell sends.
+- **Unchanged.** Every other origin and path keeps today's checks.
+  `/v1/client/exchange` keeps its strict same-origin rule.
+- **Values.** The allow-list holds only values captured from real Tauri v2
+  shells and recorded in ADR-0038 §6.
+- **`null` is never admitted.** A platform whose shell sends `null` registers
+  a loopback origin at mint instead, and that origin is admitted only for the
+  token's lifetime.
+- **Pre-auth limits.** Concurrent unauthenticated `/v1/ws` connections and
+  failed `hello` attempts are capped, with typed refusals. The §5a handshake
+  deadline still applies.
+
+**Tests that must fail first.**
+- A captured shell origin is admitted on `/v1/ws` and refused on the exchange.
+- `null` is refused on both.
+- A shell origin with a missing or wrong token is refused at `hello`.
+- A scoped mint is refused, and so is a mint from a non-LocalOperator peer.
+- Process exit revokes the token and closes its live sessions (a real child
+  process, no polling).
+- TTL expiry does the same (an injected clock).
+- A restart revokes every app-session token.
+- The pre-auth caps refuse once exceeded.

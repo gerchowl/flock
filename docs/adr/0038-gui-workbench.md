@@ -609,21 +609,52 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
   - The `flk` binary with the `web` feature embeds the assets and serves them beside `/v1/ws`.
   - `flk client open` mints a one-time code over the Unix socket and opens the browser (ADR-0036 §5). Loopback is the default bind, and `--allow-non-loopback` stays explicit.
 - **Tauri v2** (#1402). It carries the same assets in a native shell: WKWebView, WebView2, WebKitGTK and Android WebView. It is a separate binary and repo or crate, never linked into `flk` (bin-only).
-  - **Connection.** The shell connects to a `flk` server by URL, over `/v1/ws` with a client token, like the browser. How it gets the token depends on where the server is (owner decision 16):
-    - **The server on the same machine (zero-touch).**
-      - At launch, the shell's native side opens `flock.sock`. The kernel checks the caller's UID and PID on every connection (`getpeereid` + `LOCAL_PEERPID` on macOS, `SO_PEERCRED` on Linux), so the app counts as the LocalOperator, exactly as `flk client open` does.
-      - Over that socket it mints an **app-session token**:
-        - scoped to what the shell asks for, never more than `operate`;
-        - with a server-side TTL;
-        - bound to the app's PID, so it is revoked when that process exits, crash included.
-      - The native side hands the token to the webview through one Tauri command. The webview keeps it **in memory only** and mints again after a reload; nothing is persisted.
-      - The socket carries only this mint. Every stream and command still goes over `/v1/ws`, so this does not reopen ADR-0011 §3's direct-socket transport (owner decision 1).
-      - If no server is running, the shell starts one through the existing daemon path.
-      - An app launched from inside a flk pane fails the LocalOperator check (pane ancestry). It says so and stops; it never falls back to a weaker path.
-    - **A remote server** (#2293). The person pastes or deep-links a one-time code, and the token lives in the keychain or keystore, optionally behind biometric unlock.
-  - **Shell origins.** A shell's webview does not present the server's origin: macOS WKWebView sends `Origin: null`, and Windows and Android send `http://tauri.localhost`. The listener's guard (ADR-0036 §5) admits an **exact allow-list** of these shell origins on `/v1/*`, with the loopback-peer and exact-`Host` checks unchanged.
-    - Admitting `null` is safe only because `/v1/ws` has no ambient credential: it authenticates by the token in HELLO. A page in a browser can also send `null` (a sandboxed frame), but it has no token.
-    - `/v1/client/exchange` stays strictly same-origin, because its one-time code is a bearer secret.
+  - **Connection.** The shell connects to a `flk` server by URL, over `/v1/ws` with a client token, like the browser. How it gets the token depends on where the server is (owner decision 16; the server side is ADR-0036's amendment "App-session tokens and shell origins").
+    - **The server on the same machine (zero-touch), macOS and Linux.**
+      - **The mint.**
+        - At launch, the shell's native side opens `flock.sock` and calls the mint verb.
+        - The server admits the call only from the LocalOperator. That means the kernel-checked peer UID and PID (`getpeereid` + `LOCAL_PEERPID` on macOS, `SO_PEERCRED` on Linux, `src/platform/peer.rs`), and no flk pane in the caller's ancestry. It is exactly the authority `flk client open` has.
+      - **Scopes, chosen by the server.**
+        - The verb takes no scope parameter. It grants exactly `{read, send, answer, operate}`, the set `flk client open` gives a browser, because the shell is the operator's own console.
+        - A call that names scopes is refused with `invalid_params`. The caller can neither narrow nor widen the set.
+      - **What the token is.** The app-session token is a **bearer** secret, like every client token.
+        - Once it is in the shell's process, any local process that reads it can use `/v1/ws` over TCP until it is revoked or expires.
+        - That adds no authority a process of the same UID lacks, because such a process can mint its own over the socket. What the binding below buys is a bounded lifetime, not confinement.
+      - **Binding to the app's process.**
+        - The PID comes from the **minting connection's peer credentials**, never from a parameter, together with the process start time that `src/platform/peer.rs` captures, which guards against PID reuse.
+        - The server detects the process's exit with kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS and a pidfd on Linux. It never polls with `kill(pid, 0)`.
+        - If the watch cannot be armed, because the process is gone or its start time does not match, the mint is refused.
+      - **Lifetime.**
+        - App-session tokens live in the server's memory only, never on disk, so a server restart revokes them.
+        - Each one has a fixed **TTL of 12 hours** from the mint, with no sliding renewal.
+        - Before expiry, the native side mints a fresh token and hands it to the webview, which reconnects through §3's resume path. The cursors and the outbox survive, so nothing is lost.
+      - **Revocation.** A token is revoked when its process exits, when its TTL ends or when the server restarts. The server then closes every `/v1/ws` session authenticated by it, with a typed auth close (`token_revoked` or `token_expired`). The client treats that as NeedsToken, and the local shell mints again silently.
+      - **In the webview.** The native side hands the token over through one Tauri command. The webview keeps it **in memory only** and asks again after a reload; nothing is persisted.
+      - **One transport.** The socket carries only the mint. Every stream and command goes over `/v1/ws`, so ADR-0011 §3's direct-socket transport stays superseded (owner decision 1).
+      - **No server running.** The shell starts one through the existing daemon path.
+      - **No silent fallback.** An app launched from inside a flk pane fails the LocalOperator check, and a sandboxed (App Store) build cannot reach `flock.sock`. Either one says why and offers the remote path; it never falls back silently.
+    - **A remote server** (#2293), or a platform without `flock.sock`. The person pastes or deep-links a one-time code, and the token lives in the keychain or keystore, optionally behind biometric unlock.
+  - **Shell origins, on `/v1/ws` only.**
+    - A shell's webview does not present the server's origin. The listener's guard (`origin_allowed`, `src/web/gui.rs`, used by the listener in `src/web/client_listener.rs`) admits an **exact allow-list of shell origins** on the `/v1/ws` upgrade only.
+    - For those origins only, it relaxes the `Sec-Fetch-Site` check to the value the shell actually sends (`cross-site` against `127.0.0.1:port`). Every other origin keeps today's `none`/`same-origin` rule.
+    - The loopback-peer and exact-`Host` checks are unchanged.
+    - **The values are captured, not assumed.** G9a's first step records the `Origin` and `Sec-Fetch-Site` that a real Tauri v2 shell sends on macOS, Linux and Windows, in this section. The allow-list holds only those captured values. The documentation is inconsistent, giving `tauri://localhost` and `null` for macOS and `http://tauri.localhost` for Windows, so nothing is admitted on that basis.
+    - **`null` is never admitted.** If a platform's shell sends `Origin: null`, that platform's shell serves its bundle from a loopback origin instead. The mint registers that exact origin, and the server admits it only for that token's lifetime. `null` is also what an artifact frame (§7), a `file://` page, a `data:` URL and other sandboxed pages send, so admitting it would leave only the token and the frames' CSP as the barrier.
+    - **The threat model.** Admitting a shell origin opens no ambient authority: `/v1/ws` authenticates by the token in `hello` alone (ADR-0036 §5), and the server has no cookie or other ambient credential. ADR-0036 §5 already notes that local processes can forge `Host` and `Origin`, so the origin check is a defence against browsers, not against local code. Here is how each origin that could reach the listener stays out:
+      - A web page in any local browser has a real web origin, which is refused. Even if it were admitted, it has no token.
+      - Artifact frames (§7) are `null`, so they are refused. Their injected CSP `connect-src 'none'` is **required** as a second barrier, and G7's per-shell security test checks it.
+      - `file://` and `data:` pages are `null` or their own scheme, so they are refused.
+    - **Pre-auth limits.** The server caps concurrent unauthenticated `/v1/ws` connections and failed `hello` attempts. A refusal is typed and counted. The ADR-0036 §5a handshake deadline still applies. These bound resource use; guessing a token is infeasible.
+    - **`/v1/client/exchange` keeps its strict checks** (`src/web/client_exchange.rs`: loopback peer, exact `Host` and `Origin`, `Sec-Fetch-Site` `same-origin`). Its one-time code is a bearer secret, and the shell never uses it locally.
+  - **Tests that must fail before the change** (server slice and G9a):
+    - a captured shell origin is admitted on `/v1/ws` and refused on `/v1/client/exchange`;
+    - `Origin: null` is refused on both, with and without a token;
+    - a shell origin with no token, or with a wrong one, is refused at `hello`;
+    - a mint that names scopes is refused, and a mint from a non-LocalOperator peer is refused;
+    - the token dies when its process exits (a real child process, exit detected without polling), and a live session is closed with `token_revoked`;
+    - the token dies at its TTL (an injected clock), and a live session is closed with `token_expired`;
+    - a server restart invalidates every app-session token;
+    - the pre-auth caps refuse once they are exceeded.
   - **Native additions:**
     - the keyboard accessory bar;
     - deep links to an agent, question or artifact;
@@ -784,7 +815,7 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 | 13 | What happens to a thread's fork after the merge-back? (§5b) | **Decided: yes** ("stop fork but keep transcript"). The fork is stopped, and its transcript is kept in the lineage (the `AgentForked` edge); the sidebar folds ended threads. | Stored transcripts, and lineage rows to fold. No retention limit is stated yet: ADR-0036 S16 owns it. A rehydrated copy is deleted when the fork ends either way (ADR-0036 owner decision 14). |
 | 14 | A thread fork's tools (§5b) | **Decided: read-only now, through the general machinery** ("machinery first … but with read only as per now"). The fork runs under ADR-0036 S19's permission tiers (#1321) with a read-only tier, never a thread-specific flag. | A fork that would have to run a command to answer must say so in its proposal. Widening is #1321's follow-up: tiers selectable per model, and a fork that requests more, which the person grants. |
 | 15 | Does S6e retake ADR-0036 owner decision 3a, so that the asker decides blocking, with a reason, instead of S6d's System-One check? (§5b decision 5) | **Decided: yes** (the owner typed "y" on 2026-10-19, recorded on #1717), following the owner's #1717 words "not vlocking [sic] unless there is literally nothing else to work on". | The server stops catching a wrongly held or wrongly continued turn, and an agent that over-uses `blocking: true` only costs itself and puts its card first. S6d no longer holds a turn; any later use of its check is advisory only (the backend ruling on #1717). |
-| 16 | How does the Tauri shell get its token from a server on the same machine? (§6; amends item 1's consequence) | **Decided: zero-touch** (the owner typed "go" on 2026-10-25, recorded on #1601), after asking for no token input on the person's own machine. The native side mints a scoped, TTL-limited, PID-bound app-session token over `flock.sock`, and the webview holds it in memory. The listener admits an exact allow-list of shell origins on `/v1/*`. Remote servers keep a code and the keychain. | The server gains ephemeral tokens (TTL, PID binding, revocation) and the origin allow-list, an amendment to ADR-0036 §5. The shell needs a non-sandboxed build: an App Store sandbox cannot reach `flock.sock`. |
+| 16 | How does the Tauri shell get its token from a server on the same machine? (§6; amends item 1's consequence) | **Decided: zero-touch** (the owner typed "go" on 2026-10-25, recorded on #1601), after asking for no token input on the person's own machine. The native side mints an app-session token over `flock.sock`: server-chosen scopes, a 12 h TTL, bound to the minting process (exit detected by kqueue or pidfd), in server memory only. The webview holds it in memory. The listener admits an exact allow-list of **captured** shell origins on `/v1/ws` only; `null` is never admitted. Remote servers keep a code and the keychain. | The server gains in-memory app-session tokens and the shell-origin allow-list (ADR-0036's amendment "App-session tokens and shell origins"). The token is still a bearer secret while the app runs. The shell needs a non-sandboxed build: an App Store sandbox cannot reach `flock.sock`. The shell needs a non-sandboxed build: an App Store sandbox cannot reach `flock.sock`. |
 
 ## Failure modes and known limits
 
