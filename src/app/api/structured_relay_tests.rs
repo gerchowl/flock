@@ -750,15 +750,16 @@ fn custody_completion_unknown_retries_in_process_with_the_same_key() {
             response["error"]["data"]["message_key"],
             json!(d.envelope.key)
         );
-        let now = std::time::Instant::now();
-        let due = r
-            .app
-            .structured_sends
-            .recovery_deadline(now)
-            .expect("unknown custody must have a recovery deadline");
+        assert!(
+            r.app
+                .structured_sends
+                .recovery_deadline(std::time::Instant::now())
+                .is_some(),
+            "unknown custody must have a recovery deadline"
+        );
         r.app.structured_workers = owner;
         // Observe the real owner commit before advancing the scheduler clock.
-        // Otherwise a pending commit can schedule a second future deadline.
+        // Worker notifications can reschedule recovery while this wait runs.
         r.until(|r| {
             r.app
                 .structured_workers
@@ -766,15 +767,22 @@ fn custody_completion_unknown_retries_in_process_with_the_same_key() {
                 == Ok(true)
         })
         .await;
-        r.app.service_structured_workers(due);
-        r.until(|_| {
+        // No deadline means observing the proof already settled custody.
+        if let Some(due) = r
+            .app
+            .structured_sends
+            .recovery_deadline(std::time::Instant::now())
+        {
+            r.app.service_structured_workers(due);
+        }
+        assert_eq!(
             with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
                 .unwrap()
                 .unwrap()
-                .state
-                == "delivered"
-        })
-        .await;
+                .state,
+            "delivered",
+            "positive proof settles on the current recovery frame"
+        );
         r.until(|r| !r.inputs().is_empty()).await;
         assert_eq!(r.inputs().len(), 1);
         r.stop().await;
