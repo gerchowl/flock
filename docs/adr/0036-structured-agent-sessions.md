@@ -1595,6 +1595,7 @@ the wire enum; implementation registers any new API error codes where needed):
 | `invalid_agent` | Unsafe or reserved stored agent namespace. Retry class `never`: select a valid subject rather than retrying unchanged. |
 | `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
 | `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
+| `session_busy` | Token mutation is pending. Retry class `later`: retry only this stream with fresh IDs after 250, 500 and 1000 ms (three automatic same-socket retries since the last `synced`), then remain visibly Refused until reopened or a later reconnect supplies a new welcome. Sibling subscriptions and the authenticated socket stay connected. |
 | `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
 
 Start the 30 s progress deadline at sub registration, or when a new gap starts
@@ -1804,6 +1805,17 @@ retained. The retained History limits, inline gaps, persisted provenance and
 single replay barrier remain authoritative. Exact-cursor offset hints are bounded
 and source-fenced; stale hints are discarded and cursor paging is used instead.
 
+
+#### Amendment: token admission locks and subscription contention (#2450)
+
+The authorization/admission boundary above uses shared file-token locks through
+the recheck and bounded callback, with exclusive locks for token mutation.
+Revocation intent fences new admissions before waiting for existing callbacks;
+readers check it again after shared acquisition. Revoke cannot return while an
+admitted callback remains in flight. This preserves S6 decision fencing and is
+the same shared/exclusive split recorded in ADR-0038 §6. A subscription's typed
+`session_busy` is retryable `later`, not a transport failure; unsafe storage and
+I/O failures retain their connection-close behavior.
 
 ### 6. One schema, generated TypeScript
 
@@ -3561,3 +3573,18 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
 - `same-site` is refused for every unregistered origin.
 - The pre-auth caps refuse at 17 concurrent connections and at the 11th failed
   `hello` within 1 s, and an authenticated session is unaffected.
+
+### Amendment: Welcome capability grants (#2461)
+
+Clarification of §5's protocol gating and §6's operation advertisement:
+`welcome.capabilities` is the authenticated token's exact granted scopes, using
+`api::client_tokens::Scope` wire spellings in enum order: `read`, `send`,
+`answer`, `operate`. Missing scopes are omitted; `operate` implies no other
+scope. A client whose `hello.protocol` exceeds `WIRE_JSON_VERSION` receives
+only `read` when explicitly granted, or an empty array otherwise. It receives
+no command capability.
+
+The welcome is an advisory snapshot, not an authorization lease. Every command
+and subscription still checks current authority at admission, including scope
+changes and revocation after the welcome. Browser command holding according to
+this advertisement is tracked separately in [#2464](https://github.com/gerchowl/flock/issues/2464).

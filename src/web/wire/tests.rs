@@ -89,16 +89,16 @@ impl Clock for TestClock {
         })
     }
 }
-struct Server {
-    core: Arc<Core>,
+pub(crate) struct Server {
+    pub(crate) core: Arc<Core>,
     bind: std::net::SocketAddr,
     task: tokio::task::JoinHandle<()>,
-    clock: TestClock,
-    _root: crate::structured::launch::SessionConfigDir,
-    wake: Arc<tokio::sync::Notify>,
+    pub(crate) clock: TestClock,
+    pub(crate) _root: crate::structured::launch::SessionConfigDir,
+    pub(crate) wake: Arc<tokio::sync::Notify>,
 }
 impl Server {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         Self::with_clock(|clock| Arc::new(clock)).await
     }
     async fn with_clock(wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>) -> Self {
@@ -140,7 +140,7 @@ impl Server {
             wake,
         }
     }
-    async fn finish(mut self) {
+    pub(crate) async fn finish(mut self) {
         self.core.shutdown().await.unwrap();
         assert!(self.core.shared.clients.lock().unwrap().is_empty());
         assert_eq!(
@@ -157,15 +157,15 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-struct Socket(tokio::net::TcpStream);
+pub(crate) struct Socket(tokio::net::TcpStream);
 #[derive(Debug)]
-enum Received {
+pub(crate) enum Received {
     Text(Value),
     Close(u16),
     End,
 }
 impl Socket {
-    async fn open(server: &Server) -> Self {
+    pub(crate) async fn open(server: &Server) -> Self {
         let (socket, headers) = Self::upgrade(server).await;
         assert!(headers.starts_with("HTTP/1.1 101"), "{headers}");
         assert!(!headers
@@ -186,7 +186,7 @@ impl Socket {
         })
         .await
     }
-    async fn send(&mut self, value: Value) {
+    pub(crate) async fn send(&mut self, value: Value) {
         self.raw(value.to_string().as_bytes(), 0x81).await;
     }
     async fn raw(&mut self, data: &[u8], flags: u8) {
@@ -208,7 +208,7 @@ impl Socket {
         })
         .await;
     }
-    async fn receive(&mut self) -> Received {
+    pub(crate) async fn receive(&mut self) -> Received {
         within(async {
             loop {
                 let flags = match self.0.read_u8().await {
@@ -244,12 +244,12 @@ impl Socket {
             other => panic!("expected frame, got {other:?}"),
         }
     }
-    async fn hello(&mut self, protocol: u32, token: &str) -> Value {
+    pub(crate) async fn hello(&mut self, protocol: u32, token: &str) -> Value {
         self.send(json!({"t":"hello","protocol":protocol,"client":{"name":"fixture","version":"1"},"token":token})).await;
         self.text().await
     }
 }
-fn runtime(work: impl Future<Output = ()>) {
+pub(crate) fn runtime(work: impl Future<Output = ()>) {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -264,7 +264,10 @@ fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
         let welcome = first.hello(WIRE_JSON_VERSION, &"a".repeat(64)).await;
         assert_eq!(welcome["protocol"], WIRE_JSON_VERSION);
         assert_eq!(welcome["principal"], "c".repeat(32));
-        assert_eq!(welcome["capabilities"], json!([]));
+        assert_eq!(
+            welcome["capabilities"],
+            json!(["read", "send", "answer", "operate"])
+        );
         assert_eq!(welcome["idempotency_window_ms"], 86_400_000);
         assert!(!welcome["server_version"].as_str().unwrap().is_empty());
         assert_eq!(welcome["server_epoch"].as_str().unwrap().len(), 32);
@@ -274,7 +277,7 @@ fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
         ));
         let mut newer = Socket::open(&server).await;
         let newer_welcome = newer.hello(WIRE_JSON_VERSION + 1, &"d".repeat(64)).await;
-        assert_eq!(newer_welcome["capabilities"], json!([]));
+        assert_eq!(newer_welcome["capabilities"], json!(["read"]));
         assert_eq!(newer_welcome["server_epoch"], welcome["server_epoch"]);
         server.clock.deadline(15_000).await;
         {
@@ -283,6 +286,60 @@ fn hello_uses_generated_contracts_epoch_identity_and_read_only_metadata() {
             assert_eq!(clients.values().filter(|c| c.read_only).count(), 1);
         }
         server.finish().await;
+    });
+}
+fn assert_welcome_grants(scopes: Value, expected: Value) {
+    runtime(async {
+        let server = Server::new().await;
+        let path = server._root.path().join("client-tokens/one.token");
+        let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        token["scopes"] = scopes;
+        fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
+        let mut socket = Socket::open(&server).await;
+        let welcome = socket.hello(WIRE_JSON_VERSION, &"a".repeat(64)).await;
+        server.finish().await;
+        assert_eq!(welcome["capabilities"], expected);
+    });
+}
+#[test]
+fn welcome_grants_read_only() {
+    assert_welcome_grants(json!(["read"]), json!(["read"]));
+}
+#[test]
+fn welcome_grants_read_and_send() {
+    assert_welcome_grants(json!(["send", "read"]), json!(["read", "send"]));
+}
+#[test]
+fn welcome_grants_all_scopes_in_enum_order() {
+    assert_welcome_grants(
+        json!(["operate", "answer", "send", "read"]),
+        json!(["read", "send", "answer", "operate"]),
+    );
+}
+#[test]
+fn welcome_grants_operate_does_not_imply_other_scopes() {
+    assert_welcome_grants(json!(["operate"]), json!(["operate"]));
+}
+#[test]
+fn newer_protocol_welcome_advertises_only_explicit_read() {
+    runtime(async {
+        for (scopes, expected) in [
+            (
+                json!(["read", "send", "answer", "operate"]),
+                json!(["read"]),
+            ),
+            (json!(["send", "answer", "operate"]), json!([])),
+        ] {
+            let server = Server::new().await;
+            let path = server._root.path().join("client-tokens/one.token");
+            let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            token["scopes"] = scopes;
+            fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
+            let mut socket = Socket::open(&server).await;
+            let welcome = socket.hello(WIRE_JSON_VERSION + 1, &"a".repeat(64)).await;
+            server.finish().await;
+            assert_eq!(welcome["capabilities"], expected);
+        }
     });
 }
 #[test]
@@ -711,6 +768,7 @@ fn covers_selected_fixture_handshake_vectors_run_against_the_core() {
             }
             let server = Server::new().await;
             let mut client = Socket::open(&server).await;
+            let newer_protocol = matches!(&hello, ClientFrame::Hello { protocol, .. } if *protocol > WIRE_JSON_VERSION);
             client.send(serde_json::to_value(hello).unwrap()).await;
             if auth_refusal {
                 assert!(matches!(
@@ -724,8 +782,12 @@ fn covers_selected_fixture_handshake_vectors_run_against_the_core() {
                 assert_eq!(welcome["protocol"], WIRE_JSON_VERSION);
                 assert_eq!(
                     welcome["capabilities"],
-                    json!([]),
-                    "later slices advertise stream/command capabilities"
+                    if newer_protocol {
+                        json!(["read"])
+                    } else {
+                        json!(["read", "send", "answer", "operate"])
+                    },
+                    "welcome advertises the authenticated token grants with protocol gating"
                 );
                 if script.iter().any(|line| {
                     matches!(
@@ -1373,3 +1435,55 @@ mod subscriptions;
 mod fleet;
 
 mod commands;
+
+/// Controlled read/read overlap: the bearer and its scopes never change.
+#[test]
+fn overlapping_read_admissions_keep_subscriptions_and_socket_alive() {
+    use crate::structured::permissions::auth::tokens::Scope;
+    runtime(async {
+        let mut server = Server::new().await;
+        let registry = crate::structured::registry::Registry::default();
+        let mut workers = crate::structured::workers::Workers::new(server.wake.clone());
+        Arc::get_mut(&mut server.core).unwrap().service(
+            &registry,
+            &mut workers,
+            server._root.path(),
+        );
+        let mut socket = Socket::open(&server).await;
+        socket.hello(1, &"a".repeat(64)).await;
+        server.clock.deadline(15_000).await;
+        let store = server.core.shared.store.clone();
+        let session = store.authenticate(&Bearer("a".repeat(64))).unwrap();
+        let (ready, entered) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let held = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let session = session.clone();
+            move || {
+                store.admit(&session, Scope::Read, |_| {
+                    ready.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                })
+            }
+        });
+        within(entered).await.unwrap();
+        assert!(store.admit(&session, Scope::Read, |_| ()).is_ok());
+        socket
+            .send(json!({"t":"sub","sub_id":"contended","stream":"fleet"}))
+            .await;
+        let contended = socket.receive().await;
+        release.send(()).unwrap();
+        within(held).await.unwrap().unwrap();
+        assert!(matches!(contended, Received::Text(frame) if frame["t"] == "gap"));
+        assert!(matches!(socket.receive().await, Received::Text(frame) if frame["t"] == "synced"));
+        assert!(store.admit(&session, Scope::Read, |_| ()).is_ok());
+        let mut fresh = Socket::open(&server).await;
+        fresh.hello(1, &"a".repeat(64)).await;
+        fresh
+            .send(json!({"t":"sub","sub_id":"uncontended","stream":"fleet"}))
+            .await;
+        assert!(matches!(fresh.receive().await, Received::Text(frame) if frame["t"] == "gap"));
+        assert!(matches!(fresh.receive().await, Received::Text(frame) if frame["t"] == "synced"));
+        server.finish().await;
+    });
+}

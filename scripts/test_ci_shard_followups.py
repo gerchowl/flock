@@ -33,6 +33,8 @@ def job(text, name):
 
 def gate_script(block):
     gate = block.split('      - name: Require every job of the leg\n', 1)[1]
+    # Stop at the next step: its env block and body are not part of this gate.
+    gate = re.split(r'^      - name: ', gate, maxsplit=1, flags=re.M)[0]
     return '\n'.join(line[10:] for line in gate.split('        run: |\n', 1)[1].splitlines()
                      if line.startswith('          '))
 
