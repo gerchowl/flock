@@ -89,16 +89,16 @@ impl Clock for TestClock {
         })
     }
 }
-struct Server {
-    core: Arc<Core>,
+pub(crate) struct Server {
+    pub(crate) core: Arc<Core>,
     bind: std::net::SocketAddr,
     task: tokio::task::JoinHandle<()>,
-    clock: TestClock,
-    _root: crate::structured::launch::SessionConfigDir,
-    wake: Arc<tokio::sync::Notify>,
+    pub(crate) clock: TestClock,
+    pub(crate) _root: crate::structured::launch::SessionConfigDir,
+    pub(crate) wake: Arc<tokio::sync::Notify>,
 }
 impl Server {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         Self::with_clock(|clock| Arc::new(clock)).await
     }
     async fn with_clock(wrap: impl FnOnce(TestClock) -> Arc<dyn Clock>) -> Self {
@@ -140,7 +140,7 @@ impl Server {
             wake,
         }
     }
-    async fn finish(mut self) {
+    pub(crate) async fn finish(mut self) {
         self.core.shutdown().await.unwrap();
         assert!(self.core.shared.clients.lock().unwrap().is_empty());
         assert_eq!(
@@ -157,15 +157,15 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-struct Socket(tokio::net::TcpStream);
+pub(crate) struct Socket(tokio::net::TcpStream);
 #[derive(Debug)]
-enum Received {
+pub(crate) enum Received {
     Text(Value),
     Close(u16),
     End,
 }
 impl Socket {
-    async fn open(server: &Server) -> Self {
+    pub(crate) async fn open(server: &Server) -> Self {
         let (socket, headers) = Self::upgrade(server).await;
         assert!(headers.starts_with("HTTP/1.1 101"), "{headers}");
         assert!(!headers
@@ -186,7 +186,7 @@ impl Socket {
         })
         .await
     }
-    async fn send(&mut self, value: Value) {
+    pub(crate) async fn send(&mut self, value: Value) {
         self.raw(value.to_string().as_bytes(), 0x81).await;
     }
     async fn raw(&mut self, data: &[u8], flags: u8) {
@@ -208,7 +208,7 @@ impl Socket {
         })
         .await;
     }
-    async fn receive(&mut self) -> Received {
+    pub(crate) async fn receive(&mut self) -> Received {
         within(async {
             loop {
                 let flags = match self.0.read_u8().await {
@@ -244,12 +244,12 @@ impl Socket {
             other => panic!("expected frame, got {other:?}"),
         }
     }
-    async fn hello(&mut self, protocol: u32, token: &str) -> Value {
+    pub(crate) async fn hello(&mut self, protocol: u32, token: &str) -> Value {
         self.send(json!({"t":"hello","protocol":protocol,"client":{"name":"fixture","version":"1"},"token":token})).await;
         self.text().await
     }
 }
-fn runtime(work: impl Future<Output = ()>) {
+pub(crate) fn runtime(work: impl Future<Output = ()>) {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1376,8 +1376,8 @@ mod commands;
 
 /// Controlled read/read overlap: the bearer and its scopes never change.
 #[test]
-fn another_valid_read_admission_closes_a_legitimate_subscription() {
-    use crate::structured::permissions::auth::tokens::{Scope, TokenError};
+fn overlapping_read_admissions_keep_subscriptions_and_socket_alive() {
+    use crate::structured::permissions::auth::tokens::Scope;
     runtime(async {
         let mut server = Server::new().await;
         let registry = crate::structured::registry::Registry::default();
@@ -1405,18 +1405,15 @@ fn another_valid_read_admission_closes_a_legitimate_subscription() {
             }
         });
         within(entered).await.unwrap();
-        assert!(matches!(
-            store.admit(&session, Scope::Read, |_| panic!("overlapping admission")),
-            Err(TokenError::Busy)
-        ));
+        assert!(store.admit(&session, Scope::Read, |_| ()).is_ok());
         socket
             .send(json!({"t":"sub","sub_id":"contended","stream":"fleet"}))
             .await;
-        // Characterize the defect; no revocation, bad token or missing scope occurs.
         let contended = socket.receive().await;
         release.send(()).unwrap();
         within(held).await.unwrap().unwrap();
-        assert!(matches!(contended, Received::Close(1001)), "{contended:?}");
+        assert!(matches!(contended, Received::Text(frame) if frame["t"] == "gap"));
+        assert!(matches!(socket.receive().await, Received::Text(frame) if frame["t"] == "synced"));
         assert!(store.admit(&session, Scope::Read, |_| ()).is_ok());
         let mut fresh = Socket::open(&server).await;
         fresh.hello(1, &"a".repeat(64)).await;
