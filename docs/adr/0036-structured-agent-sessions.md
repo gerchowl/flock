@@ -1398,7 +1398,9 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   (`src/channels.rs`): 32 random bytes as 64 hex digits, one file per client
   under `<data dir>/client-tokens/<name>.token`, mode 0600 in a 0700 dir,
   compared as SHA-256 digests in constant time, never logged, revoked by
-  deleting the file. Each token carries scopes `read`, `send`, `answer`,
+  deleting the file. (`authenticate` also checks a second, in-memory store
+  of app-session tokens; see the amendment "App-session tokens and shell
+  origins".) Each token carries scopes `read`, `send`, `answer`,
   `operate` (`operate` is what the operator's own client holds). Only the
   local operator (`caller_is_local_operator()` after §1a's uid check) can
   issue or revoke one (`flk client token add|rm|list`; else
@@ -1756,7 +1758,7 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | Lost ack / duplicate cmd / restart at claim, effect or outcome | Same principal/key/payload yields one effect and first stored ack, or explicit uncertain pending outcome. All listed verbs, including fork/reload/interrupt, prove no automatic second dispatch. Different payload never executes. |
 | Permission prompt across drop | Prompt survives replay, stored answer retries once under the same request/key, closed prompt cannot receive a second answer or an answer intended for a newer prompt. |
 | Expired key / clock uncertainty / changed principal / revoked token | No automatic resend or new-id workaround; unknown outcome is visible, old-principal outbox drops, revoked token enters NeedsToken. |
-| Restart, handoff, missing journal or ahead cursor | Token scopes and stream seqs persist; no seq reset or duplicate side effect. Missing recovery state fails closed; ahead cursor is refused. |
+| Restart, handoff, missing journal or ahead cursor | File-token scopes and stream seqs persist; in-memory app-session tokens are revoked on restart and on handoff (their sessions close with `token_revoked`, and the shell mints again); no seq reset or duplicate side effect. Missing recovery state fails closed; ahead cursor is refused. |
 | Compression disabled | Offer permessage-deflate from browser, webview and native fixtures: every S7 upgrade declines it, all messages including hello have RSV1 unset, and no secret appears in diagnostics. |
 | Single-writer handoff overlap | Hold the old process alive with queued append/rewrite and command callbacks, including event-log.jsonl writes. New loading/acceptance requires exclusive ownership; every write checks the lock's owner generation. Race rewrite with append and duplicate cmd across transfer: no overwritten append, repeated seq or double effect. |
 | Stuck handoff producer | Keep a producer alive but unable to quiesce (repeat for a stalled flush/readiness step). At the supplied-clock 10 s deadline, handoff fails with handoff_failed: old ownership/generation/serving remain, admission resumes, new owner loads/accepts nothing. Release the delayed callback afterward: it cannot transfer the fence or mint a new-owner seq. No hang or half-transfer. |
@@ -3450,56 +3452,100 @@ unchanged.
 
 **Mint verb.** A new socket method mints an **app-session token**.
 - **Who may call it.** It is admitted only from the LocalOperator (the same
-  `client_token_authority()` guard as `ClientOpen`): the peer UID and PID
-  checked by the kernel, a non-empty PID, no flk pane in the caller's
-  ancestry, and no mesh edge.
+  `client_token_authority()` guard as `ClientOpen`): the kernel-checked peer
+  UID and PID, a non-empty PID, no flk pane in the caller's ancestry, and no
+  mesh edge.
 - **Scopes.** It takes no scope parameter. It grants exactly `{read, send,
-  answer, operate}`, the set `ClientOpen` hands out. A request naming scopes
-  is refused with `invalid_params`.
-- **The token is a bearer secret.** Any local process that reads it can use
-  `/v1/ws` until it is revoked or expires. A process of the same UID could
-  mint its own anyway, so the binding below bounds the token's lifetime; it
-  does not confine it.
+  answer, operate}`, the set `ClientOpen` hands out. A request naming scopes is
+  refused with `invalid_params`.
+- **Optional parameter.** It takes one optional parameter, `origin_port`
+  (below).
 
-**Binding and lifetime.**
-- **Where the PID comes from.** The bound PID and its process start time are
-  taken from the **minting connection's peer credentials** (`LOCAL_PEERPID` /
-  `SO_PEERCRED`, `src/platform/peer.rs`), never from a parameter.
-- **Exit detection.** It uses kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS and a
-  pidfd on Linux. It never polls with `kill(pid, 0)`, which PID reuse defeats.
-  If the watch cannot be armed, the mint is refused.
-- **Storage.** App-session tokens live in server memory only. They are never
-  written under `client-tokens/` and never listed as file tokens, so a server
-  restart revokes them all.
+**What the token is.** A bearer secret. With `operate` it **is** the
+operator's identity for ADR-0014's operator-only verbs, as §5 says of an
+`operate`-scoped file token.
+- Any local process that obtains it can use `/v1/ws` until it is revoked or
+  expires.
+- **Residual risk (#1177).** Processes started from a flk pane, agents
+  included, are refused the mint, yet would gain operator authority by
+  obtaining the token, for example by reading the shell's memory. This
+  amendment narrows that risk (memory only, a bounded lifetime, the shell's
+  hardened runtime per ADR-0038 §6) but does not close it. #1177 tracks
+  same-UID agent isolation.
+
+**Binding to the minting process.**
+- **Where the PID comes from.** The **minting connection's peer credentials**:
+  `LOCAL_PEERPID` on macOS; on Linux `SO_PEERPIDFD` where available, else
+  `SO_PEERCRED`. Never from a parameter.
+- **Start time.** It is captured when the connection is accepted
+  (`src/platform/peer.rs`: Linux `/proc/<pid>/stat` field 22, macOS
+  `flock_process_facts`).
+- **Order.**
+  1. Arm the exit watch: kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS; on Linux
+     the peer pidfd, or else `pidfd_open`.
+  2. Read the start time again and compare it with the one taken at accept.
+- **Refusal.** If the watch cannot be armed, or the start times differ, the
+  mint is refused with `peer_process_changed`.
+- **No polling.** The server never polls with `kill(pid, 0)`.
+
+**Lifetime and revocation.**
+- **Storage.** App-session tokens live in a second, in-memory store that
+  `authenticate` checks beside the file tokens. They are never written under
+  `client-tokens/` and never listed as file tokens.
 - **TTL.** A fixed 12 hours from the mint, with no sliding renewal. The shell
   renews by minting again.
-- **Revocation.** On process exit, TTL expiry or server restart, `authenticate`
-  stops accepting the token. Every live `/v1/ws` session authenticated by it is
-  closed with a typed auth close: `token_revoked` or `token_expired`.
+- **Restart and handoff.** Both revoke every app-session token. A handoff does
+  not carry them or their watches to the successor. This amends the §5a
+  matrix row "Restart, handoff…".
+- **Revocation.** On process exit, TTL expiry, restart or handoff,
+  `authenticate` stops accepting the token. Every live `/v1/ws` session
+  authenticated by it is closed with a typed auth close: `token_revoked` or
+  `token_expired`.
 
 **Shell origins, on `/v1/ws` only.**
 - **The allow-list.** The listener guard (`origin_allowed`,
   `src/web/gui.rs`; `src/web/client_listener.rs`) admits an exact allow-list
-  of shell origins on the `/v1/ws` upgrade. For those origins only, it accepts
-  the `Sec-Fetch-Site` value the shell sends.
+  of shell origins on the `/v1/ws` upgrade.
+- **Its values.** The allow-list holds only values captured from real Tauri v2
+  shells and recorded in ADR-0038 §6. For those origins only, the guard
+  accepts the `Sec-Fetch-Site` value captured with them.
 - **Unchanged.** Every other origin and path keeps today's checks.
   `/v1/client/exchange` keeps its strict same-origin rule.
-- **Values.** The allow-list holds only values captured from real Tauri v2
-  shells and recorded in ADR-0038 §6.
-- **`null` is never admitted.** A platform whose shell sends `null` registers
-  a loopback origin at mint instead, and that origin is admitted only for the
-  token's lifetime.
-- **Pre-auth limits.** Concurrent unauthenticated `/v1/ws` connections and
-  failed `hello` attempts are capped, with typed refusals. The §5a handshake
-  deadline still applies.
+- **`null` is never admitted.**
+- **A registered loopback origin** replaces `null` for a platform whose shell
+  would send it.
+  - The mint carries `origin_port`, and the server builds exactly
+    `http://127.0.0.1:<port>`.
+  - It checks that the port is a listening TCP socket held by the minting
+    process (macOS `proc_pidfdinfo` socket info; Linux: the socket inode in
+    `/proc/<pid>/net/tcp`, matched to one of the PID's fds). If it is not,
+    the mint is refused with `origin_port_not_owned`.
+  - The origin is bound to that one token. The guard admits the upgrade from
+    it provisionally, and `hello` must present the bound token; any other
+    token closes the connection.
+  - For this origin only, the guard accepts `Sec-Fetch-Site: same-site`.
+  - The origin is removed when its token is revoked or expires.
+- **Pre-auth limits.**
+  - At most 16 concurrent unauthenticated `/v1/ws` connections per listener;
+    beyond that, `preauth_capacity`.
+  - One `hello` per connection; a failed `hello` closes it.
+  - After 10 failed `hello`s within 1 s, new upgrades are refused with
+    `auth_rate_limited` for the rest of that second.
+  - Authenticated sessions are unaffected.
+  - The §5a handshake deadline still applies.
 
 **Tests that must fail first.**
 - A captured shell origin is admitted on `/v1/ws` and refused on the exchange.
 - `null` is refused on both.
 - A shell origin with a missing or wrong token is refused at `hello`.
 - A scoped mint is refused, and so is a mint from a non-LocalOperator peer.
+- A start-time mismatch is refused with `peer_process_changed`.
 - Process exit revokes the token and closes its live sessions (a real child
   process, no polling).
 - TTL expiry does the same (an injected clock).
-- A restart revokes every app-session token.
-- The pre-auth caps refuse once exceeded.
+- Restart and handoff each revoke every app-session token.
+- `origin_port` held by another process is refused.
+- A registered origin with another token's `hello` is closed.
+- `same-site` is refused for every unregistered origin.
+- The pre-auth caps refuse at 17 concurrent connections and at the 11th failed
+  `hello` within 1 s, and an authenticated session is unaffected.

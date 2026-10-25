@@ -617,15 +617,20 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
       - **Scopes, chosen by the server.**
         - The verb takes no scope parameter. It grants exactly `{read, send, answer, operate}`, the set `flk client open` gives a browser, because the shell is the operator's own console.
         - A call that names scopes is refused with `invalid_params`. The caller can neither narrow nor widen the set.
-      - **What the token is.** The app-session token is a **bearer** secret, like every client token.
-        - Once it is in the shell's process, any local process that reads it can use `/v1/ws` over TCP until it is revoked or expires.
-        - That adds no authority a process of the same UID lacks, because such a process can mint its own over the socket. What the binding below buys is a bounded lifetime, not confinement.
+      - **What the token is.** The app-session token is a **bearer** secret, like every client token, and with `operate` scope it **is** the operator's identity for ADR-0014's operator-only verbs, exactly as ADR-0036 §5 says of an `operate`-scoped file token.
+        - Once it is in the shell's process, any local process that obtains it can use `/v1/ws` over TCP until it is revoked or expires.
+        - **Residual risk (#1177).** Processes started from a flk pane, which includes agents, are refused the mint. They would gain operator authority by obtaining the token, for example by reading the shell's memory. This design does not close that; #1177 tracks same-UID agent isolation. It narrows it:
+          - the token is never written to disk or logged;
+          - its lifetime is bounded (below);
+          - the shell ships with the macOS hardened runtime, without `get-task-allow`, so a same-UID process cannot attach to it.
+          - On Linux, the protection depends on Yama `ptrace_scope` ≥ 1, and the shell refuses to mint when it reads 0. It says why, and offers the remote path.
       - **Binding to the app's process.**
-        - The PID comes from the **minting connection's peer credentials**, never from a parameter, together with the process start time that `src/platform/peer.rs` captures, which guards against PID reuse.
-        - The server detects the process's exit with kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS and a pidfd on Linux. It never polls with `kill(pid, 0)`.
-        - If the watch cannot be armed, because the process is gone or its start time does not match, the mint is refused.
+        - The PID comes from the **minting connection's peer credentials** (`LOCAL_PEERPID`; on Linux `SO_PEERPIDFD` where the kernel has it, else `SO_PEERCRED`), never from a parameter.
+        - The start time comes from `src/platform/peer.rs`: `/proc/<pid>/stat` field 22 on Linux, and `flock_process_facts` on macOS.
+        - **Order.** First arm the exit watch (kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS; on Linux the peer pidfd itself, or else `pidfd_open`), then read and compare the start time. A process that exits, or a PID that is reused, between the two steps is caught by the armed watch or by the mismatch. The server never polls with `kill(pid, 0)`.
+        - If the watch cannot be armed, or the start time does not match the one taken when the connection was accepted, the mint is refused with `peer_process_changed`.
       - **Lifetime.**
-        - App-session tokens live in the server's memory only, never on disk, so a server restart revokes them.
+        - App-session tokens live in the server's memory only, never on disk, so a server restart **or handoff** revokes them. A handoff does not carry them or their watches to the new process. The shell sees `token_revoked` and mints again, so the person sees one reconnect.
         - Each one has a fixed **TTL of 12 hours** from the mint, with no sliding renewal.
         - Before expiry, the native side mints a fresh token and hands it to the webview, which reconnects through §3's resume path. The cursors and the outbox survive, so nothing is lost.
       - **Revocation.** A token is revoked when its process exits, when its TTL ends or when the server restarts. The server then closes every `/v1/ws` session authenticated by it, with a typed auth close (`token_revoked` or `token_expired`). The client treats that as NeedsToken, and the local shell mints again silently.
@@ -639,12 +644,24 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
     - For those origins only, it relaxes the `Sec-Fetch-Site` check to the value the shell actually sends (`cross-site` against `127.0.0.1:port`). Every other origin keeps today's `none`/`same-origin` rule.
     - The loopback-peer and exact-`Host` checks are unchanged.
     - **The values are captured, not assumed.** G9a's first step records the `Origin` and `Sec-Fetch-Site` that a real Tauri v2 shell sends on macOS, Linux and Windows, in this section. The allow-list holds only those captured values. The documentation is inconsistent, giving `tauri://localhost` and `null` for macOS and `http://tauri.localhost` for Windows, so nothing is admitted on that basis.
-    - **`null` is never admitted.** If a platform's shell sends `Origin: null`, that platform's shell serves its bundle from a loopback origin instead. The mint registers that exact origin, and the server admits it only for that token's lifetime. `null` is also what an artifact frame (§7), a `file://` page, a `data:` URL and other sandboxed pages send, so admitting it would leave only the token and the frames' CSP as the barrier.
+    - **`null` is never admitted.** `null` is also what an artifact frame (§7), a `file://` page, a `data:` URL and other sandboxed pages send, so admitting it would leave only the token and the frames' CSP as the barrier.
+    - **A registered loopback origin, where a platform's shell would send `null`.**
+      - That platform's shell serves its bundle from its own loopback port, and the mint carries `origin_port`.
+      - The server builds the origin itself, always in the exact form `http://127.0.0.1:<port>`. No hostname and no other address is accepted.
+      - At mint time, it checks that the port is a listening TCP socket **held by the minting process** (macOS: `proc_pidfdinfo` socket info; Linux: the socket inode in `/proc/<pid>/net/tcp`, matched to one of the PID's fds). If another process holds it, the mint is refused with `origin_port_not_owned`.
+      - The registered origin is bound to that **one token**. The guard admits the upgrade from that origin provisionally, and `hello` must then present the token it is bound to; any other token closes the connection.
+      - The origin dies with the token: at process exit, at the TTL, or at a restart or handoff. A port taken over after a crash is therefore never admitted.
+      - For this origin only, the guard accepts `Sec-Fetch-Site: same-site`, which is what a loopback page on another port sends. `src/web/gui.rs` refuses it for every other origin, as it does today.
     - **The threat model.** Admitting a shell origin opens no ambient authority: `/v1/ws` authenticates by the token in `hello` alone (ADR-0036 §5), and the server has no cookie or other ambient credential. ADR-0036 §5 already notes that local processes can forge `Host` and `Origin`, so the origin check is a defence against browsers, not against local code. Here is how each origin that could reach the listener stays out:
       - A web page in any local browser has a real web origin, which is refused. Even if it were admitted, it has no token.
       - Artifact frames (§7) are `null`, so they are refused. Their injected CSP `connect-src 'none'` is **required** as a second barrier, and G7's per-shell security test checks it.
       - `file://` and `data:` pages are `null` or their own scheme, so they are refused.
-    - **Pre-auth limits.** The server caps concurrent unauthenticated `/v1/ws` connections and failed `hello` attempts. A refusal is typed and counted. The ADR-0036 §5a handshake deadline still applies. These bound resource use; guessing a token is infeasible.
+    - **Pre-auth limits.**
+      - At most **16** concurrent unauthenticated `/v1/ws` connections per listener. Beyond that, an upgrade is refused with `preauth_capacity`.
+      - Each connection gets exactly one `hello`; a failed `hello` closes it.
+      - After **10** failed `hello`s within any **1 s**, a new upgrade is refused with `auth_rate_limited` for the rest of that second.
+      - Authenticated sessions are never affected, so a local process cannot lock the person out.
+      - The ADR-0036 §5a handshake deadline still applies. These limits bound resource use; guessing a token (32 random bytes) is infeasible.
     - **`/v1/client/exchange` keeps its strict checks** (`src/web/client_exchange.rs`: loopback peer, exact `Host` and `Origin`, `Sec-Fetch-Site` `same-origin`). Its one-time code is a bearer secret, and the shell never uses it locally.
   - **Tests that must fail before the change** (server slice and G9a):
     - a captured shell origin is admitted on `/v1/ws` and refused on `/v1/client/exchange`;
@@ -654,7 +671,10 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
     - the token dies when its process exits (a real child process, exit detected without polling), and a live session is closed with `token_revoked`;
     - the token dies at its TTL (an injected clock), and a live session is closed with `token_expired`;
     - a server restart invalidates every app-session token;
-    - the pre-auth caps refuse once they are exceeded.
+    - a start-time mismatch is refused with `peer_process_changed`, and a restart or handoff revokes every app-session token;
+    - an `origin_port` held by another process is refused, a registered origin with another token's `hello` is closed, and `same-site` is refused for every unregistered origin;
+    - the pre-auth caps refuse at 17 concurrent connections and at the 11th failed `hello` within 1 s, and an authenticated session is unaffected;
+    - the Linux shell refuses to mint when `ptrace_scope` is 0.
   - **Native additions:**
     - the keyboard accessory bar;
     - deep links to an agent, question or artifact;
@@ -815,7 +835,7 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 | 13 | What happens to a thread's fork after the merge-back? (§5b) | **Decided: yes** ("stop fork but keep transcript"). The fork is stopped, and its transcript is kept in the lineage (the `AgentForked` edge); the sidebar folds ended threads. | Stored transcripts, and lineage rows to fold. No retention limit is stated yet: ADR-0036 S16 owns it. A rehydrated copy is deleted when the fork ends either way (ADR-0036 owner decision 14). |
 | 14 | A thread fork's tools (§5b) | **Decided: read-only now, through the general machinery** ("machinery first … but with read only as per now"). The fork runs under ADR-0036 S19's permission tiers (#1321) with a read-only tier, never a thread-specific flag. | A fork that would have to run a command to answer must say so in its proposal. Widening is #1321's follow-up: tiers selectable per model, and a fork that requests more, which the person grants. |
 | 15 | Does S6e retake ADR-0036 owner decision 3a, so that the asker decides blocking, with a reason, instead of S6d's System-One check? (§5b decision 5) | **Decided: yes** (the owner typed "y" on 2026-10-19, recorded on #1717), following the owner's #1717 words "not vlocking [sic] unless there is literally nothing else to work on". | The server stops catching a wrongly held or wrongly continued turn, and an agent that over-uses `blocking: true` only costs itself and puts its card first. S6d no longer holds a turn; any later use of its check is advisory only (the backend ruling on #1717). |
-| 16 | How does the Tauri shell get its token from a server on the same machine? (§6; amends item 1's consequence) | **Decided: zero-touch** (the owner typed "go" on 2026-10-25, recorded on #1601), after asking for no token input on the person's own machine. The native side mints an app-session token over `flock.sock`: server-chosen scopes, a 12 h TTL, bound to the minting process (exit detected by kqueue or pidfd), in server memory only. The webview holds it in memory. The listener admits an exact allow-list of **captured** shell origins on `/v1/ws` only; `null` is never admitted. Remote servers keep a code and the keychain. | The server gains in-memory app-session tokens and the shell-origin allow-list (ADR-0036's amendment "App-session tokens and shell origins"). The token is still a bearer secret while the app runs. The shell needs a non-sandboxed build: an App Store sandbox cannot reach `flock.sock`. The shell needs a non-sandboxed build: an App Store sandbox cannot reach `flock.sock`. |
+| 16 | How does the Tauri shell get its token from a server on the same machine? (§6; amends item 1's consequence) | **Decided: zero-touch** (the owner typed "go" on 2026-10-25, recorded on #1601), after asking for no token input on the person's own machine. The native side mints an app-session token over `flock.sock`: server-chosen scopes, a 12 h TTL, bound to the minting process (exit detected by kqueue or pidfd), in server memory only. The webview holds it in memory. The listener admits an exact allow-list of **captured** shell origins on `/v1/ws` only; `null` is never admitted. Remote servers keep a code and the keychain. | The server gains in-memory app-session tokens and the shell-origin allow-list (ADR-0036's amendment "App-session tokens and shell origins"). The token is still a bearer secret, and the operator's identity, while the app runs. The shell needs a non-sandboxed build: an App Store sandbox cannot reach `flock.sock`. The residual risk is named: a pane-started process that obtains the token gains operator authority (#1177). |
 
 ## Failure modes and known limits
 
