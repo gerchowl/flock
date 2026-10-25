@@ -131,7 +131,12 @@ impl Recovery {
 
 /// Opening a busy exclusive lease is retryable; no write was attempted here.
 pub(super) fn open_error(source: io::Error) -> Failure {
-    if source.kind() == io::ErrorKind::WouldBlock {
+    if source.kind() == io::ErrorKind::NotFound {
+        Failure {
+            code: ErrorCode::QueueNotFound,
+            source: Some(source),
+        }
+    } else if source.kind() == io::ErrorKind::WouldBlock {
         Failure {
             code: ErrorCode::SessionBusy,
             source: Some(source),
