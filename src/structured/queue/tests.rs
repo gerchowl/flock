@@ -50,7 +50,7 @@ impl Drop for Root {
         fs::remove_dir_all(&self.0).unwrap();
     }
 }
-fn item(id: &str) -> Item {
+pub(crate) fn item(id: &str) -> Item {
     Item {
         item_id: id.into(),
         producer: Producer::Human,

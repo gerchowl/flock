@@ -144,6 +144,15 @@ pub(crate) fn structured_queue_record_skipped(sequence: Option<u64>, reason: &'s
     );
 }
 
+/// Report startup settlement failure without logging input; reopen fences the item.
+pub(crate) fn structured_queue_opening_settlement_failed(code: crate::api::error_code::ErrorCode) {
+    tracing::error!(
+        event = "structured.queue.opening_settlement_failed",
+        failure_code = code.as_str(),
+        "opening item settlement failed; reopen must settle it before delivery"
+    );
+}
+
 /// Report the first corrupt queue record without exposing any input payload.
 pub(crate) fn structured_queue_corrupt(reason: &crate::structured::queue::QueueJournalCorrupt) {
     tracing::warn!(
