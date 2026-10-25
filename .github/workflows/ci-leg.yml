@@ -67,11 +67,6 @@ jobs:
       - name: Check Rust documentation
         run: nix develop -c just doc-check
 
-      # Maintenance-script tests and the platform test-gap ratchet (#597).
-      - name: Run maintenance script tests
-        if: runner.os == 'Linux'
-        run: nix develop -c just script-tests
-
   build:
     name: build
     runs-on: ${{ inputs.leg }}

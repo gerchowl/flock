@@ -34,3 +34,23 @@ A skipped job reports success, so a mistakenly skipped shard set would leave
 pushes) the gate therefore also requires one JUnit report per shard the build
 planned (`ci-leg.yml` exposes the build's `shards` as a workflow output) and fails
 on any mismatch or an empty plan. Ordinary PRs skip that assertion by policy.
+
+## Docs-only and web-only pull requests
+
+The `changes` job in `ci.yml` runs `scripts/ci_changes.py` on the PR's changed
+paths. An ordinary pull request touching only `docs/`, `website/`, `web/client/`
+or root-level Markdown skips the Rust legs (both `ubuntu-latest` and `macos-15`
+build/lint/test); the `client` job still runs. Paths read by Rust or script tests
+or release tooling are never skippable: `docs/next/`, `web/client/test/fixtures/`,
+`web/client/src/gen/` (generated TS checked by a Rust test),
+`web/client/src/wire/`, `web/client/src/fleet*` and `web/client/tests/wire/` (bun
+scripts spawned by Rust tests and their imports; `scripts/test_ci_changes.py`
+computes every file Rust reads or spawns plus its TS import closure and fails if any
+is skippable), `website/scripts/`,
+`website/latest.json`, `CHANGELOG.md`. Changed paths come from
+`git diff --no-renames`, so a rename lists both sides. The maintenance script tests
+(which read some README/docs files) run in their own `script-tests` job on every
+event, and `check (ubuntu-latest)` requires it, so they are never skipped. Detection fails safe: any other path, an
+empty diff, a `land/` head, `merge_group`, push, or a failed `changes` job runs
+everything. The `check (...)` gates still run with `always()`; they accept a
+`skipped` leg only when `changes` explicitly reported `skip_rust=true`.
