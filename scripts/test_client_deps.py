@@ -25,7 +25,7 @@ phase = 'verify' if pin['hash'] else 'probe'
 if os.environ.get('BLOCK_PHASE') == phase:
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    os.write(int(os.environ['READY_FD']), b'ready\\n')
+    os.write(int(os.environ['READY_FD']), f'ready {os.getpid()}\\n'.encode())
     signal.pause()
 if os.environ.get('FAIL_PHASE') == phase:
     print('fixture fetch failure', file=sys.stderr)
@@ -129,8 +129,15 @@ fi' DEBUG
                     try:
                         ready, _, _ = select.select([read_fd], [], [], 10)
                         self.assertTrue(ready, 'fake fetch failed to reach the requested stage')
-                        self.assertEqual(os.read(read_fd, 64), b'ready\n')
-                        os.killpg(child.pid, sig)
+                        notice = os.read(read_fd, 64)
+                        self.assertRegex(notice, rb'\Aready [0-9]+\n\Z')
+                        if gate_restore:
+                            # Fail only the ready fetch so Bash enters EXIT naturally.
+                            # Signalling the group here lets just's forwarded TERM
+                            # re-enter restore before its DEBUG gate can announce it.
+                            os.kill(int(notice.split()[1]), sig)
+                        else:
+                            os.killpg(child.pid, sig)
                         if gate_restore:
                             ready, _, _ = select.select([restore_read], [], [], 10)
                             self.assertTrue(ready, 'recipe never entered its restore callback')
