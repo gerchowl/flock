@@ -128,7 +128,6 @@ async fn structured_pane_operations_refuse_and_cross_runtime_names_are_ambiguous
     for method in [
         "agent.read",
         "agent.focus",
-        "agent.send",
         "agent.hibernate",
         "agent.resume",
         "agent.fork",
@@ -152,10 +151,34 @@ async fn structured_pane_operations_refuse_and_cross_runtime_names_are_ambiguous
             "{method}: {result}"
         );
     }
+    for target in ["fixture-agent", "structured-fixture"] {
+        let result = request(
+            &mut app,
+            "agent.send",
+            json!({
+                "target":target, "text":"fixture message", "submit":false
+            }),
+        );
+        assert_eq!(
+            result["error"]["code"], "structured_submit_required",
+            "{result}"
+        );
+    }
     let terminal = app.state.terminals.values_mut().next().unwrap();
     terminal.set_agent_name("fixture-agent".into()).unwrap();
-    for method in ["agent.get", "agent.status", "agent.stop", "agent.read"] {
-        let result = request(&mut app, method, json!({"target":"fixture-agent"}));
+    for method in [
+        "agent.get",
+        "agent.status",
+        "agent.stop",
+        "agent.read",
+        "agent.send",
+    ] {
+        let params = if method == "agent.send" {
+            json!({"target":"fixture-agent", "text":"fixture message", "submit":true})
+        } else {
+            json!({"target":"fixture-agent"})
+        };
+        let result = request(&mut app, method, params);
         assert_eq!(
             result["error"]["code"], "agent_target_ambiguous",
             "{method}: {result}"

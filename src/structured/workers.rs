@@ -69,7 +69,8 @@ pub struct Report {
 }
 enum Message {
     Leased,
-    Ready(Runtime),
+    // Runtime owns transport and queue capabilities; keep control messages compact.
+    Ready(Box<Runtime>),
     End(Report),
 }
 struct Worker {
@@ -127,6 +128,8 @@ impl Worker {
 /// Completed reports are bounded to the latest launch per agent. Removed records
 /// discard confirmed completions, while uncertain ownership remains recoverable.
 pub struct Workers {
+    recovery_slot: Option<(String, std::sync::Weak<()>)>,
+    retained_queues: BTreeMap<String, (u64, queue::publication::Source)>,
     entries: BTreeMap<String, Worker>,
     history: BTreeMap<String, (u64, super::history::History)>,
     pending: BTreeMap<String, Option<String>>,
@@ -147,6 +150,8 @@ impl Workers {
             wake,
             wakes,
             shutdown_result: None,
+            recovery_slot: None,
+            retained_queues: BTreeMap::new(),
             entries: BTreeMap::new(),
             history: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -160,8 +165,8 @@ impl Workers {
     /// and checked on both sides of the factory. Live/unconfirmed workers and
     /// unread terminal queue completions refuse replacement with session_busy.
     /// Failure may advance the observation epoch but never the record.
-    /// The app drains published completions before operator relaunch. Internal
-    /// adapters must likewise drain terminal completions first.
+    /// The application drains terminal completions for lifecycle facts and send
+    /// acknowledgements. Internal adapters must likewise drain before relaunch.
     pub fn start(
         &mut self,
         registry: &mut Registry,
@@ -181,6 +186,13 @@ impl Workers {
             lineage,
             admission,
         } = launch;
+        if self
+            .recovery_slot
+            .as_ref()
+            .is_some_and(|(id, slot)| id == &agent_id && slot.strong_count() != 0)
+        {
+            return Err(ErrorCode::SessionBusy);
+        }
         if let Some(previous) = self.entries.get_mut(&agent_id) {
             previous.join_finished();
             if !previous.finished
@@ -296,7 +308,7 @@ impl Workers {
                             if cancelled.requested() {
                                 runtime.stop();
                             }
-                            let _ = tx.try_send(Message::Ready(runtime));
+                            let _ = tx.try_send(Message::Ready(Box::new(runtime)));
                             notify.notify_one();
                             let _ = wake.try_send(());
                         },
@@ -416,22 +428,7 @@ impl Workers {
             .ok_or(ErrorCode::AgentNotFound)?
             .queue_enqueue(request)
     }
-    /// Retained live-generation provider, fenced by the registry epoch.
-    /// Cold sources refuse with retryable queue_source_cold until #1956 part 2.
-    /// This never performs filesystem work or returns an empty successful source.
-    pub(crate) fn queue_source(
-        &self,
-        registry: &Registry,
-        id: &str,
-        generation: u64,
-    ) -> Result<queue::publication::Source, ErrorCode> {
-        if registry.get(id).is_none_or(|(_, _, g)| g != generation) {
-            return Err(ErrorCode::AgentNotFound);
-        }
-        self.runtime(id, generation)
-            .and_then(Runtime::queue_source)
-            .ok_or(ErrorCode::QueueSourceCold)
-    }
+
     /// Consume an immutable completion/cut from the current generation only.
     /// Terminal cuts remain available after exit; drain before relaunch/removal.
     /// A cancelled notification report requires durable replay through #1956.
@@ -451,6 +448,26 @@ impl Workers {
             .as_ref()?
             .queue_update()
     }
+    /// Drain the fixed notification capacity per owned generation, including a removed
+    /// registry row. Historical committed facts must outlive supervisor metadata.
+    /// Queue subscriptions remain fenced separately by queue_source.
+    pub(crate) fn queue_completions(&self, terminal: bool) -> Vec<(String, u64, queue::Update)> {
+        // After stop there can also be one peeked completion and one fact tail.
+        let budget = queue::COMPLETION_CAPACITY + if terminal { 2 } else { 0 };
+        self.entries
+            .iter()
+            .flat_map(|(id, worker)| {
+                let updates: Vec<_> = (0..budget)
+                    .map_while(|_| worker.runtime.as_ref()?.queue_update())
+                    .map(|update| (id.clone(), worker.generation, update))
+                    .collect();
+                if !terminal && updates.len() == budget {
+                    self.notify.notify_one();
+                }
+                updates
+            })
+            .collect()
+    }
     /// Latch cancellation without blocking on preparation, process or I/O cleanup.
     pub fn stop(&self, id: &str, generation: u64) -> bool {
         let Some(worker) = self.entries.get(id).filter(|w| w.generation == generation) else {
@@ -469,6 +486,9 @@ impl Workers {
     /// Drain bounded batches and due observations. Old generations are cancelled
     /// and fenced by the pure registry; terminal reports cannot overtake stdout.
     pub fn poll(&mut self, registry: &mut Registry, now: Instant, unix_ms: u64) -> bool {
+        self.retained_queues.retain(|id, (generation, _)| {
+            registry.get(id).is_some_and(|(_, _, g)| g == *generation)
+        });
         let mut changed = false;
         for (id, worker) in &mut self.entries {
             if worker.finished {
@@ -494,7 +514,7 @@ impl Workers {
                         if worker.stop.requested() {
                             runtime.stop();
                         }
-                        worker.runtime = Some(runtime);
+                        worker.runtime = Some(*runtime);
                         changed |= worker.reduce(
                             registry,
                             id,
@@ -601,12 +621,17 @@ impl Workers {
         self.history.retain(|id, (generation, _)| {
             registry.get(id).is_some_and(|(_, _, g)| g == *generation)
         });
-        // Removed records need no completed handle; uncertain ownership must survive.
+        // Keep committed completions after metadata removal; uncertain ownership survives.
+
         self.entries.retain(|id, worker| {
             worker.join_finished();
             worker.thread.is_some()
                 || !worker.finished
                 || registry.get(id).is_some()
+                || worker
+                    .runtime
+                    .as_ref()
+                    .is_some_and(Runtime::retired_queue_facts)
                 || worker
                     .report
                     .as_ref()

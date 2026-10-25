@@ -45,15 +45,69 @@ waiting for filesystem work on the server loop. Subscription requests are
 serviced even when the worker's completion channel is full. There is no queue
 deadline. Final and bootstrap status retain the last operation error.
 
-Cold recovery and its I/O-worker/generation-fenced installation are #1956 part 2.
-Until that lands, a registered generation without a retained live source returns
-`queue_source_cold` (`retry: later`), never an empty successful subscription.
-This is distinct from the permanent `queue_mode_unsupported` mode refusal.
-Retry becomes useful when part 2 installs the I/O recovery provider. A stale or
-unknown generation returns `agent_not_found`. This limit does not affect the
-retained source of a worker that has exited in the current process. Global
-lifecycle facts are #1956 part 3; producer routing/acknowledgements remain #1957
-and #1958.
+Cold sources return `queue_source_cold` (`retry: later`) until the registry
+owner installs a completed recovery. `Workers::recover_queue` admits at most one
+I/O loader per worker owner. It opens an existing private journal and lease;
+a missing namespace never creates an empty successful queue. An existing
+checkpoint retains its original sequences and bytes. A first uncheckpointed
+subscription uses the same durable bootstrap as a live owner.
+
+All opening, fsync, supported torn-tail repair and bootstrap run on that I/O
+worker. The completion owns no journal lease or file, and polling/dropping the
+handle never joins the thread on the server loop. Cancelling a consumer does
+not interrupt filesystem operations; the slot stays occupied until loading
+ends. The same agent's launch is `session_busy` while that slot is active.
+Unrelated agents can still launch. Consumer request/result retention limits
+belong to the subscription adapter (#1830); recovered snapshot memory remains
+proportional to the journal, as for the live provider.
+
+Installation rechecks the registry generation, namespace and active or
+unconfirmed owner. A live producer or the first installed recovery wins
+canonically; later completions cannot replace it. Terminal recovered sources
+serve their immutable replay and `synced`, then `End`. A later live generation
+uses its own fenced owner and continues at the persisted queue sequence.
+Retired sources are removed from the owner cache during registry polling.
+
+A missing queue namespace is `queue_not_found` (`retry: never`): resolve or
+create the queue before requesting recovery. It performs no creation. An
+existing journal may receive its durable first-subscription bootstrap.
+Lease contention is `session_busy`. Other I/O/opening failures are
+`queue_recovery_failed` with `retry: after_inspecting`: recovery
+may have repaired a tail or completed a bootstrap before the failure. No
+mutation is automatically retried. Worker loss/panic is
+`structured_worker_panicked`. The configured rewrite policy re-derives
+`queue_journal_newer`/`queue_journal_corrupt` refusals without repairing or
+rewriting read-only bytes; these sources refuse rather than claim a snapshot.
+A stale or unknown registry generation remains `agent_not_found`.
+
+The app consumes the single owner's committed transition completions and the
+same in-process provider used by S7-min. It appends `queue_item_state` to the
+global EventHub after queue durability, retaining typed producer, item/batch
+identity and the original queue cursor. It never derives transitions from a
+replacement snapshot: bootstrap and rewrite can erase intermediate states.
+Only the seven ADR §3 states participate in this global vocabulary; future
+states and queue-only formation failures remain in per-queue status/records.
+
+Each app pass drains at most four completions and 64 provider pages per agent.
+Shutdown may abandon notification cuts under backpressure, but committed
+transition facts remain owned by the terminal client until drained, in queue
+order even when a later notification finds channel capacity. Completed handles
+outlive registry-row removal until their committed facts drain; empty
+notifications do not retain a removed worker. Server shutdown and handoff drain
+the fixed channel capacity plus its one peek and terminal tail before
+relinquishing the global log. Provider
+status preserves reservation and S4/S6 gate Pending, read-only errors and explicit
+lagged closure; it does
+not auto-retry mutations or start cold recovery. A new generation discards the
+previous provider observation. Operator admission acknowledgements use this same
+completion consumer (#1957); authenticated message custody remains #1958, and
+the external subscription adapter remains #1830.
+
+The queue and global log are separate durability domains: facts are ordered
+after their queue commit, not in a shared transaction. Global append failures
+use EventHub's existing logging/retention policy. Queue replay remains the
+source of item state; loading/replaying a checkpoint never invents historical
+state transitions or new global facts.
 
 ## Reserved input kinds
 
