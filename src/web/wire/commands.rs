@@ -240,12 +240,13 @@ impl Owner {
                 } else {
                     Scope::Send
                 };
+                // Only the owner mutates these sets; lookup need not hold the token lock.
+                let duplicate =
+                    self.completed.contains(&key) || self.pending.iter().any(|p| p.key == key);
                 let outcome = request
                     .store
                     .admit(&request.session, scope, |token| {
-                        if self.completed.contains(&key)
-                            || self.pending.iter().any(|p| p.key == key)
-                        {
+                        if duplicate {
                             return Err(ErrorCode::SessionUnconfirmed);
                         }
                         dispatch(app, &request.command, &Principal::Token(token))
@@ -305,18 +306,23 @@ pub(super) async fn execute(
     };
     let revoked = matches!(&frame, ServerFrame::Ack { error: Some(error), .. } if error.code == ErrorCode::AuthRevoked.as_str());
     let (delivered, flushed) = oneshot::channel();
-    data.send(output::Delivery {
-        frame,
-        active: None,
-        delivered: Some(delivered),
-    })
-    .await
-    .map_err(|_| ())?;
-    if !flushed.await.map_err(|_| ())? {
-        return Err(());
+    let flushed = async {
+        data.send(output::Delivery {
+            frame,
+            active: None,
+            delivered: Some(delivered),
+        })
+        .await
+        .map_err(|_| ())?;
+        match flushed.await {
+            Ok(true) => Ok(()),
+            _ => Err(()),
+        }
     }
+    .await;
+    // ADR-0036 §5a: a lost ack must not suppress principal-wide revocation.
     if revoked {
         shared.revoke(&session);
     }
-    Ok(())
+    flushed
 }
