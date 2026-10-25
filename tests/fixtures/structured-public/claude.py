@@ -105,4 +105,30 @@ else:
     print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "dogfood-complete", "session_id": session}), flush=True)
     with open(root / "turn-ready", "wb", buffering=0) as ready:
         ready.write(b"T")
-    sys.stdin.read()
+    if model == "dogfood-wire-child":
+        request_number = 0
+        pending_requests = set()
+        def emit(value):
+            print(json.dumps(dict(value, session_id=session)), flush=True)
+        for line in sys.stdin:
+            value = json.loads(line)
+            if value.get("type") == "user":
+                emit({"type": "command_lifecycle", "command_uuid": value["uuid"], "state": "started"})
+                emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "wire-send-observed"}]}})
+                disabled = (root / "proof-disable").read_text() if (root / "proof-disable").exists() else "none"
+                if disabled == "permission":
+                    continue
+                # Retained permission IDs cannot be reused within a transport.
+                request_number += 1
+                request_id = "typed-request" if request_number == 1 else f"typed-request-{request_number}"
+                pending_requests.add(request_id)
+                emit({"type": "control_request", "request_id": request_id, "request": {
+                    "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "tool-example",
+                    "input": {"command": "true"}, "requires_user_interaction": True, "permission_suggestions": []}})
+            elif value.get("type") == "control_response":
+                pending_requests.remove(value["response"]["request_id"])
+                emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "wire-decision-observed"}]}})
+                if not (root / "proof-disable").exists() or (root / "proof-disable").read_text() != "result":
+                    emit({"type": "result", "subtype": "success", "is_error": False, "result": "wire-complete"})
+    else:
+        sys.stdin.read()

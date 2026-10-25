@@ -2485,6 +2485,15 @@ decision by the owner.
 Tracked in #1307. Ordered; each is at most about 400 production lines (tests and doc comments
 excluded; TypeScript counts the same as Rust) and lands behind `runtime: structured` or the `web` feature.
 
+The S7-min rows refine the original S7 endpoint slice. Execution follows
+1 → 7b → 2 → 3 → 4 → 5 → 6 → 8; the GUI bundle router (7a) is built
+independently. Artifact, inbox and mesh streams, full outbox/resume-only
+semantics, single-writer handoff and operator-only outcomes remain S7-rest;
+their fixture labels stay explicit under the ADR tracker #1307. #2369 proves
+isolated browser dogfood and
+metadata-selected welcomes, not full selected-script trace execution. That
+remaining slice-8 acceptance is tracked in #2467; #1833 and #1746 stay open.
+
 | # | Slice | Depends on | Est. lines |
 |---|---|---|---|
 | S0 | Complete (2026-10-14): the probes landed (#1356); the A.13 controls and token-path re-runs, the concurrency-safe call behind an open permission, and A.16 are recorded (#1404). Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
@@ -2499,6 +2508,16 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S6 | Control requests: `can_use_tool` → `hook.decide` and §8a questions, `AskUserQuestion` answers, `ExitPlanMode` | S4, S5 | 350 |
 | S7a | Wire message Rust types with ts derives: hello/welcome recovery metadata, sub/unsub/cmd/ev/ack, subfail, ping/pong, synced on every seq stream, gap with snapshot_to, lagged (§5/§5a); scripted fake-server fixture format, types only with no endpoint. Before S3, as ADR-0038 §10 | #1546 settled | 200 |
 | S7 | Wire endpoint implementing S7a, §5a deadlines, heartbeat, durable command journal, resume/checkpoint and single-writer rules, `/v1/blob`, client tokens, `WIRE_JSON_VERSION` gate, `web` on in release builds; refuse remote-agent cmd until #1380 | S3 (S3a #1518/#1439, S3b #1426), S7a | 350 |
+| S7-min 1 (#1825) | Client-token authority and verification | S7a, #1798 | ≤400 |
+| S7-min 7b (#1827) | Operator token CLI/socket entry and dogfood URL | Slice 1 | ≤400 |
+| S7-min 2 (#1828) | Loopback WebSocket transport and liveness | Slices 1, 7b | ≤400 |
+| S7-min 3 (#1829) | Stored session replay and live publication | Slice 2, S3 | ≤400 |
+| S7-min 4 (#1830) | Agent subscriptions, identities and bounded delivery | Slice 3 | ≤400 |
+| S7-min 5 (#1831) | Send and permission-decision routing | Slice 4, S5, S6 | ≤400 |
+| S7-min 6a (#1832) | Durable fleet-lite projection and cursor core | S4, S6 | ≤400 |
+| S7-min 6b (#2225) | Fleet stream on the endpoint; activity omitted until #2243 | Slices 4, 6a | ≤400 |
+| S7-min 7a (#1826) | GUI bundle serving router | Loopback listener, GUI build | ≤400 |
+| S7-min 8 (#1833) | Real-server conformance and isolated browser dogfood proof | Preceding minimal slices; #1734 before public start | 0 (tests/docs) |
 | S8 | `ts` feature, `ts-rs` derives, generated `web/client/src/gen`, drift test, `just gen-ts` | S7 | 200 |
 | S9a | Bun reference client in Solid: connect, follow an agent from a cursor, render P1–P4, unknown JSON dump, lazy blobs | S8 | 400 (TS) |
 | S9b | Bun reference client: P12–P15, P19, P20, queue view with edit, reorder, stashes, send now and relevance marks | S9a, S5c | 400 (TS) |
