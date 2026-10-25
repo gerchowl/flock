@@ -1332,6 +1332,6 @@ async fn finished_without_report_allows_retained_recovery() {
 
 mod recovery;
 
-mod global;
+pub(crate) mod global;
 
 mod send;
