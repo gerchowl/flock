@@ -478,10 +478,7 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
-    let cli::argv::Arguments {
-        text: raw_args,
-        handoff_socket,
-    } = cli::argv::collect(std::env::args_os())?;
+    let raw_args: Vec<_> = std::env::args_os().collect();
     if raw_args.len() == 2 && raw_args[1] == platform::client_token_lock::WORKER_ARG {
         return platform::client_token_lock::worker();
     }
@@ -501,6 +498,13 @@ fn run() -> io::Result<()> {
             std::process::exit(cli::exit::USAGE);
         }
     };
+
+    // Decode only after global stripping: the importer must see this same argv,
+    // with its socket kept native and all remaining command text checked as UTF-8.
+    let cli::argv::Arguments {
+        text: args,
+        handoff_socket,
+    } = cli::argv::collect(args.into_iter())?;
 
     if remote_launch.is_some()
         && args.get(1).is_some()

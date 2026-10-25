@@ -127,9 +127,11 @@ pub(crate) struct RemoteLaunch {
     pub(crate) proxy_jump: Option<String>,
 }
 
-pub(crate) fn extract_remote_args(
-    args: &[String],
-) -> Result<(Vec<String>, Option<RemoteLaunch>), String> {
+/// Strip remote globals without decoding native command arguments.
+/// Remote option values remain UTF-8 text and retain typed decoding refusals.
+pub(crate) fn extract_remote_args<T: AsRef<std::ffi::OsStr> + Clone + From<&'static str>>(
+    args: &[T],
+) -> Result<(Vec<T>, Option<RemoteLaunch>), String> {
     let mut cleaned = Vec::with_capacity(args.len());
     if let Some(program) = args.first() {
         cleaned.push(program.clone());
@@ -142,27 +144,30 @@ pub(crate) fn extract_remote_args(
     let mut index = 1;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--" {
+        let text = arg.as_ref().to_str();
+        if text == Some("--") {
             cleaned.extend_from_slice(&args[index..]);
             break;
         }
-        if arg == "--handoff" {
+        if text == Some("--handoff") {
             live_handoff = true;
             index += 1;
             continue;
         }
-        if arg == "--remote" {
+        if text == Some("--remote") {
             if remote_target.is_some() {
                 return Err("--remote can only be specified once".to_string());
             }
             let Some(value) = args.get(index + 1) else {
                 return Err("missing value for --remote".to_string());
             };
-            remote_target = Some(validate_remote_target(value)?.to_owned());
+            let value = crate::cli::argv::text_argument(index + 1, value.as_ref().to_os_string())
+                .map_err(|err| err.to_string())?;
+            remote_target = Some(validate_remote_target(&value)?.to_owned());
             index += 2;
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--remote=") {
+        if let Some(value) = text.and_then(|arg| arg.strip_prefix("--remote=")) {
             if remote_target.is_some() {
                 return Err("--remote can only be specified once".to_string());
             }
@@ -170,19 +175,21 @@ pub(crate) fn extract_remote_args(
             index += 1;
             continue;
         }
-        if arg == "--remote-keybindings" {
+        if text == Some("--remote-keybindings") {
             if keybindings_seen {
                 return Err("--remote-keybindings can only be specified once".to_string());
             }
             let Some(value) = args.get(index + 1) else {
                 return Err("missing value for --remote-keybindings".to_string());
             };
-            keybindings = RemoteKeybindings::parse(value)?;
+            let value = crate::cli::argv::text_argument(index + 1, value.as_ref().to_os_string())
+                .map_err(|err| err.to_string())?;
+            keybindings = RemoteKeybindings::parse(&value)?;
             keybindings_seen = true;
             index += 2;
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--remote-keybindings=") {
+        if let Some(value) = text.and_then(|arg| arg.strip_prefix("--remote-keybindings=")) {
             if keybindings_seen {
                 return Err("--remote-keybindings can only be specified once".to_string());
             }
@@ -213,7 +220,7 @@ pub(crate) fn extract_remote_args(
         return Err("--remote-keybindings requires --remote".to_string());
     }
     if remote.is_none() && live_handoff {
-        cleaned.push("--handoff".to_string());
+        cleaned.push("--handoff".into());
     }
 
     Ok((cleaned, remote))
@@ -4364,7 +4371,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_removes_space_form() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "--remote".into(),
             "dev".into(),
@@ -4379,7 +4386,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_removes_equals_form() {
-        let args = vec!["flock".into(), "--remote=user@host".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote=user@host".into()];
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
         assert_eq!(cleaned, vec!["flock"]);
         let remote = remote.unwrap();
@@ -4389,7 +4396,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_accepts_remote_keybindings_server() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "--remote".into(),
             "dev".into(),
@@ -4404,7 +4411,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_accepts_remote_keybindings_space_form() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "--remote=dev".into(),
             "--remote-keybindings".into(),
@@ -4417,7 +4424,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_accepts_explicit_handoff() {
-        let args = vec!["flock".into(), "--remote=dev".into(), "--handoff".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote=dev".into(), "--handoff".into()];
 
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
 
@@ -4429,7 +4436,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_preserves_child_remote_options_after_separator() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "agent".into(),
             "start".into(),
@@ -4450,7 +4457,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_preserves_handoff_without_remote() {
-        let args = vec!["flock".into(), "update".into(), "--handoff".into()];
+        let args: Vec<String> = vec!["flock".into(), "update".into(), "--handoff".into()];
 
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
 
@@ -4460,14 +4467,14 @@ mod tests {
 
     #[test]
     fn extract_remote_args_rejects_remote_keybindings_without_remote() {
-        let args = vec!["flock".into(), "--remote-keybindings=server".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote-keybindings=server".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "--remote-keybindings requires --remote");
     }
 
     #[test]
     fn extract_remote_args_rejects_duplicate_remote_keybindings() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "--remote=dev".into(),
             "--remote-keybindings=local".into(),
@@ -4479,21 +4486,21 @@ mod tests {
 
     #[test]
     fn extract_remote_args_requires_value() {
-        let args = vec!["flock".into(), "--remote".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "missing value for --remote");
     }
 
     #[test]
     fn extract_remote_args_rejects_empty_value() {
-        let args = vec!["flock".into(), "--remote=".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote=".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "missing value for --remote");
     }
 
     #[test]
     fn extract_remote_args_rejects_duplicate_values() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "--remote=dev".into(),
             "--remote=prod".into(),
@@ -4504,7 +4511,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_rejects_option_like_target() {
-        let args = vec!["flock".into(), "--remote".into(), "-oProxyCommand=x".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote".into(), "-oProxyCommand=x".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "--remote target must not start with '-'");
     }
