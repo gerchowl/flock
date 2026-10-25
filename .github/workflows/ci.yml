@@ -50,11 +50,78 @@ jobs:
       # job still reports success so it can stay a required context, which the
       # queue needs in order to gate on it.
 
+  # Fail-safe change detection (scripts/ci_changes.py). Only an ordinary
+  # pull_request touching nothing but docs/website/markdown or the web client
+  # may skip the Rust legs; any other path, a `land/` batch head, merge_group,
+  # push, or a detection failure leaves `skip_rust` != 'true' and runs
+  # everything. The check jobs below still report either way.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      skip_rust: ${{ steps.decide.outputs.skip_rust }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            echo "skip_rust=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA" > changed.txt
+          python3 scripts/ci_changes.py "$EVENT" "$HEAD_REF" < changed.txt >> "$GITHUB_OUTPUT"
+
+  # Maintenance-script tests and the platform test-gap ratchet (#597). Some of
+  # them read docs/website/README files, so they run on EVERY event, outside
+  # the skippable Rust legs, and `check (ubuntu-latest)` requires them.
+  script-tests:
+    name: script-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            always-allow-substitutes = true
+
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-
+          save: ${{ github.ref == 'refs/heads/dev' }}
+          gc-max-store-size-linux: 2G
+          gc-max-store-size-macos: 2G
+
+      - name: Run maintenance script tests
+        run: nix develop -c just script-tests
+
   # One platform each, split into lint, build and parallel test-shard jobs
   # (ci-leg.yml, #991). Each OS is its own reusable-workflow call so its
   # result can be judged alone in the check jobs below.
   ubuntu:
     name: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}
     uses: ./.github/workflows/ci-leg.yml
     with:
       leg: ubuntu-latest
@@ -103,6 +170,8 @@ jobs:
   # builds on. Revisit when zig gains macOS 26 SDK support.
   macos:
     name: macos-15
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}
     uses: ./.github/workflows/ci-leg.yml
     with:
       leg: macos-15
@@ -120,7 +189,7 @@ jobs:
   # run the result gate and fail explicitly, rather than permit an untested merge.
   check-ubuntu:
     name: check (ubuntu-latest)
-    needs: ubuntu
+    needs: [changes, ubuntu, script-tests]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -141,11 +210,28 @@ jobs:
         continue-on-error: true
         run: python3 scripts/ci_shards.py summary --title 'check (ubuntu-latest)' --strip-prefix junit-ubuntu-latest- junit >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Require the maintenance script tests
+        if: always()
+        env:
+          SCRIPT_TESTS: ${{ needs.script-tests.result }}
+        run: |
+          if [ "$SCRIPT_TESTS" != success ]; then
+            echo "script-tests ended as $SCRIPT_TESTS" >&2
+            exit 1
+          fi
+
       - name: Require every job of the leg
         if: always()
         env:
           RESULT: ${{ needs.ubuntu.result }}
+          SKIP_RUST: ${{ needs.changes.outputs.skip_rust }}
         run: |
+          # `skipped` is acceptable only when change detection succeeded and
+          # chose to skip (docs/web-only PR); every other state fails.
+          if [ "$RESULT" = skipped ] && [ "$SKIP_RUST" = true ]; then
+            echo "ubuntu-latest leg skipped: docs/web-only change"
+            exit 0
+          fi
           if [ "$RESULT" != success ]; then
             echo "ubuntu-latest leg ended as $RESULT" >&2
             exit 1
@@ -153,7 +239,7 @@ jobs:
 
   check-macos:
     name: check (macos-15)
-    needs: macos
+    needs: [changes, macos]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -178,7 +264,14 @@ jobs:
         if: always()
         env:
           RESULT: ${{ needs.macos.result }}
+          SKIP_RUST: ${{ needs.changes.outputs.skip_rust }}
         run: |
+          # `skipped` is acceptable only when change detection succeeded and
+          # chose to skip (docs/web-only PR); every other state fails.
+          if [ "$RESULT" = skipped ] && [ "$SKIP_RUST" = true ]; then
+            echo "macos-15 leg skipped: docs/web-only change"
+            exit 0
+          fi
           if [ "$RESULT" != success ]; then
             echo "macos-15 leg ended as $RESULT" >&2
             exit 1
