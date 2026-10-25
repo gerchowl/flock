@@ -609,7 +609,21 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
   - The `flk` binary with the `web` feature embeds the assets and serves them beside `/v1/ws`.
   - `flk client open` mints a one-time code over the Unix socket and opens the browser (ADR-0036 §5). Loopback is the default bind, and `--allow-non-loopback` stays explicit.
 - **Tauri v2** (#1402). It carries the same assets in a native shell: WKWebView, WebView2, WebKitGTK and Android WebView. It is a separate binary and repo or crate, never linked into `flk` (bin-only).
-  - **Connection:** to any `flk` server by URL with a client token. The token lives in the keychain or keystore, optionally behind biometric unlock.
+  - **Connection.** The shell connects to a `flk` server by URL, over `/v1/ws` with a client token, like the browser. How it gets the token depends on where the server is (owner decision 16):
+    - **The server on the same machine (zero-touch).**
+      - At launch, the shell's native side opens `flock.sock`. The kernel checks the caller's UID and PID on every connection (`getpeereid` + `LOCAL_PEERPID` on macOS, `SO_PEERCRED` on Linux), so the app counts as the LocalOperator, exactly as `flk client open` does.
+      - Over that socket it mints an **app-session token**:
+        - scoped to what the shell asks for, never more than `operate`;
+        - with a server-side TTL;
+        - bound to the app's PID, so it is revoked when that process exits, crash included.
+      - The native side hands the token to the webview through one Tauri command. The webview keeps it **in memory only** and mints again after a reload; nothing is persisted.
+      - The socket carries only this mint. Every stream and command still goes over `/v1/ws`, so this does not reopen ADR-0011 §3's direct-socket transport (owner decision 1).
+      - If no server is running, the shell starts one through the existing daemon path.
+      - An app launched from inside a flk pane fails the LocalOperator check (pane ancestry). It says so and stops; it never falls back to a weaker path.
+    - **A remote server** (#2293). The person pastes or deep-links a one-time code, and the token lives in the keychain or keystore, optionally behind biometric unlock.
+  - **Shell origins.** A shell's webview does not present the server's origin: macOS WKWebView sends `Origin: null`, and Windows and Android send `http://tauri.localhost`. The listener's guard (ADR-0036 §5) admits an **exact allow-list** of these shell origins on `/v1/*`, with the loopback-peer and exact-`Host` checks unchanged.
+    - Admitting `null` is safe only because `/v1/ws` has no ambient credential: it authenticates by the token in HELLO. A page in a browser can also send `null` (a sandboxed frame), but it has no token.
+    - `/v1/client/exchange` stays strictly same-origin, because its one-time code is a bearer secret.
   - **Native additions:**
     - the keyboard accessory bar;
     - deep links to an agent, question or artifact;
@@ -623,7 +637,7 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
     - Navigation outside the bundle is refused.
     - DevTools are gated in release builds.
     - Builds are signed and notarised.
-- **One transport.** ADR-0011 §3's desktop path, Tauri IPC straight to `flock.sock`, is **superseded** by the WebSocket and client tokens of ADR-0036 §5 for every shell (owner decision 1). There is one code path, one auth model and one set of tests. A desktop app on the server's host mints its own token through `flk client open`, as a browser does.
+- **One transport.** ADR-0011 §3's desktop path, Tauri IPC straight to `flock.sock`, is **superseded** by the WebSocket and client tokens of ADR-0036 §5 for every shell (owner decision 1). There is one code path, one auth model and one set of tests. A desktop app on the server's host mints its own app-session token over `flock.sock`, which is the same LocalOperator authority that `flk client open` uses (owner decision 16).
 - **Identity, and exactly what changes in ADR-0011.**
   - **Superseded for the GUI:** ADR-0011 §4's requirement that a WSS *gateway* (#150) authenticate GUI clients by a non-empty `allowed_users` list and the `Tailscale-User-Login` header, and propagate that login as the request principal. For the `/v1/ws` endpoint, the principal is the client token's (ADR-0036 §5), on any network.
   - **Kept:**
@@ -751,11 +765,11 @@ The first end-to-end milestone is **"a structured agent in a browser tile"**: G1
 
 ### 11. Owner decisions (decided by the owner, 2026-10-16, recorded on #1591)
 
-Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day. Item 11 was added on 2026-10-17, when the owner chose between two wireframe directions after rejecting the first preview. Items 12–14 were added on 2026-10-18 with §5b (#1717) and decided by the owner on 2026-10-19 (recorded on #1717). Item 15 was added and decided by the owner on 2026-10-19 (recorded on #1717).
+Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day. Item 11 was added on 2026-10-17, when the owner chose between two wireframe directions after rejecting the first preview. Items 12–14 were added on 2026-10-18 with §5b (#1717) and decided by the owner on 2026-10-19 (recorded on #1717). Item 15 was added and decided by the owner on 2026-10-19 (recorded on #1717). Item 16 was added after a spike and decided by the owner on 2026-10-25 (recorded on #1601).
 
 | # | Decision | Outcome | Consequence |
 |---|---|---|---|
-| 1 | Supersede ADR-0011 §3's direct-socket desktop transport with ADR-0036 §5's WebSocket and tokens everywhere | **Decided: yes** | A desktop app on the server host gets its token through `flk client open`. |
+| 1 | Supersede ADR-0011 §3's direct-socket desktop transport with ADR-0036 §5's WebSocket and tokens everywhere | **Decided: yes** | A desktop app on the server host gets its token through the same LocalOperator socket authority as `flk client open`; item 16 decides how (an app-session token, zero-touch). |
 | 2 | Opt-in **interactive** artifacts: scripts in an opaque-origin sandbox, no network, posts confirmed by a person | **Decided: yes**, opt-in per publish, off by default | One more security surface, reviewed in G7. Agents can render live plots and forms. |
 | 3 | Replace ADR-0011 §5's distinct hostname with the opaque-origin sandbox | **Decided: yes** | Isolation rests on correct sandbox flags and injected CSP in every shell. A client bug such as a stray `allow-same-origin` would expose the client token, so G7 carries a security test per shell. Interactive artifacts keep §7's navigation-beacon risk. Artifacts render only inside the client. |
 | 4 | Solid web client vs GPUI (#1401) | **Decided: Solid**; #1401 is closed | The Bun/TS toolchain stays. |
@@ -770,6 +784,7 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 | 13 | What happens to a thread's fork after the merge-back? (§5b) | **Decided: yes** ("stop fork but keep transcript"). The fork is stopped, and its transcript is kept in the lineage (the `AgentForked` edge); the sidebar folds ended threads. | Stored transcripts, and lineage rows to fold. No retention limit is stated yet: ADR-0036 S16 owns it. A rehydrated copy is deleted when the fork ends either way (ADR-0036 owner decision 14). |
 | 14 | A thread fork's tools (§5b) | **Decided: read-only now, through the general machinery** ("machinery first … but with read only as per now"). The fork runs under ADR-0036 S19's permission tiers (#1321) with a read-only tier, never a thread-specific flag. | A fork that would have to run a command to answer must say so in its proposal. Widening is #1321's follow-up: tiers selectable per model, and a fork that requests more, which the person grants. |
 | 15 | Does S6e retake ADR-0036 owner decision 3a, so that the asker decides blocking, with a reason, instead of S6d's System-One check? (§5b decision 5) | **Decided: yes** (the owner typed "y" on 2026-10-19, recorded on #1717), following the owner's #1717 words "not vlocking [sic] unless there is literally nothing else to work on". | The server stops catching a wrongly held or wrongly continued turn, and an agent that over-uses `blocking: true` only costs itself and puts its card first. S6d no longer holds a turn; any later use of its check is advisory only (the backend ruling on #1717). |
+| 16 | How does the Tauri shell get its token from a server on the same machine? (§6; amends item 1's consequence) | **Decided: zero-touch** (the owner typed "go" on 2026-10-25, recorded on #1601), after asking for no token input on the person's own machine. The native side mints a scoped, TTL-limited, PID-bound app-session token over `flock.sock`, and the webview holds it in memory. The listener admits an exact allow-list of shell origins on `/v1/*`. Remote servers keep a code and the keychain. | The server gains ephemeral tokens (TTL, PID binding, revocation) and the origin allow-list, an amendment to ADR-0036 §5. The shell needs a non-sandboxed build: an App Store sandbox cannot reach `flock.sock`. |
 
 ## Failure modes and known limits
 
@@ -781,6 +796,7 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 - **Stale reads.** While Stale, tiles show old state with a marker. A user can read but not act. The outbox holds actions until Live.
 - **A stale command after the idempotency window** is shown as "unknown outcome", never resent automatically.
 - **Cross-node commands** are refused until #1380. The UI shows the refusal in place.
+- **The local shell needs the socket.** A sandboxed (App Store) build, or an app launched from inside a flk pane, cannot mint an app-session token. It shows why and offers the remote path (a code); it never falls back silently.
 - **Layout loss.** Clearing browser storage resets the layout. Server state is unaffected.
 - **A thread's proposal is untrusted text.** The fork read the asker's context, which can hold injected content. The proposal is shown as text, and only the question's recipient applies it, after review (§5b decision 4; owner decision 12).
 - **A thread behind a compaction costs a cache write.** The rehydrate path is cold. The card shows the path and cost before forking (§5b decision 2).
