@@ -177,11 +177,17 @@ impl TokenStore {
         Ok(file)
     }
     fn lock(&self) -> Result<LockFile, TokenError> {
+        self.lock_with(LockFile::try_lock)
+    }
+    fn lock_with(
+        &self,
+        acquire: fn(&LockFile) -> Result<(), TryLockError>,
+    ) -> Result<LockFile, TokenError> {
         if priority::pending(&self.0)? {
             return Err(TokenError::Busy);
         }
         let file = LockFile::new(self.lock_file()?);
-        file.try_lock().map_err(|e| match e {
+        acquire(&file).map_err(|e| match e {
             TryLockError::WouldBlock => TokenError::Busy,
             TryLockError::Error(e) => e.into(),
         })?;
@@ -353,16 +359,18 @@ impl TokenStore {
         }
         Err(TokenError::Unauthorized)
     }
-    /// Recheck before dispatch and hold the revocation lock through bounded admission.
-    /// The callback cannot return the borrowed sealed capability. It must not wait
-    /// for model execution or call token management recursively; contention is Busy.
+    /// Recheck and hold a shared token-store lock through bounded dispatch (#2450).
+    /// Mutation remains exclusive; intent checks before and after acquisition give
+    /// pending revocation priority. Busy denotes mutation, never another admission.
+    /// The callback cannot return the borrowed sealed capability, wait for model
+    /// execution, or call token management recursively.
     pub(crate) fn admit<T>(
         &self,
         session: &Session,
         required: Scope,
         dispatch: impl for<'a> FnOnce(VerifiedToken<'a>) -> T,
     ) -> Result<T, TokenError> {
-        let _guard = self.lock()?;
+        let _guard = self.lock_with(LockFile::try_lock_shared)?;
         let r = self.load(&session.info.name).map_err(|e| match e {
             TokenError::Io(e) if e.kind() == io::ErrorKind::NotFound => TokenError::Revoked,
             e => e,

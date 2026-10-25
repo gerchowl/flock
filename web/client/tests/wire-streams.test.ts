@@ -423,3 +423,20 @@ test("lagged skipped_to is diagnostic and never becomes an applied cursor", () =
     expect(seen).toEqual(applied === null ? [3] : [2, 3]);
   }
 });
+
+
+test("session_busy refuses one stream and can be retried after reconnect", () => {
+  const h = new Harness();
+  live(h);
+  h.step(step({ step: "client", action: { kind: "subscribe", sub_id: "s1", stream: "agent/a" } }));
+  h.step(step({ step: "send", frame: { t: "subfail", sub_id: "s1", code: "session_busy", message: "mutation pending" } }));
+  expect(h.connection.state).toBe("Live");
+  expect(h.connection.streams().get("s1")?.state).toBe("Refused");
+  h.step(step({ step: "drop" }));
+  h.step(step({ step: "expect_connect", within_ms: 500, not_before_ms: 250 }));
+  h.step(step({ step: "open" }));
+  h.step(step({ step: "send", frame: WELCOME }));
+  expect(subIds(h)).toEqual(["s1", "s1"]);
+  h.step(step({ step: "send", frame: { t: "synced", sub_id: "s1", seq: 0 } }));
+  expect(h.connection.streams().get("s1")?.state).toBe("Current");
+});

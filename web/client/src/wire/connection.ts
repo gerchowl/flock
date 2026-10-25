@@ -545,6 +545,7 @@ export class WireConnection {
       case "unknown_stream":
         return before.server_version !== after.server_version;
       case "cursor_ahead":
+      case "session_busy":
         return true;
     }
   }

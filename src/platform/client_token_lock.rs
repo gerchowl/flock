@@ -25,6 +25,10 @@ impl LockFile {
     pub(crate) fn try_lock(&self) -> Result<(), TryLockError> {
         self.0.try_lock()
     }
+    /// Share admission ownership without waiting; token mutation remains exclusive.
+    pub(crate) fn try_lock_shared(&self) -> Result<(), TryLockError> {
+        self.0.try_lock_shared()
+    }
 }
 impl AsRawFd for LockFile {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
