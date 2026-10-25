@@ -172,6 +172,16 @@ client-browsers:
 client-preview *args:
     cd web/client && bun install --frozen-lockfile && bun run build:fixture && bun x vite preview {{args}}
 
+# Run the Tauri desktop shell (desktop/, #1601) against the client's Vite dev
+# server. Server URL: FLOCK_DESKTOP_SERVER_URL or desktop/README.md's config file.
+desktop-dev:
+    cd desktop && bun install --frozen-lockfile && bun x tauri dev
+
+# Build the client into a release desktop shell (unsigned; signing is #1636).
+# The app lands in desktop/target/release/bundle/.
+desktop-build:
+    cd desktop && bun install --frozen-lockfile && bun x tauri build
+
 # Build the vendored libghostty-vt source dist
 build-libghostty-vt:
     scripts/build_vendored_libghostty_vt.sh

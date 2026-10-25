@@ -643,7 +643,15 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
     - A shell's webview does not present the server's origin. The listener's guard (`origin_allowed`, `src/web/gui.rs`, used by the listener in `src/web/client_listener.rs`) admits an **exact allow-list of shell origins** on the `/v1/ws` upgrade only.
     - For those origins only, it relaxes the `Sec-Fetch-Site` check to the value the shell actually sends (`cross-site` against `127.0.0.1:port`). Every other origin keeps today's `none`/`same-origin` rule.
     - The loopback-peer and exact-`Host` checks are unchanged.
-    - **The values are captured, not assumed.** G9a's first step records the `Origin` and `Sec-Fetch-Site` that a real Tauri v2 shell sends on macOS, Linux and Windows, in this section. The allow-list holds only those captured values. The documentation is inconsistent, giving `tauri://localhost` and `null` for macOS and `http://tauri.localhost` for Windows, so nothing is admitted on that basis.
+    - **The values are captured, not assumed.** The allow-list holds only values a real Tauri v2 shell sent. The documentation is inconsistent, giving `tauri://localhost` and `null` for macOS and `http://tauri.localhost` for Windows, so nothing is admitted on that basis. G9a captured them with the `desktop/` shell's release protocol (`tauri build`), from a `fetch` and a `WebSocket` upgrade to a loopback echo server; both requests sent the same values:
+
+      | Platform | Origin | Sec-Fetch-Site | Tauri | Date |
+      |---|---|---|---|---|
+      | macOS 26.6 (arm64, WKWebView) | `tauri://localhost` | `cross-site` | 2.12.3 | 2026-10-25 |
+      | Linux (x86_64, WebKitGTK 2.54.1) | `tauri://localhost` | `cross-site` | 2.12.3 | 2026-10-25 |
+      | Windows (WebView2) | not captured: remote-only, no `flock.sock` | | | |
+
+      Neither local platform sends `null`, so neither needs the registered loopback origin below.
     - **`null` is never admitted.** `null` is also what an artifact frame (§7), a `file://` page, a `data:` URL and other sandboxed pages send, so admitting it would leave only the token and the frames' CSP as the barrier.
     - **A registered loopback origin, where a platform's shell would send `null`.**
       - That platform's shell serves its bundle from its own loopback port, and the mint carries `origin_port`.
