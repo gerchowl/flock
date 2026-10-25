@@ -757,6 +757,15 @@ fn custody_completion_unknown_retries_in_process_with_the_same_key() {
             .recovery_deadline(now)
             .expect("unknown custody must have a recovery deadline");
         r.app.structured_workers = owner;
+        // Observe the real owner commit before advancing the scheduler clock.
+        // Otherwise a pending commit can schedule a second future deadline.
+        r.until(|r| {
+            r.app
+                .structured_workers
+                .queue_custody_committed(&r.case.id, &d.envelope.key)
+                == Some(true)
+        })
+        .await;
         r.app.service_structured_workers(due);
         r.until(|_| {
             with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
