@@ -15,6 +15,7 @@ mod api;
 pub(crate) use api::mesh_mail::RecoveredMessage;
 pub(crate) use api::mesh_routes::Completion as MeshRoutesCompletion;
 pub(crate) use api::responses::encode_error_with_data;
+pub(crate) use api::structured_queue::SendParams as StructuredSendParams;
 pub(crate) use api::LocalOperator;
 pub(crate) mod fleet_pause;
 pub(crate) mod guarded_submit;
@@ -48,6 +49,7 @@ pub(crate) mod notifications;
 pub(crate) mod owners;
 mod peer_checkout;
 pub(crate) mod questions;
+pub(crate) mod queue_events;
 mod runtime;
 mod session;
 pub mod state;
@@ -389,6 +391,8 @@ pub struct App {
         HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
     pub(crate) input_writes: input_writes::InputWrites,
     pub(crate) structured_workers: crate::structured::workers::Workers,
+    queue_events: queue_events::QueueEvents,
+    pub(crate) structured_sends: api::structured_queue::Sends,
     pub render_notify: Arc<Notify>,
     pub render_dirty: Arc<AtomicBool>,
     pub(crate) full_redraw_pending: bool,
@@ -1145,6 +1149,8 @@ impl App {
             last_terminal_size: terminal::size().ok(),
             input_writes: input_writes::InputWrites::default(),
             structured_workers: crate::structured::workers::Workers::new(render_notify.clone()),
+            queue_events: queue_events::QueueEvents::default(),
+            structured_sends: api::structured_queue::Sends::default(),
             render_notify,
             render_dirty,
             full_redraw_pending: false,

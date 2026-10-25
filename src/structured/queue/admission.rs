@@ -11,6 +11,25 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io;
 
+impl crate::structured::permissions::Principal<'_> {
+    /// Admission authority from authenticated dispatcher context (ADR-0036 §3).
+    /// Claimed producer names are never accepted as operator capabilities.
+    pub(crate) fn queue_origin(
+        &self,
+    ) -> Result<crate::structured::queue::admission::Principal, crate::api::error_code::ErrorCode>
+    {
+        use crate::structured::queue::{admission::Principal as QueuePrincipal, model::Producer};
+        match self {
+            Self::Operator => Ok(QueuePrincipal::Operator),
+            Self::Token(_) if self.decision_subject().is_ok() => Ok(QueuePrincipal::Operator),
+            Self::Agent(id) | Self::Lease(id) if !id.is_empty() => {
+                Ok(QueuePrincipal::Origin(Producer::Agent((*id).into())))
+            }
+            _ => Err(crate::api::error_code::ErrorCode::NotAuthorized),
+        }
+    }
+}
+
 type Entropy<'a> = &'a mut dyn FnMut(&mut [u8]) -> Result<(), getrandom::Error>;
 
 /// One persisted admission decision; no automatic re-gating exists.
@@ -86,6 +105,9 @@ impl Admission {
             return Err(refuse(ErrorCode::InvalidRequest));
         }
         Ok(Self { journal, max_batch })
+    }
+    pub(super) fn take_facts(&mut self) -> Vec<crate::api::queue_event::QueueItemState> {
+        self.journal.take_facts()
     }
     /// Immutable committed state/replay for the worker's serialized publisher.
     pub fn journal(&self) -> &Journal {
@@ -461,7 +483,8 @@ fn serialization(error: serde_json::Error) -> Failure {
         source: Some(error.into()),
     }
 }
-fn canonical_uuid(id: &str) -> bool {
+/// Canonical lower-case UUID spelling used by admission identities.
+pub(crate) fn canonical_uuid(id: &str) -> bool {
     valid_id(id) && !id.bytes().any(|b| b.is_ascii_uppercase())
 }
 
