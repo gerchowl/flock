@@ -54,8 +54,23 @@ fn selected_welcome_capabilities_match_the_actual_endpoint() {
                 continue;
             };
             let server = Server::new().await;
+            // These scripts describe a read+send credential, not the all-scopes seed.
+            let path = server._root.path().join("client-tokens/one.token");
+            let mut token: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            token["scopes"] = json!(["read", "send"]);
+            fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
+            let protocol = lines
+                .iter()
+                .find_map(|line| match &line.step {
+                    FixtureStep::Expect {
+                        frame: ClientFrame::Hello { protocol, .. },
+                        ..
+                    } => Some(*protocol),
+                    _ => None,
+                })
+                .expect("selected welcome has a client hello");
             let mut client = Socket::open(&server).await;
-            let actual = client.hello(1, &"a".repeat(64)).await;
+            let actual = client.hello(protocol, &"a".repeat(64)).await;
             server.finish().await;
             // Opaque server identities differ; operation capabilities are semantic.
             for field in ["protocol", "capabilities", "idempotency_window_ms"] {
