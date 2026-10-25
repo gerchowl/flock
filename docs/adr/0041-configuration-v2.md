@@ -192,6 +192,35 @@ enabling any read surface. Neither local operator identity nor `operate`
 authorizes raw-secret export. Who, if anyone, may read raw secret values is
 an Open question requiring a further owner decision.
 
+#### Closed configuration diagnostic causes
+
+Configuration diagnostic cause labels are a separate vocabulary from ADR-0029
+`error.code`. They format closed `Diagnostic::Cause` values into text inside
+`SuccessResponse.result.diagnostics[]`; a label carries no retry class.
+Clients must not treat a label as `error.code` or infer retry policy from it.
+If a GUI later branches on causes, the causes must become a typed, versioned
+enum in the schema, not entries in the error-code registry.
+
+The closed base cause vocabulary is:
+
+| Cause | Display label |
+| --- | --- |
+| `InvalidToml` | `config parse error: invalid_toml` |
+| `InvalidType` | `invalid_config_type` |
+| `Unknown` | `unknown_config_key` |
+| `Removed` | `removed_config_key` |
+| `Read` | `read_error` |
+| `InvalidCatalog` | `invalid_catalog` |
+| `MissingPeerName` | `missing_peer_name` |
+| `DuplicatePeer` | `duplicate_peer` |
+| `InvalidPeerTarget` | `invalid_peer_target` |
+
+Adding a cause or changing its label requires updating the exhaustive fixture
+and this contract. Diagnostic source, outcome and I/O kind remain separate
+fields in the formatted text. Scanner emission-provenance work is tracked by
+[#2434](https://github.com/gerchowl/flock/issues/2434), part of #2326, and does
+not change this vocabulary.
+
 ### 5. Operator writes and honest reload outcomes
 
 `config.set` writes an admitted typed scalar to a chosen writable file layer,
