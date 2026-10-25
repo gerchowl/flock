@@ -7,6 +7,19 @@ Flock exposes a local socket API for scripts and agents that need to inspect or 
 
 Most automation should start with the CLI wrappers. Use the raw socket API only when you need direct request/response control or long-lived event subscriptions.
 
+## Structured permission decision messages
+
+For the structured `agent.decide` contract, the optional `message` is normalized
+from CRLF to LF, then trimmed, and limited to **2048 UTF-8 bytes**
+(`MAX_PERMISSION_DECISION_MESSAGE_BYTES`). Measure encoded bytes, rather than
+JavaScript string length. Empty and absent messages are allowed. The
+`prompt_control_bytes` rules permit newlines and tabs and refuse terminal escape
+sequences and other control characters, including embedded bare carriage returns.
+Oversized or unsafe messages return typed `invalid_params` before reserving the
+permission request, creating a grant, writing an audit or sending harness input.
+The normalized message is used in both the decision audit and deny response.
+See the [generated structured wire contract](../structured-wire-minimal/).
+
 ## Live handoff
 
 `server.live_handoff` transfers the running server's panes to a replacement executable. Optional params are `import_exe` (executable path), `expected_protocol`, `expected_version`, and `skip_undrained` (default `false`). A `handoff_failed` response carries its stable cause category in `error.data.kind`: `import_refused`, `broken_pipe`, `connection_reset`, `invalid_input`, or `other`. The category describes the cause, not the ownership-commit stage. Treat every category, including unknown future values, as a failure and inspect `message` for diagnostics.
@@ -385,9 +398,36 @@ margin inside the remaining caller budget. The write timeout covers writing,
 not observation. `agent.send` with `submit: true` keeps its guarded-submission
 budget and refuses a supplied raw-write timeout before any input.
 
-`pane_input_write_ack` remains false during rollout; client capability and caller
-budget enforcement follows in #1639. A lost paste reply is still an unknown
-outcome even when its writer completed; inspect the pane before another action.
+The server advertises `pane_input_write_ack: true`. Current clients probe it
+for each operation and bind raw input to `pane.write_*`; an absent capability
+or an unknown write method refuses with `server_version_gap` (exit 78), without
+falling back to a legacy send. Older wire clients can keep using `pane.send_*`.
+Raw CLI/MCP writes use a bounded 10-second response cap, select at most
+8000 ms for the write, and reduce it further to leave a strict 1000 ms reply
+margin (plus 2000 ms observation for paste). Explicit write timeouts are upper
+bounds within that effective caller budget.
+
+Guarded `pane.submit` uses a separate, server-derived 11470 ms client cap:
+9470 ms for all configured server waits, 1000 ms for capability admission and
+1000 ms for the final reply. The conservative server sum includes draft clear
+and two restoration steps (3 × 1000 ms), paste completion and both Enter
+confirmations (3 × 2000 ms), the 120 ms post-paste gap, and seven 50 ms poll
+overshoots. The 7-second injection lease can end work earlier; it is not the
+complete flow budget. A caller with 10470 ms or less remaining refuses before
+input instead of shortening that flow. OS/app scheduling stalls can exceed the
+configured waits; a lost final receipt still means unknown effect. Exhausted
+raw-write budgets likewise refuse before dispatch with `invalid_params`.
+
+After a dispatched input loses its reply, clients return `input_write_unknown`
+(exit 8, retry `after_inspecting`), with null byte counts and
+`remainder_discarded: false`. These calls are never automatically retried, even
+on connect failure. A lost paste reply is unknown even when its writer completed;
+inspect the pane before another action. MCP preserves the same evidence and
+retry classification. Delegate start/send retain the workspace, round and cursor
+on unknown or partially applied writes, including when `--keep-on-failure` was
+not requested; startup recovery never replays these uncertain writes.
+This contract does not introduce cross-host pane-input
+forwarding or change mesh VERSION 5.
 
 ## Checks
 
@@ -702,7 +742,75 @@ Subscribe to events when you need a long-lived stream:
 
 The first response acknowledges the subscription. Later lines are pushed events.
 
-A subscription starts at the moment of subscribing: it streams events that happen after it attached, never a replay of what the server already holds. Pass `"after": <seq>` next to `subscriptions` to start from a cursor instead. If the server no longer holds events that far back, the first line is `{"event":"lagged","data":{"skipped_to":<seq>}}` and the stream resumes after `skipped_to`, so a consumer that falls behind learns it rather than missing events silently. A cursor past the newest event is refused with `cursor_ahead`. Use `events.read` when the consumer must see every durable event from a cursor.
+A subscription without a cursor starts at `event_hub.current_sequence()` when it
+attaches, as it already did on dev since #1030. It streams subsequent events
+without replaying retained events. Current-state predicates, such as an
+already-matching agent status, still report current state.
+
+For retained events, `after` requests events strictly after that cursor using the
+legacy contract. An omitted cursor or `after` keeps the documented loss frame:
+
+```json
+{"event":"lagged","data":{"skipped_to":19},"subscription_index":0,"subscription":{"type":"msg.queued","pane":"ws_1:p1"}}
+```
+
+Before sending `after_sequence`, check
+`ping.result.capabilities.events_live_start`. Missing or false support must
+produce a typed `server_version_gap` refusal; never silently omit the cursor or
+start live. The shared Rust client performs this bounded capability check.
+`after_sequence` is a distinct, explicit opt-in to typed loss, not an alias for
+`after`. Supplying both returns `invalid_params`. Either cursor past the newest
+event returns `cursor_ahead`. No protocol version bump is required.
+
+An opted-in request whose cursor falls behind the 4,096-entry ring receives:
+
+```json
+{"id":"sub_1","subscription_index":0,"subscription":{"type":"msg.queued","pane":"ws_1:p1"},"error":{"code":"events_lost","message":"Events were lost. Resync with per-verb reads ...","data":{"requested_sequence":12,"oldest_available_sequence":20,"current_sequence":4115}}}
+```
+
+Each loss notice and event identifies its zero-based `subscription_index` and
+original `subscription` descriptor, including when a stream has several
+subscriptions of the same type. Every event also carries `seq`, the hub sequence
+it covers. Hub events use their committed sequence; current-state predicates
+carry their observation cursor and do not provide historical predicate replay.
+The acknowledgement includes `result.start_sequence`, the common initial cursor
+captured for every accepted filter before polling begins. For example:
+
+```json
+{"id":"sub_1","result":{"type":"subscription_started","start_sequence":49}}
+```
+
+Initialize **one applied cursor per subscription** to that acknowledged floor,
+including filters that have emitted nothing. After applying an event, advance
+only the cursor named by its `subscription_index` to that line's `seq`. Resume
+with `after_sequence` equal to the **minimum** of these applied cursors. Keep the
+same filter positions, or associate saved cursors with the corresponding
+original descriptors. Never use the maximum sequence seen across the stream:
+filters poll independently and one can emit sequence 100 before another emits
+sequence 50. A quiet filter retains the floor until it emits an applied event;
+if that conservative cursor is evicted, resumption reports loss and requires
+resync, even when no matching event was known to be lost. A client relying on
+resumable live-start must require the acknowledged floor; an older acknowledgement
+without it cannot supply a safe initial cursor.
+
+For hub-backed facts, deduplicate by subscription and `seq`. A current-state
+predicate is an observation, not historical replay: its `seq` is an observation
+watermark rather than a unique observation id. In particular,
+`pane.output_matched` samples `current_sequence()` but advances only its own
+applied cursor; the minimum rule protects events not yet applied by the other
+filters. Loss notices are not applied event cursors.
+
+`events_lost` has retry class `after_inspecting`: resync before treating the stream
+as complete. Use `workspace.list`, `pane.list`, `agent.list` and `msg.list` as
+appropriate. The unified `session.snapshot` resync remains #2163. Both loss
+contracts continue at the retained boundary; later overflow produces another
+notice. Other ring errors close the stream after the diagnostic.
+`msg.wait_reply` rereads retained facts into its existing state on a ring gap and
+continues waiting, so a retained or later reply still completes the wait.
+
+Use `events.read` for durable history from a cursor; its disk retention and `gap`
+contract are unchanged. In-process bounded state folds are explicitly named
+`ring_snapshot_after`; they do not claim complete history.
 
 Workspace event subscriptions include `workspace.created`, `workspace.updated`, `workspace.renamed`, `workspace.closed`, and `workspace.focused`.
 

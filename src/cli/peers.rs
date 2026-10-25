@@ -946,7 +946,7 @@ const SUMMARY_PUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_sec
 /// they were down: mail queued during a 1-30 s resubscribe backoff, and the
 /// change that should make the first push on connect. Stream lines carry no
 /// `seq` to resume from, so they replay what the server still holds, as every
-/// subscription did before; past its retention they get `lagged`, which
+/// subscription did before; past its retention they get a loss notice (`events_lost` on a capable server), which
 /// wakes them the same way.
 const REPLAY_FROM: u64 = 0;
 

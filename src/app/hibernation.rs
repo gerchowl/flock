@@ -353,7 +353,7 @@ mod tests {
         assert!(terminal.hibernated_resume_plan.is_none());
         let sequence = app.event_hub.current_sequence();
         let result = app.resume_hibernated_pane(0, pane_id);
-        let events = app.event_hub.events_after(sequence);
+        let events = app.event_hub.ring_snapshot_after(sequence);
         // Reap the owned fake shell before any assertion can panic.
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
@@ -428,7 +428,7 @@ mod tests {
                 terminal.hibernated_resume_plan.is_some(),
             );
             let failed_status = app.pane_info(0, pane_id).unwrap().agent_status;
-            let failed_events = app.event_hub.events_after(sequence);
+            let failed_events = app.event_hub.ring_snapshot_after(sequence);
             let snapshot = crate::persist::capture(
                 crate::persist::RegistryCapture {
                     registry: &app.state.structured_agents,
@@ -482,7 +482,7 @@ mod tests {
             let automatic_retry = app.start_pending_agent_resumes(true);
             let automatic_spawned = app.terminal_runtimes.len() != 0;
             let retried = app.resume_hibernated_pane(0, pane_id);
-            let events = app.event_hub.events_after(sequence);
+            let events = app.event_hub.ring_snapshot_after(sequence);
             for (_, runtime) in app.terminal_runtimes.drain() {
                 runtime.shutdown();
             }
@@ -544,7 +544,7 @@ mod tests {
     fn hibernate_emits_durable_event() {
         let (mut app, ws_idx, pane_id) = app_with_agent_pane();
         app.hibernate_pane(ws_idx, pane_id).unwrap();
-        let events = app.event_hub.events_after(0);
+        let events = app.event_hub.ring_snapshot_after(0);
         let has_event = events.iter().any(|(_, envelope)| {
             matches!(
                 &envelope.data,

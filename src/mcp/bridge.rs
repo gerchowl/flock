@@ -527,6 +527,39 @@ mod tests {
     }
 
     #[test]
+    fn s4_mcp_propagates_actual_client_unknown_effect() {
+        let peer = crate::test_support::ScriptedApi::new(vec![
+            (
+                "ping",
+                Some(
+                    json!({"result":{"version":"fixture","protocol":crate::protocol::PROTOCOL_VERSION,"capabilities":{"pane_input_write_ack":true}}}),
+                ),
+            ),
+            ("pane.submit", None),
+        ]);
+        struct Client(ApiClient);
+        impl FlockCall for Client {
+            fn call(&self, method: Method) -> Result<Value, ApiClientError> {
+                self.0.request_value(&Request {
+                    id: "mcp-fixture".into(),
+                    method,
+                })
+            }
+        }
+        let method: Method = serde_json::from_value(
+            json!({"method":"pane.submit","params":{"pane_id":"p_fixture","text":"hello"}}),
+        )
+        .unwrap();
+        let error = call_flock(method, &Client(peer.client())).unwrap_err();
+        let data = error.data.unwrap();
+        assert_eq!(data["refusal"], "input_write_unknown");
+        assert_eq!(data["exit"], crate::cli::exit::UNCONFIRMED);
+        assert_eq!(data["retry"], "after_inspecting");
+        assert_eq!(data["input_write"]["bytes_written"], Value::Null);
+        assert_eq!(data["input_write"]["remainder_discarded"], false);
+        assert_eq!(peer.finish().len(), 2);
+    }
+    #[test]
     fn message_target_resolution_errors_keep_typed_kinds_and_shapes() {
         for (kind, exit) in [
             ("msg_target_not_found", crate::cli::exit::FAILURE),

@@ -2629,7 +2629,7 @@ mod tests {
                 let response = app.handle_api_request(request);
                 assert!(!response.contains(label), "unsafe agent JSON: {method}");
             }
-            for (_, event) in app.event_hub.events_after(0) {
+            for (_, event) in app.event_hub.ring_snapshot_after(0) {
                 if let crate::api::schema::EventData::PaneAgentStatusChanged { agent, .. } =
                     &event.data
                 {

@@ -23,6 +23,9 @@ request_seq: number,
  */
 decision: PermissionDecision,
 /**
- * Optional explanation supplied with the answer.
+ * Optional explanation: CRLF is normalized to LF, then trimmed.
+ * At most 2048 UTF-8 bytes, using prompt_control_bytes rules (newlines and
+ * tabs permitted). Invalid input returns invalid_params before reserving
+ * the request. Empty and absent messages are allowed.
  */
 message?: string, };

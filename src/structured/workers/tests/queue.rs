@@ -713,6 +713,13 @@ async fn worker_queue_readonly_error_does_not_repeat_a_completion_per_event() {
         NonZeroU64::new(1).unwrap()
     })
     .await;
+    // Persisted init is not a completion barrier. A refused owner request
+    // establishes the latched baseline, including any initial error detail.
+    r.admit(1).await;
+    assert_eq!(
+        r.admission(1).as_ref().unwrap_err().code,
+        ErrorCode::QueueJournalCorrupt
+    );
     r.updates.clear();
     let mut events = vec![event("rate_limit_event"); 12];
     events.push(event("control_request"));
@@ -724,11 +731,19 @@ async fn worker_queue_readonly_error_does_not_repeat_a_completion_per_event() {
         )
     })
     .await;
-    assert!(
-        r.updates.is_empty(),
-        "unchanged read-only status emitted {} completions",
-        r.updates.len()
+    // The registry observes an event before the pump flushes its completion.
+    // A second acknowledged request fences all preceding event publication.
+    r.admit(2).await;
+    assert_eq!(
+        r.admission(2).as_ref().unwrap_err().code,
+        ErrorCode::QueueJournalCorrupt
     );
+    assert_eq!(
+        r.updates.len(),
+        1,
+        "only the explicit admission may emit a completion after the baseline"
+    );
+    assert!(r.inputs().is_empty());
     r.stop().await;
 }
 
