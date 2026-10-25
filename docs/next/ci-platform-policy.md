@@ -26,3 +26,11 @@ individual PR. The batch must pass its full macOS checks before landing. A green
 ordinary PR's macOS aggregate is evidence of build/lint success, not test success.
 The policy reduces PR runner demand; it does not reduce batch coverage or change
 the existing action pins, permissions, test filters or shard assignments.
+
+## Anti-vacuous-success assertion
+
+A skipped job reports success, so a mistakenly skipped shard set would leave
+`check (macos-15)` green. On full-matrix events (`land/` batch PRs, `merge_group`,
+pushes) the gate therefore also requires one JUnit report per shard the build
+planned (`ci-leg.yml` exposes the build's `shards` as a workflow output) and fails
+on any mismatch or an empty plan. Ordinary PRs skip that assertion by policy.
