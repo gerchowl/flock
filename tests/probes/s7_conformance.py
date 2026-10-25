@@ -34,15 +34,17 @@ def main():
                     "stream": ("real permission stream and fleet handle",),
                     "send": ("dogfood-1", '"scope"'),
                     "permission": ("real permission stream and fleet handle",),
-                    "decide": ("permission_request_unknown", '"scope"'),
+                    "decide": ("dogfood-2", "permission_request_unknown", '"scope"'),
                     "result": ("decision close, harness result and fleet clear",),
-                    "fleet": ("unexpected reconnect",),
+                    "fleet": ("unexpected reconnect during agent and fleet bootstrap", "synced before fleet's snapshot ended"),
                     "revocation": ("revocation close",),
                 }
                 assert result.returncode == 1 and all(stage in result.stderr for stage in stages[disabled]), (disabled, result.stdout, result.stderr)
+                if disabled != "fleet":
+                    assert "error: unexpected reconnect during" not in result.stderr, (disabled, result.stderr)
             else:
                 assert result.returncode == 0, (result.stdout, result.stderr)
-            evidence.append({"disabled": disabled, "exit": result.returncode})
+            evidence.append({"disabled": disabled, "exit": result.returncode, "stage": list(stages[disabled]) if disabled else ["complete baseline"]})
         print(json.dumps({"status": "passed", "causal_controls": evidence}))
         return
 
@@ -65,7 +67,9 @@ def main():
             artifacts.mkdir(parents=True, exist_ok=True)
             for index, path in enumerate(root.rglob("*.log")):
                 (artifacts / f"{index}-{path.name}").write_bytes(path.read_bytes())
-        assert result.returncode == 0, (result.stdout, result.stderr)
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr)
+            raise AssertionError("real-client wire proof failed")
         proof = json.loads(result.stdout)
         assert proof["status"] == "passed", proof
         print(json.dumps(proof), flush=True)

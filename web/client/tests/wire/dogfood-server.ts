@@ -15,6 +15,7 @@ const frames: ServerFrame[] = [];
 const sentFrames: unknown[] = [];
 let changed = () => {};
 let failure: Error | undefined;
+let stage = "startup";
 const sockets = (endpoint: string): SocketLike => {
     // Bun supplies no browser Origin automatically; send the real same-origin header.
     const NativeSocket = WebSocket as unknown as { new(url: string, options: { headers: Record<string, string> }): WebSocket };
@@ -48,10 +49,11 @@ const invalid = new WireConnection({ ...options, token: "0".repeat(64), store: m
 reader.onChange(() => changed());
 invalid.onChange(() => changed());
 connection.onChange(() => {
-  if (connection.state === "Reconnecting") failure = new Error(`unexpected reconnect: ${connection.error}`);
+  if (connection.state === "Reconnecting") failure = new Error(`unexpected reconnect during ${stage}: ${connection.error}`);
   changed();
 });
 function until(condition: () => boolean, label: string): Promise<void> {
+  stage = label;
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => { changed = () => {}; reject(new Error(`server/client did not produce ${label}: ${JSON.stringify({ state: connection.state, error: connection.error, frames, sentFrames, streams: [...connection.streams()] })}`)); }, 5_000);
     const check = () => {
@@ -81,7 +83,7 @@ async function command(verb: string, args: JsonValue, code?: string): Promise<Ex
   await until(() => frames.some((f) => f.t === "ack" && f.cmd_id === id), `${verb} ack`);
   const frame = frames.find((f) => f.t === "ack" && f.cmd_id === id) as Extract<ServerFrame, { t: "ack" }>;
   assert.equal(frame.ok, code === undefined, JSON.stringify(frame));
-  if (code) assert.equal(frame.error?.code, code);
+  if (code) assert.equal(frame.error?.code, code, JSON.stringify(frame));
   return frame;
 }
 try {
