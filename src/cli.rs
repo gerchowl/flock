@@ -15,6 +15,7 @@ use crate::api::schema::{
 
 mod adapter;
 mod agent;
+pub(crate) mod argv;
 mod checks;
 mod client;
 mod compatibility;

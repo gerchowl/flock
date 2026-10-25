@@ -2410,7 +2410,13 @@ mod fix1_source_tests {
         let overlay = "# comment\n[[peers]]\n name='node-a.example'";
         let loaded =
             load_with_overlay(Some(base), Some(overlay), Path::new("PRIVATE_PATH.toml")).unwrap();
-        let d = &loaded.diagnostics[0];
+        // Environment warnings may precede file diagnostics, so select the
+        // peer cause rather than assuming an order across independent sources.
+        let d = loaded
+            .diagnostics
+            .iter()
+            .find(|d| d.starts_with("duplicate_peer;") && d.contains("entry_index=1"))
+            .expect("duplicate peer diagnostic for the appended overlay entry");
         assert!(
             d.contains("entry_index=1")
                 && d.contains("source=overlay file")
