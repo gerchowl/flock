@@ -20,6 +20,41 @@ permission request, creating a grant, writing an audit or sending harness input.
 The normalized message is used in both the decision audit and deny response.
 See the [generated structured wire contract](../structured-wire-minimal/).
 
+## Live structured session grants
+
+The local operator can inspect and revoke exact `allow_always` grants without
+ending a structured session. These methods are socket/CLI only; they have no
+WebSocket or MCP management verb. Agent, lease and token callers are refused
+with `operator_only` (exit 13). This uses the existing local-operator admission
+checks and retains operator-mode UID/process-detachment limits (#1177, #1629).
+
+`structured.grants.list {"agent_id":"…"}` returns
+`result.type: "structured_grants"`, the exact `agent_id`, runtime `generation`,
+and `grants`. Each installed grant contains `request_id`, `request_seq`, `tool`,
+`canonical_input_key` and `installed_ms` (Unix milliseconds from its decision
+installation audit). The key is canonical JSON `[tool_name, input]`: object keys
+are recursively sorted; arrays and scalar values remain exact. Pending installs
+are not listed. Names and pane IDs are not accepted as grant identities.
+
+`structured.grants.revoke` takes `agent_id`, `generation`, `request_id` and
+`request_seq`. Use the generation and originating decision handle from the list
+(or the originating permission decision for a pending install). Success returns
+the same result shape with remaining `grants` and a `revoked` object containing
+`request_id` and `request_seq`. A stale generation returns
+`permission_grant_stale_generation`; an unknown or already revoked handle returns
+`permission_grant_unknown` (both exit 1, retry `never`). Refresh the list rather
+than replaying a revoke. A runtime that has ended returns `agent_not_found`;
+contention with permission bookkeeping returns `session_busy`.
+
+Revocation removes the exact key and advances its revocation epoch under the
+same Book lock used by permission decisions. A decision admitted before the
+revoke may still allow that one call, but cannot reinstall the grant afterward.
+The next matching request prompts again. Revocation does not undo tool effects
+or recall an already admitted response. Grants remain memory-only and disappear
+when the runtime ends. Successful revocation emits the persisted global event
+`structured_grant_revoked` with `agent_id`, `generation`, `request_id`,
+`request_seq`, and the authenticated revoker `principal`.
+
 ## Live handoff
 
 `server.live_handoff` transfers the running server's panes to a replacement executable. Optional params are `import_exe` (executable path), `expected_protocol`, `expected_version`, and `skip_undrained` (default `false`). A `handoff_failed` response carries its stable cause category in `error.data.kind`: `import_refused`, `broken_pipe`, `connection_reset`, `invalid_input`, or `other`. The category describes the cause, not the ownership-commit stage. Treat every category, including unknown future values, as a failure and inspect `message` for diagnostics.

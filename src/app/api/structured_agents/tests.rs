@@ -481,3 +481,106 @@ async fn structured_resume_refuses_nonoperator_uid_without_ancestry() {
         );
     }
 }
+
+#[tokio::test]
+async fn grant_socket_methods_fence_generation_authority_and_emit_revocation_audit() {
+    use crate::structured::{
+        permissions::{self, AgentDecide, Decision, Principal},
+        workers::tests::{wait, Case},
+    };
+    let mut app = app();
+    app.current_api_peer_pid = Some(std::process::id());
+    let notify = app.render_notify.clone();
+    let event = json!({"type":"control_request","request_id":"grant-origin","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"fixture-tool","input":{"command":"true"}}});
+    let case = Case::start(
+        &mut app.state.structured_agents,
+        &mut app.structured_workers,
+        2362,
+        "state-reducer",
+        vec![event],
+    );
+    case.human(
+        &mut app.state.structured_agents,
+        &mut app.structured_workers,
+        &notify,
+        std::time::Instant::now(),
+    )
+    .await;
+    let seq = app
+        .state
+        .structured_agents
+        .get(&case.id)
+        .unwrap()
+        .1
+        .update
+        .permission_requests[0]
+        .1;
+    app.structured_workers
+        .runtime(&case.id, case.generation)
+        .unwrap()
+        .agent_decide(
+            &Principal::Token(permissions::auth::fixture("fixture-operator", true)),
+            &AgentDecide {
+                agent: case.id.clone(),
+                request_id: "grant-origin".into(),
+                request_seq: seq,
+                decision: Decision::AllowAlways,
+                message: None,
+            },
+        )
+        .unwrap();
+    wait(&notify, || {
+        app.structured_workers.poll(
+            &mut app.state.structured_agents,
+            std::time::Instant::now(),
+            1000,
+        );
+        app.state
+            .structured_agents
+            .get(&case.id)
+            .unwrap()
+            .1
+            .update
+            .needs_human
+            .is_empty()
+    })
+    .await;
+    let listed = request(
+        &mut app,
+        "structured.grants.list",
+        json!({"agent_id":case.id}),
+    );
+    assert_eq!(listed["result"]["generation"], case.generation);
+    assert_eq!(listed["result"]["grants"][0]["tool"], "Bash");
+    let _: crate::api::schema::SuccessResponse = serde_json::from_value(listed.clone()).unwrap();
+    let mut params = json!({"agent_id":case.id, "generation":case.generation+1, "request_id":"grant-origin","request_seq":seq});
+    assert_eq!(
+        request(&mut app, "structured.grants.revoke", params.clone())["error"]["code"],
+        "permission_grant_stale_generation"
+    );
+    params["generation"] = json!(case.generation);
+    app.current_api_peer_pid = None;
+    for (method, p) in [
+        ("structured.grants.list", json!({"agent_id":case.id})),
+        ("structured.grants.revoke", params.clone()),
+    ] {
+        assert_eq!(
+            request(&mut app, method, p)["error"]["code"],
+            "operator_only"
+        );
+    }
+    app.current_api_peer_pid = Some(std::process::id());
+    let revoked = request(&mut app, "structured.grants.revoke", params);
+    assert_eq!(revoked["result"]["revoked"]["request_seq"], seq);
+    assert_eq!(revoked["result"]["grants"], json!([]));
+    let events = app.event_hub.ring_snapshot_after(0);
+    assert!(events.iter().any(|(_, e)| matches!(&e.data, crate::api::schema::EventData::StructuredGrantRevoked { request_seq, principal, .. } if *request_seq==seq && principal.starts_with("operator:pid:"))));
+    case.finish(
+        &mut app.state.structured_agents,
+        &mut app.structured_workers,
+        &notify,
+        std::time::Instant::now(),
+        None,
+    )
+    .await;
+}

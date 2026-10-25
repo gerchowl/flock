@@ -14,6 +14,10 @@ pub struct Request {
 pub enum Method {
     #[serde(rename = "ping")]
     Ping(PingParams),
+    #[serde(rename = "structured.grants.list")]
+    StructuredGrantsList(crate::structured::permissions::grants::GrantsList),
+    #[serde(rename = "structured.grants.revoke")]
+    StructuredGrantsRevoke(crate::structured::permissions::grants::GrantsRevoke),
     #[serde(rename = "server.stop")]
     ServerStop(EmptyParams),
     #[serde(rename = "server.live_handoff")]
@@ -357,6 +361,7 @@ impl Method {
         matches!(
             self,
             Self::Ping(_)
+                | Self::StructuredGrantsList(_)
                 | Self::NotificationList(_)
                 | Self::HandoffList(_)
                 | Self::HandoffRead(_)
@@ -403,6 +408,7 @@ impl Method {
         }
         match self {
             Self::Ping(_)
+            | Self::StructuredGrantsList(_)
             | Self::ServerStop(_)
             | Self::ServerLiveHandoff(_)
             | Self::ServerReloadConfig(_)
@@ -523,6 +529,7 @@ impl Method {
             | Self::ChecksRun(_)
             | Self::FleetPause(_)
             | Self::FleetResume(_)
+            | Self::StructuredGrantsRevoke(_)
             | Self::RevertRun(_) => true,
         }
     }
@@ -2727,6 +2734,7 @@ pub enum EventMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
+    StructuredGrantRevoked,
     MeshRoutesChanged,
     MeshOutboundPending,
     WorkspaceCreated,
@@ -2860,7 +2868,8 @@ impl EventKind {
     /// story; every lifecycle + lineage kind persists.
     pub fn is_persisted(self) -> bool {
         match self {
-            Self::WorkspaceCreated
+            Self::StructuredGrantRevoked
+            | Self::WorkspaceCreated
             | Self::WorkspaceUpdated
             | Self::WorkspaceClosed
             | Self::WorkspaceRenamed
@@ -3045,6 +3054,13 @@ pub struct ApiListenerHealth {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    StructuredGrants {
+        agent_id: String,
+        generation: u64,
+        grants: Vec<crate::structured::permissions::grants::SessionGrant>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        revoked: Option<crate::structured::permissions::grants::GrantHandle>,
+    },
     ClientTokenIssued {
         issued: super::client_tokens::Issued,
     },
@@ -4366,6 +4382,13 @@ pub struct AgentPhaseEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
+    StructuredGrantRevoked {
+        agent_id: String,
+        generation: u64,
+        request_id: String,
+        request_seq: u64,
+        principal: String,
+    },
     MeshRoutesChanged {},
     MeshOutboundPending {},
     WorkspaceCreated {

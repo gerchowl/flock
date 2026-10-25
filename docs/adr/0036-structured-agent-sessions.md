@@ -3382,3 +3382,32 @@ changes (#2043); use a fresh server after changing launch/admission policy.
 `[sessions]` live-reload semantics remain tracked by #1975. The dogfood isolates
 its policy cases in fresh servers rather than assuming a successful reload
 report changed these startup values.
+
+### Amendment: S6 operator grant management (#2362, part 1)
+
+The architect ruling on #2362 adds local-operator-only socket and CLI management
+of the exact, live-runtime `allow_always` grants in §10b. S7 WebSocket management
+is part 2 after #2251, under `operate`; this amendment adds no WS or MCP verb.
+
+A grant's handle is its originating `(request_id, request_seq)`, fenced by the
+exact `agent_id` and runtime `generation`. List returns installed handles, tool,
+canonical JSON `[tool_name, input]` key and installation audit time. Revoke must
+supply the generation and handle, including an originating decision handle when
+revoking an in-flight install. Stale generations and unknown handles have typed
+refusals. The existing operator admission and cooperative-mode limitations apply.
+
+Each key has a revocation epoch under the Book lock. `prepare` captures it when
+reserving `allow_always`; revoke bumps it and removes any installed grant.
+`audited` installs only if that captured epoch is unchanged. Retained epoch
+entries are bounded by in-flight reservations and pruned once no pending install
+can reference them. Epoch overflow refuses without removing the installed grant.
+An already admitted response still completes as `allow` for that one call, but a
+revoked in-flight decision cannot install a grant. The next matching request
+prompts. This is not cancellation or rollback of an admitted tool call.
+
+Successful revoke emits `structured_grant_revoked` in the existing persisted
+global event stream, with authenticated revoker principal, agent/generation and
+originating handle. Runtime grants remain memory-only and are cleared on end.
+The socket contract documents the result fields, registered refusals and the
+absence of automatic revoke retries. These raw socket schemas are not generated
+S7 TypeScript roots; the typed S7 management contract belongs to part 2.

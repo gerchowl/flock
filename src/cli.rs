@@ -27,6 +27,7 @@ mod events;
 pub(crate) mod exit;
 mod fleet;
 mod goal;
+mod grants;
 mod help;
 mod hook;
 mod hook_question;
@@ -234,6 +235,7 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "owner" => owner::run_owner_command(&args[2..])?,
         "fleet" => fleet::run_fleet_command(&args[2..])?,
         "goal" => goal::run_goal_command(&args[2..])?,
+        "structured" => grants::run(&args[2..])?,
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
         "client" => client::run(&args[2..])?,

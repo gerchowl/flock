@@ -571,6 +571,7 @@ fn run() -> io::Result<()> {
         println!("       flk server stop");
         println!("       flk server reload-config");
         println!("       flk config <subcommand> ...");
+        println!("       flk structured grants <list|revoke> ...");
         println!("       flk channel <subcommand> ...");
         println!("       flk workspace <subcommand> ...");
         println!("       flk worktree <subcommand> ...");

@@ -151,6 +151,8 @@ error_codes! {
         NotLinkedWorktree = "not_linked_worktree",
         OperatorOnly = "operator_only",
         NotAuthorized = "not_authorized",
+        PermissionGrantUnknown = "permission_grant_unknown",
+        PermissionGrantStaleGeneration = "permission_grant_stale_generation",
         PermissionGrantLimit = "permission_grant_limit",
         PermissionInputAlreadyHeld = "permission_input_already_held",
         PermissionRequestLimit = "permission_request_limit",

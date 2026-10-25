@@ -84,6 +84,15 @@ impl Runtime {
     pub fn turn_end_unknown(&self) -> bool {
         self.transport.turn_end_unknown()
     }
+    /// List or revoke live grants under the same lock as permission admission.
+    pub fn session_grants(
+        &self,
+        principal: &super::permissions::Principal<'_>,
+        revoke: Option<&super::permissions::grants::GrantHandle>,
+    ) -> Result<Vec<super::permissions::grants::SessionGrant>, crate::api::error_code::ErrorCode>
+    {
+        self.transport.session_grants(principal, revoke)
+    }
     /// Server entry for a dispatcher-authenticated agent.decide command.
     /// Token identity is context, never a field decoded from command arguments.
     pub fn agent_decide(

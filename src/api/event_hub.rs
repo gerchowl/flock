@@ -885,6 +885,36 @@ mod tests {
     /// ADR-0028 §3a: a kind from a newer release is skipped, not read as
     /// corruption, and its sequence stays spent.
     #[test]
+    fn grant_revocation_is_persisted_and_a_newer_kind_is_skipped() {
+        use crate::api::schema::EventData;
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("events.jsonl");
+        let hub = EventHub::with_persistence(path.clone());
+        assert!(EventKind::StructuredGrantRevoked.is_persisted());
+        hub.push(EventEnvelope {
+            event: EventKind::StructuredGrantRevoked,
+            data: EventData::StructuredGrantRevoked {
+                agent_id: "fixture-agent".into(),
+                generation: 1,
+                request_id: "request-one".into(),
+                request_seq: 2,
+                principal: "operator:pid:1".into(),
+            },
+        });
+        drop(hub);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{}", serde_json::json!({"seq":2,"ts_ms":1,"envelope":{"event":"future_grant_kind","data":{"type":"future_grant_kind"}}})).unwrap();
+        drop(file);
+        let restarted = EventHub::with_persistence(path);
+        let records = restarted.persisted_events_after(0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].2.event, EventKind::StructuredGrantRevoked);
+    }
+
+    #[test]
     fn an_unknown_kind_is_skipped_without_quarantining_the_log() {
         let path = temp_log("unknown-kind");
         let hub = EventHub::with_persistence(path.clone());

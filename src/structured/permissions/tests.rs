@@ -161,7 +161,7 @@ fn unknown_and_closed_requests_are_distinct_and_never_retry() {
         Some(ErrorCode::PermissionRequestClosed)
     );
     assert!(b.begin_answer(&answer.id, answer.request_seq));
-    b.audited(&answer);
+    b.audited(&answer, 100);
     assert!(b.waiting().is_empty());
     assert!(
         b.blocked(),
@@ -234,7 +234,7 @@ fn session_grants_reserve_distinct_keys_and_abort_releases_capacity() {
             .prepare(&token(), &args(&b, &id, Decision::AllowAlways))
             .unwrap();
         assert!(b.begin_answer(&answer.id, answer.request_seq));
-        b.audited(&answer);
+        b.audited(&answer, 100);
         b.written(answer);
     }
     b.observe("deny", request()).unwrap();
@@ -276,11 +276,11 @@ fn grant_is_installed_only_after_audit_and_cleared_on_runtime_end() {
         .unwrap();
     assert!(b.grants.is_empty());
     assert!(b.begin_answer(&answer.id, answer.request_seq));
-    b.audited(&answer);
+    b.audited(&answer, 100);
     assert_eq!(b.grants.len(), 1);
     b.end();
     assert!(b.grants.is_empty());
-    b.audited(&answer);
+    b.audited(&answer, 100);
     assert!(
         b.grants.is_empty(),
         "a late audit cannot resurrect a terminated runtime grant"
@@ -303,7 +303,7 @@ fn cancelled_grant_reservation_cannot_install_a_grant_after_its_close() {
         b.closed(&close.id, close.request_seq);
     }
     assert!(!b.begin_answer(&answer.id, answer.request_seq));
-    b.audited(&answer);
+    b.audited(&answer, 100);
     assert!(b.grants.is_empty());
     b.observe("following-request", request()).unwrap();
     assert!(b.automatic("following-request").unwrap().is_none());
@@ -319,7 +319,7 @@ fn automatic_reservations_hold_input_without_requesting_human_attention() {
         )
         .unwrap();
     assert!(b.begin_answer(&grant.id, grant.request_seq));
-    b.audited(&grant);
+    b.audited(&grant, 100);
     b.written(grant);
     b.observe("automatic-request", request()).unwrap();
     let answer = b.automatic("automatic-request").unwrap().unwrap();
@@ -353,7 +353,7 @@ fn exact_grants_preserve_numeric_representation_and_unicode() {
         .prepare(&token(), &args(&b, "grant", Decision::AllowAlways))
         .unwrap();
     assert!(b.begin_answer(&grant.id, grant.request_seq));
-    b.audited(&grant);
+    b.audited(&grant, 100);
     b.written(grant);
     let mut float = original.clone();
     float.input.insert("number".into(), json!(1.0));
@@ -443,7 +443,7 @@ fn session_grant_survives_eviction_of_its_originating_request_id() {
         .prepare(&token(), &args(&b, "grant-origin", Decision::AllowAlways))
         .unwrap();
     assert!(b.begin_answer(&answer.id, answer.request_seq));
-    b.audited(&answer);
+    b.audited(&answer, 100);
     b.written(answer);
     for n in 0..CLOSED_PERMISSION_REQUEST_WINDOW {
         let id = format!("retired-{n}");
@@ -573,11 +573,11 @@ fn queued_answer_for_an_evicted_handle_cannot_mutate_its_replacement() {
         .unwrap();
     assert!(current.request_seq > stale.request_seq);
     assert!(!b.begin_answer(&stale.id, stale.request_seq));
-    b.audited(&stale);
+    b.audited(&stale, 100);
     assert!(b.grants.is_empty());
     b.written(stale);
     assert!(b.begin_answer(&current.id, current.request_seq));
-    b.audited(&current);
+    b.audited(&current, 100);
     b.written(current);
     assert!(b.grants.is_empty());
     assert!(!b.blocked());
@@ -648,4 +648,62 @@ fn future_permission_shapes_remain_lossless_unknown_events() {
         SessionEvent::parse(raw, "fixture"),
         SessionEvent::Unknown { .. }
     ));
+}
+
+#[test]
+fn revoke_between_prepare_and_audited_cannot_reinstall_a_grant() {
+    for auditing in [false, true] {
+        let mut b = book();
+        let answer = b
+            .prepare(
+                &token(),
+                &args(&b, "request-example", Decision::AllowAlways),
+            )
+            .unwrap();
+        if auditing {
+            assert!(b.begin_answer(&answer.id, answer.request_seq));
+        }
+        b.revoke(&grants::GrantHandle {
+            request_id: answer.id.clone(),
+            request_seq: answer.request_seq,
+        })
+        .unwrap();
+        if !auditing {
+            assert!(b.begin_answer(&answer.id, answer.request_seq));
+        }
+        b.audited(&answer, 1234);
+        assert_eq!(answer.response["response"]["response"]["behavior"], "allow");
+        b.written(answer);
+        assert!(
+            b.grants().is_empty(),
+            "revoke must beat the pending install"
+        );
+        b.observe("next", request()).unwrap();
+        assert!(b.automatic("next").unwrap().is_none());
+    }
+}
+
+#[test]
+fn installed_grants_are_listed_and_revoke_makes_the_next_request_prompt() {
+    let mut b = book();
+    let answer = b
+        .prepare(
+            &token(),
+            &args(&b, "request-example", Decision::AllowAlways),
+        )
+        .unwrap();
+    assert!(b.begin_answer(&answer.id, answer.request_seq));
+    b.audited(&answer, 1234);
+    b.written(answer);
+    let grants = b.grants();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].tool, "Bash");
+    assert_eq!(
+        grants[0].canonical_input_key,
+        r#"["Bash",{"command":"true"}]"#
+    );
+    assert_eq!(grants[0].installed_ms, 1234);
+    b.revoke(&grants[0].handle).unwrap();
+    b.observe("next", request()).unwrap();
+    assert!(b.automatic("next").unwrap().is_none());
 }

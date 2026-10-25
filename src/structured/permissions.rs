@@ -20,6 +20,7 @@
 //! Harness suggestions are never interpreted or forwarded. No settings are written.
 //! [`MAX_GRANTS`] bounds distinct exact grants, including pending grants.
 pub mod auth;
+pub mod grants;
 
 /// Maximum live permission requests, including reserved answers awaiting their
 /// durable close and completed stdin write. The harness normally blocks per
@@ -101,6 +102,9 @@ enum Stage {
 }
 #[derive(Clone)]
 struct Grant {
+    epoch: u64,
+    tool: String,
+    installed_ms: u128,
     request_seq: u64,
     subject: String,
     request_id: String,
@@ -117,7 +121,8 @@ pub(super) struct Answer {
     pub request_seq: u64,
     pub response: Value,
     pub audit: Box<PermissionRecord>,
-    grant: Option<(String, Grant)>,
+    // Keep the bounded transport queue entries compact as grant metadata grows.
+    grant: Option<(String, Box<Grant>)>,
 }
 pub(super) struct Closing {
     pub id: String,
@@ -133,6 +138,7 @@ pub(super) struct Book {
     closed_fifo: VecDeque<u64>,
     last_request_seq: u64,
     grants: BTreeMap<String, Grant>,
+    grant_epochs: BTreeMap<String, u64>,
 }
 pub(super) fn open_record(id: &str, request_seq: u64, request: &ToolRequest) -> PermissionRecord {
     PermissionRecord::new(
@@ -154,6 +160,7 @@ impl Book {
             last_request_seq: 0,
             closed_fifo: VecDeque::new(),
             grants: BTreeMap::new(),
+            grant_epochs: BTreeMap::new(),
         }
     }
     // The durable stream cursor bounds every issued handle. Seed before stdout
@@ -348,12 +355,15 @@ impl Book {
                     return Err(ErrorCode::PermissionGrantLimit);
                 }
                 grant = Some((
-                    k,
-                    Grant {
+                    k.clone(),
+                    Box::new(Grant {
+                        epoch: self.grant_epochs.get(&k).copied().unwrap_or(0),
+                        tool: open.request.tool_name.clone(),
+                        installed_ms: 0,
                         request_seq,
                         subject: subject.into(),
                         request_id: id.into(),
-                    },
+                    }),
                 ));
             }
             response
@@ -428,7 +438,7 @@ impl Book {
             false
         }
     }
-    pub fn audited(&mut self, answer: &Answer) {
+    pub fn audited(&mut self, answer: &Answer, installed_ms: u128) {
         let Some(open) = self.open.get_mut(&answer.id).filter(|r| {
             r.request_seq == answer.request_seq && r.stage == Stage::Auditing && self.active
         }) else {
@@ -436,8 +446,14 @@ impl Book {
         };
         open.stage = Stage::Closed;
         open.grant = None;
-        if let Some((key, grant)) = &answer.grant {
-            self.grants.insert(key.clone(), grant.clone());
+        if let Some((key, grant)) = answer
+            .grant
+            .as_ref()
+            .filter(|(key, grant)| self.grant_epochs.get(key).copied().unwrap_or(0) == grant.epoch)
+        {
+            let mut grant = (**grant).clone();
+            grant.installed_ms = installed_ms;
+            self.grants.insert(key.clone(), grant);
         }
         self.remember_closed(&answer.id, answer.request_seq);
     }

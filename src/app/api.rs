@@ -35,6 +35,7 @@ pub(super) mod responses;
 mod revert;
 mod spawn;
 mod structured_agents;
+mod structured_grants;
 mod structured_start;
 mod tabs;
 pub(crate) mod workspaces;
@@ -1428,7 +1429,9 @@ impl App {
         let uid = self.current_api_peer_uid?;
         let code = if matches!(
             request.method,
-            Method::ServerStop(_)
+            Method::StructuredGrantsList(_)
+                | Method::StructuredGrantsRevoke(_)
+                | Method::ServerStop(_)
                 | Method::ServerReloadConfig(_)
                 | Method::ServerLiveHandoff(_)
                 | Method::ClientTokenAdd(_)
@@ -1512,6 +1515,20 @@ impl App {
             );
         }
         let response = match request.method {
+            Method::StructuredGrantsList(p) => {
+                return self.handle_structured_grants(request.id, p.agent_id, None, None)
+            }
+            Method::StructuredGrantsRevoke(p) => {
+                return self.handle_structured_grants(
+                    request.id,
+                    p.agent_id,
+                    Some(p.generation),
+                    Some(crate::structured::permissions::grants::GrantHandle {
+                        request_id: p.request_id,
+                        request_seq: p.request_seq,
+                    }),
+                )
+            }
             Method::ServerStop(_) => {
                 self.state.should_quit = true;
                 SuccessResponse {

@@ -107,7 +107,10 @@ impl<'a> Recorder<'a> {
             return Ok(());
         }
         let event = self.audit(&control.answer.audit)?;
-        self.controls.book.lock().audited(&control.answer);
+        self.controls
+            .book
+            .lock()
+            .audited(&control.answer, event.record.received_at_ms);
         publish(event, self.tx, self.cancel)?;
         self.controls
             .input
