@@ -465,12 +465,20 @@ fn switch_failure_reason(err: &io::Error) -> String {
 fn main() {
     if let Err(error) = run() {
         eprintln!("Error: {error}");
-        std::process::exit(cli::exit::FAILURE);
+        let exit = if error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<cli::argv::InvalidUtf8Argument>())
+        {
+            cli::exit::USAGE
+        } else {
+            cli::exit::FAILURE
+        };
+        std::process::exit(exit);
     }
 }
 
 fn run() -> io::Result<()> {
-    let raw_args: Vec<String> = std::env::args().collect();
+    let raw_args: Vec<_> = std::env::args_os().collect();
     if raw_args.len() == 2 && raw_args[1] == platform::client_token_lock::WORKER_ARG {
         return platform::client_token_lock::worker();
     }
@@ -490,6 +498,13 @@ fn run() -> io::Result<()> {
             std::process::exit(cli::exit::USAGE);
         }
     };
+
+    // Decode only after global stripping: the importer must see this same argv,
+    // with its socket kept native and all remaining command text checked as UTF-8.
+    let cli::argv::Arguments {
+        text: args,
+        handoff_socket,
+    } = cli::argv::collect(args.into_iter())?;
 
     if remote_launch.is_some()
         && args.get(1).is_some()
@@ -523,7 +538,7 @@ fn run() -> io::Result<()> {
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
-        return server::headless::run_server();
+        return server::headless::run_server(&args[2..], handoff_socket);
     }
 
     // Hidden client mode: connect to an existing server's client socket.
