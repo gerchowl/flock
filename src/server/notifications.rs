@@ -47,7 +47,7 @@ pub(crate) fn toast_message_from_state_change(
                 let workspace_label = ws.display_name_from(&state.terminals, terminal_runtimes);
                 Some(format!(
                     "{} {}: {}",
-                    agent_label,
+                    crate::terminal::agent_name::display(agent_label),
                     toast_event_text(kind),
                     app::actions::notification_context(ws, &workspace_label, ws_idx, pane_id)
                 ))

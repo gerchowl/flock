@@ -231,3 +231,23 @@ details > summary::-webkit-details-marker {
 .tool-run__outcome--error {
   color: var(--error);
 }
+
+/* A failed sign-in link while a session works on (ADR-0038 §3): a dismissible notice over the workbench. */
+.notice {
+  position: fixed;
+  inset-inline: 16px;
+  bottom: 16px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--surface);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.notice span {
+  flex: 1;
+}

@@ -157,6 +157,25 @@ The runtime half of #506 — `src/update.rs` refusing a manifest whose assets ar
 not this project's — is **not** in this ADR and not in this change. It is a
 product-behaviour change in `src/`, and it is still open.
 
+#### Stable asset checksum transition (#611)
+
+Each release build computes a SHA-256 sidecar for its final binary. The release
+publishes both, and `sync-latest-json` reads the sidecars to write each target as
+`{"url":"https://github.com/gerchowl/flock/releases/download/vX.Y.Z/flock-<target>","sha256":"<64 hexadecimal digits>"}`.
+Top-level assets and the current archived release mirror this object shape.
+The generator refuses incomplete or malformed checksum sidecars for new stable
+releases and preserves legacy archived URL strings. Ownership checks apply to
+the URL inside either shape.
+
+Local updates and remote bootstrap share the stable/preview asset parser and
+checksum verifier. A declared checksum is verified before chmod, replacement or
+remote installation. A mismatch or malformed digest is an `InvalidData` refusal,
+with the failed download removed. This checks bytes against the manifest, not an
+independent release signature. Legacy bare URL strings (and objects with an
+absent checksum) remain unverified during the transition. Requiring checksums
+for all downloaded assets is deferred to #2076, gated on a stable release having
+shipped this metadata. Old published manifests are not rewritten.
+
 ### 4. The bump is derived and checked; the number stays a human's
 
 `just release-plan` reports the commits since the last `v*` tag grouped by

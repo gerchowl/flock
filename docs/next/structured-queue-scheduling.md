@@ -90,9 +90,12 @@ acknowledgements before relaunch. Shutdown cancellation explicitly reports
 incomplete notification delivery and requires durable replay. Final persisted
 records drain before reservation retirement. Operator admission uses the shared
 send service (#1957); authenticated message custody routing remains #1958.
+Operator resume works after cleanup for idle starts and MCP opening turns.
 
-The worker machinery in #1955 is not production enforcement by itself. The
-production launch path is #1843; #1928 remains open until that path exists.
+
+The landed production launch path in #1843 now supplies the configured policy to
+these worker-owned queues, enforcing the production checkpoint requirement in
+#1928.
 
 The internal [queue publication provider](structured-queue-publication.md) exposes
 committed cuts without competing for the Runtime receiver. Cold recovery and

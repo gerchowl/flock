@@ -285,6 +285,8 @@ mod handler_tests {
         let response = app.handle_api_request(Request {
             id: "req".into(),
             method: Method::AgentStart(AgentStartParams {
+                runtime: Default::default(),
+                model: None,
                 dry_run: false,
                 name,
                 cwd: None,

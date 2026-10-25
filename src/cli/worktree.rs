@@ -692,6 +692,9 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
 /// remedy for the same refusal.
 pub(super) fn kill_error_exit_code(error: &serde_json::Value) -> i32 {
     match error.get("code").and_then(|v| v.as_str()).unwrap_or("") {
+        "worktree_checkout_unreachable" => {
+            super::error_code_exit("worktree_checkout_unreachable", false)
+        }
         "not_linked_worktree" | "workspace_not_found" => super::exit::WORKTREE_NOT_LINKED,
         // The retryable class: the same call with --force clears it.
         "dirty_worktree_requires_force" | "submodule_worktree_requires_force" => {
@@ -902,5 +905,14 @@ mod tests {
             "is_linked_worktree": true,
         }));
         assert_eq!(row.branch, "(detached)");
+    }
+    #[test]
+    fn unreachable_checkout_kill_exit_requires_recovery_not_force() {
+        assert_eq!(
+            super::kill_error_exit_code(
+                &serde_json::json!({"code":"worktree_checkout_unreachable"})
+            ),
+            crate::cli::exit::REFUSED
+        );
     }
 }

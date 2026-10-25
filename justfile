@@ -55,24 +55,35 @@ lint: ts-check
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
     cargo clippy --all-targets --locked --features ts -- -D warnings
+    cargo clippy --locked --bin flk --features web -- -D warnings
 
 # Build internal API docs and reject broken links, markup and other warnings.
 doc-check:
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
 
+# Shipped feature set shared by local CI and the archived shard inventory.
+ci_features := "web,ts"
+
 # Run PR CI checks
 ci filter='all()': lint
-    cargo nextest run --locked --features ts -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+    cargo nextest run --locked --features {{ci_features}} -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+
+# Build both feature variants with an explicit fixture input, proving GUI
+# embedding and exclusion without the independent frontend build (#1826).
+gui-check:
+    FLOCK_GUI_DIST="{{justfile_directory()}}/tests/fixtures/gui-dist" cargo nextest run --locked --features ts -E 'binary(gui_feature_gate) | binary(gui_bundle_build)' --retries 0
+    FLOCK_GUI_DIST="{{justfile_directory()}}/tests/fixtures/gui-dist" cargo nextest run --locked --features web,ts -E 'test(web::gui::) | binary(gui_feature_gate) | binary(gui_bundle_build)' --retries 0
 
 # Build every test binary once into a nextest archive for CI's shard jobs, then
 # fail unless the shards in .config/ci-shards.toml partition `leg`'s tests
 # exactly (#991). Writes the shard matrix to $GITHUB_OUTPUT when set.
 ci-archive leg archive:
-    cargo nextest archive --locked --features ts --archive-file "{{archive}}"
+    cargo nextest archive --locked --features {{ci_features}} --archive-file "{{archive}}"
     python3 scripts/ci_shards.py verify --leg "{{leg}}" --archive-file "{{archive}}"
 
-# Run one CI shard, named in .config/ci-shards.toml, from an
-# archive made by `ci-archive`. It is extracted into this checkout's target/
+# Run one CI shard inside the dev shell for its runtime tools, from a
+# web/ts archive made by `ci-archive`, with its feature set already compiled.
+# It is extracted into this checkout's target/
 # because the integration tests bake `env!("CARGO_BIN_EXE_flk")` in at compile
 # time, so the binary must sit where the build put it. JUnit lands in
 # target/nextest/ci/junit.xml.
@@ -110,6 +121,11 @@ client-check:
 # or Bun changes: it records the lock's sha256 and Bun version, fetches with an
 # empty hash and keeps the hash nix reports. Commit the file it writes. If the fetch fails for
 # any other reason (network, a lock bun refuses), the file is left as it was.
+# On failure or INT/TERM, restore before returning. A process-group signal can
+# arrive twice because just forwards it: each handler restores directly, and
+# restore ignores repeats and disarms EXIT before copying. A second signal
+# during EXIT must restore too, not exit past the active callback. SIGKILL
+# and host crashes cannot run cleanup and are outside this contract.
 client-deps-hash:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -117,12 +133,13 @@ client-deps-hash:
     cp nix/client-deps.json "$backup"
     restore() {
       trap '' INT TERM
+      trap - EXIT
       cp "$backup" nix/client-deps.json
       rm -f "$backup"
     }
     trap restore EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    trap 'restore; exit 130' INT
+    trap 'restore; exit 143' TERM
     lock=$(nix-hash --type sha256 --flat web/client/bun.lock)
     printf '{\n  "lock": "%s",\n  "hash": ""\n}\n' "$lock" > nix/client-deps.json
     bun=$(nix eval --raw .#flock-client.deps.bunVersion)

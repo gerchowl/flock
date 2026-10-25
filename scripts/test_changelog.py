@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import subprocess
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 from pathlib import Path
 
 from scripts.changelog import (
@@ -32,6 +36,9 @@ from scripts.changelog import (
     NO_STABLE_RELEASE_VERSION,
     prepare_release,
     cmd_prepare,
+    cmd_sync_latest_json,
+    fetch_release_payload,
+    EXPECTED_ASSET_NAMES,
     collect_fragments,
     fold_fragments,
     read_protocol_version,
@@ -353,6 +360,99 @@ class ChangelogScriptTests(unittest.TestCase):
                 load_product_announcement(path)
         finally:
             path.unlink(missing_ok=True)
+
+    def test_sync_latest_json_preserves_checksums_and_legacy_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "latest.json"
+            announcement = root / "announcement.json"
+            manifest.write_text(build_latest_json("0.1.0", "Old", default_release_assets("0.1.0")))
+            announcement.write_text("null\n")
+            assets = default_release_assets("0.1.1")
+            payload = {"tagName": "v0.1.1", "body": "Notes", "assets": [
+                {"name": name, "url": assets[target], "sha256": "a" * 64}
+                for target, name in EXPECTED_ASSET_NAMES.items()
+            ]}
+            with patch("scripts.changelog.fetch_release_payload", return_value=payload):
+                cmd_sync_latest_json(argparse.Namespace(output=str(manifest), version="0.1.1",
+                    repo=DEFAULT_RELEASE_REPO, announcement=str(announcement), protocol=5))
+            original = manifest.read_text()
+            without_hashes = {**payload, "tagName": "v0.1.2", "assets": [
+                {key: value for key, value in asset.items() if key != "sha256"}
+                for asset in payload["assets"]
+            ]}
+            with patch("scripts.changelog.fetch_release_payload", return_value=without_hashes):
+                with self.assertRaisesRegex(ChangelogError, "sha256 sidecar"):
+                    cmd_sync_latest_json(argparse.Namespace(output=str(manifest), version="0.1.2",
+                        repo=DEFAULT_RELEASE_REPO, announcement=str(announcement), protocol=5))
+            self.assertEqual(manifest.read_text(), original)
+            result = json.loads(original)
+            self.assertEqual(result["assets"], {
+                target: {"url": url, "sha256": "a" * 64} for target, url in assets.items()
+            })
+            self.assertEqual(result["releases"]["0.1.0"]["assets"], default_release_assets("0.1.0"))
+            ensure_manifest_assets_belong_to_repo(result)
+            ensure_current_release_assets_are_mirrored(result, "fixture")
+            result["assets"]["linux-x86_64"]["url"] = "https://example.invalid/foreign"
+            with self.assertRaises(ChangelogError):
+                ensure_manifest_assets_belong_to_repo(result)
+
+    def test_release_fetch_reads_published_checksum_sidecars(self) -> None:
+        payload = {"tagName": "v0.1.1", "body": "Notes", "assets": []}
+        for name in EXPECTED_ASSET_NAMES.values():
+            payload["assets"].extend([{"name": name, "url": "https://example.invalid/" + name},
+                                      {"name": name + ".sha256"}])
+        def run(command, **kwargs):
+            if "download" in command:
+                root = Path(command[command.index("--dir") + 1])
+                for name in EXPECTED_ASSET_NAMES.values():
+                    (root / (name + ".sha256")).write_text("a" * 64 + "  " + name + "\n")
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        with patch("scripts.changelog.subprocess.run", side_effect=run):
+            result = fetch_release_payload("0.1.1", DEFAULT_RELEASE_REPO)
+        for asset in result["assets"]:
+            if asset["name"] in EXPECTED_ASSET_NAMES.values():
+                self.assertEqual(asset.get("sha256"), "a" * 64)
+
+    def test_release_fetch_refuses_corrupt_or_incomplete_sidecars(self) -> None:
+        payload = {"assets": [{"name": name} for name in EXPECTED_ASSET_NAMES.values()] +
+                   [{"name": name + ".sha256"} for name in EXPECTED_ASSET_NAMES.values()]}
+        for damage in ["missing", "filename", "digest", "download"]:
+            with self.subTest(damage=damage):
+                def run(command, **kwargs):
+                    if "download" in command:
+                        if damage == "download":
+                            return SimpleNamespace(returncode=1, stdout="", stderr="fixture refusal")
+                        root = Path(command[command.index("--dir") + 1])
+                        for index, name in enumerate(EXPECTED_ASSET_NAMES.values()):
+                            if index == 0 and damage == "missing":
+                                continue
+                            filename = "other" if index == 0 and damage == "filename" else name
+                            digest = "wrong" if index == 0 and damage == "digest" else "a" * 64
+                            (root / (name + ".sha256")).write_text(digest + "  " + filename + "\n")
+                    return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+                with patch("scripts.changelog.subprocess.run", side_effect=run):
+                    with self.assertRaises(ChangelogError):
+                        fetch_release_payload("0.1.1", DEFAULT_RELEASE_REPO)
+
+    def test_release_workflow_hashes_every_uploaded_binary(self) -> None:
+        from scripts.test_actions_cache import workflow
+        release = workflow("release.yml")
+        build = release["jobs"]["build"]
+        step = next(step for step in build["steps"] if step.get("name") == "Compute asset checksum")
+        upload = next(step for step in build["steps"] if step.get("name") == "Upload artifact")
+        self.assertIn("${{ matrix.name }}.sha256", upload["with"]["path"].splitlines())
+        publish = next(step for step in release["jobs"]["release"]["steps"] if step.get("name") == "Create release")
+        self.assertIn("flock-*/*.sha256", publish["with"]["files"].splitlines())
+        for target in build["strategy"]["matrix"]["include"]:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / target["name"]).write_bytes(b"built asset")
+                result = subprocess.run(["/bin/sh", "-eu", "-c", step["run"].replace("${{ matrix.name }}", target["name"])],
+                                        cwd=root, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((root / (target["name"] + ".sha256")).read_text(),
+                                 hashlib.sha256(b"built asset").hexdigest() + "  " + target["name"] + "\n")
 
     def test_manifest_from_release_payload_uses_release_body_and_asset_urls(self) -> None:
         manifest = manifest_from_release_payload(

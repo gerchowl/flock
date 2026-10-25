@@ -1,0 +1,16 @@
+{"v":1,"step":"given","cursors":{},"outbox":[],"covers":["s7-min"]}
+{"v":1,"step":"client","action":{"kind":"subscribe","sub_id":"s1","stream":"agent/fixture"}}
+{"v":1,"step":"client","action":{"kind":"connect"}}
+{"v":1,"step":"expect_connect","within_ms":1,"not_before_ms":0}
+{"v":1,"step":"open"}
+{"v":1,"step":"expect","frame":{"t":"hello","protocol":1,"client":{"name":"fixture","version":"1"},"token":"fixture-token"},"fields":["protocol","token"],"absent":[]}
+{"v":1,"step":"send","frame":{"t":"welcome","protocol":1,"server_version":"fixture","capabilities":["read","send"],"principal":"fixture-principal","server_epoch":"fixture-epoch","idempotency_window_ms":86400000}}
+{"v":1,"step":"expect","frame":{"t":"sub","sub_id":"s1","stream":"agent/fixture"},"fields":["sub_id","stream"],"absent":["after"]}
+{"v":1,"step":"send","frame":{"t":"ev","sub_id":"s1","stream":"agent/fixture","seq":2,"ts_ms":1,"ev":{"type":"flk_permission_request","state":"open","request_id":"typed-request","request_seq":1,"request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example","input":{"command":"true"}}}}}
+{"v":1,"step":"send","frame":{"t":"synced","sub_id":"s1","seq":2}}
+{"v":1,"step":"client","action":{"kind":"command","cmd_id":"c1","verb":"agent.decide","args":{"agent":"fixture","request_id":"typed-request","request_seq":1,"decision":"deny","message":"operator reason"}}}
+{"v":1,"step":"expect","frame":{"t":"cmd","cmd_id":"c1","verb":"agent.decide","args":{"agent":"fixture","request_id":"typed-request","request_seq":1,"decision":"deny","message":"operator reason"},"resume_only":false},"fields":["cmd_id","verb","args","resume_only"],"absent":[]}
+{"v":1,"step":"send","frame":{"t":"ack","cmd_id":"c1","ok":true,"result":{"request_id":"typed-request","decision":"deny"}}}
+{"v":1,"step":"send","frame":{"t":"ev","sub_id":"s1","stream":"agent/fixture","seq":3,"ts_ms":1,"ev":{"type":"flk_permission_request","state":"closed","request_id":"typed-request","request_seq":1,"decision":"deny","message":"operator reason","principal":"fixture-client","source":"token"}}}
+{"v":1,"step":"observe","connection":"Live","outbox":{"c1":"acked"},"streams":{"s1":{"state":"Current","cursor":3}}}
+{"v":1,"step":"quiet","ceiling_ms":1000}
