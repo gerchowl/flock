@@ -468,6 +468,7 @@ impl InputHandle {
         &self,
         principal: &Principal<'_>,
         revoke: Option<&permissions::grants::GrantHandle>,
+        show_input: bool,
     ) -> Result<Vec<permissions::grants::SessionGrant>, ErrorCode> {
         if !matches!(principal, Principal::Operator) {
             return Err(ErrorCode::OperatorOnly);
@@ -479,7 +480,7 @@ impl InputHandle {
         if let Some(handle) = revoke {
             book.revoke(handle)?;
         }
-        Ok(book.grants())
+        Ok(book.grants(show_input && revoke.is_none()))
     }
     pub(super) fn waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
         Ok(self

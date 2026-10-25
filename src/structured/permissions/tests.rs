@@ -675,7 +675,7 @@ fn revoke_between_prepare_and_audited_cannot_reinstall_a_grant() {
         assert_eq!(answer.response["response"]["response"]["behavior"], "allow");
         b.written(answer);
         assert!(
-            b.grants().is_empty(),
+            b.grants(false).is_empty(),
             "revoke must beat the pending install"
         );
         b.observe("next", request()).unwrap();
@@ -695,12 +695,15 @@ fn installed_grants_are_listed_and_revoke_makes_the_next_request_prompt() {
     assert!(b.begin_answer(&answer.id, answer.request_seq));
     b.audited(&answer, 1234);
     b.written(answer);
-    let grants = b.grants();
+    let grants = b.grants(false);
     assert_eq!(grants.len(), 1);
     assert_eq!(grants[0].tool, "Bash");
+    assert!(grants[0].canonical_input_key.is_none());
+    assert_eq!(grants[0].canonical_input_key_hash, "b409bdea0bbeb2fd");
+    assert_eq!(grants[0].canonical_input_key_bytes, 27);
     assert_eq!(
-        grants[0].canonical_input_key,
-        r#"["Bash",{"command":"true"}]"#
+        b.grants(true)[0].canonical_input_key.as_deref(),
+        Some(r#"["Bash",{"command":"true"}]"#)
     );
     assert_eq!(grants[0].installed_ms, 1234);
     b.revoke(&grants[0].handle).unwrap();

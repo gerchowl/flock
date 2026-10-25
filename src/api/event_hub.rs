@@ -894,8 +894,6 @@ mod tests {
         }
     }
 
-    /// ADR-0028 §3a: a kind from a newer release is skipped, not read as
-    /// corruption, and its sequence stays spent.
     #[test]
     fn grant_revocation_is_persisted_and_a_newer_kind_is_skipped() {
         use crate::api::schema::EventData;
@@ -926,6 +924,8 @@ mod tests {
         assert_eq!(records[0].2.event, EventKind::StructuredGrantRevoked);
     }
 
+    /// ADR-0028 §3a: a kind from a newer release is skipped, not read as
+    /// corruption, and its sequence stays spent.
     #[test]
     fn an_unknown_kind_is_skipped_without_quarantining_the_log() {
         let path = temp_log("unknown-kind");
