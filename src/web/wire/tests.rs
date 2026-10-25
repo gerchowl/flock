@@ -143,10 +143,7 @@ impl Server {
     pub(crate) async fn finish(mut self) {
         self.core.shutdown().await.unwrap();
         assert!(self.core.shared.clients.lock().unwrap().is_empty());
-        assert_eq!(
-            self.core.shared.slots.available_permits(),
-            CONNECTIONS as usize
-        );
+        assert_eq!(self.core.shared.slots.available_permits(), PENDING_HELLOS);
         self.task.abort();
         let _ = (&mut self.task).await;
     }
@@ -157,7 +154,7 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-pub(crate) struct Socket(tokio::net::TcpStream);
+pub(crate) struct Socket(pub(crate) tokio::net::TcpStream);
 #[derive(Debug)]
 pub(crate) enum Received {
     Text(Value),
@@ -393,7 +390,7 @@ fn hello_deadline_is_absolute_and_releases_an_unauthenticated_slot() {
                 .shared
                 .slots
                 .clone()
-                .acquire_many_owned(CONNECTIONS),
+                .acquire_many_owned(PENDING_HELLOS as u32),
         )
         .await
         .unwrap();
@@ -495,7 +492,7 @@ fn pending_hellos_reserve_authenticated_capacity_and_shutdown_refuses_upgrades()
     runtime(async {
         let server = Server::new().await;
         let mut sockets = Vec::new();
-        for _ in 0..PENDING_HELLOS {
+        for _ in 0..16 {
             sockets.push(Socket::open(&server).await);
         }
         let (_, refusal) = Socket::upgrade(&server).await;
@@ -503,10 +500,7 @@ fn pending_hellos_reserve_authenticated_capacity_and_shutdown_refuses_upgrades()
         server.core.shutdown().await.unwrap();
         let (_, refusal) = Socket::upgrade(&server).await;
         assert!(refusal.starts_with("HTTP/1.1 503"));
-        assert_eq!(
-            server.core.shared.slots.available_permits(),
-            CONNECTIONS as usize
-        );
+        assert_eq!(server.core.shared.slots.available_permits(), PENDING_HELLOS);
         server.finish().await;
     });
 }
@@ -912,7 +906,7 @@ fn normal_constructor_opens_the_store_once_and_reports_startup_failure() {
         let core = Core::new(root.path().into(), Arc::new(tokio::sync::Notify::new()))
             .await
             .unwrap();
-        assert_eq!(core.shared.slots.available_permits(), 16);
+        assert_eq!(core.shared.slots.available_permits(), PENDING_HELLOS);
         core.shutdown().await.unwrap();
         let file = root.path().join("not-directory");
         fs::write(&file, b"fixture").unwrap();

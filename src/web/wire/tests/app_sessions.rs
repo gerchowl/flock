@@ -279,7 +279,7 @@ fn real_minting_child_exit_closes_idle_socket_without_a_command() {
     });
 }
 #[test]
-fn shutdown_revokes_both_sockets_and_fresh_handoff_owner_cannot_reuse_tokens() {
+fn shutdown_revokes_both_sockets_and_same_owner_cannot_reuse_tokens() {
     runtime(async {
         let (server, mut app, _) = fixture().await;
         let token = mint(&mut app).await;
@@ -297,14 +297,7 @@ fn shutdown_revokes_both_sockets_and_fresh_handoff_owner_cannot_reuse_tokens() {
             second.receive().await,
             Received::Close(AUTH_REVOKED_CLOSE)
         ));
-        let successor = Owner::default();
-        let store = successor
-            .get(
-                server._root.path(),
-                Arc::new(AppClock(Arc::new(server.clock.clone()))),
-            )
-            .unwrap();
-        assert!(store.authenticate(&token).is_err());
+        assert!(server.core.shared.store.authenticate(&token).is_err());
         server.finish().await;
     });
 }
@@ -346,4 +339,31 @@ fn expiry_flushes_inflight_auth_revoked_ack_before_the_close() {
         );
         server.finish().await;
     });
+}
+
+#[test]
+fn shutdown_revoke_failure_still_stops_drains_and_closes_live_sessions() {
+    let logs = crate::logging::capture_logs(|| {
+        runtime(async {
+            let (server, mut app, _) = fixture().await;
+            let token = mint(&mut app).await;
+            let mut socket = Socket::open(&server).await;
+            socket.hello(WIRE_JSON_VERSION, &token.0).await;
+            server.clock.deadline(12 * 60 * 60 * 1000).await;
+            // A non-private directory deterministically refuses token mutations.
+            let path = server._root.path().join("client-tokens");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(within(server.core.shutdown()).await.is_err());
+            assert!(*server.core.shared.stop.borrow());
+            assert!(server.core.shared.clients.lock().unwrap().is_empty());
+            assert_eq!(server.core.shared.slots.available_permits(), PENDING_HELLOS);
+            assert!(matches!(
+                socket.receive().await,
+                Received::Close(AUTH_REVOKED_CLOSE)
+            ));
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            server.finish().await;
+        })
+    });
+    assert!(logs.contains("client.app.revocation_failed"), "{logs}");
 }

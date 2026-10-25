@@ -55,5 +55,8 @@ Failed watch registration or bounded retirement work closes fail-closed with
 issuance reclaims them. Revocation notifications happen after earlier shared
 admissions drain.
 
-Shell-origin admission and pre-auth limits remain #2442 PR2. There are no
-`desktop/` changes in this server slice.
+The captured shell origin is admitted only on `/v1/ws` (#2442 PR2). Pending
+admission and failed-hello windows are isolated by kernel UID, with unknown
+attribution in its own shared bucket. Revocation failure during shutdown is
+logged and returned, while stop and bounded transport drain still complete.
+There are no `desktop/` changes in this server slice.

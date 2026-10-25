@@ -36,10 +36,10 @@ use timing::{Clock, Heartbeat, SystemClock};
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 /// Maximum encoded, received or reassembled message bytes.
 const MAX_MESSAGE: usize = 65_536;
-/// Upgraded socket cap, including pending hellos.
+/// Authenticated session cap, unchanged by pending-handshake isolation.
 const CONNECTIONS: u32 = 16;
-/// Pending unauthenticated sockets; leave capacity for authenticated sessions.
-const PENDING_HELLOS: usize = 4;
+/// Transport backstop including authenticated sockets, above one UID's budget.
+const PENDING_HELLOS: usize = 128;
 /// Registered sockets per verified token principal, including pending welcome.
 const PRINCIPAL_CONNECTIONS: usize = 4;
 /// Maximum queued control messages per socket.
@@ -73,7 +73,7 @@ struct Shared {
     epoch: String,
     clock: Arc<dyn Clock>,
     slots: Arc<Semaphore>,
-    hellos: Arc<Semaphore>,
+    preauth: Arc<super::preauth::Budget>,
     clients: Mutex<HashMap<u64, Client>>,
     next: AtomicU64,
     stop: watch::Sender<bool>,
@@ -171,9 +171,9 @@ impl Core {
                 fleet,
                 store,
                 epoch,
-                clock,
-                slots: Arc::new(Semaphore::new(CONNECTIONS as usize)),
-                hellos: Arc::new(Semaphore::new(PENDING_HELLOS)),
+                clock: clock.clone(),
+                slots: Arc::new(Semaphore::new(PENDING_HELLOS)),
+                preauth: super::preauth::Budget::new(clock.clone()),
                 clients: Mutex::new(HashMap::new()),
                 next: AtomicU64::new(1),
                 stop,
@@ -194,6 +194,10 @@ impl Core {
     pub(crate) fn router(&self) -> Router {
         Router::new().route("/v1/ws", get(upgrade).with_state(self.shared.clone()))
     }
+    /// Share pre-header admission ownership with the HTTP listener.
+    pub(super) fn preauth(&self) -> Arc<super::preauth::Budget> {
+        self.shared.preauth.clone()
+    }
     /// Admit commands on the same owner that services structured workers.
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
         self.command_owner.service(app);
@@ -201,24 +205,28 @@ impl Core {
     /// Cancel transport work and wait for every connection lease, including hello.
     pub(crate) async fn shutdown(&self) -> io::Result<()> {
         let store = self.shared.store.clone();
-        super::store_io::shared()
+        let revocation = super::store_io::shared()
             .run(move || store.shutdown())
             .await
-            .ok_or_else(|| io::Error::other("app revocation worker unavailable"))?
-            .map_err(io::Error::other)?;
+            .ok_or_else(|| io::Error::other("app revocation worker unavailable"))
+            .and_then(|out| out.map_err(io::Error::other));
+        if let Err(error) = &revocation {
+            crate::logging::client_app_revocation_failed(error);
+        }
         self.shared.stop.send_replace(true);
-        tokio::time::timeout(SHUTDOWN_WAIT, async {
+        let drained = tokio::time::timeout(SHUTDOWN_WAIT, async {
             let _ = self
                 .shared
                 .slots
                 .clone()
-                .acquire_many_owned(CONNECTIONS)
+                .acquire_many_owned(PENDING_HELLOS as u32)
                 .await;
             self.shared.fleet.closed().await;
         })
         .await
         .map(|_| ())
-        .map_err(io::Error::other)
+        .map_err(io::Error::other);
+        revocation.and(drained)
     }
 }
 /// Keep credentials and transport deadlines in the same injected monotonic domain.
@@ -247,15 +255,30 @@ async fn app_lifetime(shared: &Shared, session: &Session) -> u16 {
         },
     }
 }
-async fn upgrade(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> Response {
+async fn upgrade(
+    ws: WebSocketUpgrade,
+    State(shared): State<Arc<Shared>>,
+    ticket: Option<axum::Extension<Arc<super::preauth::Ticket>>>,
+) -> Response {
     if *shared.stop.borrow() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    if shared
+        .clients
+        .lock()
+        .map_or(true, |clients| clients.len() >= CONNECTIONS as usize)
+    {
+        return super::preauth::refusal(crate::api::error_code::ErrorCode::PreauthCapacity);
+    }
     let Ok(permit) = shared.slots.clone().try_acquire_owned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return super::preauth::refusal(crate::api::error_code::ErrorCode::PreauthCapacity);
     };
-    let Ok(hello) = shared.hellos.clone().try_acquire_owned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let hello = match ticket {
+        Some(axum::Extension(ticket)) => ticket,
+        None => match shared.preauth.acquire(None) {
+            Ok(ticket) => ticket,
+            Err(code) => return super::preauth::refusal(code),
+        },
     };
     ws.max_frame_size(MAX_MESSAGE)
         .max_message_size(MAX_MESSAGE)
@@ -373,7 +396,7 @@ async fn connection(
     mut socket: WebSocket,
     shared: Arc<Shared>,
     permit: OwnedSemaphorePermit,
-    hello: OwnedSemaphorePermit,
+    hello: Arc<super::preauth::Ticket>,
 ) {
     let Ok(id) = shared
         .next
@@ -395,6 +418,9 @@ async fn connection(
     let (session, read_only, token) = match session {
         Ok(session) => session,
         Err(failure) => {
+            if matches!(failure, HandshakeFailure::Refused) {
+                hello.failed();
+            }
             let Some(code) = failure.hello_code() else {
                 return;
             };
@@ -423,11 +449,12 @@ async fn connection(
     let (data, data_rx) = mpsc::channel(DATA_CAPACITY);
     let (revoke, mut revoked) = watch::channel(false);
     if let Ok(mut clients) = shared.clients.lock() {
-        if clients
-            .values()
-            .filter(|c| c.session.info.principal == principal)
-            .count()
-            >= PRINCIPAL_CONNECTIONS
+        if clients.len() >= CONNECTIONS as usize
+            || clients
+                .values()
+                .filter(|c| c.session.info.principal == principal)
+                .count()
+                >= PRINCIPAL_CONNECTIONS
         {
             let _ = socket.send(close(GOING_AWAY_CLOSE)).now_or_never();
             return;
@@ -454,7 +481,11 @@ async fn connection(
     };
     let registered = revoked.clone();
     let confirmed = async {
-        let session = verify(&shared, end, token).await?;
+        let session = verify(&shared, end, token).await.inspect_err(|failure| {
+            if matches!(failure, HandshakeFailure::Refused) {
+                hello.failed();
+            }
+        })?;
         if session.info.principal != principal || *registered.borrow() {
             return Err(HandshakeFailure::Refused);
         }
@@ -570,7 +601,10 @@ async fn connection(
             _ = running.join_next() => (),
         }
     }
-    if code == AUTH_REVOKED_CLOSE && session.app().is_some_and(|s| !*s.revoked.borrow()) {
+    if code == AUTH_REVOKED_CLOSE
+        && !*shared.stop.borrow()
+        && session.app().is_some_and(|s| !*s.revoked.borrow())
+    {
         let store = shared.store.clone();
         let session = session.clone();
         if !matches!(

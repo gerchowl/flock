@@ -270,3 +270,6 @@ pub(crate) mod client_tokens;
 
 #[cfg(test)]
 pub(crate) mod socket_test_support;
+
+#[cfg(any(feature = "web", test))]
+pub(crate) mod tcp_uid;

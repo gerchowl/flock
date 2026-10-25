@@ -88,6 +88,25 @@ pub(super) fn origin_allowed(headers: &HeaderMap, authority: &str) -> bool {
     })
 }
 
+/// Captured shell headers are admitted only by the listener's exact WS route.
+pub(super) fn shell_origin_allowed(headers: &HeaderMap, authority: &str) -> bool {
+    if headers.get_all(header::ORIGIN).iter().count() != 1
+        || headers
+            .get(header::ORIGIN)
+            .is_none_or(|v| v != "tauri://localhost")
+        || headers.get_all("sec-fetch-site").iter().count() != 1
+        || headers
+            .get("sec-fetch-site")
+            .is_none_or(|v| v != "cross-site")
+    {
+        return false;
+    }
+    let mut same_origin = headers.clone();
+    same_origin.remove(header::ORIGIN);
+    same_origin.remove("sec-fetch-site");
+    origin_allowed(&same_origin, authority)
+}
+
 fn immutable(path: &str) -> bool {
     // Anchor Vite's default flat assets/[name]-[hash:8].[ext] pattern.
     let Some(name) = path.strip_prefix("assets/") else {

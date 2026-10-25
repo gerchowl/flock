@@ -1246,3 +1246,34 @@ restart or handoff; there are no new authentication error names. A command that 
 `auth_revoked` error acknowledgement before closure. Persistent file tokens
 are unaffected. The existing same-UID secret-extraction risk remains (#1177).
 Shell-origin admission is a separate #2442 slice.
+
+### Shell origins and pre-auth isolation
+
+The local shell uses exactly `tauri://localhost` and `Sec-Fetch-Site: cross-site`
+on `/v1/ws` only. Other paths, the exchange endpoint, numeric Host checks and
+loopback restrictions retain their strict guards. `null` and origin lookalikes
+are refused. Mint parameters remain empty; there is no registered port option.
+
+Pending HTTP/hello admissions share a kernel-UID budget of 16. Failed TCP UID
+attribution uses a shared unknown bucket, never the operator bucket. Linux reads
+the connecting IPv4 socket's kernel UID; macOS reads its PCB/socket UID. These
+keys allocate resources only; a valid bearer is still required. Same-UID
+processes share budgets (the isolation limitation tracked in #1177).
+
+Ten failed hellos exhaust a fixed one-second per-UID window. Upgrade/HTTP
+refusals report `auth_rate_limited` (429, retry `later`) or `preauth_capacity`
+(503, retry `later`). HTTP and upgraded transports also have global backstops
+of 32 and 128; authenticated sessions remain capped at 16 and leave the
+pre-auth budget. One UID cannot fill either pending global backstop.
+
+On Linux, the native shell refuses local mint with `ptrace_scope=0`: other
+processes could read its operator credential. It offers explicit remote pairing
+or administrator-enabled `ptrace_scope ≥ 1`, without a silent fallback.
+
+The pre-auth UID table retains at most 64 buckets. Each peer may additionally
+hold one bounded HTTP refusal task; further rejected connections close without
+allocating another task. Global backstops may close excess connections before
+an HTTP response. Kernel snapshots are limited to 4 MiB; IPv6 is outside this
+IPv4-only listener. An operator connection with unavailable UID evidence also
+uses the unknown bucket and may be refused; Origin never bypasses this rule.
+These limits do not isolate processes sharing a UID.
