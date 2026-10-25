@@ -1691,3 +1691,52 @@ fn relay_idempotent_enqueue_survives_custody_gc_and_journal_pruning() {
         ErrorCode::QueueItemConflict
     );
 }
+
+#[test]
+fn native_inbox_survives_queue_pruning_and_custody_collection_until_ack() {
+    use crate::mesh::store::{Store, CUSTODY_TTL_MS, DAY_MS};
+    let root = Root::new();
+    let e = crate::mesh::sign::tests::signed();
+    let path = root.0.join("custody.sqlite");
+    let mut s = Store::open(&path, 0).unwrap();
+    s.accept_local(&e, CUSTODY_TTL_MS, "fixture-agent", "fixture-session", 0)
+        .unwrap();
+    s.settle_queue_admission(&e.key, None, 0).unwrap();
+    let mut q = queue(&root);
+    let mut original = input(2363);
+    original.item_id = e.key.lifecycle_id();
+    q.enqueue(original, Principal::Operator, Gate::Send)
+        .unwrap();
+    complete(&mut q);
+    drop(q);
+    s.native_inbox_delivered(&e.key, 2 * DAY_MS as u64, CUSTODY_TTL_MS - 1)
+        .unwrap();
+    let old_bytes = fs::metadata(root.path()).unwrap().len();
+    root.open().checkpoint().unwrap();
+    assert!(fs::metadata(root.path()).unwrap().len() < old_bytes);
+    assert_eq!(
+        s.maintain(8 * DAY_MS + 1).unwrap(),
+        0,
+        "unread body pins storage"
+    );
+    drop(s);
+    let mut s = Store::open(&path, 8 * DAY_MS + 1).unwrap();
+    let (read, expired) = s
+        .native_inbox(
+            Some(("fixture-agent", "fixture-session")),
+            true,
+            8 * DAY_MS + 1,
+        )
+        .unwrap();
+    assert_eq!(read, vec![e]);
+    assert!(expired.is_empty());
+    assert_eq!(
+        s.maintain(8 * DAY_MS + 1).unwrap(),
+        1,
+        "ack releases normal GC"
+    );
+    assert!(
+        queue(&root).batch(100).unwrap().is_none(),
+        "read never re-admits input"
+    );
+}

@@ -3655,13 +3655,19 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
 
 ### Amendment: Recipient tool-inbox projection (#2363)
 
-A lease-attested structured caller owns `msg.list` and consume-once `msg.read`
-without a pane. An explicit target must identify that same recipient; other
-inboxes refuse `not_authorized` (retry `never`) before target resolution.
-The projection reuses admitted custody identity and body, without another queue
-admission or stdin write. Its durable acknowledgement is separate from custody.
-Bulk reads return live unread messages once; expired entries produce the existing
-`dropped_undeliverable` sweep event once and do not block live mail. There is no
-selector or partial-error envelope. Single-message reply expiry remains typed.
-`msg.inbox_retention_ms` defaults to the pane mailbox window (24 hours), measured
-from durable queue settlement. Operator global listing retains its pane semantics.
+The internal projection uses the same admitted MessageKey, body and native
+agent/session binding. It never admits another input, writes stdin, changes a
+custody outcome or renews a reply deadline. Its first harness-delivery observation
+starts a persisted read window (`msg.inbox_retention_ms`, default 24 hours).
+Delivery replay, custody settlement and restart cannot renew that window. Queue
+journal checkpoint/pruning cannot delete this independently retained projection.
+Unread projected bodies pin custody storage until read or expiry acknowledgement;
+normal byte quotas still charge the retained body. Sweep/read acknowledges expired
+entries once and emits the existing `dropped_undeliverable` event; mixed bulk reads
+return live entries once. There is no selector or partial-error envelope. Invalid
+persisted envelopes are skipped, logged and preserved, without consuming them.
+This foundation adds no public read surface: #2452 owns lease/caller resolution,
+queue-delivery binding and CLI/socket/MCP wiring. It must supply actual harness
+delivery, not custody admission, and decode payloads before consumption. Existing
+queue snapshots and custody labels are not backfilled as fresh delivery. Existing
+custody expiry cannot restore an already deleted body or extend reply recovery.

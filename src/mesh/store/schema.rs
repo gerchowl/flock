@@ -417,9 +417,10 @@ const LOCAL_RECIPIENTS: &str = "CREATE TABLE IF NOT EXISTS local_recipients (
     PRIMARY KEY(origin,id),
     FOREIGN KEY(origin,id) REFERENCES envelopes(origin,id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS native_inbox_reads (
-    origin TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL,
+    origin TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, until_ms INTEGER NOT NULL,
     PRIMARY KEY(origin,id),
-    FOREIGN KEY(origin,id) REFERENCES envelopes(origin,id) ON DELETE CASCADE);";
+    FOREIGN KEY(origin,id) REFERENCES envelopes(origin,id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS native_inbox_expiry ON native_inbox_reads(state,until_ms);";
 
 const BASELINE: &str = r#"
 CREATE TABLE IF NOT EXISTS agent_owners (agent_id TEXT PRIMARY KEY, node_id TEXT NOT NULL, name TEXT NOT NULL, seen INTEGER NOT NULL);

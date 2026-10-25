@@ -1,56 +1,86 @@
 //! Recipient-owned read acknowledgements, independent of custody (ADR-0036 §3).
 use super::*;
 impl<D: DiskSpace> Store<D> {
-    /// List unread native mail, or consume live delivered mail and sweep expiry.
-    /// The acknowledgement survives restart and cannot change a custody outcome.
-    /// Returns each expired envelope once for the existing drop event sweep.
+    /// Record the first harness delivery of already admitted, natively bound mail.
+    /// Trusted internal input only: #2452 binds the queue lifecycle and caller.
+    /// Replays cannot renew the persisted window or resurrect consumed mail.
+    pub(crate) fn native_inbox_delivered(
+        &mut self,
+        key: &MessageKey,
+        retention_ms: u64,
+        wall_ms: i64,
+    ) -> Result<()> {
+        let now = self.writable(wall_ms)?;
+        if self.recipient_binding(key)?.is_none()
+            || self.get(key)?.is_none_or(|r| r.envelope.body.is_empty())
+        {
+            return Err(Error::InvalidState);
+        }
+        let until = now.saturating_add(retention_ms.min(i64::MAX as u64) as i64);
+        self.connection.execute(
+            "INSERT OR IGNORE INTO native_inbox_reads VALUES(?1,?2,'unread',?3)",
+            params![key.origin_node, key.message_id, until],
+        )?;
+        Ok(())
+    }
+    /// Peek or consume live delivered mail. Expired entries are acknowledged once
+    /// and returned separately for the existing sweep event. A missing recipient
+    /// sweeps every inbox without consuming live mail. Opaque bodies stay opaque.
+    /// Invalid persisted entries are logged/skipped and preserved (ADR-0028 §3a).
     pub(crate) fn native_inbox(
         &mut self,
         recipient: Option<(&str, &str)>,
         consume: bool,
-        retention_ms: u64,
         wall_ms: i64,
     ) -> Result<(Vec<Envelope>, Vec<Envelope>)> {
         let now = self.writable(wall_ms)?;
         let keys = {
             let mut stmt = self.connection.prepare(
-                "SELECT e.origin,e.id FROM envelopes e JOIN local_recipients r USING(origin,id)
-                 WHERE e.state='delivered' AND e.kind='message'
+                "SELECT n.origin,n.id,n.until_ms FROM native_inbox_reads n
+                 JOIN local_recipients r USING(origin,id) WHERE n.state='unread'
                  AND (?1 IS NULL OR (r.agent=?1 AND r.session=?2))
-                 AND NOT EXISTS(SELECT 1 FROM native_inbox_reads n
-                    WHERE n.origin=e.origin AND n.id=e.id) ORDER BY e.rowid",
+                 AND (?1 IS NOT NULL OR n.until_ms<=?3) ORDER BY n.rowid",
             )?;
             let rows = stmt
                 .query_map(
-                    params![recipient.map(|r| r.0), recipient.map(|r| r.1)],
+                    params![recipient.map(|r| r.0), recipient.map(|r| r.1), now],
                     |r| {
-                        Ok(MessageKey {
-                            origin_node: r.get(0)?,
-                            message_id: r.get(1)?,
-                        })
+                        Ok((
+                            MessageKey {
+                                origin_node: r.get(0)?,
+                                message_id: r.get(1)?,
+                            },
+                            r.get::<_, i64>(2)?,
+                        ))
                     },
                 )?
+                .filter_map(|row| match row {
+                    Ok(row) => Some(Ok(row)),
+                    Err(error) if invalid_column_data(&error) => {
+                        crate::logging::mesh_custody_failed("native-inbox", "undecodable_record");
+                        None
+                    }
+                    Err(error) => Some(Err(error)),
+                })
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             rows
         };
-        let mut live = Vec::new();
-        let mut expired = Vec::new();
-        let mut acknowledgements = Vec::new();
-        for key in keys {
-            let Some(record) = self.get(&key)? else {
-                continue;
+        let (mut live, mut expired, mut acknowledgements) = (Vec::new(), Vec::new(), Vec::new());
+        for (key, until) in keys {
+            let record = match self.get(&key) {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(error)
+                    if matches!(&error, Error::Json(_) | Error::InvalidEnvelope)
+                        || matches!(&error, Error::Sql(source) if invalid_column_data(source)) =>
+                {
+                    crate::logging::mesh_custody_failed("native-inbox", "undecodable_record");
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
-            let settled: i64 = self.connection.query_row(
-                "SELECT outcome_until-?3 FROM envelopes WHERE origin=?1 AND id=?2",
-                params![key.origin_node, key.message_id, CUSTODY_TTL_MS],
-                |r| r.get(0),
-            )?;
-            let elapsed = now.saturating_sub(settled).max(0) as u64;
-            let stale = elapsed >= retention_ms || record.envelope.body.is_empty();
-            if !stale {
-                serde_json::from_slice::<serde_json::Value>(&record.envelope.body)?;
-            }
-            if stale || consume {
+            let stale = until <= now || record.envelope.body.is_empty();
+            if stale || (consume && recipient.is_some()) {
                 acknowledgements.push((key, if stale { "expired" } else { "read" }));
             }
             if stale {
@@ -63,12 +93,17 @@ impl<D: DiskSpace> Store<D> {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (key, state) in acknowledgements {
-            tx.execute(
-                "INSERT INTO native_inbox_reads VALUES(?1,?2,?3)",
-                params![key.origin_node, key.message_id, state],
-            )?;
+            tx.execute("UPDATE native_inbox_reads SET state=?3 WHERE origin=?1 AND id=?2 AND state='unread'",
+                params![key.origin_node, key.message_id, state])?;
         }
         tx.commit()?;
         Ok((live, expired))
     }
+}
+
+fn invalid_column_data(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::InvalidColumnType(..) | rusqlite::Error::FromSqlConversionFailure(..)
+    )
 }

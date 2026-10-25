@@ -1,6 +1,4 @@
 #[cfg(test)]
-mod native_inbox_tests;
-#[cfg(test)]
 mod peer_uid_tests;
 #[cfg(test)]
 mod scoped_mcp_tests;
