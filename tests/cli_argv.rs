@@ -3,8 +3,9 @@
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::process::CommandExt;
-use std::process::Command;
+mod support;
+
+use support::environment::Command;
 
 #[test]
 fn non_utf8_argument_is_a_typed_usage_error() {
