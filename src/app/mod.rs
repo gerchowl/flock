@@ -3797,6 +3797,36 @@ sidebar_pane_gap = 99
     }
 
     #[test]
+    fn usability2384_fix1_unknown_keys_reach_startup_reload_and_banner() {
+        let _guard = config_env_guard();
+        let path = temp_config_path("unknown-key-location");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[msg]\n  SECRET_UNKNOWN_2384 = true").unwrap();
+        let prior = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let startup = crate::config::Config::load();
+        let mut app = test_app();
+        let report = app.reload_config();
+        let banner = app.state.config_diagnostic.clone().unwrap_or_default();
+        match prior {
+            Some(v) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, v),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        for text in [
+            startup.diagnostics.join(" "),
+            report.diagnostics.join(" "),
+            banner,
+        ] {
+            assert!(!text.contains("SECRET_"));
+            assert!(
+                text.contains("key=msg;") && text.contains("at 2:3"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn reload_config_keeps_current_state_on_invalid_toml() {
         let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-toml");

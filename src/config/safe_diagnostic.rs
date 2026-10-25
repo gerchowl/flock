@@ -53,6 +53,7 @@ pub(super) enum Outcome {
     KeepBase,
     Ignore,
     RefuseEdit,
+    DropEntry,
 }
 impl Outcome {
     fn label(self) -> &'static str {
@@ -61,6 +62,25 @@ impl Outcome {
             Self::KeepBase => "keeping base config",
             Self::Ignore => "setting ignored",
             Self::RefuseEdit => "leaving config unchanged",
+            Self::DropEntry => "entry dropped",
+        }
+    }
+}
+/// Only static, reviewed hints may supplement a safe diagnostic.
+#[derive(Debug)]
+enum Hint {
+    ToastSection,
+    MeshEdge,
+    RepairInput,
+    OwnEdit,
+}
+impl Hint {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::ToastSection => "did you mean [ui.toast]?",
+            Self::MeshEdge => "peers now always hold a mesh edge",
+            Self::RepairInput => "Fix it manually or move it aside",
+            Self::OwnEdit => "flock's own edit produced invalid TOML",
         }
     }
 }
@@ -74,6 +94,8 @@ pub(super) struct Diagnostic {
     position: Option<(usize, Option<usize>)>,
     expected: Option<String>,
     suppliers: Vec<Source>,
+    hint: Option<Hint>,
+    entry_index: Option<usize>,
 }
 impl Diagnostic {
     fn new(cause: Cause, key: &str, source: Source, outcome: Outcome) -> Self {
@@ -85,6 +107,8 @@ impl Diagnostic {
             position: None,
             expected: None,
             suppliers: Vec::new(),
+            hint: None,
+            entry_index: None,
         }
     }
     pub fn syntax(error: &toml::de::Error, text: &str, source: Source, outcome: Outcome) -> Self {
@@ -99,12 +123,16 @@ impl Diagnostic {
         d.position = line.map(|line| (line, None));
         if key == "toast" {
             d.expected = Some("[ui.toast] section".into());
+            d.hint = Some(Hint::ToastSection);
         }
         d
     }
     pub fn removed(key: &str, line: Option<usize>) -> Self {
         let mut d = Self::new(Cause::Removed, key, Source::File, Outcome::Ignore);
         d.position = line.map(|line| (line, None));
+        if key == "peers.summary_command" {
+            d.hint = Some(Hint::MeshEdge);
+        }
         d
     }
     pub fn with_source(mut self, source: Source) -> Self {
@@ -114,8 +142,15 @@ impl Diagnostic {
     pub fn read(kind: ErrorKind, source: Source, outcome: Outcome) -> Self {
         Self::new(Cause::Read(kind), "", source, outcome)
     }
-    pub fn validation(cause: Cause, key: &str) -> Self {
-        Self::new(cause, key, Source::File, Outcome::Ignore)
+    pub fn dropped_entry(cause: Cause, key: &str, index: usize) -> Self {
+        let mut d = Self::new(cause, key, Source::File, Outcome::DropEntry);
+        d.entry_index = Some(index);
+        d
+    }
+    /// Numeric coordinates only; callers must not guess a missing position.
+    pub fn with_position(mut self, position: Option<(usize, usize)>) -> Self {
+        self.position = position.map(|(line, column)| (line, Some(column)));
+        self
     }
     pub fn catalog() -> Self {
         Self::new(
@@ -205,6 +240,9 @@ impl fmt::Display for Diagnostic {
             Some((line, None)) => write!(f, "; at line {line}")?,
             None => write!(f, "; location unavailable")?,
         }
+        if let Some(index) = self.entry_index {
+            write!(f, "; entry_index={index}")?;
+        }
         if let Cause::Read(kind) = self.cause {
             write!(f, "; io_kind={kind:?}")?;
         }
@@ -224,6 +262,9 @@ impl fmt::Display for Diagnostic {
         }
         if matches!(self.cause, Cause::Removed) {
             write!(f, "; was removed (mesh); delete this line")?;
+        }
+        if let Some(hint) = &self.hint {
+            write!(f, "; {}", hint.label())?;
         }
         write!(f, "; {}", self.outcome.label())
     }
@@ -282,7 +323,7 @@ pub(super) fn schema_key(raw: &str) -> String {
 
 /// Safe refusal for both input parsing and the edited-document output guard.
 pub(crate) fn edit_parse_error(error: &toml::de::Error, text: &str, output: bool) -> String {
-    Diagnostic::syntax(
+    let mut d = Diagnostic::syntax(
         error,
         text,
         if output {
@@ -291,8 +332,13 @@ pub(crate) fn edit_parse_error(error: &toml::de::Error, text: &str, output: bool
             Source::Input
         },
         Outcome::RefuseEdit,
-    )
-    .to_string()
+    );
+    d.hint = Some(if output {
+        Hint::OwnEdit
+    } else {
+        Hint::RepairInput
+    });
+    d.to_string()
 }
 
 #[cfg(test)]

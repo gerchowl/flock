@@ -187,16 +187,23 @@ Diagnostic keys are rebuilt from catalog paths and aliases. User-map entries
 become `<key>` and collection indices become `[]`; an unknown descendant stops
 at its nearest declared container, and unknown roots become `document root`.
 The four removed schema keys are an explicit closed historical exception.
-Unknown user spellings are withheld even when they look harmless. This sacrifices
-exact unknown-key/entry identification to prevent names from being a secret
-channel; numeric source lines remain useful. File scans distinguish base and
-overlay, while a merged unknown-key warning identifies the file category only.
-TOML syntax locations retain exact one-based byte line/column positions when a
-valid span exists. A missing span is unavailable. Key scans know only the line
-and do not invent a column. I/O diagnostics retain `ErrorKind`, never `Display`.
+Unknown user spellings are withheld even when they look harmless. Safe source
+categories and numeric coordinates identify where to inspect the file without
+printing its private keys. Loader unknown-key warnings preserve base/overlay
+categories and exact byte line/column coordinates from TOML key spans. Syntax
+errors likewise retain byte coordinates when available. Removed-key scans
+retain line locations; missing spans remain unavailable. The loader keeps its
+existing unknown-key policy, and CLI retains its broader scan. I/O diagnostics
+retain `ErrorKind`, never `Display`.
+
+Peer-entry refusals retain a zero-based array index, source category and field
+coordinates when available; their outcome says `entry dropped`. Static mesh,
+misplaced-section and CLI repair hints contain no input data.
 
 Both input-document and edited-output parse refusals in `channel set` and
-`config reset-keys` use this boundary and leave the file unchanged. Aggregate
+`config reset-keys` use this boundary and leave the file unchanged. Output guards
+identify flock's own edit as the failure. CLI file paths remain permitted
+operator metadata; loader and reload diagnostics remain path-free. Aggregate
 provenance has a structural reason, separately from sensitive content kinds.
 No socket/WS read method or raw export is enabled by this slice.
 

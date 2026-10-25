@@ -56,7 +56,22 @@ pub(crate) fn file_key_diagnostics() -> Vec<KeyDiagnostic> {
     .collect()
 }
 
-fn key_diagnostics(text: &str, source: Source) -> Vec<KeyDiagnostic> {
+#[derive(Clone, Copy)]
+enum Scope {
+    AllFields,
+    Loader,
+}
+
+pub(super) fn key_diagnostics(text: &str, source: Source) -> Vec<KeyDiagnostic> {
+    scan_keys(text, source, Scope::AllFields)
+}
+
+/// Enrich the loader's existing unknown-key policy; CLI keeps its broader scan.
+pub(super) fn loader_key_diagnostics(text: &str, source: Source) -> Vec<KeyDiagnostic> {
+    scan_keys(text, source, Scope::Loader)
+}
+
+fn scan_keys(text: &str, source: Source, scope: Scope) -> Vec<KeyDiagnostic> {
     let mut diagnostics = super::io::removed_key_diagnostics(text, source);
     let Ok(document) = toml_edit::Document::parse(text) else {
         return diagnostics;
@@ -71,11 +86,12 @@ fn key_diagnostics(text: &str, source: Source) -> Vec<KeyDiagnostic> {
         // An unknown top-level table gets the loader's section wording,
         // including the [ui.toast] hint, rather than a second warning (#860).
         if super::io::unknown_top_level_section_diagnostic(key, value).is_some() {
-            if let Some(line) = locations.get(key) {
+            if let Some(position) = locations.get(key) {
                 diagnostics.push(KeyDiagnostic {
                     kind: KeyDiagnosticKind::Unknown,
                     key: schema_key(key),
-                    message: Diagnostic::unknown(key, Some(*line))
+                    message: Diagnostic::unknown(key, None)
+                        .with_position(Some(*position))
                         .with_source(source)
                         .to_string(),
                 });
@@ -84,10 +100,12 @@ fn key_diagnostics(text: &str, source: Source) -> Vec<KeyDiagnostic> {
         }
         // Deserialize sections independently so one invalid section cannot hide
         // unknown keys in another. Serde owns the schema, including aliases.
-        unknown_keys(&[Segment::Key(key.clone())], value, &mut unknown);
+        if matches!(scope, Scope::AllFields) || key == "msg" {
+            unknown_keys(&[Segment::Key(key.clone())], value, &mut unknown);
+        }
     }
     for key in unknown {
-        let Some(line) = locations.get(&key) else {
+        let Some(position) = locations.get(&key) else {
             continue;
         };
         let canonical = key
@@ -102,7 +120,8 @@ fn key_diagnostics(text: &str, source: Source) -> Vec<KeyDiagnostic> {
         }
         diagnostics.push(KeyDiagnostic {
             kind: KeyDiagnosticKind::Unknown,
-            message: Diagnostic::unknown(&key, Some(*line))
+            message: Diagnostic::unknown(&key, None)
+                .with_position(Some(*position))
                 .with_source(source)
                 .to_string(),
             key: schema_key(&key),
@@ -171,7 +190,7 @@ fn collect_locations(
     item: &toml_edit::Item,
     prefix: &str,
     text: &str,
-    locations: &mut HashMap<String, usize>,
+    locations: &mut HashMap<String, (usize, usize)>,
 ) {
     if let Some(table) = item.as_table_like() {
         for (key, value) in table.iter() {
@@ -180,11 +199,9 @@ fn collect_locations(
             } else {
                 format!("{prefix}.{key}")
             };
-            if let Some(span) = table.key(key).and_then(|key| key.span()) {
-                locations.insert(
-                    path.clone(),
-                    text[..span.start].bytes().filter(|b| *b == b'\n').count() + 1,
-                );
+            if let Some(position) = syntax_position(text, table.key(key).and_then(|key| key.span()))
+            {
+                locations.insert(path.clone(), position);
             }
             collect_locations(value, &path, text, locations);
         }
@@ -207,6 +224,37 @@ fn collect_locations(
             );
         }
     }
+}
+
+/// Safe peer source metadata, indexed in original TOML array order.
+/// No names, target strings or paths are retained.
+pub(super) struct PeerLocation {
+    pub source: Source,
+    pub name: Option<(usize, usize)>,
+    pub ssh: Option<(usize, usize)>,
+}
+
+pub(super) fn peer_locations(text: &str, source: Source) -> Vec<PeerLocation> {
+    let Ok(document) = toml_edit::Document::parse(text) else {
+        return Vec::new();
+    };
+    let Some(peers) = document.get("peers") else {
+        return Vec::new();
+    };
+    let count = peers
+        .as_array_of_tables()
+        .map(|a| a.len())
+        .or_else(|| peers.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+    let mut locations = HashMap::new();
+    collect_locations(document.as_item(), "", text, &mut locations);
+    (0..count)
+        .map(|index| PeerLocation {
+            source,
+            name: locations.get(&format!("peers.{index}.name")).copied(),
+            ssh: locations.get(&format!("peers.{index}.ssh")).copied(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -256,19 +304,22 @@ mod tests {
             "future = true\n[msg]\nfuture_setting = true\n[[peers]]\nname='nodea'\nfuture_peer=1\nsummary_command='false'\n",
         );
         assert!(
-            diagnostics.contains(&"unknown_config_key; key=document root; source=base file; at line 1; setting ignored".to_string()),
-            "{diagnostics:?}"
-        );
-        assert!(
             diagnostics.contains(
-                &"unknown_config_key; key=msg; source=base file; at line 3; setting ignored"
+                &"unknown_config_key; key=document root; source=base file; at 1:1; setting ignored"
                     .to_string()
             ),
             "{diagnostics:?}"
         );
         assert!(
             diagnostics.contains(
-                &"unknown_config_key; key=peers[]; source=base file; at line 6; setting ignored"
+                &"unknown_config_key; key=msg; source=base file; at 3:1; setting ignored"
+                    .to_string()
+            ),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics.contains(
+                &"unknown_config_key; key=peers[]; source=base file; at 6:1; setting ignored"
                     .to_string()
             ),
             "{diagnostics:?}"
@@ -286,9 +337,9 @@ mod tests {
         assert_eq!(
             diagnostics,
             vec![
-                "unknown_config_key; key=msg; source=base file; at line 3; setting ignored"
+                "unknown_config_key; key=msg; source=base file; at 3:1; setting ignored"
                     .to_string(),
-                "unknown_config_key; key=ui.toast; source=base file; at line 6; setting ignored"
+                "unknown_config_key; key=ui.toast; source=base file; at 6:1; setting ignored"
                     .to_string(),
             ]
         );
@@ -302,7 +353,7 @@ mod tests {
             messages(
                 "[[peers]]\nname = \"nodea\"\n[[peers]]\nname = \"nodeb\"\nssh = 5\nfuture_peer = 1\n",
             ),
-            vec!["unknown_config_key; key=peers[]; source=base file; at line 6; setting ignored".to_string()]
+            vec!["unknown_config_key; key=peers[]; source=base file; at 6:1; setting ignored".to_string()]
         );
     }
 
@@ -313,7 +364,7 @@ mod tests {
         assert_eq!(
             messages("onboarding = false\n[toast]\ndelivery = \"flock\"\n"),
             vec![
-                "unknown_config_key; key=document root; source=base file; at line 2; expected [ui.toast] section; setting ignored"
+                "unknown_config_key; key=document root; source=base file; at 2:2; expected [ui.toast] section; did you mean [ui.toast]?; setting ignored"
                     .to_string()
             ]
         );

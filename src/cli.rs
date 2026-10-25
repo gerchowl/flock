@@ -1618,7 +1618,7 @@ mod config_check_tests {
         };
         assert_eq!(
             diagnostics,
-            vec!["unknown_config_key; key=document root; source=base file; at line 2; expected [ui.toast] section; setting ignored"]
+            vec!["unknown_config_key; key=document root; source=base file; at 2:2; expected [ui.toast] section; did you mean [ui.toast]?; setting ignored"]
         );
     }
 
@@ -1647,7 +1647,7 @@ mod config_check_tests {
             .collect();
         assert_eq!(
             unknown,
-            vec!["unknown_config_key; key=msg; source=base file; at line 4; setting ignored"],
+            vec!["unknown_config_key; key=msg; source=base file; at 4:1; setting ignored"],
             "{diagnostics:?}"
         );
     }
@@ -1813,5 +1813,29 @@ mod config_sink_tests {
     #[test]
     fn security2384_s3b1_cli_keys_output() {
         check(ConfigEdit::KeysOutput);
+    }
+}
+
+#[cfg(test)]
+mod fix1_tests {
+    use super::*;
+    fn diagnostic(stage: ConfigEdit) -> String {
+        let text = "[ui]\nconfirm_close='SECRET_CLI_2384' trailing";
+        let error = toml::from_str::<toml::Table>(text).unwrap_err();
+        let d = config_edit_parse_error(&error, text, stage);
+        assert!(!d.contains("SECRET_"));
+        d
+    }
+    #[test]
+    fn usability2384_fix1_cli_input_hint() {
+        for stage in [ConfigEdit::KeysInput, ConfigEdit::ChannelInput] {
+            assert!(diagnostic(stage).contains("Fix it manually or move it aside"));
+        }
+    }
+    #[test]
+    fn usability2384_fix1_cli_output_guard_hint() {
+        for stage in [ConfigEdit::KeysOutput, ConfigEdit::ChannelOutput] {
+            assert!(diagnostic(stage).contains("flock's own edit"));
+        }
     }
 }

@@ -261,15 +261,18 @@ fn load_config() -> Result<LoadedConfig, Vec<String>> {
     Ok(loaded)
 }
 
-/// Replace the loader's location-less removed-key warnings with the ones that
-/// name the file and line, which also cover keys an overlay shadowed.
+/// Replace location-less loader warnings with safe source categories and
+/// numeric coordinates, also retaining warnings for shadowed source keys.
 fn attach_source_diagnostics(loaded: &mut LoadedConfig, diagnostics: Vec<KeyDiagnostic>) {
     loaded.remove_key_diagnostics(|loader| {
-        loader.kind == KeyDiagnosticKind::Removed
-            && diagnostics.iter().any(|source| source.key == loader.key)
+        diagnostics
+            .iter()
+            .any(|source| source.kind == loader.kind && source.key == loader.key)
     });
     for diagnostic in &diagnostics {
-        crate::logging::config_removed_key(&diagnostic.message);
+        if diagnostic.kind == KeyDiagnosticKind::Removed {
+            crate::logging::config_removed_key(&diagnostic.message);
+        }
     }
     loaded.diagnostics.extend(
         diagnostics
@@ -297,6 +300,33 @@ fn load_with_overlay(
     overlay: Option<&str>,
     _overlay_path: &Path,
 ) -> Result<LoadedConfig, Vec<String>> {
+    let mut loaded = load_layered(base, overlay)?;
+    attach_unknown_sources(&mut loaded, base, overlay);
+    Ok(loaded)
+}
+
+/// Scan each source before output, including shadowed keys. Only safe records
+/// leave the scanner; raw names never enter returned diagnostics or logs.
+fn attach_unknown_sources(loaded: &mut LoadedConfig, base: Option<&str>, overlay: Option<&str>) {
+    let diagnostics = [(base, Source::Base), (overlay, Source::Overlay)]
+        .into_iter()
+        .filter_map(|(text, source)| {
+            text.map(|text| super::diagnostics::loader_key_diagnostics(text, source))
+        })
+        .flatten()
+        .filter(|d| d.kind == KeyDiagnosticKind::Unknown)
+        .collect();
+    attach_source_diagnostics(loaded, diagnostics);
+}
+
+fn load_layered(base: Option<&str>, overlay: Option<&str>) -> Result<LoadedConfig, Vec<String>> {
+    let peer_locations = [(base, Source::Base), (overlay, Source::Overlay)]
+        .into_iter()
+        .filter_map(|(text, source)| {
+            text.map(|text| super::diagnostics::peer_locations(text, source))
+        })
+        .flatten()
+        .collect::<Vec<_>>();
     // ADR-0002 phase (d): the generic FLOCK_<UPPER_SNAKE> env layer sits
     // BELOW the file. Merge order below: env < base < overlay.
     //
@@ -319,7 +349,7 @@ fn load_with_overlay(
 
     let Some(overlay) = overlay else {
         // No overlay: env+base or env+defaults. Env diagnostics ride along.
-        let mut loaded = load_live_config_with_sources(merged, &sources)?;
+        let mut loaded = load_live_config_with_sources(merged, &sources, &peer_locations)?;
         loaded.diagnostics.splice(0..0, env_diagnostics);
         return Ok(loaded);
     };
@@ -329,14 +359,14 @@ fn load_with_overlay(
             // ADR-0002 open question 1: overlay beats base beats env.
             deep_merge_tables(&mut sources, source_table(&overlay_table, "overlay file"));
             deep_merge_tables(&mut merged, overlay_table);
-            let mut loaded = load_live_config_with_sources(merged, &sources)?;
+            let mut loaded = load_live_config_with_sources(merged, &sources, &peer_locations)?;
             loaded.diagnostics.splice(0..0, env_diagnostics);
             Ok(loaded)
         }
         Err(diagnostics) => {
             // The overlay itself is unparseable; fall back to env+base and
             // surface the overlay failure as a non-fatal diagnostic.
-            let mut loaded = load_live_config_with_sources(merged, &sources)?;
+            let mut loaded = load_live_config_with_sources(merged, &sources, &peer_locations)?;
             loaded.diagnostics.splice(0..0, env_diagnostics);
             loaded.diagnostics.extend(diagnostics);
             Ok(loaded)
@@ -348,21 +378,7 @@ fn load_with_overlay_diagnostic(
     base: Option<&str>,
     overlay_diagnostic: Option<Diagnostic>,
 ) -> Result<LoadedConfig, Vec<String>> {
-    // Route through load_with_overlay so the env layer applies uniformly. The
-    // caller ended up here because it couldn't even READ the overlay file —
-    // the overlay content is None; the diagnostic is threaded through.
-    let mut env_diagnostics = Vec::new();
-    let mut merged = env::env_override_table(&mut env_diagnostics);
-    let mut sources = source_table(&merged, "environment");
-
-    if let Some(b) = base {
-        let base_table = parse_config_table(b, &config_path())?;
-        deep_merge_tables(&mut sources, source_table(&base_table, "base file"));
-        deep_merge_tables(&mut merged, base_table);
-    }
-
-    let mut loaded = load_live_config_with_sources(merged, &sources)?;
-    loaded.diagnostics.splice(0..0, env_diagnostics);
+    let mut loaded = load_with_overlay(base, None, Path::new(""))?;
     if let Some(diag) = overlay_diagnostic {
         loaded.diagnostics.push(diag.to_string());
     }
@@ -410,18 +426,24 @@ fn deep_merge_tables(
 
 #[cfg(test)]
 fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>> {
-    load_live_config_from_table(parse_config_table(content, Path::new("config.toml"))?)
+    let table = parse_config_table(content, Path::new("config.toml"))?;
+    let sources = source_table(&table, "base file");
+    let positions = super::diagnostics::peer_locations(content, Source::Base);
+    let mut loaded = load_live_config_with_sources(table, &sources, &positions)?;
+    attach_unknown_sources(&mut loaded, Some(content), None);
+    Ok(loaded)
 }
 
 #[cfg(test)]
 fn load_live_config_from_table(table: toml::Table) -> Result<LoadedConfig, Vec<String>> {
     let sources = source_table(&table, "base file");
-    load_live_config_with_sources(table, &sources)
+    load_live_config_with_sources(table, &sources, &[])
 }
 
 fn load_live_config_with_sources(
     mut table: toml::map::Map<String, toml::Value>,
     sources: &toml::Table,
+    peer_locations: &[super::diagnostics::PeerLocation],
 ) -> Result<LoadedConfig, Vec<String>> {
     let removed_key = |section: &str, key: &str| KeyDiagnostic {
         kind: KeyDiagnosticKind::Removed,
@@ -748,7 +770,7 @@ fn load_live_config_with_sources(
     // rest. Runs whether or not a `[spawn.env]` was present — it is a no-op on
     // the default table.
     diagnostics.extend(config.spawn.env.normalize());
-    validate_peers(&mut config.peers, &mut diagnostics);
+    validate_peers(&mut config.peers, &mut diagnostics, peer_locations);
     crate::channels::validate(&mut config.channels, &mut diagnostics);
 
     Ok(LoadedConfig {
@@ -764,17 +786,33 @@ fn load_live_config_with_sources(
 fn validate_peers(
     peers: &mut Vec<crate::config::model::PeerConfig>,
     diagnostics: &mut Vec<String>,
+    positions: &[super::diagnostics::PeerLocation],
 ) {
     let mut seen = std::collections::HashSet::new();
+    let mut next_index = 0;
     peers.retain(|peer| {
+        let index = next_index;
+        next_index += 1;
+        let location = positions.get(index);
+        let diagnostic = |cause, field: &str| {
+            let position = location.and_then(|p| {
+                if field == "ssh" && !peer.ssh.is_empty() {
+                    p.ssh
+                } else {
+                    p.name
+                }
+            });
+            Diagnostic::dropped_entry(cause, &format!("peers[].{field}"), index)
+                .with_source(location.map(|p| p.source).unwrap_or(Source::Unavailable))
+                .with_position(position)
+                .to_string()
+        };
         if peer.name.trim().is_empty() {
-            diagnostics
-                .push(Diagnostic::validation(Cause::MissingPeerName, "peers[].name").to_string());
+            diagnostics.push(diagnostic(Cause::MissingPeerName, "name"));
             return false;
         }
         if !seen.insert(peer.name.clone()) {
-            diagnostics
-                .push(Diagnostic::validation(Cause::DuplicatePeer, "peers[].name").to_string());
+            diagnostics.push(diagnostic(Cause::DuplicatePeer, "name"));
             return false;
         }
         // #392: the destination is pushed straight into ssh's argv, where a
@@ -783,8 +821,7 @@ fn validate_peers(
         // falls back to the name and the name would then reach argv unchecked.
         let target = peer.ssh_target();
         if !crate::remote::is_valid_ssh_destination(target) {
-            diagnostics
-                .push(Diagnostic::validation(Cause::InvalidPeerTarget, "peers[].ssh").to_string());
+            diagnostics.push(diagnostic(Cause::InvalidPeerTarget, "ssh"));
             return false;
         }
         true
@@ -1433,7 +1470,7 @@ delivery = "flock"
 
         assert_eq!(
             loaded.diagnostics,
-            vec!["unknown_config_key; key=document root; source=config file; location unavailable; expected [ui.toast] section; setting ignored"]
+            vec!["unknown_config_key; key=document root; source=base file; at 2:2; expected [ui.toast] section; did you mean [ui.toast]?; setting ignored"]
         );
         assert!(loaded.invalid_sections.is_empty());
         assert_eq!(
@@ -1457,7 +1494,9 @@ delivery = "flock"
 
         assert_eq!(
             loaded.diagnostics,
-            vec!["unknown_config_key; key=document root; source=config file; location unavailable; setting ignored"]
+            vec![
+                "unknown_config_key; key=document root; source=base file; at 2:2; setting ignored"
+            ]
         );
         assert!(loaded.invalid_sections.is_empty());
     }
@@ -1531,7 +1570,9 @@ delivery = "system"
 
         assert_eq!(
             loaded.diagnostics,
-            vec!["unknown_config_key; key=document root; source=config file; location unavailable; setting ignored"]
+            vec![
+                "unknown_config_key; key=document root; source=base file; at 2:3; setting ignored"
+            ]
         );
         assert_eq!(
             loaded.config.ui.toast.delivery,
@@ -2003,7 +2044,7 @@ mod spoke_config_tests {
             .collect();
         assert_eq!(errors, vec![
             "removed_config_key; key=msg.uplink_timeout_secs; source=base file; at line 3; was removed (mesh); delete this line; setting ignored",
-            "removed_config_key; key=peers.summary_command; source=base file; at line 2; was removed (mesh); delete this line; setting ignored",
+            "removed_config_key; key=peers.summary_command; source=base file; at line 2; was removed (mesh); delete this line; peers now always hold a mesh edge; setting ignored",
         ]);
     }
 
@@ -2036,7 +2077,7 @@ mod spoke_config_tests {
             ))
             .unwrap();
             assert_eq!(loaded.config.peers[0].name, "nodea");
-            assert_eq!(loaded.diagnostics, vec!["removed_config_key; key=peers.summary_command; source=config file; location unavailable; was removed (mesh); delete this line; setting ignored"]);
+            assert_eq!(loaded.diagnostics, vec!["removed_config_key; key=peers.summary_command; source=config file; location unavailable; was removed (mesh); delete this line; peers now always hold a mesh edge; setting ignored"]);
         }
     }
 
@@ -2047,7 +2088,7 @@ mod spoke_config_tests {
         assert!(!loaded.config.msg.enabled);
         assert_eq!(
             loaded.diagnostics,
-            vec!["unknown_config_key; key=msg; source=config file; location unavailable; setting ignored"]
+            vec!["unknown_config_key; key=msg; source=base file; at 2:1; setting ignored"]
         );
         assert!(loaded.invalid_sections.is_empty());
     }
@@ -2288,5 +2329,103 @@ mod peer_sink_security_tests {
             }
         });
         assert!(!format!("{:?} {logs}", loaded.diagnostics).contains("SECRET_"));
+    }
+}
+
+#[cfg(test)]
+mod fix1_tests {
+    use super::*;
+    #[test]
+    fn usability2384_fix1_unknown_loader_positions() {
+        for input in [
+            "[msg]\n  SECRET_UNKNOWN_2384 = true",
+            "SECRET_ROOT_2384 = { value = true }",
+        ] {
+            let loaded = load_live_config_from_str(input).unwrap();
+            let text = loaded.diagnostics.join(" ");
+            assert!(!text.contains("SECRET_"));
+            assert!(
+                text.contains(if input.starts_with("[msg]") {
+                    "key=msg;"
+                } else {
+                    "key=document root;"
+                }),
+                "{text}"
+            );
+            assert!(
+                text.contains(if input.starts_with("[msg]") {
+                    "at 2:3"
+                } else {
+                    "at 1:1"
+                }),
+                "{text}"
+            );
+        }
+    }
+    #[test]
+    fn usability2384_fix1_peer_indices_positions_and_outcomes() {
+        let loaded=load_live_config_from_str("[[peers]]\nname='node-a.example'\n[[peers]]\nname='node-a.example'\n[[peers]]\nname='node-b.example'\nssh='-SECRET_OPTION_2384.example'\n").unwrap();
+        assert_eq!(loaded.config.peers.len(), 1);
+        assert_eq!(loaded.diagnostics.len(), 2);
+        for (diagnostic, index, position) in [
+            (&loaded.diagnostics[0], 1, "at 4:1"),
+            (&loaded.diagnostics[1], 2, "at 7:1"),
+        ] {
+            assert!(!diagnostic.contains("SECRET_"));
+            assert!(
+                diagnostic.contains(&format!("entry_index={index}")),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains(position), "{diagnostic}");
+            assert!(
+                diagnostic.contains("entry dropped") && !diagnostic.contains("setting ignored"),
+                "{diagnostic}"
+            );
+        }
+    }
+    #[test]
+    fn usability2384_fix1_static_hints() {
+        let removed = removed_key_diagnostics(
+            "[[peers]]\nsummary_command='SECRET_COMMAND_2384'",
+            Source::Base,
+        );
+        assert!(removed[0]
+            .message
+            .contains("peers now always hold a mesh edge"));
+        assert!(!removed[0].message.contains("SECRET_"));
+        let toast = load_live_config_from_str("[toast]\ndelivery='SECRET_DELIVERY_2384'").unwrap();
+        assert!(toast.diagnostics[0].contains("did you mean [ui.toast]"));
+        assert!(!toast.diagnostics[0].contains("SECRET_"));
+    }
+}
+
+#[cfg(test)]
+mod fix1_source_tests {
+    use super::*;
+    #[test]
+    fn usability2384_fix1_overlay_peer_positions_follow_appended_indices() {
+        let base = "[[peers]]\nname='node-a.example'";
+        let overlay = "# comment\n[[peers]]\n name='node-a.example'";
+        let loaded =
+            load_with_overlay(Some(base), Some(overlay), Path::new("PRIVATE_PATH.toml")).unwrap();
+        let d = &loaded.diagnostics[0];
+        assert!(
+            d.contains("entry_index=1")
+                && d.contains("source=overlay file")
+                && d.contains("at 3:2"),
+            "{d}"
+        );
+        assert!(!d.contains("PRIVATE_PATH"));
+    }
+    #[test]
+    fn usability2384_fix1_inline_peer_and_name_fallback_positions() {
+        let input = "peers = [{name='-SECRET_OPTION_2384.example'}]";
+        let loaded = load_live_config_from_str(input).unwrap();
+        let d = &loaded.diagnostics[0];
+        assert!(
+            d.contains("entry_index=0") && d.contains("at 1:11") && d.contains("entry dropped"),
+            "{d}"
+        );
+        assert!(!d.contains("SECRET_"));
     }
 }

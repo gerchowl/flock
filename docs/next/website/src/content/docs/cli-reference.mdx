@@ -212,9 +212,9 @@ flk config reset-keys
 | `1` | loaded, with advisory warnings (removed or unknown keys, deprecated keys, keybinding conflicts) |
 | `2` | did not load — a session would fall back to built-in defaults |
 
-`--json` emits an object with `path`, `exit_code`, and `diagnostics` on stdout. Removed and unknown-key diagnostics include source categories and line locations. Private map entries use `<key>`, and unknown spellings are withheld behind the nearest declared schema container. The `path` metadata still identifies the file being checked. Removed keys always produce exit `1`, even though the configuration loads successfully.
+`--json` emits an object with `path`, `exit_code`, and `diagnostics` on stdout. Removed and unknown-key diagnostics include source categories and numeric locations. Private map entries use `<key>`, and unknown spellings are withheld behind the nearest declared schema container. The `path` metadata still identifies the file being checked. Removed keys always produce exit `1`, even though the configuration loads successfully.
 
-Loader and file-key diagnostics withhold source filenames, rejected values and parser excerpts. Syntax errors retain typed reasons and byte line/column positions when available; CLI edit parse refusals use the same safe formatting.
+Loader and file-key diagnostics withhold source filenames, rejected values and parser excerpts. Syntax errors and unknown-key warnings retain byte line/column positions when available. Peer-entry refusals identify the zero-based array index and say `entry dropped`. CLI edit parse refusals retain static repair hints, and a failed output guard identifies flock's own edit as the cause.
 
 Every diagnostic is printed, unlike the in-app warning banner, which truncates to four lines. The check resolves keybindings in full, so conflicts and deprecation renames are caught rather than just TOML syntax errors.
 

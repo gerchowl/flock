@@ -1648,7 +1648,7 @@ fn config_check_json_and_cli_warnings_use_safe_schema_keys() {
     );
     assert!(
         json.to_string()
-            .contains("unknown_config_key; key=msg; source=base file; at line 6"),
+            .contains("unknown_config_key; key=msg; source=base file; at 6:1"),
         "{json}"
     );
     let text = run(&["config", "check"]);
