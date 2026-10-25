@@ -164,6 +164,14 @@ max_spawn_fanout = {fanout}
             assert child["runtime"] == "structured" and "pane_id" not in child
             assert select.select([turn_ready], [], [], 10)[0], "opening turn was not consumed"
             assert os.read(turn_ready, 1) == b"T"
+            journals = list((root / "x").glob(f"**/sessions/{child_id}/queue.jsonl"))
+            assert len(journals) == 1, "one opening journal owner"
+            records = [json.loads(line) for line in journals[0].read_text().splitlines()]
+            added = [record["item"] for record in records if record.get("kind") == "upsert"]
+            assert len(added) == 1, "one durable opening admission"
+            assert added[0]["producer"] == {"agent": parent_id}, "attested MCP starter"
+            assert added[0]["kind"] == "message"
+            assert "dogfood-task" in added[0]["body"] and "UNTRUSTED TASK" in added[0]["body"]
             extra = dict(args, name="extra-child")
             expected = "at_agent_capacity" if scenario == "capacity" else "at_fanout_limit"
             assert tool("flock_agent_start", extra)["error"]["data"]["refusal"] == expected
@@ -190,9 +198,8 @@ max_spawn_fanout = {fanout}
                 assert refusal["response"]["error"]["code"] == "operator_only", refusal
             resumed = cli("agent", "start", "dogfood-child", "--runtime", "structured", "--", "claude")["result"]["agent"]
             assert resumed["agent_id"] == child_id and resumed["session_id"] == child["session_id"]
-            assert select.select([resume_ready], [], [], 10)[0], "operator resume readiness missing"
+            assert select.select([resume_ready], [], [], 10)[0], "opening session resume missing"
             assert os.read(resume_ready, 1) == b"R"
-            # Fanout still bills the original parent after an operator resume.
             assert tool("flock_agent_start", extra)["error"]["data"]["refusal"] == expected
             cli("agent", "stop", child_id)
             observe(child_id, "offline")
@@ -201,10 +208,22 @@ max_spawn_fanout = {fanout}
             channel = None
             control.close()
             cli("agent", "stop", parent_id)
+            observe(parent_id, "offline")
+            resumed_parent = cli("agent", "start", "dogfood-parent", "--runtime", "structured", "--", "claude")["result"]["agent"]
+            assert resumed_parent["session_id"] == created["session_id"]
+            assert select.select([ready], [], [], 10)[0], "idle session resume missing"
+            assert os.read(ready, 1) == b"R"
+            with socket.socket(socket.AF_UNIX) as resumed_control:
+                resumed_control.settimeout(10)
+                resumed_control.connect(str(root / "control"))
+                resumed_control.sendall(b'"close"\n')
+            cli("agent", "stop", parent_id)
+            observe(parent_id, "offline")
             cli("server", "stop")
             assert server.wait(timeout=15) == 0
             return {"scenario":scenario,"status":"passed", "public_cli":True,"real_mcp":True,
-                    "scoped_identity":True,"framed_opening_turn":True,"isolated_home":True}
+                    "scoped_identity":True,"framed_opening_turn":True,"isolated_home":True,
+                    "operator_resume_with_opening":True,"operator_resume_without_opening":True}
         finally:
             if channel is not None:
                 channel.close()
