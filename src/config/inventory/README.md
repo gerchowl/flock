@@ -196,6 +196,60 @@ messages, I/O messages, file paths and input values are never retained in the
 safe diagnostic. `Display` and `Debug` only see safe data. Existing loader and
 CLI String consumers format that safe object rather than scrubbing messages.
 
+Cause labels are a closed diagnostic vocabulary, not `error.code` values.
+They appear only as text in `SuccessResponse.result.diagnostics[]` and carry
+no retry class. Clients must not interpret a cause label as `error.code`.
+Future GUI branching requires a typed, versioned schema enum, not registry
+entries. The base labels are:
+
+- `config parse error: invalid_toml`
+- `invalid_config_type`
+- `unknown_config_key`
+- `removed_config_key`
+- `read_error`
+- `invalid_catalog`
+- `missing_peer_name`
+- `duplicate_peer`
+- `invalid_peer_target`
+
+The producer-closure slice also routes `validation::Cause` through
+`Diagnostic::Cause::Validation`. Its closed labels are:
+
+- `invalid keybinding`
+- `range keybinding is only valid for indexed actions`
+- `invalid indexed keybinding: expected modifier combination`
+- `indexed keybinding must use 1..9`
+- `navigate keybinding must not include prefix`
+- `navigate keybinding cannot use esc`
+- `reserved keybinding: uses keys.prefix; pressing the prefix twice sends a literal prefix key`
+- `conflicting keybinding: first binding kept`
+- `unsafe direct keybinding: would intercept typing; require the prefix`
+- `empty custom command`
+- `unsupported sound file format; expected an mp3 file`
+- `missing sound file`
+- `invalid sound file: expected a regular file`
+- `unknown agent: not an agent flock detects`
+- `duplicate agent alias: first spelling kept`
+- `environment key is empty`
+- `environment key contains '=', which is not part of a variable name`
+- `environment key looks like a wildcard; only exact names are matched`
+- `environment key contains whitespace, which no shell can export`
+- `entry is missing name`
+- `duplicate name: later entry ignored`
+- `interval_secs is less than checks.min_tick_secs; clamped`
+- `timeout_secs is less than 1; using 1s`
+- `debounce is 0; using 1 so a single fire still emits`
+- `program is not absolute and not under ~/.flock/checks/`
+- `invalid channel name: needs 1-64 characters from [A-Za-z0-9_-]`
+- `invalid channel entry: needs an owner_node`
+- `invalid channel entry: needs a unique name`
+- `invalid channel target: expected fleet, repo:<name> or agent:<id>`
+
+The exhaustive fixture covers every `Cause` variant and pins its rendered
+label to both this guide and ADR-0041 §4. Adding a cause requires a deliberate
+fixture and documentation update. #2434 tracks the scanner's separate
+emission-provenance follow-up; it is not changed in this stack.
+
 Diagnostic keys are rebuilt from catalog paths and aliases. User-map entries
 become `<key>` and collection indices become `[]`; an unknown descendant stops
 at its nearest declared container, and unknown roots become `document root`.

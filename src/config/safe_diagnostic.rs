@@ -265,7 +265,7 @@ impl Diagnostic {
 }
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let code = match self.cause {
+        let cause_label = match self.cause {
             Cause::Validation(cause) => cause.description().0,
             Cause::InvalidToml => "config parse error: invalid_toml",
             Cause::InvalidType => "invalid_config_type",
@@ -279,7 +279,7 @@ impl fmt::Display for Diagnostic {
         };
         write!(
             f,
-            "{code}; key={}; source={}",
+            "{cause_label}; key={}; source={}",
             self.key,
             self.source.label()
         )?;
@@ -404,6 +404,110 @@ pub(crate) fn edit_parse_error(error: &toml::de::Error, text: &str, output: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cause_labels_are_closed_documented_diagnostics_not_error_codes() {
+        let mut cases = vec![
+            (Cause::InvalidToml, "config parse error: invalid_toml"),
+            (Cause::InvalidType, "invalid_config_type"),
+            (Cause::Unknown, "unknown_config_key"),
+            (Cause::Removed, "removed_config_key"),
+            (Cause::Read(ErrorKind::Other), "read_error"),
+            (Cause::InvalidCatalog, "invalid_catalog"),
+            (Cause::MissingPeerName, "missing_peer_name"),
+            (Cause::DuplicatePeer, "duplicate_peer"),
+            (Cause::InvalidPeerTarget, "invalid_peer_target"),
+        ];
+        use crate::config::validation::Cause as ValidationCause;
+        let validation_cases = [
+            (ValidationCause::InvalidBinding, "invalid keybinding"),
+            (ValidationCause::Range, "range keybinding is only valid for indexed actions"),
+            (ValidationCause::InvalidModifier, "invalid indexed keybinding: expected modifier combination"),
+            (ValidationCause::Indexed, "indexed keybinding must use 1..9"),
+            (ValidationCause::NavigatePrefix, "navigate keybinding must not include prefix"),
+            (ValidationCause::NavigateEsc, "navigate keybinding cannot use esc"),
+            (ValidationCause::Reserved, "reserved keybinding: uses keys.prefix; pressing the prefix twice sends a literal prefix key"),
+            (ValidationCause::Conflict, "conflicting keybinding: first binding kept"),
+            (ValidationCause::DirectPrintable, "unsafe direct keybinding: would intercept typing; require the prefix"),
+            (ValidationCause::EmptyCommand, "empty custom command"),
+            (ValidationCause::SoundFormat, "unsupported sound file format; expected an mp3 file"),
+            (ValidationCause::SoundMissing, "missing sound file"),
+            (ValidationCause::SoundInvalid, "invalid sound file: expected a regular file"),
+            (ValidationCause::UnknownAgent, "unknown agent: not an agent flock detects"),
+            (ValidationCause::AgentAlias, "duplicate agent alias: first spelling kept"),
+            (ValidationCause::EmptyEnv, "environment key is empty"),
+            (ValidationCause::EqualsEnv, "environment key contains '=', which is not part of a variable name"),
+            (ValidationCause::WildcardEnv, "environment key looks like a wildcard; only exact names are matched"),
+            (ValidationCause::WhitespaceEnv, "environment key contains whitespace, which no shell can export"),
+            (ValidationCause::MissingName, "entry is missing name"),
+            (ValidationCause::DuplicateName, "duplicate name: later entry ignored"),
+            (ValidationCause::Interval { minimum: 1 }, "interval_secs is less than checks.min_tick_secs; clamped"),
+            (ValidationCause::Timeout, "timeout_secs is less than 1; using 1s"),
+            (ValidationCause::Debounce, "debounce is 0; using 1 so a single fire still emits"),
+            (ValidationCause::Program, "program is not absolute and not under ~/.flock/checks/"),
+            (ValidationCause::ChannelName, "invalid channel name: needs 1-64 characters from [A-Za-z0-9_-]"),
+            (ValidationCause::ChannelOwner, "invalid channel entry: needs an owner_node"),
+            (ValidationCause::ChannelDuplicate, "invalid channel entry: needs a unique name"),
+            (ValidationCause::ChannelTarget, "invalid channel target: expected fleet, repo:<name> or agent:<id>"),
+        ];
+        let validation_source = syn::parse_file(include_str!("validation.rs")).unwrap();
+        let validation_variants = validation_source
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Enum(item) if item.ident == "Cause" => Some(item.variants.len()),
+                _ => None,
+            })
+            .unwrap();
+        let validation_covered: std::collections::HashSet<_> = validation_cases
+            .iter()
+            .map(|(cause, _)| std::mem::discriminant(cause))
+            .collect();
+        assert_eq!(
+            validation_covered.len(),
+            validation_variants,
+            "every validation Cause needs a documented label fixture"
+        );
+        cases.extend(
+            validation_cases
+                .into_iter()
+                .map(|(cause, label)| (Cause::Validation(cause), label)),
+        );
+        let source = syn::parse_file(include_str!("safe_diagnostic.rs")).unwrap();
+        let variants = source
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Enum(item) if item.ident == "Cause" => Some(item.variants.len()),
+                _ => None,
+            })
+            .unwrap();
+        let covered: std::collections::HashSet<_> = cases
+            .iter()
+            .map(|(cause, _)| std::mem::discriminant(cause))
+            .collect();
+        assert_eq!(
+            covered.len(),
+            variants,
+            "every Cause needs a documented label fixture"
+        );
+        let mut labels = std::collections::BTreeSet::new();
+        for (cause, label) in cases {
+            assert!(labels.insert(label), "cause labels must be distinct");
+            let text =
+                Diagnostic::new(cause, "", Source::Unavailable, Outcome::KeepCurrent).to_string();
+            assert_eq!(text.split_once("; key=").unwrap().0, label);
+            for document in [
+                include_str!("../../docs/adr/0041-configuration-v2.md"),
+                include_str!("inventory/README.md"),
+            ] {
+                assert!(
+                    document.contains(&format!("`{label}`")),
+                    "undocumented cause label: {label}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn schema_shapes_never_echo_adversarial_map_or_unknown_keys() {
         for path in [
