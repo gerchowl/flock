@@ -31,10 +31,11 @@ checks and retains operator-mode UID/process-detachment limits (#1177, #1629).
 `structured.grants.list {"agent_id":"…"}` returns
 `result.type: "structured_grants"`, the exact `agent_id`, runtime `generation`,
 and `grants`. Each installed grant contains `request_id`, `request_seq`, `tool`,
-`canonical_input_key` and `installed_ms` (Unix milliseconds from its decision
-installation audit). The key is canonical JSON `[tool_name, input]`: object keys
+`canonical_input_key` and `installed_ms` (unsigned 64-bit Unix milliseconds
+from its decision installation audit). The key is canonical JSON `[tool_name, input]`: object keys
 are recursively sorted; arrays and scalar values remain exact. Pending installs
-are not listed. Names and pane IDs are not accepted as grant identities.
+are not listed. A runtime holds at most 16 installed/reserved exact keys
+(`MAX_GRANTS`). Names and pane IDs are not accepted as grant identities.
 
 `structured.grants.revoke` takes `agent_id`, `generation`, `request_id` and
 `request_seq`. Use the generation and originating decision handle from the list

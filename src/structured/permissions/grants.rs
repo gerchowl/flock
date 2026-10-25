@@ -15,7 +15,7 @@ pub struct SessionGrant {
     pub handle: GrantHandle,
     pub tool: String,
     pub canonical_input_key: String,
-    pub installed_ms: u128,
+    pub installed_ms: u64,
 }
 /// Exact structured agent identity; names and pane IDs are not grant authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

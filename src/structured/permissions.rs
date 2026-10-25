@@ -104,7 +104,7 @@ enum Stage {
 struct Grant {
     epoch: u64,
     tool: String,
-    installed_ms: u128,
+    installed_ms: u64,
     request_seq: u64,
     subject: String,
     request_id: String,
@@ -438,7 +438,7 @@ impl Book {
             false
         }
     }
-    pub fn audited(&mut self, answer: &Answer, installed_ms: u128) {
+    pub fn audited(&mut self, answer: &Answer, installed_ms: u64) {
         let Some(open) = self.open.get_mut(&answer.id).filter(|r| {
             r.request_seq == answer.request_seq && r.stage == Stage::Auditing && self.active
         }) else {
