@@ -155,7 +155,7 @@ absent from the root and fields with no independent default (`Required`).
 user-keyed restart policies. Candidate and running snapshots remain separate;
 callers must supply their actual respective states rather than assuming a
 successful parse applied every setting. Existing reload limits, including
-#2397 and cached consumers, remain unchanged.
+cached consumers, remain unchanged.
 
 Provenance takes canonical schema paths (including `[]`/`<key>` patterns),
 not user instance keys. File paths and arbitrary source identifiers are never
