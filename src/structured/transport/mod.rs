@@ -464,6 +464,23 @@ impl Drop for Transport {
 }
 
 impl InputHandle {
+    pub(super) fn session_grants(
+        &self,
+        principal: &Principal<'_>,
+        revoke: Option<&permissions::grants::GrantHandle>,
+    ) -> Result<Vec<permissions::grants::SessionGrant>, ErrorCode> {
+        if !matches!(principal, Principal::Operator) {
+            return Err(ErrorCode::OperatorOnly);
+        }
+        if self.cancel.load(Ordering::Acquire) || self.close.load(Ordering::Acquire) {
+            return Err(ErrorCode::AgentNotFound);
+        }
+        let mut book = self.permissions.try_lock().ok_or(ErrorCode::SessionBusy)?;
+        if let Some(handle) = revoke {
+            book.revoke(handle)?;
+        }
+        Ok(book.grants())
+    }
     pub(super) fn waiting_on_human(&self) -> Result<Vec<(String, u64)>, ErrorCode> {
         Ok(self
             .permissions
