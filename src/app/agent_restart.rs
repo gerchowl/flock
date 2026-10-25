@@ -108,7 +108,7 @@ impl App {
         self.state
             .terminals
             .get(id)
-            .and_then(|t| t.agent_name.as_ref())
+            .and_then(|t| t.agent_name())
             .and_then(|name| config.restart_agents.get(name))
             .unwrap_or(&config.restart)
             .clone()
@@ -143,6 +143,9 @@ impl App {
                 "reason must be nonempty plain text (at most 1024 bytes); when must be after_turn"
                     .into(),
             ));
+        }
+        if let Some(error) = self.structured_terminal_error(&params.target) {
+            return Err(self.agent_target_error_body(error));
         }
         let (ws_idx, pane_id) = if params.target == "self" {
             self.parse_pane_id_or_peer("", self.current_api_peer_pid)

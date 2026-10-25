@@ -63,17 +63,19 @@ pub struct Runtime {
     stop: StopRequest,
     control: StopHandle,
     events: mpsc::Receiver<Received>,
+    /// Stored publication handle for the registry runtime owner.
+    pub(super) history: super::history::History,
     queue: Option<super::workers::queue::Client>,
 }
 impl Runtime {
     /// Offer a bounded user envelope only while idle; WouldBlock never waits.
-    /// Queue-owned workers refuse this raw entry with queue_mode_unsupported;
-    /// producers must use generation-fenced queue admission instead.
     /// Successful admission emits an internal accepted-input fact through
     /// `Received::state_input`, arming S4 silence observation before started.
     /// Success acknowledges admission, not delivery or provider execution.
     /// An unavailable acceptance observer requests process shutdown; ordinary
     /// I/O cancellation preserves the independently observed exit outcome.
+    /// Queue-owned workers refuse this raw entry with queue_mode_unsupported;
+    /// producers must use generation-fenced queue admission instead.
     /// `structured_turn_end_unknown` means loss concealed the boundary; await a
     /// subsequent result or explicitly stop, rather than retry as ordinary busy.
     pub fn try_submit(&self, user: &Value) -> io::Result<()> {
@@ -146,8 +148,10 @@ impl Runtime {
     ) -> Result<(), crate::api::error_code::ErrorCode> {
         self.transport.close_permissions(principal, id, reason)
     }
-    /// Current permission ids for S4 attention; a busy snapshot fails closed.
-    pub fn waiting_on_human(&self) -> Result<Vec<String>, crate::api::error_code::ErrorCode> {
+    /// Current `(request_id, request_seq)` handles for operator decisions; a busy snapshot fails closed.
+    pub fn waiting_on_human(
+        &self,
+    ) -> Result<Vec<(String, u64)>, crate::api::error_code::ErrorCode> {
         self.transport.waiting_on_human()
     }
     /// Poll complete events and live-only partial deltas. Empty is not EOF; monitor the owning worker result too.
@@ -215,6 +219,7 @@ pub(crate) fn run_notified(
         Control {
             stop: StopRequest::default(),
             queue_rewrite_bytes: None,
+            opening_turn: None,
         },
     )
 }
@@ -225,6 +230,8 @@ pub(crate) struct Control {
     pub stop: StopRequest,
     /// None for transport-only assembly; workers always supply configured policy.
     pub queue_rewrite_bytes: Option<std::num::NonZeroU64>,
+    /// Attested starter and framed first message, committed before runtime publication.
+    pub opening_turn: Option<(String, crate::spawn::prompt::SpawnPrompt)>,
 }
 
 /// Worker-owned cancellation exists before spawn, including deadline escalation.
@@ -242,6 +249,7 @@ pub(crate) fn run_controlled(
     let Control {
         stop,
         queue_rewrite_bytes,
+        opening_turn,
     } = policy;
     if !lease.matches(&location.agent, &location.session)
         || profile.session_id() != location.session
@@ -251,10 +259,21 @@ pub(crate) fn run_controlled(
     profile.register_flock_mcp(Some(&lease), &mcp)?;
     let (queue, queue_client) = match queue_rewrite_bytes {
         Some(bytes) => {
-            let (owner, client) =
+            let (mut owner, client) =
                 super::workers::queue::Service::open(state, &location.agent, bytes)
                     .map_err(super::workers::queue::launch_error)?;
+            if let Some((starter, prompt)) = opening_turn {
+                owner.admit_opening(starter, prompt).map_err(|error| {
+                    LaunchError::QueueAdmission {
+                        code: error.code,
+                        source: error.source,
+                    }
+                })?;
+            }
             (Some(owner), Some(client))
+        }
+        None if opening_turn.is_some() => {
+            return Err(io::Error::other("opening turn requires queue owner").into())
         }
         None => (None, None),
     };
@@ -338,6 +357,7 @@ pub(crate) fn run_controlled(
             ))
         }
     };
+    let history = transport.history.clone();
     let control = transport.stop_handle();
     let input = transport.input_handle();
     let (events_tx, events) = mpsc::sync_channel(4);
@@ -374,6 +394,7 @@ pub(crate) fn run_controlled(
     }
     let publication_failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ready(Runtime {
+            history,
             transport: input,
             stop: stop.clone(),
             control: control.clone(),
@@ -383,6 +404,7 @@ pub(crate) fn run_controlled(
     }))
     .is_err();
     if publication_failed {
+        lease.revoke();
         stop.request();
         control.cancel();
     }
@@ -392,8 +414,12 @@ pub(crate) fn run_controlled(
         files,
         config,
         stop.clone(),
-        || control.close_stdin(),
         || {
+            lease.revoke();
+            control.close_stdin();
+        },
+        || {
+            lease.revoke();
             control.close_stdin();
             match io_rx.recv_timeout(IO_LIMIT) {
                 Ok(received) => facts = received,
@@ -451,6 +477,7 @@ fn startup_failed(
     io_confirmed: bool,
     lease: &mut super::lease::Lease,
 ) -> LaunchError {
+    lease.revoke();
     let stop = StopRequest::default();
     stop.request();
     // Missing child pipes precede all I/O workers. A partially started transport
@@ -564,7 +591,9 @@ fn collect(
             if !queue.flush(control.cancelled(), notify) {
                 return false;
             }
-            if queue.tick(&input, stop.requested(), notify) && control.cancelled() {
+            // ADR-0036 §3/§4: a failed stdin offer ends this runtime's authority.
+            // Do not wait for I/O cancellation before supervising its cleanup.
+            if queue.tick(&input, stop.requested(), notify) {
                 stop.request();
             }
             queue.flush(control.cancelled(), notify)
@@ -603,7 +632,7 @@ fn collect(
                         facts.delivery_cancelled = true;
                     }
                     if let Some(queue) = &mut queue {
-                        if queue.event(&input, &received, stop.requested()) && control.cancelled() {
+                        if queue.event(&input, &received, stop.requested()) {
                             stop.request();
                         }
                     }

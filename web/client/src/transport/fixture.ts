@@ -37,6 +37,7 @@ function set<K extends string>(table: Discriminators<K>): ReadonlySet<string> {
 }
 
 const TYPES = set<KnownSessionEvent["type"]>({
+  flk_permission_request: true,
   assistant: true,
   user: true,
   command_lifecycle: true,
@@ -48,6 +49,7 @@ const TYPES = set<KnownSessionEvent["type"]>({
   stream_event: true,
   result: true,
 });
+const PERMISSION = set<Of<"flk_permission_request">["state"]>({ open: true, closed: true });
 const SYSTEM = set<Of<"system">["subtype"]>({
   init: true,
   status: true,
@@ -88,6 +90,8 @@ function hasKnownDiscriminators(value: JsonValue): boolean {
   const type = value["type"];
   if (typeof type !== "string" || !TYPES.has(type)) return false;
   switch (type) {
+    case "flk_permission_request":
+      return nestedIn(value, "state", PERMISSION);
     case "system":
       return nestedIn(value, "subtype", SYSTEM);
     case "result":

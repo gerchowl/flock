@@ -3,9 +3,11 @@
  *
  * @module
  */
-import { For, Show, createUniqueId, type JSX } from "solid-js";
+import { For, Show, createEffect, createUniqueId, type JSX } from "solid-js";
 
 import type { AgentRow } from "../fleet";
+import type { Sender } from "./Composer";
+import { PermissionActions, createDecideUi, type DecideUi } from "./decide";
 import { sortInbox, type InboxCard } from "./inbox";
 import { PHASE_LABELS, StatusMark, markFor } from "./marks";
 
@@ -44,28 +46,92 @@ export function AgentRowButton(props: { readonly row: AgentRow; readonly focused
   );
 }
 
+const keyOf = (card: InboxCard): string => `${card.agent}\u0000${card.id}`;
+
+/** The request ids that have closed in this session (see {@link createClosedIds}). */
+export type ClosedIds = { readonly has: (card: InboxCard) => boolean };
+
+/**
+ * Remembers, for the session (the Workbench's lifetime), every request id that left `cards`. The
+ * server may reuse an id once it falls out of its retained-closed window, so a card that comes
+ * back under one starts unacknowledged. It lives above the views: a phone/desktop switch or a tab
+ * change unmounts `InboxCards`, and a close or reopen can happen while it is away. Unbounded on purpose.
+ */
+export function createClosedIds(cards: () => readonly InboxCard[]): ClosedIds {
+  const closed = new Set<string>();
+  let live = new Set<string>();
+  createEffect(() => {
+    const next = new Set(cards().map(keyOf));
+    for (const key of live) if (!next.has(key)) closed.add(key);
+    live = next;
+  });
+  return { has: (card) => closed.has(keyOf(card)) };
+}
+
 /** The inbox's cards, blocking first. */
-export function InboxCards(props: { readonly cards: readonly InboxCard[] }): JSX.Element {
+export function InboxCards(props: { readonly cards: readonly InboxCard[]; readonly closed: ClosedIds; readonly source: "replay" | "live"; readonly sender: Sender | null }): JSX.Element {
+  const note = (): string | null =>
+    props.source === "live"
+      ? props.cards.length === 0
+        ? "No open permission prompts."
+        : null
+      : props.cards.length === 0
+        ? "The live inbox arrives with G5 (#1597)."
+        : "Sample cards: the live inbox arrives with G5 (#1597).";
+  // A card is rebuilt on every record, so what the person typed lives here, by request.
+  const uis = new Map<string, DecideUi>();
+  const uiFor = (card: InboxCard): DecideUi => {
+    const key = keyOf(card);
+    const found = uis.get(key);
+    if (found !== undefined) return found;
+    const fresh = createDecideUi(props.closed.has(card));
+    uis.set(key, fresh);
+    return fresh;
+  };
+  // No state leaks: an entry goes when its request closes or is delisted.
+  createEffect(() => {
+    const live = new Set(props.cards.map(keyOf));
+    for (const key of [...uis.keys()])
+      if (!live.has(key)) {
+        uis.delete(key);
+      }
+  });
   return (
     <>
-      <p class="inbox__note">{props.cards.length === 0 ? "The live inbox arrives with G5 (#1597)." : "Sample cards: the live inbox arrives with G5 (#1597)."}</p>
+      <Show when={note()}>{(text) => <p class="inbox__note">{text()}</p>}</Show>
       <For each={sortInbox(props.cards)}>
         {(card) => {
           const reason = createUniqueId();
           return (
-          <article class="card" classList={{ "card--blocking": card.blocking }} data-testid="inbox-card">
+          <article class="card" classList={{ "card--blocking": card.blocking }} data-testid="inbox-card" data-request-seq={card.requestSeq}>
             <p class="card__meta">
-              {card.kind === "permission" ? "Permission" : "Question"} · {card.agent}
+              {card.kind === "permission" ? "Permission" : "Question"} · {card.agentLabel}
             </p>
             <h3 class="card__title">{card.title}</h3>
             <p class="card__detail">{card.detail}</p>
-            <div class="card__choices">
-              <For each={card.choices}>{(choice) => <Waits label={choice} reasonId={reason} />}</For>
-              <Waits label="Edit…" reasonId={reason} />
-            </div>
-            <p id={reason} class="waits__reason">
-              Answering waits for the inbox stream (G5 #1597).
-            </p>
+            <Show when={card.stale}>
+              <p class="card__stale" data-testid="inbox-stale">
+                This agent's history has a gap; this may be out of date.
+              </p>
+            </Show>
+            <Show when={card.choices.length > 0}>
+              <Show
+                when={card.waitsFor === undefined}
+                fallback={
+                  <>
+                    <div class="card__choices">
+                      <For each={card.choices}>{(choice) => <Waits label={choice} reasonId={reason} />}</For>
+                      <Waits label="Edit…" reasonId={reason} />
+                    </div>
+                    <p id={reason} class="waits__reason">
+                      Answering waits for {card.waitsFor}.
+                    </p>
+                  </>
+                }
+              >
+                <PermissionActions card={card} sender={props.sender} ui={uiFor(card)} />
+              </Show>
+            </Show>
           </article>
           );
         }}

@@ -43,6 +43,7 @@ const REPLAYED = [
   "lagged",
   "network-change",
   "old-socket",
+  "permission-decision",
   "ping-pong",
   "protocol-refusal",
   "set-token-changed-principal",

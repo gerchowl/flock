@@ -51,7 +51,7 @@ Flock only resumes panes that reported a native session reference through a curr
 
 After a client attaches and provides terminal size and theme context, Flock resumes eligible restored agent panes across workspaces and tabs without waiting for each pane to be focused.
 
-A deferred resume sets `resume_failed` when its command has no arguments, spawning its shell fails, or sending the resume command fails. That flag stops automatic retries in the current server; a cold server restart clears it and allows one fresh automatic attempt when restore conditions are met. An empty resume command is logged once for that automatic attempt, and its saved plan is retained. Waiting for terminal theme context is a deferral: it does not set the flag and remains eligible for reconsideration on later ticks.
+A deferred resume sets `resume_failed` when its command has no arguments, spawning its shell fails, or sending the resume command fails. That flag stops automatic retries in the current server; a cold server restart clears it and allows one fresh automatic attempt when restore conditions are met. An empty resume command is logged once for that automatic attempt, and its saved plan is retained. After that failure, agent info reports `blocked_reason: resume_failed`, and the plan remains resumable. Waiting for terminal theme context is a deferral: it does not set the flag and remains eligible for reconsideration on later ticks.
 
 Native session restore requires these Flock integration versions or newer:
 

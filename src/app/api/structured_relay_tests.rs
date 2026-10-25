@@ -93,6 +93,7 @@ fn request(r: &mut AppQueue, d: Deliver) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     r.app
         .handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "relay".into(),
                 method: Method::MeshDeliver(Box::new(d)),
@@ -516,6 +517,7 @@ fn relay_queue_reply_routes_by_verified_custody_origin_not_claimed_host() {
         let (tx, rx) = mpsc::channel();
         r.app
             .handle_api_request_message(crate::api::ApiRequestMessage {
+                scope: None,
                 request: Request {
                     id: "reply".into(),
                     method: Method::MsgReply(crate::api::schema::MsgReplyParams {
@@ -684,7 +686,7 @@ fn custody_completion_permanent_recovery_refusal_is_terminal_and_visible() {
                 .state,
             "refused"
         );
-        assert!(r.hub.events_after(0).iter().any(|(_,event)| matches!(&event.data,crate::api::schema::EventData::MessageDelivered { correlation_id,delivered:false,.. } if correlation_id==&d.envelope.correlation_id)));
+        assert!(r.hub.events_after(0).expect("fixture event history is retained").iter().any(|(_,event)| matches!(&event.data,crate::api::schema::EventData::MessageDelivered { correlation_id,delivered:false,.. } if correlation_id==&d.envelope.correlation_id)));
         r.stop().await;
     });
 }
@@ -886,6 +888,7 @@ fn custody_completion_legacy_sender_claim_never_routes_to_a_queue() {
         let pid = std::process::id();
         r.app
             .handle_api_request_message(crate::api::ApiRequestMessage {
+                scope: None,
                 request: Request {
                     id: "legacy-reply".into(),
                     method: Method::MsgReply(
@@ -1015,17 +1018,25 @@ fn custody_completion_settled_unknown_recipient_does_not_emit_a_refusal() {
             .structured_agents
             .remove(&r.case.id, r.case.generation)
             .unwrap();
-        let cursor = r.hub.events_after(0).last().map_or(0, |(seq, _)| *seq);
+        let cursor = r
+            .hub
+            .events_after(0)
+            .expect("fixture event history is retained")
+            .last()
+            .map_or(0, |(seq, _)| *seq);
         r.app.restore_mesh_mail().unwrap();
-        assert!(
-            !r.hub.events_after(cursor).iter().any(|(_, event)| matches!(
+        assert!(!r
+            .hub
+            .events_after(cursor)
+            .expect("fixture event cursor is retained")
+            .iter()
+            .any(|(_, event)| matches!(
                 &event.data,
                 crate::api::schema::EventData::MessageDelivered {
                     delivered: false,
                     ..
                 }
-            ))
-        );
+            )));
         assert_eq!(
             with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
                 .unwrap()
@@ -1074,6 +1085,7 @@ fn custody_completion_node_signature_without_local_binding_is_not_sender_attesta
         let pid = std::process::id();
         r.app
             .handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "unbound-reply".into(),
                 method: Method::MsgReply(

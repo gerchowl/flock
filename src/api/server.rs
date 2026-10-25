@@ -30,13 +30,29 @@ const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 
+/// Fixed categories for optional MCP provisioning; never expose path details.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum McpEndpointFailure {
+    /// Executable lookup or validation failed.
+    Exe,
+    /// The bound listener cannot be resolved to an absolute endpoint.
+    Socket,
+}
+
 pub struct ServerHandle {
-    _thread: std::thread::JoinHandle<()>,
+    _thread: Option<std::thread::JoinHandle<()>>,
+    /// Fixture-only executable failure injection.
+    #[cfg(test)]
+    pub(crate) mcp_executable: fn() -> io::Result<PathBuf>,
     path: PathBuf,
+    // Resolved once at bind; None keeps ordinary startup available.
+    mcp_socket: Option<PathBuf>,
     pub(crate) node_id: Option<String>,
     pub(crate) clone_detection_warning: Option<String>,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
+    /// Structured listener health owned by this server, shared with its lifecycle owner.
+    pub(crate) client_listener: crate::api::client_listener::Health,
 }
 
 impl Drop for ServerHandle {
@@ -52,6 +68,38 @@ impl Drop for ServerHandle {
 }
 
 impl ServerHandle {
+    /// Pin MCP to this listener, independent of inherited client variables.
+    pub(crate) fn session_mcp(
+        &self,
+    ) -> Result<crate::structured::launch::SessionMcp, McpEndpointFailure> {
+        let socket = self.mcp_socket.as_ref().ok_or(McpEndpointFailure::Socket)?;
+        #[cfg(test)]
+        let binary = (self.mcp_executable)();
+        #[cfg(not(test))]
+        let binary = std::env::current_exe();
+        let binary = binary.map_err(|_| McpEndpointFailure::Exe)?;
+        crate::structured::launch::SessionMcp::new(&binary, socket)
+            .map_err(|_| McpEndpointFailure::Exe)
+    }
+
+    /// Stop and join this fixture's owned listener, without signaling processes.
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        // A listener that already observed shutdown may have closed before wakeup.
+        drop(UnixStream::connect(&self.path));
+        let thread = self._thread.take().expect("owned accept thread");
+        let (finished, completion) = std::sync::mpsc::sync_channel(1);
+        let joiner = std::thread::spawn(move || {
+            let _ = finished.send(thread.join());
+        });
+        completion
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bounded fixture listener shutdown")
+            .unwrap();
+        joiner.join().unwrap();
+    }
+
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
         remove_socket_file_if_owned(&self.path, self.identity)
     }
@@ -84,7 +132,9 @@ pub(crate) fn start_server_for_mode(
             clone_detection_warning: identity.clone_detection_warning.clone(),
             agent_start_label: true,
             agent_questions: true,
-            pane_input_write_ack: false,
+            structured_agents: true,
+            pane_input_write_ack: true,
+            events_live_start: true,
         }),
         uid_policy,
     )
@@ -96,9 +146,27 @@ pub(crate) fn start_server_with_capabilities(
     capabilities: Option<ServerCapabilities>,
     uid_policy: crate::structured::identity::UidPolicy,
 ) -> std::io::Result<ServerHandle> {
+    start_server_with_capabilities_and_health(
+        api_tx,
+        event_hub,
+        capabilities,
+        uid_policy,
+        Default::default(),
+    )
+}
+
+/// Rebind the API socket while retaining its logical server's listener health.
+pub(crate) fn start_server_with_capabilities_and_health(
+    api_tx: ApiRequestSender,
+    event_hub: EventHub,
+    capabilities: Option<ServerCapabilities>,
+    uid_policy: crate::structured::identity::UidPolicy,
+    client_listener: crate::api::client_listener::Health,
+) -> std::io::Result<ServerHandle> {
     let path = socket_path();
     prepare_socket_path(&path)?;
 
+    let mcp_socket = std::path::absolute(&path).ok();
     let listener = UnixListener::bind(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
@@ -110,6 +178,7 @@ pub(crate) fn start_server_with_capabilities(
     let clone_detection_warning = capabilities
         .as_ref()
         .and_then(|caps| caps.clone_detection_warning.clone());
+    let connection_status = client_listener.clone();
     let thread = std::thread::spawn(move || {
         let health = Arc::new(Mutex::new(crate::api::schema::ApiListenerHealth::default()));
         run_accept_loop(
@@ -122,6 +191,7 @@ pub(crate) fn start_server_with_capabilities(
                 let capabilities = capabilities.clone();
                 let connection_running = Arc::clone(&listener_running);
                 let health = Arc::clone(&health);
+                let client_listener = connection_status.clone();
                 let uid_policy = uid_policy.clone();
                 std::thread::spawn(move || {
                     if let Err(err) = handle_connection(
@@ -131,6 +201,7 @@ pub(crate) fn start_server_with_capabilities(
                         &connection_running,
                         capabilities,
                         &health,
+                        &client_listener,
                         &uid_policy,
                     ) {
                         crate::logging::api_connection_failed(&err.to_string());
@@ -142,12 +213,16 @@ pub(crate) fn start_server_with_capabilities(
     });
 
     Ok(ServerHandle {
-        _thread: thread,
+        _thread: Some(thread),
+        #[cfg(test)]
+        mcp_executable: std::env::current_exe,
+        mcp_socket,
         node_id,
         clone_detection_warning,
         path,
         identity,
         running,
+        client_listener,
     })
 }
 
@@ -245,6 +320,7 @@ pub(crate) fn handle_connection(
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
+    client_listener: &crate::api::client_listener::Health,
     uid_policy: &crate::structured::identity::UidPolicy,
 ) -> std::io::Result<()> {
     let peer = crate::platform::peer::credentials(&stream);
@@ -261,9 +337,9 @@ pub(crate) fn handle_connection(
         return Ok(());
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
+    let (request, credential) = match super::scoped::decode(line) {
         Ok(request) => request,
-        Err(err) => {
+        Err(detail) => {
             write_json_line_allow_disconnect(
                 &mut stream,
                 &ErrorResponse {
@@ -271,12 +347,32 @@ pub(crate) fn handle_connection(
                     error: ErrorBody {
                         data: None,
                         code: "invalid_request".into(),
-                        message: format!("invalid request: {err}"),
+                        message: detail.map_or_else(
+                            || "invalid request".into(),
+                            |error| format!("invalid request: {error}"),
+                        ),
                     },
                 },
             )?;
             return Ok(());
         }
+    };
+
+    let _scope = match credential {
+        Some(credential) => match super::scoped::Scope::enter(credential, peer, &request, api_tx) {
+            Ok(guard) => Some(guard),
+            Err(()) => {
+                return write_text_line_allow_disconnect(
+                    &mut stream,
+                    &error_response_json(
+                        request.id,
+                        crate::api::error_code::ErrorCode::NotAuthorized.as_str(),
+                        "scoped caller authentication refused".into(),
+                    ),
+                )
+            }
+        },
+        None => None,
     };
 
     let request_id = request.id.clone();
@@ -410,6 +506,7 @@ pub(crate) fn handle_connection(
                 capabilities,
                 peer,
                 listener_health,
+                client_listener,
                 uid_policy,
             );
             let result = write_text_line_allow_disconnect(&mut stream, &response);
@@ -440,6 +537,7 @@ fn handle_request(
     capabilities: Option<ServerCapabilities>,
     peer: crate::platform::peer::Credentials,
     listener_health: &Mutex<crate::api::schema::ApiListenerHealth>,
+    client_listener: &crate::api::client_listener::Health,
     uid_policy: &crate::structured::identity::UidPolicy,
 ) -> String {
     match request.method {
@@ -460,6 +558,7 @@ fn handle_request(
                 // exactly as long as the fault lasts.
                 session_health: Some(crate::health::confirmed()),
                 agent_account_diagnostic: uid_policy.account_diagnostic(),
+                client_listener: client_listener.status(),
                 api_listener: Some(
                     listener_health
                         .lock()
@@ -524,6 +623,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PeersCheckoutPrepare(_) => "peers.checkout_prepare",
         Method::AgentList(_) => "agent.list",
         Method::AgentGet(_) => "agent.get",
+        Method::AgentStop(_) => "agent.stop",
         Method::AgentRead(_) => "agent.read",
         Method::AgentHistory(_) => "agent.history",
         Method::AgentResult(_) => "agent.result",
@@ -563,6 +663,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneWriteText(_) => "pane.write_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
+        Method::PaneResolveCodexLock(_) => "pane.resolve_codex_lock",
         Method::PaneWriteKeys(_) => "pane.write_keys",
         Method::PaneWriteInput(_) => "pane.write_input",
         Method::PaneSendInput(_) => "pane.send_input",
@@ -690,7 +791,23 @@ fn stream_subscriptions(
     // cursor past the newest event is refused, as `events.read` refuses it,
     // rather than streaming nothing until the hub catches up to it.
     let head = event_hub.current_sequence();
-    let start = params.after.unwrap_or(head);
+    if params.after.is_some() && params.after_sequence.is_some() {
+        return write_json_line_allow_disconnect(
+            &mut stream,
+            &ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    data: None,
+                    code: crate::api::error_code::ErrorCode::InvalidParams
+                        .as_str()
+                        .into(),
+                    message: "after and after_sequence are mutually exclusive".into(),
+                },
+            },
+        );
+    }
+    let opted_in = params.after_sequence.is_some();
+    let start = params.after_sequence.or(params.after).unwrap_or(head);
     if start > head {
         let refusal = ErrorResponse {
             id: request_id,
@@ -705,7 +822,7 @@ fn stream_subscriptions(
     let mut subscriptions = Vec::with_capacity(params.subscriptions.len());
     for (index, subscription) in params.subscriptions.into_iter().enumerate() {
         let active = match ActiveSubscription::new(
-            subscription,
+            subscription.clone(),
             &request_id,
             index,
             start,
@@ -723,14 +840,16 @@ fn stream_subscriptions(
                 return Ok(());
             }
         };
-        subscriptions.push(active);
+        subscriptions.push((subscription, active));
     }
 
     if let Err(err) = write_json_line(
         &mut stream,
         &SuccessResponse {
-            id: request_id,
-            result: ResponseResult::SubscriptionStarted {},
+            id: request_id.clone(),
+            result: ResponseResult::SubscriptionStarted {
+                start_sequence: Some(start),
+            },
         },
     ) {
         if is_connection_closed_error(&err) {
@@ -745,14 +864,21 @@ fn stream_subscriptions(
         }
 
         let mut wrote = false;
-        for subscription in &mut subscriptions {
+        for (index, (descriptor, subscription)) in subscriptions.iter_mut().enumerate() {
             if let Some(event) = subscription.poll(api_tx, event_hub) {
+                let close = event.get("error").is_some()
+                    && event["error"]["code"]
+                        != crate::api::error_code::ErrorCode::EventsLost.as_str();
+                let event = subscription_line(event, opted_in, &request_id, index, descriptor);
                 wrote = true;
                 if let Err(err) = write_json_line(&mut stream, &event) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
                     }
                     return Err(err);
+                }
+                if close {
+                    return Ok(());
                 }
             }
         }
@@ -764,7 +890,7 @@ fn stream_subscriptions(
         // keeps its old pacing exactly.
         let cursor: Option<u64> = subscriptions
             .iter()
-            .map(ActiveSubscription::hub_cursor)
+            .map(|(_, active)| active.hub_cursor())
             .collect::<Option<Vec<u64>>>()
             .and_then(|cursors| cursors.into_iter().min());
         match cursor {
@@ -776,6 +902,29 @@ fn stream_subscriptions(
             None => std::thread::sleep(CONNECTION_POLL_INTERVAL),
         }
     }
+}
+
+/// Preserve legacy loss framing unless this request explicitly opted in.
+fn subscription_line(
+    mut event: serde_json::Value,
+    opted_in: bool,
+    request_id: &str,
+    index: usize,
+    descriptor: &crate::api::schema::Subscription,
+) -> serde_json::Value {
+    if !opted_in && event["error"]["code"] == crate::api::error_code::ErrorCode::EventsLost.as_str()
+    {
+        let skipped_to = event["error"]["data"]["oldest_available_sequence"]
+            .as_u64()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        event = serde_json::json!({"event":"lagged","data":{"skipped_to":skipped_to}});
+    } else if event.get("error").is_some() {
+        event["id"] = request_id.into();
+    }
+    event["subscription_index"] = index.into();
+    event["subscription"] = serde_json::json!(descriptor);
+    event
 }
 
 fn write_text_line(stream: &mut UnixStream, value: &str) -> std::io::Result<()> {
@@ -810,6 +959,12 @@ pub(super) fn should_stop_connection(
     stream: &mut UnixStream,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
+    if super::scoped::Scope::current()
+        .is_some_and(|scope| scope.caller() == crate::structured::lease::Caller::Uncertain)
+    {
+        return Ok(true);
+    }
+
     if !running.load(Ordering::Relaxed) {
         return Ok(true);
     }
@@ -856,6 +1011,7 @@ pub(super) fn dispatch_to_app_with_timeout(
     timeout: Option<Duration>,
     peer: crate::platform::peer::Credentials,
 ) -> String {
+    let peer = super::scoped::Scope::current().map_or(peer, |scope| scope.peer());
     let request_id = request.id.clone();
     let (respond_to, response_rx) = std::sync::mpsc::channel();
     if let Err(err) = api_tx.send(ApiRequestMessage {
@@ -864,6 +1020,7 @@ pub(super) fn dispatch_to_app_with_timeout(
         peer_pid: peer.pid,
         peer_birth: peer.birth,
         peer_uid: peer.uid,
+        scope: super::scoped::Scope::current(),
     }) {
         return error_response_json(
             request_id,
@@ -960,6 +1117,7 @@ mod tests {
                     &connection_running,
                     None,
                     &health,
+                    &crate::api::client_listener::Health::default(),
                     &Default::default(),
                 )
                 .unwrap();
@@ -1082,6 +1240,7 @@ mod tests {
                 None,
                 Default::default(),
                 &health,
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             );
             let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -1313,6 +1472,7 @@ mod tests {
             None,
             crate::platform::peer::Credentials::default(),
             &Mutex::default(),
+            &crate::api::client_listener::Health::default(),
             &app.runtime_config.uid_policy,
         );
         let parsed: SuccessResponse = serde_json::from_str(&reply).unwrap();
@@ -1363,6 +1523,7 @@ mod tests {
                 None,
                 crate::platform::peer::Credentials::default(),
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &app.runtime_config.uid_policy,
             );
             let response: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -1398,6 +1559,33 @@ mod tests {
     }
 
     #[test]
+    fn ping_reports_only_its_injected_server_listener_status() {
+        use crate::api::client_listener::{Health, Status};
+        let one = Health::default();
+        let two = Health::default();
+        one.publish(Status::Failed);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        for (health, expected) in [(&one, Some(Status::Failed)), (&two, None)] {
+            let reply = handle_request(
+                Request {
+                    id: "owned-status".into(),
+                    method: Method::Ping(crate::api::schema::PingParams::default()),
+                },
+                &tx,
+                None,
+                crate::platform::peer::Credentials::default(),
+                &Mutex::default(),
+                health,
+                &Default::default(),
+            );
+            let reply: SuccessResponse = serde_json::from_str(&reply).unwrap();
+            assert!(
+                matches!(reply.result,ResponseResult::Pong{client_listener,..} if client_listener==expected)
+            );
+        }
+    }
+
+    #[test]
     fn ping_request_returns_pong() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let response = handle_request(
@@ -1412,10 +1600,13 @@ mod tests {
                 clone_detection_warning: None,
                 agent_start_label: true,
                 agent_questions: true,
+                structured_agents: true,
                 pane_input_write_ack: false,
+                events_live_start: false,
             }),
             crate::platform::peer::Credentials::default(),
             &Mutex::default(),
+            &crate::api::client_listener::Health::default(),
             &Default::default(),
         );
 
@@ -1440,6 +1631,7 @@ mod tests {
                 None,
                 Default::default(),
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             )
         });
@@ -1516,6 +1708,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             );
             done_tx.send(result).unwrap();
@@ -1556,6 +1749,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             );
             done_tx.send(result).unwrap();
@@ -1637,6 +1831,7 @@ mod tests {
             &running,
             None,
             &Mutex::default(),
+            &crate::api::client_listener::Health::default(),
             &Default::default(),
         )
         .unwrap();
@@ -1736,6 +1931,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             )
         });
@@ -1768,8 +1964,310 @@ mod tests {
         assert!(server_thread.join().unwrap().is_ok());
     }
 
+    #[test]
+    fn two_live_subscribers_at_the_same_head_do_not_replay_retained_events() {
+        let hub = EventHub::default();
+        hub.push(queued_for("ws_1:p1", "retained"));
+        let (tx, _rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let mut readers = Vec::new();
+        let mut owners = Vec::new();
+        for index in 0..2 {
+            let (client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(client);
+            let (events, api_tx) = (hub.clone(), tx.clone());
+            let running = Arc::new(AtomicBool::new(true));
+            let stop = running.clone();
+            let thread = std::thread::spawn(move || {
+                stream_subscriptions(
+                    server,
+                    format!("live-{index}"),
+                    crate::api::schema::EventsSubscribeParams {
+                        after: None,
+                        after_sequence: None,
+                        subscriptions: vec![crate::api::schema::Subscription::MsgQueued {
+                            pane: "ws_1:p1".into(),
+                        }],
+                    },
+                    &api_tx,
+                    &events,
+                    &stop,
+                )
+            });
+            let mut ack = String::new();
+            reader.read_line(&mut ack).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&ack).unwrap()["result"]["type"],
+                "subscription_started"
+            );
+            readers.push(reader);
+            owners.push((running, thread));
+        }
+        hub.push(queued_for("ws_1:p1", "live"));
+        for mut reader in readers {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["data"]["correlation_id"],
+                "live"
+            );
+        }
+        for (running, thread) in owners {
+            running.store(false, Ordering::Relaxed);
+            assert!(thread.join().unwrap().is_ok());
+        }
+    }
+
+    struct ResumeSubscription {
+        reader: BufReader<UnixStream>,
+        running: Arc<AtomicBool>,
+        owner: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    }
+    impl ResumeSubscription {
+        fn new(hub: EventHub, after: Option<u64>, filters: Vec<serde_json::Value>) -> Self {
+            let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut params = serde_json::json!({"subscriptions":filters});
+            if let Some(cursor) = after {
+                params["after_sequence"] = cursor.into();
+            }
+            writeln!(
+                client,
+                "{}",
+                serde_json::json!({"id":"resume","method":"events.subscribe","params":params})
+            )
+            .unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            let stop = running.clone();
+            let owner = std::thread::spawn(move || {
+                handle_connection(
+                    server,
+                    &api_tx,
+                    &hub,
+                    &stop,
+                    None,
+                    &Mutex::default(),
+                    &crate::api::client_listener::Health::default(),
+                    &Default::default(),
+                )
+            });
+            Self {
+                reader: BufReader::new(client),
+                running,
+                owner: Some(owner),
+            }
+        }
+        fn next(&mut self) -> serde_json::Value {
+            let mut line = String::new();
+            self.reader.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+    }
+    impl Drop for ResumeSubscription {
+        fn drop(&mut self) {
+            self.running.store(false, Ordering::Relaxed);
+            let _ = self.reader.get_ref().shutdown(std::net::Shutdown::Both);
+            if let Some(owner) = self.owner.take() {
+                let _ = owner.join();
+            }
+        }
+    }
+
+    #[test]
+    fn subscription_ack_has_a_live_floor_even_when_every_filter_is_quiet() {
+        let hub = EventHub::default();
+        hub.push(queued_for("ws_1:p1", "retained"));
+        let mut stream = ResumeSubscription::new(
+            hub,
+            None,
+            vec![serde_json::json!({"type":"workspace.closed"})],
+        );
+        let ack = stream.next();
+        assert_eq!(ack["result"]["type"], "subscription_started");
+        assert_eq!(ack["result"]["start_sequence"], 1);
+    }
+
+    #[test]
+    fn subscription_ack_floor_protects_an_unapplied_earlier_filter_on_resume() {
+        let hub = EventHub::default();
+        hub.push(queued_for("ws_1:p2", "earlier"));
+        hub.push(queued_for("ws_1:p1", "later"));
+        let mut stream = ResumeSubscription::new(
+            hub.clone(),
+            Some(0),
+            vec![
+                serde_json::json!({"type":"msg.queued","pane":"ws_1:p1"}),
+                serde_json::json!({"type":"msg.queued","pane":"ws_1:p2"}),
+                serde_json::json!({"type":"workspace.closed"}),
+            ],
+        );
+        let ack = stream.next();
+        let floor = ack["result"]["start_sequence"]
+            .as_u64()
+            .expect("quiet filters need an acknowledged cursor");
+        let mut applied = [floor; 3];
+        let first = stream.next();
+        assert_eq!(first["data"]["correlation_id"], "later");
+        applied[first["subscription_index"].as_u64().unwrap() as usize] =
+            first["seq"].as_u64().unwrap();
+        assert_eq!(applied, [2, 0, 0]);
+        let resume = *applied.iter().min().unwrap();
+        drop(stream);
+        let mut resumed = ResumeSubscription::new(
+            hub,
+            Some(resume),
+            vec![serde_json::json!({"type":"msg.queued","pane":"ws_1:p2"})],
+        );
+        assert_eq!(resumed.next()["result"]["start_sequence"], resume);
+        let recovered = resumed.next();
+        assert_eq!(recovered["seq"], 1);
+        assert_eq!(recovered["data"]["correlation_id"], "earlier");
+    }
+
+    #[test]
+    fn ordinary_subscription_events_identify_same_type_filters_independently() {
+        let hub = EventHub::default();
+        hub.push(queued_for("ws_1:p2", "earlier"));
+        hub.push(queued_for("ws_1:p1", "later"));
+        let a = serde_json::json!({"type":"msg.queued","pane":"ws_1:p1"});
+        let b = serde_json::json!({"type":"msg.queued","pane":"ws_1:p2"});
+        let mut stream = ResumeSubscription::new(hub, Some(0), vec![a.clone(), b.clone()]);
+        assert_eq!(stream.next()["result"]["type"], "subscription_started");
+        for (index, descriptor, seq, correlation) in [(0, a, 2, "later"), (1, b, 1, "earlier")] {
+            let event = stream.next();
+            assert_eq!(event["subscription_index"], index);
+            assert_eq!(event["subscription"], descriptor);
+            assert_eq!(event["seq"], seq);
+            assert_eq!(event["data"]["correlation_id"], correlation);
+        }
+    }
+
+    #[test]
+    fn subscription_opt_in_preserves_legacy_loss_and_exposes_resume_identity() {
+        for cursor in [r#","after":0"#, r#","after_sequence":0"#] {
+            let hub = EventHub::default();
+            hub.set_ring_cap(2);
+            hub.push(queued_for("ws_1:p1", "first"));
+            hub.push(queued_for("ws_1:p1", "second"));
+            hub.push(queued_for("ws_1:p1", "third"));
+            let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            writeln!(client, r#"{{"id":"loss","method":"events.subscribe","params":{{"subscriptions":[{{"type":"msg.queued","pane":"ws_1:p1"}},{{"type":"workspace.closed"}}]{cursor}}}}}"#).unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            let (events, stop) = (hub.clone(), running.clone());
+            let owner = std::thread::spawn(move || {
+                handle_connection(
+                    server,
+                    &api_tx,
+                    &events,
+                    &stop,
+                    None,
+                    &Mutex::default(),
+                    &crate::api::client_listener::Health::default(),
+                    &Default::default(),
+                )
+            });
+            let mut reader = BufReader::new(client);
+            let next = |r: &mut BufReader<UnixStream>| {
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()
+            };
+            assert_eq!(next(&mut reader)["result"]["type"], "subscription_started");
+            let loss = next(&mut reader);
+            if cursor.contains("after_sequence") {
+                assert_eq!(loss["error"]["code"], "events_lost");
+            } else {
+                assert_eq!(loss["event"], "lagged", "{loss}");
+                assert_eq!(loss["data"]["skipped_to"], 1);
+            }
+            assert_eq!(loss["subscription_index"], 0);
+            assert_eq!(loss["subscription"]["type"], "msg.queued");
+            let other_loss = next(&mut reader);
+            assert_eq!(other_loss["subscription_index"], 1);
+            assert_eq!(other_loss["subscription"]["type"], "workspace.closed");
+            let retained = next(&mut reader);
+            assert_eq!(retained["seq"], 2);
+            assert_eq!(retained["data"]["correlation_id"], "second");
+            running.store(false, Ordering::Relaxed);
+            assert!(owner.join().unwrap().is_ok());
+        }
+    }
+
+    #[test]
+    fn live_default_subscription_keeps_legacy_loss_framing() {
+        let hub = EventHub::default();
+        hub.set_ring_cap(2);
+        let descriptor = crate::api::schema::Subscription::MsgQueued {
+            pane: "ws_1:p1".into(),
+        };
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let mut active = ActiveSubscription::new(
+            descriptor.clone(),
+            "default",
+            0,
+            hub.current_sequence(),
+            &api_tx,
+            &hub,
+        )
+        .unwrap();
+        for id in ["first", "second", "third"] {
+            hub.push(queued_for("ws_1:p1", id));
+        }
+        let loss = subscription_line(
+            active.poll(&api_tx, &hub).unwrap(),
+            false,
+            "default",
+            0,
+            &descriptor,
+        );
+        assert_eq!(loss["event"], "lagged");
+        assert_eq!(loss["data"]["skipped_to"], 1);
+        assert_eq!(loss["subscription_index"], 0);
+        assert!(loss.get("error").is_none());
+        let event = active.poll(&api_tx, &hub).unwrap();
+        assert_eq!(event["seq"], 2);
+    }
+
+    #[test]
+    fn subscription_refuses_both_cursor_fields_as_invalid_params() {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        writeln!(client, "{}", serde_json::json!({"id":"both", "method":"events.subscribe", "params":{"subscriptions":[],"after":0,"after_sequence":0}})).unwrap();
+        let owner = std::thread::spawn(move || {
+            handle_connection(
+                server,
+                &api_tx,
+                &EventHub::default(),
+                &Arc::new(AtomicBool::new(true)),
+                None,
+                &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
+                &Default::default(),
+            )
+        });
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["error"]["code"],
+            "invalid_params"
+        );
+        assert!(owner.join().unwrap().is_ok());
+    }
+
     /// #1030 (ADR-0028 §3): a subscription without `after` starts at now; one
-    /// whose cursor the ring has passed is told `lagged` before the events it
+    /// whose cursor the ring has passed is told `events_lost` before the events it
     /// still can have; one past the newest event is refused.
     #[test]
     fn a_subscription_starts_at_now_or_its_cursor_and_reports_lag() {
@@ -1796,6 +2294,7 @@ mod tests {
                     &stop,
                     None,
                     &Mutex::default(),
+                    &crate::api::client_listener::Health::default(),
                     &Default::default(),
                 )
             });
@@ -1811,13 +2310,32 @@ mod tests {
         };
 
         // The ring holds c2 and c3, so c1 is gone.
-        let (mut behind, behind_running, behind_thread) = subscribe(r#","after":0"#);
+        let (mut behind, behind_running, behind_thread) = subscribe(r#","after_sequence":0"#);
         assert_eq!(next(&mut behind)["result"]["type"], "subscription_started");
-        let lagged = next(&mut behind);
-        assert_eq!(lagged["event"], "lagged", "{lagged}");
-        assert_eq!(lagged["data"]["skipped_to"], 1);
-        assert_eq!(next(&mut behind)["data"]["correlation_id"], "c2");
+        let lost = next(&mut behind);
+        assert_eq!(lost["error"]["code"], "events_lost", "{lost}");
+        assert_eq!(lost["id"], "s");
+        assert_eq!(lost["error"]["data"]["requested_sequence"], 0);
+        assert_eq!(lost["error"]["data"]["oldest_available_sequence"], 2);
+        assert_eq!(lost["error"]["data"]["current_sequence"], 3);
+        assert!(lost["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("per-verb"));
+        let applied = next(&mut behind);
+        assert_eq!(applied["data"]["correlation_id"], "c2");
+        assert_eq!(applied["seq"], 2);
         assert_eq!(next(&mut behind)["data"]["correlation_id"], "c3");
+
+        let (mut explicit, explicit_running, explicit_thread) =
+            subscribe(&format!(",\"after_sequence\":{}", applied["seq"]));
+        assert_eq!(
+            next(&mut explicit)["result"]["type"],
+            "subscription_started"
+        );
+        let resumed = next(&mut explicit);
+        assert_eq!(resumed["data"]["correlation_id"], "c3");
+        assert_eq!(resumed["seq"], 3);
 
         let (mut now, now_running, now_thread) = subscribe("");
         assert_eq!(next(&mut now)["result"]["type"], "subscription_started");
@@ -1825,10 +2343,24 @@ mod tests {
         assert_eq!(next(&mut now)["data"]["correlation_id"], "c4", "no replay");
         assert_eq!(next(&mut behind)["data"]["correlation_id"], "c4");
 
+        let (mut second, second_running, second_thread) = subscribe("");
+        assert_eq!(next(&mut second)["result"]["type"], "subscription_started");
+        event_hub.push(queued_for("ws_1:p1", "c5"));
+        assert_eq!(
+            next(&mut second)["data"]["correlation_id"],
+            "c5",
+            "no retained replay on second attachment"
+        );
+
         let (mut ahead, _, ahead_thread) = subscribe(r#","after":99"#);
         assert_eq!(next(&mut ahead)["error"]["code"], "cursor_ahead");
         assert!(ahead_thread.join().unwrap().is_ok());
-        for (running, thread) in [(now_running, now_thread), (behind_running, behind_thread)] {
+        for (running, thread) in [
+            (now_running, now_thread),
+            (behind_running, behind_thread),
+            (explicit_running, explicit_thread),
+            (second_running, second_thread),
+        ] {
             running.store(false, Ordering::Relaxed);
             assert!(thread.join().unwrap().is_ok());
         }
@@ -1861,6 +2393,7 @@ mod tests {
                 &stop,
                 None,
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             )
         });
@@ -1903,6 +2436,7 @@ mod tests {
                 &server_running,
                 None,
                 &Mutex::default(),
+                &crate::api::client_listener::Health::default(),
                 &Default::default(),
             );
             done_tx.send(result).unwrap();
@@ -1917,5 +2451,36 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn endpoint_uses_the_bind_time_socket_and_classifies_socket_failure() {
+        let _guard = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        let socket = root.path().join("bound.sock");
+        let prior = std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR);
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &socket);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut server =
+            start_server_with_capabilities(tx, EventHub::default(), None, Default::default())
+                .unwrap();
+        if let Some(prior) = prior {
+            std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, prior);
+        } else {
+            std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+        }
+        let expected = format!("{:?}", server.session_mcp().unwrap());
+        let bound = std::mem::replace(&mut server.path, root.path().join("later-path"));
+        let actual = format!("{:?}", server.session_mcp().unwrap());
+        server.path = bound;
+        server.mcp_socket = None;
+        let refused = matches!(server.session_mcp(), Err(McpEndpointFailure::Socket));
+        server.finish_for_test();
+        assert_eq!(
+            actual, expected,
+            "request-time cwd/path lookup must not replace the bound endpoint"
+        );
+        assert!(expected.contains(socket.to_str().unwrap()));
+        assert!(refused);
     }
 }

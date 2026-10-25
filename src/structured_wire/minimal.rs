@@ -9,6 +9,8 @@ pub use crate::api::schema::AgentSendResult;
 /// Successful agent.decide ack result, echoing the applied answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub struct AgentDecideResult {
     /// Harness request identity whose answer was applied.
     pub request_id: String,
@@ -21,6 +23,8 @@ pub struct AgentDecideResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub enum AgentDecideErrorCode {
     /// No permission request has this identity.
     PermissionRequestUnknown,
@@ -28,36 +32,36 @@ pub enum AgentDecideErrorCode {
     PermissionRequestClosed,
     /// The caller is not a token-authenticated client principal.
     NotAuthorized,
+    /// The message exceeds the byte bound or carries forbidden control bytes.
+    InvalidParams,
 }
 
 /// Arguments for a token-authenticated client's agent.decide command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+// Later wire slices consume this payload.
+#[cfg_attr(feature = "web", allow(dead_code))]
 pub struct AgentDecide {
     /// Agent whose open permission request is being answered.
     pub agent: String,
     /// Harness request identity from the derived open-request record.
     pub request_id: String,
+    /// Required flk-issued handle from the open record, carried unchanged by S7
+    /// slice 5. JSON number, exact in JavaScript below 2^53 like stream cursors.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub request_seq: u64,
     /// Permission choice admitted by S6-MVP.
     pub decision: PermissionDecision,
-    /// Optional explanation supplied with the answer.
+    /// Optional explanation: CRLF is normalized to LF, then trimmed.
+    /// At most 2048 UTF-8 bytes, using prompt_control_bytes rules (newlines and
+    /// tabs permitted). Invalid input returns invalid_params before reserving
+    /// the request. Empty and absent messages are allowed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub message: Option<String>,
 }
 
-/// Closed permission vocabulary shared by the client and S6-MVP.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionDecision {
-    /// Permit only this request.
-    AllowOnce,
-    /// Permit this tool beyond the current request.
-    AllowAlways,
-    /// Refuse the request.
-    Deny,
-}
+pub use super::permission::PermissionDecision;
 
 #[cfg(test)]
 mod tests {
@@ -101,8 +105,7 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(decision).unwrap(), choice);
             for message in [None, Some("Operator explanation")] {
-                let mut value =
-                    json!({"agent":"fixture-agent","request_id":"request-one","decision":choice});
+                let mut value = json!({"agent":"fixture-agent","request_id":"request-one","request_seq":1,"decision":choice});
                 if let Some(message) = message {
                     value["message"] = json!(message);
                 }
@@ -179,6 +182,7 @@ mod tests {
                 "permission_request_closed",
             ),
             (AgentDecideErrorCode::NotAuthorized, "not_authorized"),
+            (AgentDecideErrorCode::InvalidParams, "invalid_params"),
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), spelling);
             assert_eq!(
@@ -220,6 +224,16 @@ mod tests {
         assert_eq!(value["row"]["state"]["phase"], "unknown");
         assert_eq!(value["row"]["state"]["turn"], "working");
         assert_eq!(value["row"]["state"]["lifecycle"], "live");
+    }
+
+    #[test]
+    fn generated_decide_message_documents_server_validation() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/client/src/gen");
+        let request = std::fs::read_to_string(root.join("AgentDecide.ts")).unwrap();
+        assert!(request.contains("2048 UTF-8 bytes"));
+        assert!(request.contains("trimmed"));
+        assert!(request.contains("invalid_params"));
+        assert!(request.contains("prompt_control_bytes"));
     }
 
     #[test]
