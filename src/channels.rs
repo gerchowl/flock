@@ -41,6 +41,7 @@
 //! read on every check, so deleting it revokes the binding at once, and a
 //! reload then issues a new token.
 
+use crate::config::validation::{message, Cause};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -83,9 +84,7 @@ impl TryFrom<String> for ChannelTarget {
             None if raw == "fleet" => Ok(Self::Fleet),
             Some(("repo", name)) if !name.is_empty() => Ok(Self::Repo(name.to_owned())),
             Some(("agent", id)) if !id.is_empty() => Ok(Self::Agent(id.to_owned())),
-            _ => Err(format!(
-                "invalid channel target {raw:?}: expected \"fleet\", \"repo:<name>\" or \"agent:<id>\""
-            )),
+            _ => Err(message(Cause::ChannelTarget, "channels[].target", None)),
         }
     }
 }
@@ -126,7 +125,10 @@ impl fmt::Debug for ChannelToken {
 /// the first; each drop is a diagnostic.
 pub(crate) fn validate(bindings: &mut Vec<ChannelBinding>, diagnostics: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
+    let mut index = 0;
     bindings.retain(|binding| {
+        let entry_index = index;
+        index += 1;
         let name = &binding.name;
         let usable = !name.is_empty()
             && name.len() <= 64
@@ -134,17 +136,15 @@ pub(crate) fn validate(bindings: &mut Vec<ChannelBinding>, diagnostics: &mut Vec
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
         let problem = if !usable {
-            "a name of 1-64 characters from [A-Za-z0-9_-]"
+            Cause::ChannelName
         } else if binding.owner_node.trim().is_empty() {
-            "an owner_node"
+            Cause::ChannelOwner
         } else if !seen.insert(name.clone()) {
-            "a unique name"
+            Cause::ChannelDuplicate
         } else {
             return true;
         };
-        diagnostics.push(format!(
-            "invalid [[channels]] entry {name:?}: needs {problem}; entry ignored"
-        ));
+        diagnostics.push(message(problem, "channels[]", Some(entry_index)));
         false
     });
 }

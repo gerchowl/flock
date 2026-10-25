@@ -212,6 +212,39 @@ entries. The base labels are:
 - `duplicate_peer`
 - `invalid_peer_target`
 
+The producer-closure slice also routes `validation::Cause` through
+`Diagnostic::Cause::Validation`. Its closed labels are:
+
+- `invalid keybinding`
+- `range keybinding is only valid for indexed actions`
+- `invalid indexed keybinding: expected modifier combination`
+- `indexed keybinding must use 1..9`
+- `navigate keybinding must not include prefix`
+- `navigate keybinding cannot use esc`
+- `reserved keybinding: uses keys.prefix; pressing the prefix twice sends a literal prefix key`
+- `conflicting keybinding: first binding kept`
+- `unsafe direct keybinding: would intercept typing; require the prefix`
+- `empty custom command`
+- `unsupported sound file format; expected an mp3 file`
+- `missing sound file`
+- `invalid sound file: expected a regular file`
+- `unknown agent: not an agent flock detects`
+- `duplicate agent alias: first spelling kept`
+- `environment key is empty`
+- `environment key contains '=', which is not part of a variable name`
+- `environment key looks like a wildcard; only exact names are matched`
+- `environment key contains whitespace, which no shell can export`
+- `entry is missing name`
+- `duplicate name: later entry ignored`
+- `interval_secs is less than checks.min_tick_secs; clamped`
+- `timeout_secs is less than 1; using 1s`
+- `debounce is 0; using 1 so a single fire still emits`
+- `program is not absolute and not under ~/.flock/checks/`
+- `invalid channel name: needs 1-64 characters from [A-Za-z0-9_-]`
+- `invalid channel entry: needs an owner_node`
+- `invalid channel entry: needs a unique name`
+- `invalid channel target: expected fleet, repo:<name> or agent:<id>`
+
 The exhaustive fixture covers every `Cause` variant and pins its rendered
 label to both this guide and ADR-0041 §4. Adding a cause requires a deliberate
 fixture and documentation update. #2434 tracks the scanner's separate
@@ -241,6 +274,28 @@ operator metadata; loader and reload diagnostics remain path-free. Aggregate
 provenance has a structural reason, separately from sensitive content kinds.
 No socket/WS read method or raw export is enabled by this slice.
 
-The approved slice 3b2 still owns keybinding, sound, spawn-env, checks and channel
-validator producers and their immediate logging. Those existing diagnostics are
-not claimed safe by 3b1. #2384 completion and #2385 remain gated on that work.
+### Producer closure (slice 3b2)
+
+Keybinding, sound, spawn-env, checks and channel validation now construct closed
+causes through the same boundary before either returning or immediately logging
+a diagnostic. No configured chord, command, check/channel identity, environment
+name, executable or sound path is copied into those messages. Channel target
+parse errors retain only the static accepted forms. Selection, first-wins
+admission and fallback behavior are unchanged.
+
+Diagnostics retain canonical schema paths and zero-based declaration indices.
+Custom-command conflicts report both the kept and rejected declaration indices.
+Spawn environment diagnostics identify the sorted map-entry ordinal and list item
+index, not the agent spelling or environment name. Check intervals retain the
+public minimum bound. Static hints still explain prefix reservations, indexed
+keys, mp3 sound support, exact environment names and accepted script locations.
+These validators have no source span input and explicitly say that location
+and source are unavailable rather than guessing. File scanners emit a fallback
+record for every discovered unknown key without a span, even when a located
+entry projects to the same safe key. Environment overrides cannot supply peer
+arrays, so base/overlay peer coordinates retain their original indices.
+
+The inventory and redaction prerequisite of #2384 is complete across the stack.
+This does not enable #2385, a read/write API or any raw export. Consumers must
+continue using mandatory safe projections under ADR-0041 §4; credential-file
+contents and expanded environment values are outside these read models.
