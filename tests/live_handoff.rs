@@ -1616,7 +1616,7 @@ fn removed_config_keys_warn_on_cold_start_and_live_reload() {
 }
 
 #[test]
-fn config_check_json_and_cli_warnings_name_source_keys() {
+fn config_check_json_and_cli_warnings_use_safe_schema_keys() {
     let directory = SocketDir::reserve("hlh");
     let base = directory.path().to_path_buf();
     let config_home = base.join("config");
@@ -1641,15 +1641,14 @@ fn config_check_json_and_cli_warnings_name_source_keys() {
     assert_eq!(json["exit_code"], 1);
     assert_eq!(json["diagnostics"].as_array().unwrap().len(), 2, "{json}");
     assert!(
-        json.to_string()
-            .contains(&format!("{}:5: msg.uplink_timeout_secs", config.display())),
+        json.to_string().contains(
+            "removed_config_key; key=msg.uplink_timeout_secs; source=base file; at line 5"
+        ),
         "{json}"
     );
     assert!(
-        json.to_string().contains(&format!(
-            "{}:6: unknown msg.future_setting",
-            config.display()
-        )),
+        json.to_string()
+            .contains("unknown_config_key; key=msg; source=base file; at line 6"),
         "{json}"
     );
     let text = run(&["config", "check"]);

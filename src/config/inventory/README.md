@@ -174,3 +174,32 @@ inside a startup-only container. Copying a mixed parent does not claim that
 all cached child consumers retarget: the existing whole-UI copy does not move
 the sampler's startup-owned disk path. A direct disk-path copy still demands
 an ownership review.
+
+### Diagnostic sink projection (slice 3b1)
+
+ADR-0041 §4's internal diagnostic boundary now constructs closed causes,
+source categories, outcomes and numeric positions before formatting. Raw parser
+messages, I/O messages, file paths and input values are never retained in the
+safe diagnostic. `Display` and `Debug` only see safe data. Existing loader and
+CLI String consumers format that safe object rather than scrubbing messages.
+
+Diagnostic keys are rebuilt from catalog paths and aliases. User-map entries
+become `<key>` and collection indices become `[]`; an unknown descendant stops
+at its nearest declared container, and unknown roots become `document root`.
+The four removed schema keys are an explicit closed historical exception.
+Unknown user spellings are withheld even when they look harmless. This sacrifices
+exact unknown-key/entry identification to prevent names from being a secret
+channel; numeric source lines remain useful. File scans distinguish base and
+overlay, while a merged unknown-key warning identifies the file category only.
+TOML syntax locations retain exact one-based byte line/column positions when a
+valid span exists. A missing span is unavailable. Key scans know only the line
+and do not invent a column. I/O diagnostics retain `ErrorKind`, never `Display`.
+
+Both input-document and edited-output parse refusals in `channel set` and
+`config reset-keys` use this boundary and leave the file unchanged. Aggregate
+provenance has a structural reason, separately from sensitive content kinds.
+No socket/WS read method or raw export is enabled by this slice.
+
+The approved slice 3b2 still owns keybinding, sound, spawn-env, checks and channel
+validator producers and their immediate logging. Those existing diagnostics are
+not claimed safe by 3b1. #2384 completion and #2385 remain gated on that work.
