@@ -37,7 +37,6 @@ mod spawn;
 mod structured_agents;
 pub(crate) mod structured_queue;
 mod structured_start;
-
 mod tabs;
 pub(crate) mod workspaces;
 mod worktrees;
