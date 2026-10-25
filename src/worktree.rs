@@ -1,3 +1,4 @@
+use crate::process::CommandFailure;
 use std::path::{Path, PathBuf};
 
 pub(crate) mod processes;
@@ -148,6 +149,90 @@ pub(crate) fn build_worktree_remove_command(
     }
 }
 
+/// A present path whose linked-checkout identity cannot be verified (#370).
+/// Force cannot establish identity. Device observations never decide refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckoutUnreachable {
+    /// The registered checkout path, preserved for recovery.
+    pub path: PathBuf,
+    /// Same device as the parent suggests an unmounted mount point; unknown on stat failure.
+    pub possible_unmounted_mount_point: Option<bool>,
+}
+impl CheckoutUnreachable {
+    /// Recovery needs external action, never a repo-wide prune or forced retry.
+    pub const RECOVERY: &'static str = concat!(
+        "Remount and retry, or, if the checkout is really gone, ",
+        "remove the directory yourself and retry. ",
+        "Flock will not run git worktree prune: it is repo-wide ",
+        "and can unlink temporarily absent checkouts."
+    );
+    /// Stable structured detail shared by API removal and kill-by-path.
+    pub fn data(&self) -> serde_json::Value {
+        serde_json::json!({"path":self.path.display().to_string(),
+            "possible_unmounted_mount_point":self.possible_unmounted_mount_point,
+            "recovery":Self::RECOVERY})
+    }
+}
+impl std::fmt::Display for CheckoutUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Checkout {} is present but its Git worktree registration cannot be verified. {}{}",
+            self.path.display(),
+            if self.possible_unmounted_mount_point == Some(true) {
+                "It may be an unmounted mount point (same device as parent; hint only). "
+            } else {
+                ""
+            },
+            Self::RECOVERY
+        )
+    }
+}
+
+/// Classify before removal: absent paths retain git's single-record cleanup.
+/// present paths must have mutually matching gitfile/admin/common-dir identities.
+/// This is deliberately separate from stderr's forceable-refusal classifier.
+pub(crate) fn check_worktree_remove(repo: &Path, path: &Path) -> Result<(), CheckoutUnreachable> {
+    if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(());
+    }
+    let verified = (|| -> Option<()> {
+        let gitfile = path.join(".git");
+        let text = std::fs::read_to_string(&gitfile).ok()?;
+        let target = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+        let admin = path.join(target).canonicalize().ok()?;
+        let common = run_command_capture(
+            "git",
+            &[
+                "-C",
+                &repo.to_string_lossy(),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            None,
+        )
+        .ok()?;
+        let common = PathBuf::from(common.trim()).canonicalize().ok()?;
+        if admin.parent()? != common.join("worktrees").canonicalize().ok()? {
+            return None;
+        }
+        let back = std::fs::read_to_string(admin.join("gitdir")).ok()?;
+        if admin.join(back.trim()).canonicalize().ok()? != gitfile.canonicalize().ok()? {
+            return None;
+        }
+        let owner = std::fs::read_to_string(admin.join("commondir")).ok()?;
+        (admin.join(owner.trim()).canonicalize().ok()? == common).then_some(())
+    })();
+    if verified.is_some() {
+        return Ok(());
+    }
+    Err(CheckoutUnreachable {
+        path: path.to_owned(),
+        possible_unmounted_mount_point: crate::platform::same_device_as_parent(path),
+    })
+}
+
 /// Why git refused a `git worktree remove`, when the refusal is one `--force`
 /// clears (#351).
 ///
@@ -259,8 +344,8 @@ pub enum WorktreeRemoveOutcome {
     /// — the classification, not git's raw wording, so a caller can report what
     /// it agreed to lose instead of re-deriving it from a string.
     Recovered { refusal: WorktreeRemoveRefusal },
-    /// Not removed. The message is git's own, from whichever attempt got
-    /// furthest.
+    /// Not removed. Shared checkout-identity refusal or git's error from the
+    /// attempt that got furthest.
     Failed(String),
 }
 
@@ -289,21 +374,23 @@ pub(crate) fn remove_worktree_unattended(
     path: &Path,
     force: bool,
 ) -> WorktreeRemoveOutcome {
-    let attempt =
-        |force: bool| run_worktree_command(&build_worktree_remove_command(repo_root, path, force));
+    let attempt = |force: bool| {
+        check_worktree_remove(repo_root, path).map_err(|error| error.to_string())?;
+        run_worktree_command(&build_worktree_remove_command(repo_root, path, force))
+    };
     let Err(err) = attempt(force) else {
         return WorktreeRemoveOutcome::Removed { forced: force };
     };
     let Some(refusal) = classify_worktree_remove_error(&err) else {
         // Not one `--force` clears: a locked worktree, a missing registration,
         // anything else. Git's own words are the answer.
-        return WorktreeRemoveOutcome::Failed(err);
+        return WorktreeRemoveOutcome::Failed(err.into());
     };
     // Already forced and still refused: the operator spent their confirmation
     // and it was not enough (#351's rule, unchanged). Forcing again would just
     // be the same command twice.
     if force || !may_force_unattended(path, refusal) {
-        return WorktreeRemoveOutcome::Failed(err);
+        return WorktreeRemoveOutcome::Failed(err.into());
     }
     match attempt(true) {
         // Logged only once the retry has actually worked — a record of a
@@ -318,7 +405,7 @@ pub(crate) fn remove_worktree_unattended(
         }
         // Report the forced attempt's words: the first refusal is no longer the
         // news, whatever it was.
-        Err(forced_err) => WorktreeRemoveOutcome::Failed(forced_err),
+        Err(forced_err) => WorktreeRemoveOutcome::Failed(forced_err.into()),
     }
 }
 
@@ -359,24 +446,34 @@ pub(crate) fn build_worktree_add_new_branch_command(
 /// Only the default base is rewritten: `invalid reference: <some-branch>` for
 /// an explicit base is a genuinely different problem (a typo, or a branch that
 /// isn't there) and git already names it.
-pub(crate) fn explain_worktree_add_failure(base: &str, message: &str) -> String {
+pub(crate) fn explain_worktree_add_failure(
+    base: &str,
+    message: impl Into<CommandFailure>,
+) -> CommandFailure {
+    let message = message.into();
+    if message.data.is_some() {
+        return message;
+    }
     if base == "HEAD" && message.contains("invalid reference: HEAD") {
-        return format!("{message}\nno commits yet — make one, then branch a worktree.");
+        let text = format!("{message}\nno commits yet — make one, then branch a worktree.");
+        return message.with_message(text);
     }
     if message.contains("not a git repository") {
         // git's parenthetical ("or any of the parent directories") is dropped:
         // it doubles the length and the remedy is the same either way.
-        return "fatal: not a git repository\nrun `git init` and commit, then branch a worktree."
-            .to_string();
+        return message.with_message(
+            "fatal: not a git repository\nrun `git init` and commit, then branch a worktree."
+                .to_string(),
+        );
     }
-    message.to_string()
+    message
 }
 
-pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), String> {
+pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), CommandFailure> {
     let output = crate::process::TracedCommand::new(&command.program, "worktree")
         .args(&command.args)
         .output_traced()
-        .map_err(|err| err.to_string())?;
+        .map_err(CommandFailure::from)?;
 
     if output.status.success() {
         // A worktree add/remove/move relocates repo paths on disk, so every
@@ -392,7 +489,8 @@ pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), Stri
         format!("{} failed with status {}", command.program, output.status)
     } else {
         message
-    })
+    }
+    .into())
 }
 
 /// Evidence-gated decision for deleting a worktree's local branch.
@@ -427,7 +525,7 @@ pub(crate) fn run_command_capture(
     program: &str,
     args: &[&str],
     cwd: Option<&std::path::Path>,
-) -> Result<String, String> {
+) -> Result<String, CommandFailure> {
     run_command_capture_with_cadence(program, args, cwd, crate::process::ExecCadence::Lifecycle)
 }
 
@@ -441,7 +539,7 @@ fn run_command_capture_periodic(
     program: &str,
     args: &[&str],
     cwd: Option<&std::path::Path>,
-) -> Result<String, String> {
+) -> Result<String, CommandFailure> {
     run_command_capture_with_cadence(program, args, cwd, crate::process::ExecCadence::Periodic)
 }
 
@@ -450,7 +548,7 @@ fn run_command_capture_with_cadence(
     args: &[&str],
     cwd: Option<&std::path::Path>,
     cadence: crate::process::ExecCadence,
-) -> Result<String, String> {
+) -> Result<String, CommandFailure> {
     let mut command = crate::process::TracedCommand::new(program, "worktree");
     command.args(args);
     if cadence == crate::process::ExecCadence::Periodic {
@@ -459,7 +557,7 @@ fn run_command_capture_with_cadence(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = command.output_traced().map_err(|err| err.to_string())?;
+    let output = command.output_traced().map_err(CommandFailure::from)?;
     finished_output(program, output)
 }
 
@@ -477,10 +575,10 @@ fn run_command_capture_with_timeout(
     args: &[&str],
     cwd: Option<&std::path::Path>,
     timeout: std::time::Duration,
-) -> Result<String, String> {
+) -> Result<String, CommandFailure> {
     let output = network_command(program, args, cwd)
         .output_traced_with_timeout(timeout)
-        .map_err(|err| err.to_string())?;
+        .map_err(CommandFailure::from)?;
     finished_output(program, output)
 }
 
@@ -502,16 +600,17 @@ fn network_command(
     command
 }
 
-/// Turn a finished child into this module's `Result<String, String>`: stderr on
+/// Turn a finished child into this module's `Result<String, CommandFailure>`: stderr on
 /// failure, trimmed stdout on success.
-fn finished_output(program: &str, output: std::process::Output) -> Result<String, String> {
+fn finished_output(program: &str, output: std::process::Output) -> Result<String, CommandFailure> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
             format!("{program} failed with status {}", output.status)
         } else {
             stderr
-        });
+        }
+        .into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -1181,7 +1280,9 @@ fn remote_has_branch(
     .map_err(|err| err.to_string())?;
     match output.status.code() {
         Some(2) => Ok(false),
-        _ => finished_output("git", output).map(|_| true),
+        _ => finished_output("git", output)
+            .map(|_| true)
+            .map_err(Into::into),
     }
 }
 
@@ -2258,7 +2359,9 @@ pub(crate) fn delete_local_branch(repo_root: &std::path::Path, branch: &str) -> 
         return Err(format!("refusing to delete protected branch '{branch}'"));
     }
     let root = repo_root.to_string_lossy().to_string();
-    run_command_capture("git", &["-C", &root, "branch", "-D", branch], None).map(|_| ())
+    run_command_capture("git", &["-C", &root, "branch", "-D", branch], None)
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 /// Everything the kill path decides about ONE checkout, resolved in one place.
@@ -2725,13 +2828,15 @@ pub(crate) fn parse_worktree_list_porcelain(output: &str) -> Vec<ExistingWorktre
     entries
 }
 
-pub(crate) fn list_existing_worktrees(repo_root: &Path) -> Result<Vec<ExistingWorktree>, String> {
+pub(crate) fn list_existing_worktrees(
+    repo_root: &Path,
+) -> Result<Vec<ExistingWorktree>, CommandFailure> {
     let output = crate::process::TracedCommand::new("git", "worktree")
         .arg("-C")
         .arg(repo_root)
         .args(["worktree", "list", "--porcelain"])
         .output_traced()
-        .map_err(|err| err.to_string())?;
+        .map_err(CommandFailure::from)?;
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2743,7 +2848,8 @@ pub(crate) fn list_existing_worktrees(repo_root: &Path) -> Result<Vec<ExistingWo
         format!("git worktree list failed with status {}", output.status)
     } else {
         stderr
-    })
+    }
+    .into())
 }
 
 /// #175 S2 — the atomic move a scheduled reap performs when the classified
@@ -3941,6 +4047,48 @@ mod tests {
     fn generated_branch_slug_is_worktree_namespaced_and_stable() {
         assert_eq!(generated_branch_slug(0), "worktree/brave-river-0000");
         assert_eq!(generated_branch_slug(9), "worktree/calm-cloud-0009");
+    }
+
+    #[test]
+    fn removal_checks_gitdir_owner_and_backlink_before_force() {
+        let repo = crate::test_support::create_committed_repo("remove-admin-owner");
+        let root = crate::test_support::unique_temp_path("remove-admin-checkouts");
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&root).unwrap();
+        for (path, branch) in [(&a, "worktree/a"), (&b, "worktree/b")] {
+            crate::test_support::run_git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            check_worktree_remove(&repo, path).unwrap();
+        }
+        let original = std::fs::read(a.join(".git")).unwrap();
+        std::fs::copy(b.join(".git"), a.join(".git")).unwrap();
+        assert!(
+            check_worktree_remove(&repo, &a).is_err(),
+            "another entry's backlink is not this checkout"
+        );
+        assert!(
+            matches!(remove_worktree_unattended(&repo, &a, true), WorktreeRemoveOutcome::Failed(message) if message.contains(CheckoutUnreachable::RECOVERY))
+        );
+        std::fs::write(a.join(".git"), original).unwrap();
+        let foreign = crate::test_support::create_committed_repo("foreign-remove-admin-owner");
+        assert!(
+            check_worktree_remove(&foreign, &a).is_err(),
+            "a valid gitdir must still belong to the requested repo"
+        );
+        check_worktree_remove(&repo, &a).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_dir_all(foreign).unwrap();
     }
 
     #[test]

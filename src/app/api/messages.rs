@@ -627,7 +627,7 @@ impl App {
                     let reply = status.reply.or_else(|| {
                         crate::api::best_answer(
                             self.event_hub
-                                .events_after(0)
+                                .ring_snapshot_after(0)
                                 .iter()
                                 .map(|(_, event)| event),
                             &params.correlation_id,
@@ -667,7 +667,7 @@ impl App {
             }
         }
         let mut found: Option<ResponseResult> = None;
-        for (_, event) in self.event_hub.events_after(0) {
+        for (_, event) in self.event_hub.ring_snapshot_after(0) {
             match &event.data {
                 EventData::MessageQueued { correlation_id, .. }
                     if *correlation_id == params.correlation_id =>
@@ -765,7 +765,7 @@ impl App {
         // can be the only trace of the exchange on this server.
         let answer = crate::api::best_answer(
             self.event_hub
-                .events_after(0)
+                .ring_snapshot_after(0)
                 .iter()
                 .map(|(_, event)| event),
             &params.correlation_id,
@@ -1542,11 +1542,14 @@ impl App {
         use crate::app::terminal_targets::TerminalTargetError;
         let candidates = match &error {
             TerminalTargetError::Ambiguous { candidates, .. } => candidates.clone(),
-            TerminalTargetError::NotFound { .. } => Vec::new(),
+            TerminalTargetError::NotFound { .. }
+            | TerminalTargetError::RuntimeUnsupported { .. } => Vec::new(),
         };
         let ambiguous = matches!(error, TerminalTargetError::Ambiguous { .. });
         MessageTargetError {
-            code: if ambiguous {
+            code: if matches!(error, TerminalTargetError::RuntimeUnsupported { .. }) {
+                crate::api::error_code::ErrorCode::RuntimeUnsupported
+            } else if ambiguous {
                 crate::api::error_code::ErrorCode::MsgTargetAmbiguous
             } else {
                 crate::api::error_code::ErrorCode::MsgTargetNotFound
@@ -1606,7 +1609,7 @@ impl App {
                                 .terminals
                                 .get(&pane_state.attached_terminal_id)
                                 .is_some_and(|terminal| {
-                                    terminal.agent_name.as_deref() == Some(pane.as_str())
+                                    terminal.agent_name() == Some(pane.as_str())
                                         || terminal.effective_agent_label() == Some(pane.as_str())
                                 });
                             if public_matches || agent_matches {
@@ -1867,7 +1870,7 @@ mod tests {
             assert_eq!(value["result"]["messages"].as_array().unwrap().len(), 0);
         }
         app.expire_undeliverable_messages();
-        let events = app.event_hub.events_after(0);
+        let events = app.event_hub.ring_snapshot_after(0);
         assert_eq!(
             events
                 .iter()
@@ -1946,7 +1949,7 @@ mod tests {
         assert_eq!(correlation_id, "c-1");
         assert_eq!(state, "queued");
         let queued_events = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter(|(_, envelope)| matches!(envelope.data, EventData::MessageQueued { .. }))
             .count();
@@ -1960,7 +1963,7 @@ mod tests {
         };
         assert_eq!(state, "duplicate");
         let queued_events = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter(|(_, envelope)| matches!(envelope.data, EventData::MessageQueued { .. }))
             .count();
@@ -2131,6 +2134,7 @@ mod tests {
         let recovery = hold_recovery(&mut replacement);
         let (respond_to, responses) = std::sync::mpsc::channel();
         replacement.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "reply".into(),
                 method: Method::MsgReply(MsgReplyParams {
@@ -2163,6 +2167,7 @@ mod tests {
     fn park(app: &mut crate::app::App, method: Method) -> std::sync::mpsc::Receiver<String> {
         let (respond_to, responses) = std::sync::mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "parked".into(),
                 method,
@@ -2317,6 +2322,7 @@ mod tests {
             .unwrap();
         let (respond_to, responses) = std::sync::mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "completed".into(),
                 method: fyi_send(&app, "after-recovery"),
@@ -2822,7 +2828,7 @@ mod tests {
         assert_eq!(value["result"]["state"], "queued", "{value}");
         assert!(value["result"]["message_key"].is_object());
         let relayed = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .filter(|(_, event)| matches!(event.data, EventData::MessageRelayed { .. }))
             .count();
@@ -3005,7 +3011,7 @@ mod tests {
         basic_send(&mut app, "c-read", "body");
 
         let delivered = |hub: &crate::api::EventHub| {
-            hub.events_after(0)
+            hub.ring_snapshot_after(0)
                 .iter()
                 .filter(|(_, event)| {
                     matches!(
@@ -3045,7 +3051,7 @@ mod tests {
         let _ = basic_send(&mut app, "c-pause", "hi during pause");
 
         let dropped = |hub: &crate::api::EventHub| {
-            hub.events_after(0)
+            hub.ring_snapshot_after(0)
                 .iter()
                 .filter(|(_, event)| {
                     matches!(
@@ -3423,10 +3429,12 @@ mod tests {
         );
         assert_eq!(app.mailboxes.queued_len(&answerer), 1, "still unread");
         assert!(
-            !hub.events_after(0).into_iter().any(|(_, e)| matches!(
-                &e.data,
-                EventData::MessageDelivered { correlation_id, .. } if correlation_id == "c-anon"
-            )),
+            !hub.ring_snapshot_after(0)
+                .into_iter()
+                .any(|(_, e)| matches!(
+                    &e.data,
+                    EventData::MessageDelivered { correlation_id, .. } if correlation_id == "c-anon"
+                )),
             "no durable settle for a reply that never went out"
         );
     }
@@ -3779,7 +3787,7 @@ mod tests {
         // the way a restart does has to bring the kind and the pane back.
         // Otherwise the operator reads it correctly until they reboot.
         let events: Vec<EventEnvelope> = hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .map(|(_, envelope)| envelope)
             .collect();
@@ -4100,7 +4108,7 @@ mod tests {
     }
 
     fn deferred_events(hub: &crate::api::EventHub) -> Vec<EventData> {
-        hub.events_after(0)
+        hub.ring_snapshot_after(0)
             .into_iter()
             .map(|(_, envelope)| envelope.data)
             .filter(|data| matches!(data, EventData::MessageDeferred { .. }))

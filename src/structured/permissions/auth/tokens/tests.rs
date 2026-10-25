@@ -775,3 +775,24 @@ fn intent_is_observed_by_an_independent_process_with_no_primary_lock_held() {
     drop(intent);
     assert!(store.lock().is_ok());
 }
+
+#[test]
+fn completed_token_operations_release_the_lock_before_inherited_descriptors_close() {
+    let (_root, store, mut app) = setup();
+    let guard = store.lock().unwrap();
+    let mut holder =
+        crate::platform::client_token_lock::inherited_holder::Holder::spawn(&guard).unwrap();
+    drop(guard);
+    let result = store.operator_token(&app.client_token_authority().unwrap());
+    holder
+        .verify()
+        .expect("the same inherited descriptor must remain open through admission");
+    assert!(
+        result.is_ok(),
+        "completed token lock is retained by child pid={} descriptor={} inode={}: {:?}",
+        holder.pid,
+        holder.descriptor,
+        holder.inode,
+        result.err()
+    );
+}

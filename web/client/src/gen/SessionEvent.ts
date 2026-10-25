@@ -3,7 +3,7 @@ import type { KnownSessionEvent } from "./KnownSessionEvent";
 import type { JsonValue } from "./serde_json/JsonValue";
 
 /**
- * One Claude stdout event, with lossless JSON fallback for new shapes.
+ * One structured stream event, including host permission audits, with lossless fallback.
  *
  * A known discriminator with incompatible fields also becomes Unknown.
  * Heterogeneous API messages, SSE bodies and SDK metadata stay JSON;

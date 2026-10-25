@@ -6,6 +6,75 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+use serde::{Deserialize, Deserializer};
+
+/// Stable and preview manifest entry, shared by local and remote installers.
+/// Legacy URL strings have no checksum during the transition tracked by #2076.
+#[derive(Debug, Clone)]
+pub(crate) struct AssetRef {
+    pub(crate) url: String,
+    pub(crate) sha256: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for AssetRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(url) if !url.trim().is_empty() => Ok(Self {
+                url: url.trim().to_string(),
+                sha256: None,
+            }),
+            serde_json::Value::Object(mut object) => {
+                let url = object
+                    .remove("url")
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .ok_or_else(|| serde::de::Error::custom("asset object is missing url"))?;
+                let sha256 = object
+                    .remove("sha256")
+                    .map(|value| {
+                        value.as_str().map(str::to_string).ok_or_else(|| {
+                            serde::de::Error::custom("asset sha256 must be a string")
+                        })
+                    })
+                    .transpose()?;
+                if url.trim().is_empty() {
+                    return Err(serde::de::Error::custom("asset url must not be empty"));
+                }
+                Ok(Self {
+                    url: url.trim().to_string(),
+                    sha256,
+                })
+            }
+            _ => Err(serde::de::Error::custom(
+                "asset must be a URL string or object with url",
+            )),
+        }
+    }
+}
+
+impl AssetRef {
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub(crate) fn sha256(&self) -> Option<&str> {
+        self.sha256.as_deref()
+    }
+}
+
+/// Verify a declared checksum before an installer can consume the download.
+/// Missing checksums remain accepted for legacy manifests until #2076.
+/// Malformed or mismatched checksums return `io::ErrorKind::InvalidData`.
+pub(crate) fn verify_asset(path: &Path, expected: Option<&str>) -> io::Result<()> {
+    match expected {
+        Some(expected) => verify_sha256(path, expected),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn verify_sha256(path: &Path, expected: &str) -> io::Result<()> {
     let expected = expected.trim().to_ascii_lowercase();
     if expected.len() != 64 || !expected.chars().all(|ch| ch.is_ascii_hexdigit()) {
@@ -52,6 +121,50 @@ fn to_lower_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    #[test]
+    fn asset_shapes_keep_legacy_and_verified_downloads_distinct() {
+        let legacy: super::AssetRef =
+            serde_json::from_str(r#""https://example.invalid/asset""#).unwrap();
+        assert_eq!(legacy.url(), "https://example.invalid/asset");
+        assert_eq!(legacy.sha256(), None);
+        let fixture = crate::test_support::TempDir::socket();
+        let path = fixture.path().join("asset");
+        fs::write(&path, b"flock").unwrap();
+        assert!(super::verify_asset(&path, legacy.sha256()).is_ok());
+        let verified: super::AssetRef = serde_json::from_value(serde_json::json!({
+            "url": legacy.url(), "sha256": "a".repeat(64)
+        }))
+        .unwrap();
+        let error = super::verify_asset(&path, verified.sha256()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("sha256 mismatch"));
+    }
+
+    #[test]
+    fn present_invalid_checksum_never_becomes_a_legacy_download() {
+        let fixture = crate::test_support::TempDir::socket();
+        let path = fixture.path().join("asset");
+        fs::write(&path, b"flock").unwrap();
+        for digest in ["", "wrong"] {
+            let asset: super::AssetRef = serde_json::from_value(serde_json::json!({
+                "url":"https://example.invalid/asset", "sha256":digest
+            }))
+            .unwrap();
+            assert_eq!(
+                super::verify_asset(&path, asset.sha256())
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        assert!(
+            serde_json::from_value::<super::AssetRef>(serde_json::json!({
+                "url":"https://example.invalid/asset", "sha256":42
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn verifies_matching_sha256() {

@@ -115,6 +115,33 @@ impl Scheduler {
     pub fn enqueue(&mut self, item: Item, principal: Principal, gate: Gate) -> Result<(), Failure> {
         self.admission.enqueue(item, principal, gate)
     }
+    /// Settle known unaccepted openings before a resumed generation gains input authority.
+    /// Opaque future entries remain uninterpreted and byte-preserved (ADR-0028 §3a).
+    pub(in crate::structured) fn fail_stale_openings(&mut self) -> Result<(), Failure> {
+        let stale: Vec<_> = self
+            .journal()
+            .items()
+            .iter()
+            .filter(|item| {
+                item.state == State::Queued
+                    && !self.journal().opaque.contains(&item.item_id)
+                    && item.metadata.get("opening_turn") == Some(&Value::Bool(true))
+            })
+            .map(|item| item.item_id.clone())
+            .collect();
+        for id in stale {
+            self.fail_item(id, ErrorCode::AgentStartFailed)?;
+        }
+        Ok(())
+    }
+    /// Terminally refuse a launch-owned input; it cannot become eligible on resume.
+    pub(in crate::structured) fn fail_item(
+        &mut self,
+        item_id: String,
+        reason: ErrorCode,
+    ) -> Result<(), Failure> {
+        self.admission.fail_item(item_id, reason)
+    }
     pub(in crate::structured) fn take_facts(
         &mut self,
     ) -> Vec<crate::api::queue_event::QueueItemState> {

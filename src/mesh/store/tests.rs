@@ -5188,3 +5188,4 @@ fn remote_origin_inbox_cannot_be_changed_to_refused() {
     ));
     assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "inbox");
 }
+mod diamond;

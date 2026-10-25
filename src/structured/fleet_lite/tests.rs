@@ -1,0 +1,644 @@
+use super::*;
+use crate::api::agent_state::{Attention, Phase, Turn};
+use crate::structured::{
+    permissions::Book,
+    registry::{Registry, StructuredRuntime},
+    state::{Input, SessionState},
+};
+use std::time::{Duration, Instant};
+
+struct Agent {
+    record: Record,
+    state: AgentState,
+    activity: Option<String>,
+    waiting: Vec<String>,
+}
+fn agent(id: &str) -> Agent {
+    Agent {
+        record: Record {
+            runtime: StructuredRuntime::Structured,
+            agent_id: id.into(),
+            name: Some(format!("label-{id}")),
+            harness: "claude".into(),
+            session_id: format!("session-{id}"),
+            cwd: crate::test_support::unique_temp_path("fleet-cwd"),
+            model: None,
+        },
+        state: AgentState::unknown(),
+        activity: None,
+        waiting: Vec::new(),
+    }
+}
+struct Source(Vec<Agent>);
+impl Provider for Source {
+    fn agents(&self) -> io::Result<Vec<StructuredAgent<'_>>> {
+        Ok(self
+            .0
+            .iter()
+            .map(|a| StructuredAgent {
+                record: &a.record,
+                state: &a.state,
+                activity: a.activity.as_deref(),
+                waiting_on_human: &a.waiting,
+            })
+            .collect())
+    }
+}
+fn path() -> PathBuf {
+    let dir = crate::test_support::unique_temp_path("fleet-core");
+    fs::create_dir_all(&dir).unwrap();
+    dir.join("fleet.json")
+}
+fn disk(path: &Path) -> Value {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn registry_s4_and_s6_project_into_the_generated_structured_only_contract() {
+    let mut registry = Registry::default();
+    let record = agent("a").record;
+    registry.register(record).unwrap();
+    let (record, cold, _) = registry.get("a").unwrap();
+    assert_eq!(cold.update.state.phase, Phase::Offline);
+    let request = json!({"type":"control_request","request_id":"p1", "request":{
+        "subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"t1","input":{"command":"true"}}});
+    let event = super::super::claude::SessionEvent::parse(&request.to_string(), "fixture-version");
+    let mut reducer = SessionState::new("a".into());
+    let update = reducer.reduce(
+        Input::Event(&event),
+        Instant::now(),
+        100,
+        Duration::from_secs(1),
+    );
+    assert!(matches!(
+        update.state.attention,
+        Attention::NeedsHuman { .. }
+    ));
+    let mut book = Book::new("a".into());
+    book.observe(
+        "p1",
+        serde_json::from_value(request["request"].clone()).unwrap(),
+    )
+    .unwrap();
+    let waiting: Vec<_> = book.waiting().into_iter().map(|(id, _)| id).collect();
+    let row = project(StructuredAgent {
+        record,
+        state: &update.state,
+        activity: Some("Reading source"),
+        waiting_on_human: &waiting,
+    });
+    assert_eq!(row.state, update.state);
+    assert_eq!(row.waiting_on_human, vec!["p1"]);
+    assert_eq!(row.label, "label-a");
+    assert_eq!(row.activity.as_deref(), Some("Reading source"));
+    let wire = serde_json::to_value(FleetDelta::Upsert { row: row.clone() }).unwrap();
+    assert_eq!(wire["type"], "fleet.upsert");
+    assert_eq!(wire["row"]["id"], "a");
+    assert_eq!(
+        serde_json::from_value::<FleetDelta>(wire.clone()).unwrap(),
+        FleetDelta::Upsert { row }
+    );
+    let keys: BTreeSet<_> = wire["row"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from(["id", "label", "state", "activity", "waiting_on_human"])
+    );
+    let mut unnamed = agent("unnamed");
+    unnamed.record.name = None;
+    let source = Source(vec![unnamed]);
+    assert_eq!(project(source.agents().unwrap().remove(0)).label, "unnamed");
+}
+
+#[test]
+fn membership_activity_attention_and_removal_generate_dense_deltas() {
+    let path = path();
+    let mut store = Store::open(path.clone()).unwrap();
+    let mut source = Source(vec![agent("b"), agent("a")]);
+    let first = store.refresh(&source).unwrap();
+    assert_eq!(first.iter().map(|d| d.seq).collect::<Vec<_>>(), vec![1, 2]);
+    assert!(matches!(&first[0].event, FleetDelta::Upsert { row } if row.id == "a"));
+    assert!(store.refresh(&source).unwrap().is_empty());
+    source.0[1].activity = Some("Inspecting changes".into());
+    source.0[1].waiting = vec!["permission-1".into()];
+    source.0[1].state.turn = Turn::Working;
+    let delta = store.refresh(&source).unwrap();
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0].seq, 3);
+    assert!(
+        matches!(&delta[0].event, FleetDelta::Upsert { row } if row.activity.as_deref() == Some("Inspecting changes") && row.waiting_on_human == ["permission-1"] && row.state.turn == Turn::Working)
+    );
+    source.0[1].activity = None;
+    source.0[1].waiting.clear();
+    let clear = store.refresh(&source).unwrap();
+    assert_eq!(clear[0].seq, 4);
+    assert!(
+        matches!(&clear[0].event, FleetDelta::Upsert { row } if row.activity.is_none() && row.waiting_on_human.is_empty())
+    );
+    source.0.remove(0);
+    assert_eq!(
+        store.refresh(&source).unwrap(),
+        vec![Delta {
+            seq: 5,
+            event: FleetDelta::Remove { id: "b".into() }
+        }]
+    );
+    assert_eq!(disk(&path)["high_water"], 5);
+    assert_eq!(disk(&path)["rows"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn empty_and_nonzero_empty_snapshots_and_restart_never_reset_the_high_water() {
+    let path = path();
+    let mut store = Store::open(path.clone()).unwrap();
+    assert_eq!(
+        store.snapshot().unwrap(),
+        Snapshot {
+            to: 0,
+            snapshot_to: 0,
+            rows: Vec::new()
+        }
+    );
+    assert_eq!(disk(&path)["high_water"], 0);
+    let mut source = Source(vec![agent("a")]);
+    assert_eq!(store.refresh(&source).unwrap()[0].seq, 1);
+    let cut = store.snapshot().unwrap();
+    assert_eq!((cut.to, cut.snapshot_to), (1, 2));
+    assert_eq!(cut.rows[0].seq, 2);
+    source.0.clear();
+    assert_eq!(store.refresh(&source).unwrap()[0].seq, 3);
+    assert_eq!(
+        store.snapshot().unwrap(),
+        Snapshot {
+            to: 3,
+            snapshot_to: 3,
+            rows: Vec::new()
+        }
+    );
+    assert_eq!(
+        cut.rows.len(),
+        1,
+        "an owned read cut cannot change after removal"
+    );
+    drop(store);
+    let mut restored = Store::open(path.clone()).unwrap();
+    assert_eq!(
+        restored.snapshot().unwrap(),
+        Snapshot {
+            to: 3,
+            snapshot_to: 3,
+            rows: Vec::new()
+        }
+    );
+    source.0.push(agent("new"));
+    assert_eq!(restored.refresh(&source).unwrap()[0].seq, 4);
+    assert_eq!(disk(&path)["high_water"], 4);
+}
+
+#[test]
+fn restart_restores_rows_and_checkpoints_consume_dense_positions() {
+    let path = path();
+    let mut store = Store::open(path.clone()).unwrap();
+    let source = Source(vec![agent("b"), agent("a")]);
+    store.refresh(&source).unwrap();
+    drop(store);
+    let mut restored = Store::open(path.clone()).unwrap();
+    assert!(restored.refresh(&source).unwrap().is_empty());
+    let snapshot = restored.snapshot().unwrap();
+    assert_eq!((snapshot.to, snapshot.snapshot_to), (2, 4));
+    assert_eq!(
+        snapshot.rows.iter().map(|d| d.seq).collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+    assert!(matches!(&snapshot.rows[0].event, FleetDelta::Upsert { row } if row.id == "a"));
+    assert_eq!(disk(&path)["high_water"], 4);
+}
+
+#[test]
+fn unknown_invalid_duplicate_rows_are_skipped_warned_and_preserved_on_save() {
+    let path = path();
+    let mut source = Source(vec![agent("a")]);
+    let mut known = serde_json::to_value(project(source.agents().unwrap().remove(0))).unwrap();
+    known["future_field"] = json!({"keep":true});
+    known["state"]["phase"] = json!("future_phase");
+    let unknown = json!({"future_kind":"not_a_row","payload":[1,2]});
+    let invalid = json!({"id":"broken","label":12});
+    let mut duplicate = known.clone();
+    duplicate["label"] = json!("shadow");
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({"high_water":41,"future_header":true,
+        "rows":[known,unknown,invalid,duplicate]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut result = None;
+    let logs = crate::logging::capture_logs(|| {
+        result = Some(Store::open(path.clone()).unwrap());
+    });
+    assert_eq!(logs.matches("skipping and retaining").count(), 3);
+    assert!(!logs.contains("payload"));
+    let mut store = result.unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!((snapshot.to, snapshot.snapshot_to), (41, 42));
+    assert_eq!(snapshot.rows.len(), 1);
+    assert!(
+        matches!(&snapshot.rows[0].event, FleetDelta::Upsert { row } if row.label == "label-a" && row.state.phase == Phase::Unknown)
+    );
+    let saved = disk(&path);
+    assert_eq!(saved["future_header"], true);
+    assert_eq!(saved["rows"][0]["future_field"], json!({"keep":true}));
+    assert!(saved["rows"].as_array().unwrap().contains(&unknown));
+    assert!(saved["rows"].as_array().unwrap().contains(&invalid));
+    assert!(saved["rows"].as_array().unwrap().contains(&duplicate));
+    source.0[0].activity = Some("New observation".into());
+    store.refresh(&source).unwrap();
+    let updated = disk(&path);
+    assert!(updated["rows"].as_array().unwrap().contains(&duplicate));
+    assert!(updated["rows"].as_array().unwrap().contains(&unknown));
+    assert!(updated["rows"][0].get("future_field").is_none());
+    drop(store);
+    let mut restored = Store::open(path.clone()).unwrap();
+    assert_eq!(restored.snapshot().unwrap().rows.len(), 1);
+    restored.refresh(&Source(Vec::new())).unwrap();
+    drop(restored);
+    let mut removed = Store::open(path.clone()).unwrap();
+    assert!(
+        removed.snapshot().unwrap().rows.is_empty(),
+        "retained shadows cannot resurrect a removed row"
+    );
+    assert!(disk(&path)["rows"].as_array().unwrap().contains(&unknown));
+}
+
+#[test]
+fn malformed_cursor_metadata_refuses_loading_instead_of_resetting() {
+    for document in [
+        json!({"rows":[]}),
+        json!({"high_water":"new-format","rows":[]}),
+        json!({"high_water":12,"rows":{}}),
+    ] {
+        let path = path();
+        let bytes = serde_json::to_vec(&document).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            Store::open(path.clone()).err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn exclusive_writer_is_released_on_drop_without_losing_the_cursor() {
+    let path = path();
+    let mut store = Store::open(path.clone()).unwrap();
+    store.refresh(&Source(vec![agent("a")])).unwrap();
+    assert_eq!(
+        Store::open(path.clone()).err().unwrap().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(store);
+    assert_eq!(Store::open(path).unwrap().snapshot().unwrap().to, 1);
+}
+
+#[test]
+fn failed_write_publishes_nothing_and_requires_reopen() {
+    let path = path();
+    let mut store = Store::open(path.clone()).unwrap();
+    store.snapshot().unwrap();
+    fs::create_dir(path.with_extension("json.tmp")).unwrap();
+    assert!(store.refresh(&Source(vec![agent("a")])).is_err());
+    assert_eq!(disk(&path)["high_water"], 0);
+    assert!(store.rows.is_empty());
+    assert!(store.snapshot().is_err());
+    fs::remove_dir(path.with_extension("json.tmp")).unwrap();
+    assert!(store.refresh(&Source(vec![agent("a")])).is_err());
+    drop(store);
+    assert_eq!(
+        Store::open(path)
+            .unwrap()
+            .refresh(&Source(vec![agent("a")]))
+            .unwrap()[0]
+            .seq,
+        2
+    );
+}
+
+#[test]
+fn exhausted_sequence_refuses_without_replacing_durable_state() {
+    let path = path();
+    fs::write(&path, json!({"high_water":u64::MAX,"rows":[]}).to_string()).unwrap();
+    let mut store = Store::open(path.clone()).unwrap();
+    assert!(store.refresh(&Source(vec![agent("a")])).is_err());
+    assert_eq!(disk(&path)["high_water"], u64::MAX);
+    assert_eq!(store.snapshot().unwrap().snapshot_to, u64::MAX);
+}
+
+#[test]
+fn unavailable_or_invalid_provider_does_not_remove_existing_members() {
+    struct Unavailable;
+    impl Provider for Unavailable {
+        fn agents(&self) -> io::Result<Vec<StructuredAgent<'_>>> {
+            Err(io::Error::other("fixture unavailable"))
+        }
+    }
+    let path = path();
+    let mut store = Store::open(path.clone()).unwrap();
+    store.refresh(&Source(vec![agent("a")])).unwrap();
+    assert!(store.refresh(&Unavailable).is_err());
+    assert!(store
+        .refresh(&Source(vec![agent("a"), agent("a")]))
+        .is_err());
+    let mut invalid = agent("bad");
+    invalid.record.name = Some(String::new());
+    assert!(store.refresh(&Source(vec![invalid])).is_err());
+    assert_eq!(disk(&path)["high_water"], 1);
+    assert_eq!(store.snapshot().unwrap().rows.len(), 1);
+}
+
+fn committed_path() -> PathBuf {
+    let path = path();
+    let mut store = Store::open(path.clone()).unwrap();
+    store.refresh(&Source(vec![agent("a")])).unwrap();
+    assert_eq!(store.snapshot().unwrap().snapshot_to, 2);
+    path
+}
+
+#[test]
+fn missing_snapshot_recovers_no_rows_without_resetting_the_cursor() {
+    let path = committed_path();
+    fs::remove_file(&path).unwrap();
+    let mut recovered = Store::open(path.clone()).unwrap();
+    assert_eq!(
+        recovered.diagnostics(),
+        &[Diagnostic::SnapshotMissing { high_water: 2 }]
+    );
+    let cut = recovered.snapshot().unwrap();
+    assert_eq!((cut.to, cut.snapshot_to), (2, 2));
+    assert!(cut.rows.is_empty());
+    assert_eq!(
+        recovered.refresh(&Source(vec![agent("b")])).unwrap()[0].seq,
+        3
+    );
+}
+
+#[test]
+fn corrupt_snapshot_recovers_no_rows_at_the_preserved_cursor() {
+    for corrupt in [
+        "{broken-json",
+        r#"{"high_water":"broken","rows":[]}"#,
+        r#"{"high_water":0,"rows":null}"#,
+    ] {
+        let path = committed_path();
+        fs::write(&path, corrupt).unwrap();
+        let mut recovered = Store::open(path.clone()).unwrap();
+        assert_eq!(
+            recovered.diagnostics(),
+            &[Diagnostic::SnapshotCorrupt { high_water: 2 }]
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            corrupt,
+            "opening preserves the damaged source for operator inspection"
+        );
+        let cut = recovered.snapshot().unwrap();
+        assert_eq!((cut.to, cut.snapshot_to), (2, 2));
+        assert!(cut.rows.is_empty());
+    }
+}
+
+#[test]
+fn skipped_row_diagnostics_include_index_and_content_free_reason() {
+    let path = path();
+    let source = Source(vec![agent("a")]);
+    let known = serde_json::to_value(project(source.agents().unwrap().remove(0))).unwrap();
+    fs::write(
+        &path,
+        json!({"high_water":7,"rows":[known.clone(),
+        {"future_kind":"sensitive payload"}, {"id":"broken","label":12},known]})
+        .to_string(),
+    )
+    .unwrap();
+    let logs = crate::logging::capture_logs(|| {
+        Store::open(path.clone()).unwrap();
+    });
+    for (index, reason) in [(1, "unsupported"), (2, "invalid"), (3, "duplicate")] {
+        assert!(
+            logs.contains(&format!("index={index} reason=\"{reason}\"")),
+            "{logs}"
+        );
+    }
+    assert!(!logs.contains("sensitive payload"));
+}
+
+#[test]
+fn cursor_and_snapshot_reconcile_to_the_maximum_and_never_lower_it() {
+    for (cursor_head, snapshot_head, expected) in [(1, 2, 2), (10, 2, 10), (2, 0, 2)] {
+        let path = committed_path();
+        fs::write(
+            path.with_extension("cursor"),
+            json!({"high_water":cursor_head}).to_string(),
+        )
+        .unwrap();
+        let mut snapshot = disk(&path);
+        snapshot["high_water"] = json!(snapshot_head);
+        fs::write(&path, snapshot.to_string()).unwrap();
+        let mut store = Store::open(path.clone()).unwrap();
+        assert_eq!(store.high_water, expected);
+        assert_eq!(disk(&path.with_extension("cursor"))["high_water"], expected);
+        assert_eq!(store.snapshot().unwrap().to, expected);
+    }
+}
+
+#[test]
+fn legacy_snapshot_seeds_cursor_before_it_can_be_lost() {
+    let path = path();
+    fs::write(path.with_extension("lock"), b"").unwrap();
+    assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
+    fs::write(&path, json!({"high_water":23,"rows":[]}).to_string()).unwrap();
+    let store = Store::open(path.clone()).unwrap();
+    assert!(store.diagnostics().is_empty());
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 23);
+    drop(store);
+    fs::remove_file(&path).unwrap();
+    assert_eq!(Store::open(path).unwrap().snapshot().unwrap().to, 23);
+}
+
+#[test]
+fn corrupt_cursor_refuses_reset_and_operator_can_restore_a_trusted_floor() {
+    let path = committed_path();
+    fs::write(path.with_extension("cursor"), "{bad cursor").unwrap();
+    assert!(Store::open(path.clone()).is_err());
+    assert_eq!(disk(&path)["high_water"], 2);
+    fs::write(
+        path.with_extension("cursor"),
+        json!({"high_water":42}).to_string(),
+    )
+    .unwrap();
+    let mut recovered = Store::open(path.clone()).unwrap();
+    assert_eq!(recovered.snapshot().unwrap().to, 42);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 43);
+}
+
+#[test]
+fn loss_of_both_records_is_not_mistaken_for_a_new_empty_store() {
+    let path = committed_path();
+    fs::remove_file(&path).unwrap();
+    fs::remove_file(path.with_extension("cursor")).unwrap();
+    assert_eq!(
+        Store::open(path.clone()).err().unwrap().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert!(!path.exists());
+    assert!(!path.with_extension("cursor").exists());
+}
+
+#[test]
+fn cursor_reservation_precedes_snapshot_replacement_and_is_not_reused() {
+    let path = committed_path();
+    let mut store = Store::open(path.clone()).unwrap();
+    fs::create_dir(path.with_extension("json.tmp")).unwrap();
+    assert!(store.refresh(&Source(vec![agent("b")])).is_err());
+    assert_eq!(disk(&path)["high_water"], 2);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 4);
+    drop(store);
+    fs::remove_dir(path.with_extension("json.tmp")).unwrap();
+    let mut reopened = Store::open(path).unwrap();
+    assert_eq!(
+        reopened.refresh(&Source(vec![agent("b")])).unwrap()[0].seq,
+        5
+    );
+}
+
+#[test]
+fn failed_cursor_reservation_never_replaces_the_snapshot() {
+    let path = committed_path();
+    let original = fs::read(&path).unwrap();
+    let mut store = Store::open(path.clone()).unwrap();
+    fs::create_dir(path.with_extension("cursor.tmp")).unwrap();
+    assert!(store.refresh(&Source(Vec::new())).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 2);
+    assert!(store.snapshot().is_err());
+}
+
+#[test]
+fn only_changed_rows_drop_their_future_top_level_fields() {
+    let path = path();
+    let mut source = Source(vec![agent("a"), agent("b")]);
+    let raw: Vec<_> = source
+        .agents()
+        .unwrap()
+        .into_iter()
+        .map(|a| {
+            let mut value = serde_json::to_value(project(a)).unwrap();
+            value["future_field"] = json!({"keep":true});
+            value
+        })
+        .collect();
+    fs::write(
+        &path,
+        json!({"high_water":7,"future_header":true,"rows":raw}).to_string(),
+    )
+    .unwrap();
+    let mut store = Store::open(path.clone()).unwrap();
+    source.0[1].activity = Some("Changed b".into());
+    assert_eq!(store.refresh(&source).unwrap().len(), 1);
+    let saved = disk(&path);
+    assert_eq!(saved["future_header"], true);
+    assert_eq!(saved["rows"][0]["future_field"], json!({"keep":true}));
+    assert!(saved["rows"][1].get("future_field").is_none());
+    drop(store);
+    let mut reopened = Store::open(path.clone()).unwrap();
+    assert!(reopened.refresh(&source).unwrap().is_empty());
+    reopened.snapshot().unwrap();
+    assert_eq!(disk(&path)["rows"][0]["future_field"], json!({"keep":true}));
+}
+
+#[test]
+fn lost_cursor_after_failed_snapshot_does_not_migrate_the_older_snapshot() {
+    let path = committed_path();
+    let mut store = Store::open(path.clone()).unwrap();
+    fs::create_dir(path.with_extension("json.tmp")).unwrap();
+    assert!(store.refresh(&Source(vec![agent("b")])).is_err());
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 4);
+    drop(store);
+    fs::remove_file(path.with_extension("cursor")).unwrap();
+    assert_eq!(
+        Store::open(path.clone()).err().unwrap().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(disk(&path)["high_water"], 2);
+    assert!(!path.with_extension("cursor").exists());
+}
+
+#[test]
+fn empty_unmarked_lock_without_records_restarts_initialization_at_zero() {
+    let path = path();
+    fs::write(path.with_extension("lock"), b"").unwrap();
+    assert!(!path.exists());
+    assert!(!path.with_extension("cursor").exists());
+    let mut store = Store::open(path.clone()).unwrap();
+    assert!(store.diagnostics().is_empty());
+    assert_eq!(store.snapshot().unwrap().to, 0);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 0);
+    assert_eq!(fs::read(path.with_extension("lock")).unwrap(), b"1");
+    assert_eq!(store.refresh(&Source(vec![agent("a")])).unwrap()[0].seq, 1);
+    drop(store);
+    assert_eq!(Store::open(path).unwrap().snapshot().unwrap().to, 1);
+}
+
+// The failed open leaves the real renamed cursor present but the lock unmarked.
+fn interrupted_cursor_initialization() -> PathBuf {
+    let path = path();
+    let error = Store::open_with_parent_sync(path.clone(), |cursor_path| {
+        assert_eq!(cursor_path, path.with_extension("cursor"));
+        assert_eq!(disk(cursor_path)["high_water"], 0);
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    })
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
+    path
+}
+
+#[test]
+fn matching_cursor_retry_propagates_directory_sync_failure_without_marking() {
+    let path = interrupted_cursor_initialization();
+    let error = Store::open_with_parent_sync(path.clone(), |_| {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    })
+    .err()
+    .expect("retry must propagate the directory-sync error");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
+    assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 0);
+}
+
+#[test]
+fn matching_cursor_retry_syncs_directory_before_marking() {
+    let path = interrupted_cursor_initialization();
+    let mut synced = false;
+    let mut store = Store::open_with_parent_sync(path.clone(), |record_path| {
+        assert_eq!(parent(record_path), parent(&path));
+        assert_eq!(fs::metadata(path.with_extension("lock")).unwrap().len(), 0);
+        assert_eq!(disk(&path.with_extension("cursor"))["high_water"], 0);
+        sync_parent(record_path)?;
+        synced = true;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        synced,
+        "the renamed cursor's directory must be synced again"
+    );
+    assert_eq!(fs::read(path.with_extension("lock")).unwrap(), b"1");
+    assert_eq!(store.snapshot().unwrap().to, 0);
+    drop(store);
+    assert_eq!(Store::open(path).unwrap().snapshot().unwrap().to, 0);
+}

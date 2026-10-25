@@ -81,8 +81,11 @@ pub enum Method {
     PeersCheckoutPrepare(PeersCheckoutPrepareParams),
     #[serde(rename = "agent.list")]
     AgentList(EmptyParams),
-    #[serde(rename = "agent.get")]
+    #[serde(rename = "agent.get", alias = "agent.status")]
     AgentGet(AgentTarget),
+    /// Stop a structured worker without inventing a pane or restart plan.
+    #[serde(rename = "agent.stop")]
+    AgentStop(AgentTarget),
     #[serde(rename = "agent.read")]
     AgentRead(AgentReadParams),
     /// #276: an agent's own conversation, from the session transcript.
@@ -187,6 +190,9 @@ pub enum Method {
     PaneWriteText(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]
     PaneSendKeys(PaneSendKeysParams),
+    /// Explicit retry/fork, refused unless the pane currently shows the Codex lock.
+    #[serde(rename = "pane.resolve_codex_lock")]
+    PaneResolveCodexLock(PaneResolveCodexLockParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
     #[serde(rename = "pane.write_keys")]
@@ -471,6 +477,7 @@ impl Method {
             | Self::AgentRename(_)
             | Self::AgentFocus(_)
             | Self::AgentStart(_)
+            | Self::AgentStop(_)
             | Self::AgentFork(_)
             | Self::AgentHibernate(_)
             | Self::AgentResume(_)
@@ -498,6 +505,7 @@ impl Method {
             | Self::PaneSendText(_)
             | Self::PaneWriteText(_)
             | Self::PaneSendKeys(_)
+            | Self::PaneResolveCodexLock(_)
             | Self::PaneSendInput(_)
             | Self::PaneWriteKeys(_)
             | Self::PaneWriteInput(_)
@@ -1162,8 +1170,29 @@ pub struct AgentRenameParams {
     pub name: Option<String>,
 }
 
+/// Execution mode; omitted selectors preserve the terminal start contract.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRuntime {
+    /// Traditional terminal-backed launch.
+    #[default]
+    Pty,
+    /// Restricted pane-free Claude session.
+    Structured,
+}
+impl AgentRuntime {
+    fn is_pty(&self) -> bool {
+        *self == Self::Pty
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStartParams {
+    /// Explicit opt-in, sent only to a server advertising structured_agents.
+    #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
+    pub runtime: AgentRuntime,
+    /// Structured model selector, never raw launch flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Resolve the allocation plan without creating resources.
     #[serde(default)]
     pub dry_run: bool,
@@ -1226,6 +1255,12 @@ fn is_false(value: &bool) -> bool {
 /// `AgentStartParams`: no argv, no cwd, no pane placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSpawnParams {
+    /// Explicit structured opt-in, sent only after capability negotiation.
+    #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
+    pub runtime: AgentRuntime,
+    /// Structured model selector; PTY callers must omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Which agent to launch. A closed set — see `spawn::AgentKind`.
     pub agent: String,
     /// The child's opening turn. Passed to the agent as a single positional
@@ -2030,6 +2065,32 @@ pub struct PaneSendKeysParams {
     pub keys: Vec<String>,
 }
 
+/// An operator's explicit choice on Codex's conversation-lock screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexLockChoice {
+    /// Continue the existing conversation in this pane.
+    Retry,
+    /// Fork the conversation in this pane.
+    Fork,
+}
+
+/// A single guarded key, never an automatic reply or a submitted brief.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneResolveCodexLockParams {
+    /// Same validated write budget as `pane.send_keys`; absent means 10000 ms.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
+    /// The pane whose live screen must still show the lock before writing.
+    pub pane_id: String,
+    /// Exactly one `r` or `f`, without Enter.
+    pub choice: CodexLockChoice,
+}
+
 /// `pane.arm_self_compact` params.
 ///
 /// Arming is deliberately a *different verb* from the two writes it causes.
@@ -2317,11 +2378,13 @@ pub enum ReadFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsSubscribeParams {
     pub subscriptions: Vec<Subscription>,
-    /// ADR-0028 §3 (#1030): stream events with `seq > after`. Absent means
-    /// from now, never a replay of the ring. A cursor older than the ring
-    /// gets a `lagged { skipped_to }` line first.
+    /// Legacy replay cursor. Loss retains the `lagged` wire frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<u64>,
+    /// Explicit opt-in to typed loss and resumable sequences, strictly after
+    /// this cursor. Requires `events_live_start`; mutually exclusive with `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2932,7 +2995,7 @@ pub struct InputWriteDetails {
     /// Null for an unknown transport outcome; server receipts carry exact counts.
     pub bytes_written: Option<u64>,
     pub bytes_total: Option<u64>,
-    /// Deadline, writer_broken, owner_changed, pane_gone or admission_limit.
+    /// Deadline, writer_broken, owner_changed, pane_gone, admission_limit, transport_lost or invalid_reply.
     pub reason: String,
     /// True only once remainder retirement is complete, including a late full write.
     pub remainder_discarded: bool,
@@ -2951,6 +3014,13 @@ pub struct PeersEnrollResetParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerCapabilities {
+    /// Explicit `after_sequence` opt-in, resumable stream sequences and
+    /// typed ring loss.
+    #[serde(default)]
+    pub events_live_start: bool,
+    /// Complete structured CLI/socket and narrowed MCP admission contract.
+    #[serde(default)]
+    pub structured_agents: bool,
     /// Enabled only after the complete server and client contract (#1639) ships.
     #[serde(default)]
     pub pane_input_write_ack: bool,
@@ -3038,6 +3108,9 @@ pub enum ResponseResult {
         session_health: Option<crate::platform::SessionHealth>,
         #[serde(default)]
         api_listener: Option<ApiListenerHealth>,
+        /// Confirmed structured listener state; failure never stops the server or its PTYs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_listener: Option<super::client_listener::Status>,
         /// Missing on older servers; observing status never starts an NSS lookup.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_account_diagnostic: Option<AgentAccountDiagnostic>,
@@ -3267,6 +3340,9 @@ pub enum ResponseResult {
     AgentInfo {
         agent: AgentInfo,
     },
+    StructuredAgentInfo {
+        agent: crate::api::structured_agent::StructuredAgentInfo,
+    },
     AgentStarted {
         agent: AgentInfo,
         argv: Vec<String>,
@@ -3296,6 +3372,9 @@ pub enum ResponseResult {
     },
     AgentList {
         agents: Vec<AgentInfo>,
+        /// Additive pane-free records. Older responses omit this collection.
+        #[serde(default)]
+        structured_agents: Vec<crate::api::structured_agent::StructuredAgentInfo>,
         /// The fleet directory (#320): every agent this server can address,
         /// local ones included, each stamped with the host it lives on.
         ///
@@ -3528,7 +3607,12 @@ pub enum ResponseResult {
     PaneRead {
         read: PaneReadResult,
     },
-    SubscriptionStarted {},
+    SubscriptionStarted {
+        /// Initial cursor shared by all accepted filters. New servers always
+        /// include it; absence identifies an older acknowledgement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_sequence: Option<u64>,
+    },
     WaitMatched {
         event: EventEnvelope,
     },
@@ -4924,8 +5008,8 @@ pub struct PollerHealthSummary {
     pub pr: PollerHealth,
     /// The periodic git working-tree refresh that keeps sidebar branch /
     /// dirty / ahead-behind numbers accurate (#295). `None` from a peer on
-    /// the previous release; `Some` here always, because the refresher runs
-    /// as long as any workspace exists.
+    /// the previous release. A closed viewer gate or absent/ineligible
+    /// workspaces reports `idle` with its reason; it does not stamp success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_refresh: Option<PollerHealth>,
     /// The `[checks]` runner tick — the scheduler that dispatches script /
@@ -4944,6 +5028,25 @@ pub struct PollerHealthSummary {
     pub peer_poll: Option<PollerHealth>,
 }
 
+/// Why a poller is intentionally inactive or awaiting its next refresh.
+/// Codes contain no paths or host identifiers. Future peer values decode as
+/// `Unknown`; the optional field is ignored by older JSON readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollerReason {
+    /// No rendering app client is attached; the viewer-only gate is closed.
+    NoViewer,
+    /// No workspace exists to refresh.
+    NoWorkspaces,
+    /// Workspaces exist but none supplies a nonempty working directory.
+    NoEligibleWorkspaces,
+    /// No failure is known, but fresh results have not arrived yet.
+    AwaitingRefresh,
+    /// A newer peer supplied an unrecognized reason.
+    #[serde(other)]
+    Unknown,
+}
+
 /// One poller's health.
 ///
 /// Carries the raw facts AND a computed verdict on purpose: a watchdog wants
@@ -4952,8 +5055,11 @@ pub struct PollerHealthSummary {
 /// colour a badge. Making either reconstruct the other guarantees they disagree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollerHealth {
-    /// `ok` | `degraded` | `broken`.
+    /// `ok` | `idle` | `degraded` | `broken`; unknown future values remain readable.
     pub status: String,
+    /// Typed inactivity or pending-refresh reason; absent for other pollers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PollerReason>,
     /// Seconds since the last SUCCESSFUL round. `None` = never succeeded,
     /// which is not the same as "0 seconds ago" and must not render as fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5104,6 +5210,7 @@ pub struct PeerWorkspaceSummary {
     pub is_linked_worktree: bool,
     /// Short agent label of the workspace's attention-leading pane (e.g. "cc").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
     /// Seconds since the leading pane's state last changed.
@@ -5135,6 +5242,7 @@ pub struct PeerAgentSummary {
     /// Public pane id on the owning server. A routing detail, not a name.
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
 }
@@ -5645,6 +5753,16 @@ mod tests {
     }
 
     #[test]
+    fn subscription_accepts_explicit_after_sequence() {
+        let params: EventsSubscribeParams = serde_json::from_value(serde_json::json!({
+            "subscriptions": [], "after_sequence": 7
+        }))
+        .unwrap();
+        assert_eq!(params.after, None);
+        assert_eq!(params.after_sequence, Some(7));
+    }
+
+    #[test]
     fn subscribe_request_parses_parameterized_subscriptions() {
         let json = r#"
         {
@@ -5733,10 +5851,13 @@ mod tests {
                     clone_detection_warning: None,
                     agent_start_label: true,
                     agent_questions: true,
+                    structured_agents: true,
                     pane_input_write_ack: false,
+                    events_live_start: false,
                 }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
                 api_listener: None,
+                client_listener: None,
                 agent_account_diagnostic: None,
             },
         };
@@ -5946,6 +6067,7 @@ mod tests {
         assert!(!json.contains("label"), "{json}");
 
         let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+        assert!(!old.events_live_start);
         assert!(!old.agent_start_label);
     }
 
@@ -6382,6 +6504,7 @@ mod pr_info_tests {
     #[test]
     fn s3a_write_capability_defaults_false_and_negative_counts_are_invalid() {
         let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+        assert!(!old.events_live_start);
         assert!(!old.pane_input_write_ack);
         assert_eq!(
             serde_json::to_value(old).unwrap()["pane_input_write_ack"],

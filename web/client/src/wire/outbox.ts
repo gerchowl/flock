@@ -11,7 +11,13 @@
  *   the same socket; a late `ack` on that socket still settles it.
  *
  * Unsettled commands (`pending`, `sent`, `uncertain`) are persisted, so a
- * reload restores them with their status. A stored record that is not a
+ * reload restores them with their status. A record may carry one optional
+ * client field, `echo_after`: the seq of the target agent's transcript
+ * that the composer had applied when it sent the message, so a restored
+ * message can still be matched to its event (#1773). It is never sent on
+ * the wire, and it says nothing about delivery or queue order. A record
+ * without it (or with an unreadable one) restores the same, unmatched, so
+ * the format stays `v1`. A stored record that is not a
  * readable command is dropped, never fatal: the others still restore, and
  * {@link Outbox.problem} names what was dropped. Settled ones stay in memory for
  * display and are not persisted, which bounds the stored outbox.
@@ -33,10 +39,13 @@ import type { KeyValueStore, TimerHandle } from "./env";
 /** The storage key; the version is the stored format's, not the wire's. */
 export const OUTBOX_KEY = "flock.outbox.v1";
 
-/** One outbox command, with the error that failed it, if any. */
-export type OutboxEntry = QueuedCommand & { readonly error?: WireError };
+/** A stored command: S7a's {@link QueuedCommand}, plus the client's optional `echo_after` (see the module doc). */
+export type StoredCommand = QueuedCommand & { readonly echo_after?: number };
 
-type Stored = { readonly principal: string | null; readonly commands: readonly QueuedCommand[] };
+/** One outbox command, with the error that failed it, if any. */
+export type OutboxEntry = StoredCommand & { readonly error?: WireError };
+
+type Stored = { readonly principal: string | null; readonly commands: readonly StoredCommand[] };
 
 type Live = {
   entry: OutboxEntry;
@@ -69,6 +78,14 @@ function isCommand(value: unknown): value is QueuedCommand {
   );
 }
 
+/** `command` without an `echo_after` that is not a transcript seq: such a record restores, unmatched. */
+function readableEcho(command: StoredCommand): StoredCommand {
+  const echo: unknown = command.echo_after;
+  if (echo === undefined || (typeof echo === "number" && Number.isSafeInteger(echo) && echo >= 0)) return command;
+  const { echo_after: _unreadable, ...rest } = command;
+  return rest;
+}
+
 /** The outbox; the connection drives it. */
 export class Outbox {
   #principal: string | null = null;
@@ -99,7 +116,7 @@ export class Outbox {
     this.#principal = principal;
     const dropped: string[] = [];
     commands.forEach((entry: unknown, index) => {
-      if (isCommand(entry)) this.#commands.set(entry.cmd_id, { entry, timer: null, onSocket: false });
+      if (isCommand(entry)) this.#commands.set(entry.cmd_id, { entry: readableEcho(entry), timer: null, onSocket: false });
       else dropped.push(isObject(entry) && typeof entry["cmd_id"] === "string" ? entry["cmd_id"] : `record ${index + 1}`);
     });
     if (dropped.length > 0) this.#problem = `Dropped unreadable stored ${dropped.length === 1 ? "command" : "commands"}: ${dropped.join(", ")}.`;
@@ -126,7 +143,7 @@ export class Outbox {
   }
 
   /** Adds a new command; it is persisted before this returns. */
-  add(entry: QueuedCommand): void {
+  add(entry: StoredCommand): void {
     if (this.#commands.has(entry.cmd_id)) throw new Error(`command ${entry.cmd_id} is already queued`);
     this.#commands.set(entry.cmd_id, { entry, timer: null, onSocket: false });
     this.#commit();

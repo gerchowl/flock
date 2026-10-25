@@ -1,5 +1,7 @@
 // Generated from wire JSONL scripts by just gen-ts.
 import type { FixtureLine } from "./FixtureLine";
+import type { PermissionRecord } from "./PermissionRecord";
+import type { AgentDecideResult } from "./AgentDecideResult";
 export const fixtureExamples = {
 "agent-gap": [
 {"covers":["s7-min"],"cursors":{"agent/fixture":2},"outbox":[],"step":"given","v":1},
@@ -480,6 +482,24 @@ export const fixtureExamples = {
 {"connection":"Syncing","outbox":{"c1":"unknown_outcome"},"step":"observe","v":1},
 {"ceiling_ms":1,"step":"quiet","v":1},
 ],
+"permission-decision": [
+{"covers":["s7-min"],"cursors":{},"outbox":[],"step":"given","v":1},
+{"action":{"kind":"subscribe","stream":"agent/fixture","sub_id":"s1"},"step":"client","v":1},
+{"action":{"kind":"connect"},"step":"client","v":1},
+{"not_before_ms":0,"step":"expect_connect","v":1,"within_ms":1},
+{"step":"open","v":1},
+{"absent":[],"fields":["protocol","token"],"frame":{"client":{"name":"fixture","version":"1"},"protocol":1,"t":"hello","token":"fixture-token"},"step":"expect","v":1},
+{"frame":{"capabilities":["read","send"],"idempotency_window_ms":86400000,"principal":"fixture-principal","protocol":1,"server_epoch":"fixture-epoch","server_version":"fixture","t":"welcome"},"step":"send","v":1},
+{"absent":["after"],"fields":["sub_id","stream"],"frame":{"stream":"agent/fixture","sub_id":"s1","t":"sub"},"step":"expect","v":1},
+{"frame":{"ev":{"request":{"input":{"command":"true"},"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example"},"request_id":"typed-request","request_seq":1,"state":"open","type":"flk_permission_request"},"seq":2,"stream":"agent/fixture","sub_id":"s1","t":"ev","ts_ms":1},"step":"send","v":1},
+{"frame":{"seq":2,"sub_id":"s1","t":"synced"},"step":"send","v":1},
+{"action":{"args":{"agent":"fixture","decision":"deny","message":"operator reason","request_id":"typed-request","request_seq":1},"cmd_id":"c1","kind":"command","verb":"agent.decide"},"step":"client","v":1},
+{"absent":[],"fields":["cmd_id","verb","args","resume_only"],"frame":{"args":{"agent":"fixture","decision":"deny","message":"operator reason","request_id":"typed-request","request_seq":1},"cmd_id":"c1","resume_only":false,"t":"cmd","verb":"agent.decide"},"step":"expect","v":1},
+{"frame":{"cmd_id":"c1","ok":true,"result":{"decision":"deny","request_id":"typed-request"},"t":"ack"},"step":"send","v":1},
+{"frame":{"ev":{"decision":"deny","message":"operator reason","principal":"fixture-client","request_id":"typed-request","request_seq":1,"source":"token","state":"closed","type":"flk_permission_request"},"seq":3,"stream":"agent/fixture","sub_id":"s1","t":"ev","ts_ms":1},"step":"send","v":1},
+{"connection":"Live","outbox":{"c1":"acked"},"step":"observe","streams":{"s1":{"cursor":3,"state":"Current"}},"v":1},
+{"ceiling_ms":1000,"step":"quiet","v":1},
+],
 "ping-pong": [
 {"covers":["s7-min"],"cursors":{},"outbox":[],"step":"given","v":1},
 {"action":{"kind":"connect"},"step":"client","v":1},
@@ -760,3 +780,8 @@ export const fixtureExamples = {
 {"ceiling_ms":1000,"step":"quiet","v":1},
 ],
 } satisfies Record<string, FixtureLine[]>;
+export const permissionLifecycle = [
+({"request":{"input":{"command":"true"},"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-example"},"request_id":"typed-request","request_seq":1,"state":"open","type":"flk_permission_request"}) satisfies PermissionRecord,
+({"decision":"deny","request_id":"typed-request"}) satisfies AgentDecideResult,
+({"decision":"deny","message":"operator reason","principal":"fixture-client","request_id":"typed-request","request_seq":1,"source":"token","state":"closed","type":"flk_permission_request"}) satisfies PermissionRecord,
+] as const;

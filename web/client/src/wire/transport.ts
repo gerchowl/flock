@@ -25,13 +25,13 @@ import type { Cursor, SessionEntry, SessionObserver, SessionStream, Subscription
 import type { WireConnection } from "./connection";
 
 /** Maps one agent-stream payload to an entry (see the module doc). */
-export function sessionEntry(seq: number, ev: WireEvent): SessionEntry {
+export function sessionEntry(seq: number, ev: WireEvent, tsMs: number): SessionEntry {
   if (typeof ev === "object" && ev !== null && !Array.isArray(ev) && ev["type"] === "unknown") {
     const { raw, shape } = ev as { raw?: unknown; shape?: unknown };
-    if (typeof raw === "string" && typeof shape === "string") return { seq, kind: "unknown", unknown: { raw, shape } };
+    if (typeof raw === "string" && typeof shape === "string") return { seq, tsMs, kind: "unknown", unknown: { raw, shape } };
   }
   // The server classified this payload as a known catalogue event (ADR-0036 §8).
-  return { seq, kind: "known", event: ev as KnownSessionEvent };
+  return { seq, tsMs, kind: "known", event: ev as KnownSessionEvent };
 }
 
 /** Creates a {@link Transport} whose subscriptions run on `connection`. */
@@ -49,7 +49,7 @@ export function createWireTransport(connection: WireConnection): Transport {
       const subscription = connection.subscribe(
         stream,
         {
-          event: (seq, ev) => open && observer.entry(sessionEntry(seq, ev)),
+          event: (seq, ev, tsMs) => open && observer.entry(sessionEntry(seq, ev, tsMs)),
           gap: (from, to) => open && observer.entry({ seq: to, kind: "gap", from, to }),
           synced: () => {
             if (!open || synced) return;
