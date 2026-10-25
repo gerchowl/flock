@@ -10,7 +10,7 @@ use std::{
     os::{fd::OwnedFd, unix::net::UnixStream},
     time::{Duration, Instant},
 };
-fn root() -> SessionConfigDir {
+pub(in crate::structured::workers) fn root() -> SessionConfigDir {
     SessionConfigDir::create(&std::env::temp_dir()).unwrap()
 }
 fn item(n: u32) -> Item {
@@ -19,7 +19,7 @@ fn item(n: u32) -> Item {
     item.state = State::Held;
     item
 }
-fn journal(root: &SessionConfigDir, n: u32) -> Journal {
+pub(in crate::structured::workers) fn journal(root: &SessionConfigDir, n: u32) -> Journal {
     let mut j = Journal::open(root.path(), "publication-fixture").unwrap();
     for i in 0..n {
         j.append(Change::Upsert {
@@ -38,7 +38,7 @@ fn update(cut: Cut) -> Update {
         cut: Some(cut),
     }
 }
-fn pages(reader: &mut Reader) -> Vec<Page> {
+pub(in crate::structured::workers) fn pages(reader: &mut Reader) -> Vec<Page> {
     let mut result = vec![];
     for _ in 0..1000 {
         let page = reader.page();
@@ -49,7 +49,7 @@ fn pages(reader: &mut Reader) -> Vec<Page> {
     }
     panic!("bounded in-memory replay did not finish");
 }
-fn sequences(pages: &[Page]) -> Vec<u64> {
+pub(in crate::structured::workers) fn sequences(pages: &[Page]) -> Vec<u64> {
     pages
         .iter()
         .filter_map(|p| {
@@ -97,7 +97,7 @@ fn close(t: Transport) {
 fn queue_provider_capture_and_registration_are_one_critical_section() {
     let root = root();
     let mut j = journal(&root, 1);
-    let (mut p, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut p, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     p.capture(
         || {
@@ -130,7 +130,7 @@ fn queue_provider_capture_and_registration_are_one_critical_section() {
 fn queue_provider_replay_is_immutable_across_append_and_rewrite() {
     let root = root();
     let mut j = journal(&root, 2);
-    let (mut p, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut p, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     p.capture(|| j.subscription().map_err(Into::into), None);
     let barrier = j.replay(0).unwrap().through;
@@ -200,7 +200,7 @@ fn queue_provider_bootstrap_refusal_never_claims_a_snapshot_or_sync() {
     drop(f);
     j = Journal::open(root.path(), "publication-fixture").unwrap();
     let before = fs::read(&path).unwrap();
-    let (mut p, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut p, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     p.capture(|| j.subscription().map_err(Into::into), None);
     assert!(matches!(
@@ -220,7 +220,7 @@ fn queue_provider_bootstrap_refusal_never_claims_a_snapshot_or_sync() {
 fn queue_provider_ahead_cursor_and_producer_loss_close_explicitly() {
     let root = root();
     let j = journal(&root, 0);
-    let (p, source) = Publisher::new(j.replay(0).unwrap());
+    let (p, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     assert!(matches!(
         source.subscribe(Some(100)),
         Err(ErrorCode::CursorAhead)
@@ -237,7 +237,7 @@ fn queue_provider_ahead_cursor_and_producer_loss_close_explicitly() {
 fn queue_provider_zero_read_paging_and_tail_resume_survive_file_removal() {
     let root = root();
     let mut j = journal(&root, 100);
-    let (mut p, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut p, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     p.capture(|| j.subscription().map_err(Into::into), None);
     let head = j.replay(0).unwrap().through;
@@ -264,7 +264,7 @@ fn queue_provider_zero_read_paging_and_tail_resume_survive_file_removal() {
 fn queue_provider_overflow_is_lagged_and_never_silent_loss() {
     let root = root();
     let mut j = journal(&root, 0);
-    let (mut p, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut p, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     p.capture(|| j.subscription().map_err(Into::into), None);
     pages(&mut reader);
@@ -317,7 +317,7 @@ fn queue_provider_same_code_different_source_emits_both_completions() {
 fn queue_provider_empty_replacement_and_overlapping_replay_are_not_lost_or_duplicated() {
     let root = root();
     let mut j = journal(&root, 1);
-    let (mut p, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut p, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     p.capture(|| j.subscription().map_err(Into::into), None);
     pages(&mut reader);
@@ -358,7 +358,7 @@ fn queue_provider_empty_replacement_and_overlapping_replay_are_not_lost_or_dupli
 fn queue_provider_byte_bound_and_uncertain_durability_close_explicitly() {
     let root = root();
     let mut j = journal(&root, 0);
-    let (mut p, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut p, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     p.capture(|| j.subscription().map_err(Into::into), None);
     pages(&mut reader);
@@ -396,7 +396,7 @@ fn queue_provider_byte_bound_and_uncertain_durability_close_explicitly() {
 async fn queue_provider_ready_and_live_wakes_follow_lock_release() {
     let root = root();
     let mut j = journal(&root, 0);
-    let (mut p, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut p, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     let notify = reader.waker();
     let wake = notify.notified();
@@ -495,7 +495,7 @@ fn queue_provider_split_lock_mutation_is_observed_without_racing_threads() {
 fn queue_provider_active_resume_never_recaptures_or_rescans_the_prefix() {
     let root = root();
     let mut j = journal(&root, 100);
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut initial = source.subscribe(None).unwrap();
     publisher.capture(|| j.subscription().map_err(Into::into), None);
     let full = pages(&mut initial);
@@ -526,7 +526,7 @@ fn queue_provider_ahead_cursor_cannot_become_valid_during_bootstrap() {
     assert_eq!(j.replay(0).unwrap().through, 1);
     let path = root.path().join("sessions/publication-fixture/queue.jsonl");
     let before = fs::read(&path).unwrap();
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut request = source.subscribe(Some(2));
     let observed = if let Ok(reader) = &mut request {
         publisher.capture(|| j.subscription().map_err(Into::into), None);
@@ -553,7 +553,7 @@ fn queue_provider_bootstrap_and_real_worker_cursor_do_not_duplicate_a_large_snap
     })
     .unwrap();
     let worker_cursor = j.replay(0).unwrap().through;
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     publisher.capture(|| j.subscription().map_err(Into::into), None);
     assert_eq!(sequences(&pages(&mut reader)), [2]);
@@ -572,7 +572,7 @@ fn queue_provider_bootstrap_and_real_worker_cursor_do_not_duplicate_a_large_snap
 fn queue_provider_initial_replay_does_not_consume_the_four_live_cut_slots() {
     let root = root();
     let mut j = journal(&root, 0);
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     publisher.capture(|| j.subscription().map_err(Into::into), None);
     for n in 0..LIVE_CUTS {
@@ -593,7 +593,7 @@ fn queue_provider_initial_replay_does_not_consume_the_four_live_cut_slots() {
 fn queue_provider_readers_do_not_wait_on_another_readers_book_access() {
     let root = root();
     let mut j = journal(&root, 1);
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut first = source.subscribe(None).unwrap();
     publisher.capture(|| j.subscription().map_err(Into::into), None);
     let mut second = source.subscribe(None).unwrap();
@@ -609,7 +609,7 @@ fn queue_provider_readers_do_not_wait_on_another_readers_book_access() {
 fn queue_provider_bootstrap_status_preserves_the_last_operation_error() {
     let root = root();
     let mut j = journal(&root, 1);
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut failed = update(j.replay(0).unwrap());
     failed.offer = Err(Failure {
         code: ErrorCode::InternalError,
@@ -627,7 +627,7 @@ fn queue_provider_bootstrap_status_preserves_the_last_operation_error() {
 fn queue_provider_final_status_preserves_the_last_operation_error() {
     let root = root();
     let mut j = journal(&root, 1);
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     publisher.capture(|| j.subscription().map_err(Into::into), None);
     pages(&mut reader);
@@ -648,7 +648,7 @@ fn queue_provider_final_status_preserves_the_last_operation_error() {
 fn queue_provider_status_only_publish_never_copies_the_retained_snapshot() {
     let root = root();
     let mut j = journal(&root, 2);
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let _reader = source.subscribe(None).unwrap();
     publisher.capture(|| j.subscription().map_err(Into::into), None);
     let retained = source.1.lock().retained.clone();
@@ -663,7 +663,7 @@ fn queue_provider_status_only_publish_never_copies_the_retained_snapshot() {
 fn queue_provider_late_capture_has_synced_before_end_at_every_registration_unlock() {
     let root = root();
     let mut j = journal(&root, 2);
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     let mut reader = source.subscribe(None).unwrap();
     publisher.finish(|| j.subscription().map_err(Into::into), None);
     assert!(matches!(reader.page(), Page::Pending));
@@ -684,11 +684,19 @@ fn queue_provider_late_capture_has_synced_before_end_at_every_registration_unloc
             );
         }))
     });
-    register_live(
-        &witnessed,
-        Packet(source.1.lock().retained.clone(), None, None, true, 0),
-        true,
-    );
+    let retained = source.1.lock().retained.clone();
+    let mut book = Book::<Witness> {
+        retained,
+        bootstrapped: true,
+        status: None,
+        error: None,
+        ended: true,
+        refusal: None,
+        readers: vec![],
+    };
+    book.register(None, witnessed).unwrap();
+    REGISTRATION_WITNESS
+        .with(|w| assert!(w.borrow().is_none(), "registration unlock was not observed"));
     drop(publisher);
     let replay = pages(&mut reader);
     assert_eq!(sequences(&replay), [3, 4]);
@@ -700,11 +708,30 @@ fn queue_provider_late_capture_has_synced_before_end_at_every_registration_unloc
 fn queue_provider_high_water_advances_even_without_a_record_packet() {
     let root = root();
     let j = journal(&root, 0);
-    let (mut publisher, source) = Publisher::new(j.replay(0).unwrap());
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
     publisher.publish(&update(Cut {
         gap: None,
         records: vec![],
         through: 5,
     }));
     assert_eq!(source.1.lock().retained.through, 5);
+}
+
+#[test]
+fn queue_provider_high_water_never_rewinds_on_a_stale_status_cut() {
+    let root = root();
+    let j = journal(&root, 0);
+    let (mut publisher, source) = Publisher::new("publication-fixture", j.replay(0).unwrap());
+    for through in [5, 4, 0] {
+        publisher.publish(&update(Cut {
+            gap: None,
+            records: vec![],
+            through,
+        }));
+        assert_eq!(
+            source.1.lock().retained.through,
+            5,
+            "rewound retained high-water"
+        );
+    }
 }

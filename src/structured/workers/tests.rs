@@ -1314,3 +1314,5 @@ async fn finished_without_report_allows_retained_recovery() {
     worker.report = None;
     assert!(workers.history_recovery_allowed(&case.id));
 }
+
+mod recovery;
