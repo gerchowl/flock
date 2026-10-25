@@ -1556,9 +1556,15 @@ mod config_check_tests {
             panic!("expected a conflict warning, got {outcome:?}");
         };
         assert!(
-            diagnostics.iter().any(|d| d.contains("ctrl+shift+j")),
+            diagnostics
+                .iter()
+                .any(|d| d.contains("conflicting keybinding")
+                    && d.contains("key=keys.new_tab")
+                    && d.contains("kept keys.new_workspace")
+                    && d.contains("disabling binding")),
             "{diagnostics:?}"
         );
+        assert!(diagnostics.iter().all(|d| !d.contains("ctrl+shift+j")));
     }
 
     #[test]

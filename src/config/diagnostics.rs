@@ -86,16 +86,15 @@ fn scan_keys(text: &str, source: Source, scope: Scope) -> Vec<KeyDiagnostic> {
         // An unknown top-level table gets the loader's section wording,
         // including the [ui.toast] hint, rather than a second warning (#860).
         if super::io::unknown_top_level_section_diagnostic(key, value).is_some() {
-            if let Some(position) = locations.get(key) {
-                diagnostics.push(KeyDiagnostic {
-                    kind: KeyDiagnosticKind::Unknown,
-                    key: schema_key(key),
-                    message: Diagnostic::unknown(key, None)
-                        .with_position(Some(*position))
-                        .with_source(source)
-                        .to_string(),
-                });
-            }
+            let position = locations.get(key).copied();
+            diagnostics.push(KeyDiagnostic {
+                kind: KeyDiagnosticKind::Unknown,
+                key: schema_key(key),
+                message: Diagnostic::unknown(key, None)
+                    .with_position(position)
+                    .with_source(source)
+                    .to_string(),
+            });
             continue;
         }
         // Deserialize sections independently so one invalid section cannot hide
@@ -105,9 +104,7 @@ fn scan_keys(text: &str, source: Source, scope: Scope) -> Vec<KeyDiagnostic> {
         }
     }
     for key in unknown {
-        let Some(position) = locations.get(&key) else {
-            continue;
-        };
+        let position = locations.get(&key).copied();
         let canonical = key
             .split('.')
             .filter(|part| part.parse::<usize>().is_err())
@@ -121,7 +118,7 @@ fn scan_keys(text: &str, source: Source, scope: Scope) -> Vec<KeyDiagnostic> {
         diagnostics.push(KeyDiagnostic {
             kind: KeyDiagnosticKind::Unknown,
             message: Diagnostic::unknown(&key, None)
-                .with_position(Some(*position))
+                .with_position(position)
                 .with_source(source)
                 .to_string(),
             key: schema_key(&key),

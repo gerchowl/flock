@@ -207,6 +207,28 @@ operator metadata; loader and reload diagnostics remain path-free. Aggregate
 provenance has a structural reason, separately from sensitive content kinds.
 No socket/WS read method or raw export is enabled by this slice.
 
-The approved slice 3b2 still owns keybinding, sound, spawn-env, checks and channel
-validator producers and their immediate logging. Those existing diagnostics are
-not claimed safe by 3b1. #2384 completion and #2385 remain gated on that work.
+### Producer closure (slice 3b2)
+
+Keybinding, sound, spawn-env, checks and channel validation now construct closed
+causes through the same boundary before either returning or immediately logging
+a diagnostic. No configured chord, command, check/channel identity, environment
+name, executable or sound path is copied into those messages. Channel target
+parse errors retain only the static accepted forms. Selection, first-wins
+admission and fallback behavior are unchanged.
+
+Diagnostics retain canonical schema paths and zero-based declaration indices.
+Custom-command conflicts report both the kept and rejected declaration indices.
+Spawn environment diagnostics identify the sorted map-entry ordinal and list item
+index, not the agent spelling or environment name. Check intervals retain the
+public minimum bound. Static hints still explain prefix reservations, indexed
+keys, mp3 sound support, exact environment names and accepted script locations.
+These validators have no source span input and explicitly say that location
+and source are unavailable rather than guessing. File scanners emit a fallback
+record for every discovered unknown key without a span, even when a located
+entry projects to the same safe key. Environment overrides cannot supply peer
+arrays, so base/overlay peer coordinates retain their original indices.
+
+The inventory and redaction prerequisite of #2384 is complete across the stack.
+This does not enable #2385, a read/write API or any raw export. Consumers must
+continue using mandatory safe projections under ADR-0041 §4; credential-file
+contents and expanded environment values are outside these read models.
