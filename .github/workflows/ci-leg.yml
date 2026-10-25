@@ -26,6 +26,10 @@ on:
         description: Run test shards; ordinary macOS PRs build and lint only
         type: boolean
         default: true
+    outputs:
+      shards:
+        description: JSON list of the test shards this leg builds (expected junit set)
+        value: ${{ jobs.build.outputs.shards }}
 
 permissions:
   contents: read

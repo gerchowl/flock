@@ -106,6 +106,9 @@ jobs:
     uses: ./.github/workflows/ci-leg.yml
     with:
       leg: macos-15
+      # Policy (#1613, docs/next/ci-platform-policy.md): ordinary PRs run macOS
+      # build + lint only; the full macOS test matrix runs for `land/` batch
+      # PRs, merge_group and pushes. check-macos below asserts this expectation.
       # Batch PRs use head_ref; ref is refs/pull/<number>/merge on PR events.
       run-tests: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'land/') }}
 
@@ -178,5 +181,22 @@ jobs:
         run: |
           if [ "$RESULT" != success ]; then
             echo "macos-15 leg ended as $RESULT" >&2
+            exit 1
+          fi
+
+      # A skipped test job counts as success for the leg, so on full-matrix
+      # events (batch PRs, merge_group, push) prove the shards really ran:
+      # one JUnit report per shard the build planned.
+      - name: Require the expected test shards when the full matrix is due
+        if: always()
+        env:
+          FULL: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'land/') }}
+          SHARDS: ${{ needs.macos.outputs.shards }}
+        run: |
+          [ "$FULL" = true ] || exit 0
+          expected="$(python3 -c 'import json,os; print(len(json.loads(os.environ["SHARDS"] or "[]")))')"
+          actual="$(find junit -name junit.xml 2>/dev/null | wc -l | tr -d ' ')"
+          if [ "$expected" -lt 1 ] || [ "$actual" != "$expected" ]; then
+            echo "full macOS matrix due: expected $expected shard reports, found $actual" >&2
             exit 1
           fi
