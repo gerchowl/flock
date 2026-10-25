@@ -140,7 +140,6 @@ async fn native_inbox_caller_mixed_expiry_consumes_once_and_operator_list_is_unc
     let (_env, _scrub) = crate::config::test_config_env_guard();
     let _store = crate::mesh::runtime_store::TestStore::new();
     let mut app = app();
-    let expired = seed("fixture-agent", "fixture-session", 0);
     let live = seed("fixture-agent", "fixture-session", 60_000);
     app.mailboxes.enqueue(message("legacy"));
     let global = call(&mut app, None, "msg.list", None);
@@ -151,6 +150,7 @@ async fn native_inbox_caller_mixed_expiry_consumes_once_and_operator_list_is_unc
     let listed = call(&mut app, Some(&scope), "msg.list", None);
     assert_eq!(listed["result"]["messages"].as_array().unwrap().len(), 1);
     assert_eq!(listed["result"]["messages"][0]["correlation_id"], live);
+    let expired = seed("fixture-agent", "fixture-session", 0);
     let read = call(&mut app, Some(&scope), "msg.read", None);
     assert_eq!(read["result"]["messages"][0]["correlation_id"], live);
     assert_eq!(read["result"]["messages"].as_array().unwrap().len(), 1);
