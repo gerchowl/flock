@@ -74,6 +74,7 @@ impl<D: DiskSpace> Store<D> {
     }
     /// Decode the opaque payload before acknowledging it. Only acknowledgement
     /// winners return entries, even across independent SQLite connections.
+    /// With no acknowledgements, clock projection and queries are read-only.
     pub(crate) fn native_inbox_checked(
         &mut self,
         recipient: Option<(&str, &str)>,
@@ -81,7 +82,12 @@ impl<D: DiskSpace> Store<D> {
         wall_ms: i64,
         valid: impl Fn(&Envelope) -> bool,
     ) -> Result<(Vec<Envelope>, Vec<Envelope>)> {
-        let now = self.writable(wall_ms)?;
+        // Query against a projected clock; only acknowledgements may persist it.
+        let mut clock = self.clock()?;
+        if clock.paused {
+            return Err(Error::Paused);
+        }
+        let now = clock.advance(wall_ms);
         let keys = {
             let mut stmt = self.connection.prepare(
                 "SELECT n.origin,n.id,n.until_ms FROM native_inbox_reads n
@@ -141,6 +147,10 @@ impl<D: DiskSpace> Store<D> {
                 live.push(record.envelope);
             }
         }
+        if acknowledgements.is_empty() {
+            return Ok((live, expired));
+        }
+        self.writable(wall_ms)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

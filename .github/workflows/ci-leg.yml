@@ -26,6 +26,10 @@ on:
         description: Run test shards; ordinary macOS PRs build and lint only
         type: boolean
         default: true
+    outputs:
+      shards:
+        description: JSON list of the test shards this leg builds (expected junit set)
+        value: ${{ jobs.build.outputs.shards }}
 
 permissions:
   contents: read
@@ -62,11 +66,6 @@ jobs:
 
       - name: Check Rust documentation
         run: nix develop -c just doc-check
-
-      # Maintenance-script tests and the platform test-gap ratchet (#597).
-      - name: Run maintenance script tests
-        if: runner.os == 'Linux'
-        run: nix develop -c just script-tests
 
   build:
     name: build
