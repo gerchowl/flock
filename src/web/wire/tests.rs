@@ -1373,3 +1373,58 @@ mod subscriptions;
 mod fleet;
 
 mod commands;
+
+/// Controlled read/read overlap: the bearer and its scopes never change.
+#[test]
+fn another_valid_read_admission_closes_a_legitimate_subscription() {
+    use crate::structured::permissions::auth::tokens::{Scope, TokenError};
+    runtime(async {
+        let mut server = Server::new().await;
+        let registry = crate::structured::registry::Registry::default();
+        let mut workers = crate::structured::workers::Workers::new(server.wake.clone());
+        Arc::get_mut(&mut server.core).unwrap().service(
+            &registry,
+            &mut workers,
+            server._root.path(),
+        );
+        let mut socket = Socket::open(&server).await;
+        socket.hello(1, &"a".repeat(64)).await;
+        server.clock.deadline(15_000).await;
+        let store = server.core.shared.store.clone();
+        let session = store.authenticate(&Bearer("a".repeat(64))).unwrap();
+        let (ready, entered) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let held = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let session = session.clone();
+            move || {
+                store.admit(&session, Scope::Read, |_| {
+                    ready.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                })
+            }
+        });
+        within(entered).await.unwrap();
+        assert!(matches!(
+            store.admit(&session, Scope::Read, |_| panic!("overlapping admission")),
+            Err(TokenError::Busy)
+        ));
+        socket
+            .send(json!({"t":"sub","sub_id":"contended","stream":"fleet"}))
+            .await;
+        // Characterize the defect; no revocation, bad token or missing scope occurs.
+        let contended = socket.receive().await;
+        release.send(()).unwrap();
+        within(held).await.unwrap().unwrap();
+        assert!(matches!(contended, Received::Close(1001)), "{contended:?}");
+        assert!(store.admit(&session, Scope::Read, |_| ()).is_ok());
+        let mut fresh = Socket::open(&server).await;
+        fresh.hello(1, &"a".repeat(64)).await;
+        fresh
+            .send(json!({"t":"sub","sub_id":"uncontended","stream":"fleet"}))
+            .await;
+        assert!(matches!(fresh.receive().await, Received::Text(frame) if frame["t"] == "gap"));
+        assert!(matches!(fresh.receive().await, Received::Text(frame) if frame["t"] == "synced"));
+        server.finish().await;
+    });
+}
