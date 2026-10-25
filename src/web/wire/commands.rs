@@ -10,11 +10,14 @@ use crate::{
     },
 };
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::mpsc::{Receiver, TryRecvError},
+};
 use tokio::sync::{oneshot, Notify};
-/// Each command lane has this fixed capacity.
+/// Each command lane and the send receipt set have this fixed capacity.
 const CAPACITY: usize = 32;
-/// Completed principal/command keys retained in FIFO order across all principals.
+/// Completed principal/command keys retained in FIFO order; pending sends never evict.
 const COMMAND_IDS: usize = 1024;
 /// One decoded first-send command; identity and authority never come from args.
 pub(super) struct Command {
@@ -36,10 +39,18 @@ pub(super) struct Client {
     tx: [mpsc::Sender<Request>; 2],
     wake: Arc<Notify>,
 }
+type Receipt = Receiver<Result<AgentSendResult, ErrorCode>>;
+struct Pending {
+    key: (String, String),
+    // Shared core shutdown requires Sync; the app owner uses get_mut, never a blocking lock.
+    receipt: parking_lot::Mutex<Receipt>,
+    response: oneshot::Sender<ServerFrame>,
+}
 /// Only the app owner touches App, runtime permission books and send admission.
 pub(super) struct Owner {
     rx: [mpsc::Receiver<Request>; 2],
     completed: VecDeque<(String, String)>,
+    pending: Vec<Pending>,
 }
 /// Share the existing app-loop wake without introducing a second state owner.
 pub(super) fn channel(wake: Arc<Notify>) -> (Client, Owner) {
@@ -53,6 +64,7 @@ pub(super) fn channel(wake: Arc<Notify>) -> (Client, Owner) {
         Owner {
             rx: [sends, decisions],
             completed: VecDeque::new(),
+            pending: Vec::new(),
         },
     )
 }
@@ -63,6 +75,7 @@ impl Client {
     }
 }
 enum Outcome {
+    Queued(Receipt),
     Decided(Value),
 }
 fn dispatch(
@@ -92,6 +105,27 @@ fn dispatch_verb(
     principal: &Principal<'_>,
 ) -> Result<Outcome, ErrorCode> {
     match command.verb.as_str() {
+        "agent.send" => {
+            let args: crate::api::schema::AgentSendParams =
+                serde_json::from_value(command.args.clone())
+                    .map_err(|_| ErrorCode::InvalidParams)?;
+            if args.submit && (args.raw || args.write_timeout_ms.is_some()) {
+                return Err(ErrorCode::InvalidParams);
+            }
+            let params = crate::app::StructuredSendParams {
+                target: args.target,
+                text: args.text,
+                submit: args.submit,
+                item_id: args.item_id,
+            };
+            // Let the shared service supply its refusal before any queue mutation.
+            if params.submit && app.structured_send_target(&params.target)?.is_none() {
+                return Err(missing_target(app, &params.target));
+            }
+            Ok(Outcome::Queued(
+                app.structured_send(params, principal)?.committed,
+            ))
+        }
         "agent.decide" => {
             // TODO(#2249): Bound decide message independently of the frame limit.
             let args: AgentDecide = serde_json::from_value(command.args.clone())
@@ -166,11 +200,31 @@ impl Owner {
         self.completed.push_back(key);
     }
     /// Revalidate under the token revocation lock through bounded admission.
-    /// No model or stdin completion is awaited.
+    /// Queue completion is polled separately; no model or stdin completion is awaited.
     pub(super) fn service(&mut self, app: &mut App) {
-        // Decisions retain first admission priority; send routing is unmounted (#1831).
+        let mut i = 0;
+        while i < self.pending.len() {
+            let result = match self.pending[i].receipt.get_mut().try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => {
+                    i += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => Err(ErrorCode::InputWriteUnknown),
+            };
+            let pending = self.pending.swap_remove(i);
+            let result = result.and_then(|result| {
+                serde_json::to_value(result).map_err(|_| ErrorCode::SerializationError)
+            });
+            self.remember(pending.key.clone());
+            let _ = pending.response.send(ack(pending.key.1, result));
+        }
+        // Decisions have independent capacity even when every send receipt is pending.
         for lane in [1, 0] {
             for _ in 0..CAPACITY {
+                if lane == 0 && self.pending.len() == CAPACITY {
+                    break;
+                }
                 let Ok(request) = self.rx[lane].try_recv() else {
                     break;
                 };
@@ -189,7 +243,9 @@ impl Owner {
                 let outcome = request
                     .store
                     .admit(&request.session, scope, |token| {
-                        if self.completed.contains(&key) {
+                        if self.completed.contains(&key)
+                            || self.pending.iter().any(|p| p.key == key)
+                        {
                             return Err(ErrorCode::SessionUnconfirmed);
                         }
                         dispatch(app, &request.command, &Principal::Token(token))
@@ -205,6 +261,11 @@ impl Owner {
                         })
                     });
                 match outcome {
+                    Ok(Outcome::Queued(receipt)) => self.pending.push(Pending {
+                        key,
+                        receipt: parking_lot::Mutex::new(receipt),
+                        response: request.response,
+                    }),
                     Ok(Outcome::Decided(value)) => {
                         self.remember(key);
                         let _ = request.response.send(ack(request.command.id, Ok(value)));

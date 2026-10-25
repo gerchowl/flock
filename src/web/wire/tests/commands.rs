@@ -556,3 +556,6 @@ fn newer_wire_client_cannot_decide() {
         case.stop().await;
     });
 }
+
+#[path = "sends.rs"]
+mod sends;
