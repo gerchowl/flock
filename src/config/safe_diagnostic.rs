@@ -218,7 +218,7 @@ impl Diagnostic {
 }
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let code = match self.cause {
+        let cause_label = match self.cause {
             Cause::InvalidToml => "config parse error: invalid_toml",
             Cause::InvalidType => "invalid_config_type",
             Cause::Unknown => "unknown_config_key",
@@ -231,7 +231,7 @@ impl fmt::Display for Diagnostic {
         };
         write!(
             f,
-            "{code}; key={}; source={}",
+            "{cause_label}; key={}; source={}",
             self.key,
             self.source.label()
         )?;
@@ -344,6 +344,55 @@ pub(crate) fn edit_parse_error(error: &toml::de::Error, text: &str, output: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cause_labels_are_closed_documented_diagnostics_not_error_codes() {
+        let cases = [
+            (Cause::InvalidToml, "config parse error: invalid_toml"),
+            (Cause::InvalidType, "invalid_config_type"),
+            (Cause::Unknown, "unknown_config_key"),
+            (Cause::Removed, "removed_config_key"),
+            (Cause::Read(ErrorKind::Other), "read_error"),
+            (Cause::InvalidCatalog, "invalid_catalog"),
+            (Cause::MissingPeerName, "missing_peer_name"),
+            (Cause::DuplicatePeer, "duplicate_peer"),
+            (Cause::InvalidPeerTarget, "invalid_peer_target"),
+        ];
+        let source = syn::parse_file(include_str!("safe_diagnostic.rs")).unwrap();
+        let variants = source
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Enum(item) if item.ident == "Cause" => Some(item.variants.len()),
+                _ => None,
+            })
+            .unwrap();
+        let covered: std::collections::HashSet<_> = cases
+            .iter()
+            .map(|(cause, _)| std::mem::discriminant(cause))
+            .collect();
+        assert_eq!(
+            covered.len(),
+            variants,
+            "every Cause needs a documented label fixture"
+        );
+        let mut labels = std::collections::BTreeSet::new();
+        for (cause, label) in cases {
+            assert!(labels.insert(label), "cause labels must be distinct");
+            let text =
+                Diagnostic::new(cause, "", Source::Unavailable, Outcome::KeepCurrent).to_string();
+            assert_eq!(text.split_once("; key=").unwrap().0, label);
+            for document in [
+                include_str!("../../docs/adr/0041-configuration-v2.md"),
+                include_str!("inventory/README.md"),
+            ] {
+                assert!(
+                    document.contains(&format!("`{label}`")),
+                    "undocumented cause label: {label}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn schema_shapes_never_echo_adversarial_map_or_unknown_keys() {
         for path in [

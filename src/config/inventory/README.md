@@ -196,6 +196,27 @@ messages, I/O messages, file paths and input values are never retained in the
 safe diagnostic. `Display` and `Debug` only see safe data. Existing loader and
 CLI String consumers format that safe object rather than scrubbing messages.
 
+Cause labels are a closed diagnostic vocabulary, not `error.code` values.
+They appear only as text in `SuccessResponse.result.diagnostics[]` and carry
+no retry class. Clients must not interpret a cause label as `error.code`.
+Future GUI branching requires a typed, versioned schema enum, not registry
+entries. The base labels are:
+
+- `config parse error: invalid_toml`
+- `invalid_config_type`
+- `unknown_config_key`
+- `removed_config_key`
+- `read_error`
+- `invalid_catalog`
+- `missing_peer_name`
+- `duplicate_peer`
+- `invalid_peer_target`
+
+The exhaustive fixture covers every `Cause` variant and pins its rendered
+label to both this guide and ADR-0041 §4. Adding a cause requires a deliberate
+fixture and documentation update. #2434 tracks the scanner's separate
+emission-provenance follow-up; it is not changed in this stack.
+
 Diagnostic keys are rebuilt from catalog paths and aliases. User-map entries
 become `<key>` and collection indices become `[]`; an unknown descendant stops
 at its nearest declared container, and unknown roots become `document root`.
