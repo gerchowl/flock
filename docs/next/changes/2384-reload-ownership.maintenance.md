@@ -1,0 +1,1 @@
+- Align the configuration inventory with live message and spawn policy reloads, while documenting the existing child-environment and MCP-session snapshot limits.
