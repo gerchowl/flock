@@ -4,6 +4,7 @@
  */
 import { describe, expect, test } from "bun:test";
 
+import type { FleetAgentRow } from "../src/gen/FleetAgentRow";
 import type { AgentState } from "../src/gen/AgentState";
 import type { Phase } from "../src/gen/Phase";
 import type { ServerFrame } from "../src/gen/ServerFrame";
@@ -38,6 +39,19 @@ function subscribed(): { h: Harness; seen: Seen[]; last: () => readonly AgentRow
 const send = (h: Harness, frame: ServerFrame): void => h.step(step({ step: "send", frame }));
 
 describe("wire fleet", () => {
+  test("optional mesh metadata is compatible with local-only fleet presentation", () => {
+    const routed: FleetAgentRow = {
+      id: "fixture-agent", label: "Example", state: agentState("working"), waiting_on_human: [],
+      route: { node: "5f23ba66a62a6aeffca866a461c0686ae7f869c685e1ea1f69b2b84e84de5bb0", name: "origin.example", next_hop: "5f23ba66a62a6aeffca866a461c0686ae7f869c685e1ea1f69b2b84e84de5bb0", hops: 1 },
+    };
+    const { h, seen, last } = subscribed();
+    send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 1 });
+    send(h, upsert(1, routed));
+    send(h, { t: "synced", sub_id: "s1", seq: 1 });
+    expect(seen).toEqual([{ rows: ["fixture-agent"] }]);
+    expect(last()[0]?.label).toBe("Example");
+  });
+
   test("a snapshot is shown whole at its end, then deltas apply one row each", () => {
     const { h, seen, last } = subscribed();
     send(h, { t: "gap", sub_id: "s1", from: 1, to: 0, snapshot_to: 2 });
