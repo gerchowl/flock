@@ -395,19 +395,18 @@ impl App {
         }
     }
 
-    fn self_structured_summaries(&self) -> Vec<crate::api::schema::PeerAgentSummary> {
+    fn self_structured_summaries(&self) -> Vec<crate::api::schema::PeerStructuredAgentSummary> {
         self.state
             .structured_agents
             .observations()
             .map(
-                |(record, projection)| crate::api::schema::PeerAgentSummary {
+                |(record, projection)| crate::api::schema::PeerStructuredAgentSummary {
                     agent_id: record.agent_id.clone(),
-                    pane_id: String::new(),
                     agent: Some(record.harness.clone()),
                     status: super::structured_agents::structured_status(
                         projection.update.state.phase,
                     ),
-                    runtime: Some(crate::api::schema::AgentRuntime::Structured),
+                    runtime: record.runtime,
                 },
             )
             .collect()
@@ -1112,7 +1111,6 @@ fn workspace_peer_summary(
                 }
                 let pane_number = ws.public_pane_number(detail.pane_id)?;
                 Some(crate::api::schema::PeerAgentSummary {
-                    runtime: None,
                     agent_id: terminal.agent_id.to_string(),
                     pane_id: crate::workspace::public_pane_id_for_number(&ws.id, pane_number),
                     agent: Some(agent_label_on_the_wire(&detail)),
@@ -1189,6 +1187,24 @@ mod tests {
             proxy_jump: None,
             icon: None,
         }
+    }
+
+    #[test]
+    fn hub_relay_clones_structured_directory_from_its_polled_peer() {
+        let mut app = test_app();
+        let mut peer = summary("fixture.example", "fixture.example");
+        peer.structured_agents = serde_json::from_value(serde_json::json!([
+            {"agent_id":"native-id", "agent":"claude", "status":"idle", "runtime":"structured"}
+        ]))
+        .unwrap();
+        app.state.peer_summaries.push(peer);
+        let relayed = app.own_relayed_fleet();
+        assert_eq!(
+            relayed[0].structured_agents,
+            app.state.peer_summaries[0].structured_agents
+        );
+        app.state.peer_summaries[0].structured_agents.clear();
+        assert_eq!(relayed[0].structured_agents.len(), 1);
     }
 
     #[test]

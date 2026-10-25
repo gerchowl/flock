@@ -2552,7 +2552,6 @@ mod tests {
                 status_age_secs: None,
                 activity: None,
                 agents: vec![crate::api::schema::PeerAgentSummary {
-                    runtime: None,
                     agent_id: "agent_kiln-dev_beef".into(),
                     pane_id: "w1:p1".into(),
                     agent: Some("cc".into()),
@@ -2761,7 +2760,6 @@ mod tests {
                 status_age_secs: None,
                 activity: None,
                 agents: vec![crate::api::schema::PeerAgentSummary {
-                    runtime: None,
                     agent_id: "agent_kiln-dev_beef".into(),
                     pane_id: "w1:p1".into(),
                     agent: Some("cc".into()),

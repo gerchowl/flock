@@ -3208,7 +3208,7 @@ pub enum ResponseResult {
         system: Option<PeerSystemSummary>,
         /// Pane-free identities; optional for mixed-version fleets (mesh v5).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        structured_agents: Vec<PeerAgentSummary>,
+        structured_agents: Vec<PeerStructuredAgentSummary>,
         workspaces: Vec<PeerWorkspaceSummary>,
         /// Gossip v3 (#101): the answering server's OWN polled peers, so the
         /// polling hub can render two-hop fleet visibility (hub polls spoke2,
@@ -5248,16 +5248,24 @@ pub struct PeerWorkspaceSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerAgentSummary {
     pub agent_id: String,
-    /// Public pane id on the owning server; absent for pane-free structured identities.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Public pane id on the owning server, always present even when empty (v5).
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
-    /// Present for pane-free structured agents; legacy workspace rows omit it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<AgentRuntime>,
     pub status: AgentStatus,
+}
+
+/// A pane-free identity in the additive JSON discovery list (ADR-0008).
+/// Kept separate so workspace rows retain their required v5 pane field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStructuredAgentSummary {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
+    pub agent: Option<String>,
+    pub status: AgentStatus,
+    pub runtime: crate::structured::registry::StructuredRuntime,
 }
 
 /// `peers.hub_fleet` — down-gossip from a hub to a spoke it polls (#410).
@@ -5316,7 +5324,7 @@ pub struct RelayedFleetPeer {
     pub latency_ms: Option<u64>,
     /// Pane-free agent directory, relayed unchanged by supporting peers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub structured_agents: Vec<PeerAgentSummary>,
+    pub structured_agents: Vec<PeerStructuredAgentSummary>,
     #[serde(default)]
     pub workspaces: Vec<PeerWorkspaceSummary>,
     /// Seconds since the origin's last successful poll, at relay capture time.

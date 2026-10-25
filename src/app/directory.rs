@@ -62,6 +62,43 @@ struct FleetAgentEntry {
     runtime: Option<crate::api::schema::AgentRuntime>,
 }
 
+struct PeerDirectoryAgent<'a> {
+    agent_id: &'a str,
+    pane_id: &'a str,
+    agent: Option<&'a str>,
+    status: crate::api::schema::AgentStatus,
+    runtime: Option<crate::api::schema::AgentRuntime>,
+}
+fn peer_directory_agents(
+    peer: &crate::peers::PeerSummaryState,
+) -> impl Iterator<Item = PeerDirectoryAgent<'_>> + '_ {
+    peer.workspaces
+        .iter()
+        .flat_map(|ws| &ws.agents)
+        .map(|agent| PeerDirectoryAgent {
+            agent_id: &agent.agent_id,
+            pane_id: &agent.pane_id,
+            agent: agent.agent.as_deref(),
+            status: agent.status,
+            runtime: None,
+        })
+        .chain(
+            peer.structured_agents
+                .iter()
+                .map(|agent| PeerDirectoryAgent {
+                    agent_id: &agent.agent_id,
+                    pane_id: "",
+                    agent: agent.agent.as_deref(),
+                    status: agent.status,
+                    runtime: Some(match agent.runtime {
+                        crate::structured::registry::StructuredRuntime::Structured => {
+                            crate::api::schema::AgentRuntime::Structured
+                        }
+                    }),
+                }),
+        )
+}
+
 impl App {
     /// Resolve an agent id to its current location, local first.
     ///
@@ -213,24 +250,19 @@ impl App {
                 .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
             let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
             let route = Some(peer.peer.clone());
-            for agent in peer
-                .workspaces
-                .iter()
-                .flat_map(|ws| &ws.agents)
-                .chain(&peer.structured_agents)
-            {
+            for agent in peer_directory_agents(peer) {
                 entries.push(FleetAgentEntry {
                     location: AgentLocation {
                         node: peer.node_id.clone(),
                         live,
-                        agent_id: agent.agent_id.clone(),
+                        agent_id: agent.agent_id.to_owned(),
                         host: host.clone(),
-                        pane_id: agent.pane_id.clone(),
+                        pane_id: agent.pane_id.to_owned(),
                         local: false,
                         route: route.clone(),
                         direct: true,
                     },
-                    agent: agent.agent.clone(),
+                    agent: agent.agent.map(str::to_owned),
                     status: agent.status,
                     runtime: agent.runtime,
                 });
@@ -243,19 +275,14 @@ impl App {
                 .as_deref()
                 .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
             let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
-            for agent in peer
-                .workspaces
-                .iter()
-                .flat_map(|ws| &ws.agents)
-                .chain(&peer.structured_agents)
-            {
+            for agent in peer_directory_agents(peer) {
                 entries.push(FleetAgentEntry {
                     location: AgentLocation {
                         node: peer.node_id.clone(),
                         live,
-                        agent_id: agent.agent_id.clone(),
+                        agent_id: agent.agent_id.to_owned(),
                         host: host.clone(),
-                        pane_id: agent.pane_id.clone(),
+                        pane_id: agent.pane_id.to_owned(),
                         local: false,
                         // A relayed entry is reachable only via the peer
                         // that relayed it (#410). That peer polls the
@@ -266,7 +293,7 @@ impl App {
                         route: entry.via.clone(),
                         direct: false,
                     },
-                    agent: agent.agent.clone(),
+                    agent: agent.agent.map(str::to_owned),
                     status: agent.status,
                     runtime: agent.runtime,
                 });
@@ -370,7 +397,6 @@ mod tests {
             status_age_secs: None,
             activity: None,
             agents: vec![PeerAgentSummary {
-                runtime: None,
                 agent_id: agent_id.into(),
                 pane_id: "w1:p1".into(),
                 agent: Some("cc".into()),

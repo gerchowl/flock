@@ -616,7 +616,6 @@ mod tests {
             status_age_secs: None,
             activity: None,
             agents: vec![crate::api::schema::PeerAgentSummary {
-                runtime: None,
                 agent_id: "agent_kiln_1".into(),
                 pane_id: "w1:p1".into(),
                 agent: Some("cc".into()),

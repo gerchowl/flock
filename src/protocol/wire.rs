@@ -402,7 +402,6 @@ impl From<crate::api::schema::PeerWorkspaceSummary> for FleetWorkspace {
 impl From<FleetAgent> for crate::api::schema::PeerAgentSummary {
     fn from(agent: FleetAgent) -> Self {
         Self {
-            runtime: None,
             agent_id: agent.agent_id,
             pane_id: agent.pane_id,
             agent: crate::terminal::agent_name::received(agent.agent, "mesh"),

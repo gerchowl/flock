@@ -192,7 +192,7 @@ pub struct PeerSummaryState {
     /// Round-trip latency of the last successful summary poll.
     pub latency_ms: Option<u64>,
     /// Optional pane-free directory from JSON gossip, absent in legacy attach snapshots.
-    pub structured_agents: Vec<crate::api::schema::PeerAgentSummary>,
+    pub structured_agents: Vec<crate::api::schema::PeerStructuredAgentSummary>,
     pub workspaces: Vec<PeerWorkspaceSummary>,
     pub last_ok: Option<Instant>,
     /// Last poll error, cleared on success.
@@ -937,7 +937,7 @@ pub struct PeerSummaryPayload {
     pub icon: Option<String>,
     pub system: Option<crate::api::schema::PeerSystemSummary>,
     /// Optional pane-free directory from JSON gossip, absent in legacy attach snapshots.
-    pub structured_agents: Vec<crate::api::schema::PeerAgentSummary>,
+    pub structured_agents: Vec<crate::api::schema::PeerStructuredAgentSummary>,
     pub workspaces: Vec<PeerWorkspaceSummary>,
     /// Round-trip wall time of the summary SSH call (free latency probe).
     pub latency_ms: u64,
@@ -1666,7 +1666,6 @@ mod tests {
             ).unwrap();
             ws.agent = Some(name.clone());
             ws.agents.push(crate::api::schema::PeerAgentSummary {
-                runtime: None,
                 agent_id: "fixture-agent".into(),
                 pane_id: "fixture-pane".into(),
                 agent: Some(name),
@@ -2427,10 +2426,13 @@ mod tests {
         let parsed =
             parse_summary_response(&serde_json::json!({"result":result}).to_string(), 0).unwrap();
         assert_eq!(parsed.structured_agents.len(), 1);
-        assert!(parsed.structured_agents[0].pane_id.is_empty());
+        assert!(serde_json::to_value(&parsed.structured_agents[0])
+            .unwrap()
+            .get("pane_id")
+            .is_none());
         assert_eq!(
             parsed.structured_agents[0].runtime,
-            Some(crate::api::schema::AgentRuntime::Structured)
+            crate::structured::registry::StructuredRuntime::Structured
         );
         let relay = serde_json::json!({"name":"fixture.example", "ssh_target":"fixture.example", "origin":"hub.example", "structured_agents":agents});
         let decoded: crate::api::schema::RelayedFleetPeer = serde_json::from_value(relay).unwrap();
