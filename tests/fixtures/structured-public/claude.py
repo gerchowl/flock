@@ -105,4 +105,24 @@ else:
     print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "dogfood-complete", "session_id": session}), flush=True)
     with open(root / "turn-ready", "wb", buffering=0) as ready:
         ready.write(b"T")
-    sys.stdin.read()
+    if model == "dogfood-wire-child":
+        def emit(value):
+            print(json.dumps(dict(value, session_id=session)), flush=True)
+        for line in sys.stdin:
+            value = json.loads(line)
+            if value.get("type") == "user":
+                emit({"type": "command_lifecycle", "command_uuid": value["uuid"], "state": "started"})
+                emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "wire-send-observed"}]}})
+                disabled = (root / "proof-disable").read_text() if (root / "proof-disable").exists() else "none"
+                if disabled == "permission":
+                    continue
+                emit({"type": "control_request", "request_id": "typed-request", "request": {
+                    "subtype": "can_use_tool", "tool_name": "Bash", "tool_use_id": "tool-example",
+                    "input": {"command": "true"}, "requires_user_interaction": True, "permission_suggestions": []}})
+            elif value.get("type") == "control_response":
+                assert value["response"]["request_id"] == "typed-request"
+                emit({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "wire-decision-observed"}]}})
+                if not (root / "proof-disable").exists() or (root / "proof-disable").read_text() != "result":
+                    emit({"type": "result", "subtype": "success", "is_error": False, "result": "wire-complete"})
+    else:
+        sys.stdin.read()
