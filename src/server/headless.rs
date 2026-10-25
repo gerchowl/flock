@@ -1590,7 +1590,7 @@ impl HeadlessServer {
                 agent_start_label: true,
                 agent_questions: true,
                 structured_agents: true,
-                pane_input_write_ack: false,
+                pane_input_write_ack: true,
                 events_live_start: true,
             }),
             self.app.runtime_config.uid_policy.clone(),
@@ -3889,6 +3889,7 @@ impl HeadlessServer {
                 &mut self.app.structured_workers,
                 &crate::session::data_dir(),
             );
+            wire.service_commands(&mut self.app);
         }
         self.app.start_ready_pastes();
         let mut changed = structured_changed;
