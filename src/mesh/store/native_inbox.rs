@@ -33,6 +33,17 @@ impl<D: DiskSpace> Store<D> {
         consume: bool,
         wall_ms: i64,
     ) -> Result<(Vec<Envelope>, Vec<Envelope>)> {
+        self.native_inbox_checked(recipient, consume, wall_ms, |_| true)
+    }
+    /// Decode the opaque payload before acknowledging it. Only acknowledgement
+    /// winners return entries, even across independent SQLite connections.
+    pub(crate) fn native_inbox_checked(
+        &mut self,
+        recipient: Option<(&str, &str)>,
+        consume: bool,
+        wall_ms: i64,
+        valid: impl Fn(&Envelope) -> bool,
+    ) -> Result<(Vec<Envelope>, Vec<Envelope>)> {
         let now = self.writable(wall_ms)?;
         let keys = {
             let mut stmt = self.connection.prepare(
@@ -79,6 +90,10 @@ impl<D: DiskSpace> Store<D> {
                 }
                 Err(error) => return Err(error),
             };
+            if !record.envelope.body.is_empty() && !valid(&record.envelope) {
+                crate::logging::mesh_custody_failed("native-inbox", "undecodable_payload");
+                continue;
+            }
             let stale = until <= now || record.envelope.body.is_empty();
             if stale || (consume && recipient.is_some()) {
                 acknowledgements.push((key, if stale { "expired" } else { "read" }));
@@ -93,8 +108,12 @@ impl<D: DiskSpace> Store<D> {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (key, state) in acknowledgements {
-            tx.execute("UPDATE native_inbox_reads SET state=?3 WHERE origin=?1 AND id=?2 AND state='unread'",
+            let changed = tx.execute("UPDATE native_inbox_reads SET state=?3 WHERE origin=?1 AND id=?2 AND state='unread'",
                 params![key.origin_node, key.message_id, state])?;
+            if changed != 1 {
+                live.retain(|e| e.key != key);
+                expired.retain(|e| e.key != key);
+            }
         }
         tx.commit()?;
         Ok((live, expired))
