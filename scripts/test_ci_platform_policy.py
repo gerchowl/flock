@@ -85,3 +85,28 @@ class PlatformPolicy(unittest.TestCase):
                         self.assertEqual(outcome.returncode, 0 if result == 'success' else 1)
                         if result != 'success':
                             self.assertIn('leg ended as', outcome.stderr)
+
+    def test_macos_gate_asserts_expected_shards_only_for_full_matrix_events(self):
+        gate = self.ci['jobs']['check-macos']
+        step = next(step for step in gate['steps'] if step['name'].startswith('Require the expected test shards'))
+        self.assertEqual(step.get('if'), 'always()')
+        self.assertFalse(step.get('continue-on-error', False))
+        self.assertEqual(step['env']['FULL'], self.ci['jobs']['macos']['with']['run-tests'])
+        self.assertEqual(step['env']['SHARDS'], '${{ needs.macos.outputs.shards }}')
+        self.assertEqual(self.leg['on']['workflow_call']['outputs']['shards']['value'],
+                         '${{ jobs.build.outputs.shards }}')
+
+        def run(full, shards, reports):
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp:
+                for i in range(reports):
+                    os.makedirs(f'{tmp}/junit/s{i}')
+                    open(f'{tmp}/junit/s{i}/junit.xml', 'w').close()
+                return subprocess.run(['/bin/sh', '-c', step['run']], cwd=tmp, capture_output=True, text=True,
+                                      env={**os.environ, 'FULL': full, 'SHARDS': shards}, timeout=10).returncode
+        three = '[{"name":"a"},{"name":"b"},{"name":"c"}]'
+        self.assertEqual(run('true', three, 3), 0)
+        self.assertEqual(run('true', three, 2), 1)
+        self.assertEqual(run('true', three, 0), 1)
+        self.assertEqual(run('true', '', 0), 1)
+        self.assertEqual(run('false', three, 0), 0)
