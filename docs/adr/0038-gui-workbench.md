@@ -711,6 +711,33 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
   - A deployment may still put `/v1/ws` behind `tailscale serve` as defence in depth.
   - **No migration is needed.** ADR-0011's gateway, the IPC transport and the use-case layer were never built: there is no `src/usecase/`, no `src/gui/` and no `RpcTransport` in the tree on 2026-10-15. Nothing in use changes.
 
+#### Amendment: concurrent token admissions (#2450, 2026-10-25)
+
+The file-token authorization recheck and bounded dispatch hold a **shared** store
+lock. Concurrent admissions can proceed together. Creation, replacement and
+revocation retain the **exclusive** lock. A revocation intent is published before
+waiting for exclusive ownership; admissions check intent both before and after
+acquiring their shared lock, so readers cannot starve revocation. Revoke waits
+for admitted callbacks to finish; after it returns, no dispatch under the revoked
+token remains in flight or can begin. Callbacks cannot wait for model execution
+or recursively manage tokens.
+
+A subscription encountering pending mutation receives `subfail session_busy`,
+using the registered `session_busy` retry class `later`, on that ID only. Sibling
+subscriptions and the authenticated socket remain connected. A client may open a
+fresh ID later. Unsafe or unreadable storage still closes the transport.
+
+Review amendment: intent probes also share their lock; live revokers retain
+exclusive intent ownership. Startup and exclusive revocation reclaim unlocked
+stale intents, checking exclusive ownership, link count and inode identity so
+concurrent sweepers cannot remove a newly published intent at a reused name.
+The client automatically retries only the busy stream under fresh IDs after
+250, 500 and 1000 ms, at most three same-socket retries since its last `synced`.
+Unsubscribe or socket loss cancels the pending timer. Exhaustion leaves the
+stream visibly Refused. Reopening starts a new budget; a later reconnect may
+also retry through its new welcome, without resetting this timer budget.
+Siblings keep their IDs and cursors.
+
 ### 7. Artifacts, and the artifact MCP
 
 An **artifact** is agent-authored content that a person looks at and answers: an HTML report, a plot, a diagram or a rendered table. It is versioned and immutable per version. It is also untrusted (ADR-0011 §5).
