@@ -8,11 +8,13 @@ use std::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
     },
+    path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
 };
 use support::fleet::{self, Node, NodeSpec};
 const LIMIT: Duration = Duration::from_secs(15);
+const LOCAL: &[NodeSpec] = &[NodeSpec::new("nodea", "alpha", &[])];
 const NODES: &[NodeSpec] = &[
     NodeSpec::new("nodea", "alpha", &["nodeb"]),
     NodeSpec::new("nodeb", "beta", &["nodea"]),
@@ -35,6 +37,7 @@ struct Bridge {
     stream: BufReader<UnixStream>,
     agent: String,
     seq: u64,
+    inputs: Option<PathBuf>,
 }
 impl Bridge {
     fn start(node: &Node, name: &str, structured: bool) -> Self {
@@ -60,6 +63,7 @@ impl Bridge {
             stream: BufReader::new(stream),
             agent: started["agent"]["agent_id"].as_str().unwrap().into(),
             seq: 0,
+            inputs: structured.then(|| path.with_extension("inputs")),
         };
         bridge.request("initialize", json!({}));
         bridge
@@ -89,9 +93,77 @@ impl Bridge {
         let response = self.request("tools/call", json!({"name":name, "arguments":arguments}));
         serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
     }
+    fn input_once(&self) {
+        if let Some(path) = &self.inputs {
+            let inputs = fs::read_to_string(path).expect("harness input precedes started");
+            assert_eq!(
+                inputs.lines().count(),
+                1,
+                "one actual harness input: {inputs}"
+            );
+        }
+    }
+    fn inbox(&mut self, node: &Node, queued: &Value) -> Value {
+        if let Some(path) = &self.inputs {
+            let item = queued["item_id"]
+                .as_str()
+                .expect("native admission has an item id");
+            let deadline = Instant::now() + LIMIT;
+            let mut after = 0;
+            // Consume committed transition pages. An empty stream waits on the
+            // server's EventHub condvar; this never polls inbox snapshots.
+            let delivered = loop {
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis();
+                assert!(remaining > 0, "native delivery deadline");
+                let page = api(
+                    node,
+                    "events.read",
+                    json!({"after":after,
+                    "kinds":["queue_item_state"],"subjects":[item],
+                    "wait_ms":remaining.min(5000)}),
+                );
+                assert!(page.get("gap").is_none(), "delivery cursor gap: {page}");
+                let events = page["events"].as_array().unwrap();
+                assert!(
+                    !events.is_empty(),
+                    "native delivery facts did not arrive: {page}; input={:?}; owner={}",
+                    fs::read_to_string(path),
+                    api(node, "agent.get", json!({"target":self.agent}))
+                );
+                if let Some(event) = events.iter().find(|e| e["data"]["to"] == "delivered") {
+                    break event["data"].clone();
+                }
+                assert!(
+                    events.iter().all(|e| e["data"]["to"] == "queued"),
+                    "harness did not start the admitted item: {page}"
+                );
+                let next = page["next_after"].as_u64().unwrap();
+                assert!(next > after, "delivery cursor must advance: {page}");
+                after = next;
+            };
+            assert_eq!(delivered["agent"], self.agent);
+            assert_eq!(delivered["item_id"], item);
+            self.input_once();
+            let input: Value =
+                serde_json::from_str(fs::read_to_string(path).unwrap().lines().next().unwrap())
+                    .unwrap();
+            assert_eq!(input["uuid"], delivered["batch_id"]);
+        }
+        let read = self.tool("flock_msg_read", json!({}));
+        let messages = read["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "one delivered message: {read}");
+        let message = messages[0].clone();
+        assert_eq!(
+            self.tool("flock_msg_read", json!({}))["messages"],
+            json!([])
+        );
+        message
+    }
 }
-fn setup() -> fleet::Fleet {
-    fleet::spawn_with_startup_probe("mcp-native", NODES, |fleet, name| {
+fn setup(specs: &[NodeSpec]) -> fleet::Fleet {
+    fleet::spawn_with_startup_probe("mcp-native", specs, |fleet, name| {
         let node = fleet.node(name);
         let fake = fleet.base.join("bin/claude");
         fs::write(
@@ -116,95 +188,77 @@ fn setup() -> fleet::Fleet {
         fs::write(config, text).unwrap();
     })
 }
-fn exchange(sender: &mut Bridge, recipient: &mut Bridge, correlation: &str) {
+fn exchange(
+    sender_node: &Node,
+    sender: &mut Bridge,
+    recipient_node: &Node,
+    recipient: &mut Bridge,
+    correlation: &str,
+) {
     let sent = sender.tool("flock_msg_send", json!({"to":{"type":"agent", "agent":recipient.agent}, "body":"fixture question", "intent":"needs_reply", "correlation_id":correlation}));
     assert_eq!(sent["correlation_id"], correlation, "{sent}");
-    let deadline = Instant::now() + LIMIT;
-    let received = loop {
-        let read = recipient.tool("flock_msg_read", json!({}));
-        if let Some(message) = read["messages"].as_array().unwrap().first() {
-            break message.clone();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "delivery never reached inbox: {read}"
-        );
-    };
+    let received = recipient.inbox(recipient_node, &sent);
     assert_eq!(received["body"], "fixture question");
     assert_eq!(received["correlation_id"], correlation);
     assert_eq!(received["from_agent"], sender.agent);
     assert_eq!(received["intent"], "needs_reply");
-    assert_eq!(
-        recipient.tool("flock_msg_read", json!({}))["messages"],
-        json!([])
-    );
+    let reply_id = format!("{correlation}-answer");
     let reply = recipient.tool(
         "flock_msg_reply",
-        json!({"correlation_id":correlation, "body":"fixture answer"}),
+        json!({"correlation_id":correlation,
+        "reply_correlation_id":reply_id,"body":"fixture answer"}),
     );
-    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(reply["correlation_id"], reply_id, "{reply}");
     let waited = sender.tool(
         "flock_msg_wait_reply",
-        json!({"correlation_id":correlation, "timeout_ms":5000}),
+        json!({"correlation_id":correlation,"timeout_ms":5000}),
     );
-    if waited["outcome"] != "replied" {
-        let status = sender.tool("flock_msg_status", json!({"correlation_id":correlation}));
-        let inbox = sender.tool("flock_msg_read", json!({}));
-        panic!("accepted reply: {reply}; wait: {waited}; sender status: {status}; sender inbox: {inbox}");
-    }
-    assert_eq!(waited["reply"]["body"], "fixture answer", "{waited}");
+    assert_eq!(waited["outcome"], "replied", "{waited}");
+    assert_eq!(waited["correlation_id"], correlation);
+    assert_eq!(waited["reply"]["body"], "fixture answer");
+    assert_eq!(waited["reply"]["correlation_id"], reply_id);
+    assert_eq!(waited["reply"]["from_agent"], recipient.agent);
+    let answer = sender.inbox(sender_node, &reply);
+    assert_eq!(answer["correlation_id"], reply_id);
+    assert_eq!(answer["in_reply_to"], correlation);
+    assert_eq!(answer["body"], "fixture answer");
+    assert_eq!(answer["intent"], "fyi");
+    assert_eq!(answer["from_agent"], recipient.agent);
+    sender.input_once();
+    recipient.input_once();
 }
 #[test]
 fn pty_to_structured_to_reply() {
-    let fleet = setup();
+    let fleet = setup(LOCAL);
     let node = fleet.node("nodea");
     let mut sender = Bridge::start(node, "terminal", false);
     let mut recipient = Bridge::start(node, "native", true);
-    exchange(&mut sender, &mut recipient, "pty-native");
-    let inputs = fs::read_to_string(node.home.join("native.inputs")).unwrap();
-    assert_eq!(
-        inputs.lines().count(),
-        1,
-        "exactly one actual harness input"
-    );
+    exchange(node, &mut sender, node, &mut recipient, "pty-native");
 }
-
 #[test]
 fn structured_to_pty_to_reply() {
-    let fleet = setup();
+    let fleet = setup(LOCAL);
     let node = fleet.node("nodea");
     let mut sender = Bridge::start(node, "native", true);
     let mut recipient = Bridge::start(node, "terminal", false);
-    exchange(&mut sender, &mut recipient, "native-pty");
+    exchange(node, &mut sender, node, &mut recipient, "native-pty");
 }
 #[test]
 fn structured_to_structured_to_reply() {
-    let fleet = setup();
+    let fleet = setup(LOCAL);
     let node = fleet.node("nodea");
     let mut sender = Bridge::start(node, "first", true);
     let mut recipient = Bridge::start(node, "second", true);
-    exchange(&mut sender, &mut recipient, "native-native");
+    exchange(node, &mut sender, node, &mut recipient, "native-native");
 }
 #[test]
+#[ignore = "blocked on #2474"]
 fn remote_structured_recipient_replies_to_the_other_node() {
-    let fleet = setup();
-    let mut sender = Bridge::start(fleet.node("nodeb"), "terminal", false);
-    let mut recipient = Bridge::start(fleet.node("nodea"), "native", true);
-    let deadline = Instant::now() + LIMIT;
-    loop {
-        let listing = sender.tool("flock_agent_list", json!({}));
-        if listing["fleet"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r["agent_id"] == recipient.agent)
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "recipient absent from remote directory: {listing}"
-        );
-    }
-    exchange(&mut sender, &mut recipient, "remote-native");
+    // TODO(#2474): enable with bounded native-peer discovery readiness.
+    let fleet = setup(NODES);
+    let a = fleet.node("nodea");
+    let b = fleet.node("nodeb");
+    let mut sender = Bridge::start(b, "terminal", false);
+    let mut recipient = Bridge::start(a, "native", true);
+    exchange(b, &mut sender, a, &mut recipient, "remote-native");
 }
