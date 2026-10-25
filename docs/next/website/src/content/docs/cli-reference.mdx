@@ -212,7 +212,9 @@ flk config reset-keys
 | `1` | loaded, with advisory warnings (removed or unknown keys, deprecated keys, keybinding conflicts) |
 | `2` | did not load — a session would fall back to built-in defaults |
 
-`--json` emits an object with `path`, `exit_code`, and `diagnostics` on stdout. Removed and unknown keys include file and line locations. Removed keys always produce exit `1`, even though the configuration loads successfully.
+`--json` emits an object with `path`, `exit_code`, and `diagnostics` on stdout. Removed and unknown-key diagnostics include source categories and line locations. Private map entries use `<key>`, and unknown spellings are withheld behind the nearest declared schema container. The `path` metadata still identifies the file being checked. Removed keys always produce exit `1`, even though the configuration loads successfully.
+
+Loader and file-key diagnostics withhold source filenames, rejected values and parser excerpts. Syntax errors retain typed reasons and byte line/column positions when available; CLI edit parse refusals use the same safe formatting.
 
 Every diagnostic is printed, unlike the in-app warning banner, which truncates to four lines. The check resolves keybindings in full, so conflicts and deprecation renames are caught rather than just TOML syntax errors.
 
@@ -1074,7 +1076,7 @@ Remove these settings and callers:
   route through the mesh or queue while offline. New sends outside the gossip
   horizon with no stored owner hint are refused as unknown.
 
-Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown keys with file and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
+Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown-key warnings with safe schema shapes, source categories and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
 
 Existing peer lists become a mesh with fewer edges; reciprocal SSH access is
 not required. `[msg] allow_from` names are the authenticated origin's local
