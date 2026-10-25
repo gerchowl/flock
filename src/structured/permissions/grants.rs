@@ -1,6 +1,9 @@
 //! Operator management of exact live-runtime grants (ADR-0036 S6, #2362).
 use super::*;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+const INPUT_KEY_HASH_BYTES: usize = 8;
 
 /// A grant's originating decision; identity is fenced by agent and generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,7 +17,13 @@ pub struct SessionGrant {
     #[serde(flatten)]
     pub handle: GrantHandle,
     pub tool: String,
-    pub canonical_input_key: String,
+    /// First 16 hexadecimal SHA-256 digits, for display rather than identity.
+    pub canonical_input_key_hash: String,
+    /// UTF-8 byte length of the complete canonical key.
+    pub canonical_input_key_bytes: usize,
+    /// Full tool/input key, present only with an explicit operator opt-in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_input_key: Option<String>,
     pub installed_ms: u64,
 }
 /// Exact structured agent identity; names and pane IDs are not grant authority.
@@ -22,6 +31,9 @@ pub struct SessionGrant {
 #[serde(deny_unknown_fields)]
 pub struct GrantsList {
     pub agent_id: String,
+    /// Explicitly disclose tool input, which can contain credentials.
+    #[serde(default)]
+    pub show_input: bool,
 }
 /// Revocation must use the generation and grant handle observed by the caller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,7 +46,7 @@ pub struct GrantsRevoke {
 }
 
 impl Book {
-    pub fn grants(&self) -> Vec<SessionGrant> {
+    pub fn grants(&self, show_input: bool) -> Vec<SessionGrant> {
         self.grants
             .iter()
             .map(|(key, grant)| SessionGrant {
@@ -43,7 +55,13 @@ impl Book {
                     request_seq: grant.request_seq,
                 },
                 tool: grant.tool.clone(),
-                canonical_input_key: key.clone(),
+                canonical_input_key_hash: Sha256::digest(key.as_bytes())
+                    .iter()
+                    .take(INPUT_KEY_HASH_BYTES)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                canonical_input_key_bytes: key.len(),
+                canonical_input_key: show_input.then(|| key.clone()),
                 installed_ms: grant.installed_ms,
             })
             .collect()

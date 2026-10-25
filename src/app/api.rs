@@ -1516,7 +1516,13 @@ impl App {
         }
         let response = match request.method {
             Method::StructuredGrantsList(p) => {
-                return self.handle_structured_grants(request.id, p.agent_id, None, None)
+                return self.handle_structured_grants(
+                    request.id,
+                    p.agent_id,
+                    None,
+                    None,
+                    p.show_input,
+                )
             }
             Method::StructuredGrantsRevoke(p) => {
                 return self.handle_structured_grants(
@@ -1527,6 +1533,7 @@ impl App {
                         request_id: p.request_id,
                         request_seq: p.request_seq,
                     }),
+                    false,
                 )
             }
             Method::ServerStop(_) => {

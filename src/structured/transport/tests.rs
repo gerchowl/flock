@@ -3223,14 +3223,35 @@ fn operator_revocation_reaches_the_real_book_and_the_next_request_prompts() {
         "allow"
     );
     receive(&transport);
+    grant_request(
+        &mut output,
+        "other-grant",
+        "Bash",
+        serde_json::json!({"command":"SECRET_2416_remaining_grant"}),
+        None,
+    );
+    opened(&transport);
+    let second = close_with(
+        &transport,
+        &mut input,
+        "other-grant",
+        permissions::Decision::AllowAlways,
+    );
+    assert_eq!(second["response"]["response"]["behavior"], "allow");
     let handle = transport.input_handle();
     let grants = wait(&transport, || {
-        match handle.session_grants(&Principal::Operator, None) {
+        match handle.session_grants(&Principal::Operator, None, false) {
             Err(ErrorCode::SessionBusy) => None,
             result => Some(result.unwrap()),
         }
     });
-    assert_eq!(grants.len(), 1);
+    assert_eq!(grants.len(), 2);
+    let original = grants
+        .iter()
+        .find(|grant| grant.handle.request_id == "grant-origin")
+        .unwrap()
+        .handle
+        .clone();
     for principal in [
         Principal::Agent("fixture-agent"),
         Principal::Lease("fixture-agent"),
@@ -3238,17 +3259,23 @@ fn operator_revocation_reaches_the_real_book_and_the_next_request_prompts() {
     ] {
         assert_eq!(
             handle
-                .session_grants(&principal, Some(&grants[0].handle))
+                .session_grants(&principal, Some(&original), true)
                 .unwrap_err(),
             ErrorCode::OperatorOnly
         );
     }
-    wait(&transport, || {
-        match handle.session_grants(&Principal::Operator, Some(&grants[0].handle)) {
+    let remaining = wait(&transport, || {
+        match handle.session_grants(&Principal::Operator, Some(&original), true) {
             Err(ErrorCode::SessionBusy) => None,
             result => Some(result.unwrap()),
         }
     });
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].handle.request_id, "other-grant");
+    assert!(remaining[0].canonical_input_key.is_none());
+    assert!(!serde_json::to_string(&remaining)
+        .unwrap()
+        .contains("SECRET_"));
     permission(&mut output, "after-revoke");
     receive(&transport);
     receive(&transport);

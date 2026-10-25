@@ -31,16 +31,27 @@ checks and retains operator-mode UID/process-detachment limits (#1177, #1629).
 `structured.grants.list {"agent_id":"…"}` returns
 `result.type: "structured_grants"`, the exact `agent_id`, runtime `generation`,
 and `grants`. Each installed grant contains `request_id`, `request_seq`, `tool`,
-`canonical_input_key` and `installed_ms` (unsigned 64-bit Unix milliseconds
-from its decision installation audit). The key is canonical JSON `[tool_name, input]`: object keys
-are recursively sorted; arrays and scalar values remain exact. Pending installs
-are not listed. A runtime holds at most 16 installed/reserved exact keys
+`canonical_input_key_hash`, `canonical_input_key_bytes` and `installed_ms`
+(unsigned 64-bit Unix milliseconds from its decision installation audit).
+By default the full `canonical_input_key` field is omitted, even for the operator.
+The fingerprint is the first 16 lowercase hexadecimal SHA-256 digits of the key;
+the length counts its UTF-8 bytes. These are comparison metadata, not grant
+identity or an authorization handle. Revocation still uses the originating
+request handle and runtime generation.
+
+An explicit `structured.grants.list {"agent_id":"…", "show_input":true}` returns
+`canonical_input_key` as well. **The full key can contain secrets from tool input.**
+Opt in only when disclosure is intended; CLI output can enter terminal
+scrollback and logs. Hash and length also disclose comparison metadata. The key
+is canonical JSON `[tool_name, input]`: object keys are recursively sorted;
+arrays and scalar values remain exact. Pending installs are not listed. A runtime holds at most 16 installed/reserved exact keys
 (`MAX_GRANTS`). Names and pane IDs are not accepted as grant identities.
 
 `structured.grants.revoke` takes `agent_id`, `generation`, `request_id` and
 `request_seq`. Use the generation and originating decision handle from the list
 (or the originating permission decision for a pending install). Success returns
-the same result shape with remaining `grants` and a `revoked` object containing
+the same redacted result shape with remaining `grants` (no full keys) and a
+`revoked` object containing
 `request_id` and `request_seq`. A stale generation returns
 `permission_grant_stale_generation`; an unknown or already revoked handle returns
 `permission_grant_unknown` (both exit 1, retry `never`). Refresh the list rather

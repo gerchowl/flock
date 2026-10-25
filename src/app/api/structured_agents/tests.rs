@@ -483,7 +483,7 @@ async fn structured_resume_refuses_nonoperator_uid_without_ancestry() {
 }
 
 #[tokio::test]
-async fn grant_socket_methods_fence_generation_authority_and_emit_revocation_audit() {
+async fn grant_socket_methods_redact_input_unless_operator_opts_in_and_fence_revocation() {
     use crate::structured::{
         permissions::{self, AgentDecide, Decision, Principal},
         workers::tests::{wait, Case},
@@ -491,7 +491,7 @@ async fn grant_socket_methods_fence_generation_authority_and_emit_revocation_aud
     let mut app = app();
     app.current_api_peer_pid = Some(std::process::id());
     let notify = app.render_notify.clone();
-    let event = json!({"type":"control_request","request_id":"grant-origin","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"fixture-tool","input":{"command":"true"}}});
+    let event = json!({"type":"control_request","request_id":"grant-origin","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"fixture-tool","input":{"command":"SECRET_2416_credential_probe_🔒"}}});
     let case = Case::start(
         &mut app.state.structured_agents,
         &mut app.structured_workers,
@@ -552,6 +552,36 @@ async fn grant_socket_methods_fence_generation_authority_and_emit_revocation_aud
     );
     assert_eq!(listed["result"]["generation"], case.generation);
     assert_eq!(listed["result"]["grants"][0]["tool"], "Bash");
+    assert!(
+        !listed.to_string().contains("SECRET_"),
+        "default list must redact input"
+    );
+    assert!(listed["result"]["grants"][0]
+        .get("canonical_input_key")
+        .is_none());
+    let disclosed = request(
+        &mut app,
+        "structured.grants.list",
+        json!({"agent_id":case.id,"show_input":true}),
+    );
+    assert!(disclosed["result"]["grants"][0]["canonical_input_key"]
+        .as_str()
+        .unwrap()
+        .contains("SECRET_2416_credential_probe"));
+    assert_eq!(
+        disclosed["result"]["grants"][0]["canonical_input_key_hash"],
+        listed["result"]["grants"][0]["canonical_input_key_hash"]
+    );
+
+    assert_eq!(
+        listed["result"]["grants"][0]["canonical_input_key_hash"],
+        "cd4b6d19ecabe8e0"
+    );
+    assert_eq!(
+        listed["result"]["grants"][0]["canonical_input_key_bytes"],
+        56
+    );
+    let _: crate::api::schema::SuccessResponse = serde_json::from_value(disclosed).unwrap();
     let _: crate::api::schema::SuccessResponse = serde_json::from_value(listed.clone()).unwrap();
     let mut params = json!({"agent_id":case.id, "generation":case.generation+1, "request_id":"grant-origin","request_seq":seq});
     assert_eq!(
@@ -562,6 +592,10 @@ async fn grant_socket_methods_fence_generation_authority_and_emit_revocation_aud
     app.current_api_peer_pid = None;
     for (method, p) in [
         ("structured.grants.list", json!({"agent_id":case.id})),
+        (
+            "structured.grants.list",
+            json!({"agent_id":case.id,"show_input":true}),
+        ),
         ("structured.grants.revoke", params.clone()),
     ] {
         assert_eq!(
