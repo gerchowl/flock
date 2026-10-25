@@ -92,7 +92,6 @@ records drain before reservation retirement. Operator admission uses the shared
 send service (#1957); authenticated message custody routing remains #1958.
 Operator resume works after cleanup for idle starts and MCP opening turns.
 
-
 The landed production launch path in #1843 now supplies the configured policy to
 these worker-owned queues, enforcing the production checkpoint requirement in
 #1928.
