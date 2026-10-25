@@ -3,4 +3,4 @@
 /**
  * Acceptance slice selected by the fixture's initial header.
  */
-export type FixtureCoverage = "s7-min" | "s7";
+export type FixtureCoverage = "client-only" | "s7-min" | "s7";
