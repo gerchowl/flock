@@ -44,7 +44,7 @@ pub(super) fn pending(namespace: &Namespace) -> Result<bool, TokenError> {
         match namespace
             .file(name, false)
             .map(LockFile::new)
-            .and_then(|file| match file.try_lock() {
+            .and_then(|file| match file.try_lock_shared() {
                 Ok(()) => Ok(false),
                 Err(TryLockError::WouldBlock) => Ok(true),
                 Err(TryLockError::Error(error)) => Err(error),
@@ -56,4 +56,28 @@ pub(super) fn pending(namespace: &Namespace) -> Result<bool, TokenError> {
     }
     namespace.check()?;
     Ok(false)
+}
+
+/// Reclaim unlocked published intents under the store's exclusive mutation lock.
+/// Each removal also owns the intent exclusively, so a newly published live
+/// revoker remains protected even if it appeared after the directory listing.
+pub(super) fn sweep(namespace: &Namespace) -> Result<(), TokenError> {
+    for entry in namespace.names()? {
+        let Some(name) = entry.name.as_deref() else {
+            continue;
+        };
+        if !name
+            .strip_prefix(".revoke-")
+            .is_some_and(|s| valid_hex(s, 32))
+        {
+            continue;
+        }
+        if let Err(error) = namespace.remove_unheld_intent(name) {
+            if error.kind() != io::ErrorKind::NotFound {
+                crate::logging::client_token_entry_unsafe(&entry.id);
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(())
 }
