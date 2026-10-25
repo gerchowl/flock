@@ -651,7 +651,7 @@ An **artifact** is agent-authored content that a person looks at and answers: an
 - Limits:
   - `[artifacts] max_bytes`: default 2 MiB per version.
   - `max_versions`: default 50 per artifact.
-  - Retention: 14 days after the last view or comment, with an operator purge command (ADR-0011 §5).
+  - Retention: §7a's lifetimes (a `session` default, then `idle_ttl`, 14 days by default after the last view, comment or answer), with holds, quotas and an operator purge command (ADR-0011 §5).
 - A version is immutable, and a published artifact is its hash.
 
 **Rendering and isolation.**
@@ -690,23 +690,50 @@ An **artifact** is agent-authored content that a person looks at and answers: an
 ### 7a. Artifact lifecycle: nothing piles up (#1598, owner decision 17)
 
 **Lifetimes.** `flock_artifact_publish` gains `lifetime?: "session" | "persistent"`, **default `session`**.
-- **A `session` artifact** ends with the publishing agent's identity: when the agent is stopped, or its identity is replaced (ADR-0028 §8a). A restart or compaction does not end it.
-- **A `persistent` artifact** is kept until it has been idle for `[artifacts] idle_ttl` (ADR-0041; default 14 days). Idle time counts from the last view, comment or answer.
-- **What keeps a session artifact alive past its session.** A person can pin it (below). An open question whose `about` is the artifact holds it until the question closes. When either ends, the artifact follows the persistent rule.
+- **The session** is the **publishing agent's** identity, not the server's. A `session` artifact's session ends when that agent is stopped or its identity is replaced (ADR-0028 §8a). A restart, a handoff or a compaction does not end it.
+- **Persistent.** A `persistent` artifact, and a `session` artifact whose session has ended but which is still held (below), expires after it has been **idle** for `[artifacts] idle_ttl` (default 14 days).
+- **Idle** means no view, comment or answer, and no open tile, for that long.
 
-**Quotas.** `[artifacts] quota_bytes_per_agent` (default 64 MiB) and `quota_bytes_total` (default 1 GiB) count every stored version.
-- A publish that would exceed a quota first evicts the **oldest idle, unpinned** versions.
-- If only pinned or held versions remain, the publish is refused with `artifact_quota_exceeded` (retry `never`). The agent is told; nothing is evicted silently beyond the rule.
+**Holds: what keeps an artifact.** An artifact is **held**, and is never expired or evicted, while any of these is true:
+1. A person has pinned it.
+2. A tile shows it. The client sends `artifact.viewing { artifact_id, version, open: bool }`. The server keeps a viewing lease per client session and drops it when that session disconnects.
+3. An open question has the artifact as its `about`.
+
+When a hold ends, the artifact follows the persistent idle rule from that moment. It is never deleted at once.
+- **A withdrawn question.** If the asker's identity is replaced, its open questions are withdrawn with `subject_replaced` (§5b). The hold then ends, and the artifact turns idle-persistent. A replaced identity therefore never deletes what a person was asked about.
+
+**Quotas.**
+- `[artifacts] quota_bytes_per_agent` (default 64 MiB) counts one agent's stored versions. A publish over it evicts that agent's **oldest idle, unheld** versions first. It never evicts another agent's.
+- `[artifacts] quota_bytes_total` (default 1 GiB) never evicts. A publish over it is refused.
+- If eviction cannot make room, the publish is refused with `artifact_quota_exceeded` (`scope: agent | total`).
 
 **Pinning.**
-- A person pins or unpins an artifact through a client token with `answer` or `operate` scope, or through the local CLI. This is recorded as `artifact.pinned` / `artifact.unpinned`.
-- A pinned artifact is never evicted and never expires. Only an explicit operator purge removes it.
+- A person pins or unpins through a client token with `answer` or `operate` scope, or through the local CLI. This is recorded as `artifact.pinned` / `artifact.unpinned`.
 - Agents cannot pin.
+- Only an explicit operator purge removes a pinned artifact.
 
 **Purge is a record, not a hole.**
 - Every removal writes `artifact.purged { artifact_id, version?, reason: idle | session_end | quota | operator | blob_missing }`.
-- The records, comments and questions stay. The tile shows "content expired" in place of the frame. An open question about a purged artifact stays open and answerable; its card says the content expired.
-- A blob that is missing for any reason (§7c) reads as `blob_missing` the same way.
+- The records, comments and questions stay. The tile shows "content expired". An open question about a purged artifact stays open and answerable, and its card says the content expired.
+- **What an operator purge removes.**
+  - It also removes every anchor excerpt for the purged versions: the `quote.exact`, `prefix` and `suffix` of §7d are replaced by `[purged]`, so no text of the content survives.
+  - Automatic purges (idle, session_end, quota, blob_missing) keep the excerpts, as part of the comments.
+- **A §5b fork** that is asked about a purged artifact reads the `artifact.purged` record, not the content.
+  - A fork's kept transcript (owner decision 13) is not rewritten by a purge, so text that it already read stays in the lineage.
+  - Removing that text is S16's retention work.
+
+**Configuration (new keys this ADR introduces).** They join ADR-0041's inventory (#2384) as plain, non-secret values:
+
+| Key | Type | Default |
+|---|---|---|
+| `[artifacts] max_bytes` | bytes | 2 MiB per version |
+| `[artifacts] max_versions` | int | 50 per artifact |
+| `[artifacts] idle_ttl` | duration | 14 d |
+| `[artifacts] quota_bytes_per_agent` | bytes | 64 MiB |
+| `[artifacts] quota_bytes_total` | bytes | 1 GiB |
+| `[blobs] session_backend` | enum | `session_tmp` |
+
+Any future backend credential (for example S3) must use ADR-0041's secret-reference shape, never an inline value.
 
 ### 7b. Question sets inside an artifact (#1599, owner decision 17)
 
@@ -719,37 +746,48 @@ questions: [{
   kind: "single" | "multi" | "free",
   options?: [{ id, label }],            // single and multi only
   other?: bool,                         // single and multi: adds a free-form "other"
-  anchor?: Anchor,                      // §7d: the block or text the question is about
+  anchor?: Anchor,                      // §7d
 }]
 blocking?: bool                         // for the set as a whole
 ```
 
-**One question, one record.**
-- Each question in the set is one ADR-0036 §2a question record. Its `about` is `{ artifact_id, version, set_id, question_id, anchor? }`. That is a new `about` shape for the backend to type; the question machinery itself is unchanged.
-- Routing (ADR-0034), answer authority (§5b), `question_closed` and "exactly one reply" all apply per question.
+**One question, one ADR-0036 §2a record.**
+
+Each question maps onto §2a's existing `question.asked` fields:
+
+| Set field | §2a field |
+|---|---|
+| `kind: single` | `options` with `multi_select: false` |
+| `kind: multi` | `options` with `multi_select: true` |
+| `kind: free` | no `options` |
+| `other` | `allow_other` |
+| `prompt` | `prompt` |
+
+- **`about`** is `{ artifact_id, version, set_id, question_id, anchor? }`. That is the one new shape for the backend to type.
+- **`ask_point`** is the same for every question in a set: the boundary that closes the `flock_artifact_request_feedback` call (§2a's rule for a tool call). A thread on any question forks there.
+- Routing (ADR-0034), answer authority (§5b), `question_closed` and "exactly one reply" apply **per question**.
 
 **Answers keep the main context lean.**
-- Each answered question queues **its own** `reply` item at once, so a long set does not arrive as one large message.
+- Each answered question queues **its own** `reply` item at once.
 - A **blocking** set releases the asker when its last question is answered.
 - An "other" answer is free text within the question's answer limit.
 
 **Comments and threads on each question.**
-- **A comment thread** can sit on any question or option. It is an `artifact.comment` whose anchor names `question_id` and, optionally, `option_id`, and it is queued to the agent as §7's comments are.
-- **Threads.** Any question can be taken as a **thread** through §5b unchanged:
-  - the asker is forked at the question;
-  - the person discusses it with the fork;
-  - only the fork's final proposal comes back, and it is applied after review (owner decision 12).
-- That is the "fork and chat with an ultimate final reply" the owner asked for, per question. The main agent sees one answer, not the discussion.
+- **A comment thread** can sit on any question or option: an `artifact.comment` whose anchor names `question_id` and, optionally, `option_id`.
+- **Threads.** Any question can be taken as a **thread** through §5b unchanged. The fork starts at the set's `ask_point`, and only its final proposal comes back, applied after review (owner decision 12). The main agent sees one answer, not the discussion.
 
-**Rendering.** The question set is drawn by the **client**, in trusted chrome beside the frame, not inside the untrusted frame. An artifact cannot draw its own answer buttons, which keeps the phishing defence of the failure modes.
+**Rendering.** The question set is drawn by the **client**, in trusted chrome beside the frame. An artifact cannot draw its own answer buttons, which keeps the phishing defence (failure modes).
 
-### 7c. Blob storage backend (pointer)
+### 7c. Blob lifetime and the storage backend
 
-The blob store is a configured backend behind one trait: `[blobs] backend`, defaulting to a per-session temp directory that is removed with the session. That is ADR-0036 §4 / S3b #1426 and ADR-0041 `[blobs]`, owned by the server.
+Blobs stay in ADR-0036 §4's content-addressed store (`<data dir>/blobs/<sha256>`, shared and deduplicated, also used by stream lines). §7a's lifetimes govern **records**. A blob's lifetime follows **the records that reference it**:
 
-What the GUI relies on:
-- records carry only the hash and size, and their shape never depends on the backend;
-- a blob that is gone reads as `artifact.purged { reason: blob_missing }` (§7a).
+- **Reference counting.** A blob lives while any record references it: any artifact version, stream line or other record. The store counts references. Purging a record drops its reference, and the blob is removed when the count reaches zero.
+- **The session temp backend.** The owner asked for "tmp folder sessions" now. A blob may live in the publishing agent's session temp directory (`[blobs] session_backend = "session_tmp"`) **only while every record that references it is a `session`, unheld artifact version of that agent**. It is removed when that agent's session ends.
+- **Migration.** When a referencing artifact is pinned, made persistent, held past its session, or referenced by anything else, its blob **migrates** to the durable store before that change is acknowledged. If the migration fails, the change is refused with `blob_migration_failed`, and nothing is half-moved.
+- **What the GUI relies on.** Records carry only the hash and size, and their shape never depends on the backend. A blob that is gone reads as `artifact.purged { reason: blob_missing }` (§7a).
+
+The backend trait and its config are ADR-0036 §4 / S3b #1426, owned by the server.
 
 ### 7d. Text-range anchors (#1599, owner decision 17)
 
@@ -763,30 +801,91 @@ Anchor = {
 }
 ```
 
-- **Selecting.** The client computes the anchor from the person's selection. It takes up to 32 characters of prefix and suffix, enough to make the quote unique in the block.
-- **Re-anchoring across versions.** When a newer version is shown, the client maps each older anchor:
-  1. **Re-anchored.** The same `block_id` still exists and `exact` occurs in it. Pick the occurrence that best matches `prefix`/`suffix`, then the nearest to `position`.
+- **Selecting.** The client computes the anchor from the selection. It takes up to 32 characters of prefix and suffix, enough to make the quote unique in the block.
+- **Re-anchoring across versions.** When a newer version is shown, each older anchor is mapped:
+  1. **Re-anchored.** The same `block_id` exists and `exact` occurs in it. Pick the occurrence that best matches `prefix`/`suffix`, then the nearest to `position`.
   2. **Detached (text).** The block exists but the quote is gone. The comment attaches to the block, marked "text changed".
   3. **Detached.** The block is gone. The comment is listed beside the frame with its quoted text.
-- **The server keeps the original anchor and its version and never rewrites them.** Re-anchoring is a view, recomputed per version.
+- **The server keeps the original anchor and its version, and never rewrites them**, except for an operator purge's `[purged]` (§7a). Re-anchoring is a view, recomputed per version.
 
 ### 7e. Network for artifacts: default deny now, the grant shape fixed now (#1599, owner decision 17)
 
 `connect-src 'none'` stays the default for every artifact, interactive or not. Live data later must not need a new security model, so its shape is fixed now.
 
-- **Declared capabilities.**
-  - Only an interactive artifact may declare `capabilities?` at publish. The declaration is part of the version and is shown under its badge.
-  - v1 defines one kind: `{ kind: "flock_stream", stream, access: "read" }`, a read-only subscription to a named flock stream that the viewer could open anyway.
-  - External origins are a later kind, served by a server proxy with a per-artifact scoped token. They are not defined yet.
-- **Grants are per person, per artifact, per version.**
-  - A person grants a declared capability through a client token with `operate` scope. This is recorded as `artifact.granted { artifact_id, version, capability, by, at }`, and revoked as `artifact.grant_revoked`.
-  - A new version needs a new grant, because what the code does may have changed.
-- **The only channel is parent-brokered.**
-  - The frame posts `{ type: "flock.rpc", id, capability, request }`.
-  - The parent identifies the frame by `event.source` (§7), checks the declaration and the grant, and does the work itself over its existing `/v1/ws` session. It answers with `{ type: "flock.rpc.result", id, ok | error }`.
-  - **The frame never receives the `/v1` token or any credential,** and its CSP keeps `connect-src 'none'` even when a grant exists. All data arrives by postMessage, so there is no ambient network and no way to the listener (see the `Origin: null` rule in §6).
-- **Refusals** are typed: `capability_not_declared`, `capability_not_granted`, `capability_unsupported`, `rpc_too_large`. A refused call is never retried by the parent.
-- **G6/G7 ship default deny only.** Every `flock.rpc` is answered `capability_unsupported`. Tests prove an artifact cannot reach the network or the listener, with or without a declaration. The grant record and the broker land with the live-data slice.
+**Declared capabilities.**
+- Only an interactive artifact may declare `capabilities?` at publish. The declaration is part of the version and is shown under its badge.
+- v1 defines one kind: `{ kind: "flock_stream", stream, access: "read" }`, a read-only subscription to a named flock stream that the viewer could open anyway.
+- External origins are a later kind, behind a server proxy with a per-artifact scoped token, and are not defined yet.
+
+**The navigation beacon cannot be closed, so it is disclosed and bounded.**
+- §7's residual risk applies: an interactive frame can navigate itself and leak data in the URL, as one outbound GET. Browsers ship no `navigate-to`, so no sandbox flag or CSP can stop it.
+- With a stream grant, what can leak is live flock data the viewer can read. The grant prompt therefore states it in plain words: *"This artifact runs code. It can send what it reads from \<stream\> to the internet."* The person grants knowing that.
+- **The parent bounds it.**
+  - The parent watches the frame's `load` events. A second load means the frame navigated itself.
+  - On that, the parent tears down the frame and revokes every grant on that version for that viewer (`artifact.grant_revoked { reason: navigated }`).
+  - It shows why. A version that navigates once cannot be re-granted without a new version.
+  - So at most what the frame held at that moment leaks, once.
+
+**Grants belong to a person, per artifact, per version.**
+- A person grants a declared capability through a client token with `operate` scope. This is recorded as `artifact.granted { artifact_id, version, capability, by, at }`, and revoked as `artifact.grant_revoked { reason }`.
+- A new version needs a new grant.
+- **No confused deputy.** The broker serves a call only under a grant whose `by` is the principal of **the client session that renders this frame now**. A frame viewed by person B never uses person A's grant; B is asked.
+
+**The only channel is parent-brokered.**
+- The frame posts `{ type: "flock.rpc", id, capability, request }`.
+- The parent identifies the frame by `event.source` (§7), checks the declaration and the current viewer's grant, and does the work itself over its own `/v1/ws` session. It answers with `{ type: "flock.rpc.result", id, ok | error }`.
+- **The frame never receives the `/v1` token or any credential.** Its CSP keeps `connect-src 'none'` even with a grant, so all data arrives by postMessage.
+- **Limits per frame.**
+  - 20 RPCs per second;
+  - 4 concurrent subscriptions;
+  - 16 KiB per request and 64 KiB per result message.
+
+  Over a limit, the call is refused and the parent's own session is never flooded.
+
+**Refusals (registered codes, each with its retry class):**
+
+| Code | Retry | Meaning |
+|---|---|---|
+| `capability_not_declared` | `never` | not in the version's declaration |
+| `capability_not_granted` | `never` (the parent may prompt) | no grant from the current viewer |
+| `capability_unsupported` | `never` | the kind is not implemented (v1: all of them) |
+| `rpc_too_large` | `never` | over the size limit |
+| `rpc_rate_limited` | `after: 1s` | over the rate or subscription cap |
+| `artifact_quota_exceeded` | `never` | §7a |
+| `blob_migration_failed` | `retryable` | §7c |
+
+A refused call is never retried automatically by the parent.
+
+**G6/G7 ship default deny only.** Every `flock.rpc` is answered `capability_unsupported`. The grant record and the broker land with the live-data slice.
+
+### 7f. Tests that must fail before each change
+
+- **Lifecycle.**
+  - A `session` artifact is purged with `session_end` when its agent stops, and not on a restart or compaction.
+  - A held one (open tile, open question, pin) is not purged.
+  - After a hold ends, it expires only after `idle_ttl` (an injected clock).
+  - A question withdrawn by `subject_replaced` leaves the artifact idle-persistent, not deleted.
+- **Quota.**
+  - The per-agent quota evicts that agent's oldest idle unheld version, and never a pinned, held, on-screen or other agent's version.
+  - The total quota refuses with `artifact_quota_exceeded { scope: total }`.
+- **Pin.** Only a person can pin; an agent's pin is refused. A pinned artifact survives every automatic purge.
+- **Blobs.**
+  - A shared blob survives the purge of one of its two referencing records.
+  - Pinning a session artifact migrates its blob, and a failed migration refuses the pin.
+- **Question sets.**
+  - Each answered question produces exactly one `reply`.
+  - A blocking set releases on its last answer.
+  - Each kind maps to the §2a fields.
+  - A thread forks at the set's `ask_point`.
+- **Anchors.** Each of the three re-anchor outcomes, across a real version pair.
+- **Purge.**
+  - An operator purge replaces the anchor excerpts with `[purged]`.
+  - An automatic purge keeps them.
+  - A fork reads the purged record.
+- **Network.**
+  - No artifact reaches the network or the listener, with or without a declaration.
+  - Every `flock.rpc` gets `capability_unsupported` in G6/G7.
+  - The broker tests come later: a viewer-B frame with only A's grant is refused, the limits refuse, and a self-navigation revokes the grants.
 
 ### 8. Goals and work
 
@@ -871,7 +970,7 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 | 13 | What happens to a thread's fork after the merge-back? (§5b) | **Decided: yes** ("stop fork but keep transcript"). The fork is stopped, and its transcript is kept in the lineage (the `AgentForked` edge); the sidebar folds ended threads. | Stored transcripts, and lineage rows to fold. No retention limit is stated yet: ADR-0036 S16 owns it. A rehydrated copy is deleted when the fork ends either way (ADR-0036 owner decision 14). |
 | 14 | A thread fork's tools (§5b) | **Decided: read-only now, through the general machinery** ("machinery first … but with read only as per now"). The fork runs under ADR-0036 S19's permission tiers (#1321) with a read-only tier, never a thread-specific flag. | A fork that would have to run a command to answer must say so in its proposal. Widening is #1321's follow-up: tiers selectable per model, and a fork that requests more, which the person grants. |
 | 15 | Does S6e retake ADR-0036 owner decision 3a, so that the asker decides blocking, with a reason, instead of S6d's System-One check? (§5b decision 5) | **Decided: yes** (the owner typed "y" on 2026-10-19, recorded on #1717), following the owner's #1717 words "not vlocking [sic] unless there is literally nothing else to work on". | The server stops catching a wrongly held or wrongly continued turn, and an agent that over-uses `blocking: true` only costs itself and puts its card first. S6d no longer holds a turn; any later use of its check is advisory only (the backend ruling on #1717). |
-| 17 | Artifact lifecycle, question sets, blob backend, anchors and network (§7a–§7e; added 2026-10-25, recorded on #1598) | **Decided: these requirements**, typed by the owner, scheduled after the `-p` MVP: purge handling so that artifacts do not pile up; questions of several types inside an artifact, each with comments and its own fork-and-merge-back thread; a configurable blob backend, defaulting to temp-folder sessions; comments on blocks and text; network access "if wanted" for live data, a "future feature, but get framework correct for it already now". | §7a–§7e give the design. The defaults (`session` lifetime, the quotas, the 14-day idle TTL) are proposals that the review may change. The server owns the blob trait, the lifecycle records and the grant record. |
+| 17 | Artifact lifecycle, question sets, blob backend, anchors and network (§7a–§7e; added 2026-10-25, recorded on #1598) | **Decided: these requirements**, typed by the owner, scheduled after the `-p` MVP: purge handling so that artifacts do not pile up; questions of several types inside an artifact, each with comments and its own fork-and-merge-back thread; a configurable blob backend, defaulting to temp-folder sessions; comments on blocks and text; network access "if wanted" for live data, a "future feature, but get framework correct for it already now". | §7a–§7e give the design. §7f lists the tests. The defaults (`session` lifetime, the quotas, the 14-day idle TTL, the RPC limits) are proposals the review may change. The server owns the blob reference counting and backend trait, the lifecycle and viewing records, the question `about` shape and the grant record. |
 
 ## Failure modes and known limits
 
