@@ -241,7 +241,10 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     // captured before `remote.target` is moved into the bridge.
     let active_ssh_target = remote.target.clone();
     let local_socket = local_forward_socket_path(&remote.target, &session_name);
-    let program = std::env::args().next().unwrap_or_else(|| "flk".to_string());
+    let program = crate::cli::argv::text_argument(
+        0,
+        std::env::args_os().next().unwrap_or_else(|| "flk".into()),
+    )?;
     let reattach_command = reattach_command(
         &program,
         &remote.target,
