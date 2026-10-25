@@ -107,6 +107,7 @@ impl Admission {
         gate: Gate,
     ) -> Result<(), Failure> {
         self.journal.writable()?;
+        validate_kind(&item.kind)?;
         if item.delivery != Delivery::AtIdle || item.priority != Priority::Normal {
             return Err(refuse(ErrorCode::QueueModeUnsupported));
         }
@@ -264,7 +265,9 @@ impl Admission {
                     Err(error)
                         if matches!(
                             error.code,
-                            ErrorCode::InvalidRequest | ErrorCode::QueueItemTooLarge
+                            ErrorCode::InvalidRequest
+                                | ErrorCode::QueueItemTooLarge
+                                | ErrorCode::QueueKindReserved
                         ) =>
                     {
                         error.code
@@ -355,7 +358,17 @@ impl Admission {
 }
 // Intake and edits share the same validation. Rendering repeats it so legacy
 // or otherwise malformed durable items are failed instead of wedging a worker.
+pub(super) fn validate_kind(kind: &Kind) -> Result<(), Failure> {
+    if matches!(
+        kind,
+        Kind::Finding | Kind::DelegateResult | Kind::ReloadNotice
+    ) {
+        return Err(refuse(ErrorCode::QueueKindReserved));
+    }
+    Ok(())
+}
 fn validate_content(item: &Item) -> Result<(), Failure> {
+    validate_kind(&item.kind)?;
     if !valid_id(&item.item_id)
         || (item.kind == Kind::Reply
             && metadata(item, "anchor")["question_id"]
