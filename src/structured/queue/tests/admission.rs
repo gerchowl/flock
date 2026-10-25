@@ -1534,3 +1534,87 @@ fn reserved_kinds_refuse_every_producer_before_any_mutation() {
         }
     }
 }
+
+#[test]
+fn retained_reserved_heads_fail_without_blocking_supported_input() {
+    let root = Root::new();
+    let mut journal = root.open();
+    let mut reserved = Vec::new();
+    for (n, kind) in [Kind::Finding, Kind::DelegateResult, Kind::ReloadNotice]
+        .into_iter()
+        .enumerate()
+    {
+        let mut candidate = input(n as u64);
+        candidate.kind = kind;
+        candidate
+            .metadata
+            .insert("gate".into(), json!({"decision":"send"}));
+        reserved.push(candidate.clone());
+        journal
+            .append(Change::Upsert {
+                item: Box::new(candidate),
+                position: n,
+            })
+            .unwrap();
+    }
+    let mut q = Admission::new(journal, MAX_BATCH).unwrap();
+    send(&mut q, 100, Producer::Human);
+    let batch = q.batch(100).unwrap().unwrap();
+    assert_eq!(batch.items.len(), 1);
+    assert_eq!(batch.items[0].item_id, id(100));
+    for (actual, original) in q.journal().items().to_vec().iter().zip(&reserved) {
+        assert_eq!(actual.state, State::Failed);
+        assert_eq!(actual.kind, original.kind);
+        assert_eq!(actual.body, original.body);
+        assert_eq!(actual.metadata["refusal"], "queue_kind_reserved");
+        let mut edited = actual.clone();
+        edited.state = State::Queued;
+        assert_eq!(
+            q.replace(vec![edited]).unwrap_err().code,
+            ErrorCode::QueueKindReserved
+        );
+    }
+    drop(q);
+    let reopened = root.open();
+    assert!(reopened.items()[..3]
+        .iter()
+        .all(|i| i.state == State::Failed));
+}
+
+#[test]
+fn reserved_kinds_round_trip_through_durable_replay_json() {
+    let root = Root::new();
+    let mut journal = root.open();
+    let variants = [
+        (Kind::Finding, "finding"),
+        (Kind::DelegateResult, "delegate_result"),
+        (Kind::ReloadNotice, "reload_notice"),
+    ];
+    for (n, (kind, _)) in variants.iter().enumerate() {
+        let mut candidate = input(n as u64);
+        candidate.kind = kind.clone();
+        journal
+            .append(Change::Upsert {
+                item: Box::new(candidate),
+                position: n,
+            })
+            .unwrap();
+    }
+    let cut = journal.replay(0).unwrap();
+    assert_eq!(cut.records.len(), variants.len());
+    for (raw, (kind, name)) in cut.records.iter().zip(variants) {
+        assert_eq!(raw["item"]["kind"], name);
+        let wire = serde_json::to_vec(raw).unwrap();
+        let record: Record = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(serde_json::to_value(&record).unwrap(), *raw);
+        let Change::Upsert { item, .. } = record.change else {
+            panic!("expected upsert")
+        };
+        assert_eq!(item.kind, kind);
+        assert!(!item.has_unknown());
+    }
+    drop(journal);
+    let reopened = root.open();
+    assert_eq!(reopened.items().len(), 3);
+    assert!(reopened.items().iter().all(|i| !i.has_unknown()));
+}

@@ -43,13 +43,13 @@ pub enum Kind {
     Message,
     /// Answer to a question.
     Reply,
-    /// Delegate completion.
+    /// Reserved structured delegate completion/receipt producer ([#2419](https://github.com/gerchowl/flock/issues/2419)).
     DelegateResult,
     /// Registered wait wakeup.
     Wake,
-    /// Runtime reload notice.
+    /// Reserved S11 runtime reload-notice producer ([#2420](https://github.com/gerchowl/flock/issues/2420)).
     ReloadNotice,
-    /// Fork finding.
+    /// Reserved S13 fork-return finding producer ([#2365](https://github.com/gerchowl/flock/issues/2365)).
     Finding,
     /// Isolated harness command.
     Command,
