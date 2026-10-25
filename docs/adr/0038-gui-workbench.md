@@ -714,6 +714,17 @@ using the registered `session_busy` retry class `later`, on that ID only. Siblin
 subscriptions and the authenticated socket remain connected. A client may open a
 fresh ID later. Unsafe or unreadable storage still closes the transport.
 
+Review amendment: intent probes also share their lock; live revokers retain
+exclusive intent ownership. Startup and exclusive revocation reclaim unlocked
+stale intents, checking exclusive ownership, link count and inode identity so
+concurrent sweepers cannot remove a newly published intent at a reused name.
+The client automatically retries only the busy stream under fresh IDs after
+250, 500 and 1000 ms, at most three same-socket retries since its last `synced`.
+Unsubscribe or socket loss cancels the pending timer. Exhaustion leaves the
+stream visibly Refused. Reopening starts a new budget; a later reconnect may
+also retry through its new welcome, without resetting this timer budget.
+Siblings keep their IDs and cursors.
+
 ### 7. Artifacts, and the artifact MCP
 
 An **artifact** is agent-authored content that a person looks at and answers: an HTML report, a plot, a diagram or a rendered table. It is versioned and immutable per version. It is also untrusted (ADR-0011 §5).

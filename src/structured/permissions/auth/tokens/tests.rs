@@ -828,13 +828,13 @@ fn revoke_waits_for_all_shared_admissions_and_fences_later_dispatch() {
         assert!(ready.recv_timeout(Duration::from_secs(5)).unwrap());
         holds.push((release, worker));
     }
-    let pending = other.begin_revoke("browser").unwrap();
+    let mut pending = other.begin_revoke("browser").unwrap();
     assert!(priority::pending(&other.0).unwrap());
     std::thread::scope(|scope| {
         let (started, ready) = mpsc::channel();
         let (done, completed) = mpsc::channel();
+        pending.guard.notify_waiting(started);
         let revoke = scope.spawn(move || {
-            started.send(()).unwrap();
             done.send(pending.finish()).unwrap();
         });
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -947,4 +947,63 @@ fn pending_revoke_refuses_only_the_new_subscription_and_preserves_siblings() {
         assert!(matches!(socket.receive().await, Received::Text(v) if v["t"] == "synced"));
         server.finish().await;
     });
+}
+
+#[test]
+fn stale_intent_does_not_make_concurrent_readers_busy() {
+    let (_root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
+    let session = store.authenticate(&issued.token).unwrap();
+    drop(
+        store
+            .0
+            .file(&format!(".revoke-{}", "a".repeat(32)), true)
+            .unwrap(),
+    );
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            workers.push(scope.spawn(|| {
+                barrier.wait();
+                (0..300)
+                    .filter(|_| {
+                        matches!(
+                            store.admit(&session, Scope::Read, |_| ()),
+                            Err(TokenError::Busy)
+                        )
+                    })
+                    .count()
+            }));
+        }
+        let busy: usize = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .sum();
+        assert_eq!(busy, 0, "stale intent caused admission-vs-admission Busy");
+    });
+}
+
+#[test]
+fn startup_sweeps_stale_intents_but_preserves_live_revokers() {
+    let (root, store, _app) = setup();
+    let name = format!(".revoke-{}", "a".repeat(32));
+    drop(store.0.file(&name, true).unwrap());
+    TokenStore::open(root.path()).unwrap();
+    assert!(matches!(store.0.file(&name, false), Err(e) if e.kind() == io::ErrorKind::NotFound));
+    let intent = priority::Intent::begin(&store.0, "b".repeat(32)).unwrap();
+    let guard = LockFile::new(store.lock_file().unwrap());
+    guard.try_lock().unwrap();
+    priority::sweep(&store.0).unwrap();
+    drop(guard);
+    assert!(priority::pending(&store.0).unwrap());
+    assert!(matches!(
+        TokenStore::open(root.path()),
+        Err(TokenError::Busy)
+    ));
+    assert!(store
+        .0
+        .file(&format!(".revoke-{}", "b".repeat(32)), false)
+        .is_ok());
+    drop(intent);
 }

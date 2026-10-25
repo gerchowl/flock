@@ -97,6 +97,7 @@ struct PendingRevoke<'a> {
 impl PendingRevoke<'_> {
     fn finish(self) -> Result<(), TokenError> {
         let _guard = self.guard.finish(Duration::from_secs(2))?;
+        priority::sweep(&self.store.0)?;
         self.store.0.remove_entry(&self.entry)?;
         Ok(())
     }
@@ -141,6 +142,7 @@ impl TokenStore {
         );
         // The writer lock protects active issue temporaries from the orphan sweep.
         let _guard = store.lock()?;
+        priority::sweep(&store.0)?;
         for entry in store.0.names()? {
             if entry.id.starts_with("2e746d702d") {
                 if let Err(error) = store.0.remove_temporary(&entry.id) {
@@ -361,7 +363,9 @@ impl TokenStore {
     }
     /// Recheck and hold a shared token-store lock through bounded dispatch (#2450).
     /// Mutation remains exclusive; intent checks before and after acquisition give
-    /// pending revocation priority. Busy denotes mutation, never another admission.
+    /// pending revocation priority. Busy means a live revocation intent or an
+    /// exclusive store lock; concurrent readers and unlocked stale intents do not
+    /// contend. Startup and revocation reclaim stale intents under exclusive locks.
     /// The callback cannot return the borrowed sealed capability, wait for model
     /// execution, or call token management recursively.
     pub(crate) fn admit<T>(

@@ -163,6 +163,8 @@ type Sub = {
   /** Reached Current or Refused on the current connection. */
   settled: boolean;
   progress: TimerHandle | null;
+  /** Automatic contention retries since the last synced barrier, capped at three. */
+  busyRetries: number;
   refusal: Refusal | null;
   /** The snapshot being received while Resyncing. */
   snapshot: Snapshot | null;
@@ -328,7 +330,7 @@ export class WireConnection {
    */
   subscribe(stream: StreamName, handler: StreamHandler, after?: number | null): Subscription {
     const cursor = after === undefined ? (this.#cursors.get(stream) ?? null) : after;
-    const sub: Sub = { id: this.#allocate(), stream, handler, state: "Replaying", cursor, settled: false, progress: null, refusal: null, snapshot: null };
+    const sub: Sub = { id: this.#allocate(), stream, handler, state: "Replaying", cursor, settled: false, progress: null, busyRetries: 0, refusal: null, snapshot: null };
     this.#subs.set(sub.id, sub);
     if (this.#connected()) this.#sendSub(sub);
     this.#settle();
@@ -623,6 +625,7 @@ export class WireConnection {
         if (sub.snapshot !== null) return this.#protocolError(`synced before ${sub.stream}'s snapshot ended`);
         this.#stopProgress(sub);
         sub.state = "Current";
+        sub.busyRetries = 0;
         sub.settled = true;
         sub.handler.synced();
         return this.#settle();
@@ -703,6 +706,20 @@ export class WireConnection {
        */
       const reason = `The server refused sub id ${sub.id} as already used on this connection, so this stream is not retried. Server: ${message}`;
       return this.#refuse(sub, { code, message: reason });
+    }
+    if (code === "session_busy") {
+      this.#refuse(sub, { code, message });
+      if (this.#subs.get(sub.id) !== sub || !this.#connected() || sub.busyRetries === 3) return;
+      // Three per-stream retries: 250, 500, 1000 ms, reset only by synced.
+      // Reuse the cancellable progress timer; never touch sibling subscriptions.
+      const delay = 250 * 2 ** sub.busyRetries++;
+      sub.progress = this.#options.clock.setTimeout(() => {
+        sub.progress = null;
+        sub.settled = false;
+        this.#resub(sub, false);
+        this.#settle();
+      }, delay);
+      return;
     }
     if (code !== "cursor_ahead") return this.#refuse(sub, { code, message });
     sub.handler.reset();

@@ -1595,7 +1595,7 @@ the wire enum; implementation registers any new API error codes where needed):
 | `invalid_agent` | Unsafe or reserved stored agent namespace. Retry class `never`: select a valid subject rather than retrying unchanged. |
 | `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
 | `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
-| `session_busy` | Token mutation is pending. Retry class `later`: retry this subscription with a fresh ID later; sibling subscriptions and the authenticated socket stay connected. |
+| `session_busy` | Token mutation is pending. Retry class `later`: retry only this stream with fresh IDs after 250, 500 and 1000 ms (three automatic same-socket retries since the last `synced`), then remain visibly Refused until reopened or a later reconnect supplies a new welcome. Sibling subscriptions and the authenticated socket stay connected. |
 | `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
 
 Start the 30 s progress deadline at sub registration, or when a new gap starts

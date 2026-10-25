@@ -47,6 +47,8 @@ impl Drop for LockFile {
 pub(crate) struct PendingLock {
     file: Option<LockFile>,
     helper: Option<(Child, UnixStream)>,
+    #[cfg(test)]
+    waiting: Option<std::sync::mpsc::Sender<()>>,
 }
 impl PendingLock {
     /// Start without blocking the caller. Only a contended lock needs a helper.
@@ -88,13 +90,24 @@ impl PendingLock {
         Ok(Self {
             file: Some(file),
             helper,
+            #[cfg(test)]
+            waiting: None,
         })
+    }
+    /// Observe entry into a contended lock's bounded IPC wait in fence tests.
+    #[cfg(test)]
+    pub(crate) fn notify_waiting(&mut self, ready: std::sync::mpsc::Sender<()>) {
+        self.waiting = Some(ready);
     }
     /// Wait at most the supplied lock deadline; cleanup also runs when abandoned.
     pub(crate) fn finish(mut self, deadline: Duration) -> io::Result<LockFile> {
         if let Some((_, stream)) = &mut self.helper {
             stream.set_read_timeout(Some(deadline))?;
             let mut ack = [0];
+            #[cfg(test)]
+            if let Some(ready) = self.waiting.take() {
+                ready.send(()).map_err(|_| io::ErrorKind::BrokenPipe)?;
+            }
             stream.read_exact(&mut ack).map_err(|e| {
                 if e.kind() == io::ErrorKind::WouldBlock {
                     io::ErrorKind::TimedOut.into()

@@ -440,3 +440,54 @@ test("session_busy refuses one stream and can be retried after reconnect", () =>
   h.step(step({ step: "send", frame: { t: "synced", sub_id: "s1", seq: 0 } }));
   expect(h.connection.streams().get("s1")?.state).toBe("Current");
 });
+
+
+test("session_busy retries only its stream on fresh ids with a finite backoff", () => {
+  const h = new Harness();
+  live(h);
+  for (const stream of ["agent/a", "agent/b"]) h.step(step({ step: "client", action: { kind: "subscribe", sub_id: stream.endsWith("a") ? "s1" : "s2", stream } }));
+  h.step(step({ step: "send", frame: { t: "synced", sub_id: "s2", seq: 0 } }));
+  let id = "s1";
+  for (const delay of [250, 500, 1000]) {
+    h.step(step({ step: "send", frame: { t: "subfail", sub_id: id, code: "session_busy", message: "mutation pending" } }));
+    const before = sentFrames(h).length;
+    h.clock.advanceTo(h.clock.now() + delay - 1);
+    expect(sentFrames(h)).toHaveLength(before);
+    h.clock.advanceTo(h.clock.now() + 1);
+    const next = lastSub(h);
+    expect(next).not.toBe(id);
+    expect(h.connection.streams().get("s2")?.state).toBe("Current");
+    id = next;
+  }
+  h.step(step({ step: "send", frame: { t: "subfail", sub_id: id, code: "session_busy", message: "still pending" } }));
+  const sent = sentFrames(h).length;
+  h.clock.advanceTo(h.clock.now() + 2000);
+  expect(sentFrames(h)).toHaveLength(sent);
+  expect(h.connection.streams().get(id)?.state).toBe("Refused");
+  expect(subIds(h)).toEqual(["s1", "s2", "s3", "s4", "s5"]);
+});
+
+test("session_busy fresh-id retry recovers without reconnecting", () => {
+  const h = new Harness();
+  live(h);
+  h.step(step({ step: "client", action: { kind: "subscribe", sub_id: "s1", stream: "agent/a" } }));
+  h.step(step({ step: "send", frame: { t: "subfail", sub_id: "s1", code: "session_busy", message: "mutation pending" } }));
+  h.clock.advanceTo(h.clock.now() + 250);
+  expect(lastSub(h)).toBe("s2");
+  h.step(step({ step: "send", frame: { t: "synced", sub_id: "s2", seq: 0 } }));
+  expect(h.connection.state).toBe("Live");
+  expect(h.connection.streams().get("s2")?.state).toBe("Current");
+});
+
+for (const stop of ["unsubscribe", "disconnect"] as const) {
+  test(`session_busy retry is cancelled by ${stop}`, () => {
+    const h = new Harness();
+    live(h);
+    h.step(step({ step: "client", action: { kind: "subscribe", sub_id: "s1", stream: "agent/a" } }));
+    h.step(step({ step: "send", frame: { t: "subfail", sub_id: "s1", code: "session_busy", message: "mutation pending" } }));
+    h.step(step({ step: "client", action: stop === "unsubscribe" ? { kind: "unsubscribe", sub_id: "s1" } : { kind: "disconnect" } }));
+    const sent = sentFrames(h).length;
+    h.clock.advanceTo(h.clock.now() + 1000);
+    expect(sentFrames(h)).toHaveLength(sent);
+  });
+}
