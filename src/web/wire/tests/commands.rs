@@ -1,6 +1,7 @@
 //! Decide-only port of the approved command tests: real authenticated sockets and harness stdin.
 use super::*;
 use crate::structured::{workers::tests::Case as Worker, workers::Workers};
+use crate::web::wire::commands as wire_commands;
 use tokio::io::AsyncWriteExt;
 
 fn script(name: &str) -> Vec<Value> {
@@ -559,3 +560,188 @@ fn newer_wire_client_cannot_decide() {
 
 #[path = "sends.rs"]
 mod sends;
+
+#[test]
+fn revoked_principal_closes_other_socket_even_when_ack_flush_fails() {
+    runtime(async {
+        for failure in [0, 1, 2] {
+            let mut case = Case::new(183120 + failure).await;
+            let mut other = case.open().await;
+            let shared = case.server.core.shared.clone();
+            let session = shared
+                .clients
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .session
+                .clone();
+            fs::remove_file(case.server._root.path().join("client-tokens/one.token")).unwrap();
+            let (data, mut delivery) = mpsc::channel(1);
+            if failure == 0 {
+                delivery.close();
+            }
+            let mut task = tokio::spawn(wire_commands::execute(
+                shared,
+                session,
+                data,
+                wire_commands::Command {
+                    id: "failed-flush".into(),
+                    verb: "agent.decide".into(),
+                    args: json!({}),
+                    resume_only: false,
+                    read_only: false,
+                },
+            ));
+            let wake = case.server.wake.clone();
+            let delivered = within(async {
+                loop {
+                    let changed = wake.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    case.service();
+                    tokio::select! {
+                        next = delivery.recv(), if failure != 0 => break Some(next.unwrap()),
+                        result = &mut task, if failure == 0 => {
+                            assert!(result.unwrap().is_err());
+                            break None;
+                        }
+                        _ = &mut changed => (),
+                    }
+                }
+            })
+            .await;
+            if let Some(delivered) = delivered {
+                let done = delivered.delivered.unwrap();
+                if failure == 1 {
+                    done.send(false).unwrap();
+                } else {
+                    drop(done);
+                }
+                assert!(within(task).await.unwrap().is_err());
+            }
+            assert!(matches!(
+                case.frame(&mut other).await,
+                Received::Close(4403)
+            ));
+            case.stop().await;
+        }
+    });
+}
+#[test]
+fn mismatched_permission_pair_is_refused_on_wire_without_closing_book_entries() {
+    runtime(async {
+        let mut case = Case::new(183124).await;
+        let mut socket = case.open().await;
+        let mut args = case.prompt().await;
+        let before = case
+            .app
+            .structured_workers
+            .runtime(&case.worker.id, case.worker.generation)
+            .unwrap()
+            .waiting_on_human()
+            .unwrap();
+        args["request_seq"] = json!(
+            before
+                .iter()
+                .find(|(id, _)| id == "other-request")
+                .unwrap()
+                .1
+        );
+        refusal(
+            case.command(&mut socket, "agent.decide", args).await,
+            "permission_request_unknown",
+            crate::cli::exit::FAILURE,
+        );
+        assert_eq!(
+            case.app
+                .structured_workers
+                .runtime(&case.worker.id, case.worker.generation)
+                .unwrap()
+                .waiting_on_human()
+                .unwrap(),
+            before
+        );
+        case.stop().await;
+    });
+}
+#[test]
+fn busy_ack_uses_registered_retry_class() {
+    let frame = wire_commands::ack(
+        "busy".into(),
+        Err(crate::api::error_code::ErrorCode::SessionBusy),
+    );
+    assert_eq!(
+        serde_json::to_value(frame).unwrap()["error"]["retry"],
+        "later"
+    );
+}
+
+#[test]
+fn previous_runtime_permission_handle_is_refused_after_restart() {
+    runtime(async {
+        let mut case = Case::new(183125).await;
+        let mut socket = case.open().await;
+        let old = case.prompt().await;
+        case.worker
+            .finish(
+                &mut case.app.state.structured_agents,
+                &mut case.app.structured_workers,
+                &case.notify,
+                Instant::now(),
+                None,
+            )
+            .await;
+        let fixture = case.worker.fixture.clone();
+        let path = fixture.root.path().join("queue.sock");
+        fs::remove_file(&path).unwrap();
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let launch = crate::structured::workers::Launch {
+            opening_turn: None,
+            agent_id: case.worker.id.clone(),
+            generation: case.worker.generation,
+            leases: case.worker.leases.clone(),
+            state: fixture.root.path().to_owned(),
+            storage: Default::default(),
+            mcp: fixture.mcp(),
+            stall_after: Duration::from_secs(60),
+            queue_rewrite_bytes: crate::config::Config::default()
+                .sessions
+                .queue_rewrite_bytes,
+            lineage: None,
+            admission: None,
+        };
+        case.worker.generation = case
+            .app
+            .structured_workers
+            .start(
+                &mut case.app.state.structured_agents,
+                launch,
+                case.worker.factory("queue", vec![]),
+            )
+            .unwrap();
+        case.driver = within(listener.accept()).await.unwrap().0;
+        case.worker
+            .ready(
+                &mut case.app.state.structured_agents,
+                &mut case.app.structured_workers,
+                &case.notify,
+                Instant::now(),
+            )
+            .await;
+        let fresh = case.prompt().await;
+        assert_ne!(old["request_seq"], fresh["request_seq"]);
+        refusal(
+            case.command(&mut socket, "agent.decide", old).await,
+            "permission_request_unknown",
+            crate::cli::exit::FAILURE,
+        );
+        assert_eq!(case.handles().len(), 2);
+        assert_eq!(
+            case.command(&mut socket, "agent.decide", fresh).await["ok"],
+            true
+        );
+        case.stop().await;
+    });
+}
