@@ -3514,6 +3514,21 @@ The socket contract documents the result fields, registered refusals and the
 absence of automatic revoke retries. These raw socket schemas are not generated
 S7 TypeScript roots; the typed S7 management contract belongs to part 2.
 
+### Amendment: S6 grant-list input redaction (#2416)
+
+Following ADR-0041 §4's fail-closed redaction stance, grant projections omit the
+full canonical tool/input key by default, including for the local operator.
+They expose its UTF-8 byte length and first 16 lowercase hexadecimal SHA-256
+digits. These are display/comparison metadata; grant authority still uses the
+originating request handle plus agent/generation, never the fingerprint.
+
+The owner decision on #2416 permits explicit local-operator disclosure through
+socket `show_input: true` or CLI `--show-input` on list. The full key can contain
+credentials, and CLI output can persist in terminal scrollback and logs. Hashes
+and lengths also reveal comparison metadata. Revoke responses always redact
+remaining grants; operator identity alone does not opt into full input export.
+This narrow grant-list opt-in does not authorize raw config-secret export.
+
 ### Amendment: App-session tokens and shell origins (#1601)
 
 ADR-0038 owner decision 16 (decided 2026-10-25, recorded on #1601) gives a

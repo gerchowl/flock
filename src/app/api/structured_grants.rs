@@ -16,6 +16,7 @@ impl App {
         agent_id: String,
         generation: Option<u64>,
         revoke: Option<GrantHandle>,
+        show_input: bool,
     ) -> String {
         let principal = match (self.caller_is_local_operator(), self.current_api_peer_pid) {
             (true, Some(pid)) => format!("operator:pid:{pid}"),
@@ -40,7 +41,8 @@ impl App {
                 .structured_workers
                 .runtime(&agent_id, current)
                 .ok_or(ErrorCode::AgentNotFound)?;
-            let grants = runtime.session_grants(&Principal::Operator, revoke.as_ref())?;
+            let grants =
+                runtime.session_grants(&Principal::Operator, revoke.as_ref(), show_input)?;
             Ok((current, grants))
         })();
         match result {

@@ -4,7 +4,7 @@ use crate::{
     api::schema::{Method, Request},
     structured::permissions::grants::{GrantsList, GrantsRevoke},
 };
-pub(super) const USAGE: &str = "flk structured grants list <agent_id> | flk structured grants revoke <agent_id> <generation> <request_id> <request_seq>";
+pub(super) const USAGE: &str = "flk structured grants list <agent_id> [--show-input] | flk structured grants revoke <agent_id> <generation> <request_id> <request_seq>";
 fn parse(args: &[String]) -> Option<Method> {
     match args
         .iter()
@@ -12,9 +12,20 @@ fn parse(args: &[String]) -> Option<Method> {
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["grants", "list", agent] => Some(Method::StructuredGrantsList(GrantsList {
-            agent_id: (*agent).into(),
-        })),
+        ["grants", "list", agent] if !agent.starts_with("--") => {
+            Some(Method::StructuredGrantsList(GrantsList {
+                agent_id: (*agent).into(),
+                show_input: false,
+            }))
+        }
+        ["grants", "list", agent, "--show-input"] | ["grants", "list", "--show-input", agent]
+            if !agent.starts_with("--") =>
+        {
+            Some(Method::StructuredGrantsList(GrantsList {
+                agent_id: (*agent).into(),
+                show_input: true,
+            }))
+        }
         ["grants", "revoke", agent, generation, request, seq] => {
             Some(Method::StructuredGrantsRevoke(GrantsRevoke {
                 agent_id: (*agent).into(),
@@ -44,6 +55,24 @@ mod tests {
     fn grant_commands_are_typed_and_revoke_is_not_retry_safe() {
         let list = parse(&["grants".into(), "list".into(), "fixture-agent".into()]).unwrap();
         assert!(list.is_retry_safe());
+        assert_eq!(
+            serde_json::to_value(list).unwrap()["params"]["show_input"],
+            false
+        );
+        for words in [
+            ["grants", "list", "fixture-agent", "--show-input"],
+            ["grants", "list", "--show-input", "fixture-agent"],
+        ] {
+            let words: Vec<_> = words.into_iter().map(str::to_owned).collect();
+            assert_eq!(
+                serde_json::to_value(parse(&words).unwrap()).unwrap()["params"]["show_input"],
+                true
+            );
+        }
+        assert!(parse(&["grants".into(), "list".into(), "--show-input".into()]).is_none());
+        let legacy: GrantsList =
+            serde_json::from_value(serde_json::json!({"agent_id":"fixture-agent"})).unwrap();
+        assert!(!legacy.show_input);
         let args: Vec<_> = ["grants", "revoke", "fixture-agent", "7", "request-one", "9"]
             .into_iter()
             .map(str::to_owned)

@@ -909,14 +909,19 @@ Sync reports client, installed binary and server drift but does not perform a se
 ## Structured session grants
 
 ```bash
-flk structured grants list <agent_id>
+flk structured grants list <agent_id> [--show-input]
 flk structured grants revoke <agent_id> <generation> <request_id> <request_seq>
 ```
 
 These local-operator commands inspect and revoke a live structured agent's exact
 `allow_always` grants. List returns the generation and originating decision
-handles, tool, canonical input key and installation audit time. Use those handles
-for revoke; a stale generation or unknown handle is refused with a typed error.
+handles, tool, a short SHA-256 fingerprint and UTF-8 byte length of the canonical
+input key, and installation audit time. The full key is omitted by default.
+`--show-input` explicitly includes it (socket equivalent: `show_input: true`).
+**The full key can contain secrets from tool input, and CLI output may land in
+terminal scrollback or logs.** Hash and length are comparison metadata; use the
+originating request handle and generation for revoke. A stale generation or
+unknown handle is refused with a typed error. Revoke responses stay redacted.
 Results use the socket response JSON, including `revoked` on success. `--json`
 preserves typed refusals and their registered CLI exits. Non-operators receive
 `operator_only` (exit 13).
