@@ -3573,3 +3573,18 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
 - `same-site` is refused for every unregistered origin.
 - The pre-auth caps refuse at 17 concurrent connections and at the 11th failed
   `hello` within 1 s, and an authenticated session is unaffected.
+
+### Amendment: Welcome capability grants (#2461)
+
+Clarification of §5's protocol gating and §6's operation advertisement:
+`welcome.capabilities` is the authenticated token's exact granted scopes, using
+`api::client_tokens::Scope` wire spellings in enum order: `read`, `send`,
+`answer`, `operate`. Missing scopes are omitted; `operate` implies no other
+scope. A client whose `hello.protocol` exceeds `WIRE_JSON_VERSION` receives
+only `read` when explicitly granted, or an empty array otherwise. It receives
+no command capability.
+
+The welcome is an advisory snapshot, not an authorization lease. Every command
+and subscription still checks current authority at admission, including scope
+changes and revocation after the welcome. Browser command holding according to
+this advertisement is tracked separately in [#2464](https://github.com/gerchowl/flock/issues/2464).
