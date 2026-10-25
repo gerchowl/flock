@@ -305,6 +305,10 @@ impl App {
             attachments: vec![],
             metadata: [
                 ("message_key".into(), json!(signed.key)),
+                (
+                    "native_inbox_retention_ms".into(),
+                    json!(self.state.config.msg.inbox_retention_ms),
+                ),
                 ("correlation_id".into(), json!(signed.correlation_id)),
                 ("in_reply_to".into(), json!(signed.in_reply_to)),
                 ("intent".into(), json!(ack.message.intent)),

@@ -11,6 +11,7 @@
 pub(crate) mod admission;
 pub(crate) mod custody;
 mod facts;
+pub(in crate::structured) mod inbox;
 pub mod model;
 mod policy;
 pub use policy::RewritePolicy;
@@ -111,6 +112,11 @@ fn track_opaque(change: &Change, unknown: bool, opaque: &mut HashSet<String>) {
     }
 }
 impl Journal {
+    /// The owning agent namespace, never a producer claim.
+    pub(crate) fn agent(&self) -> &str {
+        &self.agent
+    }
+
     /// Acquire exclusive `queue/<agent>` ownership and recover committed state.
     /// Components are ASCII identifiers, never paths. Uppercase letters use an
     /// injective, case-insensitive-safe encoding; the journal verifies the original

@@ -3671,3 +3671,17 @@ queue-delivery binding and CLI/socket/MCP wiring. It must supply actual harness
 delivery, not custody admission, and decode payloads before consumption. Existing
 queue snapshots and custody labels are not backfilled as fresh delivery. Existing
 custody expiry cannot restore an already deleted body or extend reply recovery.
+
+The internal queue binding (#2452 Part A) freezes `msg.inbox_retention_ms` at
+admission and stamps `native_inbox_until` only on the harness `started` event,
+in the same durable queue replacement as `delivered`. The deadline uses custody's
+pause-aware logical clock. The worker projects this explicit marker after the
+append and on reopening, before re-holding unresolved turns. Reopening preserves
+the original deadline; older items without the marker are not backfilled. Deleted
+custody payloads are not restored. A projection failure reports
+`mail_store_unavailable` and fences that owner until storage repair and restart;
+the committed marker remains available for recovery. All this I/O stays on the
+owning worker. Tool reads decode the payload before acknowledging it and preserve
+malformed raw data. Conditional acknowledgement winners alone receive live or
+expired entries, including when independent database connections read concurrently.
+Socket, CLI and MCP caller binding remains #2452 Part B.

@@ -235,6 +235,9 @@ pub(in crate::structured) struct Service {
 impl Service {
     pub fn open(data: &Path, agent: &str, bytes: NonZeroU64) -> Result<(Self, Client), Failure> {
         let journal = Journal::open_with_policy(data, agent, RewritePolicy::new(bytes))?;
+        if journal.read_only().is_none() {
+            crate::structured::queue::inbox::project(agent, journal.items())?;
+        }
         let mut scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH)?)?;
         scheduler.fail_stale_openings()?;
         let (publisher, source) =
@@ -408,6 +411,19 @@ impl Service {
         let result = self
             .policy()
             .and_then(|_| self.scheduler.observe(&received.event));
+        let result = result.and_then(|()| {
+            if matches!(&received.event, crate::structured::claude::SessionEvent::CommandLifecycle(e) if e.state == "started") {
+                crate::structured::queue::inbox::project(
+                    self.scheduler.journal().agent(), self.scheduler.journal().items())?;
+            }
+            Ok(())
+        });
+        if result
+            .as_ref()
+            .is_err_and(|e| e.code == ErrorCode::MailStoreUnavailable)
+        {
+            self.blocked = Some(ErrorCode::MailStoreUnavailable);
+        }
         self.publish(input, stopped, None, result.err())
     }
     fn policy(&mut self) -> Result<(), Failure> {

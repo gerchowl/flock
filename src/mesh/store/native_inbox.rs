@@ -1,8 +1,45 @@
 //! Recipient-owned read acknowledgements, independent of custody (ADR-0036 §3).
 use super::*;
 impl<D: DiskSpace> Store<D> {
+    /// Fix a delivery window in the custody logical clock, including pause policy.
+    pub(crate) fn native_inbox_deadline(&mut self, retention_ms: u64, wall_ms: i64) -> Result<i64> {
+        Ok(self
+            .writable(wall_ms)?
+            .saturating_add(retention_ms.min(i64::MAX as u64) as i64))
+    }
+    /// Replay an explicit journal deadline without restoring deleted payloads.
+    /// Native binding is authoritative; unrelated or collected keys add nothing.
+    pub(crate) fn native_inbox_project(
+        &mut self,
+        key: &MessageKey,
+        agent: &str,
+        until: i64,
+        wall_ms: i64,
+    ) -> Result<()> {
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM native_inbox_reads WHERE origin=?1 AND id=?2)",
+            params![key.origin_node, key.message_id],
+            |r| r.get(0),
+        )?;
+        if exists {
+            return Ok(());
+        }
+        self.writable(wall_ms)?;
+        if self
+            .recipient_binding(key)?
+            .is_none_or(|(bound, _)| bound != agent)
+            || self.get(key)?.is_none_or(|r| r.envelope.body.is_empty())
+        {
+            return Ok(());
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO native_inbox_reads VALUES(?1,?2,'unread',?3)",
+            params![key.origin_node, key.message_id, until],
+        )?;
+        Ok(())
+    }
     /// Record the first harness delivery of already admitted, natively bound mail.
-    /// Trusted internal input only: #2452 binds the queue lifecycle and caller.
+    /// Fixture/internal input only; production replays the journal deadline.
     /// Replays cannot renew the persisted window or resurrect consumed mail.
     pub(crate) fn native_inbox_delivered(
         &mut self,
