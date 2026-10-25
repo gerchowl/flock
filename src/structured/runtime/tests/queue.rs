@@ -1065,3 +1065,64 @@ fn readonly_runtime(mode: &str) {
     assert_eq!(scheduler.status(&run.running.runtime).unwrap(), status);
     assert_eq!(fs::read(path).unwrap(), bytes);
 }
+
+#[test]
+fn fresh_generation_durably_fails_reserved_unresolved_items_and_delivers_later_input() {
+    for kind in [Kind::Finding, Kind::DelegateResult, Kind::ReloadNotice] {
+        let mut run = QueueRun::new();
+        drop(run.scheduler.take());
+        let mut journal = Journal::open(run.fixture.root.path(), "fixture-agent").unwrap();
+        let mut pending = item(0);
+        pending.kind = kind.clone();
+        pending.state = State::Delivered;
+        pending
+            .metadata
+            .insert("awaiting_result".into(), json!(true));
+        journal
+            .append(Change::Upsert {
+                item: Box::new(pending.clone()),
+                position: 0,
+            })
+            .unwrap();
+        let mut later = item(1);
+        later
+            .metadata
+            .insert("gate".into(), json!({"decision":"send"}));
+        journal
+            .append(Change::Upsert {
+                item: Box::new(later),
+                position: 1,
+            })
+            .unwrap();
+        drop(journal);
+        let journal = Journal::open(run.fixture.root.path(), "fixture-agent").unwrap();
+        let scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH).unwrap())
+            .expect("retained reserved kind must not prevent scheduler construction");
+        let failed = &scheduler.journal().items()[0];
+        assert_eq!(failed.kind, kind);
+        assert_eq!(failed.body, pending.body);
+        assert_eq!(failed.state, State::Failed);
+        assert_eq!(failed.metadata["refusal"], "queue_kind_reserved");
+        assert!(!failed.metadata.contains_key("awaiting_result"));
+        let cut = scheduler.journal().replay(2).unwrap();
+        assert_eq!(cut.records.len(), 1);
+        assert_eq!(cut.records[0]["kind"], "fail");
+        assert_eq!(cut.records[0]["item_id"], id(0));
+        assert_eq!(cut.records[0]["reason"], "queue_kind_reserved");
+        drop(scheduler);
+        let journal = Journal::open(run.fixture.root.path(), "fixture-agent").unwrap();
+        assert_eq!(journal.items()[0].state, State::Failed);
+        let scheduler = Scheduler::new(Admission::new(journal, MAX_BATCH).unwrap()).unwrap();
+        assert_eq!(scheduler.journal().replay(0).unwrap().through, cut.through);
+        run.scheduler = Some(scheduler);
+        assert_eq!(run.offer().unwrap(), Some(id(1)));
+        let observed = run.input();
+        assert_eq!(observed["input"]["uuid"], id(1));
+        assert!(observed["input"]["message"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("input 1"));
+        run.lifecycle("started");
+        run.result();
+    }
+}

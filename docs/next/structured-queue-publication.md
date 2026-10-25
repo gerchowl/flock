@@ -108,3 +108,19 @@ after their queue commit, not in a shared transaction. Global append failures
 use EventHub's existing logging/retention policy. Queue replay remains the
 source of item state; loading/replaying a checkpoint never invents historical
 state transitions or new global facts.
+
+## Reserved input kinds
+
+`finding` (S13 fork return, #2365), `delegate_result` (structured delegate
+completion/receipt, #2419), and `reload_notice` (S11 reload notice, #2420) retain
+their typed JSON names for replay but have no enabled producer. All queue
+admission paths, including operator and server origins, refuse them with
+`queue_kind_reserved` (retry `never`, CLI exit 2), before mutation. Choosing a
+different gate does not enable them. Retained records remain inspectable; queued
+reserved records fail formation with that reason and never reach harness stdin.
+On restart, unresolved reserved records are durably failed before the supported
+records are held; failure clears the result flag, making recovery idempotent.
+The session transcript's raw JSON fallback can display exported records and
+items, but there is no queue GUI renderer or transport and no queue-kind-specific
+GUI coverage. Producer admission opens only with the linked
+implementation and its authenticated policy (ADR-0036 S5 amendment, #2364).
