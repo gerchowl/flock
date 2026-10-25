@@ -8,9 +8,12 @@ member of flk's build and never linked into `flk`.
 ## Build and run
 
 - `just desktop-dev`: the shell against the client's Vite dev server.
-- `just desktop-build`: the client and a release app, in
-  `target/release/bundle/`. Ad-hoc signed; signing and notarisation are G9c (#1636).
-- `cd desktop && cargo test`: the config and hardening tests.
+- `just desktop-build`: the client and a release shell. On macOS that is an
+  ad-hoc signed `flock.app` in `target/release/bundle/` (`tauri.macos.conf.json`);
+  identity signing and notarisation are G9c (#1636). Elsewhere bundling is off
+  and the build is the binary in `target/release/`.
+- `cd desktop && cargo test`: the config and hardening tests. CI does not run
+  them yet (#2477).
 
 ## Configuration
 
@@ -26,9 +29,9 @@ server_url = "ws://127.0.0.1:7682"
 It must be an origin on a loopback address; remote servers take the
 pasted-code path (#2293). An initialization script hands it to the bundle as
 `__FLOCK_SHELL_CONFIG__` (`web/client/src/config.ts`). A malformed config never
-falls back: the shell passes the reason as a transport the client refuses, so
-the client's ConfigError state shows it. With no token yet, the client waits in
-NeedsToken.
+falls back: the shell injects the contract's `{ transport: "error", message }`
+(ADR-0038 §6), and the client shows the message in its ConfigError state. With
+no token yet, the client waits in NeedsToken.
 
 ## Hardening
 
@@ -39,12 +42,13 @@ Each rule has a test in `src/hardening.rs` or `src/config.rs`:
 - **CSP:** `default-src 'self'; connect-src <server>; frame-src blob: 'self'`.
   The shell writes the configured server's `ws:`/`http:` (or `wss:`/`https:`)
   origin in at startup; the checked-in policy has `connect-src 'none'`.
-- **Navigation:** only the bundle's origin (`tauri://localhost`;
-  `http(s)://tauri.localhost` on Windows), its `blob:` frames and, under
-  `tauri dev`, the dev server.
+- **Navigation:** only the bundle's origin, its `blob:` frames and, under
+  `tauri dev`, the dev server. The origin is `tauri://localhost` on macOS and
+  Linux and `http://tauri.localhost` on Windows only: elsewhere
+  `tauri.localhost` is a loopback name any local process could serve.
 - **DevTools:** Tauri's `devtools` feature stays off, so release has no inspector.
-- **macOS:** hardened runtime; `entitlements.plist` grants nothing, so no
-  `get-task-allow` and no same-UID attach.
+- **macOS:** hardened runtime (`tauri.macos.conf.json`); `entitlements.plist`
+  grants nothing, so no `get-task-allow` and no same-UID attach.
 
 macOS and Linux send `Origin: tauri://localhost` (ADR-0038 §6 has the captured
 table), so the bundle is served from the Tauri protocol, not a loopback port.

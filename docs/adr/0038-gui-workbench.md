@@ -605,6 +605,10 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
   - **Bun stays** the package manager and test runner, with `bun.lock` pinning unchanged. ADR-0036 §7's build bullet is amended to match.
   - The output is still static assets: embedded by the `web` feature with `rust-embed` and served by `flk`, and loaded unchanged by the Tauri v2 shell.
   - The bundle has no same-origin assumption: the server URL and token come from shell config. #1402's first spike item becomes a requirement here.
+  - **The shell config contract** (`web/client/src/config.ts`). A shell sets one global, `__FLOCK_SHELL_CONFIG__`, before the bundle runs. Without it, the bundle takes its page's origin, which is the browser shell's case. The global holds one of:
+    - `{ transport: "wire", serverUrl, token? }`, for a live server;
+    - `{ transport: "fixture", fixtureJsonl, source }`, for a recorded replay;
+    - `{ transport: "error", message }`, when the shell has no configuration to give, such as the Tauri shell reading a malformed config file. The client shows `message` as the reason in its ConfigError state. A shell reports its own errors this way and never through an unknown transport, which the client refuses with a message of its own.
 - **Browser.**
   - The `flk` binary with the `web` feature embeds the assets and serves them beside `/v1/ws`.
   - `flk client open` mints a one-time code over the Unix socket and opens the browser (ADR-0036 §5). Loopback is the default bind, and `--allow-non-loopback` stays explicit.
@@ -680,7 +684,8 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
     - the token dies at its TTL (an injected clock), and a live session is closed with `token_expired`;
     - a server restart invalidates every app-session token;
     - a start-time mismatch is refused with `peer_process_changed`, and a restart or handoff revokes every app-session token;
-    - an `origin_port` held by another process is refused, a registered origin with another token's `hello` is closed, and `same-site` is refused for every unregistered origin;
+    - `same-site` is refused for every origin, since none is registered;
+    - *not built, because no captured platform needs the registered loopback origin:* an `origin_port` held by another process is refused, a registered origin with another token's `hello` is closed, and `same-site` is admitted only for a registered origin;
     - the pre-auth caps refuse at 17 concurrent connections and at the 11th failed `hello` within 1 s, and an authenticated session is unaffected;
     - the Linux shell refuses to mint when `ptrace_scope` is 0.
   - **Native additions:**

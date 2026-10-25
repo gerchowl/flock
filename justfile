@@ -177,8 +177,9 @@ client-preview *args:
 desktop-dev:
     cd desktop && bun install --frozen-lockfile && bun x tauri dev
 
-# Build the client into a release desktop shell (unsigned; signing is #1636).
-# The app lands in desktop/target/release/bundle/.
+# Build the client into a release desktop shell. macOS: an ad-hoc signed
+# flock.app in desktop/target/release/bundle/ (identity signing and
+# notarisation are #1636). Elsewhere: only the binary, desktop/target/release/.
 desktop-build:
     cd desktop && bun install --frozen-lockfile && bun x tauri build
 

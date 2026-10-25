@@ -85,12 +85,15 @@ fn server_url(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-/// The script that runs before the bundle: the wire config, or on error a
-/// transport the client refuses, so it shows the reason in its ConfigError state.
+/// The script that runs before the bundle: the wire config, or the contract's
+/// shell-reported error, which the client shows in its ConfigError state.
 pub fn init_script(server: &Result<Url, String>) -> String {
     let config = match server {
         Ok(url) => json!({ "transport": "wire", "serverUrl": url.origin().ascii_serialization() }),
-        Err(reason) => json!({ "transport": format!("invalid desktop configuration: {reason}") }),
+        Err(reason) => json!({
+            "transport": "error",
+            "message": format!("Invalid desktop configuration: {reason}"),
+        }),
     };
     format!("window.{SHELL_CONFIG_GLOBAL} = Object.freeze({config});")
 }
@@ -109,17 +112,18 @@ pub fn csp(server: Option<&Url>) -> String {
 }
 
 /// The bundle's own origin only: `tauri://localhost` on macOS and Linux,
-/// `http(s)://tauri.localhost` on Windows, and the dev server in `tauri dev`.
+/// `http://tauri.localhost` on Windows, and the dev server in `tauri dev`.
+/// Elsewhere `tauri.localhost` is a loopback name any local process may serve.
 /// macOS asks for subframes too, so the bundle's own `blob:` artifact frames pass (§7).
 pub fn navigation_allowed(url: &Url, dev_url: Option<&Url>) -> bool {
     match url.scheme() {
         "blob" => Url::parse(url.path())
             .is_ok_and(|inner| inner.scheme() != "blob" && navigation_allowed(&inner, dev_url)),
+        #[cfg(not(windows))]
         "tauri" => url.host_str() == Some("localhost") && url.port().is_none(),
-        "http" | "https" => {
-            (url.host_str() == Some("tauri.localhost") && url.port().is_none())
-                || dev_url.is_some_and(|dev| dev.origin() == url.origin())
-        }
+        #[cfg(windows)]
+        "http" if url.host_str() == Some("tauri.localhost") && url.port().is_none() => true,
+        "http" | "https" => dev_url.is_some_and(|dev| dev.origin() == url.origin()),
         _ => false,
     }
 }
@@ -181,9 +185,25 @@ mod tests {
             format!("window.__FLOCK_SHELL_CONFIG__ = Object.freeze({wire});")
         );
         let err = init_script(&Err("c.toml: \"</script>\" is bad".into()));
-        let reason =
-            r#"{"transport":"invalid desktop configuration: c.toml: \"</script>\" is bad"}"#;
-        assert!(err.contains(reason), "{err}");
+        let reason = r#"{"message":"Invalid desktop configuration: c.toml: \"</script>\" is bad","transport":"error"}"#;
+        assert_eq!(
+            err,
+            format!("window.__FLOCK_SHELL_CONFIG__ = Object.freeze({reason});")
+        );
+    }
+
+    #[test]
+    fn a_malformed_config_file_is_the_shell_reported_error() {
+        let reason = resolved(None, Some("server_url = ")).unwrap_err();
+        let script = init_script(&Err(reason.clone()));
+        let config = script
+            .strip_prefix("window.__FLOCK_SHELL_CONFIG__ = Object.freeze(")
+            .and_then(|rest| rest.strip_suffix(");"))
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(config).unwrap();
+        let message = format!("Invalid desktop configuration: {reason}");
+        assert_eq!(config, json!({ "transport": "error", "message": message }));
+        assert!(reason.starts_with("c.toml: "), "{reason}");
     }
 
     #[test]
@@ -203,30 +223,34 @@ mod tests {
 
     #[test]
     fn navigation_stays_in_the_bundle() {
-        let dev = url("http://127.0.0.1:5173");
-        let allowed = [
-            "tauri://localhost/index.html",
-            "http://tauri.localhost/",
-            "https://tauri.localhost/x",
-        ];
-        for raw in allowed.into_iter().chain(["blob:tauri://localhost/1f"]) {
-            assert!(navigation_allowed(&url(raw), None), "{raw}");
+        let bundle = ["tauri://localhost/index.html", "blob:tauri://localhost/1f"];
+        for raw in bundle {
+            assert_eq!(navigation_allowed(&url(raw), None), !cfg!(windows), "{raw}");
         }
+        // Only Windows serves the bundle from tauri.localhost; elsewhere it is loopback.
+        for raw in ["http://tauri.localhost/", "blob:http://tauri.localhost/1f"] {
+            assert_eq!(navigation_allowed(&url(raw), None), cfg!(windows), "{raw}");
+        }
+        let dev = url("http://127.0.0.1:5173");
         assert!(navigation_allowed(
             &url("http://127.0.0.1:5173/"),
             Some(&dev)
         ));
         let refused = [
             "http://127.0.0.1:5173/",
-            "https://example.com/",
+            "https://tauri.localhost/",
             "tauri://evil/",
-            "http://tauri.localhost:8080/",
         ];
-        for raw in refused.into_iter().chain([
+        let more = [
+            "http://tauri.localhost:8080/",
             "file:///etc/passwd",
             "data:text/html,x",
-            "blob:https://example.com/1f",
-        ]) {
+        ];
+        for raw in refused
+            .into_iter()
+            .chain(more)
+            .chain(["blob:https://example.com/1f"])
+        {
             assert!(!navigation_allowed(&url(raw), None), "{raw}");
         }
     }

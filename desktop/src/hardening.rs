@@ -27,20 +27,49 @@ fn capabilities_grant_no_shell_fs_http_or_dialog() {
 }
 
 #[test]
-fn csp_is_self_only_until_the_runtime_names_the_server() {
+fn csp_names_the_configured_server_only() {
     let security = &json_file(include_str!("../tauri.conf.json"))["app"]["security"];
     assert_eq!(security["csp"], crate::config::csp(None).as_str());
     assert!(security.get("devCsp").is_none());
     assert!(security
         .get("dangerousDisableAssetCspModification")
         .is_none());
-    assert!(include_str!("main.rs").contains("csp = Some(Csp::Policy(config::csp("));
+    // The context main runs with carries the policy for the configured server.
+    let csp = |server| {
+        crate::context(&server)
+            .config()
+            .app
+            .security
+            .csp
+            .as_ref()
+            .map(ToString::to_string)
+    };
+    let server = url::Url::parse("ws://127.0.0.1:7682").unwrap();
+    let connect = "connect-src ws://127.0.0.1:7682 http://127.0.0.1:7682";
+    assert_eq!(
+        csp(Ok(server)),
+        Some(format!(
+            "default-src 'self'; {connect}; frame-src blob: 'self'"
+        ))
+    );
+    assert_eq!(csp(Err("bad".into())), Some(crate::config::csp(None)));
+}
+
+/// `main.rs` without its comments, so a commented-out rule does not count.
+fn main_code() -> String {
+    let source = include_str!("main.rs");
+    assert!(!source.contains("/*"), "strip block comments too");
+    source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
 fn navigation_is_locked_to_the_bundle() {
     let lock = ".on_navigation(move |url| config::navigation_allowed(url, dev_url.as_ref()))";
-    assert!(include_str!("main.rs").contains(lock));
+    assert!(main_code().contains(lock));
 }
 
 #[test]
@@ -57,7 +86,7 @@ fn devtools_are_off_in_release() {
 
 #[test]
 fn macos_release_runs_hardened_without_get_task_allow() {
-    let macos = &json_file(include_str!("../tauri.conf.json"))["bundle"]["macOS"];
+    let macos = &json_file(include_str!("../tauri.macos.conf.json"))["bundle"]["macOS"];
     assert_eq!(
         (&macos["hardenedRuntime"], &macos["entitlements"]),
         (&json!(true), &json!("entitlements.plist"))
