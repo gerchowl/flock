@@ -158,6 +158,9 @@ pub enum FixtureStep {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum FixtureCoverage {
+    /// Client reducer/proxy contract; not a server conformance scenario.
+    #[serde(rename = "client-only")]
+    ClientOnly,
     /// Minimal GUI dogfood transport: handshake, agent stream/send and liveness/auth.
     #[serde(rename = "s7-min")]
     S7Min,

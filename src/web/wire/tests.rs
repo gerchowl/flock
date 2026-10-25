@@ -1436,6 +1436,8 @@ mod fleet;
 
 mod commands;
 
+mod conformance;
+
 /// Controlled read/read overlap: the bearer and its scopes never change.
 #[test]
 fn overlapping_read_admissions_keep_subscriptions_and_socket_alive() {
