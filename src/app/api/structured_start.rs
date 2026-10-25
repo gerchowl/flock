@@ -43,6 +43,19 @@ impl App {
         if params.argv != ["claude"] {
             return Err(ErrorCode::InvalidAgentArgv);
         }
+        let opening_turn = opening_turn
+            .map(|prompt| {
+                let starter = match caller {
+                    SpawnCaller::Agent { agent_id, .. }
+                    | SpawnCaller::Structured {
+                        agent_id: Some(agent_id),
+                        ..
+                    } => agent_id,
+                    _ => return Err(ErrorCode::NotAuthorized),
+                };
+                Ok((starter.clone(), prompt))
+            })
+            .transpose()?;
         let existing = self.structured_target(&params.name)?;
         // ADR-0036 §1a: neither history ownership nor a relay grants resume authority.
         if (existing.is_some()
@@ -139,6 +152,7 @@ impl App {
                 state,
                 mcp,
                 storage: self.state.config.sessions.storage(),
+                queue_rewrite_bytes: self.state.config.sessions.queue_rewrite_bytes,
                 stall_after: Duration::from_millis(self.state.config.sessions.stall_ms),
                 admission: lineage.as_ref().map(|l| Admission {
                     config: self.state.config.fleet,

@@ -31,7 +31,7 @@ pub const FORMAT_VERSION: u64 = 2;
 const LINE_LIMIT: u64 = 2 * 1024 * 1024;
 
 /// Snapshot gap followed inline by the retained records (ADR-0036 §4).
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Gap {
     /// Requested cursor plus one.
     pub from: u64,
@@ -41,7 +41,7 @@ pub struct Gap {
     pub snapshot_to: u64,
 }
 /// Immutable replay cut; subsequent mutations cannot interleave its records.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Cut {
     /// Present when the requested history was replaced by a checkpoint.
     pub gap: Option<Gap>,
@@ -288,6 +288,14 @@ impl Journal {
         self.seq = record.seq;
         self.records.push(value);
         Ok(record)
+    }
+    /// Persist the first subscription's snapshot before serving it. Read-only
+    /// storage returns its typed refusal without claiming a bootstrap succeeded.
+    pub(crate) fn subscription(&mut self) -> io::Result<Cut> {
+        if self.checkpoint.is_none() {
+            self.checkpoint()?;
+        }
+        self.replay(0)
     }
     /// Capture replay under the writer's serialization point. New/empty queues
     /// publish an empty gap; a checkpoint gap always includes snapshot_to.
