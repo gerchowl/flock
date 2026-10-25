@@ -609,7 +609,72 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
   - The `flk` binary with the `web` feature embeds the assets and serves them beside `/v1/ws`.
   - `flk client open` mints a one-time code over the Unix socket and opens the browser (ADR-0036 §5). Loopback is the default bind, and `--allow-non-loopback` stays explicit.
 - **Tauri v2** (#1402). It carries the same assets in a native shell: WKWebView, WebView2, WebKitGTK and Android WebView. It is a separate binary and repo or crate, never linked into `flk` (bin-only).
-  - **Connection:** to any `flk` server by URL with a client token. The token lives in the keychain or keystore, optionally behind biometric unlock.
+  - **Connection.** The shell connects to a `flk` server by URL, over `/v1/ws` with a client token, like the browser. How it gets the token depends on where the server is (owner decision 16; the server side is ADR-0036's amendment "App-session tokens and shell origins").
+    - **The server on the same machine (zero-touch), macOS and Linux.**
+      - **The mint.**
+        - At launch, the shell's native side opens `flock.sock` and calls the mint verb.
+        - The server admits the call only from the LocalOperator. That means the kernel-checked peer UID and PID (`getpeereid` + `LOCAL_PEERPID` on macOS, `SO_PEERCRED` on Linux, `src/platform/peer.rs`), and no flk pane in the caller's ancestry. It is exactly the authority `flk client open` has.
+      - **Scopes, chosen by the server.**
+        - The verb takes no scope parameter. It grants exactly `{read, send, answer, operate}`, the set `flk client open` gives a browser, because the shell is the operator's own console.
+        - A call that names scopes is refused with `invalid_params`. The caller can neither narrow nor widen the set.
+      - **What the token is.** The app-session token is a **bearer** secret, like every client token, and with `operate` scope it **is** the operator's identity for ADR-0014's operator-only verbs, exactly as ADR-0036 §5 says of an `operate`-scoped file token.
+        - Once it is in the shell's process, any local process that obtains it can use `/v1/ws` over TCP until it is revoked or expires.
+        - **Residual risk (#1177).** Processes started from a flk pane, which includes agents, are refused the mint. They would gain operator authority by obtaining the token, for example by reading the shell's memory. This design does not close that; #1177 tracks same-UID agent isolation. It narrows it:
+          - the token is never written to disk or logged;
+          - its lifetime is bounded (below);
+          - the shell ships with the macOS hardened runtime, without `get-task-allow`, so a same-UID process cannot attach to it.
+          - On Linux, the protection depends on Yama `ptrace_scope` ≥ 1, and the shell refuses to mint when it reads 0. It says why, and offers the remote path.
+      - **Binding to the app's process.**
+        - The PID comes from the **minting connection's peer credentials** (`LOCAL_PEERPID`; on Linux `SO_PEERPIDFD` where the kernel has it, else `SO_PEERCRED`), never from a parameter.
+        - The start time comes from `src/platform/peer.rs`: `/proc/<pid>/stat` field 22 on Linux, and `flock_process_facts` on macOS.
+        - **Order.** First arm the exit watch (kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS; on Linux the peer pidfd itself, or else `pidfd_open`), then read and compare the start time. A process that exits, or a PID that is reused, between the two steps is caught by the armed watch or by the mismatch. The server never polls with `kill(pid, 0)`.
+        - If the watch cannot be armed, or the start time does not match the one taken when the connection was accepted, the mint is refused with `peer_process_changed`.
+      - **Lifetime.**
+        - App-session tokens live in the server's memory only, never on disk, so a server restart **or handoff** revokes them. A handoff does not carry them or their watches to the new process. The shell sees `token_revoked` and mints again, so the person sees one reconnect.
+        - Each one has a fixed **TTL of 12 hours** from the mint, with no sliding renewal.
+        - Before expiry, the native side mints a fresh token and hands it to the webview, which reconnects through §3's resume path. The cursors and the outbox survive, so nothing is lost.
+      - **Revocation.** A token is revoked when its process exits, when its TTL ends or when the server restarts. The server then closes every `/v1/ws` session authenticated by it, with a typed auth close (`token_revoked` or `token_expired`). The client treats that as NeedsToken, and the local shell mints again silently.
+      - **In the webview.** The native side hands the token over through one Tauri command. The webview keeps it **in memory only** and asks again after a reload; nothing is persisted.
+      - **One transport.** The socket carries only the mint. Every stream and command goes over `/v1/ws`, so ADR-0011 §3's direct-socket transport stays superseded (owner decision 1).
+      - **No server running.** The shell starts one through the existing daemon path.
+      - **No silent fallback.** An app launched from inside a flk pane fails the LocalOperator check, and a sandboxed (App Store) build cannot reach `flock.sock`. Either one says why and offers the remote path; it never falls back silently.
+    - **A remote server** (#2293), or a platform without `flock.sock`. The person pastes or deep-links a one-time code, and the token lives in the keychain or keystore, optionally behind biometric unlock.
+  - **Shell origins, on `/v1/ws` only.**
+    - A shell's webview does not present the server's origin. The listener's guard (`origin_allowed`, `src/web/gui.rs`, used by the listener in `src/web/client_listener.rs`) admits an **exact allow-list of shell origins** on the `/v1/ws` upgrade only.
+    - For those origins only, it relaxes the `Sec-Fetch-Site` check to the value the shell actually sends (`cross-site` against `127.0.0.1:port`). Every other origin keeps today's `none`/`same-origin` rule.
+    - The loopback-peer and exact-`Host` checks are unchanged.
+    - **The values are captured, not assumed.** G9a's first step records the `Origin` and `Sec-Fetch-Site` that a real Tauri v2 shell sends on macOS, Linux and Windows, in this section. The allow-list holds only those captured values. The documentation is inconsistent, giving `tauri://localhost` and `null` for macOS and `http://tauri.localhost` for Windows, so nothing is admitted on that basis.
+    - **`null` is never admitted.** `null` is also what an artifact frame (§7), a `file://` page, a `data:` URL and other sandboxed pages send, so admitting it would leave only the token and the frames' CSP as the barrier.
+    - **A registered loopback origin, where a platform's shell would send `null`.**
+      - That platform's shell serves its bundle from its own loopback port, and the mint carries `origin_port`.
+      - The server builds the origin itself, always in the exact form `http://127.0.0.1:<port>`. No hostname and no other address is accepted.
+      - At mint time, it checks that the port is a listening TCP socket **held by the minting process** (macOS: `proc_pidfdinfo` socket info; Linux: the socket inode in `/proc/<pid>/net/tcp`, matched to one of the PID's fds). If another process holds it, the mint is refused with `origin_port_not_owned`.
+      - The registered origin is bound to that **one token**. The guard admits the upgrade from that origin provisionally, and `hello` must then present the token it is bound to; any other token closes the connection.
+      - The origin dies with the token: at process exit, at the TTL, or at a restart or handoff. A port taken over after a crash is therefore never admitted.
+      - For this origin only, the guard accepts `Sec-Fetch-Site: same-site`, which is what a loopback page on another port sends. `src/web/gui.rs` refuses it for every other origin, as it does today.
+    - **The threat model.** Admitting a shell origin opens no ambient authority: `/v1/ws` authenticates by the token in `hello` alone (ADR-0036 §5), and the server has no cookie or other ambient credential. ADR-0036 §5 already notes that local processes can forge `Host` and `Origin`, so the origin check is a defence against browsers, not against local code. Here is how each origin that could reach the listener stays out:
+      - A web page in any local browser has a real web origin, which is refused. Even if it were admitted, it has no token.
+      - Artifact frames (§7) are `null`, so they are refused. Their injected CSP `connect-src 'none'` is **required** as a second barrier, and G7's per-shell security test checks it.
+      - `file://` and `data:` pages are `null` or their own scheme, so they are refused.
+    - **Pre-auth limits.**
+      - At most **16** concurrent unauthenticated `/v1/ws` connections per listener. Beyond that, an upgrade is refused with `preauth_capacity`.
+      - Each connection gets exactly one `hello`; a failed `hello` closes it.
+      - After **10** failed `hello`s within any **1 s**, a new upgrade is refused with `auth_rate_limited` for the rest of that second.
+      - Authenticated sessions are never affected, so a local process cannot lock the person out.
+      - The ADR-0036 §5a handshake deadline still applies. These limits bound resource use; guessing a token (32 random bytes) is infeasible.
+    - **`/v1/client/exchange` keeps its strict checks** (`src/web/client_exchange.rs`: loopback peer, exact `Host` and `Origin`, `Sec-Fetch-Site` `same-origin`). Its one-time code is a bearer secret, and the shell never uses it locally.
+  - **Tests that must fail before the change** (server slice and G9a):
+    - a captured shell origin is admitted on `/v1/ws` and refused on `/v1/client/exchange`;
+    - `Origin: null` is refused on both, with and without a token;
+    - a shell origin with no token, or with a wrong one, is refused at `hello`;
+    - a mint that names scopes is refused, and a mint from a non-LocalOperator peer is refused;
+    - the token dies when its process exits (a real child process, exit detected without polling), and a live session is closed with `token_revoked`;
+    - the token dies at its TTL (an injected clock), and a live session is closed with `token_expired`;
+    - a server restart invalidates every app-session token;
+    - a start-time mismatch is refused with `peer_process_changed`, and a restart or handoff revokes every app-session token;
+    - an `origin_port` held by another process is refused, a registered origin with another token's `hello` is closed, and `same-site` is refused for every unregistered origin;
+    - the pre-auth caps refuse at 17 concurrent connections and at the 11th failed `hello` within 1 s, and an authenticated session is unaffected;
+    - the Linux shell refuses to mint when `ptrace_scope` is 0.
   - **Native additions:**
     - the keyboard accessory bar;
     - deep links to an agent, question or artifact;
@@ -623,7 +688,7 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
     - Navigation outside the bundle is refused.
     - DevTools are gated in release builds.
     - Builds are signed and notarised.
-- **One transport.** ADR-0011 §3's desktop path, Tauri IPC straight to `flock.sock`, is **superseded** by the WebSocket and client tokens of ADR-0036 §5 for every shell (owner decision 1). There is one code path, one auth model and one set of tests. A desktop app on the server's host mints its own token through `flk client open`, as a browser does.
+- **One transport.** ADR-0011 §3's desktop path, Tauri IPC straight to `flock.sock`, is **superseded** by the WebSocket and client tokens of ADR-0036 §5 for every shell (owner decision 1). There is one code path, one auth model and one set of tests. A desktop app on the server's host mints its own app-session token over `flock.sock`, which is the same LocalOperator authority that `flk client open` uses (owner decision 16).
 - **Identity, and exactly what changes in ADR-0011.**
   - **Superseded for the GUI:** ADR-0011 §4's requirement that a WSS *gateway* (#150) authenticate GUI clients by a non-empty `allowed_users` list and the `Tailscale-User-Login` header, and propagate that login as the request principal. For the `/v1/ws` endpoint, the principal is the client token's (ADR-0036 §5), on any network.
   - **Kept:**
@@ -971,11 +1036,11 @@ The first end-to-end milestone is **"a structured agent in a browser tile"**: G1
 
 ### 11. Owner decisions (decided by the owner, 2026-10-16, recorded on #1591)
 
-Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day. Item 11 was added on 2026-10-17, when the owner chose between two wireframe directions after rejecting the first preview. Items 12–14 were added on 2026-10-18 with §5b (#1717) and decided by the owner on 2026-10-19 (recorded on #1717). Item 15 was added and decided by the owner on 2026-10-19 (recorded on #1717). Item 17 records the owner's typed artifact requirements of 2026-10-25 (on #1598).
+Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follow the recommendation. Item 5 was decided differently from the recommendation. Item 10 was added and decided the same day. Item 11 was added on 2026-10-17, when the owner chose between two wireframe directions after rejecting the first preview. Items 12–14 were added on 2026-10-18 with §5b (#1717) and decided by the owner on 2026-10-19 (recorded on #1717). Item 15 was added and decided by the owner on 2026-10-19 (recorded on #1717). Item 16 was added after a spike and decided by the owner on 2026-10-25 (recorded on #1601). Item 17 records the owner's typed artifact requirements of 2026-10-25 (on #1598).
 
 | # | Decision | Outcome | Consequence |
 |---|---|---|---|
-| 1 | Supersede ADR-0011 §3's direct-socket desktop transport with ADR-0036 §5's WebSocket and tokens everywhere | **Decided: yes** | A desktop app on the server host gets its token through `flk client open`. |
+| 1 | Supersede ADR-0011 §3's direct-socket desktop transport with ADR-0036 §5's WebSocket and tokens everywhere | **Decided: yes** | A desktop app on the server host gets its token through the same LocalOperator socket authority as `flk client open`; item 16 decides how (an app-session token, zero-touch). |
 | 2 | Opt-in **interactive** artifacts: scripts in an opaque-origin sandbox, no network, posts confirmed by a person | **Decided: yes**, opt-in per publish, off by default | One more security surface, reviewed in G7. Agents can render live plots and forms. |
 | 3 | Replace ADR-0011 §5's distinct hostname with the opaque-origin sandbox | **Decided: yes** | Isolation rests on correct sandbox flags and injected CSP in every shell. A client bug such as a stray `allow-same-origin` would expose the client token, so G7 carries a security test per shell. Interactive artifacts keep §7's navigation-beacon risk. Artifacts render only inside the client. |
 | 4 | Solid web client vs GPUI (#1401) | **Decided: Solid**; #1401 is closed | The Bun/TS toolchain stays. |
@@ -990,6 +1055,7 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 | 13 | What happens to a thread's fork after the merge-back? (§5b) | **Decided: yes** ("stop fork but keep transcript"). The fork is stopped, and its transcript is kept in the lineage (the `AgentForked` edge); the sidebar folds ended threads. | Stored transcripts, and lineage rows to fold. No retention limit is stated yet: ADR-0036 S16 owns it. A rehydrated copy is deleted when the fork ends either way (ADR-0036 owner decision 14). |
 | 14 | A thread fork's tools (§5b) | **Decided: read-only now, through the general machinery** ("machinery first … but with read only as per now"). The fork runs under ADR-0036 S19's permission tiers (#1321) with a read-only tier, never a thread-specific flag. | A fork that would have to run a command to answer must say so in its proposal. Widening is #1321's follow-up: tiers selectable per model, and a fork that requests more, which the person grants. |
 | 15 | Does S6e retake ADR-0036 owner decision 3a, so that the asker decides blocking, with a reason, instead of S6d's System-One check? (§5b decision 5) | **Decided: yes** (the owner typed "y" on 2026-10-19, recorded on #1717), following the owner's #1717 words "not vlocking [sic] unless there is literally nothing else to work on". | The server stops catching a wrongly held or wrongly continued turn, and an agent that over-uses `blocking: true` only costs itself and puts its card first. S6d no longer holds a turn; any later use of its check is advisory only (the backend ruling on #1717). |
+| 16 | How does the Tauri shell get its token from a server on the same machine? (§6; amends item 1's consequence) | **Decided: zero-touch** (the owner typed "go" on 2026-10-25, recorded on #1601), after asking for no token input on the person's own machine. The native side mints an app-session token over `flock.sock`: server-chosen scopes, a 12 h TTL, bound to the minting process (exit detected by kqueue or pidfd), in server memory only. The webview holds it in memory. The listener admits an exact allow-list of **captured** shell origins on `/v1/ws` only; `null` is never admitted. Remote servers keep a code and the keychain. | The server gains in-memory app-session tokens and the shell-origin allow-list (ADR-0036's amendment "App-session tokens and shell origins"). The token is still a bearer secret, and the operator's identity, while the app runs. The shell needs a non-sandboxed build: an App Store sandbox cannot reach `flock.sock`. The residual risk is named: a pane-started process that obtains the token gains operator authority (#1177). |
 | 17 | Artifact lifecycle, question sets, blob backend, anchors and network (§7a–§7e; added 2026-10-25, recorded on #1598) | **Decided: these requirements**, typed by the owner, scheduled after the `-p` MVP: purge handling so that artifacts do not pile up; questions of several types inside an artifact, each with comments and its own fork-and-merge-back thread; a configurable blob backend, defaulting to temp-folder sessions; comments on blocks and text; network access "if wanted" for live data, a "future feature, but get framework correct for it already now". | §7a–§7e give the design. §7f lists the tests. The defaults (`session` lifetime, the quotas, the 14-day idle TTL, the RPC limits) are proposals the review may change. The server owns the blob reference counting and backend trait, the lifecycle and viewing records, the question `about` shape and the grant record. |
 
 ## Failure modes and known limits
@@ -1002,6 +1068,7 @@ Items 1–9 were decided by the owner on 2026-10-16. Items 1–4 and 6–9 follo
 - **Stale reads.** While Stale, tiles show old state with a marker. A user can read but not act. The outbox holds actions until Live.
 - **A stale command after the idempotency window** is shown as "unknown outcome", never resent automatically.
 - **Cross-node commands** are refused until #1380. The UI shows the refusal in place.
+- **The local shell needs the socket.** A sandboxed (App Store) build, or an app launched from inside a flk pane, cannot mint an app-session token. It shows why and offers the remote path (a code); it never falls back silently.
 - **Layout loss.** Clearing browser storage resets the layout. Server state is unaffected.
 - **A thread's proposal is untrusted text.** The fork read the asker's context, which can hold injected content. The proposal is shown as text, and only the question's recipient applies it, after review (§5b decision 4; owner decision 12).
 - **A thread behind a compaction costs a cache write.** The rehydrate path is cold. The card shows the path and cost before forking (§5b decision 2).
