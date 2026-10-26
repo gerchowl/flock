@@ -1310,6 +1310,21 @@ mod tests {
     /// the error was a bare "connection closed".
     #[test]
     fn a_stream_that_cannot_be_established_says_why() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let state = crate::test_support::TempDir::socket();
+        struct RestoreStateHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreStateHome {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(previous) => std::env::set_var("XDG_STATE_HOME", previous),
+                    None => std::env::remove_var("XDG_STATE_HOME"),
+                }
+            }
+        }
+        let _restore = RestoreStateHome(std::env::var_os("XDG_STATE_HOME"));
+        // Enrollment loads a node identity before observing the SSH failure.
+        // Keep that identity in this fixture, never the operator's state.
+        std::env::set_var("XDG_STATE_HOME", state.path());
         let target = PeerConfig {
             name: "flk418-stream".into(),
             ssh: "nobody@flk-418-no-such-host.invalid".into(),

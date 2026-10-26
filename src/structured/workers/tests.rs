@@ -25,7 +25,7 @@ pub(crate) struct Case {
     pub id: String,
     session: String,
     pub generation: u64,
-    leases: SessionLeases,
+    pub(crate) leases: SessionLeases,
 }
 impl Case {
     pub fn start(
@@ -91,7 +91,7 @@ impl Case {
         let factory = case.factory(mode, events);
         (case, launch, factory)
     }
-    fn factory(
+    pub(crate) fn factory(
         &self,
         mode: &str,
         events: Vec<Value>,
