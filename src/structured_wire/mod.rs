@@ -150,6 +150,8 @@ pub enum SubfailCode {
     UnknownStream,
     /// Stop until read authorization changes.
     Scope,
+    /// Token mutation is pending; registered session_busy retries later on a fresh ID.
+    SessionBusy,
     /// Subscription identity was already used on this connection; allocate a fresh one.
     SubIdReused,
 }

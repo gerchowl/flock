@@ -123,8 +123,12 @@ class ActionsCachePolicy(unittest.TestCase):
         commands = {step['run'] for step in job['steps'] if 'run' in step}
         self.assertEqual(commands, {
             'nix develop -c just lint', 'nix develop -c just doc-check',
-            'nix develop -c just script-tests',
         })
+
+    def test_script_tests_job_uses_the_dev_shell_and_bounded_dev_only_store_cache(self):
+        document = workflow('ci.yml')
+        self.assert_ci_dev_shell_cache(document, document['jobs']['script-tests'],
+                                       'nix develop -c just script-tests')
 
     def test_archived_shards_run_in_the_dev_shell_on_every_platform(self):
         document = workflow('ci-leg.yml')
