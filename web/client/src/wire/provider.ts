@@ -13,9 +13,13 @@
  * - **Before expiry.** A provider token that carries `expiresInMs` (the
  *   lifetime the server reported at mint) is renewed at {@link RENEW_AT} of
  *   it, by one timer, and the connection switches to the new token through
- *   §3's resume path. A failed renewal is not retried: the reactive path
- *   above takes over when the server ends the token. Without `expiresInMs`
- *   there is no timer.
+ *   §3's resume path. The timer is armed in steps of at most
+ *   {@link MAX_TIMER_DELAY} until the renewal time, so no lifetime is too long.
+ *   It is cleared on Disconnect, and it renews only a running session: in
+ *   NeedsToken (a spent cap included) the reactive path owns the provider.
+ *   A failed renewal is not retried; the session stays Live, the shell's
+ *   message is {@link ShellTokens.notice}, and the reactive path takes over
+ *   when the server ends the token. Without `expiresInMs` there is no timer.
  * - One call at a time: a request while one is in flight, or waiting, is
  *   the same request.
  * - Its token goes to the connection with `setToken`, which connects only
@@ -53,12 +57,22 @@ export const REMINTS_SPENT = `The server ended ${MAX_REMINTS} tokens from this s
  */
 export const RENEW_AT = 3 / 4;
 
+/**
+ * The longest delay one timer is given: 2³¹ − 1 ms (about 24.8 days).
+ * Browsers fire a longer `setTimeout` at once, so a later renewal is armed
+ * in steps of this until it is due.
+ */
+export const MAX_TIMER_DELAY = 2 ** 31 - 1;
+
 /** What the app reads and does; `changed` runs on every change of `asking` or `error`. */
 export type ShellTokens = {
   /** A provider call is in flight or waiting on its backoff. */
   readonly asking: boolean;
   /** Why the last call gave no token, or why the provider is no longer asked. */
   readonly error: string | null;
+  /** Why the last renewal failed while the session ran on, until dismissed or the next token. */
+  readonly notice: string | null;
+  dismissNotice(): void;
   /** The person's Connect: asks at once, with a fresh streak. */
   ask(): void;
   dispose(): void;
@@ -70,13 +84,14 @@ function reason(error: unknown): string {
   return message === "" ? "The shell could not provide a token." : message;
 }
 
-/** The provider's value as a {@link ShellToken}, or null when it is not one. */
-function shellToken(value: unknown): ShellToken | null {
-  if (typeof value !== "object" || value === null) return null;
+/** The provider's value as a {@link ShellToken}, or why it is not one. */
+function shellToken(value: unknown): ShellToken | string {
+  if (typeof value !== "object" || value === null) return "The shell gave no token.";
   const { token, expiresInMs } = value as Record<string, unknown>;
-  if (typeof token !== "string" || token === "") return null;
+  if (typeof token !== "string" || token === "") return "The shell gave no token.";
   if (expiresInMs === undefined) return { token };
-  return typeof expiresInMs === "number" && Number.isFinite(expiresInMs) && expiresInMs > 0 ? { token, expiresInMs } : null;
+  const valid = typeof expiresInMs === "number" && Number.isFinite(expiresInMs) && expiresInMs > 0;
+  return valid ? { token, expiresInMs } : "The shell's token has an invalid expiresInMs: it must be a positive, finite number of milliseconds.";
 }
 
 export function driveTokenProvider(connection: WireConnection, provider: TokenProvider, clock: Clock, random: () => number, changed: () => void): ShellTokens {
@@ -84,6 +99,7 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
   let waiting: TimerHandle | null = null;
   let renewal: TimerHandle | null = null;
   let error: string | null = null;
+  let notice: string | null = null;
   let disposed = false;
   let streak = 0;
   let acksAtStreak = 0;
@@ -94,27 +110,43 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
     if (timer !== null) clock.clearTimeout(timer);
     return null;
   };
+  const running = (): boolean => connection.state !== "NeedsToken" && connection.state !== "Disconnected";
+  /** Arms the renewal for `due` on the monotonic clock, in steps of at most {@link MAX_TIMER_DELAY}. */
+  const renewAt = (due: number): void => {
+    const delay = Math.max(0, due - clock.now());
+    renewal = clock.setTimeout(() => {
+      renewal = null;
+      if (delay > MAX_TIMER_DELAY) renewAt(due);
+      else if (running()) call(true);
+    }, Math.min(delay, MAX_TIMER_DELAY));
+  };
   /** Hands `token` over: from NeedsToken or Disconnected `setToken` is enough; a running session reconnects on it. */
   const adopt = ({ token, expiresInMs }: ShellToken): void => {
-    const running = connection.state !== "NeedsToken" && connection.state !== "Disconnected";
+    const reconnect = running();
     connection.setToken(token);
-    if (running) {
+    if (reconnect) {
       connection.disconnect();
       connection.connect();
     }
     renewal = cancel(renewal);
-    if (expiresInMs !== undefined) renewal = clock.setTimeout(() => ((renewal = null), request(0)), Math.floor(expiresInMs * RENEW_AT));
+    if (expiresInMs !== undefined) renewAt(clock.now() + Math.floor(expiresInMs * RENEW_AT));
   };
-  const call = (): void => {
+  /** One provider call; a renewal's failure is a notice, since the session runs on. */
+  const call = (renewing = false): void => {
+    if (inFlight || disposed) return;
     waiting = null;
     inFlight = true;
-    error = null;
+    if (!renewing) error = null;
     changed();
     const settle = (token: ShellToken | null, failure: string | null): void => {
       inFlight = false;
       if (disposed) return;
-      error = failure;
-      if (token !== null) adopt(token);
+      if (renewing && failure !== null) notice = failure;
+      else error = failure;
+      if (token !== null) {
+        notice = null;
+        adopt(token);
+      }
       changed();
     };
     Promise.resolve()
@@ -122,7 +154,8 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
       .then(
         (value: unknown) => {
           const token = shellToken(value);
-          settle(token, token === null ? "The shell gave no token." : null);
+          if (typeof token === "string") settle(null, token);
+          else settle(token, null);
         },
         (failure: unknown) => settle(null, reason(failure)),
       );
@@ -131,7 +164,7 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
     if (inFlight || waiting !== null || disposed) return;
     if (delay === 0) call();
     else {
-      waiting = clock.setTimeout(call, delay);
+      waiting = clock.setTimeout(() => call(), delay);
       changed();
     }
   };
@@ -152,8 +185,9 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
       if (clock.now() - liveSince >= DEADLINES.healthy) streak = 0;
       liveSince = null;
     }
-    if (state === "Disconnected" && waiting !== null) {
+    if (state === "Disconnected" && (waiting !== null || renewal !== null)) {
       waiting = cancel(waiting);
+      renewal = cancel(renewal);
       changed();
     }
     if (state === "NeedsToken") {
@@ -171,6 +205,13 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
     },
     get error() {
       return error;
+    },
+    get notice() {
+      return notice;
+    },
+    dismissNotice() {
+      notice = null;
+      changed();
     },
     ask() {
       waiting = cancel(waiting);
