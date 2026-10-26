@@ -17,7 +17,7 @@ import tempfile
 import time
 
 
-def run(binary, scenario):
+def run(binary, scenario, wire=None):
     repo = Path(__file__).resolve().parents[2]
     with tempfile.TemporaryDirectory(prefix="fc", dir="/tmp") as temporary:
         root = Path(temporary).resolve()
@@ -43,13 +43,18 @@ def run(binary, scenario):
         # Explicit, owned short endpoint; no inherited FLOCK variable survives.
         env["FLOCK_SOCKET_PATH"] = str(root / "a")
         env["FLOCK_CLIENT_SOCKET_PATH"] = str(root / "c")
+        if wire is not None:
+            tailscale = root / "bin" / "tailscale"
+            tailscale.write_text("#!/bin/sh\nprintf '{}\\n'\n")
+            tailscale.chmod(0o700)
         def configure(operator=True, enabled=True, capacity=1, depth=2, fanout=2):
+            client_config = "[client]\nbind = '127.0.0.1:0'\n" if wire is not None else ""
             config = f'''onboarding = false
 [structured]
 run_as = '{"operator" if operator else "flk-agent"}'
 profile = 'dogfood'
 token_file = {json.dumps(str(token))}
-[security]
+{client_config}[security]
 agent_account = 'none'
 [fleet]
 agent_spawn_enabled = {str(enabled).lower()}
@@ -136,7 +141,7 @@ max_spawn_fanout = {fanout}
             workspace = api("workspace.create", {"cwd":str(root / "project")})
             assert "result" in workspace, workspace
             args = {"runtime":"structured", "agent":"claude", "prompt":"dogfood-task",
-                    "model":"dogfood-child", "name":"dogfood-child",
+                    "model":"dogfood-wire-child" if wire else "dogfood-child", "name":"dogfood-child",
                     "location":{"kind":"worktree_path","path":str(root / "project")}}
             raw = tool("agent.start", args)
             assert raw["error"]["data"]["refusal"] == "not_exposed_via_mcp", raw
@@ -177,6 +182,8 @@ max_spawn_fanout = {fanout}
             assert tool("flock_agent_start", extra)["error"]["data"]["refusal"] == expected
             observe(child_id, "turn_idle")
             assert any("dogfood-complete" in path.read_text() for path in (root / "x").rglob("*.jsonl")), "turn result must be durably observed"
+            if wire is not None:
+                wire(cli, api, child_id, env, root)
             listing = tool("flock_agent_list", {})
             assert {a["agent_id"] for a in listing["structured_agents"]} == {parent_id, child_id}
             assert all("pane_id" in a for a in listing["agents"])

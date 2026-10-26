@@ -1,4 +1,6 @@
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -43,7 +45,11 @@ if __name__ == "__main__":
 
 
 class RustReaders(unittest.TestCase):
-    """Anything Rust reads or spawns under a skippable prefix, plus its TS import closure, must be denied."""
+    """PR inputs read/spawned by Rust, including TS imports, must be denied.
+
+    Requires a Git checkout: ignore only untracked generated outputs, never
+    tracked files (even those force-added under an ignore rule).
+    """
 
     ROOT = Path(__file__).resolve().parents[1]
     LITERAL = re.compile(r'"((?:web/client|website|docs)/[A-Za-z0-9_./-]*)"')
@@ -98,10 +104,40 @@ class RustReaders(unittest.TestCase):
                 todo.append(resolved)
         return seen
 
+    def repository_files(self, paths):
+        """Ignored untracked build outputs cannot appear in a PR diff."""
+        result = subprocess.run(
+            ["git", "check-ignore", "--stdin", "-z"], cwd=self.ROOT,
+            input="".join(f"{p.relative_to(self.ROOT)}\0" for p in sorted(paths)),
+            text=True, capture_output=True,
+        )
+        self.assertIn(result.returncode, (0, 1), result.stderr)
+        # Without --no-index, Git retains tracked files even under an ignore rule.
+        ignored = {self.ROOT / p for p in result.stdout.split("\0") if p}
+        return paths - ignored
+
+    def test_ignored_outputs_are_excluded_but_tracked_and_new_sources_remain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.ROOT = Path(directory).resolve()
+            templates = self.ROOT / "empty-templates"
+            templates.mkdir()
+            subprocess.run(["git", "init", "--quiet", f"--template={templates}", str(self.ROOT)], check=True)
+            excludes = self.ROOT / "empty-excludes"
+            excludes.write_text("")
+            subprocess.run(["git", "config", "--local", "core.excludesFile", str(excludes)], cwd=self.ROOT, check=True)
+            (self.ROOT / ".gitignore").write_text("build/\n")
+            build = self.ROOT / "build"
+            build.mkdir()
+            tracked, ignored, source = build / "tracked.ts", build / "output.js", self.ROOT / "new.ts"
+            for path in (tracked, ignored, source):
+                path.write_text("export {};\n")
+            subprocess.run(["git", "add", "--force", "build/tracked.ts"], cwd=self.ROOT, check=True)
+            self.assertEqual(self.repository_files({tracked, ignored, source}), {tracked, source})
+
     def test_every_file_rust_reads_or_spawns_and_its_imports_are_not_skippable(self):
-        referenced = self.referenced_files()
+        referenced = self.repository_files(self.referenced_files())
         self.assertTrue(any(p.name == "fleet-server.ts" for p in referenced), "scan lost the bun-spawned scripts")
-        reachable = referenced | self.closure(referenced)
+        reachable = self.repository_files(referenced | self.closure(referenced))
         bad = sorted(str(p.relative_to(self.ROOT)) for p in reachable if allowed(str(p.relative_to(self.ROOT))))
         self.assertEqual(bad, [], "Rust reads/spawns these (directly or via imports) but ci_changes.py "
                                   "would let a PR skip the Rust legs: extend DENY_*")

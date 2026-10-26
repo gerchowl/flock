@@ -44,7 +44,6 @@ pub(crate) mod structured_messages;
 pub(crate) mod structured_queue;
 mod structured_relay;
 mod structured_start;
-
 mod tabs;
 pub(crate) mod workspaces;
 mod worktrees;
