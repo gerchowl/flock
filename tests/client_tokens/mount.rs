@@ -538,7 +538,7 @@ peer.settimeout(5)
 peer.connect(sys.argv[3])
 peer.sendall(os.environ.pop('FLOCK_HANDOFF_TOKEN').encode()+b'\n')
 manifest=json.loads(peer.makefile('rb').readline(65536))
-Path(OBSERVATION).write_text(json.dumps({'version':manifest['version'],'listener':manifest.get('client_listener',False),'panes':len(manifest['panes'])}))
+Path(OBSERVATION).write_text(json.dumps({'version':manifest['version'],'listener':manifest.get('client_listener',False),'socket_owners':manifest.get('socket_owners',False),'panes':len(manifest['panes'])}))
 if manifest['version'] != 1:
     peer.sendall(b'error: legacy importer refuses descriptor extension\n')
 else:
@@ -558,7 +558,11 @@ PY
         .unwrap()
         .contains("legacy importer refuses descriptor extension"));
     let observed: Value = serde_json::from_slice(&fs::read(observation).unwrap()).unwrap();
-    assert_eq!(observed, json!({"version":2,"listener":true,"panes":0}));
+    // ADR-0036 transfers ownership descriptors under manifest v3, still refused by v1.
+    assert_eq!(
+        observed,
+        json!({"version":3,"listener":true,"socket_owners":true,"panes":0})
+    );
     let mut original = WebSocket::open(&endpoint);
     assert_eq!(original.hello(&token).0, 1);
 }
