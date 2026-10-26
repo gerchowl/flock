@@ -1,7 +1,7 @@
 # Core config inventory — ADR-0041 §2
 
 This is internal classification data for #2384 slices 2a/2b, not a read API or
-redaction projection. `core.json` records 504 fields/container and payload nodes
+redaction projection. `core.json` records 505 fields/container and payload nodes
 and 29 enum/newtype representations. The source-based test walks `Config`
 through core declarations and their imported structured-launch, check, cron,
 fleet, channel, restart-policy and notification-sound declarations. Every

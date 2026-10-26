@@ -4,11 +4,45 @@ use crate::{
     app::App,
 };
 impl App {
+    /// Internal seam for Part B: decode before ack, preserving malformed raw mail.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn read_native_inbox(
+        &mut self,
+        agent: &str,
+        session: &str,
+        consume: bool,
+    ) -> Result<Vec<crate::mesh::store::Envelope>, crate::api::error_code::ErrorCode> {
+        let (live, expired) = crate::mesh::hello::with_store(|s| {
+            s.native_inbox_checked(
+                Some((agent, session)),
+                consume,
+                super::messages::now_ms() as i64,
+                |e| super::mesh_mail::payload(e).is_ok(),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .map_err(|_| crate::api::error_code::ErrorCode::MailStoreUnavailable)?;
+        for envelope in expired {
+            self.emit_event(EventEnvelope {
+                event: EventKind::MessageDelivered,
+                data: EventData::MessageDelivered {
+                    correlation_id: envelope.correlation_id,
+                    delivered: false,
+                    outcome: "dropped_undeliverable".into(),
+                    delivery_attempts: 0,
+                    latency_ms: 0,
+                },
+            });
+        }
+        Ok(live)
+    }
     /// Sweep only the independent tool-read window, never queue delivery/custody.
     pub(super) fn sweep_native_inboxes(&mut self) {
         match crate::mesh::hello::with_store(|s| {
-            s.native_inbox(None, false, super::messages::now_ms() as i64)
-                .map_err(|e| e.to_string())
+            s.native_inbox_checked(None, false, super::messages::now_ms() as i64, |e| {
+                super::mesh_mail::payload(e).is_ok()
+            })
+            .map_err(|e| e.to_string())
         }) {
             Ok((_, expired)) => {
                 for envelope in expired {
@@ -47,7 +81,12 @@ mod tests {
             crate::api::EventHub::default(),
         );
         crate::mesh::hello::with_store(|s| {
-            let e = crate::mesh::sign::tests::signed();
+            let mut e = crate::mesh::sign::tests::signed();
+            e.body = serde_json::to_vec(&serde_json::json!({"message": {
+                "correlation_id":e.correlation_id,"body":"fixture mail","to_pane":"recipient",
+                "enqueued_at_ms":0,"delivery_attempts":0,"intent":"fyi"
+            },"peer":null,"host":null,"direct":false}))
+            .unwrap();
             let now = super::super::messages::now_ms() as i64;
             s.accept_local(
                 &e,

@@ -353,6 +353,9 @@ impl Scheduler {
             let mut items = self.members();
             for item in &mut items {
                 if matches!(item.state, State::Queued | State::Delivered) {
+                    if target == State::Delivered {
+                        super::inbox::started(item)?;
+                    }
                     item.state = target.clone();
                 }
             }

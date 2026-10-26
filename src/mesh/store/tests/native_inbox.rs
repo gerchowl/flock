@@ -123,6 +123,34 @@ fn native_inbox_failed_batch_ack_rolls_back_and_skips_corrupt_entries() {
 }
 
 #[test]
+fn native_inbox_concurrent_connections_return_one_ack_winner() {
+    let f = Fixture::new();
+    let mut a = f.open(0);
+    let e = admit(&mut a);
+    a.native_inbox_delivered(&e.key, 100, 1).unwrap();
+    let b = f.open(0);
+    let (one_tx, one_rx) = std::sync::mpsc::channel();
+    let (two_tx, two_rx) = std::sync::mpsc::channel();
+    let read = |mut s: Store<Disk>,
+                ready: std::sync::mpsc::Sender<()>,
+                other: std::sync::mpsc::Receiver<()>| {
+        s.native_inbox_checked(Some(("recipient", "session")), true, 2, |_| {
+            ready.send(()).expect("other reader is alive");
+            other
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("both readers reached acknowledgement");
+            true
+        })
+        .unwrap()
+        .0
+        .len()
+    };
+    let one = std::thread::spawn(move || read(a, one_tx, two_rx));
+    let two = std::thread::spawn(move || read(b, two_tx, one_rx));
+    assert_eq!(one.join().unwrap() + two.join().unwrap(), 1);
+}
+
+#[test]
 fn native_inbox_idle_sweep_is_read_only() {
     let f = Fixture::new();
     let mut s = f.open(0);

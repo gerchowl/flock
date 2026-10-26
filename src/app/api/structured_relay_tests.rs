@@ -2201,3 +2201,122 @@ fn relay_origin_presentation_lookup_failure_cannot_revoke_proven_delivery() {
         r.stop().await;
     });
 }
+
+#[test]
+fn native_inbox_delivery_waits_for_harness_and_replays_the_original_window() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(24520).await;
+        let d = mail(&r);
+        let session = r
+            .app
+            .state
+            .structured_agents
+            .get(&r.case.id)
+            .unwrap()
+            .0
+            .session_id
+            .clone();
+        let rx = request(&mut r, d.clone());
+        assert!(answer(&mut r, &rx).await["result"]["item_id"].is_string());
+        r.until(|r| r.inputs().len() == 1).await;
+        assert!(r
+            .app
+            .read_native_inbox(&r.case.id, &session, false)
+            .unwrap()
+            .is_empty());
+        let connection =
+            rusqlite::Connection::open(with_store(|s| Ok(s.path().to_owned())).unwrap()).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_projection BEFORE INSERT ON native_inbox_reads BEGIN SELECT RAISE(ABORT,'injected projection failure'); END;").unwrap();
+        let id = r.inputs()[0]["input"]["uuid"].clone();
+        r.control(json!({"op":"lifecycle","state":"started","uuid":id}));
+        r.until(|r| {
+            matches!(
+                r.app.queue_observation(&r.case.id),
+                Some(crate::app::queue_events::Observation::Status(
+                    _,
+                    Some(crate::api::error_code::ErrorCode::MailStoreUnavailable)
+                ))
+            )
+        })
+        .await;
+        assert!(r
+            .app
+            .read_native_inbox(&r.case.id, &session, false)
+            .unwrap()
+            .is_empty());
+        r.stop().await;
+        let original_until = {
+            let journal =
+                crate::structured::queue::Journal::open(r.case.fixture.root.path(), &r.case.id)
+                    .unwrap();
+            journal
+                .items()
+                .iter()
+                .find(|item| item.item_id == d.envelope.key.lifecycle_id())
+                .unwrap()
+                .metadata["native_inbox_until"]
+                .as_i64()
+                .unwrap()
+        };
+        connection
+            .execute_batch("DROP TRIGGER fail_projection;")
+            .unwrap();
+        r.restart(|_| ()).await;
+        let first = r
+            .app
+            .read_native_inbox(&r.case.id, &session, false)
+            .unwrap();
+        assert_eq!(first, vec![d.envelope.clone()]);
+        let until: i64 = connection
+            .query_row("SELECT until_ms FROM native_inbox_reads", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(until, original_until);
+        r.stop().await;
+        r.restart(|_| ()).await;
+        assert_eq!(
+            connection
+                .query_row("SELECT until_ms FROM native_inbox_reads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            until
+        );
+        assert_eq!(r.inputs().len(), 1);
+        connection
+            .execute(
+                "UPDATE envelopes SET body=?1 WHERE id=?2",
+                rusqlite::params![b"{".as_slice(), d.envelope.key.message_id],
+            )
+            .unwrap();
+        assert!(r
+            .app
+            .read_native_inbox(&r.case.id, &session, true)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            connection
+                .query_row("SELECT state FROM native_inbox_reads", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "unread"
+        );
+        connection
+            .execute(
+                "UPDATE envelopes SET body=?1 WHERE id=?2",
+                rusqlite::params![d.envelope.body, d.envelope.key.message_id],
+            )
+            .unwrap();
+        assert_eq!(
+            r.app.read_native_inbox(&r.case.id, &session, true).unwrap(),
+            first
+        );
+        assert!(r
+            .app
+            .read_native_inbox(&r.case.id, &session, true)
+            .unwrap()
+            .is_empty());
+        r.stop().await;
+    });
+}
