@@ -72,7 +72,10 @@ It requires a known operator UID, the original live PID/birth, and no pane,
 structured-agent or mesh-edge origin. Complete ancestry is supported through
 sixteen stable process links, matching the pane-origin resolver; unavailable,
 reused or truncated ancestry cannot establish operator authority. The proof owns
-its exit watch, which admission rechecks before publishing any registration.
+its exit watch, which admission rechecks before publishing any registration,
+including an exit during the ancestry walk. The watch stays private; `process()`
+lends a shared reference so callers cannot replace it while retaining the peer's
+credentials.
 
 `server::Store::admit_peer` holds the existing shared admission/revocation fence
 through its registration callback. Local app credentials must match the minting

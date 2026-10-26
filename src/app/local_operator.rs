@@ -12,9 +12,13 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct LocalPeer {
     peer: Credentials,
-    pub(crate) process: Arc<ExitWatch>,
+    process: Arc<ExitWatch>,
 }
 impl LocalPeer {
+    /// Immutable watch bound to these credentials; consumers cannot replace it.
+    pub(crate) fn process(&self) -> &Arc<ExitWatch> {
+        &self.process
+    }
     /// Accepted kernel facts, never values supplied in HTTP headers or hello frames.
     pub(crate) fn credentials(&self) -> Credentials {
         self.peer
@@ -24,6 +28,14 @@ impl App {
     /// Validate an explicit peer without changing the current API caller or scope.
     /// UID/ancestry refusals take precedence over missing or changed process evidence.
     pub(crate) fn admit_local_peer(&mut self, peer: Credentials) -> Result<LocalPeer, ErrorCode> {
+        self.admit_local_peer_using(peer, crate::platform::live_process_facts)
+    }
+    // Only the facts reader varies: production always uses the platform's live snapshot.
+    fn admit_local_peer_using(
+        &mut self,
+        peer: Credentials,
+        mut facts: impl FnMut(u32) -> Option<(u32, u64)>,
+    ) -> Result<LocalPeer, ErrorCode> {
         if peer.uid != Some(self.runtime_config.uid_policy.operator)
             || self.runtime_config.uid_policy.classify(peer.uid) != Principal::Operator
         {
@@ -40,9 +52,13 @@ impl App {
         }
         let process = process.map_err(|_| ErrorCode::PeerProcessChanged)?;
         if origin != Some(true)
-            || !peer
-                .pid
-                .is_some_and(crate::platform::peer::complete_ancestry)
+            || !peer.pid.is_some_and(|pid| {
+                crate::platform::peer::complete_ancestry(
+                    pid,
+                    &mut facts,
+                    crate::platform::process_start_time,
+                )
+            })
         {
             return Err(ErrorCode::OperatorOnly);
         }

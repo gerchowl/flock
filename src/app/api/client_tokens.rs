@@ -55,7 +55,7 @@ impl App {
                 .map_err(
                     crate::structured::permissions::auth::tokens::app_sessions::IssueError::Store,
                 )
-                .and_then(|store| store.issue(&authority, peer.process));
+                .and_then(|store| store.issue(&authority, peer.process().clone()));
             return match result {
                 Ok(issued) => encode_success(id, ResponseResult::ClientTokenIssued { issued }),
                 Err(e) => {

@@ -27,7 +27,7 @@ fn kernel_peer_admission_is_independent_of_the_current_api_request() {
     app.current_api_peer_uid = Some(None);
     app.current_api_peer_birth = Some(None);
     let admitted = app.admit_local_peer(child.credentials).unwrap();
-    assert!(admitted.process.matches(child.credentials));
+    assert!(admitted.process().matches(child.credentials));
     assert_eq!(app.current_api_peer_pid, None);
     assert_eq!(app.current_api_peer_uid, Some(None));
     assert_eq!(app.current_api_peer_birth, Some(None));
@@ -70,7 +70,7 @@ fn strict_uid_pid_birth_and_exit_fail_closed_with_registered_reasons() {
     let admitted = app.admit_local_peer(original).unwrap();
     child.exit();
     assert!(readable(
-        admitted.process.as_raw_fd(),
+        admitted.process().as_raw_fd(),
         Duration::from_secs(5)
     ));
     refuses(&mut app, original, ErrorCode::PeerProcessChanged);
@@ -117,4 +117,39 @@ async fn real_pane_agent_and_mesh_origins_cannot_become_local_operators() {
         },
         ErrorCode::OperatorOnly,
     );
+}
+
+#[test]
+fn exit_during_ancestry_refuses_the_unreaped_peer() {
+    let mut app = app();
+    let mut child = Peer::spawn();
+    let credentials = child.credentials;
+    let mut exited = false;
+    let result = app.admit_local_peer_using(credentials, |pid| {
+        let facts = crate::platform::live_process_facts(pid);
+        if Some(pid) == credentials.pid && !exited {
+            assert!(facts.is_some());
+            child.exit_unreaped();
+            exited = true;
+        }
+        facts
+    });
+    assert!(
+        exited,
+        "the real peer must exit after its kernel watch was armed"
+    );
+    assert_eq!(result.err(), Some(ErrorCode::PeerProcessChanged));
+}
+
+#[test]
+fn incomplete_ancestry_refuses_an_otherwise_live_peer() {
+    let mut app = app();
+    let child = Peer::spawn();
+    let mut read = false;
+    let result = app.admit_local_peer_using(child.credentials, |_| {
+        read = true;
+        None
+    });
+    assert!(read, "admission must request ancestry evidence");
+    assert_eq!(result.err(), Some(ErrorCode::OperatorOnly));
 }

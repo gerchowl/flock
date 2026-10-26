@@ -112,7 +112,7 @@ impl Store {
         let _guard = self.files.lock_with(LockFile::try_lock_shared)?;
         let session = self.authenticate(token)?;
         let peer_exited = match peer {
-            Some(peer) => peer.process.exited().map_err(TokenError::from)?,
+            Some(peer) => peer.process().exited().map_err(TokenError::from)?,
             None => false,
         };
         if peer_exited {

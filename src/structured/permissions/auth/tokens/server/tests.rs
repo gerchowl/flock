@@ -18,7 +18,7 @@ fn process_bound_hello_and_registration_require_the_exact_minting_peer() {
     let minted = store
         .issue(
             &app.client_token_authority().unwrap(),
-            local_a.process.clone(),
+            local_a.process().clone(),
         )
         .unwrap();
     let matched = store
@@ -58,11 +58,14 @@ fn ready_peer_exit_prevents_registration_before_notifications_are_serviced() {
     let minted = store
         .issue(
             &app.client_token_authority().unwrap(),
-            local.process.clone(),
+            local.process().clone(),
         )
         .unwrap();
     child.exit();
-    assert!(readable(local.process.as_raw_fd(), Duration::from_secs(5)));
+    assert!(readable(
+        local.process().as_raw_fd(),
+        Duration::from_secs(5)
+    ));
     assert!(matches!(
         store.admit_peer(&minted.token, Some(&local), |_| panic!(
             "exited registration"
@@ -80,7 +83,7 @@ fn registered_callback_retains_the_shared_revocation_fence() {
     let minted = store
         .issue(
             &app.client_token_authority().unwrap(),
-            local.process.clone(),
+            local.process().clone(),
         )
         .unwrap();
     store
@@ -92,4 +95,32 @@ fn registered_callback_retains_the_shared_revocation_fence() {
             ));
         })
         .unwrap();
+}
+
+#[test]
+fn persistent_file_bearer_refuses_an_exited_local_peer() {
+    let (_root, files, mut app) = super::super::tests::setup();
+    let store = Store::new(files, Arc::new(app_sessions::SystemClock));
+    let mut child = Peer::spawn();
+    peer(&mut app, child.credentials);
+    let local = app.admit_local_peer(child.credentials).unwrap();
+    let file = store
+        .files
+        .issue(
+            &app.client_token_authority().unwrap(),
+            "file-exited-peer",
+            [Scope::Send].into(),
+        )
+        .unwrap();
+    child.exit_unreaped();
+    assert!(
+        store.authenticate(&file.token).is_ok(),
+        "file bearer remains valid"
+    );
+    assert!(matches!(
+        store.admit_peer(&file.token, Some(&local), |_| panic!(
+            "exited file registration"
+        )),
+        Err(PeerAdmissionError::PeerProcessChanged)
+    ));
 }
