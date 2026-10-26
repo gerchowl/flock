@@ -1,7 +1,7 @@
 # ADR-0038: The GUI is a tiled workbench over one wire: a client that holds only presentation state, artifacts in opaque-origin sandboxes with feedback through questions, and goals and work as records on the same log
 
-- Status: Proposed; the §11 owner decisions 1–11 were taken on 2026-10-16 and 2026-10-17 (recorded on #1591), and 12–15 (§5b) on 2026-10-19 (recorded on #1717)
-- Date: 2026-10-15, amended 2026-10-16 (#1606; then #1641: the client side of ADR-0036 §5a's transport recovery), and 2026-10-18 (#1717: §5b, question threads)
+- Status: Proposed; the §11 owner decisions 1–11 were taken on 2026-10-16 and 2026-10-17 (recorded on #1591), 12–15 (§5b) on 2026-10-19 (recorded on #1717), and 16–17 on 2026-10-25 (recorded on #1601 and #1598)
+- Date: 2026-10-15, amended 2026-10-16 (#1606; then #1641: the client side of ADR-0036 §5a's transport recovery), 2026-10-18 (#1717: §5b, question threads), and 2026-10-25 (#1601: §6 shell tokens and origins; #1598: §7a–§7f artifact lifecycle; #2443: §7 residuals)
 - Issues: [#1307](https://github.com/gerchowl/flock/issues/1307) (ADR-0036 slices), [#1310](https://github.com/gerchowl/flock/issues/1310), [#1323](https://github.com/gerchowl/flock/issues/1323) (superseded by the vigil decision), [#1614](https://github.com/gerchowl/flock/issues/1614), [#1380](https://github.com/gerchowl/flock/issues/1380), [#1401](https://github.com/gerchowl/flock/issues/1401), [#1402](https://github.com/gerchowl/flock/issues/1402), [#1546](https://github.com/gerchowl/flock/issues/1546) (settled by ADR-0036 §5a), [#1641](https://github.com/gerchowl/flock/issues/1641), [#1076](https://github.com/gerchowl/flock/issues/1076), [#1717](https://github.com/gerchowl/flock/issues/1717) (question threads, §5b), [#1719](https://github.com/gerchowl/flock/issues/1719), [#1673](https://github.com/gerchowl/flock/issues/1673)
 - Builds on: ADR-0036 §5–§8, §10a, §12 (wire contract, generated types, reference client, unknown events, collapsible turns, reserved extension points); ADR-0011 (conversation-first GUI, Accepted, not built); ADR-0012 (read model); ADR-0026 (mesh); ADR-0027 (delegate edges); ADR-0030 and ADR-0031 (goals); ADR-0034 (question routing); ADR-0035 (repo owner)
 - Wireframes: [`0038-gui/wireframes.html`](0038-gui/wireframes.html) (static, self-contained; open it in a browser)
@@ -747,7 +747,8 @@ An **artifact** is agent-authored content that a person looks at and answers: an
   - With no script, no forms and no top navigation, a static artifact has no way to make a request beyond the inline data it carries.
   - **Interactive** artifacts add `allow-scripts` to the sandbox and `script-src 'unsafe-inline'`. `connect-src 'none'` stays.
 - **Residual risk of interactive artifacts: navigation of the frame itself.** A script can navigate its own frame (`location = …`, a meta refresh, a link) and so leak data in a URL as a beacon. CSP has no widely shipped `navigate-to`, so the sandbox flags cannot fully stop this.
-  - The mitigation is the frame's own CSP plus `default-src 'none'`, so the navigated-to page cannot load anything in the same frame. A beacon is still one outbound GET.
+  - The frame's own CSP plus `default-src 'none'` means the navigated-to page cannot load anything in the same frame. That narrows the channel but does **not** bound it: a navigation to a URL that answers 204/205 fires no `load` and can repeat, and WebRTC reaches the network with no navigation at all (§7e).
+  - So an interactive artifact can send out the data it carries inline, with or without a stream grant. This is §7e's accepted residual, not a bounded leak.
   - That is why interactive artifacts are opt-in per publish, carry a visible "interactive" badge, and are owner decision 2.
 - **Tauri.** The shell's own policy is `default-src 'self'`, so it adds `frame-src blob: 'self'` so that `srcdoc` and `blob:` frames load. The frame's injected CSP still governs what runs inside it.
 - This **replaces ADR-0011 §5's distinct hostname** (owner decision 3). An opaque origin is a stronger boundary than a separate site, and it works the same in Tauri, which has no hostname.
@@ -778,14 +779,17 @@ An **artifact** is agent-authored content that a person looks at and answers: an
 **Lifetimes.** `flock_artifact_publish` gains `lifetime?: "session" | "persistent"`, **default `session`**.
 - **The session** is the **publishing agent's** identity, not the server's. A `session` artifact's session ends when that agent is stopped or its identity is replaced (ADR-0028 §8a). A restart, a handoff or a compaction does not end it.
 - **Persistent.** A `persistent` artifact, and a `session` artifact whose session has ended but which is still held (below), expires after it has been **idle** for `[artifacts] idle_ttl` (default 14 days).
-- **Idle** means no view, comment or answer, and no open tile, for that long.
+- **Idle** means no view, comment or answer, and no open tile, for that long. A non-operator principal's view or open tile counts only within its lease budget (Holds, below).
 
 **Holds: what keeps an artifact.** An artifact is **held**, and is never expired or evicted, while any of these is true:
 1. A person has pinned it.
 2. A tile shows it. The client sends `artifact.viewing { artifact_id, version, open: bool }` from a client session holding at least `read` scope.
    - The server keeps a **viewing lease** per client session. The client renews it by heartbeat every 30 s, and the lease lapses after 90 s without one, after **8 h** in any case, and on disconnect.
    - A principal holds at most **8** viewing leases at once.
-   - A viewing lease defers expiry and eviction. It **never** migrates a blob (§7c) and never exempts an agent's versions from that agent's own quota, so a token-holding agent cannot keep its artifacts alive by viewing them.
+   - A viewing lease defers expiry and eviction under both quotas. It **never** migrates a blob (§7c), and a held version's bytes still count against its publisher's quota and the total: a hold makes a publish refuse, never frees room.
+   - **Lease budget, for non-operator principals only.** A lease from the **operator principal** (ADR-0036 §5: an `operate`-scoped token *is* the operator's identity, which covers the operator's client token and an app-session token, §6) holds for as long as it is renewed, so a version a person has open is never expired or evicted, however long or often they view it.
+   - A lease from **any other principal**, such as a read-scope token given to an agent, holds one version for at most **8 h in total** over that version's lifetime. Past that budget, the server still accepts the lease and the tile still shows the version, but the lease neither holds the version nor counts as a view for the idle clock. So an agent cannot keep its artifacts alive by re-leasing them.
+   - A process that obtains an operator token is outside this bound; that is ADR-0036's named residual (#1177).
 3. An open question has the artifact as its `about`.
 
 When a hold ends, the artifact follows the persistent idle rule from that moment. It is never deleted at once.
@@ -793,10 +797,10 @@ When a hold ends, the artifact follows the persistent idle rule from that moment
 
 **Quotas.**
 - `[artifacts] quota_bytes_per_agent` (default **32 MiB**) counts one agent's stored versions. A publish over it evicts that agent's **oldest idle, unheld** versions first. It never evicts another agent's.
-- `[artifacts] quota_bytes_total` (default **2 GiB**, which fits 64 agents at their full quota) never evicts across agents. A publish that would exceed it first evicts **the publisher's own** idle, unheld versions. If the total is still full, it is refused with `scope: total`.
+- `[artifacts] quota_bytes_total` (default **2 GiB**, which fits 64 agents at their full quota) never evicts across agents. A publish that would exceed it first evicts **the publisher's own** idle, unheld versions. A viewed, pinned or otherwise held version is never part of that eviction. If the total is still full, it is refused with `artifact_total_quota_exceeded`.
 - **Pressure is visible.** At 80 % and at 100 % of the total, the operator gets an inbox notice naming the largest holders, with a one-click purge of idle, unpinned artifacts. So a full store is never a silent block for 14 days.
 - Most artifacts are `session` and die with their agent, so the idle TTL only governs persistent and held ones.
-- If eviction cannot make room, the publish is refused with `artifact_quota_exceeded` (`scope: agent | total`; retry classes in §7e).
+- If eviction cannot make room, the publish is refused with `artifact_quota_exceeded` (the agent's own quota) or `artifact_total_quota_exceeded` (the server total). These are two codes because the registry gives each code one retry class (§7e).
 
 **Pinning.**
 - A person pins or unpins through a client token with `answer` or `operate` scope, or through the local CLI. This is recorded as `artifact.pinned` / `artifact.unpinned`.
@@ -952,8 +956,8 @@ Anchor = {
 | `capability_unsupported` | `never` | the kind is not implemented, or stream grants are disabled (v1: all) |
 | `rpc_too_large` | `never` | over the size limit |
 | `rpc_rate_limited` | `later` | over the rate or subscription cap |
-| `artifact_quota_exceeded` (`scope: agent`) | `after_human` | only pinned or held versions remain; a person must unpin or close |
-| `artifact_quota_exceeded` (`scope: total`) | `later` | the server total is full; expiry frees space |
+| `artifact_quota_exceeded` | `after_human` | the agent's own quota holds only pinned or held versions; a person must unpin or close |
+| `artifact_total_quota_exceeded` | `later` | the server total is full; idle versions expiring, or the operator purging after the 100 % notice (§7a), frees space. Pinned and held bytes never expire |
 | `blob_migration_failed` | `maybe` | §7c; the triggering change was refused, nothing is half-moved |
 
 A refused call is never retried automatically by the parent.
@@ -969,7 +973,7 @@ A refused call is never retried automatically by the parent.
   - A question withdrawn by `subject_replaced` leaves the artifact idle-persistent, not deleted.
 - **Quota.**
   - The per-agent quota evicts that agent's oldest idle unheld version, and never a pinned, held, on-screen or other agent's version.
-  - The total quota refuses with `artifact_quota_exceeded { scope: total }`.
+  - The total quota never evicts a viewed or other held version, and refuses with `artifact_total_quota_exceeded`.
 - **Pin.** Only a person can pin; an agent's pin is refused. A pinned artifact survives every automatic purge.
 - **Blobs.**
   - A shared blob survives the purge of one of its two referencing records.
@@ -985,13 +989,13 @@ A refused call is never retried automatically by the parent.
   - An automatic purge keeps them.
   - A fork reads the purged record.
 - **Network.**
-  - No artifact reaches the network or the listener, with or without a declaration.
+  - A static artifact makes no request at all. An interactive one makes no `fetch`, XHR, WebSocket or EventSource request (`connect-src 'none'`), and no frame reaches the listener with a credential. Its navigation and WebRTC channels are §7e's accepted residual and are not asserted closed.
   - Every `flock.rpc` gets `capability_unsupported` in G6/G7.
   - With `allow_stream_grants = false` (the default), a grant is refused.
   - The broker tests come later: a viewer-B frame with only A's grant is refused, the limits refuse, an unexpected extra load revokes the grants, and a parent reload resets the counter.
 - **Quota pressure.** The 80 % and 100 % notices are emitted. The total quota evicts only the publisher's own versions, and then refuses with `later`.
 - **Migration.** A sweep during an in-progress migration skips that blob. A failed hash verification refuses the pin and leaves the blob whole.
-- **Viewing lease.** It lapses without a heartbeat and at 8 h, at most 8 are held per principal, and it never protects an agent's versions from that agent's quota.
+- **Viewing lease.** It lapses without a heartbeat and at 8 h, at most 8 are held per principal, and a held version's bytes still count against its publisher's quota. An operator lease renewed past 8 h of total viewing still holds the version, and the version is not evicted. A non-operator principal re-leasing past its 8 h budget on a version neither holds it nor resets its idle clock.
 
 ### 8. Goals and work
 
