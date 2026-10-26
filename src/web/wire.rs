@@ -198,16 +198,20 @@ impl Core {
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
         self.command_owner.service(app);
     }
-    /// Cancel transport work and wait for every connection lease, including hello.
+    /// Stop and drain every transport lease even when app revocation fails.
+    /// Return the revocation failure after bounded cleanup, logging it first.
     pub(crate) async fn shutdown(&self) -> io::Result<()> {
         let store = self.shared.store.clone();
-        super::store_io::shared()
+        let revocation = super::store_io::shared()
             .run(move || store.shutdown())
             .await
-            .ok_or_else(|| io::Error::other("app revocation worker unavailable"))?
-            .map_err(io::Error::other)?;
+            .ok_or_else(|| io::Error::other("app revocation worker unavailable"))
+            .and_then(|out| out.map_err(io::Error::other));
+        if let Err(error) = &revocation {
+            crate::logging::client_app_revocation_failed(error);
+        }
         self.shared.stop.send_replace(true);
-        tokio::time::timeout(SHUTDOWN_WAIT, async {
+        let drained = tokio::time::timeout(SHUTDOWN_WAIT, async {
             let _ = self
                 .shared
                 .slots
@@ -218,7 +222,8 @@ impl Core {
         })
         .await
         .map(|_| ())
-        .map_err(io::Error::other)
+        .map_err(io::Error::other);
+        revocation.and(drained)
     }
 }
 /// Keep credentials and transport deadlines in the same injected monotonic domain.
@@ -570,7 +575,10 @@ async fn connection(
             _ = running.join_next() => (),
         }
     }
-    if code == AUTH_REVOKED_CLOSE && session.app().is_some_and(|s| !*s.revoked.borrow()) {
+    if code == AUTH_REVOKED_CLOSE
+        && !*shared.stop.borrow()
+        && session.app().is_some_and(|s| !*s.revoked.borrow())
+    {
         let store = shared.store.clone();
         let session = session.clone();
         if !matches!(
