@@ -15,10 +15,14 @@ callers can supply `guiDist` themselves; Cargo callers set `FLOCK_GUI_DIST` to t
 A relative path is resolved against the Cargo manifest directory;
 the default is `web/client/dist`. This build consumes the artifact without
 fetching dependencies or running Vite. The assets, including debug builds, are
-embedded with `rust-embed`; rebuild to consume a changed dist. Dist roots and
-entries that are symlinks (including dangling links) are refused before
-embedding. Build inputs must remain unchanged during compilation; immutable
-Nix outputs provide that guarantee. Only existing dist paths are watched; when
+embedded with `rust-embed`; rebuild to consume a changed dist. The final
+component of the selected dist root and every entry beneath it are checked
+for symlinks (including dangling links), which are refused before embedding.
+Ancestor path components may be symlinks: for example, `FLOCK_GUI_DIST=/x/link/sub`
+resolves `link` normally and checks `sub` and its descendants. This check does
+not confine the resolved dist to a particular ancestor directory. Build inputs
+must remain unchanged during compilation; immutable Nix outputs provide that
+guarantee. Only existing dist paths are watched; when
 supplying a previously absent bundle, set `FLOCK_GUI_DIST` to its new output path.
 Unchanged embed declarations are not rewritten. A non-web build
 never declares or embeds the GUI assets and has no GUI router.
@@ -54,10 +58,14 @@ Serving the static bundle does not grant token scopes or mutation authority.
 
 - `/` and `/index.html` serve the entry document with `Cache-Control: no-cache`
   and a quoted SHA-256 ETag of its embedded bytes.
-- Vite's anchored flat `assets/<name>-<8-character-base64url-hash>.<extension>` files
+- Flat paths matching `assets/<name>-<8-base64url-characters>.<extension>`
   (nonempty ASCII alphanumeric/underscore/hyphen name, alphanumeric extension)
-  get `public, max-age=31536000, immutable`, with an ETag. Other files use
-  `no-cache`, so a nonstandard naming scheme conservatively revalidates.
+  get `public, max-age=31536000, immutable`, with an ETag. This is a filename
+  heuristic for Vite's default content-hash naming, not a manifest check or proof
+  that the suffix is a hash: `assets/vendor-polyfill.js` also matches. Bundle
+  producers must ensure every matching filename changes when its bytes change;
+  otherwise clients can keep stale bytes for a year without revalidation.
+  Nonmatching files use `no-cache`; custom names outside this pattern revalidate.
 - GET conditional requests support matching, weak/list and wildcard
   `If-None-Match`, returning 304 with the same cache policy and ETag and no body.
   HEAD returns the same metadata without a body.
@@ -72,4 +80,7 @@ Tests serve a committed fixture dist over owned loopback TCP listeners, with
 bounded HTTP reads and cleanup. `just gui-check` explicitly supplies the fixture
 at compile time in both feature variants: the web router must serve it and
 the non-web executable must exclude its bytes and refuse the web command.
+The Linux CI build leg runs this recipe before publishing its test archive; a
+failure fails the required Linux check. Ordinary macOS PRs still build and lint
+without running tests.
 Build-generator tests cover unchanged-file timestamps and symlink refusal. No live server or model is involved.
