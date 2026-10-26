@@ -926,3 +926,59 @@ fn custody_completion_opaque_journal_cannot_prove_key_absence() {
     );
     assert_eq!(fs::read(path).unwrap(), before);
 }
+
+#[test]
+fn custody_tracking_stays_bounded_across_many_committed_messages() {
+    use crate::structured::queue::model::{Kind, Producer};
+    let root = root();
+    let (mut owner, client) = Service::open(
+        root.path(),
+        "input-fixture",
+        NonZeroU64::new(u64::MAX).unwrap(),
+    )
+    .unwrap();
+    let (t, _pipes) = transport(&root);
+    let mut keys = Vec::new();
+    for n in 0..256 {
+        let key = crate::mesh::key::MessageKey::mint("origin.example".into(), n).unwrap();
+        let mut item = crate::structured::queue::tests::item(&key.lifecycle_id());
+        item.kind = Kind::Message;
+        item.metadata
+            .insert("message_key".into(), serde_json::json!(key));
+        client
+            .enqueue(super::super::Request {
+                item,
+                principal: Principal::Origin(Producer::Agent("sender.example".into())),
+                gate: Gate::Send,
+            })
+            .unwrap();
+        owner.tick(&t.input_handle(), false, &|| {});
+        assert!(owner.flush(false, &|| {}));
+        assert!(client.update().unwrap().admitted.unwrap().1.is_ok());
+        keys.push(key);
+        assert!(Arc::ptr_eq(
+            &client.committed_custody.lock().items,
+            &owner.scheduler.journal().item_snapshot()
+        ));
+        assert!(
+            client.committed_custody.lock().tracked_keys() <= 2,
+            "custody bookkeeping must not retain one key per historical message"
+        );
+    }
+    for key in &keys {
+        assert_eq!(client.custody_committed(key), Some(true));
+    }
+    drop(owner);
+    drop(client);
+    let (_owner, client) = Service::open(
+        root.path(),
+        "input-fixture",
+        NonZeroU64::new(u64::MAX).unwrap(),
+    )
+    .unwrap();
+    assert!(client.committed_custody.lock().tracked_keys() <= 2);
+    for key in &keys {
+        assert_eq!(client.custody_committed(key), Some(true));
+    }
+    close(t);
+}

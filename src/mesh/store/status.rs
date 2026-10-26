@@ -140,7 +140,7 @@ impl<D: DiskSpace> Store<D> {
             return Ok(None);
         };
         let now = self.clock()?.advance(wall_ms);
-        let (custody, inbox, until, remote, error): (i64, Option<i64>, Option<i64>, Option<String>, Option<String>) = self.connection.query_row(
+        let (custody, inbox, until, remote, mut error): (i64, Option<i64>, Option<i64>, Option<String>, Option<String>) = self.connection.query_row(
             "SELECT custody_deadline,inbox_deadline,outcome_until,remote_state,collect_error FROM envelopes WHERE origin=?1 AND id=?2",
             params![key.origin_node,key.message_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;
         let mut state = match record.state.as_str() {
@@ -163,7 +163,15 @@ impl<D: DiskSpace> Store<D> {
             }
         }
         let local_inbox = record.state == "inbox" && state == "queued";
+        let commitment_unknown = matches!(record.state.as_str(), "inbox" | "inbox_expired")
+            && error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(COMMITMENT_UNKNOWN_PREFIX));
+        if commitment_unknown && state == "expired" {
+            error = Some(COMMITMENT_UNKNOWN_AT_EXPIRY.into());
+        }
         if error.is_some()
+            && !commitment_unknown
             && !matches!(
                 state.as_str(),
                 "refused" | "recipient_gone" | hub_outcomes::UNDELIVERABLE
