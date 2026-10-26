@@ -72,6 +72,9 @@ impl SocketOwner {
         Ok(Self(std::sync::Arc::new(file), path.to_owned()))
     }
     /// Reclaim only a same-user socket while holding authoritative ownership.
+    /// A successful nonblocking probe refuses an unlocked legacy listener. Failed
+    /// probes can miss older listeners with full backlogs; only participating
+    /// owners are authoritatively excluded by the lock protocol.
     pub(crate) fn prepare(&self, path: &Path) -> io::Result<()> {
         if path != self.1 {
             return Err(io::Error::new(
@@ -86,6 +89,12 @@ impl SocketOwner {
         };
         require_owned_socket(&metadata, crate::platform::peer::effective_uid())?;
         let original = identity(&metadata);
+        if crate::platform::socket::probe_listener(path).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("flk server is already running (unlocked legacy listener at {} accepted a connection; legacy listeners with full backlogs can evade this check)", path.display()),
+            ));
+        }
         if socket_file_identity(path)? != original {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,

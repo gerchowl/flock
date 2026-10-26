@@ -169,7 +169,6 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let socket_path = dir.join("live.sock");
 
-        let _owner = prepare_socket_path(&socket_path).unwrap();
         let _listener = UnixListener::bind(&socket_path).expect("bind");
 
         let result = prepare_socket_path(&socket_path);

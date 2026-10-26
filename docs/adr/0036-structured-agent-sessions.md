@@ -3831,8 +3831,14 @@ sibling `<socket>.lock` before bind or stale-path reclamation. This applies to
 introduced. The lock file is operator-owned, regular, single-link, mode `0600`,
 opened with `O_CLOEXEC | O_NOFOLLOW`; it is never unlinked. The containing
 directory must exclude entry replacement by other users. Contention reports
-busy and never removes a socket, even with a full accept backlog. Connection
-probes are not proof of staleness. Once ownership is acquired,
+busy and never removes a socket, even with a full accept backlog. After acquiring
+the lock, `SocketOwner::prepare` also makes a nonblocking connection probe: a
+**successful** connect means busy, preserving an older listener that has no lock.
+A failed probe never proves staleness; the held lock excludes live owners only
+when those owners participate in this protocol. An old-build listener with a
+full backlog can fail this probe and its pathname can still be reclaimed. This
+residual rollout limitation is stated in the legacy-listener busy diagnostic;
+ownership locks cannot retroactively protect older builds. Once ownership is acquired,
 `SocketOwner::prepare` checks socket type, owner, and device/inode before removing
 an abandoned pathname. Symlinks, foreign ownership, and replacement entries
 are refused rather than followed or removed.

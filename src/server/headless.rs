@@ -4297,7 +4297,7 @@ pub fn run_server(args: &[String], handoff_socket: Option<PathBuf>) -> io::Resul
     ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: flk server is already running");
+            eprintln!("error: {err}");
             eprintln!("api socket: {}", api::socket_path().display());
             std::process::exit(crate::cli::exit::FAILURE);
         }
@@ -4337,7 +4337,7 @@ pub fn run_server(args: &[String], handoff_socket: Option<PathBuf>) -> io::Resul
         ) {
             Ok(server) => server,
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                eprintln!("error: flk server is already running");
+                eprintln!("error: {err}");
                 eprintln!("client socket: {}", client_socket_path().display());
                 std::process::exit(crate::cli::exit::FAILURE);
             }

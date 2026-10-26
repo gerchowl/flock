@@ -66,7 +66,6 @@ pub(crate) fn lock_owner(file: &std::fs::File) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 /// Nonblocking liveness probe for an existing pathname socket.
 /// Success is live; errors alone do not prove staleness (#2531).
 /// Return kernel evidence without waiting or retrying; a full live backlog can refuse.

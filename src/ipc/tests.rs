@@ -228,3 +228,115 @@ fn socket_owner_child() {
     std::io::stdout().flush().unwrap();
     let _ = std::io::stdin().read(&mut [0]);
 }
+
+#[test]
+fn unlocked_live_listeners_refuse_a_new_starter_without_changing_the_inode() {
+    let root = crate::test_support::TempDir::socket();
+    for name in ["a.sock", "a-client.sock"] {
+        let path = root.path().join(name);
+        let _listener = UnixListener::bind(&path).unwrap();
+        let original = socket_file_identity(&path).unwrap();
+        assert!(!path.with_extension("sock.lock").exists());
+        for _ in 0..2 {
+            let refusal = prepare_socket_path(&path, busy).unwrap_err();
+            assert_eq!(refusal.kind(), io::ErrorKind::AddrInUse);
+            assert!(refusal.to_string().contains("already running"));
+            assert_eq!(socket_file_identity(&path).unwrap(), original);
+        }
+    }
+}
+
+#[test]
+fn a_real_server_start_preserves_both_legacy_listener_inodes() {
+    use std::os::fd::AsRawFd;
+    use std::process::Stdio;
+    use std::time::Duration;
+    let root = crate::test_support::TempDir::socket();
+    let api = root.path().join("a.sock");
+    let terminal = root.path().join("a-client.sock");
+    let _api = UnixListener::bind(&api).unwrap();
+    let _terminal = UnixListener::bind(&terminal).unwrap();
+    let before = [
+        socket_file_identity(&api).unwrap(),
+        socket_file_identity(&terminal).unwrap(),
+    ];
+    let home = root.path().join("home");
+    let config = root.path().join("config");
+    fs::create_dir_all(&home).unwrap();
+    let app_config = config.join(crate::config::app_dir_name());
+    fs::create_dir_all(&app_config).unwrap();
+    fs::write(
+        app_config.join("config.toml"),
+        "onboarding = false\n[security]\nagent_account = \"none\"\n",
+    )
+    .unwrap();
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("flk");
+    let output_path = root.path().join("starter.log");
+    let output = fs::File::create(&output_path).unwrap();
+    let mut command = crate::process::TracedCommand::new(binary, "legacy-listener-starter");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("FLOCK_") {
+            command.env_remove(key);
+        }
+    }
+    command
+        .arg("server")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+        .env("FLOCK_SOCKET_PATH", &api)
+        .env("FLOCK_CLIENT_SOCKET_PATH", &terminal)
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output.try_clone().unwrap()))
+        .stderr(Stdio::from(output));
+    let mut child = OwnerChild(command.spawn_traced().unwrap());
+    let peer = crate::platform::peer::Credentials {
+        pid: Some(child.0.id()),
+        uid: Some(crate::platform::peer::effective_uid()),
+        birth: crate::platform::process_start_time(child.0.id()),
+    };
+    // A broken starter stays alive; kernel readiness bounds failure without a retry loop.
+    let finished = match crate::platform::process_exit::ExitWatch::arm(peer) {
+        Ok(watch) => crate::platform::process_exit::tests::readable(
+            watch.as_raw_fd(),
+            Duration::from_secs(5),
+        ),
+        Err(_) => child.0.try_wait().unwrap().is_some(),
+    };
+    if !finished {
+        child.0.kill().unwrap();
+    }
+    let status = child.0.wait().unwrap();
+    let output = fs::read_to_string(output_path).unwrap();
+    assert_eq!(
+        [
+            socket_file_identity(&api).unwrap(),
+            socket_file_identity(&terminal).unwrap()
+        ],
+        before,
+        "starter replaced legacy listeners: {status}; {output}"
+    );
+    assert!(finished, "starter never refused: {output}");
+    assert_eq!(
+        status.code(),
+        Some(crate::cli::exit::FAILURE),
+        "starter must refuse an existing server: {output}"
+    );
+    assert!(
+        output.contains("already running"),
+        "missing busy diagnostic: {output}"
+    );
+    assert!(
+        output.contains("legacy") && output.contains("full backlog"),
+        "missing rollout limitation: {output}"
+    );
+}
