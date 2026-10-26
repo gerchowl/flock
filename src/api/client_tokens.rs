@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use zeroize::Zeroize;
 /// Explicit token scopes; operate does not silently grant the other scopes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
     /// Read authorized streams.
@@ -17,6 +18,7 @@ pub enum Scope {
 }
 /// A wire bearer whose diagnostic form is always redacted.
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(transparent)]
 pub struct Bearer(pub(crate) String);
 impl std::fmt::Debug for Bearer {
@@ -31,16 +33,24 @@ impl Drop for Bearer {
 }
 /// Public token metadata, never containing a bearer or digest.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TokenInfo {
-    /// Lowercase operator-assigned client name.
+    /// Operator-assigned file name or server-assigned app-session label.
     pub name: String,
     /// Opaque identity, fresh on every issuance.
     pub principal: String,
     /// Exact grants; no implicit scope hierarchy.
     pub scopes: BTreeSet<Scope>,
+    /// Remaining app-session lifetime at issuance, in milliseconds, absent for file tokens.
+    /// Derived from the store's enforcing clock/deadline, currently monotonic
+    /// pending the clock-policy owner decision in #2489. Later reads do not refresh it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional, type = "number"))]
+    pub expires_in_ms: Option<u64>,
 }
 /// The only explicit secret response, for the authenticated issuing operator.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Issued {
     /// Public identity and scope metadata.
     pub info: TokenInfo,
@@ -81,4 +91,12 @@ pub struct RemoveParams {
     pub name: Option<String>,
     /// Hexadecimal filename identifier reported by list.
     pub entry: Option<String>,
+}
+
+/// Server-chosen scopes and process identity: all caller-supplied fields are refused.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MintParams {
+    /// Captured only to return typed invalid_params, never used as authority or grants.
+    #[serde(flatten)]
+    pub(crate) fields: std::collections::BTreeMap<String, serde_json::Value>,
 }

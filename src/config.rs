@@ -1,6 +1,9 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
 mod diagnostics;
+mod safe_diagnostic;
+pub(crate) mod validation;
+pub(crate) use safe_diagnostic::edit_parse_error;
 mod env;
 mod inventory;
 mod io;
@@ -226,3 +229,6 @@ command = "lazygit"
         assert!(!profile.contains("[[keys.command]]"));
     }
 }
+
+#[cfg(test)]
+mod producer_tests;

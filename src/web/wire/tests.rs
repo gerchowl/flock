@@ -157,7 +157,7 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-pub(crate) struct Socket(tokio::net::TcpStream);
+pub(crate) struct Socket(pub(crate) tokio::net::TcpStream);
 #[derive(Debug)]
 pub(crate) enum Received {
     Text(Value),
@@ -1489,3 +1489,5 @@ fn overlapping_read_admissions_keep_subscriptions_and_socket_alive() {
         server.finish().await;
     });
 }
+
+mod app_sessions;

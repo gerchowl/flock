@@ -28,6 +28,7 @@ mod events;
 pub(crate) mod exit;
 mod fleet;
 mod goal;
+mod grants;
 mod help;
 mod hook;
 mod hook_question;
@@ -235,6 +236,13 @@ fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
         "owner" => owner::run_owner_command(&args[2..])?,
         "fleet" => fleet::run_fleet_command(&args[2..])?,
         "goal" => goal::run_goal_command(&args[2..])?,
+        "structured" => match args.get(2).map(String::as_str) {
+            Some("grants") => grants::run(&args[2..])?,
+            _ => {
+                eprintln!("usage: {}", grants::USAGE);
+                exit::USAGE
+            }
+        },
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
         "client" => client::run(&args[2..])?,
@@ -281,6 +289,23 @@ fn run_channel_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
+/// Closed edit stages distinguish input rejection from a failed output guard.
+#[derive(Clone, Copy)]
+enum ConfigEdit {
+    ChannelInput,
+    ChannelOutput,
+    KeysInput,
+    KeysOutput,
+}
+
+fn config_edit_parse_error(error: &toml::de::Error, source: &str, stage: ConfigEdit) -> String {
+    crate::config::edit_parse_error(
+        error,
+        source,
+        matches!(stage, ConfigEdit::ChannelOutput | ConfigEdit::KeysOutput),
+    )
+}
+
 fn channel_set(args: &[String]) -> std::io::Result<i32> {
     let Some(channel) = parse_channel_set_arg(args) else {
         eprintln!("usage: flk channel set <stable|preview>");
@@ -303,8 +328,8 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
     };
     if let Err(err) = toml::from_str::<toml::Value>(&content) {
         eprintln!(
-            "config file at {} is invalid TOML: {err}. Fix it before changing the update channel.",
-            path.display()
+            "{}",
+            config_edit_parse_error(&err, &content, ConfigEdit::ChannelInput)
         );
         return Ok(1);
     }
@@ -317,8 +342,8 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
     );
     if let Err(err) = toml::from_str::<toml::Value>(&updated) {
         eprintln!(
-            "changing the update channel would make {} invalid TOML: {err}; leaving config unchanged",
-            path.display()
+            "{}",
+            config_edit_parse_error(&err, &updated, ConfigEdit::ChannelOutput)
         );
         return Ok(1);
     }
@@ -521,7 +546,7 @@ fn config_check_outcome() -> ConfigCheckOutcome {
     match crate::config::load_live_config() {
         Err(diagnostics) => ConfigCheckOutcome::DidNotLoad(diagnostics),
         Ok(mut loaded) => {
-            // The source scan names file and line, so it replaces the loader's
+            // The source scan supplies a safe category and line, replacing the loader's
             // warning for every key it found. A key it missed keeps the
             // loader's, which is how no warning gets lost.
             let file_keys = crate::config::file_key_diagnostics();
@@ -613,8 +638,8 @@ fn config_reset_keys(args: &[String]) -> std::io::Result<i32> {
         Ok(value) => value,
         Err(err) => {
             eprintln!(
-                "config file at {} is invalid TOML: {err}. Fix it manually or move it aside to use defaults.",
-                path.display()
+                "{}",
+                config_edit_parse_error(&err, &content, ConfigEdit::KeysInput)
             );
             return Ok(1);
         }
@@ -645,8 +670,8 @@ fn config_reset_keys(args: &[String]) -> std::io::Result<i32> {
     }
     if let Err(err) = toml::from_str::<toml::Value>(&updated) {
         eprintln!(
-            "removing keybinding config would make {} invalid TOML: {err}; leaving config unchanged",
-            path.display()
+            "{}",
+            config_edit_parse_error(&err, &updated, ConfigEdit::KeysOutput)
         );
         return Ok(1);
     }
@@ -1540,9 +1565,15 @@ mod config_check_tests {
             panic!("expected a conflict warning, got {outcome:?}");
         };
         assert!(
-            diagnostics.iter().any(|d| d.contains("ctrl+shift+j")),
+            diagnostics
+                .iter()
+                .any(|d| d.contains("conflicting keybinding")
+                    && d.contains("key=keys.new_tab")
+                    && d.contains("kept keys.new_workspace")
+                    && d.contains("disabling binding")),
             "{diagnostics:?}"
         );
+        assert!(diagnostics.iter().all(|d| !d.contains("ctrl+shift+j")));
     }
 
     #[test]
@@ -1602,10 +1633,7 @@ mod config_check_tests {
         };
         assert_eq!(
             diagnostics,
-            vec![format!(
-                "{}:2: unknown config section [toast]; did you mean [ui.toast]? ignoring section",
-                base.display()
-            )]
+            vec!["unknown_config_key; key=document root; source=base file; at 2:2; expected [ui.toast] section; did you mean [ui.toast]?; setting ignored"]
         );
     }
 
@@ -1628,14 +1656,13 @@ mod config_check_tests {
         };
         let unknown: Vec<_> = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.contains("msg.future_setting"))
+            .filter(|diagnostic| {
+                diagnostic.contains("unknown_config_key") && diagnostic.contains("key=msg;")
+            })
             .collect();
         assert_eq!(
             unknown,
-            vec![&format!(
-                "{}:4: unknown msg.future_setting setting ignored",
-                base.display()
-            )],
+            vec!["unknown_config_key; key=msg; source=base file; at 4:1; setting ignored"],
             "{diagnostics:?}"
         );
     }
@@ -1776,3 +1803,54 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) use agent::test_structured_start;
+
+#[cfg(test)]
+mod config_sink_tests {
+    use super::*;
+    fn check(stage: ConfigEdit) {
+        let source = "[ui]\nconfirm_close = 'SECRET_CLI_2384' trailing";
+        let error = toml::from_str::<toml::Table>(source).unwrap_err();
+        let text = config_edit_parse_error(&error, source, stage);
+        assert!(!text.contains("SECRET_"), "CLI guard leaked: {text}");
+    }
+    #[test]
+    fn security2384_s3b1_cli_channel_input() {
+        check(ConfigEdit::ChannelInput);
+    }
+    #[test]
+    fn security2384_s3b1_cli_channel_output() {
+        check(ConfigEdit::ChannelOutput);
+    }
+    #[test]
+    fn security2384_s3b1_cli_keys_input() {
+        check(ConfigEdit::KeysInput);
+    }
+    #[test]
+    fn security2384_s3b1_cli_keys_output() {
+        check(ConfigEdit::KeysOutput);
+    }
+}
+
+#[cfg(test)]
+mod fix1_tests {
+    use super::*;
+    fn diagnostic(stage: ConfigEdit) -> String {
+        let text = "[ui]\nconfirm_close='SECRET_CLI_2384' trailing";
+        let error = toml::from_str::<toml::Table>(text).unwrap_err();
+        let d = config_edit_parse_error(&error, text, stage);
+        assert!(!d.contains("SECRET_"));
+        d
+    }
+    #[test]
+    fn usability2384_fix1_cli_input_hint() {
+        for stage in [ConfigEdit::KeysInput, ConfigEdit::ChannelInput] {
+            assert!(diagnostic(stage).contains("Fix it manually or move it aside"));
+        }
+    }
+    #[test]
+    fn usability2384_fix1_cli_output_guard_hint() {
+        for stage in [ConfigEdit::KeysOutput, ConfigEdit::ChannelOutput] {
+            assert!(diagnostic(stage).contains("flock's own edit"));
+        }
+    }
+}

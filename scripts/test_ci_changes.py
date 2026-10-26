@@ -17,6 +17,12 @@ class CiChanges(unittest.TestCase):
                       ["docs/a.md", "web/client/src/a.ts"]):
             self.assertTrue(self.skip(paths), paths)
 
+    def test_config_diagnostic_contract_adr_runs_rust(self):
+        adr = "docs/adr/0041-configuration-v2.md"
+        self.assertFalse(allowed(adr))
+        self.assertFalse(self.skip([adr]))
+        self.assertFalse(self.skip(["docs/guide.md", adr]))
+
     def test_anything_else_runs_everything(self):
         for paths in (["src/main.rs"], ["docs/a.md", "Cargo.toml"], ["scripts/ci_shards.py"],
                       ["workflows/ci.yml"], ["docs/next/changes/1.fixed.md"],

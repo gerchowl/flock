@@ -97,6 +97,7 @@ impl Listener {
         inherited: Option<TcpListener>,
         health: Health,
         wake: Arc<tokio::sync::Notify>,
+        credentials: crate::structured::permissions::auth::tokens::server::Owner,
     ) -> io::Result<Option<Self>> {
         let Some(bind) = bind else {
             return if inherited.is_none() {
@@ -135,7 +136,7 @@ impl Listener {
             .map_err(io::Error::other)??;
         socket.set_nonblocking(true)?;
         let acceptor = tokio::net::TcpListener::from_std(socket.try_clone()?)?;
-        let core = Core::new(data.clone(), wake).await?;
+        let core = Core::new_shared(data.clone(), wake, credentials).await?;
         let csp = HeaderValue::from_str(&format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://{actual}/v1/ws; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")).map_err(io::Error::other)?;
         let router = core
             .router()
@@ -191,7 +192,8 @@ async fn guard(
     let authority = bind.to_string();
     let headers = request.headers();
     if peer.ip() != Ipv4Addr::LOCALHOST
-        || !gui::origin_allowed(headers, &authority)
+        || !(gui::origin_allowed(headers, &authority)
+            || (request.uri().path() == "/v1/ws" && gui::shell_origin_allowed(headers, &authority)))
         || (request.uri().path().starts_with("/v1/") && !headers.contains_key(header::ORIGIN))
     {
         return StatusCode::FORBIDDEN.into_response();

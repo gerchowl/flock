@@ -1,7 +1,7 @@
 # ADR-0038: The GUI is a tiled workbench over one wire: a client that holds only presentation state, artifacts in opaque-origin sandboxes with feedback through questions, and goals and work as records on the same log
 
-- Status: Proposed; the §11 owner decisions 1–11 were taken on 2026-10-16 and 2026-10-17 (recorded on #1591), and 12–15 (§5b) on 2026-10-19 (recorded on #1717)
-- Date: 2026-10-15, amended 2026-10-16 (#1606; then #1641: the client side of ADR-0036 §5a's transport recovery), and 2026-10-18 (#1717: §5b, question threads)
+- Status: Proposed; the §11 owner decisions 1–11 were taken on 2026-10-16 and 2026-10-17 (recorded on #1591), 12–15 (§5b) on 2026-10-19 (recorded on #1717), and 16–17 on 2026-10-25 (recorded on #1601 and #1598)
+- Date: 2026-10-15, amended 2026-10-16 (#1606; then #1641: the client side of ADR-0036 §5a's transport recovery), 2026-10-18 (#1717: §5b, question threads), and 2026-10-25 (#1601: §6 shell tokens and origins; #1598: §7a–§7f artifact lifecycle; #2443: §7 residuals)
 - Issues: [#1307](https://github.com/gerchowl/flock/issues/1307) (ADR-0036 slices), [#1310](https://github.com/gerchowl/flock/issues/1310), [#1323](https://github.com/gerchowl/flock/issues/1323) (superseded by the vigil decision), [#1614](https://github.com/gerchowl/flock/issues/1614), [#1380](https://github.com/gerchowl/flock/issues/1380), [#1401](https://github.com/gerchowl/flock/issues/1401), [#1402](https://github.com/gerchowl/flock/issues/1402), [#1546](https://github.com/gerchowl/flock/issues/1546) (settled by ADR-0036 §5a), [#1641](https://github.com/gerchowl/flock/issues/1641), [#1076](https://github.com/gerchowl/flock/issues/1076), [#1717](https://github.com/gerchowl/flock/issues/1717) (question threads, §5b), [#1719](https://github.com/gerchowl/flock/issues/1719), [#1673](https://github.com/gerchowl/flock/issues/1673)
 - Builds on: ADR-0036 §5–§8, §10a, §12 (wire contract, generated types, reference client, unknown events, collapsible turns, reserved extension points); ADR-0011 (conversation-first GUI, Accepted, not built); ADR-0012 (read model); ADR-0026 (mesh); ADR-0027 (delegate edges); ADR-0030 and ADR-0031 (goals); ADR-0034 (question routing); ADR-0035 (repo owner)
 - Wireframes: [`0038-gui/wireframes.html`](0038-gui/wireframes.html) (static, self-contained; open it in a browser)
@@ -605,6 +605,10 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
   - **Bun stays** the package manager and test runner, with `bun.lock` pinning unchanged. ADR-0036 §7's build bullet is amended to match.
   - The output is still static assets: embedded by the `web` feature with `rust-embed` and served by `flk`, and loaded unchanged by the Tauri v2 shell.
   - The bundle has no same-origin assumption: the server URL and token come from shell config. #1402's first spike item becomes a requirement here.
+  - **The shell config contract** (`web/client/src/config.ts`). A shell sets one global, `__FLOCK_SHELL_CONFIG__`, before the bundle runs. Without it, the bundle takes its page's origin, which is the browser shell's case. The global holds one of:
+    - `{ transport: "wire", serverUrl, token? }`, for a live server;
+    - `{ transport: "fixture", fixtureJsonl, source }`, for a recorded replay;
+    - `{ transport: "error", message }`, when the shell has no configuration to give, such as the Tauri shell reading a malformed config file. The client shows `message` as the reason in its ConfigError state. A shell reports its own errors this way and never through an unknown transport, which the client refuses with a message of its own.
 - **Browser.**
   - The `flk` binary with the `web` feature embeds the assets and serves them beside `/v1/ws`.
   - `flk client open` mints a one-time code over the Unix socket and opens the browser (ADR-0036 §5). Loopback is the default bind, and `--allow-non-loopback` stays explicit.
@@ -623,44 +627,48 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
           - the token is never written to disk or logged;
           - its lifetime is bounded (below);
           - the shell ships with the macOS hardened runtime, without `get-task-allow`, so a same-UID process cannot attach to it.
-          - On Linux, the protection depends on Yama `ptrace_scope` ≥ 1, and the shell refuses to mint when it reads 0. It says why, and offers the remote path.
+          - On Linux, the protection depends on Yama `ptrace_scope` ≥ 1, and the native shell refuses to mint when it reads 0. It says “Local connection unavailable: Linux ptrace_scope is 0, so other processes could read the operator credential from this app. Use a remote connection or ask your administrator to enable ptrace_scope ≥ 1.” It offers explicit remote pairing, never a silent fallback. G9a owns this native-side check.
       - **Binding to the app's process.**
         - The PID comes from the **minting connection's peer credentials** (`LOCAL_PEERPID`; on Linux `SO_PEERPIDFD` where the kernel has it, else `SO_PEERCRED`), never from a parameter.
         - The start time comes from `src/platform/peer.rs`: `/proc/<pid>/stat` field 22 on Linux, and `flock_process_facts` on macOS.
         - **Order.** First arm the exit watch (kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS; on Linux the peer pidfd itself, or else `pidfd_open`), then read and compare the start time. A process that exits, or a PID that is reused, between the two steps is caught by the armed watch or by the mismatch. The server never polls with `kill(pid, 0)`.
         - If the watch cannot be armed, or the start time does not match the one taken when the connection was accepted, the mint is refused with `peer_process_changed`.
       - **Lifetime.**
-        - App-session tokens live in the server's memory only, never on disk, so a server restart **or handoff** revokes them. A handoff does not carry them or their watches to the new process. The shell sees `token_revoked` and mints again, so the person sees one reconnect.
+        - App-session tokens live in the server's memory only, never on disk, so a server restart **or handoff** revokes them. A handoff does not carry them or their watches to the new process. The shell sees close 4403 and mints again, so the person sees one reconnect.
         - Each one has a fixed **TTL of 12 hours** from the mint, with no sliding renewal.
+        - `client.app.mint` returns `issued.info.expires_in_ms`, the server-computed remaining lifetime in unsigned milliseconds at issuance. The native side uses this relative value to renew before expiry without hard-coding the TTL or relying on matching wall clocks. It uses the same clock and deadline as store enforcement (currently monotonic; the clock-policy owner decision remains #2489). Persistent file-token metadata omits it; older responses may omit it.
         - Before expiry, the native side mints a fresh token and hands it to the webview, which reconnects through §3's resume path. The cursors and the outbox survive, so nothing is lost.
-      - **Revocation.** A token is revoked when its process exits, when its TTL ends or when the server restarts. The server then closes every `/v1/ws` session authenticated by it, with a typed auth close (`token_revoked` or `token_expired`). The client treats that as NeedsToken, and the local shell mints again silently.
+      - **Revocation.** A token is revoked when its process exits, when its TTL ends or when the server restarts or hands off. The server then closes every `/v1/ws` session authenticated by it through ADR-0036's existing close 4403. A command that detects revocation first receives an `auth_revoked` error acknowledgement; idle sessions close without needing a command. No new auth error names are introduced (#2442). The client treats that as NeedsToken, and the local shell mints again silently.
       - **In the webview.** The native side hands the token over through one Tauri command. The webview keeps it **in memory only** and asks again after a reload; nothing is persisted.
       - **One transport.** The socket carries only the mint. Every stream and command goes over `/v1/ws`, so ADR-0011 §3's direct-socket transport stays superseded (owner decision 1).
       - **No server running.** The shell starts one through the existing daemon path.
       - **No silent fallback.** An app launched from inside a flk pane fails the LocalOperator check, and a sandboxed (App Store) build cannot reach `flock.sock`. Either one says why and offers the remote path; it never falls back silently.
     - **A remote server** (#2293), or a platform without `flock.sock`. The person pastes or deep-links a one-time code, and the token lives in the keychain or keystore, optionally behind biometric unlock.
   - **Shell origins, on `/v1/ws` only.**
-    - A shell's webview does not present the server's origin. The listener's guard (`origin_allowed`, `src/web/gui.rs`, used by the listener in `src/web/client_listener.rs`) admits an **exact allow-list of shell origins** on the `/v1/ws` upgrade only.
+    - A shell's webview does not present the server's origin. The listener's guard (`shell_origin_allowed`, `src/web/gui.rs`, used by the listener in `src/web/client_listener.rs`) admits an **exact allow-list of shell origins** on the `/v1/ws` upgrade only.
     - For those origins only, it relaxes the `Sec-Fetch-Site` check to the value the shell actually sends (`cross-site` against `127.0.0.1:port`). Every other origin keeps today's `none`/`same-origin` rule.
     - The loopback-peer and exact-`Host` checks are unchanged.
-    - **The values are captured, not assumed.** G9a's first step records the `Origin` and `Sec-Fetch-Site` that a real Tauri v2 shell sends on macOS, Linux and Windows, in this section. The allow-list holds only those captured values. The documentation is inconsistent, giving `tauri://localhost` and `null` for macOS and `http://tauri.localhost` for Windows, so nothing is admitted on that basis.
+    - **The values are captured, not assumed.** The allow-list holds only values a real Tauri v2 shell sent. The documentation is inconsistent, giving `tauri://localhost` and `null` for macOS and `http://tauri.localhost` for Windows, so nothing is admitted on that basis. G9a captured them with the `desktop/` shell's release protocol (`tauri build`), from a `fetch` and a `WebSocket` upgrade to a loopback echo server; both requests sent the same values:
+
+      | Platform | Origin | Sec-Fetch-Site | Tauri | Date |
+      |---|---|---|---|---|
+      | macOS 26.6 (arm64, WKWebView) | `tauri://localhost` | `cross-site` | 2.12.3 | 2026-10-25 |
+      | Linux (x86_64, WebKitGTK 2.54.1) | `tauri://localhost` | `cross-site` | 2.12.3 | 2026-10-25 |
+      | Windows (WebView2) | not captured: remote-only, no `flock.sock` | | | |
+
+      Neither local platform sends `null`. Admit the captured pair only on the exact `/v1/ws` path; it grants no general cross-site fetch permission.
     - **`null` is never admitted.** `null` is also what an artifact frame (§7), a `file://` page, a `data:` URL and other sandboxed pages send, so admitting it would leave only the token and the frames' CSP as the barrier.
-    - **A registered loopback origin, where a platform's shell would send `null`.**
-      - That platform's shell serves its bundle from its own loopback port, and the mint carries `origin_port`.
-      - The server builds the origin itself, always in the exact form `http://127.0.0.1:<port>`. No hostname and no other address is accepted.
-      - At mint time, it checks that the port is a listening TCP socket **held by the minting process** (macOS: `proc_pidfdinfo` socket info; Linux: the socket inode in `/proc/<pid>/net/tcp`, matched to one of the PID's fds). If another process holds it, the mint is refused with `origin_port_not_owned`.
-      - The registered origin is bound to that **one token**. The guard admits the upgrade from that origin provisionally, and `hello` must then present the token it is bound to; any other token closes the connection.
-      - The origin dies with the token: at process exit, at the TTL, or at a restart or handoff. A port taken over after a crash is therefore never admitted.
-      - For this origin only, the guard accepts `Sec-Fetch-Site: same-site`, which is what a loopback page on another port sends. `src/web/gui.rs` refuses it for every other origin, as it does today.
+    - **No registered port.** The capture supersedes the earlier registered-loopback design. No `origin_port` parameter, mint-time port-ownership check or `origin_port_not_owned` code is needed on the captured platforms.
     - **The threat model.** Admitting a shell origin opens no ambient authority: `/v1/ws` authenticates by the token in `hello` alone (ADR-0036 §5), and the server has no cookie or other ambient credential. ADR-0036 §5 already notes that local processes can forge `Host` and `Origin`, so the origin check is a defence against browsers, not against local code. Here is how each origin that could reach the listener stays out:
       - A web page in any local browser has a real web origin, which is refused. Even if it were admitted, it has no token.
       - Artifact frames (§7) are `null`, so they are refused. Their injected CSP `connect-src 'none'` is **required** as a second barrier, and G7's per-shell security test checks it.
       - `file://` and `data:` pages are `null` or their own scheme, so they are refused.
-    - **Pre-auth limits.**
+    - **Admission-policy hold (#2500).** The UID attribution proposal is held for an owner decision after review found attribution failure and accept-loop amplification. This Origin-only split preserves the runtime's existing four pending hellos, 16 upgraded sockets and 32 incomplete HTTP connections. It does not implement or settle the revised isolation/window policy below. The registry reserves `preauth_capacity` (HTTP 503) and `auth_rate_limited` (HTTP 429), each with the single retry class `later`.
+    - **Original pre-auth target (isolation/window revision held in #2500).**
       - At most **16** concurrent unauthenticated `/v1/ws` connections per listener. Beyond that, an upgrade is refused with `preauth_capacity`.
       - Each connection gets exactly one `hello`; a failed `hello` closes it.
       - After **10** failed `hello`s within any **1 s**, a new upgrade is refused with `auth_rate_limited` for the rest of that second.
-      - Authenticated sessions are never affected, so a local process cannot lock the person out.
+      - This original global policy does not provide reconnect isolation. That guarantee and its budget key remain held for the owner decision in #2500.
       - The ADR-0036 §5a handshake deadline still applies. These limits bound resource use; guessing a token (32 random bytes) is infeasible.
     - **`/v1/client/exchange` keeps its strict checks** (`src/web/client_exchange.rs`: loopback peer, exact `Host` and `Origin`, `Sec-Fetch-Site` `same-origin`). Its one-time code is a bearer secret, and the shell never uses it locally.
   - **Tests that must fail before the change** (server slice and G9a):
@@ -668,12 +676,11 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
     - `Origin: null` is refused on both, with and without a token;
     - a shell origin with no token, or with a wrong one, is refused at `hello`;
     - a mint that names scopes is refused, and a mint from a non-LocalOperator peer is refused;
-    - the token dies when its process exits (a real child process, exit detected without polling), and a live session is closed with `token_revoked`;
-    - the token dies at its TTL (an injected clock), and a live session is closed with `token_expired`;
-    - a server restart invalidates every app-session token;
+    - the token dies when its process exits (a real child process, exit detected without polling), and a live session is closed with 4403;
+    - the token dies at its TTL (an injected clock), and a live session is closed with 4403;
     - a start-time mismatch is refused with `peer_process_changed`, and a restart or handoff revokes every app-session token;
-    - an `origin_port` held by another process is refused, a registered origin with another token's `hello` is closed, and `same-site` is refused for every unregistered origin;
-    - the pre-auth caps refuse at 17 concurrent connections and at the 11th failed `hello` within 1 s, and an authenticated session is unaffected;
+    - `same-site`, `null`, duplicate headers, lookalike shell origins and non-WS paths keep their existing refusal treatment;
+    - the pre-auth cap test (17 concurrent / 11th failed `hello` within 1 s, authenticated sessions unaffected) is held in #2500, outside the Origin-only slice, pending the isolation/window policy decision;
     - the Linux shell refuses to mint when `ptrace_scope` is 0.
   - **Native additions:**
     - the keyboard accessory bar;
@@ -753,7 +760,8 @@ An **artifact** is agent-authored content that a person looks at and answers: an
   - With no script, no forms and no top navigation, a static artifact has no way to make a request beyond the inline data it carries.
   - **Interactive** artifacts add `allow-scripts` to the sandbox and `script-src 'unsafe-inline'`. `connect-src 'none'` stays.
 - **Residual risk of interactive artifacts: navigation of the frame itself.** A script can navigate its own frame (`location = …`, a meta refresh, a link) and so leak data in a URL as a beacon. CSP has no widely shipped `navigate-to`, so the sandbox flags cannot fully stop this.
-  - The mitigation is the frame's own CSP plus `default-src 'none'`, so the navigated-to page cannot load anything in the same frame. A beacon is still one outbound GET.
+  - The frame's own CSP plus `default-src 'none'` means the navigated-to page cannot load anything in the same frame. That narrows the channel but does **not** bound it: a navigation to a URL that answers 204/205 fires no `load` and can repeat, and WebRTC reaches the network with no navigation at all (§7e).
+  - So an interactive artifact can send out the data it carries inline, with or without a stream grant. This is §7e's accepted residual, not a bounded leak.
   - That is why interactive artifacts are opt-in per publish, carry a visible "interactive" badge, and are owner decision 2.
 - **Tauri.** The shell's own policy is `default-src 'self'`, so it adds `frame-src blob: 'self'` so that `srcdoc` and `blob:` frames load. The frame's injected CSP still governs what runs inside it.
 - This **replaces ADR-0011 §5's distinct hostname** (owner decision 3). An opaque origin is a stronger boundary than a separate site, and it works the same in Tauri, which has no hostname.
@@ -784,14 +792,17 @@ An **artifact** is agent-authored content that a person looks at and answers: an
 **Lifetimes.** `flock_artifact_publish` gains `lifetime?: "session" | "persistent"`, **default `session`**.
 - **The session** is the **publishing agent's** identity, not the server's. A `session` artifact's session ends when that agent is stopped or its identity is replaced (ADR-0028 §8a). A restart, a handoff or a compaction does not end it.
 - **Persistent.** A `persistent` artifact, and a `session` artifact whose session has ended but which is still held (below), expires after it has been **idle** for `[artifacts] idle_ttl` (default 14 days).
-- **Idle** means no view, comment or answer, and no open tile, for that long.
+- **Idle** means no view, comment or answer, and no open tile, for that long. A non-operator principal's view or open tile counts only within its lease budget (Holds, below).
 
 **Holds: what keeps an artifact.** An artifact is **held**, and is never expired or evicted, while any of these is true:
 1. A person has pinned it.
 2. A tile shows it. The client sends `artifact.viewing { artifact_id, version, open: bool }` from a client session holding at least `read` scope.
    - The server keeps a **viewing lease** per client session. The client renews it by heartbeat every 30 s, and the lease lapses after 90 s without one, after **8 h** in any case, and on disconnect.
    - A principal holds at most **8** viewing leases at once.
-   - A viewing lease defers expiry and eviction. It **never** migrates a blob (§7c) and never exempts an agent's versions from that agent's own quota, so a token-holding agent cannot keep its artifacts alive by viewing them.
+   - A viewing lease defers expiry and eviction under both quotas. It **never** migrates a blob (§7c), and a held version's bytes still count against its publisher's quota and the total: a hold makes a publish refuse, never frees room.
+   - **Lease budget, for non-operator principals only.** A lease from the **operator principal** (ADR-0036 §5: an `operate`-scoped token *is* the operator's identity, which covers the operator's client token and an app-session token, §6) holds for as long as it is renewed, so a version a person has open is never expired or evicted, however long or often they view it.
+   - A lease from **any other principal**, such as a read-scope token given to an agent, holds one version for at most **8 h in total** over that version's lifetime. Past that budget, the server still accepts the lease and the tile still shows the version, but the lease neither holds the version nor counts as a view for the idle clock. So an agent cannot keep its artifacts alive by re-leasing them.
+   - A process that obtains an operator token is outside this bound; that is ADR-0036's named residual (#1177).
 3. An open question has the artifact as its `about`.
 
 When a hold ends, the artifact follows the persistent idle rule from that moment. It is never deleted at once.
@@ -799,10 +810,10 @@ When a hold ends, the artifact follows the persistent idle rule from that moment
 
 **Quotas.**
 - `[artifacts] quota_bytes_per_agent` (default **32 MiB**) counts one agent's stored versions. A publish over it evicts that agent's **oldest idle, unheld** versions first. It never evicts another agent's.
-- `[artifacts] quota_bytes_total` (default **2 GiB**, which fits 64 agents at their full quota) never evicts across agents. A publish that would exceed it first evicts **the publisher's own** idle, unheld versions. If the total is still full, it is refused with `scope: total`.
+- `[artifacts] quota_bytes_total` (default **2 GiB**, which fits 64 agents at their full quota) never evicts across agents. A publish that would exceed it first evicts **the publisher's own** idle, unheld versions. A viewed, pinned or otherwise held version is never part of that eviction. If the total is still full, it is refused with `artifact_total_quota_exceeded`.
 - **Pressure is visible.** At 80 % and at 100 % of the total, the operator gets an inbox notice naming the largest holders, with a one-click purge of idle, unpinned artifacts. So a full store is never a silent block for 14 days.
 - Most artifacts are `session` and die with their agent, so the idle TTL only governs persistent and held ones.
-- If eviction cannot make room, the publish is refused with `artifact_quota_exceeded` (`scope: agent | total`; retry classes in §7e).
+- If eviction cannot make room, the publish is refused with `artifact_quota_exceeded` (the agent's own quota) or `artifact_total_quota_exceeded` (the server total). These are two codes because the registry gives each code one retry class (§7e).
 
 **Pinning.**
 - A person pins or unpins through a client token with `answer` or `operate` scope, or through the local CLI. This is recorded as `artifact.pinned` / `artifact.unpinned`.
@@ -958,8 +969,8 @@ Anchor = {
 | `capability_unsupported` | `never` | the kind is not implemented, or stream grants are disabled (v1: all) |
 | `rpc_too_large` | `never` | over the size limit |
 | `rpc_rate_limited` | `later` | over the rate or subscription cap |
-| `artifact_quota_exceeded` (`scope: agent`) | `after_human` | only pinned or held versions remain; a person must unpin or close |
-| `artifact_quota_exceeded` (`scope: total`) | `later` | the server total is full; expiry frees space |
+| `artifact_quota_exceeded` | `after_human` | the agent's own quota holds only pinned or held versions; a person must unpin or close |
+| `artifact_total_quota_exceeded` | `later` | the server total is full; idle versions expiring, or the operator purging after the 100 % notice (§7a), frees space. Pinned and held bytes never expire |
 | `blob_migration_failed` | `maybe` | §7c; the triggering change was refused, nothing is half-moved |
 
 A refused call is never retried automatically by the parent.
@@ -975,7 +986,7 @@ A refused call is never retried automatically by the parent.
   - A question withdrawn by `subject_replaced` leaves the artifact idle-persistent, not deleted.
 - **Quota.**
   - The per-agent quota evicts that agent's oldest idle unheld version, and never a pinned, held, on-screen or other agent's version.
-  - The total quota refuses with `artifact_quota_exceeded { scope: total }`.
+  - The total quota never evicts a viewed or other held version, and refuses with `artifact_total_quota_exceeded`.
 - **Pin.** Only a person can pin; an agent's pin is refused. A pinned artifact survives every automatic purge.
 - **Blobs.**
   - A shared blob survives the purge of one of its two referencing records.
@@ -991,13 +1002,13 @@ A refused call is never retried automatically by the parent.
   - An automatic purge keeps them.
   - A fork reads the purged record.
 - **Network.**
-  - No artifact reaches the network or the listener, with or without a declaration.
+  - A static artifact makes no request at all. An interactive one makes no `fetch`, XHR, WebSocket or EventSource request (`connect-src 'none'`), and no frame reaches the listener with a credential. Its navigation and WebRTC channels are §7e's accepted residual and are not asserted closed.
   - Every `flock.rpc` gets `capability_unsupported` in G6/G7.
   - With `allow_stream_grants = false` (the default), a grant is refused.
   - The broker tests come later: a viewer-B frame with only A's grant is refused, the limits refuse, an unexpected extra load revokes the grants, and a parent reload resets the counter.
 - **Quota pressure.** The 80 % and 100 % notices are emitted. The total quota evicts only the publisher's own versions, and then refuses with `later`.
 - **Migration.** A sweep during an in-progress migration skips that blob. A failed hash verification refuses the pin and leaves the blob whole.
-- **Viewing lease.** It lapses without a heartbeat and at 8 h, at most 8 are held per principal, and it never protects an agent's versions from that agent's quota.
+- **Viewing lease.** It lapses without a heartbeat and at 8 h, at most 8 are held per principal, and a held version's bytes still count against its publisher's quota. An operator lease renewed past 8 h of total viewing still holds the version, and the version is not evicted. A non-operator principal re-leasing past its 8 h budget on a version neither holds it nor resets its idle clock.
 
 ### 8. Goals and work
 
