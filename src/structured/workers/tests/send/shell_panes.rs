@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicBool;
 async fn shell_request(
     r: &mut AppQueue,
     nested: bool,
+    custom_runtime: bool,
 ) -> (
     crate::layout::PaneId,
     crate::api::ApiRequestMessage,
@@ -23,19 +24,36 @@ async fn shell_request(
         .unwrap();
     state.created_as_root_shell = true;
     let terminal = state.attached_terminal_id.clone();
-    let runtime = crate::terminal::TerminalRuntime::spawn(
-        pane,
-        24,
-        100,
-        r.case.fixture.root.path().to_path_buf(),
-        4096,
-        Default::default(),
-        crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
-        r.app.event_tx.clone(),
-        Arc::new(Notify::new()),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .unwrap();
+    let runtime = if custom_runtime {
+        crate::terminal::TerminalRuntime::spawn_shell_command(
+            pane,
+            24,
+            100,
+            r.case.fixture.root.path().to_path_buf(),
+            "while IFS= read -r command; do eval \"$command\"; done",
+            &[],
+            4096,
+            Default::default(),
+            r.app.event_tx.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+    } else {
+        crate::terminal::TerminalRuntime::spawn(
+            pane,
+            24,
+            100,
+            r.case.fixture.root.path().to_path_buf(),
+            4096,
+            Default::default(),
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            r.app.event_tx.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+    };
     let socket = r.case.fixture.root.path().join("shell.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let request = serde_json::to_string(&Request {
@@ -130,7 +148,7 @@ async fn dispatch(
 async fn shell2494_prompt_child_is_stamped_in_wire_and_durable_history() {
     let mut r = AppQueue::new(2494, |_| max_policy()).await;
     ready(&mut r).await;
-    let (pane, message, server) = shell_request(&mut r, false).await;
+    let (pane, message, server) = shell_request(&mut r, false, false).await;
     assert_eq!(
         dispatch(&mut r, message, server).await["result"]["item_id"],
         id(2494)
@@ -174,7 +192,7 @@ async fn shell2494_prompt_child_is_stamped_in_wire_and_durable_history() {
 async fn shell2494_grandchild_is_not_an_operator() {
     let mut r = AppQueue::new(2495, |_| max_policy()).await;
     ready(&mut r).await;
-    let (_, message, server) = shell_request(&mut r, true).await;
+    let (_, message, server) = shell_request(&mut r, true, false).await;
     assert_eq!(
         dispatch(&mut r, message, server).await["error"]["code"],
         "not_authorized"
@@ -187,7 +205,7 @@ async fn shell2494_grandchild_is_not_an_operator() {
 async fn shell2494_agent_pane_is_not_an_operator() {
     let mut r = AppQueue::new(2496, |_| max_policy()).await;
     ready(&mut r).await;
-    let (pane, message, server) = shell_request(&mut r, false).await;
+    let (pane, message, server) = shell_request(&mut r, false, false).await;
     let terminal = r.app.state.terminal_id_for_pane(0, pane).unwrap();
     r.app
         .state
@@ -208,7 +226,7 @@ async fn shell2494_agent_pane_is_not_an_operator() {
 async fn shell2494_unknown_provenance_is_refused() {
     let mut r = AppQueue::new(2497, |_| max_policy()).await;
     ready(&mut r).await;
-    let (pane, message, server) = shell_request(&mut r, false).await;
+    let (pane, message, server) = shell_request(&mut r, false, false).await;
     r.app.state.workspaces[0].tabs[0]
         .panes
         .get_mut(&pane)
@@ -225,7 +243,7 @@ async fn shell2494_unknown_provenance_is_refused() {
 async fn shell2494_exited_root_is_refused() {
     let mut r = AppQueue::new(2498, |_| max_policy()).await;
     ready(&mut r).await;
-    let (pane, message, server) = shell_request(&mut r, false).await;
+    let (pane, message, server) = shell_request(&mut r, false, false).await;
     let terminal = r.app.state.terminal_id_for_pane(0, pane).unwrap();
     r.app
         .terminal_runtimes
@@ -243,8 +261,27 @@ async fn shell2494_exited_root_is_refused() {
 async fn shell2494_mismatched_uid_is_refused() {
     let mut r = AppQueue::new(2499, |_| max_policy()).await;
     ready(&mut r).await;
-    let (_, message, server) = shell_request(&mut r, false).await;
+    let (_, message, server) = shell_request(&mut r, false, false).await;
     r.app.runtime_config.uid_policy.operator = message.peer_uid.unwrap().wrapping_add(1);
+    assert_eq!(
+        dispatch(&mut r, message, server).await["error"]["code"],
+        "not_authorized"
+    );
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn shell2494_nondefault_runtime_is_refused() {
+    let mut r = AppQueue::new(2500, |_| max_policy()).await;
+    ready(&mut r).await;
+    let (pane, message, server) = shell_request(&mut r, false, true).await;
+    let terminal = r.app.state.terminal_id_for_pane(0, pane).unwrap();
+    assert!(!r
+        .app
+        .terminal_runtimes
+        .get(&terminal)
+        .unwrap()
+        .was_spawned_with_default_shell());
     assert_eq!(
         dispatch(&mut r, message, server).await["error"]["code"],
         "not_authorized"

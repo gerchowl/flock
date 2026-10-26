@@ -2,6 +2,8 @@
 //! Composer and authenticated S7-min dispatchers call `App::structured_send`.
 //! Socket/CLI dispatch adapts its verified ancestry, never a producer string.
 //! A ticket succeeds only after the single journal owner commits admission.
+mod shell_identity;
+
 use super::responses::{encode_error, encode_success};
 use crate::{
     api::{
@@ -302,48 +304,46 @@ impl App {
     /// ADR-0036 §1a: a root shell's immediate socket child, never inferred
     /// from unknown detection. All evidence is reread for this request.
     fn operator_shell_send_pane(&mut self) -> Option<crate::layout::PaneId> {
-        let uid = self.current_api_peer_uid.flatten()?;
-        if uid != self.runtime_config.uid_policy.operator
-            || self.current_api_scope.is_some()
-            || self.lease_caller() != crate::structured::lease::Caller::Unrelated
-        {
-            return None;
-        }
-        let pid = self.current_api_peer_pid?;
-        let (parent, birth) = crate::platform::live_process_facts(pid)?;
-        if self.current_api_peer_birth != Some(Some(birth))
-            || self
+        let caller = shell_identity::Caller {
+            uid: self.current_api_peer_uid.flatten(),
+            pid: self.current_api_peer_pid,
+            birth: self.current_api_peer_birth.flatten(),
+            scoped: self.current_api_scope.is_some(),
+            unrelated: self.lease_caller() == crate::structured::lease::Caller::Unrelated,
+            relay: self
                 .inbound
-                .edge(Some(pid), crate::platform::process_start_time)
-                .is_some()
-        {
-            return None;
-        }
-        for ws in &self.state.workspaces {
-            for tab in &ws.tabs {
-                for (pane_id, pane) in &tab.panes {
-                    let Some(terminal) = self.state.terminals.get(&pane.attached_terminal_id)
-                    else {
-                        continue;
-                    };
-                    let Some(runtime) = self.terminal_runtimes.get(&pane.attached_terminal_id)
-                    else {
-                        continue;
-                    };
-                    if pane.created_as_root_shell
-                        && !terminal.is_agent_terminal()
-                        && runtime.was_spawned_with_default_shell()
-                        && runtime.child_pid() == Some(parent)
-                        && !runtime.child_exit().is_some_and(|exit| exit.is_reaped())
-                        && crate::platform::live_process_facts(parent)
-                            .is_some_and(|(_, birth)| Some(birth) == runtime.child_birth())
-                    {
-                        return Some(*pane_id);
-                    }
-                }
-            }
-        }
-        None
+                .edge(
+                    self.current_api_peer_pid,
+                    crate::platform::process_start_time,
+                )
+                .is_some(),
+        };
+        let panes = self
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|ws| &ws.tabs)
+            .flat_map(|tab| &tab.panes)
+            .filter_map(|(id, pane)| {
+                let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+                let runtime = self.terminal_runtimes.get(&pane.attached_terminal_id)?;
+                Some(shell_identity::Pane {
+                    id: id.raw(),
+                    root_shell: pane.created_as_root_shell,
+                    agent: terminal.is_agent_terminal(),
+                    default_shell: runtime.was_spawned_with_default_shell(),
+                    pid: runtime.child_pid(),
+                    birth: runtime.child_birth(),
+                    reaped: runtime.child_exit().is_some_and(|exit| exit.is_reaped()),
+                })
+            });
+        shell_identity::admit(
+            caller,
+            self.runtime_config.uid_policy.operator,
+            panes,
+            crate::platform::live_process_facts,
+        )
+        .map(crate::layout::PaneId::from_raw)
     }
 
     pub(super) fn handle_structured_send(&mut self, id: String, params: AgentSendParams) -> String {
