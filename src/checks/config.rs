@@ -7,6 +7,7 @@
 //! only the DECLARATIVE surface: knobs, script argv, and a CLOSED `ActionSpec`
 //! enum (#175 P7, no shell strings ever).
 
+use crate::config::validation::{message, Cause};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -374,55 +375,73 @@ impl ChecksConfig {
         }
 
         let mut seen = std::collections::HashSet::new();
-        for script in &self.scripts {
+        for (index, script) in self.scripts.iter().enumerate() {
             let name = script.name.trim();
             if name.is_empty() {
-                out.push("[[checks.script]] entry is missing name; entry ignored".to_string());
+                out.push(message(
+                    Cause::MissingName,
+                    "checks.script[].name",
+                    Some(index),
+                ));
                 continue;
             }
             if !seen.insert(name.to_string()) {
-                out.push(format!(
-                    "[[checks.script]] duplicate name \"{name}\"; later entry ignored"
+                out.push(message(
+                    Cause::DuplicateName,
+                    "checks.script[].name",
+                    Some(index),
                 ));
                 continue;
             }
             if script.interval_secs < self.min_tick_secs.max(1) {
-                out.push(format!(
-                    "[[checks.script]] \"{name}\" interval_secs ({}) is less than [checks] min_tick_secs ({}); clamped",
-                    script.interval_secs,
-                    self.min_tick_secs.max(1)
+                out.push(message(
+                    Cause::Interval {
+                        minimum: self.min_tick_secs.max(1),
+                    },
+                    "checks.script[].interval_secs",
+                    Some(index),
                 ));
             }
             if script.timeout_secs < 1 {
-                out.push(format!(
-                    "[[checks.script]] \"{name}\" timeout_secs ({}) is less than 1; using 1s",
-                    script.timeout_secs
+                out.push(message(
+                    Cause::Timeout,
+                    "checks.script[].timeout_secs",
+                    Some(index),
                 ));
             }
             if script.debounce == 0 {
-                out.push(format!(
-                    "[[checks.script]] \"{name}\" debounce is 0; using 1 so a single fire still emits"
+                out.push(message(
+                    Cause::Debounce,
+                    "checks.script[].debounce",
+                    Some(index),
                 ));
             }
             if accepted_program_path(&script.program).is_none() {
-                out.push(format!(
-                    "[[checks.script]] \"{name}\" program {:?} is not absolute and not under ~/.flock/checks/; entry ignored",
-                    script.program
+                out.push(message(
+                    Cause::Program,
+                    "checks.script[].program",
+                    Some(index),
                 ));
             }
         }
 
         // Cron entries share the script-name namespace: two different
         // predicate kinds with the same name would confuse ack/list/run.
-        for cron in &self.crons {
+        for (index, cron) in self.crons.iter().enumerate() {
             let name = cron.name.trim();
             if name.is_empty() {
-                out.push("[[checks.cron]] entry is missing name; entry ignored".to_string());
+                out.push(message(
+                    Cause::MissingName,
+                    "checks.cron[].name",
+                    Some(index),
+                ));
                 continue;
             }
             if !seen.insert(name.to_string()) {
-                out.push(format!(
-                    "[[checks.cron]] duplicate name \"{name}\"; later entry ignored"
+                out.push(message(
+                    Cause::DuplicateName,
+                    "checks.cron[].name",
+                    Some(index),
                 ));
                 continue;
             }
@@ -631,7 +650,7 @@ label = "custom-fired"
         assert!(
             diags
                 .iter()
-                .any(|d| d.contains("\"bare\"") && d.contains("not absolute")),
+                .any(|d| d.contains("entry_index=1") && d.contains("not absolute")),
             "{diags:?}"
         );
         assert!(
@@ -641,25 +660,25 @@ label = "custom-fired"
         assert!(
             diags
                 .iter()
-                .any(|d| d.contains("\"escape\"") && d.contains("not absolute")),
+                .any(|d| d.contains("entry_index=4") && d.contains("not absolute")),
             "{diags:?}"
         );
         assert!(
             diags
                 .iter()
-                .any(|d| d.contains("\"fast\"") && d.contains("interval_secs")),
+                .any(|d| d.contains("entry_index=5") && d.contains("interval_secs")),
             "{diags:?}"
         );
         assert!(
             diags
                 .iter()
-                .any(|d| d.contains("\"fast\"") && d.contains("timeout_secs")),
+                .any(|d| d.contains("entry_index=5") && d.contains("timeout_secs")),
             "{diags:?}"
         );
         assert!(
             diags
                 .iter()
-                .any(|d| d.contains("\"fast\"") && d.contains("debounce")),
+                .any(|d| d.contains("entry_index=5") && d.contains("debounce")),
             "{diags:?}"
         );
     }
@@ -723,13 +742,13 @@ expr = "@daily"
         assert!(
             diags
                 .iter()
-                .any(|d| d.contains("[[checks.cron]] entry is missing name")),
+                .any(|d| d.contains("key=checks.cron[].name") && d.contains("missing name")),
             "{diags:?}"
         );
         assert!(
             diags
                 .iter()
-                .any(|d| d.contains("[[checks.cron]] duplicate name")),
+                .any(|d| d.contains("key=checks.cron[].name") && d.contains("duplicate name")),
             "{diags:?}"
         );
     }

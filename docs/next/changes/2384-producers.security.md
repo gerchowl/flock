@@ -1,0 +1,1 @@
+- Prevent keybinding, sound, spawn-environment, check and channel validation diagnostics from exposing configured text, including messages logged immediately. Keep schema locations, entry indices, typed causes and static repair hints, and retain unknown-key warnings without source spans.
