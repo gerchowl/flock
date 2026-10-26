@@ -43,6 +43,23 @@ describe("readShellConfig", () => {
     expect(readShellConfig(scope(null)).ok).toBe(false);
   });
 
+  test("a shell-reported error is a ConfigError with the shell's message", () => {
+    expect(readShellConfig(scope({ transport: "error", message: "config.toml: bad server_url" }))).toEqual({
+      ok: false,
+      error: { message: "config.toml: bad server_url" },
+    });
+    for (const message of [undefined, "", 7]) {
+      expect(readShellConfig(scope({ transport: "error", message }))).toEqual({
+        ok: false,
+        error: { message: "A shell-reported error needs a non-empty message string." },
+      });
+    }
+    expect(readShellConfig(scope({ transport: "carrier-pigeon" }))).toEqual({
+      ok: false,
+      error: { message: 'Unknown transport "carrier-pigeon".' },
+    });
+  });
+
   test("valid wire and fixture configs pass through unchanged", () => {
     expect(readShellConfig(scope({ transport: "wire", serverUrl: "wss://h:7000/v1/ws", token: "t" }))).toEqual({
       ok: true,
