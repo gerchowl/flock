@@ -502,7 +502,7 @@ for (const mode of MODES) {
       }
       h.clock.advanceTo(start + 20_000 * RENEW_AT);
       await tick();
-      // A bridge's new session reports its bearer's remaining lifetime, and so arms a renewal of its own.
+      // The Disconnect forgot the due time; on a bridge the session after Connect reports its bearer's remaining lifetime, which sets it again.
       expect([tokens.calls, tokens.renews]).toEqual(mode === "bridge" && reconnectFirst ? [2, [false, false, true]] : [1, mode === "bridge" ? [false] : []]);
       dispose?.();
     }
