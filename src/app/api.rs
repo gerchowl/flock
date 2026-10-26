@@ -38,6 +38,7 @@ pub(super) mod responses;
 mod revert;
 mod spawn;
 mod structured_agents;
+mod structured_grants;
 pub(crate) mod structured_messages;
 pub(crate) mod structured_queue;
 mod structured_relay;
@@ -169,7 +170,21 @@ pub(crate) struct LocalOperator<'a> {
     _app: &'a mut App,
 }
 
+impl LocalOperator<'_> {
+    /// Accepted kernel evidence from this proof's connection, never a caller argument.
+    pub(crate) fn peer_credentials(&self) -> crate::platform::peer::Credentials {
+        self._app.api_peer_credentials()
+    }
+}
+
 impl App {
+    pub(super) fn api_peer_credentials(&self) -> crate::platform::peer::Credentials {
+        crate::platform::peer::Credentials {
+            pid: self.current_api_peer_pid,
+            uid: self.current_api_peer_uid.flatten(),
+            birth: self.current_api_peer_birth.flatten(),
+        }
+    }
     /// Mint token-management authority only from the existing kernel/lease policy.
     pub(crate) fn client_token_authority(
         &mut self,
@@ -1420,6 +1435,10 @@ impl App {
         request: &crate::api::schema::Request,
     ) -> Option<String> {
         use crate::api::{error_code::ErrorCode, schema::Method};
+        // Mint validates kernel evidence before any generic start-time recheck.
+        if matches!(request.method, Method::ClientAppMint(_)) {
+            return None;
+        }
         if self
             .current_api_scope
             .as_ref()
@@ -1434,13 +1453,16 @@ impl App {
         let uid = self.current_api_peer_uid?;
         let code = if matches!(
             request.method,
-            Method::ServerStop(_)
+            Method::StructuredGrantsList(_)
+                | Method::StructuredGrantsRevoke(_)
+                | Method::ServerStop(_)
                 | Method::ServerReloadConfig(_)
                 | Method::ServerLiveHandoff(_)
                 | Method::ClientTokenAdd(_)
                 | Method::ClientTokenRemove(_)
                 | Method::ClientTokenList(_)
                 | Method::ClientOpen(_)
+                | Method::ClientAppMint(_)
         ) && !matches!(self.spawn_caller(), spawn::SpawnCaller::Operator { .. })
         {
             Some(ErrorCode::OperatorOnly)
@@ -1526,6 +1548,27 @@ impl App {
             );
         }
         let response = match request.method {
+            Method::StructuredGrantsList(p) => {
+                return self.handle_structured_grants(
+                    request.id,
+                    p.agent_id,
+                    None,
+                    None,
+                    p.show_input,
+                )
+            }
+            Method::StructuredGrantsRevoke(p) => {
+                return self.handle_structured_grants(
+                    request.id,
+                    p.agent_id,
+                    Some(p.generation),
+                    Some(crate::structured::permissions::grants::GrantHandle {
+                        request_id: p.request_id,
+                        request_seq: p.request_seq,
+                    }),
+                    false,
+                )
+            }
             Method::ServerStop(_) => {
                 self.state.should_quit = true;
                 SuccessResponse {
@@ -1626,7 +1669,8 @@ impl App {
             Method::ClientTokenAdd(_)
             | Method::ClientTokenRemove(_)
             | Method::ClientTokenList(_)
-            | Method::ClientOpen(_) => {
+            | Method::ClientOpen(_)
+            | Method::ClientAppMint(_) => {
                 return self.handle_client_token(request.id, request.method);
             }
             Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),

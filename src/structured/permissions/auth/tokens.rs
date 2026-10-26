@@ -10,7 +10,9 @@ use std::fs::{File, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+pub(crate) mod app_sessions;
 mod priority;
+pub(crate) mod server;
 use std::time::Duration;
 use zeroize::Zeroize;
 
@@ -101,6 +103,9 @@ impl PendingRevoke<'_> {
         self.store.0.remove_entry(&self.entry)?;
         Ok(())
     }
+}
+fn operator_scopes() -> BTreeSet<Scope> {
+    BTreeSet::from([Scope::Read, Scope::Send, Scope::Answer, Scope::Operate])
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -278,7 +283,7 @@ impl TokenStore {
         &self,
         authority: &LocalOperator<'_>,
     ) -> Result<Bearer, TokenError> {
-        let scopes = BTreeSet::from([Scope::Read, Scope::Send, Scope::Answer, Scope::Operate]);
+        let scopes = operator_scopes();
         let guard = self.lock()?;
         match self.load("operator") {
             Ok(record) if record.scopes == scopes => Ok(record.token),
