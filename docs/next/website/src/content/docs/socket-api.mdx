@@ -1290,6 +1290,23 @@ the clock-policy decision), so wall-clock skew does not affect this value.
 Use it to renew before expiry instead of hard-coding the TTL. This optional
 additive field is absent for persistent file tokens and may be absent from
 older servers. It is an issuance snapshot, not a sliding lifetime.
+App-session `issued.info.principal` is exactly `app:operator:<uid>`, with the
+decimal UID taken from the kernel-attested LocalOperator. It remains the same
+across re-mint, restart, handoff and relaunch. Each token name, bearer, process
+watch, expiry and revocation remains independent: revoking one mint does not
+revoke another. File-token identities are unchanged.
+
+Re-mint preserves `(principal, cmd_id)` for command resend/dedupe and does not
+force the operator outbox to be dropped. Existing server-epoch, retention and
+resume-only rules still apply; a stable identity does not extend the lifetime
+of a cached outcome or authorize an automatic second dispatch after restart.
+
+App instances of the same operator share the existing four authenticated
+socket slots per principal, including pending welcome. Three old sockets can
+coexist with one relaunched socket; at four, an old slot must drain first.
+Unauthenticated hello capacity (four) and upgraded-socket capacity (sixteen)
+remain global. Minting still consumes one of the store's 128 credential entries.
+
 Renewal issues an independent credential. There are at most 128 live entries;
 capacity/contention returns `session_busy`, and storage failures return
 `internal_error`. Store the bearer only in memory and never log it.

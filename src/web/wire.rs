@@ -82,7 +82,7 @@ impl Shared {
     fn revoke(&self, session: &Session) {
         if let Ok(clients) = self.clients.lock() {
             for client in clients.values() {
-                if client.session.info.principal == session.info.principal {
+                if client.session.same_credential(session) {
                     let _ = client.revoke.send(true);
                 }
             }

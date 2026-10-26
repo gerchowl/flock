@@ -3559,6 +3559,31 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
   hardened runtime per ADR-0038 §6) but does not close it. #1177 tracks
   same-UID agent isolation.
 
+**Stable app-session identity (#2442).** The principal is exactly
+`app:operator:<uid>`, where `<uid>` is the decimal kernel-attested operator
+UID sealed by LocalOperator. It is scoped to this server's operator identity,
+not a cross-server authorization claim. It survives re-mint, restart, handoff
+and relaunch; no caller field chooses it. File-token principals remain separate.
+The credential is distinct: every mint retains its fresh random `app:<nonce>`
+name, bearer/digest, process watch, deadline and revocation signal. Revoking or
+expiring one bearer closes only sockets using that credential, not sibling
+mints of the same operator. All mints have the same fixed operator grants;
+sharing the principal adds no authority beyond those grants.
+
+Command resend/dedupe stays keyed by `(principal, cmd_id)`. Re-mint no longer
+changes that key or requires dropping the operator's outbox. This does not
+extend retention or preserve an in-memory command cache across restart:
+existing epoch/resume-only/unknown-outcome rules still apply, with no automatic
+second dispatch.
+
+Two app instances share the existing four registered sockets per principal
+(including pending welcome); three old sockets can drain while one renewed
+socket connects. Four occupied slots must drain before another can connect.
+The four unauthenticated hello slots and sixteen upgraded sockets remain
+global, because a principal is untrusted before authentication. These bounds
+are not per bearer and are unchanged. The store's 128-entry cap remains per
+credential, so a renewal still needs a free entry or expired/exited reclamation.
+
 **Binding to the minting process.**
 - **Where the PID comes from.** The **minting connection's peer credentials**:
   `LOCAL_PEERPID` on macOS; on Linux `SO_PEERPIDFD` where available, else

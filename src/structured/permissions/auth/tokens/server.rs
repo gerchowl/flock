@@ -14,6 +14,14 @@ enum Source {
     App(app_sessions::Session),
 }
 impl Session {
+    /// Match the authenticated credential, independently of its shared operator identity.
+    pub(crate) fn same_credential(&self, other: &Self) -> bool {
+        match (&self.source, &other.source) {
+            (Source::App(a), Source::App(b)) => a.revoked.same_channel(&b.revoked),
+            (Source::File(a), Source::File(b)) => a.digest == b.digest,
+            _ => false,
+        }
+    }
     /// Ephemeral lifecycle evidence, absent for persistent file credentials.
     pub(crate) fn app(&self) -> Option<&app_sessions::Session> {
         match &self.source {

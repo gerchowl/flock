@@ -30,7 +30,12 @@ revokes every app credential before stopping its sockets. Persistent file
 credentials remain valid across these boundaries.
 
 Each credential expires exactly 12 monotonic hours after issuance, with no
-sliding renewal. Renewal issues an independent bearer and principal. At most
+sliding renewal. Renewal issues an independent bearer and token name with the same operator
+principal, `app:operator:<uid>` (decimal kernel-attested UID). Identity survives
+restart and handoff while credentials do not. Revocation fanout is per
+credential; concurrent app instances share the four registered-socket slots
+per principal, including pending welcome. The four pending hello slots and
+sixteen upgraded sockets remain global. At most
 128 app entries live. Issuance first reclaims expired/exited entries; capacity
 or admission contention refuses with `session_busy`. No failed mint discloses
 a credential. Storage/entropy failures return `internal_error`.

@@ -1,0 +1,1 @@
+- App-session re-mints retain a stable operator principal for command deduplication and outbox recovery while keeping each bearer’s revocation, expiry and process binding independent.

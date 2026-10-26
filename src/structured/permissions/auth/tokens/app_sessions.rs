@@ -6,7 +6,7 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::watch;
 
 const CAPACITY: usize = 128;
-/// Fixed lifetime; renewal always issues a different bearer and principal.
+/// Fixed lifetime; renewal issues a different credential for the same operator identity.
 pub(crate) const TTL: Duration = Duration::from_secs(12 * 60 * 60);
 /// Monotonic time supplied by the owning server, never serialized or wall-clock based.
 pub(crate) trait Clock: Send + Sync {
@@ -136,12 +136,15 @@ impl Store {
         if entries.contains_key(&digest) {
             return Err(TokenError::Unsafe.into());
         }
-        let principal = self.files.random::<16>()?;
+        let name = self.files.random::<16>()?;
+        let uid = authority.peer_credentials().uid.ok_or_else(|| {
+            IssueError::PeerProcessChanged(io::Error::other("operator UID is unavailable"))
+        })?;
         let issued_at = self.clock.now();
         let expires = issued_at + TTL;
         let info = TokenInfo {
-            name: format!("app:{principal}"),
-            principal,
+            name: format!("app:{name}"),
+            principal: format!("app:operator:{uid}"),
             scopes: operator_scopes(),
             expires_in_ms: Some(
                 u64::try_from(expires.duration_since(issued_at).as_millis())
