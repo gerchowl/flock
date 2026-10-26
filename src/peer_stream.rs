@@ -86,6 +86,8 @@ fn pre_mesh_output(text: &str) -> bool {
 struct EnrollmentError {
     detail: String,
     transient: bool,
+    /// Transport I/O needs SSH diagnostics; a decoded mesh refusal does not.
+    transport: bool,
 }
 
 impl From<String> for EnrollmentError {
@@ -105,6 +107,7 @@ impl From<String> for EnrollmentError {
         Self {
             detail,
             transient: !permanent,
+            transport: false,
         }
     }
 }
@@ -114,6 +117,7 @@ impl EnrollmentError {
         Self {
             detail,
             transient: true,
+            transport: true,
         }
     }
 
@@ -137,6 +141,7 @@ impl EnrollmentError {
         Self {
             detail,
             transient: !permanent,
+            transport: false,
         }
     }
 }
@@ -793,6 +798,17 @@ fn request_over(
     params: serde_json::Value,
     spawn: bool,
 ) -> Result<String, String> {
+    request_over_with(peer, method, params, spawn, PeerStream::spawn)
+}
+
+/// Keep connection establishment injectable without changing the request path.
+fn request_over_with(
+    peer: &PeerConfig,
+    method: &str,
+    params: serde_json::Value,
+    spawn: bool,
+    connect: impl FnOnce(&PeerConfig) -> Result<PeerStream, String>,
+) -> Result<String, String> {
     // Outer lock is held only long enough to find the slot; the request itself
     // runs under the per-peer lock so one slow peer cannot stall the others.
     let slot = {
@@ -842,7 +858,7 @@ fn request_over(
         if !spawn {
             return Err("no held connection".into());
         }
-        match PeerStream::spawn(peer) {
+        match connect(peer) {
             Ok(mut stream) => match stream.enroll(peer) {
                 Ok(node_id) => {
                     slot.transient_failures = 0;
@@ -852,9 +868,9 @@ fn request_over(
                 }
                 Err(err) => {
                     let mut transient = err.transient;
+                    let transport = err.transport;
                     let err = err.detail;
-                    let (mut detail, tail) = if err == CONNECTION_CLOSED || err.starts_with(WEDGED)
-                    {
+                    let (mut detail, tail) = if transport {
                         stream.explain(&err)
                     } else {
                         (err, None)
@@ -874,6 +890,7 @@ fn request_over(
                         Err(EnrollmentError {
                             detail: detail.clone(),
                             transient,
+                            transport,
                         }),
                     );
                     record_establish_failure(
@@ -1092,6 +1109,16 @@ pub fn retain_configured(peers: &[PeerConfig]) {
 mod tests {
     use super::*;
 
+    struct RestoreStateHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreStateHome {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => std::env::set_var("XDG_STATE_HOME", previous),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
     fn peer(name: &str) -> PeerConfig {
         PeerConfig {
             name: name.to_string(),
@@ -1235,6 +1262,7 @@ mod tests {
                 )
             );
             assert_eq!(failure.detail, code);
+            assert!(!failure.transport);
         }
         assert!(!EnrollmentError::from("identity changed for peer".to_string()).transient);
         assert!(EnrollmentError::from("unparseable response".to_string()).transient);
@@ -1254,6 +1282,8 @@ mod tests {
         );
         assert!(EnrollmentError::response(&serde_json::json!({}), "unparseable".into()).transient);
         assert!(EnrollmentError::transport(CONNECTION_CLOSED.into()).transient);
+        assert!(EnrollmentError::transport("write failed: Broken pipe".into()).transport);
+        assert!(!EnrollmentError::from("unparseable response".to_owned()).transport);
     }
 
     #[test]
@@ -1312,15 +1342,6 @@ mod tests {
     fn a_stream_that_cannot_be_established_says_why() {
         let _lock = crate::config::test_config_env_lock().lock().unwrap();
         let state = crate::test_support::TempDir::socket();
-        struct RestoreStateHome(Option<std::ffi::OsString>);
-        impl Drop for RestoreStateHome {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(previous) => std::env::set_var("XDG_STATE_HOME", previous),
-                    None => std::env::remove_var("XDG_STATE_HOME"),
-                }
-            }
-        }
         let _restore = RestoreStateHome(std::env::var_os("XDG_STATE_HOME"));
         // Enrollment loads a node identity before observing the SSH failure.
         // Keep that identity in this fixture, never the operator's state.
@@ -1355,6 +1376,71 @@ mod tests {
         assert_eq!(establish_failure(&target).as_deref(), Some(err.as_str()));
         assert_eq!(enrollment(&target).state, "retrying");
         assert_eq!(enrollment(&target).reason.as_deref(), Some(err.as_str()));
+    }
+
+    #[test]
+    fn exited_ssh_is_classified_even_before_stdout_eof_is_observed() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let state = crate::test_support::TempDir::socket();
+        let _restore = RestoreStateHome(std::env::var_os("XDG_STATE_HOME"));
+        std::env::set_var("XDG_STATE_HOME", state.path());
+        let target = peer("epipe.example");
+        let mut child = crate::process::TracedCommand::new("/bin/sh", "peers")
+            .args(["-c", "printf '%s\n' 'ssh: Could not resolve hostname missing.invalid: Name or service not known' >&2; exit 255"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_traced()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let (collected, diagnostic) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let result = std::io::Read::read_to_string(&mut stderr, &mut text).map(|_| text);
+            let _ = collected.send(result);
+        });
+        // Holding the sender models the stdout reader not having observed EOF.
+        // The exited child's stdin is already closed, so the write must fail.
+        let (_stdout_pending, lines) = std::sync::mpsc::channel();
+        let (stderr_finished, stderr_done) = std::sync::mpsc::channel();
+        drop(stderr_finished);
+        let mut stream = PeerStream {
+            child,
+            stdin,
+            lines,
+            next_id: 0,
+            latest_push: Arc::new(Mutex::new(None)),
+            stderr_tail: Arc::new(Mutex::new(Default::default())),
+            stderr_done,
+            agent: crate::platform::ssh_agent::AgentSocket::Unset,
+        };
+        // The stream owns cleanup if the child fails to close stderr in time.
+        let stderr = diagnostic
+            .recv_timeout(REQUEST_TIMEOUT)
+            .expect("child stderr EOF")
+            .unwrap();
+        assert_eq!(stream.child.wait().unwrap().code(), Some(255));
+        *stream.stderr_tail.lock().unwrap() = stderr.lines().map(str::to_owned).collect();
+        let logs = crate::logging::capture_logs(|| {
+            let err = request_over_with(
+                &target,
+                "peers.summary",
+                serde_json::json!({}),
+                true,
+                |_| Ok(stream),
+            )
+            .expect_err("the child exited before enrollment");
+            assert_eq!(
+                crate::peers::SshFailureReason::classify(&err),
+                crate::peers::SshFailureReason::UnknownHost,
+                "{err}"
+            );
+            assert!(err.contains("Could not resolve hostname"), "{err}");
+            assert_eq!(establish_failure(&target).as_deref(), Some(err.as_str()));
+            assert_eq!(enrollment(&target).reason.as_deref(), Some(err.as_str()));
+        });
+        assert!(logs.contains("reason=\"unknown_host\""), "{logs}");
     }
 
     /// The same establish failure on every backoff is one WARN, not one per

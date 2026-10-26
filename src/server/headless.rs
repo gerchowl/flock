@@ -675,6 +675,7 @@ impl HeadlessServer {
             inherited,
             self.client_wire_health.clone(),
             self.app.render_notify.clone(),
+            self.app.client_auth.clone(),
         )
         .await?;
         if let Some(wire) = &self.client_wire {
