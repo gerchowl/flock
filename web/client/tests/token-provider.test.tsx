@@ -92,15 +92,20 @@ function bridgedSession(net: FakeNetwork, bearer: Bearer, hellos: Record<string,
  */
 function provider(mode: Mode, ...replies: Reply[]) {
   let release: ((issued: Issued) => void) | undefined;
+  let refuse: ((failure: unknown) => void) | undefined;
   let bearer: Bearer | null = null;
   const shell = {
     mode,
     calls: 0,
     renews: [] as boolean[],
+    /** When each open was called, beside {@link renews}. */
+    openedAt: [] as number[],
     hellos: [] as Record<string, unknown>[],
     lifetimes: [] as { readonly at: number; readonly expiresInMs: number }[],
     net: null as FakeNetwork | null,
     resolve: (token: string) => release?.({ token }),
+    /** Rejects the deferred call with `failure`. */
+    reject: (failure: unknown) => refuse?.(failure),
     /** A bridge session on a bearer minted outside the script, as before a driver is attached. */
     open: (token: string): BridgeSocket => session((bearer = { token, mintedAt: network().clock.now(), refused: false })),
     config: {} as { readonly tokenProvider: TokenProvider } | { readonly openBridge: OpenBridge },
@@ -122,7 +127,7 @@ function provider(mode: Mode, ...replies: Reply[]) {
   const answer = (): Promise<unknown> => {
     const reply = replies[shell.calls++];
     if (reply === undefined) throw new Error("an unscripted shell call");
-    if (reply === "deferred") return new Promise<Issued>((resolve) => (release = resolve)).then(value);
+    if (reply === "deferred") return new Promise<Issued>((resolve, reject) => ((release = resolve), (refuse = reject))).then(value);
     if (typeof reply === "string") return Promise.resolve(value({ token: reply }));
     if ("token" in reply) return Promise.resolve(value(reply));
     if ("throws" in reply) throw reply.throws;
@@ -141,6 +146,7 @@ function provider(mode: Mode, ...replies: Reply[]) {
       : {
           openBridge: ({ renew }) => {
             shell.renews.push(renew);
+            shell.openedAt.push(network().clock.now());
             return (!renew && bearer !== null && !bearer.refused ? reuse(bearer) : answer()) as ReturnType<OpenBridge>;
           },
         };
@@ -633,6 +639,83 @@ test("the contract: openBridge is a function, and never beside serverUrl, token 
 });
 
 describe("the bridge transport", () => {
+  /**
+   * Keeps the current session Live for `ms` with a server ping every 30 s,
+   * inside the 45 s liveness window. It stops at each of `stops` too, and
+   * lets the shell's calls run at every stop, so an open is recorded at the
+   * instant it was made.
+   */
+  const alive = async (h: Harness, ms: number, stops: readonly number[] = []): Promise<void> => {
+    const until = h.clock.now() + ms;
+    const pings = Array.from({ length: Math.ceil(ms / 30_000) }, (_, index) => h.clock.now() + (index + 1) * 30_000).filter((at) => at < until);
+    for (const at of [...new Set([...pings, ...stops.filter((stop) => stop > h.clock.now() && stop < until), until])].sort((a, b) => a - b)) {
+      h.clock.advanceTo(at);
+      await tick();
+      if (pings.includes(at)) send(h, { t: "ping", nonce: `n${at}` });
+    }
+  };
+  const MINUTE = 60_000;
+
+  test("the renewal's due time belongs to the bearer: a drop every 10 min still renews a 12 h bearer at ¾ of its life", async () => {
+    const lifetime = 12 * 60 * MINUTE;
+    const shell = provider("bridge", { token: "t1", expiresInMs: lifetime }, "t2");
+    const { h } = mount(shell);
+    await tick();
+    const start = h.clock.now();
+    while (!shell.renews.includes(true) && h.clock.now() < start + lifetime) {
+      welcome(h, 0);
+      await alive(h, 10 * MINUTE, [start + lifetime * RENEW_AT]);
+      if (shell.renews.includes(true)) break;
+      // An ordinary drop keeps the bearer; the reconnect's session reports what is left of it.
+      h.step(step({ step: "drop" }));
+      h.clock.advanceTo(h.clock.now() + 250);
+      await tick();
+    }
+    const renewedAt = shell.openedAt[shell.renews.indexOf(true)] ?? Number.POSITIVE_INFINITY;
+    expect(shell.renews.filter((renew) => !renew).length).toBeGreaterThan(40);
+    expect(renewedAt - start).toBeLessThanOrEqual(lifetime * RENEW_AT);
+  });
+
+  test("a new bearer replaces the due time: after a 4403 the re-minted bearer renews at ¾ of its own life, not the old one's", async () => {
+    const shell = provider("bridge", { token: "t1", expiresInMs: 40_000 }, { token: "t2", expiresInMs: 100_000 }, "t3");
+    const { h } = mount(shell);
+    await tick();
+    welcome(h, 0);
+    h.clock.advanceTo(h.clock.now() + 1_000);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    const reminted = h.clock.now();
+    welcome(h, 0);
+    // t1's renewal would have been due at 30 s.
+    await alive(h, 75_000 - 1);
+    expect(shell.renews).toEqual([false, false]);
+    h.clock.advanceTo(reminted + 75_000);
+    await tick();
+    expect(shell.renews).toEqual([false, false, true]);
+  });
+
+  test("a renewal that fails while a reconnect waits for its session is followed at once by the reconnect's own open", async () => {
+    const shell = provider("bridge", { token: "t1", expiresInMs: 40_000 }, "deferred");
+    const { h, root } = mount(shell);
+    await tick();
+    welcome(h, 0);
+    h.clock.advanceTo(h.clock.now() + 30_000);
+    await tick();
+    expect(shell.renews).toEqual([false, true]);
+    // The socket drops while the renewal is in flight: the reconnect waits for a session, and its own open waits for the call.
+    h.step(step({ step: "drop" }));
+    h.clock.advanceTo(h.clock.now() + 250);
+    await tick();
+    expect(shell.renews).toEqual([false, true]);
+    shell.reject(PANE);
+    await tick();
+    expect(shell.renews).toEqual([false, true, false]);
+    expect(shell.openedAt.at(-1)).toBe(h.clock.now());
+    welcome(h, 0);
+    expect(status(root)).toBe("Live");
+    expect(root.querySelector('[data-testid="renewal-notice"]')?.textContent).toContain(PANE);
+  });
+
   test("openBridge passes renew: false at connect and on every reconnect, and renew: true only from the renewal timer", async () => {
     const shell = provider("bridge", { token: "t1", expiresInMs: 40_000 }, "t2");
     const { h, root } = mount(shell);
@@ -645,12 +728,11 @@ describe("the bridge transport", () => {
     await tick();
     welcome(h, 0);
     expect([shell.renews, shell.calls]).toEqual([[false, false], 1]);
-    // That session reported 39 s left, so the renewal is due ¾ of it after the reconnect.
-    const reconnected = h.clock.now();
-    h.clock.advanceTo(reconnected + Math.floor((40_000 - 1_000) * RENEW_AT) - 1);
+    // That session reported 39 s left, which would be due later than the bearer's own ¾ mark: the bearer's stands.
+    h.clock.advanceTo(40_000 * RENEW_AT - 1);
     await tick();
     expect(shell.renews).toEqual([false, false]);
-    h.clock.advanceTo(reconnected + Math.floor((40_000 - 1_000) * RENEW_AT));
+    h.clock.advanceTo(40_000 * RENEW_AT);
     await tick();
     expect([shell.renews, shell.calls]).toEqual([[false, false, true], 2]);
     welcome(h, 0);
@@ -679,7 +761,8 @@ describe("the bridge transport", () => {
       expect([shell.calls, status(root)]).toEqual([2, "Signing in…"]);
       h.clock.advanceTo(h.clock.now() + 250);
       await tick();
-      expect(shell.calls).toBe(3);
+      // The re-mint after the backoff is no renewal either.
+      expect([shell.renews, shell.calls]).toEqual([[false, false, false], 3]);
       expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t1", "t2", "t3"]);
     });
   }
@@ -730,6 +813,41 @@ describe("the bridge transport", () => {
     expect([shell.renews, shell.calls]).toEqual([[false, false, false], 3]);
     welcome(h, 0);
     expect(status(root)).toBe("Live");
+  });
+
+  test("Connect from Disconnected starts a fresh streak: the next end re-mints at once, with no backoff", async () => {
+    const shell = provider("bridge", "t1", "t2", "t3", "t4");
+    const { h, root } = mount(shell);
+    await tick();
+    // Two ends in a row: the second re-mint waits for the backoff.
+    welcome(h, 0);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    welcome(h, 0);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    expect(shell.calls).toBe(2);
+    click(root, ".connection-bar__toggle");
+    click(root, ".connection-bar__toggle");
+    await tick();
+    expect([shell.renews, shell.calls]).toEqual([[false, false, false], 3]);
+    welcome(h, 0);
+    h.step(step({ step: "token_refused", code: 4403 }));
+    await tick();
+    expect(shell.calls).toBe(4);
+  });
+
+  test("a session held after a Disconnect is closed when the app goes away", async () => {
+    const shell = provider("bridge", "deferred");
+    const { h, root } = mount(shell);
+    await tick();
+    click(root, ".connection-bar__toggle");
+    shell.resolve("late");
+    await tick();
+    expect(h.net.closes).toEqual([]);
+    dispose?.();
+    dispose = undefined;
+    expect(h.net.closes.map((close) => [close.code, close.reason])).toEqual([[1000, "disconnect"]]);
   });
 
   test("a session held after a Disconnect that closes before Connect is dropped: Connect opens another on the same bearer", async () => {
@@ -819,15 +937,13 @@ for (const mode of MODES) {
       }
       expect(tokens.calls).toBe(1);
       expect(delays.every((ms) => ms <= MAX_TIMER_DELAY)).toBe(true);
-      if (mode === "bridge") {
-        // Nothing keeps this socket alive, so the bridge reconnects: each session on the same bearer arms the renewal at ¾ of what is left, never before `due`.
-        const latest = tokens.lifetimes.at(-1);
-        expect(tokens.lifetimes.length).toBeGreaterThan(1);
-        expect(latest === undefined ? null : latest.at + Math.floor(latest.expiresInMs * RENEW_AT) >= due).toBe(true);
-      } else if (due - h.clock.now() <= 20 * MAX_TIMER_DELAY) {
+      // Nothing keeps this socket alive, so a bridge reconnects all along on the same bearer, whose due time stands.
+      if (mode === "bridge") expect(tokens.lifetimes.length).toBeGreaterThan(1);
+      if (due - h.clock.now() <= 20 * MAX_TIMER_DELAY) {
         h.clock.advanceTo(due);
         await tick();
         expect(tokens.calls).toBe(2);
+        if (mode === "bridge") expect(tokens.renews.at(-1)).toBe(true);
       }
     });
   }
@@ -850,6 +966,57 @@ for (const mode of MODES) {
   });
 });
 }
+
+describe("a bridged connection", () => {
+  /** A bridged connection on a fresh harness, and a session factory on its network. */
+  function bridged() {
+    const h = new Harness();
+    h.conn = new WireConnection({ bridged: true, client: { name: "fixture", version: "1" }, clock: h.clock, random: () => 0, store: h.store });
+    const shell = provider("bridge");
+    shell.net = h.net;
+    return { h, shell, open: (token: string) => shell.open(token) };
+  }
+
+  test("a held session replaced by another is closed", () => {
+    const { h, open } = bridged();
+    h.connection.setSocket(open("t1"));
+    h.connection.setSocket(open("t2"));
+    expect(h.net.closes.map((close) => [close.code, close.reason])).toEqual([[1000, "replaced"]]);
+    h.connection.connect();
+    expect(frames(h, "hello").map((frame) => frame["token"])).toEqual(["t2"]);
+  });
+
+  test("a late close from an abandoned session is ignored: the session that replaced it stays Live", () => {
+    const { h, open } = bridged();
+    h.connection.setSocket(open("t1"));
+    h.connection.connect();
+    send(h, WELCOME);
+    h.connection.disconnect();
+    h.connection.setSocket(open("t2"));
+    h.connection.connect();
+    send(h, WELCOME);
+    expect(h.connection.state).toBe("Live");
+    h.net.previous().serverClose(4403, "");
+    h.net.previous().drop();
+    expect(h.connection.state).toBe("Live");
+  });
+
+  test("a reconnect's session goes to the waiting attempt directly: the connection never passes through Disconnected", async () => {
+    const { h, shell, open } = bridged();
+    h.connection.setSocket(open("t1"));
+    h.connection.connect();
+    send(h, WELCOME);
+    const states: string[] = [];
+    h.connection.onTransition((state) => states.push(state));
+    const config = shell.config as { readonly openBridge: OpenBridge };
+    driveBridge(h.connection, config.openBridge, h.clock, () => 0, () => undefined);
+    h.step(step({ step: "drop" }));
+    h.clock.advanceTo(h.clock.now() + 250);
+    await tick();
+    expect(shell.renews).toEqual([false]);
+    expect(states).toEqual(["Reconnecting", "Connecting", "Hello"]);
+  });
+});
 
 test("a principal change's drop notice clears at the next acked command", () => {
   const h = new Harness();
