@@ -908,6 +908,31 @@ Sync uses the selected `CLAUDE_CONFIG_DIR` and `CODEX_HOME` profiles (or their d
 
 Sync reports client, installed binary and server drift but does not perform a server handoff or stop sessions. Use `flk server live-handoff` when needed. Running agents need `flk agent restart` or an MCP reconnect to load the new bridge and tool catalog.
 
+## Structured session grants
+
+```bash
+flk structured grants list <agent_id> [--show-input]
+flk structured grants revoke <agent_id> <generation> <request_id> <request_seq>
+```
+
+These local-operator commands inspect and revoke a live structured agent's exact
+`allow_always` grants. List returns the generation and originating decision
+handles, tool, a short SHA-256 fingerprint and UTF-8 byte length of the canonical
+input key, and installation audit time. The full key is omitted by default.
+`--show-input` explicitly includes it (socket equivalent: `show_input: true`).
+**The full key can contain secrets from tool input, and CLI output may land in
+terminal scrollback or logs.** Hash and length are comparison metadata; use the
+originating request handle and generation for revoke. A stale generation or
+unknown handle is refused with a typed error. Revoke responses stay redacted.
+Results use the socket response JSON, including `revoked` on success. `--json`
+preserves typed refusals and their registered CLI exits. Non-operators receive
+`operator_only` (exit 13).
+
+Revocation prevents a pending decision from reinstalling the grant. An already
+admitted call may still complete once; the next matching request prompts. Grants
+are not persistent presets and disappear with the runtime. See the
+[socket grant contract](../socket-api/#live-structured-session-grants).
+
 ## MCP server
 
 ```bash
