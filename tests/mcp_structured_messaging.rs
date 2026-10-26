@@ -252,13 +252,35 @@ fn structured_to_structured_to_reply() {
     exchange(node, &mut sender, node, &mut recipient, "native-native");
 }
 #[test]
-#[ignore = "blocked on #2474"]
 fn remote_structured_recipient_replies_to_the_other_node() {
-    // TODO(#2474): enable with bounded native-peer discovery readiness.
     let fleet = setup(NODES);
     let a = fleet.node("nodea");
     let b = fleet.node("nodeb");
     let mut sender = Bridge::start(b, "terminal", false);
     let mut recipient = Bridge::start(a, "native", true);
+    let deadline = Instant::now() + LIMIT;
+    // Explicit bounded poll: agent.list/peers.summary have no wait parameter,
+    // and peer-summary updates notify the renderer, not the EventHub.
+    // mesh.routes_changed tracks topology, not agent-directory changes.
+    // Poll only discovery within LIMIT; submit the message once afterwards.
+    loop {
+        let listing = sender.tool("flock_agent_list", json!({}));
+        let expected_fleet = format!("MCP listing must contain a fleet array: {listing}");
+        if let Some(row) = listing["fleet"]
+            .as_array()
+            .expect(&expected_fleet)
+            .iter()
+            .find(|row| row["agent_id"] == recipient.agent)
+        {
+            assert_eq!(row["runtime"], "structured");
+            assert_eq!(row["local"], false);
+            assert!(row.get("pane_id").is_none());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remote native discovery absent: {listing}"
+        );
+    }
     exchange(b, &mut sender, a, &mut recipient, "remote-native");
 }
