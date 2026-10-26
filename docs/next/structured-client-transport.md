@@ -172,7 +172,9 @@ bound IPv4 authority (normalizing HTTP's default port only). API routes require
 Origin; top-level GUI navigation may omit it. Forwarded headers grant nothing.
 The GUI index carries CSP with self-only default, script and style sources,
 self plus the exact WebSocket URL for connections, and no objects, base URL,
-framing or form actions. There is no generated configuration script.
+framing or form actions; every other response carries a deny-all policy
+(see [GUI bundle hosting](structured-gui-hosting.md#document-security-policy),
+#1848). There is no generated configuration script.
 
 Startup runs `tailscale serve status --json` off the async executor, bounded at
 five seconds and 64 KiB. Any serve or funnel configuration targeting the bound

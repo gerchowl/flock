@@ -54,6 +54,49 @@ Requests without browser metadata are allowed when Host matches. This minimal
 listener does not support hostname aliases, proxy origins or TLS termination.
 Serving the static bundle does not grant token scopes or mutation authority.
 
+## Document security policy
+
+The entry document (`/` and `/index.html`) sends one enforcing
+`Content-Security-Policy` on GET, HEAD and conditional 304 responses (#1848):
+
+```text
+default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://<listener-authority>/v1/ws; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'
+```
+
+The policy lives in one file, `src/web/gui/document-policy.txt`, with
+`LISTENER` replaced by the actual numeric listener address and port, never the
+request's Host or Origin. The explicit WebSocket source supplements `'self'`
+for browsers whose same-origin matching does not include WebSockets. `'self'`
+already covers the client's same-origin `POST /v1/client/exchange`. An IPv6
+router omits the extra source, because literal IPv6 addresses are invalid CSP
+host sources; it relies on CSP3's same-host/port WebSocket matching and fails
+closed on browsers without it. The mounted listener is IPv4-only today.
+
+The production Vite bundle uses external same-origin module scripts and one
+stylesheet, and needs no `unsafe-inline`, `unsafe-eval`, hash or nonce. Solid
+sets dynamic styles through the CSSOM, which `style-src` does not restrict.
+The fixture build inlines its bundle and is not a hosting input. A shell that
+injects configuration must do so outside the document (the Tauri shell uses an
+initialization script under its own policy, `desktop/src/config.rs`); `flk`
+serves no configuration script. Artifact frames (ADR-0038 §7) are not served
+yet; when they are, this policy needs an explicit `frame-src`.
+
+The router sets the policy only on the entry document. The mounting client
+listener (#1894) adds `default-src 'none'; base-uri 'none'; form-action 'none';
+frame-ancestors 'none'` to every other response, API replies, assets and
+refusals included, so none of them can act as a page that loads or embeds
+anything.
+
+`web/client/e2e/csp.test.ts` (run by `just client-check`) serves the production
+build with this exact policy in Chromium. The fixture workbench and the live
+sign-in path (code exchange, then the `/v1/ws` hello) must run with no
+`securitypolicyviolation`; an inline script, an inline style and a WebSocket to
+another loopback port must be blocked, and that port must see no request.
+
+The [CSP3 source-matching rules](https://www.w3.org/TR/CSP3/#match-url-to-source-expression)
+define WebSocket matching; [MDN's connect-src reference](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/connect-src)
+notes the browser difference for `'self'`.
+
 ## Paths and caching
 
 - `/` and `/index.html` serve the entry document with `Cache-Control: no-cache`
