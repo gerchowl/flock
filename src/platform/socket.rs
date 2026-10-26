@@ -45,15 +45,27 @@ pub(crate) fn read_ready(
 }
 
 /// Open a permanent, private ownership file without following symbolic links.
+/// Repair umask-restricted permissions through the new descriptor only. Existing
+/// files remain unchanged and must pass the caller's ownership/mode validation.
 pub(crate) fn open_owner(path: &std::path::Path) -> io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut options = std::fs::OpenOptions::new();
+    options
         .read(true)
         .write(true)
-        .create(true)
+        .create_new(true)
         .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    match options.open(path) {
+        Ok(file) => {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            Ok(file)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            options.create_new(false).open(path)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Nonblocking exclusive ownership, shared across duplicated handoff descriptors.
