@@ -1,3 +1,4 @@
+mod native_inbox;
 use super::*;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -3031,8 +3032,9 @@ fn failed_migration_reports_path_and_hint() {
         .to_string();
     assert!(
         error.contains(&format!(
-            "mail_store_unavailable: migrating {} (schema v11 -> v12) failed:",
-            f.path.display()
+            "mail_store_unavailable: migrating {} (schema v11 -> v{}) failed:",
+            f.path.display(),
+            schema::VERSION
         )),
         "{error}"
     );

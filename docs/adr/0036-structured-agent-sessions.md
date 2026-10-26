@@ -3731,6 +3731,29 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
 - `same-site`, duplicate headers, lookalike shell origins and non-WS paths
   keep their existing refusal treatment.
 
+### Amendment: Recipient tool-inbox projection (#2363)
+
+The internal projection uses the same admitted MessageKey, body and native
+agent/session binding. It never admits another input, writes stdin, changes a
+custody outcome or renews a reply deadline. Its first harness-delivery observation
+starts a persisted read window. The caller supplies its retention policy;
+#2452 introduces `msg.inbox_retention_ms` (default 24 hours) with its actual
+harness-delivery consumer.
+Idle sweeps and non-consuming reads project logical time without writing the
+clock or opening a write transaction; only acknowledgements persist changes.
+Delivery replay, custody settlement and restart cannot renew that window. Queue
+journal checkpoint/pruning cannot delete this independently retained projection.
+Unread projected bodies pin custody storage until read or expiry acknowledgement;
+normal byte quotas still charge the retained body. Sweep/read acknowledges expired
+entries once and emits the existing `dropped_undeliverable` event; mixed bulk reads
+return live entries once. There is no selector or partial-error envelope. Invalid
+persisted envelopes are skipped, logged and preserved, without consuming them.
+This foundation adds no public read surface: #2452 owns lease/caller resolution,
+queue-delivery binding and CLI/socket/MCP wiring. It must supply actual harness
+delivery, not custody admission, and decode payloads before consumption. Existing
+queue snapshots and custody labels are not backfilled as fresh delivery. Existing
+custody expiry cannot restore an already deleted body or extend reply recovery.
+
 ### Amendment: Welcome capability grants (#2461)
 
 Clarification of §5's protocol gating and §6's operation advertisement:
