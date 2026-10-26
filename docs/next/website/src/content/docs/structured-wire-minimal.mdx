@@ -193,3 +193,23 @@ slots and exact grants are not restored. Legacy opens without `request_seq`
 use their durable stream position for the recovery close; an old close without
 a handle matches by ID. Unknown records remain untouched, and invalid permission
 headers are logged and preserved rather than failing the entire recovery scan.
+
+
+## Unsupported command verbs
+
+After authentication, an otherwise valid, bounded `cmd` frame with an unknown
+`verb` is refused for that command with
+`server_version_gap`, following ADR-0036 §5 protocol gating. The existing
+registered code has one retry class, `after_handoff`, and exit 78. The ack echoes
+`cmd_id`, sets `ok: false`, and carries the ADR-0029 error envelope in `error`;
+there is no `result` or top-level `code` field:
+
+```json
+{"t":"ack","cmd_id":"unsupported-one","ok":false,"error":{"code":"server_version_gap","message":"command refused: server_version_gap","exit":78,"retry":"after_handoff"}}
+```
+
+The refusal does not close the connection or submit the unsupported command.
+The next supported command or subscription can use the same socket. Repeating
+an unknown verb on the same server does not make it supported; use a compatible
+server/version before retrying. This command-level refusal does not change the
+existing protocol-close rules for malformed frames or invalid session traffic.

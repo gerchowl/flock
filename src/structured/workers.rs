@@ -635,8 +635,7 @@ impl Workers {
         self.history.retain(|id, (generation, _)| {
             registry.get(id).is_some_and(|(_, _, g)| g == *generation)
         });
-        // Keep committed completions after metadata removal; uncertain ownership survives.
-
+        // Keep worker entries with committed completions or uncertain ownership after metadata removal.
         self.entries.retain(|id, worker| {
             worker.join_finished();
             worker.thread.is_some()

@@ -20,6 +20,53 @@ permission request, creating a grant, writing an audit or sending harness input.
 The normalized message is used in both the decision audit and deny response.
 See the [generated structured wire contract](../structured-wire-minimal/).
 
+## Live structured session grants
+
+The local operator can inspect and revoke exact `allow_always` grants without
+ending a structured session. These methods are socket/CLI only; they have no
+WebSocket or MCP management verb. Agent, lease and token callers are refused
+with `operator_only` (exit 13). This uses the existing local-operator admission
+checks and retains operator-mode UID/process-detachment limits (#1177, #1629).
+
+`structured.grants.list {"agent_id":"…"}` returns
+`result.type: "structured_grants"`, the exact `agent_id`, runtime `generation`,
+and `grants`. Each installed grant contains `request_id`, `request_seq`, `tool`,
+`canonical_input_key_hash`, `canonical_input_key_bytes` and `installed_ms`
+(unsigned 64-bit Unix milliseconds from its decision installation audit).
+By default the full `canonical_input_key` field is omitted, even for the operator.
+The fingerprint is the first 16 lowercase hexadecimal SHA-256 digits of the key;
+the length counts its UTF-8 bytes. These are comparison metadata, not grant
+identity or an authorization handle. Revocation still uses the originating
+request handle and runtime generation.
+
+An explicit `structured.grants.list {"agent_id":"…", "show_input":true}` returns
+`canonical_input_key` as well. **The full key can contain secrets from tool input.**
+Opt in only when disclosure is intended; CLI output can enter terminal
+scrollback and logs. Hash and length also disclose comparison metadata. The key
+is canonical JSON `[tool_name, input]`: object keys are recursively sorted;
+arrays and scalar values remain exact. Pending installs are not listed. A runtime holds at most 16 installed/reserved exact keys
+(`MAX_GRANTS`). Names and pane IDs are not accepted as grant identities.
+
+`structured.grants.revoke` takes `agent_id`, `generation`, `request_id` and
+`request_seq`. Use the generation and originating decision handle from the list
+(or the originating permission decision for a pending install). Success returns
+the same redacted result shape with remaining `grants` (no full keys) and a
+`revoked` object containing
+`request_id` and `request_seq`. A stale generation returns
+`permission_grant_stale_generation`; an unknown or already revoked handle returns
+`permission_grant_unknown` (both exit 1, retry `never`). Refresh the list rather
+than replaying a revoke. A runtime that has ended returns `agent_not_found`;
+contention with permission bookkeeping returns `session_busy`.
+
+Revocation removes the exact key and advances its revocation epoch under the
+same Book lock used by permission decisions. A decision admitted before the
+revoke may still allow that one call, but cannot reinstall the grant afterward.
+The next matching request prompts again. Revocation does not undo tool effects
+or recall an already admitted response. Grants remain memory-only and disappear
+when the runtime ends. Successful revocation emits the persisted global event
+`structured_grant_revoked` with `agent_id`, `generation`, `request_id`,
+`request_seq`, and the authenticated revoker `principal`.
+
 ## Live handoff
 
 `server.live_handoff` transfers the running server's panes to a replacement executable. Optional params are `import_exe` (executable path), `expected_protocol`, `expected_version`, and `skip_undrained` (default `false`). A `handoff_failed` response carries its stable cause category in `error.data.kind`: `import_refused`, `broken_pipe`, `connection_reset`, `invalid_input`, or `other`. The category describes the cause, not the ownership-commit stage. Treat every category, including unknown future values, as a failure and inspect `message` for diagnostics.
@@ -1336,3 +1383,33 @@ skips an unknown event kind, while preserving the global cursor high-water.
 Adding, editing, reordering or checkpointing items does not emit lifecycle
 facts. Recovery from `delivered` to `held` does. These facts use the existing
 event-log retention and rotation and are not relayed over the mesh.
+
+
+## App-session credentials
+
+A native operator console can mint a process-bound bearer with
+`{"id":"mint","method":"client.app.mint","params":{}}`. The response is
+`{"id":"mint","result":{"type":"client_token_issued","issued":{"info":{"name":"app:…","principal":"…","scopes":["read","send","answer","operate"]},"token":"…"}}}`.
+The server chooses all scopes and identity. Supplying scopes, PID, origin port
+or any other parameter returns `invalid_params`.
+
+Minting requires LocalOperator: the socket's kernel-attested operator UID and
+PID, no flk pane (including a shell pane) in its ancestry, and no mesh edge or
+agent lease. The exit watch is armed before the accepted process start identity
+is rechecked. Unknown operator evidence returns `operator_only`; changed birth
+or an unavailable exit watch returns `peer_process_changed` (never retry stale
+connection evidence). The native process must mint directly: a short-lived
+subprocess's exit revokes its credential.
+
+The credential lives only in server memory, is not listed among file tokens,
+and grants exactly `read`, `send`, `answer`, `operate` for a fixed 12 hours.
+Renewal issues an independent credential. There are at most 128 live entries;
+capacity/contention returns `session_busy`, and storage failures return
+`internal_error`. Store the bearer only in memory and never log it.
+
+Use the bearer in the structured WebSocket `hello`. Idle sockets close with
+the existing authentication close 4403 at expiry, process exit, revocation,
+restart or handoff; there are no new authentication error names. A command that detects revocation receives its
+`auth_revoked` error acknowledgement before closure. Persistent file tokens
+are unaffected. The existing same-UID secret-extraction risk remains (#1177).
+Shell-origin admission is a separate #2442 slice.

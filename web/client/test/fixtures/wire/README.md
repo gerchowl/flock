@@ -121,10 +121,12 @@ They validate the script assertions; they do not execute G3. G3 must consume the
 same scripts with its actual client, fake transport and virtual clock.
 
 
-Every script header has a machine-readable covers list containing s7-min, s7,
-or both when the script is required by both slices.
-S7-min (#1746) selects clean, agent-gap, agent-send, ping-pong, token-refused,
-token-revoked, heartbeat-missed, fleet-lite and unknown-subscription: hello/welcome/token, agent/<id> cursor replay with synced and gap
+The JSONL files are the authored fixture source; `just gen-ts` derives the
+TypeScript contracts and examples from them. Every header has a machine-readable
+`covers` list containing `s7-min`, `s7`, or `client-only`. Multi-label headers
+remain selected whenever they contain the relevant server slice.
+S7-min (#1746) selects clean, agent-gap, agent-send, permission-decision,
+ping-pong, token-refused, token-revoked, heartbeat-missed and unknown-subscription: hello/welcome/token, agent/<id> cursor replay with synced and gap
 (no entity snapshot), agent.send with ack, ping/pong, 4401/4403 closes and
 a protocol close (1002) for a never-opened subscription ID. These
 scripts use agent streams or fleet and only agent.send/agent.decide commands.
@@ -136,6 +138,11 @@ the checked-in inventory requires the selected slice labels explicitly.
 The generator also emits FixtureExamples.ts from every JSONL line as a literal
 checked against FixtureLine. The strict ts-check recipe compiles that artifact;
 the Rust drift test ensures it cannot silently lag behind the scripts.
+
+The `fleet-lite` script is explicitly `client-only`: its activity-only upsert
+has no server producer until #2243. Server conformance selects no client-only
+fixture and uses `tests/fixtures/structured-wire/fleet-server.jsonl` for fleet
+membership and permission handles. No replacement activity value is invented.
 
 The fleet-lite script uses the §5a inline checkpoint: gap with snapshot_to,
 full FleetAgentRow upserts, then synced. Live fleet.upsert/fleet.remove payloads
