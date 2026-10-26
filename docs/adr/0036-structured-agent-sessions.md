@@ -4108,3 +4108,21 @@ The final descriptor close releases the lock on shutdown or process death.
 There is deliberately no explicit `LOCK_UN`: that would release the shared lock
 while an importing process still owns it. Ownership guarantees apply to
 listeners implementing this protocol; older releases do not hold these locks.
+
+
+#### Unix HTTP listener foundation (#2500 PR3a)
+
+`local_listener::Listener` reuses `client_listener::serve` with a Unix stream
+and kernel-captured peer credentials. `prepare` does not accept HTTP requests;
+`activate` is explicit, and `stop` cancels the owned acceptor and HTTP tasks.
+The containing directory must be real, operator-owned and not writable by
+other users; its ancestor chain is trusted as for the API namespace. The
+socket shares the API's mode `0600` constant and the ownership protocol above.
+`owner`, `SocketOwner::duplicate` and `SocketOwner::take` retain the same locked
+open description through descriptor transfer, rebind and rollback. `unlink`
+and destruction compare the recorded inode, so an old exporter cannot unlink
+an importer's replacement socket. This slice adds no production call to these
+listener methods and changes neither reachable endpoints nor TCP authentication.
+The following activation slice owns the server handoff manifest extension,
+LocalOperator admission, independent pre-auth pools and the atomic TCP
+app-session refusal.

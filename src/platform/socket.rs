@@ -4,6 +4,27 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
+/// Require a real, operator-owned socket directory that other users cannot modify.
+/// Callers supply a trusted ancestor chain, as for the API socket namespace.
+#[cfg(feature = "web")]
+pub(crate) fn check_listener_parent(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("socket has no parent"))?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !metadata.is_dir()
+        || metadata.uid() != super::peer::effective_uid()
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket directory must be operator-owned and exclude other writers",
+        ));
+    }
+    Ok(())
+}
+
 /// Wait for one readable chunk, including data queued before a peer's hangup.
 /// The caller recomputes its absolute deadline after interrupted/spurious
 /// readiness or a bounded poll timeout. Receive is nonblocking so readiness
