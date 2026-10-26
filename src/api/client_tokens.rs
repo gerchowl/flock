@@ -32,7 +32,7 @@ impl Drop for Bearer {
 /// Public token metadata, never containing a bearer or digest.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TokenInfo {
-    /// Lowercase operator-assigned client name.
+    /// Operator-assigned file name or server-assigned app-session label.
     pub name: String,
     /// Opaque identity, fresh on every issuance.
     pub principal: String,
@@ -81,4 +81,12 @@ pub struct RemoveParams {
     pub name: Option<String>,
     /// Hexadecimal filename identifier reported by list.
     pub entry: Option<String>,
+}
+
+/// Server-chosen scopes and process identity: all caller-supplied fields are refused.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MintParams {
+    /// Captured only to return typed invalid_params, never used as authority or grants.
+    #[serde(flatten)]
+    pub(crate) fields: std::collections::BTreeMap<String, serde_json::Value>,
 }

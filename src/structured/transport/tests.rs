@@ -891,7 +891,7 @@ fn input_line_does_not_acknowledge_an_unsettled_book_after_worker_failure() {
                 )
                 .unwrap();
             assert!(book.begin_answer(&answer.id, answer.request_seq));
-            book.audited(&answer);
+            book.audited(&answer, 100);
             assert!(book.waiting().is_empty());
             assert!(book.blocked());
             answer
@@ -3042,7 +3042,7 @@ fn seed_permission_crash(root: &SessionConfigDir, automatic: bool) -> u64 {
         let answer = book.prepare(&owner(), &args).unwrap();
         assert!(book.begin_answer(&answer.id, answer.request_seq));
         audits.push((*answer.audit).clone());
-        book.audited(&answer);
+        book.audited(&answer, 100);
         book.written(answer);
         book.resume_after(audits.len() as u64);
     }
@@ -3268,4 +3268,92 @@ fn recovery_preserves_legacy_unknown_invalid_and_stdout_records() {
     let (transport, output, _input) = start(&root);
     end_restarted_transport(&transport, output);
     assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn operator_revocation_reaches_the_real_book_and_the_next_request_prompts() {
+    let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+    let (transport, mut output, mut input) = start(&root);
+    transport.try_submit(&user("first")).unwrap();
+    assert_eq!(input_line(&transport, &mut input), user("first"));
+    permission(&mut output, "grant-origin");
+    accepted(&transport);
+    receive(&transport);
+    receive(&transport);
+    let seq = permission_handle(&transport, "grant-origin");
+    call_decide(
+        &transport,
+        &owner(),
+        &decide("grant-origin", permissions::Decision::AllowAlways, seq),
+    )
+    .unwrap();
+    assert_eq!(
+        input_line(&transport, &mut input)["response"]["response"]["behavior"],
+        "allow"
+    );
+    receive(&transport);
+    grant_request(
+        &mut output,
+        "other-grant",
+        "Bash",
+        serde_json::json!({"command":"SECRET_2416_remaining_grant"}),
+        None,
+    );
+    opened(&transport);
+    let second = close_with(
+        &transport,
+        &mut input,
+        "other-grant",
+        permissions::Decision::AllowAlways,
+    );
+    assert_eq!(second["response"]["response"]["behavior"], "allow");
+    let handle = transport.input_handle();
+    let grants = wait(&transport, || {
+        match handle.session_grants(&Principal::Operator, None, false) {
+            Err(ErrorCode::SessionBusy) => None,
+            result => Some(result.unwrap()),
+        }
+    });
+    assert_eq!(grants.len(), 2);
+    let original = grants
+        .iter()
+        .find(|grant| grant.handle.request_id == "grant-origin")
+        .unwrap()
+        .handle
+        .clone();
+    for principal in [
+        Principal::Agent("fixture-agent"),
+        Principal::Lease("fixture-agent"),
+        owner(),
+    ] {
+        assert_eq!(
+            handle
+                .session_grants(&principal, Some(&original), true)
+                .unwrap_err(),
+            ErrorCode::OperatorOnly
+        );
+    }
+    let remaining = wait(&transport, || {
+        match handle.session_grants(&Principal::Operator, Some(&original), true) {
+            Err(ErrorCode::SessionBusy) => None,
+            result => Some(result.unwrap()),
+        }
+    });
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].handle.request_id, "other-grant");
+    assert!(remaining[0].canonical_input_key.is_none());
+    assert!(!serde_json::to_string(&remaining)
+        .unwrap()
+        .contains("SECRET_"));
+    permission(&mut output, "after-revoke");
+    receive(&transport);
+    receive(&transport);
+    assert_eq!(waiting_ids(&transport), vec!["after-revoke"]);
+    private_fs::set_nonblocking(&input).unwrap();
+    assert_eq!(
+        input.read(&mut [0; 1]).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(output);
+    reader_done(&transport).unwrap();
 }
