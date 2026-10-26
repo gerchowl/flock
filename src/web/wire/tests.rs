@@ -157,7 +157,7 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-pub(crate) struct Socket(pub(crate) tokio::net::TcpStream);
+pub(crate) struct Socket<S = tokio::net::TcpStream>(pub(crate) S);
 #[derive(Debug)]
 pub(crate) enum Received {
     Text(Value),
@@ -186,6 +186,8 @@ impl Socket {
         })
         .await
     }
+}
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Socket<S> {
     pub(crate) async fn send(&mut self, value: Value) {
         self.raw(value.to_string().as_bytes(), 0x81).await;
     }
@@ -1491,3 +1493,5 @@ fn overlapping_read_admissions_keep_subscriptions_and_socket_alive() {
 }
 
 mod app_sessions;
+
+mod native;

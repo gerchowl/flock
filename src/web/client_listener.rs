@@ -55,29 +55,45 @@ where
         while clients.try_join_next().is_some() {}
         let (socket, peer) = accept_next(&mut accept, clock.as_ref(), &health).await?;
         let Ok(permit) = slots.clone().try_acquire_owned() else {
+            http(
+                socket,
+                Router::new().fallback(|| async {
+                    super::local_admission::refusal(
+                        crate::api::error_code::ErrorCode::PreauthCapacity,
+                    )
+                }),
+            )
+            .await;
             continue;
         };
         let service = router.clone().layer(Extension(ConnectInfo(peer)));
         clients.spawn(async move {
             let _permit = permit;
-            let mut builder = hyper::server::conn::http1::Builder::new();
-            builder
-                .half_close(true)
-                .header_read_timeout(HTTP_ADMISSION_DEADLINE)
-                .timer(TokioTimer::new());
-            let _ = tokio::time::timeout(
-                HTTP_ADMISSION_DEADLINE,
-                builder
-                    .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
-                    .with_upgrades(),
-            )
-            .await;
+            http(socket, service).await;
         });
     }
 }
+async fn http<S>(socket: S, service: Router)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .half_close(true)
+        .header_read_timeout(HTTP_ADMISSION_DEADLINE)
+        .timer(TokioTimer::new());
+    let _ = tokio::time::timeout(
+        HTTP_ADMISSION_DEADLINE,
+        builder
+            .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+            .with_upgrades(),
+    )
+    .await;
+}
 /// Prepared before handoff ready; only run activates acceptance, after commit.
 pub(crate) struct Listener {
-    pub(crate) socket: TcpListener,
+    pub(crate) socket: Option<TcpListener>,
+    local: super::local_listener::Listener,
     pub(crate) health: Health,
     core: Core,
     prepared: Option<(tokio::net::TcpListener, Router)>,
@@ -97,19 +113,29 @@ impl Listener {
         codes: Codes,
         data: PathBuf,
         inherited: Option<TcpListener>,
+        local: (PathBuf, Option<crate::ipc::SocketOwner>),
         health: Health,
         wake: Arc<tokio::sync::Notify>,
         credentials: crate::structured::permissions::auth::tokens::server::Owner,
     ) -> io::Result<Option<Self>> {
+        let core = Core::new_shared(data.clone(), wake, credentials).await?;
+        let local =
+            super::local_listener::Listener::prepare(local.0, local.1, core.local_router())?;
         let Some(bind) = bind else {
-            return if inherited.is_none() {
-                Ok(None)
-            } else {
-                Err(io::Error::new(
+            if inherited.is_some() {
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     InvalidListener::Unconfigured,
-                ))
-            };
+                ));
+            }
+            return Ok(Some(Self {
+                health,
+                socket: None,
+                local,
+                core,
+                prepared: None,
+                task: None,
+            }));
         };
         crate::platform::client_listener::require_loopback(bind)?;
         if bind.ip() != Ipv4Addr::LOCALHOST {
@@ -138,7 +164,6 @@ impl Listener {
             .map_err(io::Error::other)??;
         socket.set_nonblocking(true)?;
         let acceptor = tokio::net::TcpListener::from_std(socket.try_clone()?)?;
-        let core = Core::new_shared(data.clone(), wake, credentials).await?;
         let csp = HeaderValue::from_str(&format!("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws://{actual}/v1/ws; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")).map_err(io::Error::other)?;
         let router = core
             .router()
@@ -147,11 +172,30 @@ impl Listener {
             .layer(middleware::from_fn_with_state((actual, csp), guard));
         Ok(Some(Self {
             health,
-            socket,
+            socket: Some(socket),
+            local,
             core,
             prepared: Some((acceptor, router)),
             task: None,
         }))
+    }
+    /// Transfer ownership without ever releasing the permanent local listener lock.
+    pub(crate) fn local_owner(&self) -> crate::ipc::SocketOwner {
+        self.local.owner()
+    }
+    /// Retain ownership while the importer binds its replacement pathname.
+    pub(crate) fn unlink_local(&self) -> io::Result<()> {
+        self.local.unlink()
+    }
+    /// Rollback rebinds under the same guard; the old inode cannot remove the new one.
+    pub(crate) fn restore_local(&mut self, path: PathBuf) -> io::Result<()> {
+        self.local = super::local_listener::Listener::prepare(
+            path,
+            Some(self.local.owner()),
+            self.core.local_router(),
+        )?;
+        self.local.activate();
+        Ok(())
     }
     /// Run history admission only on the application owner.
     pub(crate) fn service(
@@ -168,6 +212,7 @@ impl Listener {
     }
     /// Start only inside the owning server loop, after handoff commit if importing.
     pub(crate) fn activate(&mut self) {
+        self.local.activate();
         if let Some((socket, router)) = self.prepared.take() {
             self.health.publish(Status::Listening);
             let health = self.health.clone();
@@ -182,6 +227,7 @@ impl Listener {
             task.abort();
             let _ = task.await;
         }
+        self.local.stop().await;
         self.core.shutdown().await.map_err(io::Error::other)
     }
 }

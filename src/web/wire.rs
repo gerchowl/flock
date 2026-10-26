@@ -9,21 +9,15 @@ use crate::structured::permissions::auth::tokens::TokenStore;
 use crate::{
     api::client_tokens::{Bearer, Scope},
     structured::permissions::auth::tokens::{
-        server::{Owner, Session, Store},
+        server::{Owner, PeerAdmissionError, Session, Store},
         TokenError,
     },
     structured_wire::*,
 };
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::get,
-    Router,
-};
+use axum::{extract::State, response::Response, routing::get, Extension, Router};
 use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     collections::HashMap,
     future::Future,
@@ -73,7 +67,8 @@ struct Shared {
     epoch: String,
     clock: Arc<dyn Clock>,
     slots: Arc<Semaphore>,
-    hellos: Arc<Semaphore>,
+    hellos: [Arc<Semaphore>; 2],
+    admission: super::local_admission::Client,
     clients: Mutex<HashMap<u64, Client>>,
     next: AtomicU64,
     stop: watch::Sender<bool>,
@@ -92,11 +87,13 @@ impl Shared {
 struct Lease {
     shared: Arc<Shared>,
     id: u64,
+    live: Arc<AtomicBool>,
     _permit: OwnedSemaphorePermit,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
         if let Ok(mut clients) = self.shared.clients.lock() {
+            self.live.store(false, Ordering::Release);
             clients.remove(&self.id);
         }
     }
@@ -106,6 +103,7 @@ impl Drop for Lease {
 pub(crate) struct Core {
     owner: crate::structured::history::owner::Owner,
     command_owner: commands::Owner,
+    admission: super::local_admission::Owner,
     shared: Arc<Shared>,
 }
 impl Drop for Core {
@@ -161,10 +159,12 @@ impl Core {
         let (stop, _) = watch::channel(false);
         let fleet = fleet::Client::new(wake.clone(), stop.subscribe());
         let (commands, command_owner) = commands::channel(wake.clone());
+        let (admission, admission_owner) = super::local_admission::channel(wake.clone());
         let (histories, owner) = crate::structured::history::owner::channel(wake);
         Ok(Self {
             owner,
             command_owner,
+            admission: admission_owner,
             shared: Arc::new(Shared {
                 histories,
                 commands,
@@ -173,7 +173,8 @@ impl Core {
                 epoch,
                 clock,
                 slots: Arc::new(Semaphore::new(CONNECTIONS as usize)),
-                hellos: Arc::new(Semaphore::new(PENDING_HELLOS)),
+                hellos: std::array::from_fn(|_| Arc::new(Semaphore::new(PENDING_HELLOS))),
+                admission,
                 clients: Mutex::new(HashMap::new()),
                 next: AtomicU64::new(1),
                 stop,
@@ -192,10 +193,25 @@ impl Core {
     }
     /// Mount only behind S2b-mount's loopback, Host/Origin and funnel guards.
     pub(crate) fn router(&self) -> Router {
-        Router::new().route("/v1/ws", get(upgrade).with_state(self.shared.clone()))
+        self.endpoint(false)
+    }
+    /// Same protocol and global caps, with a separate native pre-auth pool and kernel proof.
+    pub(crate) fn local_router(&self) -> Router {
+        self.endpoint(true)
+            .layer(axum::middleware::from_fn_with_state(
+                self.shared.admission.clone(),
+                super::local_listener::admit,
+            ))
+    }
+    fn endpoint(&self, local: bool) -> Router {
+        Router::new().route(
+            "/v1/ws",
+            get(upgrade).with_state((self.shared.clone(), local)),
+        )
     }
     /// Admit commands on the same owner that services structured workers.
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
+        self.admission.service(app);
         self.command_owner.service(app);
     }
     /// Stop and drain every transport lease even when app revocation fails.
@@ -252,21 +268,31 @@ async fn app_lifetime(shared: &Shared, session: &Session) -> u16 {
         },
     }
 }
-async fn upgrade(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> Response {
+async fn upgrade(
+    ws: WebSocketUpgrade,
+    State((shared, local)): State<(Arc<Shared>, bool)>,
+    peer: Option<Extension<crate::app::LocalPeer>>,
+) -> Response {
+    if local && peer.is_none() {
+        return super::local_admission::refusal(crate::api::error_code::ErrorCode::OperatorOnly);
+    }
     if *shared.stop.borrow() {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return super::local_admission::refusal(crate::api::error_code::ErrorCode::PreauthCapacity);
     }
     let Ok(permit) = shared.slots.clone().try_acquire_owned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return super::local_admission::refusal(crate::api::error_code::ErrorCode::PreauthCapacity);
     };
-    let Ok(hello) = shared.hellos.clone().try_acquire_owned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let Ok(hello) = shared.hellos[usize::from(local)]
+        .clone()
+        .try_acquire_owned()
+    else {
+        return super::local_admission::refusal(crate::api::error_code::ErrorCode::PreauthCapacity);
     };
     ws.max_frame_size(MAX_MESSAGE)
         .max_message_size(MAX_MESSAGE)
         .write_buffer_size(0)
         .max_write_buffer_size(WRITE_BUFFER_BYTES)
-        .on_upgrade(move |socket| connection(socket, shared, permit, hello))
+        .on_upgrade(move |socket| connection(socket, shared, permit, hello, peer.map(|p| p.0)))
 }
 async fn before<T>(
     clock: &dyn Clock,
@@ -379,6 +405,7 @@ async fn connection(
     shared: Arc<Shared>,
     permit: OwnedSemaphorePermit,
     hello: OwnedSemaphorePermit,
+    peer: Option<crate::app::LocalPeer>,
 ) {
     let Ok(id) = shared
         .next
@@ -386,9 +413,11 @@ async fn connection(
     else {
         return;
     };
+    let live = Arc::new(AtomicBool::new(true));
     let _lease = Lease {
         shared: shared.clone(),
         id,
+        live: live.clone(),
         _permit: permit,
     };
     let mut stop = shared.stop.subscribe();
@@ -397,13 +426,71 @@ async fn connection(
     }
     let end = shared.clock.now() + Duration::from_millis(HANDSHAKE_DEADLINE_MS);
     let session = tokio::select! { biased; _ = stop.changed() => return, session = authenticate(&mut socket, &shared, end) => session };
-    let (session, read_only, token) = match session {
+    let (_session, read_only, token) = match session {
         Ok(session) => session,
         Err(failure) => {
             let Some(code) = failure.hello_code() else {
                 return;
             };
             let _ = socket.send(close(code)).now_or_never();
+            return;
+        }
+    };
+    let (priority, priority_rx) = mpsc::channel(PRIORITY_CAPACITY);
+    let (data, data_rx) = mpsc::channel(DATA_CAPACITY);
+    let (revoke, mut revoked) = watch::channel(false);
+    let registration = {
+        let shared = shared.clone();
+        let token = token.clone();
+        super::store_io::shared().run(move || {
+            shared.store.admit_peer(&token, peer.as_ref(), |session| {
+                let mut clients = shared.clients.lock().map_err(|_| TokenError::Busy)?;
+                if !live.load(Ordering::Acquire)
+                    || *shared.stop.borrow()
+                    || shared.clock.now() >= end
+                    || clients
+                        .values()
+                        .filter(|c| c.session.same_credential(&session))
+                        .count()
+                        >= CREDENTIAL_CONNECTIONS
+                {
+                    return Err(TokenError::Busy);
+                }
+                clients.insert(
+                    id,
+                    Client {
+                        session: session.clone(),
+                        read_only,
+                        data,
+                        revoke,
+                    },
+                );
+                Ok(session)
+            })
+        })
+    };
+    let session = match before(shared.clock.as_ref(), end, registration)
+        .await
+        .flatten()
+    {
+        Some(Ok(Ok(session))) => session,
+        failure => {
+            let changed = matches!(failure, Some(Err(PeerAdmissionError::PeerProcessChanged)));
+            let code = match failure {
+                Some(Err(PeerAdmissionError::Token(error))) => HandshakeFailure::from(error)
+                    .hello_code()
+                    .unwrap_or(GOING_AWAY_CLOSE),
+                _ if changed => AUTH_REFUSED_CLOSE,
+                _ => GOING_AWAY_CLOSE,
+            };
+            let mut frame = close(code);
+            if changed {
+                frame = Message::Close(Some(CloseFrame {
+                    code,
+                    reason: "peer_process_changed".into(),
+                }));
+            }
+            let _ = socket.send(frame).now_or_never();
             return;
         }
     };
@@ -424,31 +511,6 @@ async fn connection(
         })
         .collect();
     let principal = session.info.principal.clone();
-    let (priority, priority_rx) = mpsc::channel(PRIORITY_CAPACITY);
-    let (data, data_rx) = mpsc::channel(DATA_CAPACITY);
-    let (revoke, mut revoked) = watch::channel(false);
-    if let Ok(mut clients) = shared.clients.lock() {
-        if clients
-            .values()
-            .filter(|c| c.session.same_credential(&session))
-            .count()
-            >= CREDENTIAL_CONNECTIONS
-        {
-            let _ = socket.send(close(GOING_AWAY_CLOSE)).now_or_never();
-            return;
-        }
-        clients.insert(
-            id,
-            Client {
-                session: session.clone(),
-                read_only,
-                data,
-                revoke,
-            },
-        );
-    } else {
-        return;
-    }
     let welcome = ServerFrame::Welcome {
         protocol: WIRE_JSON_VERSION,
         server_version: crate::build_info::version(),

@@ -101,8 +101,8 @@ impl Store {
     /// transport supplies its sealed origin proof; TCP supplies None. App credentials
     /// require the minting PID and birth, while file credentials retain their grants.
     /// The callback must stay bounded and must not acquire an exclusive store lock.
-    // Staged for the approved #2500 PR3 listener/core integration; tests exercise the primitive now.
-    #[allow(dead_code)]
+    // Native registration is optional; non-web binaries still compile the store tests.
+    #[cfg_attr(not(feature = "web"), allow(dead_code))]
     pub(crate) fn admit_peer<T>(
         &self,
         token: &Bearer,
