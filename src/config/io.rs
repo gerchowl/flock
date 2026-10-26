@@ -263,6 +263,8 @@ fn load_config() -> Result<LoadedConfig, Vec<String>> {
 
 /// Replace location-less loader warnings with safe source categories and
 /// numeric coordinates, also retaining warnings for shadowed source keys.
+/// The scanner emits every discovered key, including missing-span fallbacks,
+/// before matching safe-key groups replace the location-less loader warnings.
 fn attach_source_diagnostics(loaded: &mut LoadedConfig, diagnostics: Vec<KeyDiagnostic>) {
     loaded.remove_key_diagnostics(|loader| {
         diagnostics
@@ -425,7 +427,7 @@ fn deep_merge_tables(
 }
 
 #[cfg(test)]
-fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>> {
+pub(super) fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>> {
     let table = parse_config_table(content, Path::new("config.toml"))?;
     let sources = source_table(&table, "base file");
     let positions = super::diagnostics::peer_locations(content, Source::Base);
@@ -2433,5 +2435,30 @@ mod fix1_source_tests {
             "{d}"
         );
         assert!(!d.contains("SECRET_"));
+    }
+}
+
+#[cfg(test)]
+mod source_fallback_tests {
+    use super::*;
+    #[test]
+    fn security2384_source_scan_keeps_unlocated_unknown_in_same_safe_group() {
+        let loaded = load_live_config_from_str("[msg]\nknown_span=true\n'a.?.b'=true").unwrap();
+        let warnings: Vec<_> = loaded
+            .key_diagnostics
+            .iter()
+            .filter(|d| d.kind == KeyDiagnosticKind::Unknown)
+            .collect();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|d| d.message.contains("location unavailable")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|d| d.message.contains("at 2:1")),
+            "{warnings:?}"
+        );
     }
 }

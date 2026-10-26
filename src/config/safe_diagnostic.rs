@@ -37,6 +37,7 @@ impl Source {
 }
 #[derive(Debug)]
 pub(super) enum Cause {
+    Validation(super::validation::Cause),
     InvalidToml,
     InvalidType,
     Unknown,
@@ -49,6 +50,11 @@ pub(super) enum Cause {
 }
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Outcome {
+    DisableBinding,
+    DisableCommand,
+    Fallback,
+    DefaultSound,
+    Clamp,
     KeepCurrent,
     KeepBase,
     Ignore,
@@ -58,6 +64,11 @@ pub(super) enum Outcome {
 impl Outcome {
     fn label(self) -> &'static str {
         match self {
+            Self::DisableCommand => "disabling custom command",
+            Self::DisableBinding => "disabling binding",
+            Self::Fallback => "using fallback",
+            Self::DefaultSound => "using default sound",
+            Self::Clamp => "using clamped value",
             Self::KeepCurrent => "keeping current config",
             Self::KeepBase => "keeping base config",
             Self::Ignore => "setting ignored",
@@ -96,6 +107,8 @@ pub(super) struct Diagnostic {
     suppliers: Vec<Source>,
     hint: Option<Hint>,
     entry_index: Option<usize>,
+    related: Option<(String, Option<usize>)>,
+    item_index: Option<usize>,
 }
 impl Diagnostic {
     fn new(cause: Cause, key: &str, source: Source, outcome: Outcome) -> Self {
@@ -109,7 +122,41 @@ impl Diagnostic {
             suppliers: Vec::new(),
             hint: None,
             entry_index: None,
+            related: None,
+            item_index: None,
         }
+    }
+    pub fn validation(cause: super::validation::Cause, key: &str, index: Option<usize>) -> Self {
+        let mut d = Self::new(
+            Cause::Validation(cause),
+            key,
+            Source::Unavailable,
+            cause.description().1,
+        );
+        d.entry_index = index.or_else(|| declaration_index(key));
+        if let super::validation::Cause::Interval { minimum } = cause {
+            d.expected = Some(format!("interval_secs >= {minimum}"));
+        }
+        d
+    }
+    pub fn with_related(mut self, key: &str) -> Self {
+        self.related = Some((
+            if key == "navigate reserved keys" {
+                key.into()
+            } else {
+                schema_key(key)
+            },
+            declaration_index(key),
+        ));
+        self
+    }
+    pub fn with_item_index(mut self, index: usize) -> Self {
+        self.item_index = Some(index);
+        self
+    }
+    pub fn fallback(mut self) -> Self {
+        self.outcome = Outcome::Fallback;
+        self
     }
     pub fn syntax(error: &toml::de::Error, text: &str, source: Source, outcome: Outcome) -> Self {
         let mut d = Self::new(Cause::InvalidToml, "", source, outcome);
@@ -219,6 +266,7 @@ impl Diagnostic {
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let cause_label = match self.cause {
+            Cause::Validation(cause) => cause.description().0,
             Cause::InvalidToml => "config parse error: invalid_toml",
             Cause::InvalidType => "invalid_config_type",
             Cause::Unknown => "unknown_config_key",
@@ -242,6 +290,15 @@ impl fmt::Display for Diagnostic {
         }
         if let Some(index) = self.entry_index {
             write!(f, "; entry_index={index}")?;
+        }
+        if let Some(index) = self.item_index {
+            write!(f, "; item_index={index}")?;
+        }
+        if let Some((key, index)) = &self.related {
+            write!(f, "; kept {key}")?;
+            if let Some(index) = index {
+                write!(f, "; kept_entry_index={index}")?;
+            }
         }
         if let Cause::Read(kind) = self.cause {
             write!(f, "; io_kind={kind:?}")?;
@@ -268,6 +325,9 @@ impl fmt::Display for Diagnostic {
         }
         write!(f, "; {}", self.outcome.label())
     }
+}
+fn declaration_index(key: &str) -> Option<usize> {
+    key.split_once('[')?.1.split_once(']')?.0.parse().ok()
 }
 /// Return a trusted schema shape, never an input key. Unknown descendants stop
 /// at the nearest declared container. User map entries become `<key>`, indices
@@ -346,7 +406,7 @@ mod tests {
     use super::*;
     #[test]
     fn cause_labels_are_closed_documented_diagnostics_not_error_codes() {
-        let cases = [
+        let mut cases = vec![
             (Cause::InvalidToml, "config parse error: invalid_toml"),
             (Cause::InvalidType, "invalid_config_type"),
             (Cause::Unknown, "unknown_config_key"),
@@ -357,6 +417,61 @@ mod tests {
             (Cause::DuplicatePeer, "duplicate_peer"),
             (Cause::InvalidPeerTarget, "invalid_peer_target"),
         ];
+        use crate::config::validation::Cause as ValidationCause;
+        let validation_cases = [
+            (ValidationCause::InvalidBinding, "invalid keybinding"),
+            (ValidationCause::Range, "range keybinding is only valid for indexed actions"),
+            (ValidationCause::InvalidModifier, "invalid indexed keybinding: expected modifier combination"),
+            (ValidationCause::Indexed, "indexed keybinding must use 1..9"),
+            (ValidationCause::NavigatePrefix, "navigate keybinding must not include prefix"),
+            (ValidationCause::NavigateEsc, "navigate keybinding cannot use esc"),
+            (ValidationCause::Reserved, "reserved keybinding: uses keys.prefix; pressing the prefix twice sends a literal prefix key"),
+            (ValidationCause::Conflict, "conflicting keybinding: first binding kept"),
+            (ValidationCause::DirectPrintable, "unsafe direct keybinding: would intercept typing; require the prefix"),
+            (ValidationCause::EmptyCommand, "empty custom command"),
+            (ValidationCause::SoundFormat, "unsupported sound file format; expected an mp3 file"),
+            (ValidationCause::SoundMissing, "missing sound file"),
+            (ValidationCause::SoundInvalid, "invalid sound file: expected a regular file"),
+            (ValidationCause::UnknownAgent, "unknown agent: not an agent flock detects"),
+            (ValidationCause::AgentAlias, "duplicate agent alias: first spelling kept"),
+            (ValidationCause::EmptyEnv, "environment key is empty"),
+            (ValidationCause::EqualsEnv, "environment key contains '=', which is not part of a variable name"),
+            (ValidationCause::WildcardEnv, "environment key looks like a wildcard; only exact names are matched"),
+            (ValidationCause::WhitespaceEnv, "environment key contains whitespace, which no shell can export"),
+            (ValidationCause::MissingName, "entry is missing name"),
+            (ValidationCause::DuplicateName, "duplicate name: later entry ignored"),
+            (ValidationCause::Interval { minimum: 1 }, "interval_secs is less than checks.min_tick_secs; clamped"),
+            (ValidationCause::Timeout, "timeout_secs is less than 1; using 1s"),
+            (ValidationCause::Debounce, "debounce is 0; using 1 so a single fire still emits"),
+            (ValidationCause::Program, "program is not absolute and not under ~/.flock/checks/"),
+            (ValidationCause::ChannelName, "invalid channel name: needs 1-64 characters from [A-Za-z0-9_-]"),
+            (ValidationCause::ChannelOwner, "invalid channel entry: needs an owner_node"),
+            (ValidationCause::ChannelDuplicate, "invalid channel entry: needs a unique name"),
+            (ValidationCause::ChannelTarget, "invalid channel target: expected fleet, repo:<name> or agent:<id>"),
+        ];
+        let validation_source = syn::parse_file(include_str!("validation.rs")).unwrap();
+        let validation_variants = validation_source
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Enum(item) if item.ident == "Cause" => Some(item.variants.len()),
+                _ => None,
+            })
+            .unwrap();
+        let validation_covered: std::collections::HashSet<_> = validation_cases
+            .iter()
+            .map(|(cause, _)| std::mem::discriminant(cause))
+            .collect();
+        assert_eq!(
+            validation_covered.len(),
+            validation_variants,
+            "every validation Cause needs a documented label fixture"
+        );
+        cases.extend(
+            validation_cases
+                .into_iter()
+                .map(|(cause, label)| (Cause::Validation(cause), label)),
+        );
         let source = syn::parse_file(include_str!("safe_diagnostic.rs")).unwrap();
         let variants = source
             .items
