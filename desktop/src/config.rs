@@ -16,6 +16,8 @@ const DEFAULT_SERVER_URL: &str = "ws://127.0.0.1:7682";
 const SERVER_URL_ENV: &str = "FLOCK_DESKTOP_SERVER_URL";
 /// `web/client/src/config.ts`: the global the bundle reads before it renders.
 const SHELL_CONFIG_GLOBAL: &str = "__FLOCK_SHELL_CONFIG__";
+/// The contract's token provider: the one Tauri command, `main.rs` `mint_token`.
+const TOKEN_PROVIDER: &str = r#"() => window.__TAURI_INTERNALS__.invoke("mint_token")"#;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,15 +87,21 @@ fn server_url(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-/// The script that runs before the bundle: the wire config, or the contract's
-/// shell-reported error, which the client shows in its ConfigError state.
+/// The script that runs before the bundle: the wire config with its token
+/// provider, or the contract's shell-reported error, which the client shows
+/// in its ConfigError state.
 pub fn init_script(server: &Result<Url, String>) -> String {
     let config = match server {
-        Ok(url) => json!({ "transport": "wire", "serverUrl": url.origin().ascii_serialization() }),
+        Ok(url) => {
+            let wire =
+                json!({ "transport": "wire", "serverUrl": url.origin().ascii_serialization() });
+            format!("{{ ...{wire}, tokenProvider: {TOKEN_PROVIDER} }}")
+        }
         Err(reason) => json!({
             "transport": "error",
             "message": format!("Invalid desktop configuration: {reason}"),
-        }),
+        })
+        .to_string(),
     };
     format!("window.{SHELL_CONFIG_GLOBAL} = Object.freeze({config});")
 }
@@ -180,9 +188,10 @@ mod tests {
     fn init_script_carries_the_origin_or_the_reason() {
         let ok = init_script(&Ok(url("ws://127.0.0.1:7682")));
         let wire = r#"{"serverUrl":"ws://127.0.0.1:7682","transport":"wire"}"#;
+        let provider = r#"() => window.__TAURI_INTERNALS__.invoke("mint_token")"#;
         assert_eq!(
             ok,
-            format!("window.__FLOCK_SHELL_CONFIG__ = Object.freeze({wire});")
+            format!("window.__FLOCK_SHELL_CONFIG__ = Object.freeze({{ ...{wire}, tokenProvider: {provider} }});")
         );
         let err = init_script(&Err("c.toml: \"</script>\" is bad".into()));
         let reason = r#"{"message":"Invalid desktop configuration: c.toml: \"</script>\" is bad","transport":"error"}"#;

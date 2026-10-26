@@ -12,12 +12,14 @@ fn capabilities_grant_no_shell_fs_http_or_dialog() {
     let conf = json_file(include_str!("../tauri.conf.json"));
     assert_eq!(conf["app"]["security"]["capabilities"], json!(["main"]));
     assert_eq!(conf["app"]["withGlobalTauri"], false);
-    // The bundle calls no command yet; PR 2 adds the token command, and nothing else.
+    // The one permission is the token command's, and it is the only app command.
     let main = json_file(include_str!("../capabilities/main.json"));
     assert_eq!(
         (&main["windows"], &main["permissions"]),
-        (&json!(["main"]), &json!([]))
+        (&json!(["main"]), &json!(["allow-mint-token"]))
     );
+    assert!(include_str!("../build.rs").contains(r#".commands(&["mint_token"])"#));
+    assert!(main_code().contains("tauri::generate_handler![mint_token]"));
     assert!(
         main.get("remote").is_none(),
         "no remote origin may reach the IPC"

@@ -5,6 +5,7 @@
 mod config;
 #[cfg(test)]
 mod hardening;
+mod mint;
 
 use tauri::{utils::config::Csp, WebviewUrl, WebviewWindowBuilder};
 use url::Url;
@@ -29,6 +30,7 @@ fn main() {
                 .build()?;
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![mint_token])
         .run(context)
         .expect("the Tauri runtime failed");
 }
@@ -39,4 +41,16 @@ fn context(server: &Result<Url, String>) -> tauri::Context<tauri::Wry> {
     let mut context = tauri::generate_context!();
     context.config_mut().app.security.csp = Some(Csp::Policy(config::csp(server.as_ref().ok())));
     context
+}
+
+/// The webview's one command: a fresh app-session token, minted by this
+/// process off the main thread (ADR-0038 §6, "In the webview").
+#[tauri::command]
+async fn mint_token() -> Result<String, String> {
+    let minted = tauri::async_runtime::spawn_blocking(mint::mint).await;
+    let minted = minted.map_err(|error| format!("the mint task failed: {error}"))?;
+    // The reason, never the token: a refusal is the only thing printed.
+    minted
+        .map(mint::Token::into_secret)
+        .inspect_err(|reason| eprintln!("flock-desktop: {reason}"))
 }
