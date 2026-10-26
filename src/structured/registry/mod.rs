@@ -335,6 +335,13 @@ impl Registry {
         Ok(record)
     }
 
+    /// Borrow stable identity and its current observation together in agent-id order.
+    pub fn observations(&self) -> impl Iterator<Item = (&Record, &Projection)> {
+        self.entries
+            .values()
+            .map(|entry| (&entry.record, &entry.projection))
+    }
+
     /// Durable metadata in stable agent-id order, without observations or authority.
     pub fn records(&self) -> Vec<Record> {
         self.entries
