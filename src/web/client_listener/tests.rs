@@ -86,7 +86,9 @@ pub(crate) async fn failed_listener() -> (crate::test_support::TempDir, Listener
     let health = Health::default();
     health.publish(Status::Listening);
     let task = tokio::spawn(serve(
-        || async { Err(io::Error::from_raw_os_error(libc::EBADF)) },
+        || async {
+            Err::<(tokio::net::TcpStream, SocketAddr), _>(io::Error::from_raw_os_error(libc::EBADF))
+        },
         Router::new(),
         Arc::new(SystemClock),
         health.clone(),
@@ -425,4 +427,22 @@ async fn captured_shell_origin_is_exact_cross_site_and_ws_only() {
     let (_, header) = server.request("/fixture", &origin, "cross-site", "").await;
     assert!(header.starts_with("HTTP/1.1 403"));
     server.core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn disabled_public_listener_does_not_create_a_native_endpoint() {
+    let root = crate::test_support::TempDir::socket();
+    let listener = Listener::prepare(
+        None,
+        Codes::default(),
+        root.path().into(),
+        None,
+        Health::default(),
+        Arc::new(tokio::sync::Notify::new()),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert!(listener.is_none());
+    assert!(!super::super::local_listener::socket_path(&root.path().join("flock.sock")).exists());
 }

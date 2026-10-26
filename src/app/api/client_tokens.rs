@@ -28,17 +28,16 @@ impl App {
                     "app mint requires a kernel-attested local operator",
                 );
             }
-            let watch =
-                match crate::platform::process_exit::ExitWatch::arm(self.api_peer_credentials()) {
-                    Ok(watch) => watch,
-                    Err(_) => {
-                        return encode_error(
-                            id,
-                            "peer_process_changed",
-                            "accepted process identity changed or cannot be watched",
-                        )
-                    }
-                };
+            let peer = match self.admit_local_peer(self.api_peer_credentials()) {
+                Ok(peer) => peer,
+                Err(code) => {
+                    return encode_error(
+                        id,
+                        code.as_str(),
+                        "app mint requires a live local operator",
+                    )
+                }
+            };
             let owner = self.client_auth.clone();
             let authority = match self.client_token_authority() {
                 Ok(a) => a,
@@ -56,7 +55,7 @@ impl App {
                 .map_err(
                     crate::structured::permissions::auth::tokens::app_sessions::IssueError::Store,
                 )
-                .and_then(|store| store.issue(&authority, watch));
+                .and_then(|store| store.issue(&authority, peer.process().clone()));
             return match result {
                 Ok(issued) => encode_success(id, ResponseResult::ClientTokenIssued { issued }),
                 Err(e) => {

@@ -79,6 +79,40 @@ impl Peer {
     pub(crate) fn exit(&mut self) {
         drop(self.child.stdin.take());
     }
+    /// Observe this child's exit without reaping, preserving readable birth evidence.
+    /// Kill only this child if the producer misses the five-second failure ceiling.
+    pub(crate) fn exit_unreaped(&mut self) {
+        self.exit();
+        let pid = self.child.id();
+        let (done, received) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            // SAFETY: this fixture owns pid; WNOWAIT observes exit without reaping.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result =
+                unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+            let result = if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+            let _ = done.send(result);
+        });
+        let result = received.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        waiter.join().unwrap();
+        result
+            .expect("peer must exit within the fail ceiling")
+            .unwrap();
+        assert!(self.credentials.birth.is_some());
+        assert_eq!(
+            crate::platform::process_start_time(pid),
+            self.credentials.birth,
+            "exit must leave the original birth readable until this fixture reaps it"
+        );
+    }
 }
 impl Drop for Peer {
     fn drop(&mut self) {
@@ -179,4 +213,15 @@ fn async_kernel_exit_wait_is_observable_by_exited() {
             assert!(watch.exited().unwrap());
             assert!(watch.exited().unwrap());
         });
+}
+
+#[test]
+fn exit_watch_refuses_unreaped_exit_during_birth_read() {
+    let mut child = Peer::spawn();
+    let credentials = child.credentials;
+    assert!(ExitWatch::checked(credentials, |pid| {
+        child.exit_unreaped();
+        crate::platform::process_start_time(pid)
+    })
+    .is_err());
 }

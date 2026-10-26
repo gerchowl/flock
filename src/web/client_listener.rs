@@ -37,7 +37,7 @@ const FUNNEL_DEADLINE: Duration = Duration::from_secs(5);
 /// Maximum status JSON bytes accepted from the public-funnel probe.
 const FUNNEL_STATUS_BYTES: usize = 65_536;
 /// Own every HTTP task; acceptance and its monotonic clock are injectable without test sleeps.
-async fn serve<A, F>(
+pub(super) async fn serve<S, P, A, F>(
     mut accept: A,
     router: Router,
     clock: Arc<dyn Clock>,
@@ -45,7 +45,9 @@ async fn serve<A, F>(
 ) -> io::Result<()>
 where
     A: FnMut() -> F,
-    F: Future<Output = io::Result<(tokio::net::TcpStream, SocketAddr)>>,
+    F: Future<Output = io::Result<(S, P)>>,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    P: Clone + Send + Sync + 'static,
 {
     let slots = Arc::new(Semaphore::new(HTTP_CONNECTIONS));
     let mut clients = JoinSet::new();
