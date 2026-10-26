@@ -976,6 +976,8 @@ impl HeadlessServer {
                 }
             }
 
+            self.app.sync_directory_events();
+
             // 7. Render virtually and stream frames.
             if needs_render && self.app.can_render_now(now) {
                 crate::render_prof::event("render.attempt");
