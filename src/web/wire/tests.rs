@@ -157,7 +157,7 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-pub(crate) struct Socket(tokio::net::TcpStream);
+pub(crate) struct Socket(pub(crate) tokio::net::TcpStream);
 #[derive(Debug)]
 pub(crate) enum Received {
     Text(Value),

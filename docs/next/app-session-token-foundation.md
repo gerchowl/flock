@@ -61,5 +61,7 @@ Failed watch registration or bounded retirement work closes fail-closed with
 issuance reclaims them. Revocation notifications happen after earlier shared
 admissions drain.
 
-Shell-origin admission and pre-auth limits remain #2442 PR2. There are no
-`desktop/` changes in this server slice.
+The captured shell Origin/header pair is admitted only on `/v1/ws` (#2442).
+Pre-auth UID attribution and revised budgets remain held for an owner decision
+in #2500. Existing pending-hello and connection limits are unchanged. There
+are no `desktop/` changes in this server slice.
