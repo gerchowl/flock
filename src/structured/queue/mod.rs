@@ -57,7 +57,7 @@ pub struct Journal {
     agent: String,
     directory: File,
     file: File,
-    items: Vec<Item>,
+    items: std::sync::Arc<Vec<Item>>,
     facts: Vec<crate::api::queue_event::QueueItemState>,
     records: Vec<Value>,
     seq: u64,
@@ -175,7 +175,7 @@ impl Journal {
             agent: agent.to_owned(),
             directory: File::open(dir)?,
             file,
-            items: Vec::new(),
+            items: Default::default(),
             facts: Vec::new(),
             records: Vec::new(),
             seq: 0,
@@ -224,6 +224,11 @@ impl Journal {
     /// never eligible for delivery.
     pub fn items(&self) -> &[Item] {
         &self.items
+    }
+    /// Share the existing committed fold without copying items or indexing keys.
+    /// Appends already fold on a private vector and publish it only after sync.
+    pub(crate) fn item_snapshot(&self) -> std::sync::Arc<Vec<Item>> {
+        self.items.clone()
     }
     /// Whether the retained items can prove absence of a committed item.
     /// Opaque records, read-only state and uncertain writes prevent that proof.
@@ -280,7 +285,7 @@ impl Journal {
     /// snapshot, rather than assuming append always advances by exactly one.
     pub fn append(&mut self, change: Change) -> io::Result<Record> {
         self.writable()?;
-        let mut items = self.items.clone();
+        let mut items = self.items.as_ref().clone();
         change.apply(&mut items)?;
         let needs_checkpoint = self.version < self.supported || self.rewrite_required()?;
         let snapshot = if needs_checkpoint {
@@ -311,7 +316,7 @@ impl Journal {
             &items,
             record.seq,
         ));
-        self.items = items;
+        self.items = std::sync::Arc::new(items);
         track_opaque(
             &record.change,
             record.change.has_unknown(),
@@ -566,7 +571,7 @@ impl Journal {
                     serde_json::from_value::<Record>(value.clone())
                         .map_err(io::Error::other)
                         .and_then(|record| {
-                            let mut items = self.items.clone();
+                            let mut items = self.items.as_ref().clone();
                             record.change.apply(&mut items)?;
                             let unknown = record.change.has_unknown()
                                 || serde_json::to_value(&record)? != value;
@@ -578,7 +583,7 @@ impl Journal {
                                     "unknown_data",
                                 );
                             }
-                            self.items = items;
+                            self.items = std::sync::Arc::new(items);
                             Ok(())
                         })
                 } else {
