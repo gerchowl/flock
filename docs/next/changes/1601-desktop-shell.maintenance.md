@@ -1,0 +1,1 @@
+- An in-repo Tauri v2 desktop shell (`desktop/`, `just desktop-build`) loads the web client against a loopback `flk` server, hardened per ADR-0011 §3; it is not yet packaged or released.

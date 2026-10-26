@@ -23,7 +23,9 @@
  *
  * A malformed configuration, or no global on a page not served over
  * `http:`/`https:`, is an explicit {@link ConfigError}, which the app
- * renders as an error state.
+ * renders as an error state. A shell that cannot build a configuration,
+ * such as the Tauri shell reading a malformed config file, reports why with
+ * {@link ShellReportedError}, which becomes a ConfigError with its message.
  *
  * @module
  */
@@ -55,6 +57,16 @@ export type FixtureShellConfig = {
 
 /** What a shell may inject. */
 export type ShellConfig = WireShellConfig | FixtureShellConfig;
+
+/**
+ * Injected instead of a {@link ShellConfig} when the shell has none to give:
+ * the client shows `message` as the reason in its ConfigError state.
+ */
+export type ShellReportedError = {
+  readonly transport: "error";
+  /** Why the shell has no configuration, for the person to act on. */
+  readonly message: string;
+};
 
 /** Why the injected configuration was refused. */
 export type ConfigError = { readonly message: string };
@@ -137,6 +149,13 @@ export function readShellConfig(scope: object): ConfigResult {
         return refuse("A fixture configuration needs fixtureJsonl and source strings.");
       }
       return { ok: true, config: { transport: "fixture", fixtureJsonl, source } };
+    }
+    case "error": {
+      const { message } = raw;
+      if (typeof message !== "string" || message === "") {
+        return refuse("A shell-reported error needs a non-empty message string.");
+      }
+      return refuse(message);
     }
     default:
       return refuse(`Unknown transport ${JSON.stringify(raw["transport"]) ?? "undefined"}.`);

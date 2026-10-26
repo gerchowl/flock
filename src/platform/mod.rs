@@ -8,6 +8,7 @@ mod url;
 pub use url::{open_url, validate_url, OpenUrlError};
 
 pub(crate) mod peer;
+pub(crate) mod process_exit;
 pub(crate) mod received_fd;
 pub(crate) mod socket;
 pub(crate) mod structured;
