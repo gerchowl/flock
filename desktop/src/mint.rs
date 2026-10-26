@@ -195,8 +195,6 @@ mod unix {
 
     /// `flk server` as `spawn_server_daemon` runs it: its own process group,
     /// no stdio, this environment. `FLOCK_DESKTOP_FLK` names the binary, else `flk` on PATH.
-    // flk's `TracedCommand` funnel lives in flk; this crate never links it (#1601).
-    #[allow(clippy::disallowed_methods)]
     fn start_server(path: &Path) -> Result<(), String> {
         let flk = std::env::var_os("FLOCK_DESKTOP_FLK").unwrap_or_else(|| "flk".into());
         let mut child = Command::new(&flk)
