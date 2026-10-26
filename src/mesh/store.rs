@@ -828,11 +828,11 @@ impl<D: DiskSpace> Store<D> {
     /// dedupe, return bindings and receipts. Transferred origins retain bodies
     /// until a final receipt or expiry, without continuing to send.
     pub fn finish(&mut self, key: &MessageKey, outcome: Outcome, wall_ms: i64) -> Result<()> {
-        self.finish_with_detail(key, outcome, None, wall_ms)
+        self.finish_with_detail(key, outcome, None, wall_ms, false)
     }
 
-    /// Refuse pending custody or an own-node unread inbox admission. Actual reads
-    /// and remote-origin inbox deliveries cannot be changed to a refusal.
+    /// Refuse pending transport custody. Inbox admission uses the separately
+    /// bound queue transition; receipts cannot revoke a local inbox row.
     pub fn refuse(&mut self, key: &MessageKey, reason: &str, wall_ms: i64) -> Result<()> {
         self.finish_with_detail(
             key,
@@ -843,7 +843,28 @@ impl<D: DiskSpace> Store<D> {
             },
             Some(reason),
             wall_ms,
+            false,
         )
+    }
+
+    /// Transfer native inbox custody to the durable queue, or record its refusal.
+    /// The existing recipient binding is required. Delivered preserves reply
+    /// material under existing outcome retention and does not claim an actual read.
+    pub fn settle_queue_admission(
+        &mut self,
+        key: &MessageKey,
+        refusal: Option<&str>,
+        wall_ms: i64,
+    ) -> Result<()> {
+        if self.recipient_binding(key)?.is_none() {
+            return Err(Error::InvalidState);
+        }
+        let outcome = match refusal {
+            None => Outcome::Delivered,
+            Some("recipient_gone") => Outcome::RecipientGone,
+            Some(_) => Outcome::Refused,
+        };
+        self.finish_with_detail(key, outcome, refusal, wall_ms, true)
     }
 
     fn finish_with_detail(
@@ -852,6 +873,7 @@ impl<D: DiskSpace> Store<D> {
         outcome: Outcome,
         detail: Option<&str>,
         wall_ms: i64,
+        queue: bool,
     ) -> Result<()> {
         let now = self.writable(wall_ms)?;
         let tx = self
@@ -863,22 +885,31 @@ impl<D: DiskSpace> Store<D> {
         if state == outcome.name() {
             return Ok(());
         }
-        let valid = match outcome {
-            Outcome::Refused if state == "inbox" && key.origin_node == self.local_node => {
-                inbox.is_some_and(|deadline| deadline > now)
-            }
-            Outcome::Read => state == "inbox" && inbox.is_some_and(|d| d > now),
-            Outcome::InboxExpired => state == "inbox" && inbox.is_some_and(|d| d <= now),
-            Outcome::Expired => {
-                matches!(state.as_str(), "custody" | "held" | "transferred") && custody <= now
-            }
-            _ => matches!(state.as_str(), "custody" | "held") && custody > now,
-        };
+        let valid =
+            match outcome {
+                Outcome::Delivered | Outcome::Refused | Outcome::RecipientGone
+                    if queue && state == "inbox" =>
+                {
+                    inbox.is_some_and(|d| d > now)
+                }
+                Outcome::Read if state == "delivered" => custody > now
+                    && tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM local_recipients WHERE origin=?1 AND id=?2)",
+                        params![key.origin_node, key.message_id],
+                        |r| r.get::<_, bool>(0),
+                    )?,
+                Outcome::Read => state == "inbox" && inbox.is_some_and(|d| d > now),
+                Outcome::InboxExpired => state == "inbox" && inbox.is_some_and(|d| d <= now),
+                Outcome::Expired => {
+                    matches!(state.as_str(), "custody" | "held" | "transferred") && custody <= now
+                }
+                _ => matches!(state.as_str(), "custody" | "held") && custody > now,
+            };
         if !valid {
             return Err(Error::InvalidState);
         }
         tx.execute(
-            "UPDATE envelopes SET state=?3,body=CASE WHEN ?3='read' OR (?3='transferred' AND origin=?6) THEN body ELSE X'' END,outcome_until=?4,
+            "UPDATE envelopes SET state=?3,body=CASE WHEN ?3='read' OR (?7 AND ?3='delivered') OR (?3='transferred' AND origin=?6) THEN body ELSE X'' END,outcome_until=?4,
             delivered=CASE WHEN ?3='delivered' THEN 1 ELSE delivered END,
             collect_error=COALESCE(?5,collect_error) WHERE origin=?1 AND id=?2",
             params![
@@ -887,7 +918,8 @@ impl<D: DiskSpace> Store<D> {
                 outcome.name(),
                 now.saturating_add(CUSTODY_TTL_MS),
                 detail,
-                self.local_node
+                self.local_node,
+                queue
             ],
         )?;
         if outcome == Outcome::Delivered {
@@ -1272,7 +1304,7 @@ impl<D: DiskSpace> Store<D> {
     fn projection_keys(&self, include_read: bool) -> Result<Vec<MessageKey>> {
         let mut stmt = self
             .connection
-            .prepare("SELECT origin,id FROM envelopes WHERE kind='message' AND (state='inbox' OR (?1 AND state='read')) ORDER BY origin,id")?;
+            .prepare("SELECT origin,id FROM envelopes WHERE kind='message' AND (state='inbox' OR (?1 AND (state='read' OR (state='delivered' AND EXISTS(SELECT 1 FROM local_recipients r WHERE r.origin=envelopes.origin AND r.id=envelopes.id))))) ORDER BY origin,id")?;
         let keys = stmt
             .query_map([include_read], |r| {
                 Ok(MessageKey {

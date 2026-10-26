@@ -429,6 +429,20 @@ impl Workers {
             .queue_enqueue(request)
     }
 
+    /// Positive proof from the sole journal owner, including keys loaded on reopen.
+    /// In-flight admission, opaque state or unavailable ownership is unknown,
+    /// never proof that a committed key is absent.
+    pub(crate) fn queue_custody_committed(
+        &self,
+        id: &str,
+        key: &crate::mesh::key::MessageKey,
+    ) -> Option<bool> {
+        self.entries
+            .get(id)?
+            .runtime
+            .as_ref()?
+            .queue_custody_committed(key)
+    }
     /// Consume an immutable completion/cut from the current generation only.
     /// Terminal cuts remain available after exit; drain before relaunch/removal.
     /// A cancelled notification report requires durable replay through #1956.

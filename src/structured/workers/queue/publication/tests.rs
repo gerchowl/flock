@@ -806,3 +806,123 @@ fn queue_global_empty_capture_wakes_app_once_without_a_new_completion() {
     service.capture(&notify);
     assert_eq!(wakes.get(), 1, "idle owner must not generate a wake loop");
 }
+
+#[test]
+fn custody_completion_pending_key_is_unknown_until_the_owner_finishes() {
+    use crate::structured::queue::model::{Kind, Producer};
+    let root = root();
+    let node = crate::mesh::identity::NodeIdentity::fixture([42; 32]);
+    let key = crate::mesh::key::MessageKey::mint(node.node_id(), 0).unwrap();
+    let request = |key: &crate::mesh::key::MessageKey| {
+        let mut item = crate::structured::queue::tests::item(&key.lifecycle_id());
+        item.kind = Kind::Message;
+        item.metadata
+            .insert("message_key".into(), serde_json::json!(key));
+        super::super::Request {
+            item,
+            principal: Principal::Origin(Producer::Agent("agent_sender_example".into())),
+            gate: Gate::Send,
+        }
+    };
+    let (mut owner, client) =
+        Service::open(root.path(), "input-fixture", NonZeroU64::new(1).unwrap()).unwrap();
+    client.enqueue(request(&key)).unwrap();
+    assert_eq!(
+        format!("{:?}", client.custody_committed(&key)),
+        "None",
+        "a buffered admission may still commit and must not be revoked"
+    );
+    assert_eq!(
+        client.enqueue(request(&key)).unwrap_err(),
+        ErrorCode::SessionBusy
+    );
+    assert_eq!(
+        format!("{:?}", client.custody_committed(&key)),
+        "None",
+        "a failed duplicate enqueue must not clear the first pending request"
+    );
+    let other = crate::mesh::key::MessageKey::mint(node.node_id(), 0).unwrap();
+    assert_eq!(
+        client.enqueue(request(&other)).unwrap_err(),
+        ErrorCode::SessionBusy
+    );
+    assert_eq!(
+        format!("{:?}", client.custody_committed(&other)),
+        "Some(false)",
+        "an unbuffered request cannot commit later"
+    );
+    let (t, _pipes) = transport(&root);
+    owner.tick(&t.input_handle(), false, &|| {});
+    assert!(owner.flush(false, &|| {}));
+    assert_eq!(
+        format!("{:?}", client.custody_committed(&key)),
+        "Some(true)"
+    );
+    assert!(client.update().unwrap().admitted.unwrap().1.is_ok());
+    // The next required checkpoint cannot replace a moved namespace.
+    fs::rename(
+        root.path().join("sessions/input-fixture"),
+        root.path().join("sessions/retired-fixture"),
+    )
+    .unwrap();
+    client.enqueue(request(&other)).unwrap();
+    owner.tick(&t.input_handle(), false, &|| {});
+    assert!(owner.flush(false, &|| {}));
+    assert_eq!(
+        client
+            .update()
+            .unwrap()
+            .admitted
+            .unwrap()
+            .1
+            .unwrap_err()
+            .code,
+        ErrorCode::InputWriteUnknown
+    );
+    assert_eq!(
+        format!("{:?}", client.custody_committed(&other)),
+        "None",
+        "uncertain writes need reopen before absence can be proven"
+    );
+    assert_eq!(
+        format!("{:?}", client.custody_committed(&key)),
+        "Some(true)"
+    );
+    drop(owner);
+    close(t);
+}
+
+#[test]
+fn custody_completion_opaque_journal_cannot_prove_key_absence() {
+    use std::io::Write;
+    let root = root();
+    drop(Journal::open(root.path(), "opaque-fixture").unwrap());
+    let path = root.path().join("sessions/opaque-fixture/queue.jsonl");
+    let key = crate::mesh::key::MessageKey::mint(
+        crate::mesh::identity::NodeIdentity::fixture([42; 32]).node_id(),
+        0,
+    )
+    .unwrap();
+    let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({"seq":1,"kind":"future","message_key":key})
+    )
+    .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let before = fs::read(&path).unwrap();
+    let (_owner, client) = Service::open(
+        root.path(),
+        "opaque-fixture",
+        NonZeroU64::new(u64::MAX).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        format!("{:?}", client.custody_committed(&key)),
+        "None",
+        "opaque committed records may contain the custody admission"
+    );
+    assert_eq!(fs::read(path).unwrap(), before);
+}

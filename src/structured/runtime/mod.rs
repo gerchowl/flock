@@ -115,6 +115,20 @@ impl Runtime {
     pub(super) fn queue_source(&self) -> Option<super::workers::queue::publication::Source> {
         Some(self.queue.as_ref()?.source.clone())
     }
+    /// Hold this test owner's admissions before commit without stopping its process.
+    #[cfg(test)]
+    pub(crate) fn hold_queue_admission(&self) -> super::workers::queue::AdmissionHold {
+        self.queue
+            .as_ref()
+            .expect("test requires a queue owner")
+            .hold_admission()
+    }
+    pub(super) fn queue_custody_committed(
+        &self,
+        key: &crate::mesh::key::MessageKey,
+    ) -> Option<bool> {
+        self.queue.as_ref()?.custody_committed(key)
+    }
     pub(super) fn queue_update(&self) -> Option<super::workers::queue::Update> {
         self.queue.as_ref()?.update()
     }

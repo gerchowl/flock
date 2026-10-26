@@ -44,7 +44,7 @@ impl App {
         }
         if original.envelope.return_binding.request != *request
             || original.envelope.return_binding.recipient_node != origin
-            || !matches!(original.state.as_str(), "inbox" | "read")
+            || !matches!(original.state.as_str(), "inbox" | "read" | "delivered")
         {
             return Err(UNAVAILABLE.into());
         }
