@@ -62,9 +62,9 @@ issuance reclaims them. Revocation notifications happen after earlier shared
 admissions drain.
 
 The captured shell Origin/header pair is admitted only on `/v1/ws` (#2442).
-Pre-auth UID attribution and revised budgets remain held for an owner decision
-in #2500. Existing pending-hello and connection limits are unchanged. There
-are no `desktop/` changes in this server slice.
+The sibling listener, pre-auth UID attribution and revised transport budgets
+belong to the next approved #2500 slice. Existing pending-hello and connection
+limits are unchanged here. There are no `desktop/` changes in this server slice.
 
 The server's transport-neutral `App::admit_local_peer` checks explicit kernel
 credentials rather than borrowing the current CLI request's caller context.
