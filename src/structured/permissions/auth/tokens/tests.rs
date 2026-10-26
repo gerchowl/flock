@@ -44,7 +44,7 @@ impl Entropy for FixtureEntropy {
         Ok(())
     }
 }
-fn setup() -> (SessionConfigDir, TokenStore, App) {
+pub(super) fn setup() -> (SessionConfigDir, TokenStore, App) {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let store = TokenStore::open_with_entropy(root.path(), FixtureEntropy(0)).unwrap();
     (root, store, operator())
@@ -625,7 +625,7 @@ fn browser_open_does_not_widen_an_existing_operator_named_token() {
     );
 }
 
-fn helper_binary() -> std::path::PathBuf {
+pub(super) fn helper_binary() -> std::path::PathBuf {
     std::env::current_exe()
         .unwrap()
         .parent()

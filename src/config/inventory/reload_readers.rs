@@ -89,6 +89,28 @@ fn derived_clone_models(items: &[syn::Item]) -> BTreeSet<String> {
         .collect()
 }
 
+/// Helper lookup uses the nominal model, independent of an impl's lifetimes.
+/// Config declaration formatting remains strict about every generic argument.
+fn helper_model(ty: &syn::Type) -> String {
+    let syn::Type::Path(path) = ty else {
+        panic!("unclassified helper receiver")
+    };
+    assert!(path.qself.is_none(), "qualified helper receiver");
+    path.path.segments.last().unwrap().ident.to_string()
+}
+
+#[test]
+fn helper_lookup_accepts_lifetimes_without_weakening_declared_types() {
+    assert_eq!(
+        helper_model(&syn::parse_str("crate::app::LocalOperator<'_>").unwrap()),
+        "LocalOperator"
+    );
+    assert_eq!(
+        type_name(&syn::parse_str("Option<crate::config::MsgConfig>").unwrap()),
+        "Option<crate::config::MsgConfig>"
+    );
+}
+
 struct Readers<'a> {
     aliases: BTreeMap<String, String>,
     fields: &'a BTreeSet<String>,
@@ -341,9 +363,10 @@ fn assert_msg_spawn_leaf_owners(catalog: &Catalog) {
         })
         .flat_map(|i| {
             i.items.iter().filter_map(move |item| match item {
-                syn::ImplItem::Fn(f) if !test_only(&f.attrs) => {
-                    Some(((model_type(&i.self_ty), f.sig.ident.to_string()), f.clone()))
-                }
+                syn::ImplItem::Fn(f) if !test_only(&f.attrs) => Some((
+                    (helper_model(&i.self_ty), f.sig.ident.to_string()),
+                    f.clone(),
+                )),
                 _ => None,
             })
         })

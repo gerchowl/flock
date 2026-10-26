@@ -101,6 +101,12 @@ pub(crate) fn client_listener_shutdown_failed(error: &std::io::Error) {
     tracing::warn!(event = "client.listener.shutdown_failed", subsystem = "structured_client", kind = ?error.kind(), errno = ?error.raw_os_error(), "client listener cleanup failed after server failure");
 }
 
+/// App credential revocation failed; transport shutdown still runs to completion.
+#[cfg(feature = "web")]
+pub(crate) fn client_app_revocation_failed(error: &std::io::Error) {
+    tracing::warn!(event = "client.app.revocation_failed", subsystem = "structured_client", kind = ?error.kind(), errno = ?error.raw_os_error(), "app credential revocation failed during shutdown");
+}
+
 /// Report a single capacity refusal without recording tool input or prompts.
 pub(crate) fn structured_permission_request_refused(
     agent: &str,
