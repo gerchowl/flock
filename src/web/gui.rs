@@ -61,7 +61,8 @@ fn refusal(status: StatusCode, code: ErrorCode, message: &'static str) -> Respon
         .into_response()
 }
 
-fn origin_allowed(headers: &HeaderMap, authority: &str) -> bool {
+/// Match the bound numeric authority for GUI and mounted protocol routes.
+pub(super) fn origin_allowed(headers: &HeaderMap, authority: &str) -> bool {
     // Browsers omit the default HTTP port when serializing Host and Origin.
     let canonical = authority.strip_suffix(":80").unwrap_or(authority);
     if headers.get_all(header::HOST).iter().count() != 1
@@ -87,6 +88,25 @@ fn origin_allowed(headers: &HeaderMap, authority: &str) -> bool {
     })
 }
 
+/// Captured shell headers are admitted only by the listener's exact WS route.
+pub(super) fn shell_origin_allowed(headers: &HeaderMap, authority: &str) -> bool {
+    if headers.get_all(header::ORIGIN).iter().count() != 1
+        || headers
+            .get(header::ORIGIN)
+            .is_none_or(|v| v != "tauri://localhost")
+        || headers.get_all("sec-fetch-site").iter().count() != 1
+        || headers
+            .get("sec-fetch-site")
+            .is_none_or(|v| v != "cross-site")
+    {
+        return false;
+    }
+    let mut same_origin = headers.clone();
+    same_origin.remove(header::ORIGIN);
+    same_origin.remove("sec-fetch-site");
+    origin_allowed(&same_origin, authority)
+}
+
 fn immutable(path: &str) -> bool {
     // Anchor Vite's default flat assets/[name]-[hash:8].[ext] pattern.
     let Some(name) = path.strip_prefix("assets/") else {
@@ -107,26 +127,6 @@ fn immutable(path: &str) -> bool {
         && suffix[1..].iter().all(name_char)
         && !extension.is_empty()
         && extension.bytes().all(|b| b.is_ascii_alphanumeric())
-}
-
-/// Restrict the document to bundled resources and its listener's transport.
-///
-/// CSP3's `'self'` includes same-host/port WebSockets. An explicit IPv4 source
-/// also supports browsers with older matching rules. IPv6 literals are invalid
-/// CSP host sources, so IPv6 uses `'self'` and fails closed on older browsers.
-fn document_policy(authority: &str) -> axum::http::HeaderValue {
-    let websocket = if authority.starts_with('[') {
-        String::new()
-    } else {
-        format!(" ws://{authority}/v1/ws")
-    };
-    format!(
-        "default-src 'self'; script-src 'self'; style-src 'self'; \
-         connect-src 'self'{websocket}; object-src 'none'; base-uri 'none'; \
-         frame-ancestors 'none'; form-action 'none'"
-    )
-    .parse()
-    .expect("numeric listener authority produces a valid CSP header")
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -207,9 +207,6 @@ async fn serve<A: RustEmbed>(
         file.data.into_owned().into_response()
     };
     let output = response.headers_mut();
-    if path == "index.html" {
-        output.insert(header::CONTENT_SECURITY_POLICY, document_policy(&authority));
-    }
     output.insert(
         header::CACHE_CONTROL,
         cache.parse().expect("constant cache header"),

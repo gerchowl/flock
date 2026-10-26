@@ -1254,7 +1254,7 @@ async fn guarded_dispatch_requires_consuming_deferred_attempt() {
         panic!("expected submit event")
     };
     runtime(&app).test_stamp_operator_input_at(Instant::now());
-    app.advance_guarded_request(request_id, pane_id, attempt, respond_to);
+    app.advance_guarded_request(request_id, pane_id, *attempt, respond_to);
     assert!(!app.active_submissions.contains(&pane));
     let response: serde_json::Value = serde_json::from_str(&receiver.recv().unwrap()).unwrap();
     assert_eq!(response["result"]["outcome"], "unconfirmed");
@@ -1562,7 +1562,7 @@ async fn delivery_attempt_disable_resets_tracker_and_digest_reports_uncertainty(
     let attempts = app.delivery_attempts();
     assert_eq!(attempts[0].state, "unconfirmed");
     assert_eq!(attempts[0].reason.as_deref(), Some("paste_written"));
-    let events = app.event_hub.events_after(0);
+    let events = app.event_hub.ring_snapshot_after(0);
     let digest = crate::digest::categorize(events.iter().map(|(seq, event)| (*seq, 0, event)));
     let row = digest
         .yellow
@@ -1604,6 +1604,10 @@ async fn delivery_attempt_handoff_import_restores_interrupted_evidence() {
     assert!(!drain(&mut pty).is_empty());
     let id = app.delivery_attempts()[0].attempt_id.clone();
     let snapshot = crate::persist::capture(
+        crate::persist::RegistryCapture {
+            registry: &app.state.structured_agents,
+            now_ms: Some(42),
+        },
         &[],
         &Default::default(),
         &Default::default(),
@@ -1734,6 +1738,7 @@ async fn plain_paste_retains_missing_runtime_error_codes() {
         };
         let method = if agent_send {
             Method::AgentSend(crate::api::schema::AgentSendParams {
+                item_id: None,
                 write_timeout_ms: None,
                 raw: false,
                 target: pane,

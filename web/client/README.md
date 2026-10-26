@@ -9,6 +9,17 @@ pinned in `bun.lock`.
   type check and the production build.
 - `just client-preview`: a fixture-mode build (a replayed session, no server
   needed) served on the loopback address.
+- `just desktop-dev` / `just desktop-build`: the same bundle in the Tauri
+  desktop shell; see [`desktop/README.md`](../../desktop/README.md).
+
+The fixture screenshot tests wait for the pinned Playwright Chromium's first
+non-empty compositor frame at the requested viewport before one PNG capture.
+DOM visibility and `document.fonts.ready` alone do not prove that the compositor
+can supply pixels. The five-second capture deadline also bounds cleanup; page
+closure, crashes, wrong-size or empty frames fail explicitly. Capture errors are
+never retried. This barrier is for the Chromium-only preview harness and is not
+an application rendering signal. `tests/capture.test.ts` drives readiness and
+failure events with a controlled peer and an injected abort deadline.
 
 ## The production bundle in nix
 
@@ -29,12 +40,22 @@ How it is built (`nix/client.nix`):
    (patched to find their libraries on Linux), and runs `bun run build`
    offline under the same nodejs as the dev shell.
 
-### After changing `bun.lock`
+### After changing `bun.lock` or Bun
 
 Run `just client-deps-hash` and commit `nix/client-deps.json`. The file
-records the sha256 of the `bun.lock` its hash was computed from, so a lock
-changed without it fails evaluation with a message that names the file and
-this command. `dist/` is never committed.
+records the lock’s sha256 and Bun version. Changing either without refreshing
+the pin fails evaluation with a message naming this command. Failed refreshes
+and INT/TERM interruptions restore the original pin, including during verification.
+`dist/` is never committed.
+
+A same-version nixpkgs Bun patch can reuse the cached fixed-output outPath;
+the version check cannot detect it. Run `just client-deps-hash` explicitly
+after such a patch. The mismatch diagnostic documents this limit too.
+
+The client-dependency workflow builds and rebuilds the FOD on x86_64-linux
+and aarch64-darwin, records the actual NAR hashes, and requires matching
+hashes, lock digests and Bun versions. Rebuilding prevents a shared cached
+output from hiding a platform-specific difference.
 
 ### Known limits
 

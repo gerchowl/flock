@@ -118,7 +118,7 @@ export function isHistoryStream(stream: string): boolean {
  */
 export interface StreamHandler {
   /** An event to apply. The cursor advances once this returns. */
-  event(seq: number, ev: WireEvent): void;
+  event(seq: number, ev: WireEvent, tsMs: number): void;
   /** History-stream `gap`: seqs `from`–`to` are no longer stored. */
   gap(from: number, to: number): void;
   /** The `synced` barrier: the stream is Current. Once per `sub`. */
@@ -140,7 +140,8 @@ export type StreamStatus = { readonly stream: string; readonly state: StreamStat
 /** What the connection was created with. */
 export type ConnectionOptions = {
   readonly url: string;
-  readonly token: string;
+  /** The token for `hello`; null connects straight into NeedsToken. */
+  readonly token: string | null;
   readonly client: WireClient;
   readonly clock: Clock;
   readonly sockets: SocketFactory;
@@ -162,6 +163,8 @@ type Sub = {
   /** Reached Current or Refused on the current connection. */
   settled: boolean;
   progress: TimerHandle | null;
+  /** Automatic contention retries since the last synced barrier, capped at three. */
+  busyRetries: number;
   refusal: Refusal | null;
   /** The snapshot being received while Resyncing. */
   snapshot: Snapshot | null;
@@ -196,6 +199,7 @@ export class WireConnection {
   #socket: SocketLike | null = null;
   #generation = 0;
   #attempt = 0;
+  #acks = 0;
   #timers = new Map<Timer, TimerHandle>();
   #subs = new Map<string, Sub>();
   /** The last sub id allocated: ids are `s<n>`, and n only grows (ADR-0038 §3). */
@@ -225,6 +229,21 @@ export class WireConnection {
   /** The latest failure, shown while reconnecting or stopped; never a token. */
   get error(): string | null {
     return this.#error;
+  }
+
+  /** How many commands an ok `ack` settled on this connection: it only grows, whatever the outbox drops. */
+  get acks(): number {
+    return this.#acks;
+  }
+
+  /** What a changed principal dropped from the outbox, until dismissed or the next ok `ack`. */
+  get outboxDropped(): string | null {
+    return this.#outbox.dropped;
+  }
+
+  /** The person has seen {@link outboxDropped}. */
+  dismissOutboxDropped(): void {
+    this.#outbox.dismissDropped();
   }
 
   /** What restoring the stored outbox had to drop, or null (shown, never fatal). */
@@ -327,7 +346,7 @@ export class WireConnection {
    */
   subscribe(stream: StreamName, handler: StreamHandler, after?: number | null): Subscription {
     const cursor = after === undefined ? (this.#cursors.get(stream) ?? null) : after;
-    const sub: Sub = { id: this.#allocate(), stream, handler, state: "Replaying", cursor, settled: false, progress: null, refusal: null, snapshot: null };
+    const sub: Sub = { id: this.#allocate(), stream, handler, state: "Replaying", cursor, settled: false, progress: null, busyRetries: 0, refusal: null, snapshot: null };
     this.#subs.set(sub.id, sub);
     if (this.#connected()) this.#sendSub(sub);
     this.#settle();
@@ -353,17 +372,18 @@ export class WireConnection {
 
   /**
    * Queues a command (ADR-0038 §3's outbox). It is persisted as `pending`
-   * before any send, and sent in Live. Returns its `cmd_id`.
+   * before any send, and sent in Live. Returns its `cmd_id`. `echoAfter`
+   * is stored with it as `echo_after` (`outbox.ts`), and never sent.
    *
    * @throws if no principal is known yet: a command is stored with the
    *   principal that queued it, so none can be queued before a first
    *   `welcome`.
    */
-  command(verb: string, args: JsonValue, cmdId?: string): string {
+  command(verb: string, args: JsonValue, cmdId?: string, echoAfter?: number): string {
     const principal = this.principal;
     if (principal === null) throw new Error("no principal yet: connect once before sending commands");
     const id = cmdId ?? this.#options.newCommandId?.() ?? uuidv7(this.#options.clock.wallNow());
-    this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending" });
+    this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending", ...(echoAfter === undefined ? {} : { echo_after: echoAfter }) });
     this.#flush();
     return id;
   }
@@ -538,9 +558,12 @@ export class WireConnection {
         return before.principal !== after.principal || before.capabilities.join() !== after.capabilities.join();
       case "operator_only":
         return before.principal !== after.principal;
+      case "invalid_agent":
+        return false;
       case "unknown_stream":
         return before.server_version !== after.server_version;
       case "cursor_ahead":
+      case "session_busy":
         return true;
     }
   }
@@ -606,7 +629,7 @@ export class WireConnection {
         if (frame.seq === undefined) return this.#protocolError(`ev without seq on ${sub.stream}`);
         if (sub.snapshot !== null) return this.#snapshotLine(sub, sub.snapshot, frame.seq, frame.ev);
         if (sub.cursor !== null && frame.seq <= sub.cursor) return;
-        sub.handler.event(frame.seq, frame.ev);
+        sub.handler.event(frame.seq, frame.ev, frame.ts_ms);
         if (this.#subs.get(sub.id) !== sub) return this.#changed();
         this.#advance(sub, frame.seq);
         return;
@@ -618,10 +641,12 @@ export class WireConnection {
         if (sub.snapshot !== null) return this.#protocolError(`synced before ${sub.stream}'s snapshot ended`);
         this.#stopProgress(sub);
         sub.state = "Current";
+        sub.busyRetries = 0;
         sub.settled = true;
         sub.handler.synced();
         return this.#settle();
       case "lagged":
+        // `skipped_to` is diagnostic only. Resume from the applied cursor.
         // `lagged` closes the id on the server, like `subfail`.
         this.#resub(sub, false);
         return this.#changed();
@@ -698,6 +723,20 @@ export class WireConnection {
       const reason = `The server refused sub id ${sub.id} as already used on this connection, so this stream is not retried. Server: ${message}`;
       return this.#refuse(sub, { code, message: reason });
     }
+    if (code === "session_busy") {
+      this.#refuse(sub, { code, message });
+      if (this.#subs.get(sub.id) !== sub || !this.#connected() || sub.busyRetries === 3) return;
+      // Three per-stream retries: 250, 500, 1000 ms, reset only by synced.
+      // Reuse the cancellable progress timer; never touch sibling subscriptions.
+      const delay = 250 * 2 ** sub.busyRetries++;
+      sub.progress = this.#options.clock.setTimeout(() => {
+        sub.progress = null;
+        sub.settled = false;
+        this.#resub(sub, false);
+        this.#settle();
+      }, delay);
+      return;
+    }
     if (code !== "cursor_ahead") return this.#refuse(sub, { code, message });
     sub.handler.reset();
     if (this.#subs.get(sub.id) !== sub) return this.#changed();
@@ -730,5 +769,6 @@ export class WireConnection {
     const error: WireError | null = frame.error ?? null;
     if (frame.ok === (error !== null)) return this.#protocolError(`ack ${frame.cmd_id} with ok=${frame.ok} and ${error === null ? "no" : "an"} error`);
     if (!this.#outbox.settle(frame.cmd_id, error)) return this.#protocolError(`ack for ${frame.cmd_id}, which is not awaiting one on this socket`);
+    if (error === null) this.#acks++;
   }
 }

@@ -75,6 +75,15 @@ pub enum LaunchError {
     NeedsAgentUser,
     /// Socket isolation requires Claude Code 2.1.290 or newer on an absolute path.
     UnsupportedHarness,
+    /// No live reservation matches the profile being registered.
+    McpLeaseRequired,
+    /// The opening turn was refused before runtime publication or harness spawn.
+    QueueAdmission {
+        /// Registered refusal from the journal owner.
+        code: ErrorCode,
+        /// Underlying I/O failure, when available.
+        source: Option<io::Error>,
+    },
     /// Credential or private-directory I/O failed. No fallback is attempted.
     Io(io::Error),
 }
@@ -85,6 +94,8 @@ impl LaunchError {
         match self {
             Self::NeedsAgentUser => ErrorCode::StructuredNeedsAgentUser,
             Self::UnsupportedHarness => ErrorCode::StructuredHarnessVersionUnsupported,
+            Self::McpLeaseRequired => ErrorCode::StructuredMcpLeaseRequired,
+            Self::QueueAdmission { code, .. } => *code,
             Self::Io(_) => ErrorCode::AgentStartFailed,
         }
     }
@@ -96,6 +107,14 @@ impl fmt::Display for LaunchError {
             Self::NeedsAgentUser => f.write_str(
                 "structured_needs_agent_user: flk-agent launch requires O19a (#1208)",
             ),
+            Self::McpLeaseRequired => f.write_str(
+                "structured_mcp_lease_required: flock MCP requires this session reservation",
+            ),
+            Self::QueueAdmission { code, source } => {
+                write!(f, "opening turn refused: {}", code.as_str())?;
+                if let Some(source) = source { write!(f, ": {source}")?; }
+                Ok(())
+            }
             Self::Io(err) => write!(f, "structured launch preparation failed: {err}"),
             Self::UnsupportedHarness => f.write_str(
                 "structured_harness_version_unsupported: require Claude Code >= 2.1.290 at an absolute binary path",
@@ -267,6 +286,30 @@ struct McpConfig {
     mcp_servers: BTreeMap<String, serde_json::Value>,
 }
 
+/// Pinned MCP executable and explicit socket of the server owning the lease.
+/// Never resolved through the model's PATH or inherited FLOCK_* variables.
+#[derive(Debug, Clone)]
+pub struct SessionMcp {
+    binary: PathBuf,
+    socket: PathBuf,
+}
+
+impl SessionMcp {
+    /// Pin an existing absolute executable path and an absolute server socket.
+    /// The session owner supplies both; the socket may be bound after preparation.
+    pub fn new(binary: &Path, socket: &Path) -> io::Result<Self> {
+        if !binary.is_absolute() || !binary.is_file() || !socket.is_absolute() {
+            return Err(io::Error::other(
+                "session MCP requires absolute binary and socket paths",
+            ));
+        }
+        Ok(Self {
+            binary: binary.canonicalize()?,
+            socket: socket.to_owned(),
+        })
+    }
+}
+
 /// Persistent private harness profile, retained for resume, hot reload and forks
 /// (ADR-0036 §1, §9). Sessions never delete its transcripts or registry.
 /// `flk-agent` profiles belong under that user's `~/.flk/claude/<profile>` once
@@ -368,6 +411,7 @@ impl Drop for SessionConfigDir {
 #[derive(Debug)]
 pub struct LaunchProfile {
     session_id: String,
+    cwd: Option<PathBuf>,
     args: Vec<OsString>,
     binary: VerifiedBinary,
     environment: EnvironmentAllowlist,
@@ -430,12 +474,64 @@ impl LaunchProfile {
         let environment = EnvironmentAllowlist::capture(read_env, token);
         Ok(Self {
             session_id: session_id.into(),
+            cwd: None,
             args,
             binary,
             environment,
             profile_directory,
             directory,
         })
+    }
+
+    /// Install only flock into this session's private MCP config (ADR-0036 §1/§1a).
+    /// A reservation is mandatory. Identity is kernel-attested ancestry after the
+    /// runtime binds the Claude PID and birth. The credential reaches only the
+    /// MCP child via the generated private config, never Claude's launch env.
+    /// Call before spawn; the same session guard owns the rotated file's lifetime.
+    pub(crate) fn register_flock_mcp(
+        &self,
+        lease: Option<&super::lease::Lease>,
+        endpoint: &SessionMcp,
+    ) -> Result<(), LaunchError> {
+        let lease = lease
+            .filter(|lease| lease.matches_session(&self.session_id))
+            .ok_or(LaunchError::McpLeaseRequired)?;
+        let registration = serde_json::json!({"mcpServers":{"flock":{
+            "type":"stdio", "command":endpoint.binary, "args":["mcp","serve","--structured"],
+            "env":{"FLOCK_SOCKET_PATH":endpoint.socket,
+                "FLOCK_MCP_LEASE_CREDENTIAL":lease.credential()}
+        }}});
+        let next = self.directory.write("mcp.next.json", &registration)?;
+        fs::rename(next, self.directory.path().join("mcp.json"))?;
+        Ok(())
+    }
+
+    /// Bind registry launch metadata on the preparation worker, before spawn.
+    /// Cwd must be an existing absolute directory; a requested model is explicit argv.
+    pub(crate) fn for_agent(
+        mut self,
+        cwd: &Path,
+        model: Option<&str>,
+    ) -> Result<Self, LaunchError> {
+        if !cwd.is_absolute() || !cwd.is_dir() || model.is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid structured cwd or model",
+            )
+            .into());
+        }
+        self.cwd = Some(cwd.canonicalize()?);
+        if let Some(model) = model {
+            self.args
+                .extend([OsString::from("--model"), OsString::from(model)]);
+        }
+        Ok(self)
+    }
+
+    /// Worker-validated cwd; older runtime-only callers retain their supplied process cwd.
+    pub(crate) fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
     }
 
     /// Canonical session id passed to Claude, also used by the lease and stream.
@@ -532,3 +628,6 @@ impl EnvironmentAllowlist {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod mcp_tests;

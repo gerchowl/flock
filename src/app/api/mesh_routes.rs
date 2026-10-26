@@ -25,19 +25,28 @@ pub(crate) struct Routes {
     tick_at: Option<Instant>,
 }
 
-struct Retry {
+pub(super) struct Retry {
     enrollment: u64,
     generation: u64,
     attempts: u32,
-    at: Instant,
+    pub(super) at: Instant,
+    /// Repeated failure wakes from one owner never bypass this floor.
+    pub(super) wake_at: Instant,
+    /// A failed post-expiry custody settlement must honor its scheduled backoff.
+    pub(super) custody_correction: bool,
 }
 
 impl Retry {
-    fn superseded(&self, enrollment: u64, generation: u64, awakened: bool) -> bool {
+    pub(super) fn superseded(&self, enrollment: u64, generation: u64, awakened: bool) -> bool {
         awakened || self.enrollment != enrollment || self.generation != generation
     }
 
-    fn failed(previous: Option<&Self>, enrollment: u64, generation: u64, now: Instant) -> Self {
+    pub(super) fn failed(
+        previous: Option<&Self>,
+        enrollment: u64,
+        generation: u64,
+        now: Instant,
+    ) -> Self {
         let attempts = previous
             .filter(|r| r.enrollment == enrollment && r.generation == generation)
             .map_or(0, |r| r.attempts.saturating_add(1));
@@ -59,6 +68,8 @@ impl Retry {
             generation,
             attempts,
             at: now + delay,
+            wake_at: now + Duration::from_secs(4),
+            custody_correction: false,
         }
     }
 }
@@ -70,6 +81,13 @@ pub(crate) struct Completion {
     enrollment: u64,
     generation: u64,
     result: Result<Vec<Advert>, String>,
+}
+
+/// A reported identity is authoritative only after enrollment is pinned.
+fn enrolled_node(status: &crate::mesh::hello::Enrollment) -> Option<&str> {
+    (status.state == "pinned")
+        .then_some(status.node_id.as_deref())
+        .flatten()
 }
 
 impl App {
@@ -116,6 +134,34 @@ impl App {
         self.mesh_routes
             .table
             .set_live_edges(live.keys().cloned().collect());
+        self.state.server_node = self.node_id.clone();
+        self.state.server_paths = self.custody_routes();
+        let mut names: BTreeMap<String, String> = live
+            .iter()
+            .map(|(node, name)| (name.clone(), node.clone()))
+            .collect();
+        for peer in &self.state.peers {
+            let status = crate::peer_stream::enrollment(peer);
+            let pinned = crate::mesh::runtime_store::read(|store| {
+                store.get_pin(&peer.name).map_err(|e| e.to_string())
+            });
+            match pinned {
+                Ok(pin) => {
+                    if let Some(node) = pin
+                        .flatten()
+                        .map(|pin| pin.node_id)
+                        .or_else(|| enrolled_node(&status).map(str::to_owned))
+                    {
+                        names.insert(peer.name.clone(), node);
+                    }
+                }
+                Err(_) => tracing::warn!(
+                    code = "server_pin_unavailable",
+                    "server identity unavailable"
+                ),
+            }
+        }
+        self.state.server_nodes = names;
         if self.mesh_routes.table.own().is_some() && live == self.mesh_routes.live {
             return;
         }
@@ -159,6 +205,7 @@ impl App {
             self.mesh_routes.live = live;
             Ok::<_, String>(())
         })();
+        self.state.server_paths = self.custody_routes();
         if let Err(reason) = result {
             crate::logging::mesh_routing_failed("build_advert", "", &reason);
         }
@@ -217,6 +264,7 @@ impl App {
         self.mesh_routes
             .table
             .learn(&supplier, crate::mesh::routes::decode_adverts(adverts));
+        self.state.server_paths = self.custody_routes();
         encode_success(
             id,
             ResponseResult::MeshRoutes {
@@ -359,6 +407,7 @@ impl App {
                     &completion.node,
                     adverts.into_iter().take(crate::mesh::routes::MAX_RECORDS),
                 );
+                self.state.server_paths = self.custody_routes();
             }
             Err(reason) => {
                 self.mesh_routes.sent.remove(&completion.peer.name);
@@ -380,8 +429,11 @@ impl App {
         self.refresh_mesh_routes();
         let mut names = self.mesh_routes.live.clone();
         for peer in &self.state.peers {
-            if let Some(node) = crate::peer_stream::enrollment(peer).node_id {
-                names.insert(node, peer.name.clone());
+            let status = crate::peer_stream::enrollment(peer);
+            if status.state == "pinned" {
+                if let Some(node) = status.node_id {
+                    names.insert(node, peer.name.clone());
+                }
             }
         }
         self.mesh_routes
@@ -515,6 +567,24 @@ mod tests {
             record.next_hop
         );
         assert_eq!(record.envelope.key, mail.key, "custody must be retained");
+    }
+
+    #[test]
+    fn server_identity1076_unpinned_enrollment_cannot_supply_a_name_binding() {
+        for state in ["pending", "refused", "retrying", "pinned"] {
+            let status = crate::mesh::hello::Enrollment {
+                peer: "node-b.example".into(),
+                source: crate::mesh::store::PinSource::Configured,
+                pin_origin: Default::default(),
+                node_id: Some("claimed-node".into()),
+                state: state.into(),
+                reason: None,
+            };
+            assert_eq!(
+                enrolled_node(&status),
+                (state == "pinned").then_some("claimed-node")
+            );
+        }
     }
 
     #[test]

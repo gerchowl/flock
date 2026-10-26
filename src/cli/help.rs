@@ -58,6 +58,7 @@ const HELP_FLAGS: [&str; 2] = ["--help", "-h"];
 /// `pane` is the group to watch when adding rows here: `src/cli/pane.rs` owns
 /// those parsers and its own help text, and this table mirrors them.
 const VERBS: &[(&str, &str, &str)] = &[
+    ("structured", "grants", super::grants::USAGE),
     ("server", "stop", "flk server stop"),
     (
         "server",
@@ -182,8 +183,8 @@ const VERBS: &[(&str, &str, &str)] = &[
         "reply",
         "flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]",
     ),
-    ("msg", "list", "flk msg list [--pane TARGET]"),
-    ("msg", "read", "flk msg read [--pane TARGET]"),
+    ("msg", "list", "flk msg list [--pane TARGET]   peek at your structured inbox or the operator global list"),
+    ("msg", "read", "flk msg read [--pane TARGET]   consume your attested pane or structured inbox"),
     ("msg", "status", "flk msg status <correlation_id>"),
     (
         "msg",
@@ -562,6 +563,8 @@ mod tests {
     /// Naming them here rather than only in the module docs is what keeps the
     /// choice reviewable: adding a seventh name is a visible act.
     const SELF_SERVED: &[&str] = &[
+        // Nested credential verbs share their complete operator-only usage.
+        "client",
         // What a target resolves from, and how reused branch names disambiguate.
         "lineage",
         // `--since` suffixes and where the rendered file lands by default.
@@ -633,6 +636,7 @@ mod tests {
             "fleet" => include_str!("fleet.rs"),
             "owner" => include_str!("owner.rs"),
             "goal" => include_str!("goal.rs"),
+            "structured" => include_str!("grants.rs"),
             "events" => include_str!("events.rs"),
             "adapter" => include_str!("adapter.rs"),
             // `wait park` shares the `events` parser.
@@ -721,17 +725,104 @@ mod tests {
         }
     }
 
+    /// Read actual match patterns, including aliases and optional subcommands.
+    /// Comments and string expressions cannot invent a routed verb.
+    fn routed_verbs(source: &str) -> std::collections::BTreeSet<String> {
+        use syn::visit::Visit;
+        #[derive(Default)]
+        struct Routes(std::collections::BTreeSet<String>);
+        impl Routes {
+            fn pattern(&mut self, pattern: &syn::Pat) {
+                match pattern {
+                    syn::Pat::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(value),
+                        ..
+                    }) => {
+                        self.0.insert(value.value());
+                    }
+                    syn::Pat::Or(pattern) => {
+                        for case in &pattern.cases {
+                            self.pattern(case);
+                        }
+                    }
+                    syn::Pat::Paren(pattern) => self.pattern(&pattern.pat),
+                    syn::Pat::TupleStruct(pattern) if pattern.path.is_ident("Some") => {
+                        for element in &pattern.elems {
+                            self.pattern(element);
+                        }
+                    }
+                    _ => (),
+                }
+            }
+        }
+        impl<'ast> Visit<'ast> for Routes {
+            fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+                self.pattern(&arm.pat);
+                syn::visit::visit_arm(self, arm);
+            }
+        }
+        let module = syn::parse_file(source).expect("CLI parser source must parse");
+        let mut routes = Routes::default();
+        routes.visit_file(&module);
+        routes.0
+    }
+
+    #[test]
+    fn dispatch_patterns_include_aliases_but_not_command_shaped_text() {
+        let verbs = routed_verbs(
+            r#"
+            fn route(verb: &str, optional: Option<&str>) {
+                // "comment-only" => ignored()
+                let text = "Some(\"string-only\")";
+                match verb {
+                    "get"
+                    | "status" => { let text = "body-only"; }
+                    "stop" => (),
+                    _ => (),
+                }
+                match optional {
+                    Some("list" | "show") => (),
+                    _ => (),
+                }
+            }
+        "#,
+        );
+        assert_eq!(verbs.len(), 5);
+        for verb in ["get", "status", "stop", "list", "show"] {
+            assert!(verbs.contains(verb), "missing routed verb {verb}");
+        }
+        for verb in ["comment-only", "string-only", "body-only", "deleted"] {
+            assert!(!verbs.contains(verb), "invented routed verb {verb}");
+        }
+    }
+
     /// Every verb the table claims exists is a verb its dispatcher routes.
     ///
     /// The other direction of the same walk: a row left behind by a renamed or
     /// deleted verb is a help answer for a command that no longer exists.
     #[test]
     fn every_tabelled_verb_is_still_dispatched() {
+        let mut groups = std::collections::BTreeMap::new();
         for (group, verb, _) in VERBS {
-            let source = group_parser_source(group);
+            let verbs = groups.entry(*group).or_insert_with(|| {
+                // Concatenated modules have separate inner attributes.
+                let sources = match *group {
+                    "delegate" => vec![
+                        include_str!("delegate.rs"),
+                        include_str!("delegate_list.rs"),
+                    ],
+                    "wait" => vec![DISPATCH_SOURCE, include_str!("events.rs")],
+                    // The group routes grants inline; its nested parser owns flags.
+                    "structured" => vec![DISPATCH_SOURCE, group_parser_source(group)],
+                    _ => vec![group_parser_source(group)],
+                };
+                sources
+                    .into_iter()
+                    .flat_map(routed_verbs)
+                    .collect::<std::collections::BTreeSet<_>>()
+            });
             assert!(
-                source.contains(&format!("\"{verb}\" =>"))
-                    || source.contains(&format!("Some(\"{verb}\")")),
+                verbs.contains(*verb),
                 "{group} no longer routes a {verb} verb, but the help table does"
             );
         }

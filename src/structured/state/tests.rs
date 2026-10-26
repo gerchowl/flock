@@ -334,7 +334,7 @@ fn keyed_sink_never_changes_another_agent_or_publishes_eventhub_events() {
 }
 
 #[test]
-fn review_blocker_allowed_warning_does_not_block() {
+fn allowed_warning_does_not_block() {
     let now = Instant::now();
     let mut reducer = SessionState::new("agent_fixture".into());
     step(&mut reducer, started(), now);
@@ -354,7 +354,7 @@ fn review_blocker_allowed_warning_does_not_block() {
 }
 
 #[test]
-fn review_blocker_unknown_limit_status_preserves_the_last_observation() {
+fn unknown_rate_limit_status_preserves_the_last_observation() {
     let now = Instant::now();
     let mut reducer = SessionState::new("agent_fixture".into());
     step(&mut reducer, started(), now);
@@ -371,7 +371,7 @@ fn review_blocker_unknown_limit_status_preserves_the_last_observation() {
 }
 
 #[test]
-fn review_blocker_exit_closes_all_open_requests() {
+fn process_exit_closes_all_open_requests() {
     let now = Instant::now();
     let mut reducer = SessionState::new("agent_fixture".into());
     step(&mut reducer, started(), now);
@@ -394,7 +394,7 @@ fn review_blocker_exit_closes_all_open_requests() {
 }
 
 #[test]
-fn review_blocker_result_closes_all_open_requests() {
+fn top_level_result_closes_all_open_requests() {
     for result in [
         result(),
         fixture("result", Some(("/subtype", "error_during_execution"))),
@@ -416,12 +416,14 @@ fn review_blocker_result_closes_all_open_requests() {
 }
 
 #[test]
-fn review_blocker_cancel_closes_only_the_named_request() {
+fn control_cancel_closes_only_the_named_request() {
     let now = Instant::now();
     let mut reducer = SessionState::new("agent_fixture".into());
     step(&mut reducer, started(), now);
     step(&mut reducer, permission("p1", "Read"), now);
     step(&mut reducer, permission("p2", "AskUserQuestion"), now);
+    // Reconstructed from the SDK protocol, not a CLI capture. Its shape must be
+    // confirmed in the #1385 recapture: https://github.com/gerchowl/flock/issues/1385.
     let cancel = |id: &str| json!({"type":"control_cancel_request","request_id":id});
     assert_eq!(
         step(&mut reducer, cancel("other"), now).needs_human.len(),
@@ -453,4 +455,69 @@ fn provider_limit_outranks_crashed_until_the_registry_changes_lifecycle() {
     );
     let offline = reducer.reduce(Input::Lifecycle(Lifecycle::Offline), now, 1000, STALL);
     assert_eq!(offline.state.phase, Phase::Offline);
+}
+
+#[test]
+fn accepted_input_silence_uses_caller_policy_and_started_recovers() {
+    let now = Instant::now();
+    let mut reducer = SessionState::new("agent_fixture".into());
+    let accepted = reducer.reduce(
+        Input::Accepted {
+            at: now,
+            at_ms: 1234,
+        },
+        now,
+        1234,
+        STALL,
+    );
+    assert_eq!(accepted.state.turn, Turn::Unknown);
+    assert_eq!(accepted.observe_at, Some(now + STALL));
+    assert!(clock(&mut reducer, now + STALL - Duration::from_millis(1))
+        .stalled_since_ms
+        .is_none());
+    assert_eq!(
+        clock(&mut reducer, now + STALL).stalled_since_ms,
+        Some(1234)
+    );
+    assert!(clock(&mut reducer, now + STALL * 2)
+        .stalled_since_ms
+        .is_none());
+    let recovered = step(&mut reducer, started(), now + STALL * 2);
+    assert!(recovered.stalled_since_ms.is_none());
+    assert_eq!(recovered.state.turn, Turn::Working);
+    assert_eq!(recovered.observe_at, Some(now + STALL * 3));
+}
+
+#[test]
+fn accepted_input_result_and_exit_retire_silence_without_inventing_started() {
+    for exit in [false, true] {
+        let now = Instant::now();
+        let mut reducer = SessionState::new("agent_fixture".into());
+        reducer.reduce(
+            Input::Accepted {
+                at: now,
+                at_ms: 1234,
+            },
+            now,
+            1234,
+            STALL,
+        );
+        if exit {
+            reducer.reduce(Input::ProcessExited, now, 1234, STALL);
+        } else {
+            step(&mut reducer, result(), now);
+        }
+        assert!(clock(&mut reducer, now + STALL).stalled_since_ms.is_none());
+        let settled = now + STALL + Duration::from_millis(crate::api::agent_state::SETTLE_MS);
+        assert!(clock(&mut reducer, settled).observe_at.is_none());
+    }
+}
+
+#[test]
+fn delayed_accepted_input_observation_keeps_the_admission_clock() {
+    let at = Instant::now();
+    let mut reducer = SessionState::new("agent_fixture".into());
+    let update = reducer.reduce(Input::Accepted { at, at_ms: 1000 }, at + STALL, 1100, STALL);
+    assert_eq!(update.stalled_since_ms, Some(1000));
+    assert!(update.observe_at.is_none());
 }

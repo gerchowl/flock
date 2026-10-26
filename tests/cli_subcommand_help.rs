@@ -409,3 +409,13 @@ fn agent_history_help_and_invalid_arguments() {
         assert!(!stderr_of(&output).is_empty());
     }
 }
+
+#[test]
+fn native_inbox_help_describes_the_attested_structured_surface() {
+    let env = Env::new();
+    for verb in ["list", "read"] {
+        let output = env.flk(&["msg", verb, "--help"]);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stdout_of(&output).contains("structured inbox"));
+    }
+}

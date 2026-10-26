@@ -17,8 +17,8 @@
 #   libraries. `$out` is the built `dist/`: `index.html` plus `assets/`.
 #
 # The hash is pinned in `nix/client-deps.json`, together with the sha256
-# of the `bun.lock` it was computed from. Evaluation fails, naming the file
-# and the command, when the lock no longer matches: run
+# of the `bun.lock` and the Bun version it was computed from. Evaluation
+# fails, naming the file and command, when either no longer matches: run
 # `just client-deps-hash` and commit `nix/client-deps.json`.
 #
 # This is only the bundle. Serving it from `flk` (embedding, cache headers,
@@ -97,12 +97,19 @@ let
     outputHashMode = "recursive";
     outputHashAlgo = "sha256";
     outputHash = if pinned.hash == "" then lib.fakeHash else pinned.hash;
+    passthru.bunVersion = bun.version;
   };
 in
 assert lib.assertMsg (pinned.lock == lockSha256) ''
   web/client/bun.lock changed since nix/client-deps.json was computed
   (pinned for sha256 ${pinned.lock}, the lock is now ${lockSha256}).
   Run `just client-deps-hash` and commit nix/client-deps.json.'';
+assert lib.assertMsg (pinned.hash == "" || (pinned.bun or null) == bun.version) ''
+  Bun changed since nix/client-deps.json was computed
+  (pinned for ${pinned.bun or "unrecorded"}, nixpkgs supplies ${bun.version}).
+  Run `just client-deps-hash` and commit nix/client-deps.json.
+  A same-version nixpkgs Bun patch can reuse the cached fixed-output outPath
+  without detecting changed output. Refresh explicitly with the same command.'';
 stdenv.mkDerivation {
   pname = "flock-client";
   version = "0.0.0";

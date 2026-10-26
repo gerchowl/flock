@@ -212,9 +212,15 @@ pub struct HeadlessServer {
     app: app::App,
     api_tx: Option<api::ApiRequestSender>,
     api_server: Option<api::ServerHandle>,
+    /// Logical-server health survives API socket replacement during handoff rollback.
+    client_wire_health: crate::api::client_listener::Health,
     client_listener: UnixListener,
+    /// Bound structured listener and acceptor lifetime, including handoff preparation.
+    #[cfg(feature = "web")]
+    client_wire: Option<crate::web::client_listener::Listener>,
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
+    client_socket_owner: crate::ipc::SocketOwner,
     clients: HashMap<u64, ClientConnection>,
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
@@ -249,6 +255,8 @@ pub struct HeadlessServer {
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
+    // True only after the replacement owns the committed handoff.
+    handoff_completed: bool,
     /// Panes whose pending input the current `--skip-undrained` handoff has
     /// dropped. Reported with the outcome even when a later step fails.
     handoff_skipped_undrained: Vec<api::schema::UndrainedPane>,
@@ -568,15 +576,33 @@ impl HeadlessServer {
     /// 2. Binds the client socket listener
     /// 3. Returns the server ready to run
     pub fn new(
-        mut app: app::App,
+        app: app::App,
         config_diagnostics: &[String],
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
     ) -> io::Result<Self> {
+        Self::new_owned(app, config_diagnostics, api_tx, api_server, None)
+    }
+
+    /// Import or restore under the existing socket ownership description.
+    fn new_owned(
+        mut app: app::App,
+        config_diagnostics: &[String],
+        api_tx: Option<api::ApiRequestSender>,
+        api_server: Option<api::ServerHandle>,
+        inherited: Option<crate::ipc::SocketOwner>,
+    ) -> io::Result<Self> {
+        app.state.app_client_attached = false;
         app.initialize_mesh_mail(api_server.as_ref())
             .map_err(io::Error::other)?;
         let client_path = client_socket_path();
-        prepare_socket_path(&client_path)?;
+        let client_socket_owner = match inherited {
+            Some(owner) => {
+                owner.prepare(&client_path)?;
+                owner
+            }
+            None => prepare_socket_path(&client_path)?,
+        };
 
         let listener = UnixListener::bind(&client_path)?;
         restrict_socket_permissions(&client_path)?;
@@ -594,13 +620,21 @@ impl HeadlessServer {
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(config_diagnostics);
 
+        let client_wire_health = api_server
+            .as_ref()
+            .map(|server| server.client_listener.clone())
+            .unwrap_or_default();
         Ok(Self {
             app,
             api_tx,
             api_server,
+            client_wire_health,
             client_listener: listener,
+            #[cfg(feature = "web")]
+            client_wire: None,
             client_socket_path: client_path,
             client_socket_identity,
+            client_socket_owner,
             clients: HashMap::new(),
             next_client_id: 1,
             foreground_client_id: None,
@@ -614,6 +648,7 @@ impl HeadlessServer {
             last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
+            handoff_completed: false,
             handoff_skipped_undrained: Vec::new(),
             pending_handoff_repaint_nudge: false,
             should_quit,
@@ -633,6 +668,45 @@ impl HeadlessServer {
     /// - Handles scheduled tasks (resize poll, animation, session save, etc.)
     /// - Renders virtually and streams frames to clients
     pub async fn run(&mut self) -> io::Result<()> {
+        #[cfg(feature = "web")]
+        {
+            if let Some(wire) = &mut self.client_wire {
+                wire.activate();
+            }
+        }
+        let result = self.run_loop().await;
+        #[cfg(feature = "web")]
+        if let Some(wire) = self.client_wire.take() {
+            return crate::web::client_listener::finish_shutdown(result, wire.shutdown().await);
+        }
+        result
+    }
+    /// Prepare while rollback is still possible; activation belongs to the run loop.
+    #[cfg(feature = "web")]
+    async fn prepare_client_wire(
+        &mut self,
+        inherited: Option<std::net::TcpListener>,
+    ) -> io::Result<()> {
+        self.client_wire = crate::web::client_listener::Listener::prepare(
+            self.app.state.config.client.bind,
+            self.app.client_codes.clone(),
+            crate::session::data_dir(),
+            inherited,
+            self.client_wire_health.clone(),
+            self.app.render_notify.clone(),
+            self.app.client_auth.clone(),
+        )
+        .await?;
+        if let Some(wire) = &self.client_wire {
+            self.app
+                .client_codes
+                .set_endpoint(wire.socket.local_addr()?)
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+    /// Own the event loop inside the structured listener's lifetime.
+    async fn run_loop(&mut self) -> io::Result<()> {
         crate::logging::startup("server");
 
         // Register SIGINT handler for graceful shutdown.
@@ -985,11 +1059,6 @@ impl HeadlessServer {
             }
         }
 
-        // Save session on exit.
-        if !self.app.no_session {
-            self.app.save_session_now();
-        }
-
         info!("headless server exiting");
         Ok(())
     }
@@ -1155,6 +1224,15 @@ impl HeadlessServer {
         }
     }
 
+    /// S3a-3 deliberately stops structured sessions before transferring ownership.
+    /// Full single-writer session handoff belongs to S7-rest.
+    fn stop_structured_before_handoff(&mut self) -> Vec<String> {
+        if let Err(error) = self.app.shutdown_structured_workers() {
+            crate::logging::structured_worker_shutdown_failed(&error);
+        }
+        self.app.state.structured_agents.handoff_unknown()
+    }
+
     #[cfg(unix)]
     fn perform_live_handoff(
         &mut self,
@@ -1180,6 +1258,7 @@ impl HeadlessServer {
             );
             return Err(HandoffError::SessionBroken);
         }
+        let structured_unknown = self.stop_structured_before_handoff();
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
@@ -1295,7 +1374,12 @@ impl HeadlessServer {
             return Err(HandoffError::Undrained(undrained));
         }
 
+        let retained_at_ms = self.app.prepare_retained_save();
         let snapshot = crate::persist::capture(
+            crate::persist::RegistryCapture {
+                registry: &self.app.state.structured_agents,
+                now_ms: retained_at_ms,
+            },
             &self.app.state.workspaces,
             &self.app.state.terminals,
             &self.app.terminal_runtimes,
@@ -1347,6 +1431,7 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
         );
+        manifest.structured_unknown = structured_unknown;
         manifest.store_generation = store_generation;
         manifest.kept_drafts = self.app.kept_drafts.borrow().export();
         if cfg!(debug_assertions)
@@ -1354,6 +1439,15 @@ impl HeadlessServer {
         {
             manifest.store_generation = store_generation.saturating_add(1);
         }
+        #[cfg(feature = "web")]
+        {
+            manifest.client_listener = self.client_wire.is_some();
+            if manifest.client_listener {
+                manifest.version = crate::server::handoff::CLIENT_LISTENER_HANDOFF_VERSION;
+            }
+        }
+        manifest.socket_owners = true;
+        manifest.version = crate::server::handoff::SOCKET_OWNER_HANDOFF_VERSION;
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
             &socket_path,
@@ -1376,6 +1470,19 @@ impl HeadlessServer {
                 };
                 fds.push(runtime.duplicate_handoff_fd()?);
             }
+            #[cfg(feature = "web")]
+            if let Some(wire) = &self.client_wire {
+                use std::os::fd::IntoRawFd;
+                fds.push(crate::platform::client_listener::duplicate(&wire.socket)?.into_raw_fd());
+            }
+            use std::os::fd::IntoRawFd;
+            let api_owner = &self
+                .api_server
+                .as_ref()
+                .ok_or_else(|| io::Error::other("handoff requires API socket ownership"))?
+                .socket_owner;
+            fds.push(api_owner.duplicate()?.into_raw_fd());
+            fds.push(self.client_socket_owner.duplicate()?.into_raw_fd());
             Ok::<(), io::Error>(())
         })();
         if let Err(err) = duplicate_result {
@@ -1422,8 +1529,6 @@ impl HeadlessServer {
 
         if let Some(api_server) = &self.api_server {
             let _ = api_server.remove_socket_file_if_owned();
-        } else {
-            let _ = std::fs::remove_file(crate::api::socket_path());
         }
         let _ = remove_socket_file_if_owned(&self.client_socket_path, self.client_socket_identity);
         if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
@@ -1463,11 +1568,17 @@ impl HeadlessServer {
         }
         crate::server::handoff::wait_owned_ack(&mut stream);
 
+        self.commit_handoff_shutdown();
+        info!("live handoff completed; old server exiting");
+        Ok(skipped_undrained)
+    }
+
+    /// Enter exporter shutdown only after the replacement's owned acknowledgement.
+    fn commit_handoff_shutdown(&mut self) {
         self.shutting_down = true;
         self.app.state.should_quit = true;
         self.app.no_session = true;
-        info!("live handoff completed; old server exiting");
-        Ok(skipped_undrained)
+        self.handoff_completed = true;
     }
 
     #[cfg(not(unix))]
@@ -1497,7 +1608,7 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
-        let api_server = api::start_server_with_capabilities(
+        let api_server = api::server::start_server_owned(
             api_tx,
             self.app.event_hub.clone(),
             Some(crate::api::schema::ServerCapabilities {
@@ -1506,12 +1617,19 @@ impl HeadlessServer {
                 clone_detection_warning: self.app.clone_detection_warning.clone(),
                 agent_start_label: true,
                 agent_questions: true,
-                pane_input_write_ack: false,
+                structured_agents: true,
+                pane_input_write_ack: true,
+                events_live_start: true,
             }),
+            self.app.runtime_config.uid_policy.clone(),
+            self.client_wire_health.clone(),
+            self.api_server
+                .as_ref()
+                .map(|server| server.socket_owner.clone()),
         )?;
 
         let client_path = client_socket_path();
-        prepare_socket_path(&client_path)?;
+        self.client_socket_owner.prepare(&client_path)?;
         let listener = UnixListener::bind(&client_path)?;
         restrict_socket_permissions(&client_path)?;
         let client_socket_identity = socket_file_identity(&client_path)?;
@@ -1685,6 +1803,7 @@ impl HeadlessServer {
                 }
             }
         }
+        self.app.state.app_client_attached = self.has_app_client();
         if was_foreground {
             self.promote_latest_remaining_client()
         } else {
@@ -2436,6 +2555,7 @@ impl HeadlessServer {
         client.render_state.reset_baseline();
         client.last_activity = stamp;
         let was_foreground = self.foreground_client_id == Some(client_id);
+        self.app.state.app_client_attached = self.has_app_client();
         if was_foreground {
             self.promote_latest_remaining_client();
         }
@@ -2531,6 +2651,7 @@ impl HeadlessServer {
                     // Last attach wins; an empty/absent theme changes nothing.
                     self.app.set_host_terminal_theme(host_theme);
                 }
+                self.app.state.app_client_attached = self.has_app_client();
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
                 }
@@ -2865,6 +2986,9 @@ impl HeadlessServer {
     /// trigger internal events that may set toast state or would normally
     /// play sounds — in headless mode we forward these to clients instead.
     fn handle_api_request_with_shutdown_check(&mut self, msg: api::ApiRequestMessage) -> bool {
+        if self.app.respond_scope_probe(&msg) {
+            return false;
+        }
         if self.shutting_down {
             // During shutdown, respond with server_unavailable.
             let response = serde_json::to_string(&api::schema::ErrorResponse {
@@ -2887,6 +3011,7 @@ impl HeadlessServer {
             msg.request.method,
             api::schema::Method::ServerLiveHandoff(_) | api::schema::Method::ServerReloadConfig(_)
         ) {
+            let scope = std::mem::replace(&mut self.app.current_api_scope, msg.scope.clone());
             let outer = (
                 self.app.current_api_peer_pid,
                 self.app.current_api_peer_birth,
@@ -2896,6 +3021,7 @@ impl HeadlessServer {
             self.app.current_api_peer_birth = Some(msg.peer_birth);
             self.app.current_api_peer_uid = Some(msg.peer_uid);
             let refusal = self.app.peer_uid_refusal(&msg.request);
+            self.app.current_api_scope = scope;
             (
                 self.app.current_api_peer_pid,
                 self.app.current_api_peer_birth,
@@ -3016,12 +3142,14 @@ impl HeadlessServer {
                 .unwrap_or_else(|_| "{}".to_string())
             })
         } else {
+            self.app.current_api_scope = msg.scope;
             self.app.current_api_peer_pid = msg.peer_pid;
             self.app.current_api_peer_birth = Some(msg.peer_birth);
             self.app.current_api_peer_uid = Some(msg.peer_uid);
             let response = self
                 .app
                 .handle_api_request_after_internal_events_drained(msg.request);
+            self.app.current_api_scope = None;
             self.app.current_api_peer_pid = None;
             self.app.current_api_peer_birth = None;
             self.app.current_api_peer_uid = None;
@@ -3782,9 +3910,20 @@ impl HeadlessServer {
     /// clients render, so a session probe that only ran in the monolithic loop
     /// would never see the fault that only the server can have.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
+        self.app.state.app_client_attached = self.has_app_client();
         self.app.input_writes.service_due(now);
+        let structured_changed = self.app.service_structured_workers(now);
+        #[cfg(feature = "web")]
+        if let Some(wire) = &mut self.client_wire {
+            wire.service(
+                &self.app.state.structured_agents,
+                &mut self.app.structured_workers,
+                &crate::session::data_dir(),
+            );
+            wire.service_commands(&mut self.app);
+        }
         self.app.start_ready_pastes();
-        let mut changed = false;
+        let mut changed = structured_changed;
 
         self.app.sync_headless_animation_timer(now);
         changed |= self.app.refresh_session_health(now);
@@ -4025,6 +4164,7 @@ impl HeadlessServer {
     fn complete_shutdown(&mut self) -> io::Result<()> {
         info!("completing server shutdown");
         self.app.settle_injections_for_exit();
+        let structured = self.app.finish_session();
 
         // Send ServerShutdown to all remaining clients.
         if !self.clients.is_empty() {
@@ -4048,7 +4188,11 @@ impl HeadlessServer {
         // Remove socket files.
         self.cleanup_sockets()?;
 
-        Ok(())
+        if self.handoff_completed {
+            Ok(())
+        } else {
+            structured.map_err(io::Error::other)
+        }
     }
 
     /// Removes socket files created by the server.
@@ -4120,19 +4264,21 @@ fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
     clippy::print_stderr,
     reason = "startup fatal errors (socket already in use) must surface on the launching process's stderr before tracing is bootstrapped for the user"
 )]
-pub fn run_server() -> io::Result<()> {
+pub fn run_server(args: &[String], handoff_socket: Option<PathBuf>) -> io::Result<()> {
     crate::platform::raise_server_nofile_limit();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(2).map(String::as_str) == Some("--handoff-import") {
-        let socket_path = args
-            .get(3)
-            .map(PathBuf::from)
+    if args.first().map(String::as_str) == Some("--handoff-import") {
+        let socket_path = handoff_socket
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff socket"))?;
-        let token = args
-            .get(4)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
-        return run_handoff_import_server(&socket_path, token);
+        // Old running exporters use the positional channel. Keep import compatible
+        // across upgrades; new exporters supply only the environment channel.
+        let token = std::env::var(crate::server::handoff::HANDOFF_TOKEN_ENV)
+            .or_else(|_| args.get(1).cloned().ok_or(std::env::VarError::NotPresent))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
+        // Consume before starting threads or children, so panes cannot inherit it.
+        std::env::remove_var(crate::server::handoff::HANDOFF_TOKEN_ENV);
+        let token = zeroize::Zeroizing::new(token);
+        return run_handoff_import_server(&socket_path, &token);
     }
 
     init_logging();
@@ -4143,10 +4289,15 @@ pub fn run_server() -> io::Result<()> {
     event_hub.set_read_max_wait_ms(loaded_config.config.events.read_max_wait_ms);
 
     // Start the JSON API socket server.
-    let _api_server = match api::start_server(api_tx.clone(), event_hub.clone()) {
+    let runtime_config = app::AppRuntimeConfig::for_config(&loaded_config.config);
+    let _api_server = match api::start_server(
+        api_tx.clone(),
+        event_hub.clone(),
+        runtime_config.uid_policy.clone(),
+    ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: flk server is already running");
+            eprintln!("error: {err}");
             eprintln!("api socket: {}", api::socket_path().display());
             std::process::exit(crate::cli::exit::FAILURE);
         }
@@ -4162,12 +4313,13 @@ pub fn run_server() -> io::Result<()> {
 
     let result = rt.block_on(async {
         // Create the App (with AppState, event channels, etc.).
-        let mut app = app::App::new(
+        let mut app = app::App::new_with_runtime_config(
             &loaded_config.config,
             no_session,
             config::config_diagnostic_summary(&loaded_config.diagnostics),
             api_rx,
             event_hub,
+            runtime_config,
         );
 
         // The server runs headless — disable local notification side effects.
@@ -4185,13 +4337,15 @@ pub fn run_server() -> io::Result<()> {
         ) {
             Ok(server) => server,
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                eprintln!("error: flk server is already running");
+                eprintln!("error: {err}");
                 eprintln!("client socket: {}", client_socket_path().display());
                 std::process::exit(crate::cli::exit::FAILURE);
             }
             Err(err) => return Err(err),
         };
 
+        #[cfg(feature = "web")]
+        server.prepare_client_wire(None).await?;
         crate::logging::server_started(&api::socket_path(), &client_socket_path());
         print_ready_message(&api::socket_path(), &client_socket_path());
 
@@ -4210,6 +4364,26 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     init_logging();
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
+    let (api_owner, client_owner) = if received.manifest.socket_owners {
+        let client = crate::ipc::SocketOwner::take(&client_socket_path(), &mut received.fds)?;
+        let api = crate::ipc::SocketOwner::take(&api::socket_path(), &mut received.fds)?;
+        (Some(api), Some(client))
+    } else {
+        (None, None)
+    };
+    #[cfg(feature = "web")]
+    let wire_listener = if received.manifest.client_listener {
+        Some(
+            crate::platform::client_listener::take(&mut received.fds).inspect_err(|err| {
+                let _ = crate::server::handoff::report_import_refusal(
+                    &mut received.stream,
+                    &err.to_string(),
+                );
+            })?,
+        )
+    } else {
+        None
+    };
     crate::server::handoff::log_import_result(received.manifest.panes.len());
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4218,7 +4392,10 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     event_hub.set_read_max_wait_ms(loaded_config.config.events.read_max_wait_ms);
 
     let mut imports = HashMap::new();
-    for (pane, fd) in received.manifest.panes.into_iter().zip(received.fds) {
+    for (pane, fd) in std::mem::take(&mut received.manifest.panes)
+        .into_iter()
+        .zip(received.fds)
+    {
         let pane_id = pane.pane_id;
         imports.insert(
             pane_id,
@@ -4256,6 +4433,9 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
                 return Err(err);
             }
         };
+        received
+            .manifest
+            .restore_structured_unknown(&mut app.state.structured_agents);
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
         app.kept_drafts
@@ -4271,13 +4451,25 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         }
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
-        let api_server = api::start_server(api_tx.clone(), event_hub.clone())?;
-        let mut server = HeadlessServer::new(
+        let api_server = api::server::start_server_for_mode_owned(
+            api_tx.clone(),
+            event_hub.clone(),
+            true,
+            app.runtime_config.uid_policy.clone(),
+            api_owner,
+        )?;
+        let mut server = HeadlessServer::new_owned(
             app,
             &loaded_config.diagnostics,
             Some(api_tx.clone()),
             Some(api_server),
+            client_owner,
         )?;
+        #[cfg(feature = "web")]
+        if let Err(err) = server.prepare_client_wire(wire_listener).await {
+            crate::server::handoff::report_import_refusal(&mut received.stream, &err.to_string())?;
+            return Err(err);
+        }
         // Late failure tests corrupt only their supplied sandbox identity after bootstrap.
         if cfg!(debug_assertions) {
             if let Some(path) = std::env::var_os("FLOCK_TEST_HANDOFF_CORRUPT_IDENTITY_PATH") {
@@ -4382,6 +4574,7 @@ fn init_logging() {
 
 #[cfg(test)]
 mod tests {
+    mod observer_stall;
     use super::*;
 
     use crate::app::AppState;
@@ -4733,6 +4926,351 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_stops_and_joins_all_structured_workers() {
+        assert_structured_workers_stopped(false).await;
+    }
+
+    #[tokio::test]
+    async fn pre_handoff_stops_and_joins_all_structured_workers() {
+        assert_structured_workers_stopped(true).await;
+    }
+
+    async fn assert_structured_workers_stopped(handoff: bool) {
+        use crate::api::agent_state::Lifecycle;
+        use crate::structured::{
+            supervision::ProcessIdentity,
+            workers::tests::{event, Case},
+        };
+        let mut server = test_headless_server();
+        let notify = server.app.render_notify.clone();
+        let now = Instant::now();
+        let mut cases = Vec::new();
+        let mut children = Vec::new();
+        for n in [33, 34] {
+            let case = Case::start(
+                &mut server.app.state.structured_agents,
+                &mut server.app.structured_workers,
+                n,
+                "state-reducer",
+                vec![event("control_request")],
+            );
+            case.human(
+                &mut server.app.state.structured_agents,
+                &mut server.app.structured_workers,
+                &notify,
+                now,
+            )
+            .await;
+            let pid = std::fs::read_to_string(case.fixture.root.path().join("model.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            children.push(ProcessIdentity::capture(pid).unwrap());
+            cases.push(case);
+        }
+        if handoff {
+            assert!(server.stop_structured_before_handoff().is_empty());
+        } else {
+            server.complete_shutdown().unwrap();
+        }
+        assert!(children.into_iter().all(|child| !child.alive()));
+        for case in cases {
+            case.assert_shutdown(
+                &server.app.state.structured_agents,
+                &server.app.structured_workers,
+            );
+            assert_eq!(
+                server
+                    .app
+                    .state
+                    .structured_agents
+                    .get(&case.id)
+                    .unwrap()
+                    .1
+                    .update
+                    .state
+                    .lifecycle,
+                Lifecycle::Offline
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_worker_reports_but_does_not_veto_handoff_and_crosses_as_unknown() {
+        use crate::api::{agent_state::Lifecycle, error_code::ErrorCode};
+        use crate::structured::workers::tests::Case;
+        let _guard = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        struct SavedEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for SavedEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+        let _env = SavedEnv(
+            [
+                crate::config::CONFIG_PATH_ENV_VAR,
+                "XDG_STATE_HOME",
+                "XDG_CONFIG_HOME",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+        );
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+        let mut server = test_headless_server();
+        let notify = server.app.render_notify.clone();
+        let case = Case::uncertain(
+            &mut server.app.state.structured_agents,
+            &mut server.app.structured_workers,
+            42,
+            &notify,
+        )
+        .await;
+        let (offline, mut restored_launch, _) = Case::prepare(
+            &mut server.app.state.structured_agents,
+            43,
+            "state-reducer",
+            vec![],
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                server.stop_structured_before_handoff(),
+                vec![case.id.clone()]
+            );
+            let error = server
+                .app
+                .structured_workers
+                .shutdown(&mut server.app.state.structured_agents)
+                .unwrap_err();
+            assert!(error
+                .0
+                .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
+            let result = server.perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
+                import_exe: Some(
+                    root.path()
+                        .join("missing-importer")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                expected_protocol: None,
+                expected_version: None,
+                skip_undrained: false,
+            });
+            match result {
+                Err(HandoffError::Failed(error)) => assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::NotFound,
+                    "worker diagnostics must reach the real importer precondition"
+                ),
+                other => panic!("unexpected handoff outcome: {other:?}"),
+            }
+        }
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "workspaces":[],"active":null,"selected":0,"structured_agents":server.app.state.structured_agents,
+        })).unwrap();
+        let mut manifest = crate::server::handoff::manifest_for(snapshot, Vec::new(), None, None);
+        manifest.structured_unknown = server.stop_structured_before_handoff();
+        let manifest: crate::server::handoff::HandoffManifest =
+            serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut restored = crate::app::App::new_from_handoff(
+            &crate::config::Config::default(),
+            None,
+            rx,
+            crate::api::EventHub::default(),
+            &manifest.snapshot,
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        manifest.restore_structured_unknown(&mut restored.state.structured_agents);
+        assert_eq!(
+            restored
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle,
+            Lifecycle::Unknown
+        );
+        assert_eq!(
+            restored
+                .state
+                .structured_agents
+                .get(&offline.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle,
+            Lifecycle::Offline
+        );
+        assert_eq!(
+            restored.state.structured_agents.handoff_unknown(),
+            vec![case.id.clone()],
+            "the next handoff must preserve Unknown without a restored worker"
+        );
+        assert!(restored
+            .structured_workers
+            .runtime(&case.id, case.generation)
+            .is_none());
+        let generation = restored.state.structured_agents.get(&case.id).unwrap().2;
+        restored_launch.agent_id = case.id.clone();
+        restored_launch.generation = generation;
+        restored_launch.leases = restored.session_leases.clone();
+        assert_eq!(
+            restored.structured_workers.start(
+                &mut restored.state.structured_agents,
+                restored_launch,
+                |_| panic!("handoff-restored Unknown cannot prepare")
+            ),
+            Err(ErrorCode::StructuredRecoveryRequired)
+        );
+        assert_eq!(
+            restored.state.structured_agents.get(&case.id).unwrap().2,
+            generation
+        );
+        let error = server.complete_shutdown().unwrap_err();
+        let diagnostic = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::structured::workers::ShutdownError>())
+            .expect("quit must keep the typed shutdown diagnostic as its source");
+        assert!(diagnostic
+            .0
+            .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
+        // The committed handoff keeps this diagnostic but must exit successfully.
+        server.commit_handoff_shutdown();
+        let log = crate::logging::capture_logs(|| assert!(server.complete_shutdown().is_ok()));
+        assert!(log.contains("structured.worker.shutdown_failed"));
+        assert!(log.contains("structured_worker_cleanup_failed"));
+        assert!(
+            server
+                .app
+                .structured_workers
+                .shutdown(&mut server.app.state.structured_agents)
+                .is_err(),
+            "successful handoff does not erase the cached diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_worker_notifications_and_exact_deadlines_reach_the_scheduler() {
+        use crate::api::agent_state::{Lifecycle, Phase};
+        use crate::structured::workers::tests::{event, wait, Case};
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        let notify = server.app.render_notify.clone();
+        server.app.state.workspaces.clear();
+        server.app.state.config.checks.enable = false;
+        server.app.next_auto_update_check = None;
+        server.app.checks_heartbeat_deadline = None;
+        server.app.checks_next_deadline = None;
+        server.app.next_animation_tick = None;
+        server.app.session_save_deadline = None;
+        let (mut case, mut launch, factory) = Case::prepare(
+            &mut server.app.state.structured_agents,
+            11,
+            "state-reducer",
+            vec![event("command_lifecycle")],
+        );
+        // Choose an explicit fixture policy earlier than unrelated app deadlines.
+        launch.stall_after = Duration::from_millis(1);
+        case.generation = server
+            .app
+            .structured_workers
+            .start(&mut server.app.state.structured_agents, launch, factory)
+            .unwrap();
+        wait(&notify, || {
+            server.handle_scheduled_tasks_headless(now, false);
+            assert!(server
+                .app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            server
+                .app
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle
+                == Lifecycle::Live
+        })
+        .await;
+        case.submit(&server.app.structured_workers);
+        wait(&notify, || {
+            server.handle_scheduled_tasks_headless(now, false);
+            assert!(server
+                .app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            server
+                .app
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .phase
+                == Phase::Working
+        })
+        .await;
+        server.app.checks_next_deadline = None;
+        server.app.checks_heartbeat_deadline = None;
+        let due = server
+            .app
+            .structured_workers
+            .next_deadline(&server.app.state.structured_agents)
+            .unwrap();
+        assert_eq!(
+            server
+                .app
+                .next_headless_loop_deadline_with_git_refresh(now, false, false),
+            Some(due)
+        );
+        let now = due;
+        server.handle_scheduled_tasks_headless(now, false);
+        let update = &server
+            .app
+            .state
+            .structured_agents
+            .get(&case.id)
+            .unwrap()
+            .1
+            .update;
+        assert_eq!(update.state.phase, Phase::Working);
+        assert!(update.stalled_since_ms.is_some());
+        case.finish(
+            &mut server.app.state.structured_agents,
+            &mut server.app.structured_workers,
+            &notify,
+            now,
+            Some(crate::structured::runtime::Outcome::Stopped),
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn s3b_headless_dispatch_deadline_cancels_held_input_without_traffic() {
         let mut server = test_headless_server();
         server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("write-ack")];
@@ -4747,6 +5285,7 @@ mod tests {
             .insert(pane, runtime);
         let (respond_to, response) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            scope: None,
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true,"write_timeout_ms":200}})).unwrap(),
             respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
         });
@@ -4791,6 +5330,7 @@ mod tests {
             .insert(pane, runtime);
         let (respond_to, response) = std::sync::mpsc::channel();
         server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            scope: None,
             request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true}})).unwrap(),
             respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
         });
@@ -4803,6 +5343,95 @@ mod tests {
         assert_eq!(value["error"]["data"]["input_write"]["reason"], "pane_gone");
         assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
         assert!(bytes.try_recv().is_err());
+    }
+
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn fatal_client_accept_keeps_the_server_loop_and_shell_pty_alive() {
+        async fn request(
+            tx: &api::ApiRequestSender,
+            method: &str,
+            params: serde_json::Value,
+        ) -> serde_json::Value {
+            let (respond_to, response) = std::sync::mpsc::channel();
+            tx.send(api::ApiRequestMessage {
+                scope: None,
+                request: serde_json::from_value(
+                    serde_json::json!({"id":"listener-survival","method":method,"params":params}),
+                )
+                .unwrap(),
+                respond_to,
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
+            })
+            .unwrap();
+            let response = tokio::task::spawn_blocking(move || {
+                response
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("headless request producer disappeared or stayed silent")
+            })
+            .await
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert!(value.get("error").is_none(), "{value}");
+            value
+        }
+        let (data, failed) = crate::web::client_listener::tests::failed_listener().await;
+        let health = failed.health.clone();
+        let mut server = test_headless_server();
+        server.app.state.default_shell = "/bin/sh".into();
+        server.app.state.config.terminal.default_shell = "/bin/sh".into();
+        server.app.state.config.checks.enable = false;
+        server.app.next_auto_update_check = None;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        server.app.api_rx = rx;
+        server.client_wire_health = health.clone();
+        server.client_wire = Some(failed);
+        let quit = server.should_quit.clone();
+        let wake = server.server_event_tx.clone();
+        let exercise = async {
+            assert_eq!(
+                health.status(),
+                Some(crate::api::client_listener::Status::Failed)
+            );
+            let created = request(
+                &tx,
+                "workspace.create",
+                serde_json::json!({"cwd":data.path(),"focus":true}),
+            )
+            .await;
+            let pane = created["result"]["root_pane"]["pane_id"]
+                .as_str()
+                .expect("live shell pane");
+            request(&tx,"pane.write_input",serde_json::json!({"pane_id":pane,"text":"printf '%s%s\\n' listener- survived\n","raw":true})).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let read = request(
+                        &tx,
+                        "pane.read",
+                        serde_json::json!({"pane_id":pane,"source":"recent","format":"text"}),
+                    )
+                    .await;
+                    if read.to_string().contains("listener-survived") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("shell producer stayed silent after listener failure");
+            quit.store(true, Ordering::Release);
+            wake.send(ServerEvent::QuitSignal)
+                .await
+                .expect("owned server shutdown wake");
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(server.run(), exercise)
+        })
+        .await
+        .expect("headless loop did not finish after explicit owned shutdown");
+        result.unwrap();
     }
 
     fn test_headless_server() -> HeadlessServer {
@@ -4827,6 +5456,7 @@ mod tests {
         let socket_path = dir.join("client.sock");
         let _ = fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).expect("bind test listener");
+        let client_socket_owner = crate::ipc::SocketOwner::acquire(&socket_path).unwrap();
         let client_socket_identity =
             socket_file_identity(&socket_path).expect("test listener socket identity");
         listener
@@ -4839,9 +5469,13 @@ mod tests {
             app,
             api_tx: None,
             api_server: None,
+            client_wire_health: Default::default(),
             client_listener: listener,
+            #[cfg(feature = "web")]
+            client_wire: None,
             client_socket_path: socket_path,
             client_socket_identity,
+            client_socket_owner,
             clients: HashMap::new(),
             next_client_id: 1,
             foreground_client_id: None,
@@ -4855,6 +5489,7 @@ mod tests {
             last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
+            handoff_completed: false,
             handoff_skipped_undrained: Vec::new(),
             pending_handoff_repaint_nudge: false,
             should_quit: Arc::new(AtomicBool::new(false)),
@@ -4906,6 +5541,7 @@ mod tests {
             crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
         let (respond_to, response) = std::sync::mpsc::channel();
         let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            scope: None,
             request: api::schema::Request {
                 id: "uid-handoff".into(),
                 method: api::schema::Method::ServerLiveHandoff(
@@ -4945,6 +5581,7 @@ mod tests {
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(
             server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                scope: None,
                 request: api::schema::Request {
                     id: "headless_stop_after_events".into(),
                     method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
@@ -5268,6 +5905,7 @@ mod tests {
         let fleet = protocol::FleetSnapshot {
             origin: "hopper".to_string(),
             peers: vec![protocol::FleetPeer {
+                node_id: None,
                 name: "kiln".to_string(),
                 ssh_target: "operator@kiln".to_string(),
                 host: Some("kiln".to_string()),
@@ -5895,6 +6533,31 @@ next_tab = ""
         );
     }
 
+    #[test]
+    fn headless_no_viewer_gate_reaches_the_summary_as_idle() {
+        let mut server = test_headless_server();
+        server
+            .app
+            .state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("git-health"));
+        server
+            .app
+            .git_refresh_health
+            .mark_success(Instant::now() - Duration::from_secs(29_656));
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+        assert!(!server.app.git_refresh_in_flight);
+        let response = server.app.handle_api_request(crate::api::schema::Request {
+            id: "idle-health".into(),
+            method: crate::api::schema::Method::PeersSummary(crate::api::schema::EmptyParams {}),
+        });
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let row = &value["result"]["pollers"]["git_refresh"];
+        assert_eq!(row["status"], "idle");
+        assert_eq!(row["reason"], "no_viewer");
+        assert_eq!(row["consecutive_failures"], 0);
+    }
+
     fn app_client_marks_git_refresh_due_on_first_attach(render_encoding: RenderEncoding) {
         let mut server = test_headless_server();
         server
@@ -6279,7 +6942,7 @@ next_tab = ""
         let done_in_hub = server
             .app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .any(|(_, event)| {
                 matches!(
@@ -6371,7 +7034,7 @@ next_tab = ""
         assert!(server
             .app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .any(|(_, event)| {
                 event.event == crate::api::schema::EventKind::PaneAgentStatusChanged
@@ -7661,6 +8324,7 @@ next_tab = ""
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(
             server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                scope: None,
                 request: api::schema::Request {
                     id: "focus_b".into(),
                     method: api::schema::Method::WorkspaceFocus(api::schema::WorkspaceTarget {
@@ -9234,7 +9898,7 @@ next_tab = ""
             server
                 .app
                 .event_hub
-                .events_after(0)
+                .ring_snapshot_after(0)
                 .iter()
                 .any(|(_, event)| { event.event == api::schema::EventKind::NotificationFiled }),
             "the projection is only as durable as the event it queued"
@@ -9290,6 +9954,7 @@ next_tab = ""
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            scope: None,
             request: api::schema::Request {
                 id: "stale".into(),
                 method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {

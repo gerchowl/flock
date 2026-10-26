@@ -80,6 +80,24 @@ pub fn session_ref_from_report(
     agent_session_id.and_then(AgentSessionRef::id)
 }
 
+/// Unvalidated Codex SessionStart data retained separately from resume identity.
+/// Runtime must validate path, launch and writer before consuming its transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexSessionStart {
+    pub thread: String,
+    pub transcript_path: Option<String>,
+    pub source: Option<String>,
+}
+
+/// Codex also reports fork; accepting it must not widen Claude's source set.
+pub fn normalize_session_start_source(agent: &str, value: Option<String>) -> Option<String> {
+    if agent == "codex" && value.as_deref().map(str::trim) == Some("fork") {
+        Some("fork".into())
+    } else {
+        normalize_claude_session_start_source(value)
+    }
+}
+
 /// Normalize the optional `session_start_source` field reported by the Claude
 /// Code hook on `SessionStart`. Claude reports `startup`, `resume`, `clear`,
 /// or `compact` — anything else is treated as absent so we don't trust an

@@ -23,7 +23,7 @@ ceiling; mismatch, unexpected output and premature exit fail immediately.
 | `observe` | Optional `connection:string`, `streams{sub_id:{state:string,cursor:number\|null}}`, `outbox{cmd_id:OutboxStatus}`, optional `absent_streams`, `absent_outbox`, `connection_transitions`. Assert only specified entries; null means no applied cursor, while zero is meaningful. G3 owns connection/stream states; outbox statuses are the closed six-state enum below. |
 | `deadline` | `stage:{kind:"connect"\|"handshake"\|"subscription"\|"command_ack",sub_id?,cmd_id?}`. Advance to the original stage ceiling, rejecting every early effect, with no duration override. Subscription and command stages require their identity. |
 | `heartbeat_missed` | Withhold valid current-socket traffic and advance to 45 s from the last valid current-socket frame. The fake transport determines that instant; an old callback cannot shift it. |
-| `close` | `code`, `reason`. Deliver a WS close; 4401/4403 are rejected here. |
+| `close` | `code`, `reason`. Deliver a non-auth WS close (including 1001 for an initial hello or post-registration handshake deadline, unavailable store worker, I/O failure or unsafe storage); reconnect with the retained token. 4401/4403 are rejected here. |
 | `drop` | Lose the active socket without a close, retaining applied state and outbox. |
 | `token_refused` | `code:4401\|4403`. Enter NeedsToken, hold pending outbox and do not reconnect until credentials change. |
 | `quiet` | Positive `ceiling_ms`. Advance the fake clock by that duration, requiring no client frame, close **or connection attempt** throughout. Required last, also usable between other operations. |
@@ -121,10 +121,12 @@ They validate the script assertions; they do not execute G3. G3 must consume the
 same scripts with its actual client, fake transport and virtual clock.
 
 
-Every script header has a machine-readable covers list containing s7-min, s7,
-or both when the script is required by both slices.
-S7-min (#1746) selects clean, agent-gap, agent-send, ping-pong, token-refused,
-token-revoked, heartbeat-missed, fleet-lite and unknown-subscription: hello/welcome/token, agent/<id> cursor replay with synced and gap
+The JSONL files are the authored fixture source; `just gen-ts` derives the
+TypeScript contracts and examples from them. Every header has a machine-readable
+`covers` list containing `s7-min`, `s7`, or `client-only`. Multi-label headers
+remain selected whenever they contain the relevant server slice.
+S7-min (#1746) selects clean, agent-gap, agent-send, permission-decision,
+ping-pong, token-refused, token-revoked, heartbeat-missed and unknown-subscription: hello/welcome/token, agent/<id> cursor replay with synced and gap
 (no entity snapshot), agent.send with ack, ping/pong, 4401/4403 closes and
 a protocol close (1002) for a never-opened subscription ID. These
 scripts use agent streams or fleet and only agent.send/agent.decide commands.
@@ -136,6 +138,11 @@ the checked-in inventory requires the selected slice labels explicitly.
 The generator also emits FixtureExamples.ts from every JSONL line as a literal
 checked against FixtureLine. The strict ts-check recipe compiles that artifact;
 the Rust drift test ensures it cannot silently lag behind the scripts.
+
+The `fleet-lite` script is explicitly `client-only`: its activity-only upsert
+has no server producer until #2243. Server conformance selects no client-only
+fixture and uses `tests/fixtures/structured-wire/fleet-server.jsonl` for fleet
+membership and permission handles. No replacement activity value is invented.
 
 The fleet-lite script uses the §5a inline checkpoint: gap with snapshot_to,
 full FleetAgentRow upserts, then synced. Live fleet.upsert/fleet.remove payloads
