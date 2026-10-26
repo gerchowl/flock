@@ -1,0 +1,80 @@
+# guardrails-ok(ci-shim): cross-system FOD rebuilds and artifact comparison need two native runners (#1838)
+name: Client dependency reproducibility
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/client-deps.yml'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'nix/client*'
+      - 'scripts/client_deps.py'
+      - 'scripts/test_client_deps.py'
+      - 'web/client/bun.lock'
+      - 'web/client/package.json'
+      - 'justfile'
+  push:
+    branches: [dev, main]
+    paths:
+      - '.github/workflows/client-deps.yml'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'nix/client*'
+      - 'scripts/client_deps.py'
+      - 'scripts/test_client_deps.py'
+      - 'web/client/bun.lock'
+      - 'web/client/package.json'
+      - 'justfile'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: client-deps-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-deps:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            always-allow-substitutes = true
+      - name: Build and rebuild dependency FOD
+        run: python3 scripts/client_deps.py build '${{ matrix.system }}' '${{ runner.temp }}/${{ matrix.system }}.json'
+      - uses: actions/upload-artifact@v7
+        with:
+          name: client-deps-${{ matrix.system }}
+          path: ${{ runner.temp }}/${{ matrix.system }}.json
+          if-no-files-found: error
+
+  compare:
+    needs: build-deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: client-deps-*
+          path: reports
+          merge-multiple: true
+      - name: Assert cross-system hashes match
+        run: python3 scripts/client_deps.py compare reports/*.json

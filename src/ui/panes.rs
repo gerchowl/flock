@@ -366,8 +366,12 @@ pub(super) fn render_panes(
                 .as_ref()
                 .is_some_and(|s| s.source == crate::selection::SelectionSource::PromptPanel);
             if !is_panel_selection {
+                let selection = app
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| rt.resolve_selection(selection));
                 render_selection_highlight(
-                    &app.selection,
+                    &selection,
                     frame,
                     info.id,
                     info.inner_rect,

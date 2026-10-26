@@ -566,6 +566,8 @@ fn plan_session(
     };
     // Only a genuine SessionStart may forward a rebind source and Codex path.
     // Other lifecycle actions cannot spoof a replacement binding.
+    // Codex fork source/transcript_path are hints, not reader authority. Their
+    // runtime integration belongs to https://github.com/gerchowl/flock/issues/1664.
     let session_start_source = (matches!(agent, Agent::Claude | Agent::Codex)
         && hook_event_name == "SessionStart")
         .then(|| str_field(input, "source"))

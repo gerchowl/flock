@@ -12,7 +12,7 @@ import type { ClientFrame } from "../../src/gen/ClientFrame";
 import type { FixtureLine } from "../../src/gen/FixtureLine";
 import type { ServerFrame } from "../../src/gen/ServerFrame";
 import type { WireEvent } from "../../src/gen/WireEvent";
-import { WireConnection, type Refusal, type StreamName } from "../../src/wire/connection";
+import { WireConnection, type Refusal, type StreamName, type Subscription } from "../../src/wire/connection";
 import { memoryStore, type Clock, type SocketLike, type TimerHandle } from "../../src/wire/env";
 import { OUTBOX_KEY } from "../../src/wire/outbox";
 
@@ -85,19 +85,29 @@ export class VirtualClock implements Clock {
   }
 }
 
-/** A scripted socket: records what the client sends and closes. */
+/**
+ * A scripted socket: records what the client sends and closes. Like the
+ * server, it holds the sub ids the client opened on it: a client frame for
+ * any other id is a protocol error (ADR-0038 §3), and fails the test there.
+ */
 export class FakeSocket implements SocketLike {
   onopen: (() => void) | null = null;
   onmessage: ((event: { readonly data: unknown }) => void) | null = null;
   onclose: ((event: { readonly code: number; readonly reason: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   readonly #net: FakeNetwork;
+  readonly #opened = new Set<string>();
 
   constructor(net: FakeNetwork) {
     this.#net = net;
   }
 
   send(text: string): void {
+    const frame = JSON.parse(text) as { readonly t?: unknown; readonly sub_id?: unknown };
+    if (typeof frame.sub_id === "string") {
+      if (frame.t === "sub") this.#opened.add(frame.sub_id);
+      else if (!this.#opened.has(frame.sub_id)) throw new Error(`the client sent ${String(frame.t)} for sub id ${frame.sub_id}, which it never opened on this socket`);
+    }
     this.#net.frames.push({ text, at: this.#net.clock.now() });
   }
 
@@ -192,6 +202,8 @@ export class Harness {
   store = memoryStore();
   conn: WireConnection | null = null;
   readonly seen = new Map<string, Seen[]>();
+  /** The script's subscriptions, which follow their ids across re-subs. */
+  readonly #subscriptions: Subscription[] = [];
   readonly #random: () => number;
   #transitions: string[] = [];
   #changes = 0;
@@ -306,7 +318,7 @@ export class Harness {
       case "subscribe": {
         const seen: Seen[] = [];
         this.seen.set(action.sub_id, seen);
-        conn.subscribe(action.sub_id, action.stream as StreamName, {
+        const subscription = conn.subscribe(action.stream as StreamName, {
           event: (seq, ev) => seen.push({ kind: "event", seq, ev }),
           gap: (from, to) => seen.push({ kind: "gap", from, to }),
           synced: () => seen.push({ kind: "synced" }),
@@ -314,11 +326,14 @@ export class Harness {
           reset: () => seen.push({ kind: "reset" }),
           refused: (refusal) => seen.push({ kind: "refused", refusal }),
         });
+        // The connection allocates every id; a script names the one it expects, in order.
+        if (subscription.id !== action.sub_id) fail(`the script subscribes ${action.sub_id}, but the connection allocated ${subscription.id}`);
+        this.#subscriptions.push(subscription);
         return;
       }
       case "unsubscribe":
         // The script names the id on the wire now, which a re-sub may have moved.
-        return conn.unsubscribe(action.sub_id);
+        return this.#subscriptions.find((subscription) => subscription.id === action.sub_id)?.close();
       case "command":
         conn.command(action.verb, action.args, action.cmd_id);
         return;

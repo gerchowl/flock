@@ -1,5 +1,5 @@
 /**
- * The owner preview: the §2a workbench at desktop size (#1594).
+ * The owner preview: the §2a workbench at desktop and phone sizes (#1594).
  *
  * Builds the fixture page, opens it from a `file:` URL in Chromium (no
  * server of any kind), and checks: no request leaves the file, the replay
@@ -18,10 +18,12 @@ import { pathToFileURL } from "node:url";
 import { chromium, type Browser, type Page } from "playwright";
 
 import { CLIENT_ROOT, buildClient } from "../tests/build";
+import { capturePreview } from "./capture";
 
 const DIST = `${CLIENT_ROOT}/artifacts/fixture-dist`;
 const SHOTS = `${CLIENT_ROOT}/artifacts/screenshots`;
 const DESKTOP = { width: 1280, height: 800 } as const;
+const PHONE = { width: 390, height: 844 } as const;
 
 let browser: Browser;
 
@@ -65,6 +67,13 @@ async function bodyTextSize(page: Page): Promise<number> {
   return page.evaluate(() => parseFloat(getComputedStyle(document.body).fontSize));
 }
 
+/** Pins the artifact to the requested viewport, not just valid DOM geometry. */
+async function capture(page: Page, name: string): Promise<void> {
+  const image = await capturePreview(page, `${SHOTS}/${name}.png`);
+  expect(image.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  expect({ width: image.readUInt32BE(16), height: image.readUInt32BE(20) }).toEqual(page.viewportSize()!);
+}
+
 describe("fixture preview", () => {
   test("desktop 1280x800: top bar, sidebar, focus pane and inbox side by side", async () => {
     const page = await browser.newPage({ viewport: DESKTOP });
@@ -81,7 +90,36 @@ describe("fixture preview", () => {
     await expectNoHorizontalScroll(page);
     await expectTouchTargets(page);
     expect(await bodyTextSize(page)).toBe(14);
-    await page.screenshot({ path: `${SHOTS}/workbench-desktop-1280x800.png` });
+    await capture(page, "workbench-desktop-1280x800");
+
+    expect(seen.requests.filter((url) => !url.startsWith("file:") && !url.startsWith("data:"))).toEqual([]);
+    expect(seen.errors).toEqual([]);
+    await page.close();
+  });
+
+  test("phone 390x844: the Inbox tab first, then an agent's screen", async () => {
+    const page = await browser.newPage({ viewport: PHONE });
+    const seen = watch(page);
+    await page.goto(pathToFileURL(`${DIST}/index.html`).href);
+    await page.getByTestId("inbox-headline").waitFor({ timeout: 10_000 });
+
+    await expectNoHorizontalScroll(page);
+    await expectTouchTargets(page);
+    expect(await bodyTextSize(page)).toBe(15);
+    const choice = await page.getByTestId("inbox-card").first().locator("button").first().boundingBox();
+    expect(choice?.height).toBeGreaterThanOrEqual(48);
+    expect(choice?.width).toBeGreaterThan(PHONE.width / 2);
+    await capture(page, "workbench-phone-inbox-390x844");
+
+    await page.getByRole("button", { name: "Agents" }).click();
+    await page.getByTestId("agent-row").first().click();
+    await page.getByTestId("transcript-synced").waitFor({ timeout: 10_000 });
+    await expectNoHorizontalScroll(page);
+    await expectTouchTargets(page);
+    // The page itself never scrolls: the back control and the tab bar stay on screen.
+    expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBeLessThanOrEqual(PHONE.height);
+    expect(await page.getByRole("button", { name: "‹ Back" }).isVisible()).toBe(true);
+    await capture(page, "workbench-phone-agent-390x844");
 
     expect(seen.requests.filter((url) => !url.startsWith("file:") && !url.startsWith("data:"))).toEqual([]);
     expect(seen.errors).toEqual([]);

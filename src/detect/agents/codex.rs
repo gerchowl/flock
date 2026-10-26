@@ -280,7 +280,8 @@ fn has_codex_visible_working_without_prompt(content: &str) -> bool {
 }
 
 fn has_codex_strong_blocked_prompt(lower_content: &str) -> bool {
-    has_codex_hook_review(lower_content)
+    has_codex_conversation_lock(lower_content)
+        || has_codex_hook_review(lower_content)
         || has_codex_folder_trust(lower_content)
         || lower_content.contains("press enter to confirm or esc to cancel")
         || lower_content.contains("enter to submit answer")
@@ -522,6 +523,18 @@ pub(in crate::detect) fn is_progress_chrome(line: &str) -> bool {
     codex_working_status_line(line)
 }
 
+/// Codex's live conversation lock, bounded by its retry/fork/exit footer (#1667).
+/// Joining the final transcript label tolerates terminal wrapping inside a word.
+pub(in crate::detect) fn has_codex_conversation_lock(content: &str) -> bool {
+    let tail = bottom_non_empty_lines(content, 8).join(" ").to_lowercase();
+    let flat = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.contains("this conversation is open in another app")
+        && flat.contains("close it there and press r to continue here")
+        && flat
+            .rsplit_once("r retry f fork esc/ctrl+c/q exit ctrl+t ")
+            .is_some_and(|(_, end)| end.replace(' ', "") == "transcript")
+}
+
 pub(in crate::detect) fn has_codex_hook_review(content: &str) -> bool {
     let bottom = bottom_non_empty_lines(content, 10);
     bottom
@@ -553,6 +566,19 @@ pub(in crate::detect) fn has_codex_folder_trust(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_lock_fixture_is_blocked_but_scrollback_is_not() {
+        let screen = include_str!("../../../tests/fixtures/codex/conversation-locked.txt");
+        assert_eq!(detect(screen), AgentState::Blocked);
+        assert!(has_visible_blocker(screen));
+        let earlier_footer =
+            format!("r retry f fork esc/ctrl+c/q exit ctrl+t transcript\n{screen}");
+        assert_eq!(detect(&earlier_footer), AgentState::Blocked);
+        let history = format!("{screen}\n› Ask Codex to do anything\n  ? for shortcuts\n");
+        assert_eq!(detect(&history), AgentState::Idle);
+        assert!(!has_visible_blocker(&history));
+    }
 
     const HOLLOW_WORKING: &str =
         include_str!("../../../tests/fixtures/codex/working-hollow-background.txt");

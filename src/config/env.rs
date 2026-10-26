@@ -75,13 +75,13 @@ const BLOCKLIST_PREFIXES: &[&str] = &[
     "ui.sound.all_clear_path",
 ];
 
-fn is_blocklisted(path: &str) -> bool {
+pub(super) fn is_blocklisted(path: &str) -> bool {
     BLOCKLIST_PREFIXES
         .iter()
         .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}.")))
 }
 
-fn env_var_name_for(path: &[String]) -> String {
+pub(super) fn env_var_name_for(path: &[String]) -> String {
     let mut name = String::from("FLOCK");
     for segment in path {
         name.push('_');
@@ -96,27 +96,43 @@ fn env_var_name_for(path: &[String]) -> String {
     name
 }
 
-/// Parse an env-var value by the leaf's TOML type. Returns the parsed value or
-/// a diagnostic string on failure.
-fn parse_env_value(schema_leaf: &Value, raw: &str) -> Result<Value, String> {
+/// Content-free expected type for a rejected generic environment override.
+#[derive(Debug, Clone, Copy)]
+enum EnvValueError {
+    Boolean,
+    Integer,
+    Float,
+    Scalar,
+}
+impl EnvValueError {
+    fn expected(self) -> &'static str {
+        match self {
+            Self::Boolean => "boolean",
+            Self::Integer => "integer",
+            Self::Float => "float",
+            Self::Scalar => "scalar",
+        }
+    }
+}
+
+/// Parse by the leaf's TOML type; failures never retain input or parser text.
+fn parse_env_value(schema_leaf: &Value, raw: &str) -> Result<Value, EnvValueError> {
     match schema_leaf {
         Value::String(_) => Ok(Value::String(raw.to_string())),
         Value::Boolean(_) => raw
             .parse::<bool>()
             .map(Value::Boolean)
-            .map_err(|err| format!("invalid bool: {err}")),
+            .map_err(|_| EnvValueError::Boolean),
         Value::Integer(_) => raw
             .parse::<i64>()
             .map(Value::Integer)
-            .map_err(|err| format!("invalid integer: {err}")),
+            .map_err(|_| EnvValueError::Integer),
         Value::Float(_) => raw
             .parse::<f64>()
             .map(Value::Float)
-            .map_err(|err| format!("invalid float: {err}")),
+            .map_err(|_| EnvValueError::Float),
         Value::Datetime(_) => Ok(Value::String(raw.to_string())),
-        Value::Array(_) | Value::Table(_) => {
-            Err("non-scalar leaves are not env-mappable".to_string())
-        }
+        Value::Array(_) | Value::Table(_) => Err(EnvValueError::Scalar),
     }
 }
 
@@ -151,7 +167,7 @@ fn path_has_value(root: &toml::map::Map<String, Value>, path: &[String]) -> bool
     cursor.contains_key(last)
 }
 
-fn walk_scalar_leaves<F>(
+pub(super) fn walk_scalar_leaves<F>(
     schema: &toml::map::Map<String, Value>,
     path: &mut Vec<String>,
     visit: &mut F,
@@ -212,7 +228,8 @@ pub(super) fn env_override_table(diagnostics: &mut Vec<String>) -> toml::map::Ma
         match parse_env_value(&leaf, &raw) {
             Ok(parsed) => insert_at_path(&mut env_table, &path, parsed),
             Err(err) => diagnostics.push(format!(
-                "env {env_name}={raw:?} for {joined}: {err}; using lower config layer"
+                "env {env_name} for {joined}: invalid_env_type; expected {}; using lower config layer",
+                err.expected()
             )),
         }
     }
@@ -336,6 +353,56 @@ mod tests {
     }
 
     // ADR-0002 phase (d) test names track the spec exactly.
+
+    #[test]
+    fn security2384_env_cannot_prepend_peer_entries_or_shift_positions() {
+        let _lock = crate::config::test_config_env_guard();
+        let _peers = EnvGuard::set("FLOCK_PEERS", "[{name='SECRET_ENV_PEER_2384'}]");
+        let _name = EnvGuard::set("FLOCK_PEERS_0_NAME", "SECRET_ENV_PEER_2384");
+        let table = env_override_table(&mut Vec::new());
+        assert!(!table.contains_key("peers"));
+        let dir = unique_test_dir("env-peer-positions");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[[peers]]\nname=''\n").unwrap();
+        let loaded = load_with_base(&path);
+        let message = loaded.diagnostics.join(" ");
+        assert!(
+            message.contains("entry_index=0") && message.contains("at 2:1"),
+            "{message}"
+        );
+        assert!(!message.contains("SECRET_ENV_PEER_2384"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn security2384_env_diagnostics_do_not_echo_values() {
+        let _guard = crate::config::test_config_env_guard();
+        let probe = "CONFIG2384_ENV_PRIVATE_a7c4e19b_do_not_print_any_of_this_payload";
+        for (name, key, expected) in [
+            ("FLOCK_UI_CONFIRM_CLOSE", "ui.confirm_close", "boolean"),
+            ("FLOCK_UI_SIDEBAR_ROW_GAP", "ui.sidebar_row_gap", "integer"),
+            ("FLOCK_SYSTEMONE_TIMEOUT_S", "systemone.timeout_s", "float"),
+        ] {
+            let _value = EnvGuard::set(name, probe);
+            let mut diagnostics = Vec::new();
+            let logs = crate::logging::capture_logs(|| {
+                let loaded = load_env_only();
+                diagnostics = loaded.diagnostics;
+                let resolved = toml::Value::try_from(loaded.config).unwrap();
+                let baseline = toml::Value::try_from(Config::default()).unwrap();
+                let leaf = |root: &toml::Value| {
+                    key.split('.')
+                        .fold(root.clone(), |value, part| value.get(part).unwrap().clone())
+                };
+                assert_eq!(leaf(&resolved), leaf(&baseline));
+            });
+            let text = diagnostics.join("\n");
+            assert!(!text.contains(probe), "env value leaked in diagnostics");
+            assert!(!logs.contains(probe), "env value leaked in logs");
+            assert!(text.contains(name) && text.contains(key));
+            assert!(text.contains("invalid_env_type") && text.contains(expected));
+        }
+    }
 
     #[test]
     fn env_var_applies_over_defaults() {

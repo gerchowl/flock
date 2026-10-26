@@ -304,11 +304,11 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
         "clean",
         "agent-gap",
         "agent-send",
+        "permission-decision",
         "ping-pong",
         "token-refused",
         "token-revoked",
         "heartbeat-missed",
-        "fleet-lite",
         "unknown-subscription",
     ];
     let files = fixtures();
@@ -318,7 +318,9 @@ fn every_header_declares_coverage_and_minimal_scripts_use_only_minimal_operation
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let expected = if matches!(name.as_str(), "heartbeat-missed" | "unknown-subscription") {
+        let expected = if name == "fleet-lite" {
+            json!(["client-only"])
+        } else if matches!(name.as_str(), "heartbeat-missed" | "unknown-subscription") {
             json!(["s7", "s7-min"])
         } else if minimal.contains(&name.as_str()) {
             json!(["s7-min"])

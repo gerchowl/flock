@@ -29,6 +29,11 @@ describe("built bundle", () => {
       for (const file of files.filter((name) => /\.(html|css)$/.test(name))) {
         expect({ file, absolute: absoluteUrls(await Bun.file(`${dir}/${file}`).text()) }).toEqual({ file, absolute: [] });
       }
+      // The served page enforces `script-src 'self'` (#1875): no inline script, no eval.
+      expect(html.match(/<script(?![^>]*\bsrc=)[^>]*>/g) ?? []).toEqual([]);
+      for (const file of files.filter((name) => name.endsWith(".js"))) {
+        expect({ file, evals: /\beval\s*\(|\bnew Function\s*\(/.test(await Bun.file(`${dir}/${file}`).text()) }).toEqual({ file, evals: false });
+      }
       // The recorded session is bundled only into fixture builds.
       for (const file of files.filter((name) => name.endsWith(".js"))) {
         expect(await Bun.file(`${dir}/${file}`).text()).not.toContain("session-example");

@@ -18,10 +18,13 @@
  * before the end is a protocol error.
  *
  * **Sub ids** are never reused on a connection (ADR-0038 §3, "Sub ids and
- * closed subs"). A re-`sub` on the same socket, after the progress
- * deadline, `lagged` or `cursor_ahead`, moves the stream to a fresh id and
- * closes the old one, whose late frames are dropped and touch nothing. A
- * reconnect re-sends each `sub` under its current id on the new socket.
+ * closed subs"), and the connection allocates every one of them, `s1`,
+ * `s2`, … from a single counter: callers never name an id, so no caller's
+ * id can collide with one allocated for an automatic re-`sub` (#1816). A
+ * re-`sub` on the same socket, after the progress deadline, `lagged` or
+ * `cursor_ahead`, moves the stream to the next id and closes the old one,
+ * whose late frames are dropped and touch nothing. A reconnect re-sends
+ * each `sub` under its current id on the new socket.
  *
  * **The outbox:** see `outbox.ts`. Commands go out only in Live.
  *
@@ -89,6 +92,17 @@ export type StreamState = "Replaying" | "Resyncing" | "Current" | "Refused";
 /** Why a stream was refused: the server's `subfail`. */
 export type Refusal = { readonly code: SubfailCode; readonly message: string };
 
+/** A subscription the connection opened, as {@link WireConnection.subscribe} returns it. */
+export type Subscription = {
+  /**
+   * Its sub id on the wire now. A re-sub on the same socket moves it to a
+   * fresh one, so hold the subscription, never this id.
+   */
+  readonly id: string;
+  /** Ends it, whatever its id has become; no handler call follows. */
+  readonly close: () => void;
+};
+
 /** A stream name the client can subscribe to (ADR-0036 §5), minus `*\/live`. */
 export type StreamName = `agent/${string}` | `queue/${string}` | `terminal/${string}` | "events" | "fleet" | "inbox" | "artifacts" | "work";
 
@@ -99,12 +113,12 @@ export function isHistoryStream(stream: string): boolean {
 
 /**
  * Receives one stream's progress. Each callback runs synchronously, and may
- * {@link WireConnection.unsubscribe} its own subscription; nothing of that
+ * close its own subscription ({@link Subscription.close}); nothing of that
  * subscription follows.
  */
 export interface StreamHandler {
   /** An event to apply. The cursor advances once this returns. */
-  event(seq: number, ev: WireEvent): void;
+  event(seq: number, ev: WireEvent, tsMs: number): void;
   /** History-stream `gap`: seqs `from`–`to` are no longer stored. */
   gap(from: number, to: number): void;
   /** The `synced` barrier: the stream is Current. Once per `sub`. */
@@ -126,7 +140,8 @@ export type StreamStatus = { readonly stream: string; readonly state: StreamStat
 /** What the connection was created with. */
 export type ConnectionOptions = {
   readonly url: string;
-  readonly token: string;
+  /** The token for `hello`; null connects straight into NeedsToken. */
+  readonly token: string | null;
   readonly client: WireClient;
   readonly clock: Clock;
   readonly sockets: SocketFactory;
@@ -141,8 +156,6 @@ export type ConnectionOptions = {
 type Sub = {
   /** The id on the wire now: a re-sub on the same socket moves it to a fresh one. */
   id: string;
-  /** The prefix fresh ids take, from the id it was opened with. */
-  readonly prefix: string;
   readonly stream: string;
   readonly handler: StreamHandler;
   state: StreamState;
@@ -150,6 +163,8 @@ type Sub = {
   /** Reached Current or Refused on the current connection. */
   settled: boolean;
   progress: TimerHandle | null;
+  /** Automatic contention retries since the last synced barrier, capped at three. */
+  busyRetries: number;
   refusal: Refusal | null;
   /** The snapshot being received while Resyncing. */
   snapshot: Snapshot | null;
@@ -184,10 +199,10 @@ export class WireConnection {
   #socket: SocketLike | null = null;
   #generation = 0;
   #attempt = 0;
+  #acks = 0;
   #timers = new Map<Timer, TimerHandle>();
   #subs = new Map<string, Sub>();
-  /** Every sub id ever opened here: one is never reused (ADR-0038 §3). */
-  #used = new Set<string>();
+  /** The last sub id allocated: ids are `s<n>`, and n only grows (ADR-0038 §3). */
   #nextSub = 0;
   /** Sub ids ended by `unsub` on this socket, whose late frames are not errors. */
   #ended = new Set<string>();
@@ -214,6 +229,21 @@ export class WireConnection {
   /** The latest failure, shown while reconnecting or stopped; never a token. */
   get error(): string | null {
     return this.#error;
+  }
+
+  /** How many commands an ok `ack` settled on this connection: it only grows, whatever the outbox drops. */
+  get acks(): number {
+    return this.#acks;
+  }
+
+  /** What a changed principal dropped from the outbox, until dismissed or the next ok `ack`. */
+  get outboxDropped(): string | null {
+    return this.#outbox.dropped;
+  }
+
+  /** The person has seen {@link outboxDropped}. */
+  dismissOutboxDropped(): void {
+    this.#outbox.dismissDropped();
   }
 
   /** What restoring the stored outbox had to drop, or null (shown, never fatal). */
@@ -297,45 +327,35 @@ export class WireConnection {
   }
 
   /**
-   * A sub id never used on this connection, as `<prefix><n>`. The counter
-   * lives here, not in a view or adapter, so remounting one cannot reuse an
-   * id whose late frames may still be in flight (ADR-0038 §3).
+   * The next sub id. The counter lives here, not in a view or adapter, so
+   * remounting one cannot reuse an id whose late frames may still be in
+   * flight, and nothing outside allocates one (ADR-0038 §3).
    */
-  nextSubId(prefix: string): string {
-    let id: string;
-    do id = `${prefix}${++this.#nextSub}`;
-    while (this.#used.has(id));
-    return id;
+  #allocate(): string {
+    return `s${++this.#nextSub}`;
   }
 
   /**
-   * Subscribes `id` to `stream` from `after`, or from the applied cursor
-   * this connection holds for the stream. Sent at once when connected,
-   * otherwise after the next `welcome`.
+   * Subscribes to `stream` from `after`, or from the applied cursor this
+   * connection holds for the stream, under the next sub id. Sent at once
+   * when connected, otherwise after the next `welcome`.
    *
    * A re-sub on the same socket (the progress deadline, `lagged`,
-   * `cursor_ahead`) moves the subscription to a fresh id with the same
-   * prefix (ADR-0038 §3, ADR-0036 §5a), so `id` names it only until then.
-   * The returned function ends it whatever its id has become.
-   *
-   * @throws if `id` was already opened on this connection, even if closed since.
+   * `cursor_ahead`) moves the subscription to the next id (ADR-0038 §3,
+   * ADR-0036 §5a); the returned {@link Subscription} follows it.
    */
-  subscribe(id: string, stream: StreamName, handler: StreamHandler, after?: number | null): () => void {
-    if (this.#used.has(id)) throw new Error(`sub id ${id} was already used on this connection`);
-    this.#used.add(id);
+  subscribe(stream: StreamName, handler: StreamHandler, after?: number | null): Subscription {
     const cursor = after === undefined ? (this.#cursors.get(stream) ?? null) : after;
-    const prefix = id.replace(/\d+$/, "");
-    const sub: Sub = { id, prefix, stream, handler, state: "Replaying", cursor, settled: false, progress: null, refusal: null, snapshot: null };
-    this.#subs.set(id, sub);
+    const sub: Sub = { id: this.#allocate(), stream, handler, state: "Replaying", cursor, settled: false, progress: null, busyRetries: 0, refusal: null, snapshot: null };
+    this.#subs.set(sub.id, sub);
     if (this.#connected()) this.#sendSub(sub);
     this.#settle();
-    return () => this.#unsubscribe(sub);
-  }
-
-  /** Ends the subscription whose id on the wire is now `id`; no handler call follows. */
-  unsubscribe(id: string): void {
-    const sub = this.#subs.get(id);
-    if (sub !== undefined) this.#unsubscribe(sub);
+    return {
+      get id() {
+        return sub.id;
+      },
+      close: () => this.#unsubscribe(sub),
+    };
   }
 
   #unsubscribe(sub: Sub): void {
@@ -352,17 +372,18 @@ export class WireConnection {
 
   /**
    * Queues a command (ADR-0038 §3's outbox). It is persisted as `pending`
-   * before any send, and sent in Live. Returns its `cmd_id`.
+   * before any send, and sent in Live. Returns its `cmd_id`. `echoAfter`
+   * is stored with it as `echo_after` (`outbox.ts`), and never sent.
    *
    * @throws if no principal is known yet: a command is stored with the
    *   principal that queued it, so none can be queued before a first
    *   `welcome`.
    */
-  command(verb: string, args: JsonValue, cmdId?: string): string {
+  command(verb: string, args: JsonValue, cmdId?: string, echoAfter?: number): string {
     const principal = this.principal;
     if (principal === null) throw new Error("no principal yet: connect once before sending commands");
     const id = cmdId ?? this.#options.newCommandId?.() ?? uuidv7(this.#options.clock.wallNow());
-    this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending" });
+    this.#outbox.add({ cmd_id: id, verb, args, principal, created_ms: this.#options.clock.wallNow(), status: "pending", ...(echoAfter === undefined ? {} : { echo_after: echoAfter }) });
     this.#flush();
     return id;
   }
@@ -529,18 +550,21 @@ export class WireConnection {
 
   /** Whether a new `welcome` can cure a refusal (ADR-0038 §3, Refused). */
   #cures(refusal: Refusal, before: Welcome | null, after: Welcome): boolean {
+    // A reused sub id is the client's own fault, which no new `welcome` cures (ADR-0036 §5a).
+    if (refusal.code === "sub_id_reused") return false;
     if (before === null) return true;
     switch (refusal.code) {
       case "scope":
         return before.principal !== after.principal || before.capabilities.join() !== after.capabilities.join();
       case "operator_only":
         return before.principal !== after.principal;
+      case "invalid_agent":
+        return false;
       case "unknown_stream":
         return before.server_version !== after.server_version;
       case "cursor_ahead":
+      case "session_busy":
         return true;
-      case "sub_id_reused":
-        return false;
     }
   }
 
@@ -564,8 +588,7 @@ export class WireConnection {
     if (unsubOld) this.#send({ t: "unsub", sub_id: old });
     this.#subs.delete(old);
     this.#ended.add(old);
-    sub.id = this.nextSubId(sub.prefix);
-    this.#used.add(sub.id);
+    sub.id = this.#allocate();
     this.#subs.set(sub.id, sub);
     this.#sendSub(sub);
   }
@@ -606,7 +629,7 @@ export class WireConnection {
         if (frame.seq === undefined) return this.#protocolError(`ev without seq on ${sub.stream}`);
         if (sub.snapshot !== null) return this.#snapshotLine(sub, sub.snapshot, frame.seq, frame.ev);
         if (sub.cursor !== null && frame.seq <= sub.cursor) return;
-        sub.handler.event(frame.seq, frame.ev);
+        sub.handler.event(frame.seq, frame.ev, frame.ts_ms);
         if (this.#subs.get(sub.id) !== sub) return this.#changed();
         this.#advance(sub, frame.seq);
         return;
@@ -618,10 +641,12 @@ export class WireConnection {
         if (sub.snapshot !== null) return this.#protocolError(`synced before ${sub.stream}'s snapshot ended`);
         this.#stopProgress(sub);
         sub.state = "Current";
+        sub.busyRetries = 0;
         sub.settled = true;
         sub.handler.synced();
         return this.#settle();
       case "lagged":
+        // `skipped_to` is diagnostic only. Resume from the applied cursor.
         // `lagged` closes the id on the server, like `subfail`.
         this.#resub(sub, false);
         return this.#changed();
@@ -688,6 +713,30 @@ export class WireConnection {
   }
 
   #subfail(sub: Sub, code: SubfailCode, message: string): void {
+    if (code === "sub_id_reused") {
+      /*
+       * ADR-0036 §5a: the server refuses a `sub` whose id this connection
+       * already used. That is never retried: the stream is Refused, says so,
+       * and its id stays closed (Refused frames are dropped, and no `welcome`
+       * cures it; see `#cures`).
+       */
+      const reason = `The server refused sub id ${sub.id} as already used on this connection, so this stream is not retried. Server: ${message}`;
+      return this.#refuse(sub, { code, message: reason });
+    }
+    if (code === "session_busy") {
+      this.#refuse(sub, { code, message });
+      if (this.#subs.get(sub.id) !== sub || !this.#connected() || sub.busyRetries === 3) return;
+      // Three per-stream retries: 250, 500, 1000 ms, reset only by synced.
+      // Reuse the cancellable progress timer; never touch sibling subscriptions.
+      const delay = 250 * 2 ** sub.busyRetries++;
+      sub.progress = this.#options.clock.setTimeout(() => {
+        sub.progress = null;
+        sub.settled = false;
+        this.#resub(sub, false);
+        this.#settle();
+      }, delay);
+      return;
+    }
     if (code !== "cursor_ahead") return this.#refuse(sub, { code, message });
     sub.handler.reset();
     if (this.#subs.get(sub.id) !== sub) return this.#changed();
@@ -720,5 +769,6 @@ export class WireConnection {
     const error: WireError | null = frame.error ?? null;
     if (frame.ok === (error !== null)) return this.#protocolError(`ack ${frame.cmd_id} with ok=${frame.ok} and ${error === null ? "no" : "an"} error`);
     if (!this.#outbox.settle(frame.cmd_id, error)) return this.#protocolError(`ack for ${frame.cmd_id}, which is not awaiting one on this socket`);
+    if (error === null) this.#acks++;
   }
 }

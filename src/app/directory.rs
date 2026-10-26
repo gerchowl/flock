@@ -24,7 +24,7 @@ pub(crate) struct AgentLocation {
     pub(crate) live: bool,
     /// Short host name of the server the agent lives on.
     pub(crate) host: String,
-    /// Public pane id **on that host**. Meaningless anywhere else.
+    /// Public pane id **on that host**; empty for pane-free identities.
     pub(crate) pane_id: String,
     /// `true` when the agent is on this server — i.e. reachable without the
     /// peer channel.
@@ -59,6 +59,44 @@ struct FleetAgentEntry {
     location: AgentLocation,
     agent: Option<String>,
     status: crate::api::schema::AgentStatus,
+    runtime: Option<crate::api::schema::AgentRuntime>,
+}
+
+struct PeerDirectoryAgent<'a> {
+    agent_id: &'a str,
+    pane_id: &'a str,
+    agent: Option<&'a str>,
+    status: crate::api::schema::AgentStatus,
+    runtime: Option<crate::api::schema::AgentRuntime>,
+}
+fn peer_directory_agents(
+    peer: &crate::peers::PeerSummaryState,
+) -> impl Iterator<Item = PeerDirectoryAgent<'_>> + '_ {
+    peer.workspaces
+        .iter()
+        .flat_map(|ws| &ws.agents)
+        .map(|agent| PeerDirectoryAgent {
+            agent_id: &agent.agent_id,
+            pane_id: &agent.pane_id,
+            agent: agent.agent.as_deref(),
+            status: agent.status,
+            runtime: None,
+        })
+        .chain(
+            peer.structured_agents
+                .iter()
+                .map(|agent| PeerDirectoryAgent {
+                    agent_id: &agent.agent_id,
+                    pane_id: "",
+                    agent: agent.agent.as_deref(),
+                    status: agent.status,
+                    runtime: Some(match agent.runtime {
+                        crate::structured::registry::StructuredRuntime::Structured => {
+                            crate::api::schema::AgentRuntime::Structured
+                        }
+                    }),
+                }),
+        )
 }
 
 impl App {
@@ -212,23 +250,22 @@ impl App {
                 .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
             let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
             let route = Some(peer.peer.clone());
-            for ws in &peer.workspaces {
-                for agent in &ws.agents {
-                    entries.push(FleetAgentEntry {
-                        location: AgentLocation {
-                            node: peer.node_id.clone(),
-                            live,
-                            agent_id: agent.agent_id.clone(),
-                            host: host.clone(),
-                            pane_id: agent.pane_id.clone(),
-                            local: false,
-                            route: route.clone(),
-                            direct: true,
-                        },
-                        agent: agent.agent.clone(),
-                        status: agent.status,
-                    });
-                }
+            for agent in peer_directory_agents(peer) {
+                entries.push(FleetAgentEntry {
+                    location: AgentLocation {
+                        node: peer.node_id.clone(),
+                        live,
+                        agent_id: agent.agent_id.to_owned(),
+                        host: host.clone(),
+                        pane_id: agent.pane_id.to_owned(),
+                        local: false,
+                        route: route.clone(),
+                        direct: true,
+                    },
+                    agent: agent.agent.map(str::to_owned),
+                    status: agent.status,
+                    runtime: agent.runtime,
+                });
             }
         }
         for entry in self.state.relayed_fleet_cache.values() {
@@ -238,29 +275,28 @@ impl App {
                 .as_deref()
                 .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
             let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
-            for ws in &peer.workspaces {
-                for agent in &ws.agents {
-                    entries.push(FleetAgentEntry {
-                        location: AgentLocation {
-                            node: peer.node_id.clone(),
-                            live,
-                            agent_id: agent.agent_id.clone(),
-                            host: host.clone(),
-                            pane_id: agent.pane_id.clone(),
-                            local: false,
-                            // A relayed entry is reachable only via the peer
-                            // that relayed it (#410). That peer polls the
-                            // agent's host itself, so handing the message to it
-                            // is one hop and its ordinary `msg.send` makes the
-                            // next. `None` only for an entry that predates the
-                            // field — there is then no edge to name.
-                            route: entry.via.clone(),
-                            direct: false,
-                        },
-                        agent: agent.agent.clone(),
-                        status: agent.status,
-                    });
-                }
+            for agent in peer_directory_agents(peer) {
+                entries.push(FleetAgentEntry {
+                    location: AgentLocation {
+                        node: peer.node_id.clone(),
+                        live,
+                        agent_id: agent.agent_id.to_owned(),
+                        host: host.clone(),
+                        pane_id: agent.pane_id.to_owned(),
+                        local: false,
+                        // A relayed entry is reachable only via the peer
+                        // that relayed it (#410). That peer polls the
+                        // agent's host itself, so handing the message to it
+                        // is one hop and its ordinary `msg.send` makes the
+                        // next. `None` only for an entry that predates the
+                        // field — there is then no edge to name.
+                        route: entry.via.clone(),
+                        direct: false,
+                    },
+                    agent: agent.agent.map(str::to_owned),
+                    status: agent.status,
+                    runtime: agent.runtime,
+                });
             }
         }
         entries
@@ -291,9 +327,10 @@ impl App {
                 continue;
             }
             rows.push(crate::api::schema::FleetAgentInfo {
+                runtime: None,
                 agent_id: agent.agent_id.clone(),
                 host: host.clone(),
-                pane_id: agent.pane_id.clone(),
+                pane_id: Some(agent.pane_id.clone()),
                 local: true,
                 route: None,
                 agent: agent.agent.clone(),
@@ -308,9 +345,10 @@ impl App {
                 continue;
             }
             rows.push(crate::api::schema::FleetAgentInfo {
+                runtime: entry.runtime,
                 agent_id: entry.location.agent_id,
                 host: entry.location.host,
-                pane_id: entry.location.pane_id,
+                pane_id: (!entry.location.pane_id.is_empty()).then_some(entry.location.pane_id),
                 local: false,
                 route: entry.location.route,
                 agent: entry.agent,
@@ -366,6 +404,54 @@ mod tests {
             }],
         }];
         state
+    }
+
+    #[test]
+    fn structured_directory_rows_resolve_without_a_pane_directly_and_via_hub() {
+        let mut app = test_app();
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "fixture.example".into(),
+            ..Default::default()
+        });
+        peer.structured_agents = serde_json::from_value(serde_json::json!([
+            {"agent_id":"native-id", "agent":"claude", "status":"idle", "runtime":"structured"}
+        ]))
+        .unwrap();
+        app.state.peer_summaries.push(peer);
+        for relayed in [false, true] {
+            if relayed {
+                let mut entry = crate::peers::relayed_entry_from_wire(serde_json::from_value(
+                    serde_json::json!({"name":"fixture.example", "ssh_target":"fixture.example", "origin":"hub.example"})
+                ).unwrap()).unwrap();
+                entry.peer = app.state.peer_summaries.remove(0);
+                entry.via = Some("hub.example".into());
+                app.state
+                    .relayed_fleet_cache
+                    .insert("fixture.example".into(), entry);
+            }
+            let location = app.locate_agent("native-id").unwrap();
+            assert!(location.pane_id.is_empty());
+            assert_eq!(location.direct, !relayed);
+            assert_eq!(
+                location.route.as_deref(),
+                Some(if relayed {
+                    "hub.example"
+                } else {
+                    "fixture.example"
+                })
+            );
+            let fleet = app.collect_fleet_agents(&[]);
+            assert_eq!(fleet.len(), 1);
+            assert_eq!(
+                fleet[0].runtime,
+                Some(crate::api::schema::AgentRuntime::Structured)
+            );
+            assert_eq!(fleet[0].status, AgentStatus::Idle);
+            assert!(serde_json::to_value(&fleet[0])
+                .unwrap()
+                .get("pane_id")
+                .is_none());
+        }
     }
 
     #[test]
@@ -484,7 +570,7 @@ mod tests {
             .attached_terminal_id
             .clone();
         let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
-        terminal.set_agent_name(name.to_string());
+        terminal.set_agent_name(name.to_string()).unwrap();
         terminal.agent_id.to_string()
     }
 
@@ -519,7 +605,11 @@ mod tests {
             Some("kiln"),
             "how we reach it — the [[peers]] name, which routinely differs"
         );
-        assert_eq!(remote.pane_id, "w1:p1", "a routing detail on THAT host");
+        assert_eq!(
+            remote.pane_id.as_deref(),
+            Some("w1:p1"),
+            "a routing detail on THAT host"
+        );
     }
 
     #[test]

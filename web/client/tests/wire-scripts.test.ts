@@ -3,7 +3,7 @@
  * {@link WireConnection}, with a virtual clock and scripted sockets.
  *
  * **Selection.** Each script's header names the slices it covers in
- * `covers`: `s7-min` (#1746), full `s7`, or both. Every script covering
+ * `covers`: `s7-min` (#1746), full `s7`, or `client-only`. Every script covering
  * `s7-min` is replayed, and so is every `s7` script whose behaviour G3a
  * already implements; the rest are listed with the G3b (#1595) feature
  * they need. A script in no list, or an `s7-min` script left to G3b, fails
@@ -43,6 +43,7 @@ const REPLAYED = [
   "lagged",
   "network-change",
   "old-socket",
+  "permission-decision",
   "ping-pong",
   "protocol-refusal",
   "set-token-changed-principal",
@@ -134,4 +135,12 @@ describe("harness assertions", () => {
   test("absent_outbox passes for a command the outbox does not hold", () => {
     expect(() => new Harness().run(seeded("c9"))).not.toThrow();
   });
+});
+
+test("server conformance selection excludes the client-only fleet fixture", async () => {
+  const names = (await readdir(SCRIPTS)).filter((name) => name.endsWith(".jsonl")).map((name) => name.slice(0, -6));
+  const server = [];
+  for (const name of names) if (coverage(name, await load(name)).includes("s7-min")) server.push(name);
+  expect(server).not.toContain("fleet-lite");
+  expect(coverage("fleet-lite", await load("fleet-lite"))).toEqual(["client-only"]);
 });

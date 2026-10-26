@@ -270,8 +270,15 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
   tracks open control
   requests by `request_id`, and the agent stays `waiting_on_human` until
   every one of them is answered. Working is `system/status: requesting` or
-  an open `message_start`. A stall is a started input with no stdout event for
-  `[sessions] stall_ms` while no control request and no tool call is open;
+  an open `message_start`. A stall is an accepted or started input with no stdout event for
+  `[sessions] stall_ms` while no control request and no tool call is open.
+  This optional setting defaults to **120000 ms** (2 minutes), with an inclusive
+  range of **5000..=3600000 ms**. Out-of-range values, including zero, are config
+  validation errors; there is no disabled value or silent clamping. A stall is
+  an observation that leaves the phase unchanged, so false positives are cheap.
+  Provider retries and rate-limit backoff can produce tens of seconds of silence;
+  two minutes avoids reporting those as stalls while exposing a hung harness.
+  The production worker caller passes the loaded value, without another default;
   a long-running tool is not a stall (its `tool_use` is open). A stall is
   reported as `agent.session_stalled{since}` and leaves the phase as it is
   (ADR-0028 §1 derivation is unchanged); it is an observation, not a timeout
@@ -310,6 +317,18 @@ and `--add-dir`. The server owns stdin and stdout exclusively.
 
 ### 1a. Identity and the operator boundary for structured agents
 
+**Resume authority (#2047 review amendment).** Resuming an existing structured
+record is operator-only (`operator_only`), including an agent resuming itself.
+The original parent and depth survive every resume and lease generation; resume
+never re-parents a conversation. This rule is adjacent to the `may_stop` policy:
+stop remains available only to the operator and the structured agent itself.
+MCP spawn is fresh-only. Mesh relays cannot carry structured start/spawn, and the
+server independently refuses recorded mesh edges. Client token scopes, including
+`operate`, grant permission decisions, not local socket operator identity or
+resume authority. The current WebSocket terminal bridge does not dispatch the
+structured `cmd` frame; future command admission must preserve this boundary.
+The cooperative same-UID limitation of #1177 still applies.
+
 `caller_is_local_operator()` (`src/app/api/mesh.rs:182`) treats a local
 caller with no flk pane in its process ancestry as the operator. A
 structured agent has no pane, so its tool calls (`flk msg send`, `flk
@@ -337,7 +356,8 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   resolved absent account does too. A dedicated UID equal to the server UID
   is a §1a misconfiguration, never operator authority. Report
   `agent_account_uid_collision` once in the log and retain the typed diagnostic
-  in server status until restart.
+  in server status until restart. Each server owns its account cache and
+  collision-reporting state; its app and API listener share the same policy.
 
   Explicit `agent_account = "none"` declares that no dedicated account is used.
   The server never starts the dedicated-account NSS lookup, and callers with
@@ -362,6 +382,40 @@ WebSocket over TCP carries no peer pid at all. Three rules close that:
   identity: the operator's own browser is a client with an `operator`-scoped
   token that only the local operator can mint over the unix socket, and the
   `principal` in `welcome` names the token, never the address.
+
+**Scoped session MCP requests (#1734).** Every structured-session MCP API request carries a server-issued credential scoped to one lease reservation generation. The server verifies it against current kernel peer identity and the live bound lease root, and derives only an agent principal. Failed or revoked session authentication never falls back to operator ancestry classification. This applies independently to every connection, queued request and channel attachment; lease/root loss refuses subsequent admission. Already admitted work never acquires operator authority. Parent-change exit is defense in depth. Unscoped arbitrary same-UID programs retain the explicitly cooperative #1177 limitation; dedicated-account policy remains mandatory unless the operator opts out.
+
+Slice A adds the scoped local request envelope and server admission. Slice B of #1734 supplies mandatory generated MCP credentials and immutable transport propagation; public structured starts remain gated until both land. Legacy unscoped CLI/MCP requests retain their existing policy. Credentials are not operator/client tokens and never appear in logs, errors or status. Failed scoped decoding or authentication cannot be retried through legacy dispatch. Revocation precedes cleanup and lease removal; scoped subscriptions close on revoked or unreadable identity. Operations admitted before root loss may finish with agent authority only. The scoped verifier requires a living kernel process, not merely a matching birth time: zombies cannot authorize admission. The local envelope is `{"request": <Request>, "credential": <LeaseCredential>}`; malformed scoped envelopes return `invalid_request`, authentication failures return `not_authorized`, and neither path retries as a legacy request.
+
+Slice B of #1734 provisions each generation credential only in the generated private MCP configuration's child environment (`FLOCK_MCP_LEASE_CREDENTIAL`), alongside an explicit `mcp serve --structured` mode. It never enters Claude's launch environment or process arguments. Before reading stdin, the MCP child captures that mode, the absolute socket endpoint and the credential into immutable client state. Calls, compatibility probes, subscriptions and reconnects use that same state. Missing, malformed or inconsistent configuration fails startup; authentication failure never selects unscoped transport. Ordinary unscoped MCP remains compatible. Public structured starts still require the registry/start slice (#1439).
+
+Scoped verification never waits for the lease registry lock: contention has a typed refusal and no snapshot fallback. Each admission performs at most sixteen kernel process-fact reads, refusing ancestry beyond that budget. This is a bounded supported ancestry depth, not permission to trust partial evidence. Credential comparison uses opaque accumulation (`core::hint::black_box`) to prevent optimizer replacement with an early-exit comparison. Encoded credential length is public format information. Legacy unscoped malformed requests retain serde diagnosis; scoped schema failures keep their fixed, secret-free error. JSON syntax diagnostics contain no field values.
+
+**Operator shell sends (#2494, owner option a).** The structured `agent.send`
+adapter alone may authenticate an operator via a pane. This is affirmative
+server evidence, not `AgentState::Unknown` or absence of agent detection. On
+every request it requires the unix socket's kernel PID and UID, the operator
+UID, and an unrelated lease identity. The pane must retain `created_as_root_shell`
+provenance (no argv override) and a runtime spawned with the default shell,
+with no agent name/label or launch argv. The caller's immediate kernel parent
+must equal that runtime's original root-shell PID. Both processes must be
+living, and the caller's socket-captured birth and the shell's spawn-captured
+birth must still match. A reaped shell, missing process facts, unknown UID,
+restored pane without provenance, scoped session or enrolled relay cannot grant
+this exception. Evidence is never cached. Scripts, `sh -c`, and agent children
+with an intervening process are refused; dedicated structured agents continue
+to use their native authenticated path. This does not broaden the shared
+`caller_is_local_operator` helper or other privileged verbs.
+
+Admission stamps the server-owned numeric `operator_via_pane` in durable queue
+history. Section 3 input framing renders it as `operator via pane <id>` in the
+producer header, outside the nonce-delimited body. Request metadata cannot
+supply or replace the stamp. The existing explicit native-command exception
+still sends the command alone; its durable queue record retains the stamp.
+This is the cooperative same-UID boundary of #1177, not proof of a physical
+keyboard: a direct child deliberately launched by the root shell satisfies the
+rule. Shell functions and exec-style commands can likewise preserve immediate
+parentage; no broader human-presence claim is made.
 
 ### 2. Mapping session events onto flk state, questions and waits
 
@@ -397,6 +451,188 @@ settled supervisor events. S4 emits no `agent.phase_changed`, `agent.needs_human
 or `agent.session_stalled` EventHub envelopes: `AgentPhaseEvent` and mesh v5
 stay unchanged. #1804 owns the mesh-versioned pane-free event contract.
 No placement is empty or fabricated, and list/side-pane wiring remains #1439.
+
+S3a-3 registry amendment (#1439, owner-approved split). #1841 owns pure
+records, runtime-tagged persistence and the S4 `StateSink` consumer. Each
+registered agent owns a reducer and a generation token. Admission rejects
+conflicting agent ids, names and native session ids without replacing another
+record. Removal and state delivery require the current generation, so late
+worker output cannot alter a replacement. The registry stores the complete S4
+publication, including phase edges, needs-human facts and the next observation
+deadline; it emits no EventHub envelopes (#1804).
+
+Session persistence stores `runtime: structured` identity/name/harness/session,
+cwd and requested model alongside `runtime: pty` pane records. Older snapshots
+without structured records remain valid; older pane records default to PTY.
+Cold restore retains metadata only: lifecycle is offline, observations are
+unknown, and no clock ages, outstanding questions, deadlines, process ids or
+lease proofs survive. An agent whose process is gone stays `Lifecycle::Offline`:
+it remains resumable by explicit launch and is never resurrected automatically.
+Under ADR-0028 §3a, structured records deserialize individually. Unknown runtime
+or harness records, invalid entries and duplicates are skipped with a warning,
+without rejecting any PTY workspace. The first supported id/name/session wins.
+Skipped entries remain raw and in order across saves, including additional
+fields, so rollback cannot erase newer records. Explicit removal also discards
+retained entries sharing the removed id or session, preventing a shadowed
+duplicate from becoming active after restart. Known-runtime shadows also match
+by name; a future-runtime record sharing only a name has a separate identity
+and survives removal (#1858). Explicit admission refuses any retained name.
+Removal compacts retained slots.
+Known records also retain their original extra fields. An unknown collection shape remains raw
+and inactive; new admission refuses until its shape is understood. Warnings
+contain an index and reason, never raw payloads. The registry exposes a retained
+entry count for diagnostics; structured status/doctor routing remains #1843.
+Unknown pane runtime tags also survive restore/save and disable automatic agent
+resume for that pane only; its hibernation request and shell placement survive,
+and other panes retain normal resume behavior. A registry-only session remains
+persistable even when it contains only inactive raw entries and no terminal
+workspaces.
+
+**Retained-record lifetime (corrected owner decision, #1853).** DEAD classification
+is version-independent: an element is **DEAD** only when it is not a JSON object,
+or its canonical digest equals a record already kept, live or retained (an exact
+duplicate). Canonical JSON here sorts object keys and preserves JSON value types.
+Everything else this build cannot use is **FORWARD**, never automatically pruned:
+supported-tag parse failures (including future field shapes), unknown runtime or
+harness values, empty/odd identity strings, and non-identical conflicting records
+sharing an agent ID, name or session ID. Current-build parsing/validation failure
+is never evidence that another version cannot use an object (ADR-0028 §3a).
+On save, prune DEAD records strictly older than `RETAINED_DEAD_MAX_AGE` (30 days)
+and then enforce `RETAINED_DEAD_MAX` (256), oldest first. Equal timestamps use
+original array order. The injected clock determines age; a backward clock never
+ages a record early. Missing stamps receive the next capture/save time, not an
+invented historical age. Every capture runs stamp-only preparation on its snapshot copy
+with an injected clock; undo/test captures never prune or mutate live state.
+Only actual save/export boundaries prune the live registry. A failed wall clock
+or an unknown sidecar collection format logs a warning and refuses automatic
+retention maintenance, preserving data.
+
+`first_seen_ms` is Unix milliseconds in the additive `structured_retention`
+sidecar field, never a property inserted into preserved record JSON. Each entry
+binds a timestamp to the serialized slot and a SHA-256 digest of the record's
+JSON representation. Mismatched or invalid sidecar entries are logged and kept
+raw; matching entries preserve extra fields. Recognized stamps precede opaque
+entries so stale duplicates cannot replace the active timestamp. Cold restore,
+compaction, subsequent saves and live handoff carry these stamps. Older binaries
+may drop this new sidecar on save; missing stamps then restart conservatively on
+the next new-binary save. Retention timestamps never supply runtime observations,
+lease evidence or authority.
+
+A non-array `structured_agents` collection remains raw and inactive and refuses
+admission with typed `RegistryError::UnsupportedCollectionShape`, naming the
+session-state repair guide. Never discard the whole session because of a bad
+entry. The operator list/purge commands and doctor counts/hints are the separate
+second PR of #1853; they are not enabled by this policy/persistence slice.
+Both the temporary
+snapshot file before rename and its parent directory after rename are fsynced.
+A directory sync failure after successful replacement is logged as a durability
+warning and the save reports success because the new file is already installed.
+Handoff restores structured metadata offline; this slice owns no workers to
+transfer.
+
+#1842 owns runtime workers, actual lease ownership and observation scheduling.
+The app owns `structured::workers::Workers` outside pure `AppState`. Each launch
+reserves its native session before running the admission-supplied, bounded
+profile factory on an owning thread, then binds the registered cwd/model.
+Preparation is cancellable at its boundaries; an in-progress factory must finish
+within its own bound. One blocked factory cannot block another agent or the app.
+A new launch advances the observation generation, without modifying durable
+metadata. Live/unconfirmed workers refuse replacement. Cold restore remains
+offline and never starts a worker automatically.
+
+Ready/completion share a bounded two-message channel. Runtime stream queues are
+bounded separately; an app pass drains at most four records per worker and
+rearms its existing event wake when it reaches that budget. Every stream record
+enters S4 only via `Received::state_input`, so durable permission-book closes
+clear attention without waiting for a result (#1846/#1849). Lifecycle and due
+observations are explicit host facts. Both TUI and headless schedulers service
+owner wakes and include S4's exact next observation boundary. No periodic
+structured-agent timer, kill-on-silence policy or EventHub emission is added.
+
+Ordinary stop latches cancellation without waiting; polling joins only finished threads. A terminal report
+becomes visible only after queued stream facts drain. Confirmed cleanup closes
+open requests and sets Offline; unconfirmed ownership instead retains authority
+and Unknown lifecycle, refuses restart, and requires explicit recovery. Reports
+retain actual exit status/outcome or typed preparation/worker failure; results
+remain turn facts rather than process-success evidence. Finished threads are joined
+before replacement or pruning. Shutdown and the pre-handoff step attempt to stop
+all workers, drain durable permission closes, release confirmed leases, and join
+within the stated bound. Handoff deliberately stops structured sessions in this
+slice (full single-writer transfer is S7-rest). Records remain Offline and resume
+only through an explicit start using their stored session id, never automatically.
+A shared 10-second graceful deadline is followed by identity-checked child-tree
+KILL and a bounded 10-second cleanup/join interval. Deadline overruns report
+`structured_worker_timeout`; unconfirmed cleanup reports
+`structured_worker_cleanup_failed`. Worker diagnostics never veto handoff: kill,
+report the typed codes and proceed once the real handoff preconditions hold.
+An additive, optional handoff-manifest list carries uncertain agent identities,
+restored as Unknown without lease or process authority; confirmed cleanup stays
+Offline. Cold disk restore still defaults to Offline. Unknown identities never
+grant permission to signal. An unjoined worker remains owned and fenced, and
+later owner polls can finish joining it. Worker panics report the distinct
+`structured_worker_panicked` failure. These diagnostics require human inspection
+before retrying an uncertain session. Shutdown runs once per worker set and caches its typed result.
+Both TUI and headless quit always save the session before returning a shutdown
+error. Drop runs bounded teardown only if it has not already been attempted;
+after success or failure it joins only finished threads, without another wait.
+A newly admitted worker resets that cached result. The caller must mark session persistence
+dirty when durable metadata changes.
+#1843 owns the public `StructuredAgentInfo`, additive `structured_agents` list,
+get/status/stop routes and `runtime_unsupported` refusals. Existing PTY
+`AgentInfo` placement fields remain mandatory and unchanged; structured records
+have no fabricated placement. Mesh VERSION stays 5; remote directory rows
+remain #1380. Public structured start stays unreachable until #1843 and #1734
+have landed. The default remains the agent user (#1177); the owner-approved
+MVP exception permits explicit operator-mode opt-in only. #1843 supplies the
+public admission wiring and isolated manual dogfood runbook for that exception.
+
+#1843 part 1 amendment (owner-approved three-part split): read/control contracts
+land before public launch. `agent.list` adds a default-empty `structured_agents`
+array, preserving the existing PTY `agents` and `fleet` fields. A
+`StructuredAgentInfo` carries `runtime: structured`, `agent_id`, optional `name`,
+`harness`, `lifecycle`, presentation `status`, the canonical ADR-0028 `state`,
+`session_id`, `cwd`, optional `model`, and `lease_state`. The optional `view`
+contains workspace/tab/pane placement only when an attached view exists; it is
+omitted until S10. No PTY placement, process id or caller credential is fabricated.
+`lease_state` is nonblocking binding evidence (`absent`, `reserved`, `bound`,
+`uncertain`), never proof of liveness or authority. Contention is uncertain.
+
+`agent.get` and its `agent.status` alias resolve registered identity/name, refusing
+cross-runtime ambiguity. `agent.stop` accepts only a structured target and is
+restricted to the operator and the structured agent itself only. PTY callers
+and lineage parents receive no stop authority. Stop latches cancellation and
+returns current facts; it does not promise immediate Offline. Offline stop is
+idempotent. A restored Unknown record refuses launch before epoch advancement or
+profile preparation, and refuses stop without process ownership, with
+`structured_recovery_required` (retry `after_human`, CLI exit 1). The operator must
+confirm cleanup and clear/re-register the record before explicit launch; no
+public recovery/force bypass is introduced. Pane-only operations, including
+attach and PTY readiness/settled waits, return `runtime_unsupported` (retry
+`never`, CLI exit 2). Required PTY `AgentInfo` fields remain unchanged.
+
+A committed successful handoff exits successfully even when its worker teardown
+cached a diagnostic. The diagnostic remains logged and carried through handoff as Unknown;
+ordinary quit still returns its typed shutdown error. Public structured start
+remains gated until part 3 and #1734 land. Part 2 owns atomic owner-thread pending
+admission; part 3 owns narrowed MCP start and the complete isolated dogfood runbook.
+
+Accepted-input silence (#1903): successful transport admission of a user
+stdin envelope supplies `Input::Accepted { at, at_ms }` through
+`Received::state_input`, using monotonic and Unix clocks captured at admission.
+It arms the same caller stall policy before any started/requesting/message_start
+observation, without inventing a working turn. Later stdout resets the silence
+anchor normally; started evidence establishes working, and top-level result or
+exit retires the pending interval. Control requests and open tools suppress
+stall reporting exactly as for started turns. The transport serializes its host
+`flk_input_accepted` stream record before later stdout observations, even for a
+fast response. This is an internal stream fact, not an EventHub event kind or
+mesh frame. Its monotonic stamp belongs only to the current launch and cannot
+be reconstructed on replay; a raw host record without that stamp is skipped.
+Admission is not proof of a successful pipe write or provider turn. An unavailable
+acceptance observer requests process shutdown as well as pipe cancellation.
+Ordinary I/O cancellation does not record stop intent or change the observed exit
+outcome. Transport failure remains an explicit worker failure, and output backpressure delays
+notification rather than dropping it. No queue/scheduler feed is needed.
 
 The caller supplies monotonic observation time and its configured `stall_ms`;
 the reducer never starts a timer, polls a process or kills/retries a turn.
@@ -617,11 +853,12 @@ same queue (owner decision 5): there is no second input path.
   anchor?: { item_id | correlation_id | question_id | fork_point },
   priority: normal | urgent,          ordering only: which waiting item goes first
   delivery: at_idle | steer | interrupt,   timing only: when the item is written
-  state: queued | held | stashed | delivered | done | cancelled | dropped,
+  state: queued | held | stashed | delivered | done | cancelled | dropped | failed,
   (queued → delivered → done | cancelled; queued → held | stashed | dropped;
-   held | stashed → queued; delivered → held when the process dies without a result)
+   held | stashed → queued; queued → failed with a typed refusal;
+   delivered → held when the process dies without a result)
   stash?: name,                       which stash a stashed item is in
-  edit_lease?: { client, until_ms },  an open editor; the item is skipped while it holds
+  edit_lease?: { client, until_ms },  human producers only; skipped while it holds
   batch_id?: uuid,                    the message the item was written in
   relevant_now?: { p, band },         the last relevance check (below)
   body, attachments: [blob refs] }
@@ -678,6 +915,17 @@ same queue (owner decision 5): there is no second input path.
   that every item in it records; a one-item batch uses the `item_id` as its
   uuid, as before. `command_lifecycle` for that uuid moves all its items
   together. Up to `[queue] max_batch` (default 8) items go in one batch.
+
+  **Command exception (architect decision for #1802, 2026-10-17).** A harness
+  slash-command item is sent **verbatim**, as the sole text block of its own
+  isolated turn, without a producer label and never batched with another item.
+  The label would break command parsing. Attribution remains in the queue item
+  and its audit/lifecycle records. Only an operator may create command items:
+  the operator composer or `flk agent send` authenticated as operator/token
+  principal. Text from agents, MCP or relayed peers that starts with `/` remains
+  ordinary input, wrapped in the normal producer-labelled template, and cannot
+  become a harness command. Neither a slash prefix nor a claimed producer in
+  request JSON grants operator authority.
 - **Relatedness joins (owner decision 5).** After rules 1 to 4, when
   System One is configured (§2a's `[systemone]` client), the server asks
   it, in one call, one `noul` per candidate among the next
@@ -753,13 +1001,116 @@ same queue (owner decision 5): there is no second input path.
     flk never uses it for a take-back.
 - **Acknowledgement (E3).** `command_lifecycle` drives the item state, so
   "delivered" means the harness started it, not that bytes were written.
+- **Pending turns (architect revised decision, #1896 review).** Only a real
+  result consumed by the queue owner or runtime exit/error ends its reservation.
+  Harness cancellation keeps the items cancelled while waiting for the result;
+  operator take-back (§3 above) is a separate operation, not implemented by this
+  worker slice. Indeterminate loss retains the S3a writer guard. Status reports
+  the batch ID, original reservation time and an explicit cause: `awaiting_result`,
+  `turn_end_unknown` or `cancelled_awaiting_result`. A refused uncertain offer
+  writes no stdin and restores its original queued items instead of holding them
+  as `input_write_failed`. A real result or runtime exit/restart recovers the
+  pending state; restart holds unresolved items `session_unconfirmed`, never
+  automatically resending them. No queue timeout is inferred from pending age.
+  Stall observation belongs to the session state/supervision policy.
 - **Ported producers.** `msg.send` / `msg.reply` delivery to a structured
   agent becomes a queue item instead of the inbox nudge and knock order
   (ADR-0026, which superseded the delivery contracts of ADR-0008, ADR-0018
   and ADR-0019; custody and the authenticated origin stay as ADR-0026
-  defines them). A delegate's structured result and receipt become a
+  defines them). Relayed sends and replies use a typed
+  `node_asserted { sender, origin }` producer: "sender as asserted by node origin".
+  Display metadata `from_host` uses the authoritative node-id/name mapping,
+  preferring the configured alias to the authenticated inbound name, as legacy
+  custody does. It is absent for an unmapped origin; the existing node-asserted
+  header retains the claimed sender and signing node id as explicit attribution,
+  never a bare node id posing as a host. A recovery-time name lookup failure is
+  logged with its registered code and leaves the host absent; it cannot revoke
+  proven delivery. Name presentation grants no local sender authority.
+  The origin is the verified signing node, independent of the forwarding hop;
+  its sender assertion is attribution only, as strong as that node's sender
+  policy. It may have been a permitted caller claim on the originating node.
+  Signature, origin policy and reply capability checks precede admission and
+  are rechecked during recovery. Relays always enter as nonce-framed Messages,
+  never Commands or `Principal::Operator`; they gain no local authority or
+  locally attested sender quota. Remote blocking accounting retains the
+  existing unattested bucket.
+  Existing custody fields carry this proof, with no retroactive attestation
+  marker (architect decision on #1958). A delegate's structured result and receipt become a
   `delegate_result` item for its parent. The Stop-hook recap and nudge
   become server work on `result` (§3a).
+- **Queue custody completion (#2160, #2186, #2164).** The journal owner's
+  committed fold is authoritative: a committed `MessageKey` cannot later be
+  refused as never committed. The custody lookup shares that fold, without a
+  separate growing key index. Auxiliary tracking is bounded by in-flight
+  admissions. Each lookup is O(retained journal items), with no file I/O on the
+  server loop. The journal still retains its item history. The shared snapshot
+  refreshes on admission completion and publication; between an append and that
+  refresh, the owner and snapshot may briefly retain two item vectors. A definite
+  absence requires a complete, readable fold with no pending admission.
+  Production never emits queue removals; future garbage collection must preserve
+  commitment proof before removing items.
+  Missing owners/runtimes, read-only or future-format journals and uncertain
+  writes cannot prove absence. Admission persists `admission_pending` before
+  dispatching to the owner, so expiry before acknowledgement retains uncertainty.
+  Even a permanent recovery error then keeps the
+  same key recovering until its existing inbox TTL (24 hours), never a fresh
+  send or a terminal refusal. Jittered backoff is 4–5 seconds, then 48–60 seconds,
+  then capped at 240–300 seconds, clipped to the remaining TTL. Owner/capacity
+  wakes can shorten a long backoff, but consecutive attempts against the same
+  owner generation remain at least four seconds apart. A new owner generation
+  can resume immediately on its wake; a failure's own notification cannot
+  create a retry loop.
+  Status stays `queued` with typed detail `input_write_unknown:<cause>`:
+  `owner_unavailable`, `admission_pending`, `write_uncertain`,
+  `commit_proven_settle_pending`, `journal_opaque`,
+  `queue_journal_newer` or `queue_journal_corrupt`. These describe unresolved
+  proof or settlement, independently of the error that triggered recovery.
+  Positive proof whose delivery save fails records `commit_proven_settle_pending`
+  until settlement is durable. Expiry retains the correction path in this case
+  too, so a transient store failure cannot erase proven commitment. A reply is
+  not journal commitment proof: `queued` and the unknown detail may coexist
+  with a reply until the owner answers, custody settles, or its TTL expires.
+  At TTL expiry the existing expiry/tombstone path records
+  `input_write_unknown:commitment_unknown_at_expiry` for the existing outcome
+  window. Expiry ends admission recovery without proving that nothing committed;
+  positive proof can still retain settlement recovery as bounded below.
+  Positive proof before expiry is persisted settles `Delivered` directly, even
+  if the inbox deadline passed between commit and settlement. After persisted
+  expiry, only an expiry carrying unknown commitment can change to `Delivered`,
+  exactly once, with typed detail `delivered_after_expiry:<item_id>` (the proven
+  MessageKey's lifecycle identity). A commit proof never changes an existing
+  `Delivered` or `Refused` outcome.
+  If the delivery save fails again after expiry, a positive owner proof retains
+  the same key and retries settlement on the existing capped backoff, including
+  across wake notifications. Correction is bounded by the expired row's existing
+  `outcome_until` (seven days after expiry is persisted), never extended by a
+  retry or proof. At that deadline a retained row records typed detail
+  `input_write_unknown:correction_retention_elapsed`; after maintenance collects
+  the outcome, a retained status reference reports `outcome_retention_elapsed`.
+  Even before collection, proof cannot turn an out-of-window expiry into delivery.
+  The retention decision uses a read-only deadline check. If persisting its final
+  diagnostic fails, recovery still stops and logs the save error and typed
+  `outcome_retention_elapsed` reason; the status deadline remains observable.
+  **Restart limit:** active correction retains the already authenticated envelope
+  in memory. Startup's mailbox projection excludes payload-less `inbox_expired`
+  rows, so restart ends automatic post-expiry correction. It does not restore
+  deleted payload to revalidate a signature; the expired outcome remains until
+  ordinary retention deletion. Before expiry, startup recovery still loads inboxes.
+  Payload-less `Delivered`/`Read` rows are omitted from mailbox rehydration while
+  their terminal status is preserved; intentional collection is not corruption.
+  This corrects the expiry label only: deleted payload is not restored, released
+  quota is not re-acquired, and the original deadlines stay unchanged. Replies
+  use the existing payload-less path and the seven-day custody/reply deadline
+  from original admission; neither proof nor settlement extends that window.
+  Deleted payload cannot be signature-verified again or recover original pane
+  metadata, so local replies requiring that material remain unavailable. Remote
+  return bindings retain their existing deadline and validation requirements.
+  No new store
+  outcome or wire kind is introduced.
+  Attested sends reuse the process's validated node identity without reading its
+  key file per send. Pre-upgrade unsigned custody rows are not retroactively
+  attested: their replies retain the terminal route during the existing inbox
+  window (up to 24 hours), rather than acquiring structured sender authority.
 - **Storage.** The queue persists as `queue.jsonl` beside the agent's
   session streams (§4).
 
@@ -772,9 +1123,33 @@ live. The misses came from an external, client-side supervisor that polled
 `agent_status` every few minutes and missed short idle windows between
 back-to-back turns. For a structured agent there is no polling at all:
 
+- **Input framing (architect decision, #1885 review).** Every non-command
+  item uses a single header line `From <producer> (item <item_id>):` with
+  reply metadata and `Attachments (blob refs): <JSON refs>` on that line.
+  Producer/attachment values are JSON-encoded so embedded newlines remain
+  escaped, including U+2028, U+2029 and U+0085. Attachment strings must be
+  content-addressed `blob:<sha256>` refs: exactly 64 lowercase hex digits
+  after `blob:`. Reply `question_id` must be a canonical lowercase hyphenated
+  UUID. The next line is `<<<flk-item <nonce>`, followed
+  by the literal body and a final line `flk-item <nonce>>>>`. Here `<nonce>`
+  denotes 128 random bits encoded as 32 lowercase hex digits. Generate a
+  fresh nonce per rendered item and regenerate if its hex string occurs
+  anywhere in the body. Sender text, including fake labels, attachment lines
+  or delimiters, remains inside that item's block. Attachments and reply
+  metadata never enter the body block. The operator-only native command
+  exception in §3 remains verbatim and isolated. Admission and replacement
+  validate anchors and refs, refusing `invalid_request` before writing.
+  Rendering validates again: an invalid head becomes durably `failed`
+  with its typed refusal, allowing subsequent items through. A valid prefix
+  is delivered before a later malformed item is failed.
 - **Trigger.** The turn end is the `result` event (E1). An armed self-compact
   (`flock_self_compact`, `flk pane arm-self-compact`) queues a `command`
-  item with body `/compact`, `delivery: at_idle`, `priority: urgent`. By
+  item with body `/compact`, `delivery: at_idle`, `priority: urgent`. The §3
+  command exception applies to direct command items: operator authorization
+  is required, the body is sent verbatim alone, and attribution stays in
+  queue/audit records. The agent-initiated self-compact authorization path
+  belongs to S5c (#1879); this admission slice does not implement or grant it.
+  An agent's recap or supervisor text cannot manufacture that authority. By
   §3, `at_idle` means it is never written into a running turn, and `urgent`
   means it is the first item written after that `result`, ahead of any
   `normal` `at_idle` item. Background shells, held waits and subagents do not matter, because
@@ -792,6 +1167,31 @@ back-to-back turns. For a structured agent there is no polling at all:
   did for a `pty` agent.
 
 ### 4. Storage
+
+Owner amendment (#1820): each queue identity header declares a journal format
+version. Missing stamps mean version 1. Append/checkpoint require a journal
+version no greater than the writer's supported version, and checkpoint writes
+the writer's own version before any new-format append. Bump for every new kind,
+top-level field or enum name. Newer journals load read-only with persistence
+leniency (ADR-0028 §3a), preserving raw bytes without repair or rewriting.
+Every mutation returns typed `queue_journal_newer { found, supported }`;
+queue status exposes the refusal, which requires a compatible writer and must
+never be retried in a loop. Opaque checkpoint passthrough is forbidden because
+an older writer cannot preserve unknown records' interleaving semantics.
+Owner clarification (#1820): unknown kinds/fields/enum names follow lenient
+recovery, with raw bytes preserved and unknown semantics never delivered.
+Malformed known records in supported formats load read-only as
+`queue_journal_corrupt { seq, offset, reason }`: stop folding, refuse every
+mutation/checkpoint and preserve the whole file. Operator recovery is outside
+this slice. A crash-torn final line keeps the existing truncation/sync path;
+it is not corruption. Neither read-only mode permits tail repair.
+Owner clarification (#1922): an invalid header format version is known-record
+corruption and uses the same typed read-only refusal. Unknown data in v1 prevent
+its mandatory upgrade, so it opens read-only with `queue_journal_corrupt` and
+reason `unknown_data_prevents_checkpoint`. Same-version unknown data permit
+known writes only until a checkpoint is required; a refused checkpoint latches
+that typed read-only reason before any further writes, bounding journal growth.
+The fsync-temp, rename, fsync-directory rule below is unchanged.
 
 - **Per-agent session stream.** Every stdout line of a structured agent is
   appended, with a per-stream `seq` and a receive timestamp, to
@@ -843,12 +1243,40 @@ back-to-back turns. For a structured agent there is no polling at all:
   `{stream, stream_seq}` so a reader can jump from the global order into the
   per-agent stream. The global log is the only place where two agents'
   events are ordered against each other.
+- **Queue lifecycle facts (owner decision #1956).** Exactly one persisted
+  global kind, `queue_item_state`, follows a committed queue state transition.
+  Its fields are `agent`, `item_id`, optional `batch_id`, the existing typed
+  `producer`, typed `from` and `to`, `stream: "queue/<agent>"` and the original
+  committed `stream_seq`. The state vocabulary is §3's `queued`, `held`,
+  `stashed`, `delivered`, `done`, `cancelled`, `dropped`, plus `Unknown` for
+  lenient reading. Unknown kinds and facts with unknown states are skipped;
+  their global sequence remains spent. Adds, edits, reorders and checkpoints
+  do not emit this fact. Crash recovery's `delivered → held` does emit it.
+  Snapshot sequence allocation never changes a captured fact's transition
+  sequence. This kind stays local, under existing global retention/rotation;
+  it adds no mesh relay, per-transition kinds, checkpoint or question facts.
 - **Blobs by hash.** A tool result, attachment or thinking block over
   `[sessions] blob_min_bytes` (default 2 KiB) is stored once under
   `<data dir>/blobs/<sha256>` and the stored line keeps `{blob: sha256,
   size, preview}` in its place. Partial deltas (`stream_event`) are relayed
   live and not persisted; the complete `assistant` event that follows carries
-  the same content.
+  the same content. A corrupt object is repaired by a verified put. Only repairs
+  attempt serialization across stores/processes using an advisory directory lock;
+  first writes never lock, since racing Missing writers publish identical verified
+  bytes without repair events. Contended nonblocking acquisition backs off on
+  the supplied monotonic clock: sleep 1 ms, doubling thereafter and clipping each
+  request to the remaining 20 ms budget. Elapsed time bounds normal contention;
+  eight attempts only guard against a clock/sleeper that fails to advance.
+  Clock expiry reports `TimedOut`; attempt exhaustion reports `WouldBlock`.
+  The bounds apply to requested sleeps, not OS scheduling or filesystem latency.
+  On a lock error or exhaustion, one `structured.blob.repair_lock_unavailable`
+  warning names only the error kind
+  and blob hash, then publication proceeds without the lock. The current object
+  is reverified before rename; coordinated writers emit `structured.blob.repaired`
+  only when replacing corrupt bytes, after directory fsync, with hash and size,
+  never content. Fallback may duplicate that diagnostic but must not lose a blob
+  or stop the pump because locking failed. Other filesystem I/O failures remain
+  explicit. Direct filesystem mutations outside the lock are not coordinated.
 - **Rehydrate.** The native transcript Claude writes under the profile is a
   disposable working copy. A byte prefix of it (E11) is the only thing flk
   ever writes back, under a new session uuid, and only for a fork behind a
@@ -895,14 +1323,17 @@ Lines files and its optional signed audit trail, not through Grafana and not
 through a separate pipeline. The integration is #1614. #1323 no longer gates
 S7; #1546 (liveness and recovery on unstable connections) does.
 
-One endpoint serves every frontend: `GET /v1/ws` (WebSocket) and
-`GET /v1/blob/<sha256>` (HTTP). It runs inside the flk server process,
+The network endpoints serving every frontend are `GET /v1/ws` (WebSocket) and
+`GET /v1/blob/<sha256>` (HTTP). They run inside the flk server process,
 because the streams, the queue and the blobs are server state. It reuses the
 axum stack of the `web` feature (`src/web/mod.rs`), not the `flk web`
 subcommand, which stays the terminal bridge it is (one pty client per
 socket). It is off by default, binds loopback by default, and follows
 ADR-0001's hosting rules (`--allow-non-loopback` explicit, refused under
-`tailscale funnel`, same-origin check on upgrade).
+`tailscale funnel`, same-origin check on upgrade). The native local shell
+uses the same `/v1/ws` protocol over a sibling Unix socket, with kernel peer
+credentials as an additional admission gate (the local-transport amendment
+below). That listener does not enable TCP exposure.
 
 Messages are JSON text frames, one object each, tagged by `t`:
 
@@ -928,6 +1359,10 @@ server → client
   ack     { cmd_id, ok, result? | error{ code, message, exit, retry } }
 ```
 
+Agent replay preserves the receive-time `known`/`shape` provenance of §5a/§8.
+Legacy records without it produce `provenance_missing` history gaps while later
+records continue. Replay never reclassifies using the current harness version.
+
 **S7-min fleet and permission contracts (#1746).** The `fleet` snapshot stream
 lists structured agents as `FleetAgentRow { id, label, state: AgentState,
 activity?, waiting_on_human: string[] }`. `AgentState` is the shared S4 object,
@@ -937,6 +1372,72 @@ other axes survive; it must not discard the fleet delta. Snapshot rows use §5a'
 existing inline gap/checkpoint path. Fleet `ev` payloads are the closed tagged
 `FleetDelta` union: `{ type:"fleet.upsert", row: FleetAgentRow }` or
 `{ type:"fleet.remove", id }`, rather than session `WireEvent` payloads.
+
+S7-min slice 6a (#1832) supplies only the provider core: structured registry
+identity/label, S4 state, current activity and S6 waiting IDs project into these
+rows. Slice 6b omits optional `activity`: the structured registry and S4 have no
+activity producer yet. [#2243](https://github.com/gerchowl/flock/issues/2243)
+tracks that producer; no value is inferred from transcripts or PTY state.
+Amendment #1976 adds an independent durable cursor reservation record:
+under the same exclusive lock, fsync/rename/fsync-dir the cursor first, then
+atomically replace the rows/high-water snapshot by the same discipline, before
+returning changes or checkpoint cuts. The snapshot still mirrors its high-water
+as §4 requires; the independent floor can run ahead after a failed snapshot
+write, but never goes backwards or authorizes reuse of reserved positions.
+Snapshot reads allocate dense positions for their complete upserts; empty
+snapshots preserve the existing head, including across restart. Invalid row
+entries are skipped, warned with array index and unsupported/invalid/duplicate
+reason, and retained raw. Unchanged rows retain unknown top-level fields;
+changed rows serialize a fresh projection and drop them, since future fields may
+no longer agree with the changed facts. A missing or corrupt snapshot opens with
+no rows at the independent floor and a typed recovery diagnostic. Corrupt cursor
+metadata, or loss of both records from an initialized store, refuses loading rather
+than resetting it. A valid legacy snapshot with an unmarked lock seeds the new
+cursor durably; thereafter a durable marker on the locked inode makes cursor
+loss a refusal, not a migration from an older snapshot. When both records are
+valid, the maximum high-water wins. Any uncertain write requires reopening the
+store before another publication. Slice 6b (#2225) wires the provider into
+authenticated `fleet` subscriptions.
+Its single owner serializes refresh, durable checkpoint allocation, pending live
+publication, and new-cut registration. Each checkpoint belongs only to its
+requesting subscription, using that cut's acknowledged replay path. The shared
+ring carries only live deltas, so one reader's resnapshot cannot lag another
+reader. Checkpoint positions remain globally reserved: another cut's next live
+sequence can jump past those private positions without missing a mutation.
+Storage and frame preparation run off the executor; live publication
+yields between frames. Replay retains an immutable cut while later mutations
+enter its live continuation. Owner-turn
+observations coalesce to the latest materialization; the agent journal, not
+fleet-lite, retains every intermediate harness event. The live ring holds sixteen
+frames, each preflighted once with the maximum escaped subscription-ID overhead
+within the endpoint's existing 64 KiB message limit; overflow retires
+only the affected subscription ID. A fresh ID requests a complete snapshot, and
+absent rows disappear only at its advertised completion. Permission IDs come from
+the runtime book's open, non-automatic requests, never S4 phase inference. Before
+serving after cold boot, 6b refreshes the
+registry/S4/S6 provider cut; persisted observation state grants no process lease
+or resume authority. Local file locking does not implement S7-rest's
+single-writer handoff protocol.
+
+**Fleet-lite operator recovery (#1976).** For a store at `fleet.json`, preserve
+`fleet.cursor` (a small `{"high_water":N}` record) and `fleet.lock`. Do not
+delete them to repair snapshot corruption. Opening leaves damaged snapshot bytes
+intact for inspection; save a copy before a subsequent refresh/checkpoint
+replaces them. With a valid cursor, refresh the registry provider and publish a
+recovery snapshot at or above its floor. Unpublished reservations left by a
+failed write are covered by the next inline gap/checkpoint, not reused. If the
+cursor is missing after initialization or damaged, or both records are lost from an initialized store,
+repair offline with the owning store closed: restore a trusted cursor backup or
+atomically replace the cursor with a floor at least as high as both the
+surviving snapshot head and the highest cursor clients have observed. Use
+temp-file fsync, rename, then directory fsync. Never guess zero when that floor
+is unavailable; keep the store closed until trusted recovery evidence exists.
+
+An empty, unmarked lock with neither data record safely retries initialization
+at zero: cursor durability always precedes the initialization marker.
+`fleet.lock` carries that marker, so deleting it together with `fleet.cursor`
+while an older `fleet.json` survives reopens at that older head. The operator
+must never delete the lock.
 
 `cmd agent.decide` takes `AgentDecide { agent, request_id, decision, message? }`,
 where decision is `allow_once`, `allow_always` or `deny`. Only a token-authenticated
@@ -993,14 +1494,45 @@ are deferred to S6 (#1429); this types slice names the contracts only.
   type the client's protocol predates without the §8 unknown wrapper.
 - **Auth.** Every client presents a bearer token in `hello`; the address it
   connects from grants nothing (§1a). The operator's own browser gets an
-  `operator`-scoped token through `flk client open`, which runs over the
+  `operate`-scoped token through `flk client open`, which runs over the
   unix socket (so `caller_is_local_operator()` and the uid check of §1a
-  apply), mints a one-time code, and opens the client with it; the client
-  exchanges the code for its session token once. Tokens follow the channel-token model of ADR-0028 §8
+  apply), mints a one-time code, and opens the client in a new browser tab or
+  window; the client
+  exchanges the code for its session token once. The code contains 256 bits of
+  randomness encoded as 64 lowercase hex characters, is bound to that token,
+  exists only in server memory, is single
+  use, and expires at age 60 seconds. `flk client open --print` prints the
+  loopback URL rather than launching the browser. The code is carried only in
+  the URL fragment (`#code=…`), never the query, so it is absent from HTTP
+  request targets and Referer. The browser consumes that fragment and sends
+  `POST /v1/client/exchange` with JSON `{ "code": "…" }`; the loopback-only,
+  same-origin endpoint returns `{ "token": "…" }` exactly once, with
+  `Cache-Control: no-store`. Used, expired and unknown codes get one uniform
+  401. There is no global failed-exchange gate: every caller reaches the
+  loopback listener locally, and local processes can forge Host/Origin.
+  Such a gate would let any local process, including an agent, lock out the
+  operator. Guessing a 256-bit, single-use code with a 60-second lifetime is
+  infeasible. Keep the store bounded at 128 live codes and request bodies at
+  1024 bytes. Cross-origin and non-loopback requests are refused, and neither
+  codes nor tokens enter diagnostic logs.
+  The opener's URL argument is an explicit credential-in-argv exception:
+  `open`/`xdg-open` have no stdin or environment URL channel. The exchange code
+  is visible through `ps` for the opener's lifetime. Single use, the 60-second
+  TTL and fragment-only transport bound this known exposure; process logging
+  masks the code. This exception does not permit long-lived tokens in argv.
+  The token then travels in the unchanged normal `hello` frame.
+  The served client derives its server and transport from its own location
+  (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.
+  `token add` prints the bearer only to terminal stdout unless `--json` or
+  `--show-token` explicitly permits redirected secret output. Without that
+  consent it refuses before issuance, so no undisclosed credential is created.
+  Tokens follow the channel-token model of ADR-0028 §8
   (`src/channels.rs`): 32 random bytes as 64 hex digits, one file per client
   under `<data dir>/client-tokens/<name>.token`, mode 0600 in a 0700 dir,
   compared as SHA-256 digests in constant time, never logged, revoked by
-  deleting the file. Each token carries scopes `read`, `send`, `answer`,
+  deleting the file. (`authenticate` also checks a second, in-memory store
+  of app-session tokens; see the amendment "App-session tokens and shell
+  origins".) Each token carries scopes `read`, `send`, `answer`,
   `operate` (`operate` is what the operator's own client holds). Only the
   local operator (`caller_is_local_operator()` after §1a's uid check) can
   issue or revoke one (`flk client token add|rm|list`; else
@@ -1026,7 +1558,7 @@ local use, and its types precede G3 in S7a. No deployment is authorized here.
 | Parameter | Proposed value | Rationale |
 | --- | --- | --- |
 | Connect deadline | 10 s per attempt, from attempt start through name resolution, TCP/TLS and HTTP upgrade | Bounds a black-holed route without waiting for operating-system timeouts; allows mobile connection setup. |
-| Handshake deadline | 5 s from WebSocket open to authenticated `welcome`; server closes if valid `hello` is absent within 5 s | Hello is local validation, not model work. Neither side can hold an unauthenticated socket indefinitely. |
+| Handshake deadline | 5 s from WebSocket open to authenticated `welcome`; server closes 1001 if `hello` is absent within 5 s | Hello is local validation, not model work. Neither side can hold an unauthenticated socket indefinitely. |
 | Handoff deadline | 10 s from handoff request, across producer quiescence, claim settlement, flush and readiness for exclusive transfer | This is local coordination, not model work. Bound a stuck producer or flush without releasing ownership; fail and continue serving from the old owner rather than half-transfer. |
 | Heartbeat interval | 15 s from `welcome`, independent of other traffic | Detects suspended or half-open peers even during long quiet turns; four round trips/minute per connected client. |
 | Liveness window | 45 s | Three heartbeat intervals tolerate brief scheduling delays while bounding stale display and server resource retention. |
@@ -1085,12 +1617,45 @@ policy does not retry a condition assertion or declare a command successful.
 WS close **4401** means auth refused during hello; **4403** means token revoked
 mid-session. Both enter NeedsToken, holding the outbox without reconnecting until
 a new token arrives. These codes differ from protocol failures (visible error,
-capped reconnect) and network loss (reconnect).
+capped reconnect) and network loss (reconnect). During initial hello and the
+post-registration recheck, a handshake deadline miss, unavailable token-store
+worker, store I/O failure or unsafe storage closes with **1001**, preserving the
+credential for reconnect. Unsafe storage is not evidence that a bearer is invalid.
+An unauthorized or revoked credential, an explicit authentication-scope
+refusal, or a malformed/tokenless hello justifies **4401** during hello.
+If no initial hello arrives within the handshake deadline, close **1001** and
+retain the token for reconnect; absence alone is not an auth refusal.
+A failed welcome encode or send drops the transport without attempting another
+close send; it cannot establish revocation. Only a credential that no longer authenticates, a changed verified principal,
+or a revocation signal justifies **4403** after registration.
 Frames for a closed subscription ID are silently dropped. A frame for an ID
 never opened on the current connection is a protocol error, not a closed-ID case.
 Protocol errors close with a visible diagnosis and capped reconnect (a server
 upgrade can cure them). A newer client follows §5's ReadOnly capabilities and
 holds commands; it can keep reading and detecting stale transport.
+
+**Session replay provenance (S7-min slice 3, #1829).** New session-store
+`StreamRecord`s add optional `known` (boolean) and `shape` (the original
+`ShapeKey` string). The receive-time adapter sets `known`; unknown events retain
+the original sender's harness/version-scoped `shape`. Known records keep their
+stored blob projection. Readers ignore additive envelope fields under ADR-0028
+§3a. Replay never invokes the current parser to reconstruct classification or
+shape. A legacy record without classification, or an unknown without its shape,
+yields a typed history gap with reason `provenance_missing`; later records still
+replay. It is neither a whole-replay refusal nor an entity snapshot. A missing
+retained prefix uses the same gap path with reason `retained_prefix`.
+
+The registry's runtime stream owner registers bounded continuation and captures
+its durable head under one publication lock. An owned file cut pages through that
+head before exactly one `synced`; subsequent publications cannot fall between
+registration and the barrier. Capture and registration are one operation over
+the locked book; constructing the owned cut afterwards cannot open a hole.
+Replay retains unread page bytes. Runtime-only, source-fenced byte checkpoints
+let a consumer resume its applied cursor after lag without rescanning the prefix;
+they are neither new wire fields nor durable cursor authority. Lag terminates
+unfinished replay on its next page. Terminal permission audits use this same source,
+even when runtime notification delivery is cancelled. Partial deltas consume no
+durable cursor and do not enter this source. The S4 reader remains singular.
 
 **Replay and resync.** Reconnect authenticates again, then sends each seq
 stream's `sub { after:last_applied_seq }`, preserving any unfinished resync
@@ -1101,7 +1666,10 @@ the client silently drops late frames for it. Re-subscribe with a fresh ID from
 the applied cursor, never `skipped_to`; no `unsub` is needed for the closed ID.
 A snapshot gap uses §4's inline checkpoint; no snapshot gap may omit `snapshot_to`.
 A history gap on `agent/<id>` or `events` leaves an explicit missing-range marker
-and continues from `to+1`, without implying complete history.
+and continues from `to+1`, without implying complete history. A persisted known
+payload that no longer parses follows that same inline history-gap path over
+its original sequence; it does not close the socket or retry the same bad
+payload on reconnect.
 
 `terminal/<pane>` is a **snapshot stream**, not history-only. Its snapshot
 contains the complete terminal frame and rendering state for that pane; keep its
@@ -1144,8 +1712,10 @@ the wire enum; implementation registers any new API error codes where needed):
 | --- | --- |
 | `cursor_ahead` | Stored cursor exceeds the stream head. Clear only that stream's entities, cursor and resync marker, then re-subscribe with a fresh ID without `after` through bootstrap; do not silently clamp. |
 | `operator_only` | Subscription requires the operator principal. Show refusal and stop that subscription until the principal changes; other streams stay up. |
+| `invalid_agent` | Unsafe or reserved stored agent namespace. Retry class `never`: select a valid subject rather than retrying unchanged. |
 | `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
 | `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
+| `session_busy` | Token mutation is pending. Retry class `later`: retry only this stream with fresh IDs after 250, 500 and 1000 ms (three automatic same-socket retries since the last `synced`), then remain visibly Refused until reopened or a later reconnect supplies a new welcome. Sibling subscriptions and the authenticated socket stay connected. |
 | `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
 
 Start the 30 s progress deadline at sub registration, or when a new gap starts
@@ -1252,7 +1822,10 @@ that the existing implementation already enforces these rules.
 scopes on **every cmd**, before claiming an idempotency key, returning a cached
 ack or dispatching a verb; cached hello authorization is insufficient. Serialize
 this authorization/admission boundary with operator revocation, so a command
-cannot be newly admitted after revocation. On detection of a removed/replaced
+cannot be newly admitted after revocation. Each admission or management operation
+explicitly unlocks its owned file description at scope exit, including completion
+or cancellation of lock-helper transfers. An inherited pre-exec descriptor in a
+child cannot extend that critical section. On detection of a removed/replaced
 token, return an error ack for the triggering cmd with `code:"auth_revoked"`
 before closing **all sockets for that token with 4403**; clients enter NeedsToken.
 Order that ack before the close on the triggering socket, without waiting for
@@ -1267,7 +1840,8 @@ is chosen because it does not rely on portable filesystem-watch delivery. Its
 limit is explicit: deletion alone does not proactively close a read-only idle
 socket; the next cmd or reconnect detects it. Read scopes are checked at sub
 registration (`subfail scope`), not continuously on existing subscriptions;
-shrinking read scope alone does not terminate those subscriptions.
+shrinking read scope alone does not terminate those subscriptions (continuous
+enforcement is tracked in #2042).
 Revocation prevents subsequent admission, not cancellation of an already admitted command; report its outcome
 through the journal and existing state rather than implying it was rolled back.
 
@@ -1317,7 +1891,7 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | Lost ack / duplicate cmd / restart at claim, effect or outcome | Same principal/key/payload yields one effect and first stored ack, or explicit uncertain pending outcome. All listed verbs, including fork/reload/interrupt, prove no automatic second dispatch. Different payload never executes. |
 | Permission prompt across drop | Prompt survives replay, stored answer retries once under the same request/key, closed prompt cannot receive a second answer or an answer intended for a newer prompt. |
 | Expired key / clock uncertainty / changed principal / revoked token | No automatic resend or new-id workaround; unknown outcome is visible, old-principal outbox drops, revoked token enters NeedsToken. |
-| Restart, handoff, missing journal or ahead cursor | Token scopes and stream seqs persist; no seq reset or duplicate side effect. Missing recovery state fails closed; ahead cursor is refused. |
+| Restart, handoff, missing journal or ahead cursor | File-token scopes and stream seqs persist; in-memory app-session tokens are revoked on restart and on handoff (their sessions close with `token_revoked`, and the shell mints again); no seq reset or duplicate side effect. Missing recovery state fails closed; ahead cursor is refused. |
 | Compression disabled | Offer permessage-deflate from browser, webview and native fixtures: every S7 upgrade declines it, all messages including hello have RSV1 unset, and no secret appears in diagnostics. |
 | Single-writer handoff overlap | Hold the old process alive with queued append/rewrite and command callbacks, including event-log.jsonl writes. New loading/acceptance requires exclusive ownership; every write checks the lock's owner generation. Race rewrite with append and duplicate cmd across transfer: no overwritten append, repeated seq or double effect. |
 | Stuck handoff producer | Keep a producer alive but unable to quiesce (repeat for a stalled flush/readiness step). At the supplied-clock 10 s deadline, handoff fails with handoff_failed: old ownership/generation/serving remain, admission resumes, new owner loads/accepts nothing. Release the delayed callback afterward: it cannot transfer the fence or mint a new-owner seq. No hang or half-transfer. |
@@ -1333,6 +1907,35 @@ controlled socket faults and bounded receives, not sleeps or live models.
 | Per-stream progress deadline | Replay exceeds 30 s overall but progresses within each window and succeeds. A stalled sub expires despite duplicate/unrelated/heartbeat traffic: unsub the stalled ID, then re-subscribe with a fresh ID from its applied cursor, retaining resync marker and the connection. |
 | Ack timeout and delayed original | Missing ack marks only that cmd uncertain; no same-socket resend or teardown. A late current-socket ack resolves it. After reconnect, deliver resume-only lookup before buffered original: show unknown outcome while the original may later execute once; never manufacture a new ID. Verify retry:later remains harmless with resume_only. |
 | Mobile suspend and remote outage | Foreground invalidates old socket and resumes. Local heartbeat does not clear remote stale state; cross-node cmd still refuses under VERSION 5. |
+
+#### S7-min agent subscription resource bounds (§5a implementation)
+
+The agent subscription implementation uses at most eight active cuts and 1024
+lifetime-used IDs per connection. IDs are limited to 128 bytes and stream names
+to 256 bytes; exceeding these caps closes 1001. Each cut has one outstanding
+writer delivery, with per-ID cancellation fencing and flush acknowledgement.
+History page work has 32 global I/O slots; abandoned work retains its slot until
+it returns. Storage/resource failures close 1001, distinct from authorization
+refusals. Current read scope is rechecked before owner lookup.
+
+An encoded agent event above the 65,536-byte message cap closes that subscription
+with `lagged`, without truncation, silent cursor advancement or sibling failure.
+Resuming from the applied cursor encounters that event again while it remains
+retained. The retained History limits, inline gaps, persisted provenance and
+single replay barrier remain authoritative. Exact-cursor offset hints are bounded
+and source-fenced; stale hints are discarded and cursor paging is used instead.
+
+
+#### Amendment: token admission locks and subscription contention (#2450)
+
+The authorization/admission boundary above uses shared file-token locks through
+the recheck and bounded callback, with exclusive locks for token mutation.
+Revocation intent fences new admissions before waiting for existing callbacks;
+readers check it again after shared acquisition. Revoke cannot return while an
+admitted callback remains in flight. This preserves S6 decision fencing and is
+the same shared/exclusive split recorded in ADR-0038 §6. A subscription's typed
+`session_busy` is retryable `later`, not a transport failure; unsafe storage and
+I/O failures retain their connection-close behavior.
 
 ### 6. One schema, generated TypeScript
 
@@ -1358,7 +1961,7 @@ reach clients only through §8's `UnknownEvent` wrapper and use §8's rendering.
 S7a (#1604) defines separate `ClientFrame` and `ServerFrame` enums tagged by
 `t`, with unknown transport tags rejected as protocol errors and additive fields
 ignored. `WireEvent = UnknownEvent | KnownSessionEvent | JsonValue`: the known-only
-projection is the S8a catalogue type supplied by #1723. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
+projection is the S8a catalogue type defined by the adapter’s `events!` macro. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
 client-version-ineligible event uses `{type:"unknown", raw, shape}`. `raw` is
 the exact original line as a string (including non-JSON diagnostics); `shape`
 is the sender's §8 canonical key, never recomputed with the client version.
@@ -1392,8 +1995,13 @@ only reads files, so a normal test run cannot repair stale generated output.
 The generator normalises trailing whitespace, and checks the complete TS file
 inventory as well as contents. ts-rs reports unsupported custom deserializers;
 these affect lenient input reading, while the emitted types describe serialization.
+The stored `SessionEvent` and wire `WireEvent` are distinct contracts.
 The adapter's `Unknown.raw` retains the exact line; its `shape` is Rust metadata
-until the server constructs the explicit wire wrapper. The existing serde_json
+until the server constructs §5/§8's explicit
+`UnknownEvent = {type:"unknown", raw:string, shape:string}` wrapper.
+A bare stored unknown is never an agent-stream wire payload. The wire alias
+remains `UnknownEvent | KnownSessionEvent | JsonValue`; `JsonValue` supports
+non-agent streams and does not remove the agent-stream wrapper requirement. The existing serde_json
 serializer preserves JSON token spelling and interior whitespace, trims surrounding whitespace, and
 encodes non-JSON diagnostics as a JSON string.
 
@@ -1446,6 +2054,11 @@ encodes non-JSON diagnostics as a JSON string.
   discriminators distinguish SSE and control envelopes that otherwise share
   the same top-level shape. Missing discriminators are null. This refines the
   key's representation without changing the owner decision.
+- **Replay provenance.** The §5 session-store `known`/`shape` metadata fixes
+  the sender's original classification and version-scoped key across restarts
+  and parser upgrades. A now-known payload originally classified unknown still
+  uses its original unknown wrapper. Missing legacy provenance emits the
+  `provenance_missing` history gap and replay continues, without recomputation.
 - **Rendering.** Every frontend renders `Unknown` (and a known event's
   `extra`) as a collapsible JSON dump with the shape key as its title. That
   rendering is part of the reference client and of the TUI's structured view.
@@ -1635,6 +2248,124 @@ P16 and P17 have no source in the stream today and are not promised;
   is refused with `operator_only` (exit 13). A switch down needs `send`
   scope. A `flk-agent` caller can switch its own agent down, never up.
 
+- **Per-request session grants (S6, #1429).** `agent.decide` accepts
+  `allow_once`, `allow_always` and `deny` only from an authenticated,
+  `operate`-scoped token principal. A local UID alone, pane input, an agent
+  message or a structured harness's MCP lease never authorizes a decision
+  (`not_authorized`, retry never). Identity comes from the authenticated
+  dispatcher context, never command arguments. Every decision is recorded
+  on `agent/<id>` in ordered open/closed permission audit records, including
+  automatic matches, with the originating token subject. Automatic closes also
+  reference the originating grant request ID. A raw request already reserved by
+  an exact grant carries that trusted reference into replay and counts as
+  stdout progress without ever opening S4 needs-human attention.
+  Decision messages normalize CRLF to LF, trim surrounding whitespace, and
+  contain at most 2048 UTF-8 bytes (`MAX_PERMISSION_DECISION_MESSAGE_BYTES`,
+  #2249). They use `prompt_control_bytes` rules: newlines and tabs are allowed;
+  other controls are refused. Oversized or unsafe messages return typed
+  `invalid_params` before any reservation, grant, audit or harness input.
+  Empty and absent messages are allowed; audits and deny responses carry the
+  normalized text.
+
+- **`allow_always` lasts for one live harness runtime.** Its grant is held
+  only in memory for that structured agent. Exit, restart and resume into a
+  new runtime discard it, even when resuming the same persisted session.
+  Grants are never shared between agents, persisted in flk policy, or
+  written to a settings file. Persistent presets remain the separately
+  operator-edited policy described above (#1799).
+- **Match exactly; never forward harness rules.** `allow_always` always
+  installs an in-memory grant for only the exact tool name plus canonical
+  JSON input (recursively sorted object keys; array order and scalar values
+  preserved). Matching performs no Unicode normalization and treats `1` and
+  `1.0` as different. A different tool or input prompts again.
+  Harness permission suggestions are never interpreted or forwarded, even
+  when they appear limited to the requested tool: determining their scope
+  would require interpreting the harness rule grammar. The response allows
+  the current call with its original input and no `updatedPermissions`.
+  When nonempty suggestions are present, the closed audit records
+  `ignored_suggestions` with reason `not_forwarded` and the request ID linking
+  to the open audit record containing the full original suggestions.
+  Absent, null and empty suggestions produce the same exact grant.
+  Broader rules belong to the separately operator-edited policy in #1799.
+  The `MAX_GRANTS` constant in `src/structured/permissions.rs` bounds distinct
+  installed and reserved exact grant keys per runtime; exceeding that bound
+  returns `permission_grant_limit` (retry never, policy refusal) without
+  closing the request or sending a response. The operator may still allow
+  once or deny that request. Token authorization still applies to manual
+  decisions after a grant exists.
+- **Permission request bounds and handles (S6, #1813).** There is no lifetime
+  request-ID cap. `MAX_OPEN_PERMISSION_REQUESTS = 16` keeps live requests in full,
+  including reserved/audited responses until stdin delivery completes. The
+  harness blocks per request, so more than a few concurrent prompts is
+  pathological; 16 leaves headroom for parallel tool calls. An excess valid new
+  request is denied individually with `permission_request_limit` (retry never),
+  a structured warning and a durable closed audit carrying that code, with no
+  matching open audit. It consumes no live slot and does not end the session or
+  close other requests. The deny uses existing bounded, cancel-aware writer
+  delivery: backpressure delays it, while disk failure, cancellation or a
+  disconnected writer remains an explicit I/O failure.
+  Every request receives a flk-issued `request_seq: u64`, strictly increasing
+  and never reused within the session. The book seeds allocation from the durable
+  stream cursor when a runtime resumes; each issued handle precedes at least one
+  durable stream record before being surfaced. Exhaustion fails closed without
+  wrapping. The open audit, authenticated stdout envelope and S4 snapshot carry
+  `(request_id, request_seq)`. `AgentDecide` requires both; only an exact live
+  pair can reserve an answer or a session grant. S7 slice 5 must carry the
+  sequence end to end in its request display, command and decision routing.
+  `CLOSED_PERMISSION_REQUEST_WINDOW = 1024` retains closed sequences with their
+  request IDs in FIFO order of durable closure, including capacity denials.
+  A decide for a retained closed pair gets `permission_request_closed`; an
+  evicted or never-seen pair gets `permission_request_unknown` (both retry never).
+  A mismatching sequence never approves the currently open request. Live/in-flight
+  handles remain independently correlated when older closed handles are evicted.
+  Invalid IDs and duplicates still live or in the window retain fail-closed
+  transport behavior. Reusing an evicted harness ID is harmless: the new request
+  has a new sequence and no delayed decision for the old handle can approve it.
+  Bookkeeping never expires or changes session-only exact-match `allow_always`
+  grants; their audits retain the originating request ID and sequence.
+- **Permission wire records (S6/S7, #2224).** `flk_permission_request` is a
+  known typed agent-stream event, generated from the producer's `PermissionRecord`.
+  Its `state` union is `open | closed`, never `decided`. Both states carry
+  `request_id` and `request_seq`; only `open` carries `request: ToolRequest`.
+  Closed records carry `decision`, nullable `message`, `principal` and `source`,
+  or a typed `reason`: `ended`, `cancelled`, `result`, `interrupted`,
+  `permission_request_limit`, `permission_request_too_large`, or `session_ended`.
+  Policy denies retain their existing reason/error-code fields alongside the
+  decision. Capacity refusals can close without a prior open. Existing closed
+  JSON stays unchanged apart from the handle. An `agent.decide` ack acknowledges
+  admission, while the durable close retires the card. Unknown fields or future
+  reasons retain the lossless unknown-event wrapper instead of being discarded.
+  `session_ended` marks the restart sweep in #2236.
+- **Startup permission recovery (S6, #2236).** The stream owner projects host
+  audit headers while scanning the existing stream. Before admitting any new
+  control request, it appends a `closed` / `session_ended` record without a
+  decision for each unmatched `(request_id, request_seq)`. All recovery closes
+  use ordinary audit writes and fsyncs, and all are durable before the first
+  notification. A failed write/fsync stops the owner before control admission.
+  Repeated starts append nothing once every open has a matching close. Old
+  live slots and exact grants are never restored. An interrupted automatic or
+  oversized answer is handled exactly like any other unmatched open.
+  The projection ignores unknown kinds and preserves opaque metadata, including
+  newer close reasons. Invalid permission headers are warned and preserved raw,
+  not fatal to the whole scan (ADR-0028 §3a). For legacy audits without handles,
+  an open's durable stream position supplies its recovery handle; a legacy close
+  without a handle matches by ID. New closes match both ID and handle, so a
+  reused ID cannot close another generation. Recovery retains handles, not tool
+  inputs, until the scan completes.
+- **Delivery and audit ordering.** A permission closes for attention only
+  after its decision audit is durable, and user input remains gated until
+  the control response is fully written. Admission success reserves a
+  decision and does not promise eventual pipe delivery. Audit or writer
+  failure stops delivery; runtime shutdown writes a reasoned terminal close
+  for each outstanding request before clearing the book, without inventing
+  an operator decision.
+  Harness cancellation closes its named request; top-level result and host
+  interruption also produce reasoned closes. A cancelled reservation cannot
+  deliver a stale answer. Disk errors are surfaced; failed persistence cannot
+  promise a durable close. Unknown IDs, including evicted closed IDs, yield
+  `permission_request_unknown`. An already accepted decision or an ID still in
+  the closed window yields `permission_request_closed`; both are retry never.
+
 ### 11. Harness neutrality
 
 One flk event model covers Claude, Codex and opencode at the level of §2:
@@ -1654,7 +2385,12 @@ four places that the schema must normalise rather than mirror:
    `completed` / `error`. flk stores a generic call with a typed `kind`.
 3. **Approvals.** Claude allow / deny with `updatedInput`; Codex accept /
    acceptForSession / decline / cancel; opencode once / always / reject. flk
-   keeps `allow | allow_always | deny{reason}` and maps down.
+   keeps `allow_once | allow_always | deny{reason}` and maps down.
+   `allow_always` obeys §10b's live-runtime lifetime, token-only authority
+   and audit contract. flk always uses exact in-memory grants and never
+   forwards harness permission suggestions or sends `updatedPermissions`.
+   Future adapters must preserve that scope rather than map an always
+   decision to a persistent harness rule.
 4. **Fork granularity.** Claude forks at a message uuid; opencode at a
    message id; Codex at a turn (`thread/fork{lastTurnId}`). `agent.fork`
    refuses a mid-turn point on Codex with `unsupported_for_agent`.
@@ -1869,6 +2605,15 @@ decision by the owner.
 Tracked in #1307. Ordered; each is at most about 400 production lines (tests and doc comments
 excluded; TypeScript counts the same as Rust) and lands behind `runtime: structured` or the `web` feature.
 
+The S7-min rows refine the original S7 endpoint slice. Execution follows
+1 → 7b → 2 → 3 → 4 → 5 → 6 → 8; the GUI bundle router (7a) is built
+independently. Artifact, inbox and mesh streams, full outbox/resume-only
+semantics, single-writer handoff and operator-only outcomes remain S7-rest;
+their fixture labels stay explicit under the ADR tracker #1307. #2369 proves
+isolated browser dogfood and
+metadata-selected welcomes, not full selected-script trace execution. That
+remaining slice-8 acceptance is tracked in #2467; #1833 and #1746 stay open.
+
 | # | Slice | Depends on | Est. lines |
 |---|---|---|---|
 | S0 | Complete (2026-10-14): the probes landed (#1356); the A.13 controls and token-path re-runs, the concurrency-safe call behind an open permission, and A.16 are recorded (#1404). Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
@@ -1883,6 +2628,16 @@ excluded; TypeScript counts the same as Rust) and lands behind `runtime: structu
 | S6 | Control requests: `can_use_tool` → `hook.decide` and §8a questions, `AskUserQuestion` answers, `ExitPlanMode` | S4, S5 | 350 |
 | S7a | Wire message Rust types with ts derives: hello/welcome recovery metadata, sub/unsub/cmd/ev/ack, subfail, ping/pong, synced on every seq stream, gap with snapshot_to, lagged (§5/§5a); scripted fake-server fixture format, types only with no endpoint. Before S3, as ADR-0038 §10 | #1546 settled | 200 |
 | S7 | Wire endpoint implementing S7a, §5a deadlines, heartbeat, durable command journal, resume/checkpoint and single-writer rules, `/v1/blob`, client tokens, `WIRE_JSON_VERSION` gate, `web` on in release builds; refuse remote-agent cmd until #1380 | S3 (S3a #1518/#1439, S3b #1426), S7a | 350 |
+| S7-min 1 (#1825) | Client-token authority and verification | S7a, #1798 | ≤400 |
+| S7-min 7b (#1827) | Operator token CLI/socket entry and dogfood URL | Slice 1 | ≤400 |
+| S7-min 2 (#1828) | Loopback WebSocket transport and liveness | Slices 1, 7b | ≤400 |
+| S7-min 3 (#1829) | Stored session replay and live publication | Slice 2, S3 | ≤400 |
+| S7-min 4 (#1830) | Agent subscriptions, identities and bounded delivery | Slice 3 | ≤400 |
+| S7-min 5 (#1831) | Send and permission-decision routing | Slice 4, S5, S6 | ≤400 |
+| S7-min 6a (#1832) | Durable fleet-lite projection and cursor core | S4, S6 | ≤400 |
+| S7-min 6b (#2225) | Fleet stream on the endpoint; activity omitted until #2243 | Slices 4, 6a | ≤400 |
+| S7-min 7a (#1826) | GUI bundle serving router | Loopback listener, GUI build | ≤400 |
+| S7-min 8 (#1833) | Real-server conformance and isolated browser dogfood proof | Preceding minimal slices; #1734 before public start | 0 (tests/docs) |
 | S8 | `ts` feature, `ts-rs` derives, generated `web/client/src/gen`, drift test, `just gen-ts` | S7 | 200 |
 | S9a | Bun reference client in Solid: connect, follow an agent from a cursor, render P1–P4, unknown JSON dump, lazy blobs | S8 | 400 (TS) |
 | S9b | Bun reference client: P12–P15, P19, P20, queue view with edit, reorder, stashes, send now and relevance marks | S9a, S5c | 400 (TS) |
@@ -2692,3 +3447,682 @@ Operator cleanup is explicit: inspect the retained directory and associated
 processes, establish that none still uses it, then remove the directory by hand.
 No automatic PID-only reaping and no cleanup CLI is introduced in this slice;
 operator tooling is a follow-up owned by the architect.
+
+### Amendment: Atomic structured admission (#1843 part 2a)
+
+The Workers owner is the single admission authority for structured launches. It
+checks limits and reserves a pending slot keyed by agent id in one owner
+operation before starting a producer. Counts combine live leases with pending
+slots, deduplicated by agent id. Agent-started launches count toward capacity
+and parent fanout; the attested operator exemption is unchanged. Admission reads
+the published lease copy nonblockingly, falling back to the live copy. If both
+copies are busy, `session_busy` is a typed retryable refusal. Neither path waits
+on the App thread or changes caller identity.
+
+A pending slot ends on lease acquisition or launch failure, never on elapsed
+time alone. Pending metadata grants neither caller identity nor signaling
+rights. Preparation remains off-thread and bounded by its owner. Part 2b adds
+the production CLI/socket caller and its loaded session policy; public client
+and server start remain gated until part 3 completes narrowed MCP admission.
+
+### Amendment: Shared structured CLI/socket launch (#1843 part 2b)
+
+The local `agent.start` contract adds the closed selector `runtime` (`pty` by
+absence, `structured` by explicit request) and the optional structured `model`.
+The CLI and socket share App admission and the Workers owner's atomic pending
+reservation. The listener supplies the immutable MCP endpoint. Relative listener
+paths are resolved to absolute paths once at listener bind time. Endpoint
+resolution is optional at server startup: failure emits a typed
+`structured_endpoint_restart_required` warning with fixed reason `exe` or
+`socket`, without private resolution details, and a structured start refuses
+with that code before registering metadata or reserving capacity. Endpoint
+recovery takes effect on the next listener initialization. Ordinary server
+startup and PTY routes remain available. The caller cannot supply a binary, MCP
+endpoint, credential or harness flags: the only accepted structured argv is
+`claude`. `cwd` must resolve to an existing absolute directory. A resumed
+identity keeps its native session, cwd and model; launch overrides on resume are
+refused. Structured launches create no pane placement. Pane-only placement,
+focus, dry-run and readiness options are refused rather than ignored. Unknown
+restored ownership remains fenced before any start.
+
+Default `run_as = "flk-agent"` refuses until the dedicated-user launcher exists.
+Operator execution requires the explicit `run_as = "operator"` opt-in and
+retains #1177's cooperative same-UID limitation. Preparation and bounded version
+verification run off the owner thread; startup/cleanup facts remain asynchronous
+worker observations. The first production Workers caller forwards the loaded
+`sessions` storage policy and `stall_ms` together, without substituting
+defaults.
+
+Both production start gates stay closed until part 3 supplies narrowed MCP
+admission and capability negotiation: a client must not send this selector to an
+older server that might silently ignore it and launch a PTY. Existing PTY
+`AgentInfo` fields and the `agents` list are unchanged. Structured read/control
+continues to use the additive `structured_agents` and `StructuredAgentInfo`
+contracts. Refusals use registered error codes and their retry/exit mappings.
+
+Endpoint provisioning failures require operator recovery: correct executable or
+socket resolution, then restart or hand off the listener. The registered
+`structured_endpoint_restart_required` refusal has retry `after_human`, exit 1.
+Ordinary routes remain available. Repeating start alone cannot repair it.
+
+### Amendment: Public structured routing (#1843 part 3)
+
+The public CLI/socket gate opens with narrowed MCP admission. Servers advertise
+`structured_agents`; CLI and MCP refuse absent or malformed capability evidence
+before transmitting a structured selector, avoiding a legacy PTY launch.
+`agent.spawn` adds default-PTY `runtime` and optional structured `model`. MCP's
+`flock_agent_start` continues to build only that narrowed verb, never raw
+`agent.start`. Structured Claude resolves a tracked checkout, validates and
+nonce-frames the opening prompt (ADR-0014 §4). There is no prompt in launch argv.
+
+The MCP opening turn follows the single queue owner (ADR-0036 §3/S5, #1955).
+Before Ready, the launch worker commits one lifecycle-UUID item with
+`Producer::Agent` bound to the server-attested starter and `Kind::Message`.
+Its validated `SpawnPrompt` nonce frame is preserved byte for byte inside the
+queue's message frame. It never uses direct stdin or command admission.
+CLI starts enqueue no opening turn. Refused admission reports the queue's typed
+refusal code, or `agent_start_failed` for other launch failures, and publishes
+no Ready runtime or partial harness process.
+Until stdin accepts that item, the owner retains a settlement guard. Startup
+failure terminally fails it with `agent_start_failed` through the existing queue
+Fail record. Its internal `opening_turn` metadata also fences an unresolved
+queued opening on reopen: settlement must commit before that generation may
+serve input. Failed settlement is logged with its typed code; reopening attempts
+the terminal write before delivery rather than replaying an old opening prompt.
+After accepted input, ordinary result and unresolved-turn recovery apply.
+A failed stdin offer requests supervisor stop even if transport cancellation has
+not yet happened (ADR-0036 §3/§4); busy and uncertain-turn pending remain waits.
+
+Both routes share App admission and the Workers owner reservation from parts
+2a/2b. MCP uses Spawn policy, including explicit node opt-in and attested caller
+identity. Lineage, depth, fanout, capacity and pending accounting remain intact.
+An unattested MCP caller never receives the operator exemption. #1734's scoped
+credential remains only in generated private MCP configuration and immutable MCP
+client context, never the model environment. Verification and revocation at
+effect admission apply equally to these newly public verbs.
+
+MCP mirrors the additive `structured_agents` list and typed get result, with no
+invented placement. `flock_agent_stop` wraps typed stop; authority remains the
+operator and the structured agent itself, never its lineage parent. Public start
+never accepts caller-selected binaries, harness flags or MCP endpoints. Unknown
+restored ownership remains fenced, and default agent-user execution still
+refuses until #1208. The operator-mode #1177 cooperative limitation and #1629
+detachment limitation remain explicit. Permission decisions and question routing
+remain S6 (#1307); explicit structured question policies are refused. Pane-only
+read/control operations retain registered `runtime_unsupported` (retry `never`,
+exit 2). PTY fields/contracts and mesh VERSION 5 are unchanged.
+
+The executable dogfood is `tests/probes/structured_public.py`, documented in
+`tests/probes/structured-public.md` and run by nextest's `structured_public`
+integration binary. It owns a separate server and HOME, fake Claude and real
+scoped MCP child, readiness pipes and finite failure ceilings. No live server,
+profile, model, sleeps or retry loops participate.
+
+The current live-reload whitelist does not apply `[structured]` or `[fleet]`
+changes (#2043); use a fresh server after changing launch/admission policy.
+`[sessions]` live-reload semantics remain tracked by #1975. The dogfood isolates
+its policy cases in fresh servers rather than assuming a successful reload
+report changed these startup values.
+
+### Amendment: S5 reserved queue kinds (#2364)
+
+`finding`, `delegate_result` and `reload_notice` are reserved known queue kinds,
+not currently enabled producers. Keep their typed serialized names and lossless
+round trips so retained data and future clients can be inspected today:
+
+| Kind | Future producer | Tracker |
+| --- | --- | --- |
+| `finding` | S13 fork-return channel into the parent's queue | #2365 |
+| `delegate_result` | Server-owned structured delegate completion and receipt | #2419 |
+| `reload_notice` | S11 structured reload lifecycle and init-difference notice | #2420 |
+
+Until those producers exist, shared admission refuses every reserved kind from
+every principal/producer and gate with registered `queue_kind_reserved` (retry
+`never`, CLI exit 2). No journal append, cursor advance or queue mutation occurs.
+There is no operator override. Enabling one requires its producer slice and
+explicit authenticated admission policy; merely sending the enum name is not
+permission to create it.
+
+Retained reserved records remain readable and round-trip with their known kind;
+loading never deletes or reinterprets them. Edits cannot release them for delivery.
+Formation durably fails a queued reserved head with the same typed reason while
+preserving its payload, rather than sending it or wedging later supported work.
+Unknown future kinds retain the existing ADR-0028 §3a behavior. The session
+transcript's raw JSON fallback preserves exported queue records and items, but
+there is no queue GUI renderer or transport yet. Its fallback test is not
+queue-kind-specific GUI coverage. This reservation adds no producer, queue
+command or live GUI transport.
+
+
+### Amendment: S5 unresolved reserved records on restart (#2364)
+
+Before holding unresolved records for a fresh generation, the scheduler durably
+fails reserved kinds with `queue_kind_reserved`, preserving identity, body and
+FIFO position. The terminal failure clears `awaiting_result`, so reconstructing
+the scheduler again adds no duplicate failure. Supported unresolved records keep
+the existing hold behavior. Admission and edits still refuse reserved kinds;
+recovery uses the existing durable `fail` transition, not renewed admission.
+Later supported queued inputs remain deliverable after construction. Read-only
+and opaque future records retain their existing inspection-only behavior.
+
+### Amendment: S6 operator grant management (#2362, part 1)
+
+The architect ruling on #2362 adds local-operator-only socket and CLI management
+of the exact, live-runtime `allow_always` grants in §10b. S7 WebSocket management
+is part 2 after #2251, under `operate`; this amendment adds no WS or MCP verb.
+
+A grant's handle is its originating `(request_id, request_seq)`, fenced by the
+exact `agent_id` and runtime `generation`. List returns installed handles, tool,
+canonical JSON `[tool_name, input]` key and installation audit time. Revoke must
+supply the generation and handle, including an originating decision handle when
+revoking an in-flight install. Stale generations and unknown handles have typed
+refusals. The existing operator admission and cooperative-mode limitations apply.
+
+Each key has a revocation epoch under the Book lock. `prepare` captures it when
+reserving `allow_always`; revoke bumps it and removes any installed grant.
+`audited` installs only if that captured epoch is unchanged. Retained epoch
+entries are bounded by in-flight reservations and pruned once no pending install
+can reference them. Epoch overflow refuses without removing the installed grant.
+An already admitted response still completes as `allow` for that one call, but a
+revoked in-flight decision cannot install a grant. The next matching request
+prompts. This is not cancellation or rollback of an admitted tool call.
+
+Successful revoke emits `structured_grant_revoked` in the existing persisted
+global event stream, with authenticated revoker principal, agent/generation and
+originating handle. Runtime grants remain memory-only and are cleared on end.
+The socket contract documents the result fields, registered refusals and the
+absence of automatic revoke retries. These raw socket schemas are not generated
+S7 TypeScript roots; the typed S7 management contract belongs to part 2.
+
+### Amendment: S6 grant-list input redaction (#2416)
+
+Following ADR-0041 §4's fail-closed redaction stance, grant projections omit the
+full canonical tool/input key by default, including for the local operator.
+They expose its UTF-8 byte length and first 16 lowercase hexadecimal SHA-256
+digits. These are display/comparison metadata; grant authority still uses the
+originating request handle plus agent/generation, never the fingerprint.
+
+The owner decision on #2416 permits explicit local-operator disclosure through
+socket `show_input: true` or CLI `--show-input` on list. The full key can contain
+credentials, and CLI output can persist in terminal scrollback and logs. Hashes
+and lengths also reveal comparison metadata. Revoke responses always redact
+remaining grants; operator identity alone does not opt into full input export.
+This narrow grant-list opt-in does not authorize raw config-secret export.
+
+### Amendment: App-session tokens and shell origins (#1601)
+
+ADR-0038 owner decision 16 (decided 2026-10-25, recorded on #1601) gives a
+Tauri shell on the server's own machine a zero-touch token. ADR-0038 §6 has the
+shell's side. This section is the server contract. §5's other auth rules are
+unchanged.
+
+**Mint verb.** A new socket method mints an **app-session token**.
+- **Who may call it.** It is admitted only from the LocalOperator (the same
+  `client_token_authority()` guard as `ClientOpen`): the kernel-checked peer
+  UID and PID, a non-empty PID, no flk pane in the caller's ancestry, and no
+  mesh edge.
+- **Scopes.** It takes no scope parameter. It grants exactly `{read, send,
+  answer, operate}`, the set `ClientOpen` hands out. A request naming scopes is
+  refused with `invalid_params`.
+- **Parameters.** Empty. The captured shell origin needs no `origin_port`;
+  extra fields are refused with `invalid_params` (#2442).
+
+**What the token is.** A bearer secret. With `operate` it **is** the
+operator's identity for ADR-0014's operator-only verbs, as §5 says of an
+`operate`-scoped file token.
+- On the local Unix transport, only the minting process may use it at
+  `/v1/ws`, after a fresh LocalOperator check and bearer authentication. The
+  local-transport amendment below supersedes admission by possession alone.
+  App-session bearers are not admitted over TCP, where their PID binding
+  cannot be proved.
+- **Residual risk (#1177).** Processes started from a flk pane, agents
+  included, are refused the mint and local admission. PID binding prevents
+  another process from using a stolen bearer directly, but does not prevent
+  control of the shell process, for example by modifying its memory. The
+  bounded lifetime and shell hardening in ADR-0038 §6 narrow that risk but do
+  not close it. #1177 tracks same-UID agent isolation.
+
+**Stable app-session identity (#2442).** The principal is exactly
+`app:operator:<uid>`, where `<uid>` is the decimal kernel-attested operator
+UID sealed by LocalOperator. It is scoped to this server's operator identity,
+not a cross-server authorization claim. It survives re-mint, restart, handoff
+and relaunch; no caller field chooses it. File-token principals remain separate.
+The credential is distinct: every mint retains its fresh random `app:<nonce>`
+name, bearer/digest, process watch, deadline and revocation signal. Revoking or
+expiring one bearer closes only sockets using that credential, not sibling
+mints of the same operator. All mints have the same fixed operator grants;
+sharing the principal adds no authority beyond those grants.
+
+Command resend/dedupe stays keyed by `(principal, cmd_id)`. Re-mint no longer
+changes that key or requires dropping the operator's outbox. This does not
+extend retention or preserve an in-memory command cache across restart:
+existing epoch/resume-only/unknown-outcome rules still apply, with no automatic
+second dispatch.
+
+Resource budgets are per credential, keyed by the authenticated bearer digest,
+not by the shared operator principal. Each mint has four registered sockets,
+including pending welcome. A live old mint can fill all four while a fresh
+mint connects and uses its own four; sharing identity does not require the old
+app to drain. The global bound remains sixteen upgraded sockets, so one full
+credential cannot consume it. No additional per-principal aggregate cap is
+introduced. The four unauthenticated hello slots remain global: no credential
+is trusted before authentication. The store's 128-entry cap remains per
+credential, so a renewal still needs a free entry or expired/exited reclamation.
+
+**Audit limit.** Permission-decision records currently retain only the verified
+principal and source (`token`). The decision capability exposes neither the
+token name nor a bearer digest, so an answer can be attributed to the operator
+but not to a particular app mint. Shared-principal mints are indistinguishable
+in that audit trail. This does not expose credentials or change answer policy.
+
+**Binding to the minting process.**
+- **Where the PID comes from.** The **minting connection's peer credentials**:
+  `LOCAL_PEERPID` on macOS; on Linux `SO_PEERPIDFD` where available, else
+  `SO_PEERCRED`. Never from a parameter.
+- **Start time.** It is captured when the connection is accepted
+  (`src/platform/peer.rs`: Linux `/proc/<pid>/stat` field 22, macOS
+  `flock_process_facts`).
+- **Order.**
+  1. Arm the exit watch: kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS; on Linux
+     the peer pidfd, or else `pidfd_open`.
+  2. Read the start time again and compare it with the one taken at accept.
+- **Refusal.** If the watch cannot be armed, or the start times differ, the
+  mint is refused with `peer_process_changed`.
+- **No polling.** The server never polls with `kill(pid, 0)`.
+
+**Lifetime and revocation.**
+- **Storage.** App-session tokens live in a second, in-memory store that
+  `authenticate` checks beside the file tokens. They are never written under
+  `client-tokens/` and never listed as file tokens.
+- **TTL.** A fixed 12 hours from the mint, with no sliding renewal. The shell
+  renews by minting again.
+- **Restart and handoff.** Both revoke every app-session token. A handoff does
+  not carry them or their watches to the successor. This amends the §5a
+  matrix row "Restart, handoff…".
+- **Revocation.** On process exit, TTL expiry, restart or handoff,
+  `authenticate` stops accepting the token. Every live `/v1/ws` session
+  authenticated by it uses the existing close 4403. A command that detects
+  revocation receives its `auth_revoked` error acknowledgement before the close;
+  idle expiry and exit also close without waiting for a command. No new auth
+  error names are introduced (#2442).
+
+**Shell origins, on `/v1/ws` only.**
+- **The allow-list.** The listener guard (`shell_origin_allowed`,
+  `src/web/gui.rs`; `src/web/client_listener.rs`) admits an exact allow-list
+  of shell origins on the `/v1/ws` upgrade.
+- **Its values.** The allow-list holds only values captured from real Tauri v2
+  shells and recorded in ADR-0038 §6. For those origins only, the guard
+  accepts the `Sec-Fetch-Site` value captured with them.
+- **Unchanged.** Every other origin and path keeps today's checks.
+  `/v1/client/exchange` keeps its strict same-origin rule.
+- **`null` is never admitted.**
+- **Captured local origin (#2442).** Exactly `tauri://localhost` with
+  `Sec-Fetch-Site: cross-site`, only on the exact `/v1/ws` path. The captured
+  platforms need no registered-loopback origin, `origin_port`, port-ownership
+  check or `origin_port_not_owned` code. Windows remains remote-only.
+- **Replacement for the held policy (#2500).** Owner decision (a),
+  2026-10-26, replaces per-UID TCP attribution with the local Unix transport
+  specified below. TCP retains one shared browser pre-auth budget, without
+  attribution or unknown-UID buckets. The registry's `preauth_capacity`
+  (HTTP 503/retry `later`) and `auth_rate_limited` (HTTP 429/retry `later`)
+  remain registered; registration is not a new rate-limiting policy.
+- **Linux native refusal.** G9a refuses local mint at `ptrace_scope=0`, explains
+  that another process could read the operator credential from app memory,
+  and offers explicit remote pairing or administrator-enabled
+  `ptrace_scope ≥ 1`. No silent fallback is permitted (ADR-0038 §6).
+- **Remote/browser path only.** The captured shell-Origin exception from
+  #2505 remains on TCP for an explicitly selected remote/browser connection.
+  It does not authenticate a local native bridge, bypass a bearer, or permit
+  an app-session token on TCP. The UDS route uses kernel peer evidence, not
+  an Origin or fetch-metadata claim, to establish local authority.
+
+**Tests that must fail first.**
+- A captured shell origin is admitted on `/v1/ws` and refused on the exchange.
+- `null` is refused on both.
+- A shell origin with a missing or wrong token is refused at `hello`.
+- A scoped mint is refused, and so is a mint from a non-LocalOperator peer.
+- A start-time mismatch is refused with `peer_process_changed`.
+- Process exit revokes the token and closes its live sessions (a real child
+  process, no polling).
+- TTL expiry does the same (an injected clock).
+- Restart and handoff each revoke every app-session token.
+- `same-site`, duplicate headers, lookalike shell origins and non-WS paths
+  keep their existing refusal treatment.
+
+### Amendment: Local `/v1/ws` over a Unix socket (#2500)
+
+**Accepted owner decision (a), 2026-10-26.** This is the server half of
+[#2500](https://github.com/gerchowl/flock/pull/2500#issuecomment-6411345834).
+The native shell owns the Unix connection and bridges WebSocket traffic for
+its webview. The companion shell amendment is
+[#2529, reviewed head `37455b06`](https://github.com/gerchowl/flock/pull/2529):
+[ADR-0038 §6](0038-gui-workbench.md#6-shells-one-bundle-two-hosts-one-transport),
+"One protocol, two sockets", and ADR-0038 §11 owner decision **18**. The GUI
+architect owns that amendment; ADR-0038 is not edited here. This server
+contract does not claim implementation. It supersedes the earlier TCP UID
+attribution/window proposal, not §5's scopes, idempotency or §5a's recovery.
+
+**Shell cross-reference, not additional server requirements.** ADR-0038 §6
+keeps the bearer in native memory: the webview sends a token-free first
+`hello`; the bridge injects the bearer and passes later frames through byte
+for byte. A first frame other than a token-free hello is closed by the bridge
+with 1008, before forwarding. The server always receives the bearer-bearing
+hello specified below. The same shell contract re-mints on any 4401 or 4403
+for its current bearer, whether welcomed or not, at renewal at three quarters
+of `expires_in_ms`, and on `openBridge({renew:true})`. Closures 1006 and 1001
+reuse that bearer; replacing it does not revoke it early, so its existing TTL
+or exit watch still ends it. These bridge/re-mint rules are owned by ADR-0038,
+not introduced as another server admission path here.
+
+**Transport and location.** Use a **sibling `flock-ws.sock`**, derived beside
+that session's active `flock.sock`, including a selected or overridden runtime
+path. Its socket mode is **0600**, matching `SOCKET_PERMISSION_MODE` in
+`src/api/server.rs`. It lives in the **same directory as `flock.sock`**, with
+that directory's existing owner and permissions; do not broaden those
+permissions or create a less protected directory for the sibling. Retain
+listener ownership and the bounded shutdown/handoff lifecycle.
+
+Before binding, inspect an existing path and check whether its listener is
+live. A successful connect means busy, never permission to unlink. Remove
+only a proved-stale socket owned by this operator, after verifying its file
+type, owner and unchanged device/inode identity. A timeout, uncertain
+ownership, foreign owner, non-socket or symlink is not proof of staleness:
+refuse startup without removing it. Cleanup must likewise compare the bound
+socket's device/inode identity before unlinking, so a replaced path and
+another live listener's socket survive. `src/ipc.rs` owns the existing socket
+lifecycle helpers; implementation must preserve these checks rather than
+assuming every pre-existing sibling is disposable. Do not bind a
+machine-wide hard-coded path.
+The endpoint on that socket is exactly `GET /v1/ws`: HTTP/1.1 upgrade, then
+exactly the existing JSON text frames. No JSON-line tunnel, custom length
+prefix, new handshake field, wire-version bump or mesh change is introduced.
+The close-code set is reused **verbatim**, including 4401 for refused hello,
+4403 for post-registration revocation, 1001 for capacity/liveness failure,
+and the remaining §5/§5a codes. Recovery and command logic remain identical.
+The sibling serves only the WS route, not token exchange, minting or static
+web content; minting remains a request over `flock.sock`.
+
+This location deliberately avoids protocol sniffing on the existing API:
+`api::server::handle_connection` captures credentials and calls
+`read_initial_request_line`, then `api::scoped::decode` on a bounded,
+newline-delimited JSON request (`src/api/server.rs`, `src/api/scoped.rs`).
+It has no HTTP path router; routing an HTTP upgrade there would require a new
+protocol discriminator and complicate existing CLI/subscription reads.
+The sibling can reuse the HTTP/1.1 upgrade and WS core in
+`src/web/client_listener.rs` and `src/web/wire.rs`, while the platform adapter
+provides Unix peer evidence through `src/platform/peer.rs`. This is a
+recommendation for the implementation's listener placement, not permission
+to reinterpret existing socket bytes or weaken its permissions.
+
+**Admission requires both proofs.** Capture UID, PID and process-birth evidence
+from the accepted Unix connection, never from HTTP headers or `hello` fields.
+The UDS LocalOperator rule is explicit: a **known UID equal to the operator
+UID**, a live peer PID **with verified start-time evidence**, no pane/agent
+ancestry and no mesh-edge caller. A missing UID is a refusal, not an operator
+fallback. A missing PID, missing start time, exited peer or changed process
+identity is also a refusal. Matching UIDs or a non-empty PID alone are
+insufficient.
+
+Do **not** reuse `App::client_token_authority` or
+`App::caller_is_local_operator` as the complete UDS proof without strengthening
+it: `src/app/api/mesh.rs` currently uses `is_none_or` for the UID and only
+`pid.is_some()`, without requiring start-time evidence. Those existing
+semantics are not the normative rule for this new listener. Do not allocate
+a registered session before the stronger checks pass. Bounded admission
+resources may be reserved before this check, but never unbounded work or
+authenticated capacity.
+
+**Pre-upgrade refusal contract.** Send no HTTP 101 or WebSocket frame on these
+paths. Return `Content-Type: application/json`, `Cache-Control: no-store`,
+and exactly the following JSON object for the matching HTTP status, then close
+the HTTP connection within its admission deadline. JSON whitespace and key
+order are immaterial; code and message strings are fixed.
+
+| Condition | HTTP status | JSON body |
+| --- | --- | --- |
+| UID missing, UID not the operator UID, pane/agent ancestry or mesh-edge caller | 403 | `{"error":{"code":"operator_only","message":"Local operator required"}}` |
+| PID/start-time evidence missing, exited peer or changed process identity | 403 | `{"error":{"code":"peer_process_changed","message":"Peer process identity unavailable or changed"}}` |
+| No pre-auth admission capacity | 503 | `{"error":{"code":"preauth_capacity","message":"Pre-authentication capacity exhausted"}}` |
+
+Capacity can refuse before identity checks; otherwise check the UID/ancestry
+rule before process evidence, so a caller violating both receives
+`operator_only`. Reuse the typed-body shape of `web::gui::refusal`
+(`src/web/gui.rs`); do not emit a bare status or HTML fallback. ADR-0038 §6's
+native bridge **must map these status/code pairs** into its visible bridge
+admission failure/reconnect behavior; that mapping belongs in the companion
+shell amendment, not in a new server frame. It must not treat a refused HTTP
+upgrade as 4401/4403 or forward the HTTP body as a WS message.
+
+Kernel evidence is **additional to**, never a replacement for, bearer auth.
+Mint over `flock.sock`, then send the existing `hello` with that bearer; this
+is the **only** session admission path. A kernel-authorized but tokenless,
+invalid-token, expired-token or revoked-token hello receives the existing
+4401 without welcome. File credentials, if used locally, still require both
+LocalOperator and their own current scopes; local transport adds no scopes.
+Recheck authority at registration and preserve §5's command-time checks.
+No Origin, webview claim, command parameter or UID can mint a session implicitly.
+
+**App-session PID binding and reuse.** Bind each mint to its kernel-attested
+process instance, not merely its UID, deterministic operator principal or
+per-mint name. A UDS hello must have the minting peer PID **and birth**.
+A mismatched process is refused with the registered `peer_process_changed`
+(close 4401 with that code as the close reason, no new JSON frame or welcome).
+The native process that mints must therefore also own the bridge connection;
+a webview or helper with another PID cannot use its token. TCP cannot prove
+this binding, so its app-session hello refusal is exactly **close 4401 with
+reason `peer_process_changed`**, without welcome or a new JSON frame. This
+reuses the registered identity-proof refusal because TCP lacks the required
+peer-process proof, rather than inventing another transport error code or
+claiming the bearer itself expired. ADR-0038 §6 must mirror that exact reason
+string; it is not `operator_only`, `auth_revoked` or an implementation-chosen
+message. The browser/file-token path remains available.
+
+The ordering guarantee is stronger than waiting for an asynchronous callback:
+arm the per-mint exit watch before validating the accepted process identity,
+recheck birth after arming, and only then publish the bearer. On every hello,
+under the admission/revocation fence, verify the token's live exit watch and
+peer instance **before registering or sending welcome**. An already-ready
+exit must invalidate admission even if the owner has not yet serviced its
+notification. Exit retirement and session registration share that fence:
+a registration that linearizes first is included in revocation fanout; an
+exit that linearizes first prevents registration. A reused numeric PID can
+never revive the old watch, bearer or token-store entry. Exit, expiry,
+restart and handoff retain the existing 4403 fanout and the triggering
+`auth_revoked` command acknowledgement-before-close ordering. Missing watch
+proof fails closed; watch/store I/O failure remains 1001 under §5a, not
+fabricated evidence of revocation. See
+`src/structured/permissions/auth/tokens/app_sessions.rs` and
+`src/platform/process_exit.rs` for the existing per-mint watch/admission owner.
+
+**Budgets and isolation.** No TCP tuple-to-UID lookup, per-UID table or
+unknown-UID bucket is used. TCP browser admissions share one pre-auth budget.
+UDS admissions have their own bounded HTTP/hello reservations and consume
+**none** of that TCP pre-auth budget. Preserve these explicit backstops:
+
+| Resource | Bound and ownership |
+| --- | --- |
+| Incomplete HTTP connections | 32 per transport listener; TCP and UDS reservations are separate, at most 64 combined. Each has the existing absolute 5 s HTTP admission deadline. |
+| Pending unauthenticated WS hellos | Four per transport listener, at most eight combined; separate TCP/UDS permits. One hello per connection; the existing 5 s hello deadline applies. |
+| Upgraded WS sockets, including pending hello/welcome | 16 server-wide across both transports. This resource backstop is shared; it is not a TCP pre-auth attribution budget. |
+| Registered sockets per credential, including pending welcome | Four, counted across both transports by sealed bearer digest, as decided in #2518. Never key this cap by operator principal or PID. |
+| In-memory app-session credentials | 128 server-wide, retaining the existing store cap, TTL and exit retirement. |
+| Frame, writer and command resources | Existing WS core limits, including 65,536-byte messages and four concurrent first-send commands per socket; no unbounded bridge buffer. |
+
+An old mint's four sockets must not exclude a new mint's four merely because
+the operator principal is stable. There is no extra principal-wide cap;
+the global 16-socket backstop still applies. Refusing a new reservation must
+not evict authenticated sockets or leak a permit. Before upgrade, exhaustion
+is typed `preauth_capacity`/HTTP 503; after upgrade use existing 1001 capacity
+semantics. This amendment does not reinstate #2500's proposed ten-failures
+window or claim per-UID browser isolation. Same-UID processes outside the
+pane ancestry can still compete for local unauthenticated slots; #1177's
+residual process-isolation boundary remains explicit.
+
+**Implementation tests: each must fail first.** These are acceptance tests
+for the implementation PR, not claims that this docs-only PR adds a listener.
+Use real Unix sockets and child processes for credential/exit checks, an
+injected monotonic clock for deadlines, and bounded observable barriers rather
+than sleeps or ambient process scans.
+
+1. On the real sibling listener, perform HTTP/1.1 upgrade and drive the existing
+   client hello/subscription/command fixtures unchanged through JSON text
+   frames. Verify all §5a close-code mappings, including 4401/4403/1001, and
+   reject extra paths. Existing JSON-line requests and subscriptions on
+   `flock.sock` must still work without a discriminator or framing change.
+   Assert mode 0600 and the same parent directory/permissions as `flock.sock`.
+   A proved-stale operator-owned socket is replaced; a live listener, foreign
+   socket, non-socket, symlink or uncertain stale probe is refused without
+   unlinking it. Replace the bound socket's inode before cleanup and prove
+   the replacement survives.
+2. A LocalOperator with a valid bearer gets welcome. Tokenless and wrong-token
+   hellos do not. A real pane-descended caller with a valid stolen bearer,
+   another UID, **UID missing**, PID missing, start time missing, an exited
+   peer, and a mesh caller each fail before registration. Assert the exact
+   pre-upgrade HTTP status, content type, cache policy and JSON body above,
+   including refusal precedence. None yields a 101 or WS frame. Spoofed
+   headers do not help; the UID-missing case must fail with the current
+   helper's permissive `is_none_or` rule substituted.
+3. Child A mints and bridges successfully; child B using A's bearer is refused
+   with `peer_process_changed`/4401. Reusing A's PID in injected peer facts
+   after its real exit never admits the old token. Gate the exit notification
+   consumer to prove that a ready exit still prevents welcome; race exit with
+   registration to prove that every admitted socket is in revocation fanout.
+4. Exit and expiry revoke every socket of that credential, without revoking a
+   sibling mint. Restart/handoff reject old bearers. A command discovering
+   revocation gets its `auth_revoked` acknowledgement before 4403. PID/birth
+   mismatch and watch I/O failure exercise their distinct refusal/1001 paths.
+5. Fill TCP's pre-auth budget and still admit an authorized UDS hello, and
+   vice versa, with authenticated sessions alive. Exercise each HTTP, hello,
+   global upgraded and store limit independently; verify permit release on
+   every refused or interrupted admission. A slow header/absent hello must
+   terminate at its deadline without keeping a slot forever. The exhausted
+   pre-auth path must return the exact 503/`preauth_capacity` body above.
+6. Keep four ping-answering sockets on one credential and four on a renewed
+   mint with the same principal. Refuse each fifth with existing capacity
+   behavior, while other sockets keep working. Across both transports a file
+   credential still has only four slots; the 17th total upgraded socket fails.
+7. TCP refuses an app-session bearer with exactly close 4401 and reason
+   `peer_process_changed`, without welcome or another frame. The explicit remote
+   browser/file-token route still admits #2505's exact captured shell Origin
+   pair only on `/v1/ws`; exchange, duplicate-header, lookalike-Origin and
+   `null` refusals remain unchanged. A shell-Origin claim on UDS never replaces
+   LocalOperator or bearer proof. No unsupported-platform failure silently
+   redirects the local bridge onto TCP.
+
+### Amendment: Recipient tool-inbox projection (#2363)
+
+The internal projection uses the same admitted MessageKey, body and native
+agent/session binding. It never admits another input, writes stdin, changes a
+custody outcome or renews a reply deadline. Its first harness-delivery observation
+starts a persisted read window. The caller supplies its retention policy;
+#2452 introduces `msg.inbox_retention_ms` (default 24 hours) with its actual
+harness-delivery consumer.
+Idle sweeps and non-consuming reads project logical time without writing the
+clock or opening a write transaction; only acknowledgements persist changes.
+Delivery replay, custody settlement and restart cannot renew that window. Queue
+journal checkpoint/pruning cannot delete this independently retained projection.
+Unread projected bodies pin custody storage until read or expiry acknowledgement;
+normal byte quotas still charge the retained body. Sweep/read acknowledges expired
+entries once and emits the existing `dropped_undeliverable` event; mixed bulk reads
+return live entries once. There is no selector or partial-error envelope. Invalid
+persisted envelopes are skipped, logged and preserved, without consuming them.
+This foundation adds no public read surface: #2452 owns lease/caller resolution,
+queue-delivery binding and CLI/socket/MCP wiring. It must supply actual harness
+delivery, not custody admission, and decode payloads before consumption. Existing
+queue snapshots and custody labels are not backfilled as fresh delivery. Existing
+custody expiry cannot restore an already deleted body or extend reply recovery.
+
+The internal queue binding (#2452 Part A) freezes `msg.inbox_retention_ms` at
+admission and stamps `native_inbox_until` only on the harness `started` event,
+in the same durable queue replacement as `delivered`. The deadline uses custody's
+pause-aware logical clock. The worker projects this explicit marker after the
+append and on reopening, before re-holding unresolved turns. Reopening preserves
+the original deadline; older items without the marker are not backfilled. Deleted
+custody payloads are not restored. A projection failure reports
+`mail_store_unavailable` and fences that owner until storage repair and restart;
+the committed marker remains available for recovery. All this I/O stays on the
+owning worker. Tool reads decode the payload before acknowledging it and preserve
+malformed raw data. Conditional acknowledgement winners alone receive live or
+expired entries, including when independent database connections read concurrently.
+Socket, CLI and MCP caller binding remains #2452 Part B.
+
+Part B of #2452 binds socket `msg.list`/`msg.read`, CLI and MCP to the current
+attested agent/session. Omitting a target selects structured self, preserving the
+operator global list. Native names use the directory's ambiguity refusal; targets
+cannot grant inbox ownership (`inbox_not_owner`, retry `never`). Invalid or revoked
+leases uniformly refuse as `not_authorized` before target resolution. The CLI
+reference's messaging and MCP tool sections document the shared caller contract.
+
+### Amendment: Welcome capability grants (#2461)
+
+Clarification of §5's protocol gating and §6's operation advertisement:
+`welcome.capabilities` is the authenticated token's exact granted scopes, using
+`api::client_tokens::Scope` wire spellings in enum order: `read`, `send`,
+`answer`, `operate`. Missing scopes are omitted; `operate` implies no other
+scope. A client whose `hello.protocol` exceeds `WIRE_JSON_VERSION` receives
+only `read` when explicitly granted, or an empty array otherwise. It receives
+no command capability.
+
+The welcome is an advisory snapshot, not an authorization lease. Every command
+and subscription still checks current authority at admission, including scope
+changes and revocation after the welcome. Browser command holding according to
+this advertisement is tracked separately in [#2464](https://github.com/gerchowl/flock/issues/2464).
+
+### Pathname listener ownership (#2531)
+
+`SocketOwner::acquire` takes a nonblocking exclusive `flock` on a permanent
+sibling `<socket>.lock` before bind or stale-path reclamation. This applies to
+`flock.sock`, the terminal client socket, and the UDS WebSocket listener when
+introduced. The lock file is operator-owned, regular, single-link, mode `0600`,
+opened with `O_CLOEXEC | O_NOFOLLOW`; it is never unlinked. Newly created
+files receive descriptor-based mode `0600` repair after open, independently of
+the inherited umask. Existing lock files are never permission-repaired; they
+must pass the original ownership, link-count, mode and pathname validation.
+The containing directory must exclude entry replacement by other users.
+Contention reports busy and never removes a socket, even with a full accept
+backlog. After acquiring the lock, `SocketOwner::prepare` also makes a nonblocking
+connection probe: a **successful** connect means busy, preserving an older listener
+that has no lock.
+A failed probe never proves staleness; the held lock excludes live owners only
+when those owners participate in this protocol. An old-build listener with a
+full backlog can fail this probe and its pathname can still be reclaimed. This
+residual rollout limitation is stated in the legacy-listener busy diagnostic;
+ownership locks cannot retroactively protect older builds. Once ownership is acquired,
+`SocketOwner::prepare` checks socket type, owner, and device/inode before removing
+an abandoned pathname. Symlinks, foreign ownership, and replacement entries
+are refused rather than followed or removed.
+
+The lock follows the **open file description**, including across SCM_RIGHTS.
+`perform_live_handoff` sends the API and terminal ownership descriptors after
+PTYs and the optional TCP listener, under handoff manifest version 3. Older
+importers refuse that version before transfer. `run_handoff_import_server`
+adopts both descriptors before acknowledging restoration or rebinding the
+public paths; the exporter retains its descriptors for rollback. Public Unix
+listeners are rebound under those same locks; TCP retains its listening fd.
+`restore_public_sockets_after_failed_handoff` also reuses the retained locks.
+There is no unlocked interval during either transition. This changes only the
+internal handoff manifest, not the mesh protocol.
+
+Cleanup removes only the recorded socket inode while still holding ownership.
+The final descriptor close releases the lock on shutdown or process death.
+There is deliberately no explicit `LOCK_UN`: that would release the shared lock
+while an importing process still owns it. Ownership guarantees apply to
+listeners implementing this protocol; older releases do not hold these locks.
+
+
+#### Unix HTTP listener foundation (#2500 PR3a)
+
+`local_listener::Listener` reuses `client_listener::serve` with a Unix stream
+and kernel-captured peer credentials. `prepare` does not accept HTTP requests;
+`activate` is explicit, and `stop` cancels the owned acceptor and HTTP tasks.
+The containing directory must be real, operator-owned and not writable by
+other users; its ancestor chain is trusted as for the API namespace. The
+socket shares the API's mode `0600` constant and the ownership protocol above.
+`owner`, `SocketOwner::duplicate` and `SocketOwner::take` retain the same locked
+open description through descriptor transfer, rebind and rollback. `unlink`
+and destruction compare the recorded inode, so an old exporter cannot unlink
+an importer's replacement socket. This slice adds no production call to these
+listener methods and changes neither reachable endpoints nor TCP authentication.
+The following activation slice owns the server handoff manifest extension,
+LocalOperator admission, independent pre-auth pools and the atomic TCP
+app-session refusal.

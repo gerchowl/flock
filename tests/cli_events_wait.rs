@@ -9,7 +9,7 @@
 mod support;
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::{io::AsRawFd, net::UnixListener};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -22,7 +22,7 @@ fn wait_against(args: &[&str], replies: Vec<Value>) -> (std::process::Output, Ve
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("f1029-{}-{nanos}", std::process::id()));
+    let dir = std::path::Path::new("/tmp").join(format!("f1029-{}-{nanos}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
     let socket = dir.join("api.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -30,7 +30,20 @@ fn wait_against(args: &[&str], replies: Vec<Value>) -> (std::process::Output, Ve
         let mut afters = Vec::new();
         let mut replies = replies.into_iter().peekable();
         while replies.peek().is_some() {
+            let mut ready = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut ready, 1, 10_000) },
+                1,
+                "CLI did not send the next scripted request"
+            );
             let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
             let mut line = String::new();
             BufReader::new(stream.try_clone().unwrap())
                 .read_line(&mut line)
@@ -49,13 +62,27 @@ fn wait_against(args: &[&str], replies: Vec<Value>) -> (std::process::Output, Ve
         }
         afters
     });
-    let output = Command::new(env!("CARGO_BIN_EXE_flk"))
+    let child = Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(args)
         .env("FLOCK_SOCKET_PATH", &socket)
         .env_remove("FLOCK_CLIENT_SOCKET_PATH")
         .env_remove("FLOCK_SESSION")
         .env_remove("FLOCK_ENV")
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (done, output) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = done.send(child.wait_with_output());
+    });
+    let output = output
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .unwrap_or_else(|_| {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            panic!("owned CLI child did not finish the scripted exchange");
+        })
         .unwrap();
     let afters = server.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -90,4 +117,27 @@ fn a_gap_during_a_wait_is_reported_and_skipped() {
     let printed: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(printed, event);
     assert_eq!(afters, [json!(u64::MAX), json!(1), json!(5)]);
+}
+
+#[test]
+fn event_read_keeps_explicit_and_default_durable_cursors() {
+    for (args, cursor) in [
+        (vec!["events", "read", "--after", "7", "--json"], 7),
+        (vec!["events", "read", "--json"], 0),
+    ] {
+        let event = json!({"seq": 8, "event":"pane_exited", "data":{"pane_id":"w1:p1"}});
+        let reply = json!({"events":[event], "next_after":8});
+        let (output, afters) = wait_against(&args, vec![json!({"result":reply})]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(afters, [json!(cursor)]);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+            reply
+        );
+    }
 }

@@ -4,4 +4,4 @@
  * Decision-specific refusal vocabulary; S6 registers these before serving them.
  * These failures have retry class never and use the existing ack error envelope.
  */
-export type AgentDecideErrorCode = "permission_request_unknown" | "permission_request_closed" | "not_authorized";
+export type AgentDecideErrorCode = "permission_request_unknown" | "permission_request_closed" | "not_authorized" | "invalid_params";

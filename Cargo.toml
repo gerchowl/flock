@@ -31,13 +31,17 @@ dbg_macro = "deny"
 # `flock web`: xterm.js <-> flock PTY bridge (gerchowl/flock#131). Kept behind a
 # feature so axum/futures-util/rust-embed stay out of a default `flock` build.
 # tokio/net + tokio/io-util are the runtime drivers axum needs for `axum::serve`.
-web = ["dep:anyhow", "dep:axum", "dep:futures-util", "dep:rust-embed", "tokio/net", "tokio/io-util"]
+web = ["dep:anyhow", "dep:axum", "dep:hyper", "dep:hyper-util", "dep:futures-util", "dep:rust-embed", "tokio/net", "tokio/io-util"]
 
 ts = ["dep:ts-rs"]
 
 [dependencies]
 anyhow = { version = "1", optional = true }
 axum = { version = "0.8", features = ["ws"], optional = true }
+# Own HTTP/1 connection tasks and configure header/half-close policy for the mounted client.
+# Both packages are already transitive dependencies of axum; no new package versions.
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "service"], optional = true }
 base64 = "0.23.0"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
@@ -62,6 +66,8 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 # Detect unknown config fields using the deserializer, including aliases and dynamic maps.
 serde_ignored = "0.1"
+# Report structural config error paths without value-bearing deserializer messages.
+serde_path_to_error = "0.1"
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.11"
 ts-rs = { version = "=12.0.1", optional = true, features = ["serde-json-impl"] }
@@ -70,6 +76,8 @@ toml = "1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 unicode-width = "0.2"
+# Reuse termwiz's locked Unicode 17 categories for identity-format validation.
+finl_unicode = "1.4"
 sysinfo = "0.39.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 toml_edit = "0.25.15"
@@ -83,8 +91,8 @@ tokio = { version = "1", features = ["net", "io-util", "process"] }
 # Count SQLite VM operations in store complexity regression tests.
 rusqlite = { version = "0.40.2", features = ["hooks"] }
 
-# Parse adapter declarations for the optional-field coverage drift test.
-syn = { version = "2", features = ["full"] }
+# Parse adapter declarations and CLI match patterns for coverage drift tests.
+syn = { version = "2", features = ["full", "visit"] }
 
 [build-dependencies]
 # Use SDK declarations for Darwin kinfo_proc rather than copying its ABI.

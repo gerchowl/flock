@@ -763,6 +763,8 @@ fn lease_time_clears_stale_assignment_after_route_pass() {
     // hub can still lease a reply or deliver a late withdrawal advert after
     // the first hub's route disappears. Route absence is not gossip completion.
     // The chain isolates lease-time validation from that independent traffic.
+    // The fixed-clock store diamond test replays legitimate reassignment and
+    // shows why lifetime offer counts cannot identify a stale lease (#1754).
     let c = Conversation::to(fleet::LAPTOP_HUB_SPOKE, "nodec");
     c.send();
     fleet::wait_until("request imported before gating leases", DEADLINE, || {
@@ -798,6 +800,17 @@ fn lease_time_clears_stale_assignment_after_route_pass() {
     c.fleet.wait_route("nodec", "nodea", false);
     wait_unrouted_reply(spoke, correlation);
     let generation = api(spoke, "peers.enrollment", json!({}))["route_generation"].clone();
+    let before_stale_poll: i64 = db(spoke)
+        .query_row(
+            "SELECT collect_attempts FROM envelopes WHERE correlation=?1",
+            [correlation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        before_stale_poll, initial.1,
+        "the sole collector was gated throughout the withdrawal"
+    );
     assert_eq!(db(spoke).execute(
         "UPDATE envelopes SET next_hop=?1,retry_at=0 WHERE correlation=?2 AND state='held' AND next_hop=''",
         rusqlite::params![fleet::node_id(c.fleet.node("nodeb")), correlation],
@@ -815,7 +828,10 @@ fn lease_time_clears_stale_assignment_after_route_pass() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(attempts, 0, "stale row must never be leased");
+    assert_eq!(
+        attempts, before_stale_poll,
+        "stale-hop rejection must not add an offer"
+    );
     assert_eq!(
         scalar(
             c.fleet.node("nodeb"),
@@ -1929,6 +1945,45 @@ fn store_fault_keeps_panes_and_unknown_refusals_stay_queued() {
     due(origin);
     c.read_question();
     once(owner, "question");
+}
+
+#[test]
+fn custody_completion_peer_message_not_found_retains_custody() {
+    let c = Conversation::new(DIRECT);
+    let origin = c.fleet.node("nodea");
+    cut(&c.fleet, "nodea", "nodeb");
+    let path = c.fleet.base.join("bin/ssh");
+    let source = fs::read_to_string(&path).unwrap();
+    assert!(source.contains("\"code\": \"held_by_test\""));
+    fs::write(
+        path,
+        source.replace(
+            "\"code\": \"held_by_test\"",
+            "\"code\": \"message_not_found\"",
+        ),
+    )
+    .unwrap();
+    let capture = c.fleet.base.join("capture-delivery-nodea-nodeb");
+    fs::write(&capture, "").unwrap();
+    assert_eq!(c.send()["state"], "queued");
+    reconnect(&c.fleet, "nodea", "nodeb");
+    due(origin);
+    fleet::wait_until("lookup-miss response processed", DEADLINE, || {
+        let captured = fs::read(&capture).ok()?;
+        serde_json::from_slice::<Value>(&captured).ok()?;
+        let status = api(origin, "msg.status", json!({"correlation_id":"question"}));
+        (status["state"] == "refused" || scalar(origin,
+            "SELECT count(*) FROM envelopes WHERE state='custody' AND retry_at>0 AND lease_until<=retry_at") > 0)
+            .then_some(())
+    });
+    assert_eq!(
+        api(origin, "msg.status", json!({"correlation_id":"question"}))["state"],
+        "queued"
+    );
+    fs::remove_file(capture).unwrap();
+    due(origin);
+    c.read_question();
+    once(c.fleet.node("nodeb"), "question");
 }
 
 #[test]

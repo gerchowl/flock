@@ -1616,7 +1616,7 @@ fn removed_config_keys_warn_on_cold_start_and_live_reload() {
 }
 
 #[test]
-fn config_check_json_and_cli_warnings_name_source_keys() {
+fn config_check_json_and_cli_warnings_use_safe_schema_keys() {
     let directory = SocketDir::reserve("hlh");
     let base = directory.path().to_path_buf();
     let config_home = base.join("config");
@@ -1641,15 +1641,14 @@ fn config_check_json_and_cli_warnings_name_source_keys() {
     assert_eq!(json["exit_code"], 1);
     assert_eq!(json["diagnostics"].as_array().unwrap().len(), 2, "{json}");
     assert!(
-        json.to_string()
-            .contains(&format!("{}:5: msg.uplink_timeout_secs", config.display())),
+        json.to_string().contains(
+            "removed_config_key; key=msg.uplink_timeout_secs; source=base file; at line 5"
+        ),
         "{json}"
     );
     assert!(
-        json.to_string().contains(&format!(
-            "{}:6: unknown msg.future_setting",
-            config.display()
-        )),
+        json.to_string()
+            .contains("unknown_config_key; key=msg; source=base file; at 6:1"),
         "{json}"
     );
     let text = run(&["config", "check"]);
@@ -2307,6 +2306,7 @@ fn handoff_import_stalled_peer_exits_within_deadline() {
     command
         .args(["server", "--handoff-import"])
         .arg(&socket)
+        // Compatibility with an exporter that was already running before #301.
         .arg("stalled-peer-token")
         .envs(support::environment::isolated_env(
             &base.join("config"),
@@ -2366,7 +2366,7 @@ fn handoff_ready_importer_survives_commit_after_startup_deadline() {
     command
         .args(["server", "--handoff-import"])
         .arg(&socket)
-        .arg("late-commit-token")
+        .env("FLOCK_HANDOFF_TOKEN", "late-commit-token")
         .envs(support::environment::isolated_env(
             &base.join("config"),
             &base.join("runtime"),
@@ -2566,14 +2566,17 @@ fn assert_failed_fd_transfer_keeps_old_server(close_reader: bool) {
         fs::write(
             &importer,
             r#"import json
+import os
 from pathlib import Path
 import socket
 import sys
 
+assert len(sys.argv) == 4, "handoff credential must use the environment"
+token = os.environ.pop("FLOCK_HANDOFF_TOKEN")
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
     peer.settimeout(30)
     peer.connect(sys.argv[3])
-    peer.sendall((sys.argv[4] + "\n").encode())
+    peer.sendall((token + "\n").encode())
     manifest = json.loads(peer.makefile("rb").readline())
     assert len(manifest["panes"]) == 150, manifest
     peer.shutdown(socket.SHUT_RD)

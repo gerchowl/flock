@@ -210,9 +210,13 @@ fn highest_seq_best_effort(path: &Path) -> u64 {
 /// live handoff keeps the log instead of quarantining it. A KNOWN kind that
 /// fails to parse is real corruption and is not skipped.
 fn unknown_kind_seq(line: &str) -> Option<u64> {
+    unknown_kind_seq_as::<EventKind>(line)
+}
+// The reader's vocabulary is explicit so compatibility witnesses use this fallback.
+fn unknown_kind_seq_as<K: serde::de::DeserializeOwned>(line: &str) -> Option<u64> {
     let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
     let kind = value.pointer("/envelope/event")?;
-    if !kind.is_string() || serde_json::from_value::<EventKind>(kind.clone()).is_ok() {
+    if !kind.is_string() || serde_json::from_value::<K>(kind.clone()).is_ok() {
         return None;
     }
     value.get("seq")?.as_u64()
@@ -240,7 +244,15 @@ fn read_log_file(path: &Path) -> Result<(Vec<PersistedEvent>, u64), String> {
         }
         let complete = line.ends_with('\n');
         match serde_json::from_str::<PersistedEvent>(line.trim_end()) {
-            Ok(event) => events.push(event),
+            Ok(event) => {
+                if matches!(&event.envelope.data, crate::api::schema::EventData::QueueItemState(fact) if !fact.known())
+                {
+                    tracing::warn!(seq = event.seq, "skipping unknown queue lifecycle state");
+                    skipped_seq = skipped_seq.max(event.seq);
+                } else {
+                    events.push(event);
+                }
+            }
             Err(err) if !complete => {
                 // Torn tail from a crash mid-write: drop it, keep the prefix.
                 crate::logging::event_log_torn_tail(&path.display().to_string());
@@ -473,7 +485,49 @@ impl EventHub {
         }
     }
 
-    pub fn events_after(&self, sequence: u64) -> Vec<(u64, EventEnvelope)> {
+    /// A complete continuation from the ring, or a typed refusal requiring resync.
+    /// Checking retention and capturing events share one lock.
+    pub fn events_after(
+        &self,
+        sequence: u64,
+    ) -> Result<Vec<(u64, EventEnvelope)>, super::schema::ErrorBody> {
+        use super::{
+            error_code::ErrorCode,
+            schema::{ErrorBody, ErrorData},
+        };
+        let state = self.inner.lock().map_err(|_| ErrorBody {
+            data: None,
+            code: ErrorCode::InternalError.as_str().into(),
+            message: "event ring is unavailable".into(),
+        })?;
+        let floor = state
+            .events
+            .first()
+            .map_or(state.next_sequence, |(seq, _)| seq.saturating_sub(1));
+        let oldest = floor.saturating_add(1);
+        if sequence < floor {
+            return Err(ErrorBody {
+                code: ErrorCode::EventsLost.as_str().into(),
+                message: "Events were lost. Resync with per-verb reads (workspace.list, pane.list, agent.list, msg.list); use events.read for retained durable history.".into(),
+                data: Some(Box::new(ErrorData {
+                    extra: [("requested_sequence".into(), sequence.into()),
+                        ("oldest_available_sequence".into(), oldest.into()),
+                        ("current_sequence".into(), state.next_sequence.into())].into_iter().collect(),
+                    ..Default::default()
+                })),
+            });
+        }
+        Ok(state
+            .events
+            .iter()
+            .filter(|(seq, _)| *seq > sequence)
+            .cloned()
+            .collect())
+    }
+
+    /// A bounded state-fold snapshot, without a completeness guarantee.
+    /// Continuation/subscription readers must use [`Self::events_after`].
+    pub fn ring_snapshot_after(&self, sequence: u64) -> Vec<(u64, EventEnvelope)> {
         let Ok(state) = self.inner.lock() else {
             return Vec::new();
         };
@@ -483,28 +537,6 @@ impl EventHub {
             .filter(|(event_sequence, _)| *event_sequence > sequence)
             .cloned()
             .collect()
-    }
-
-    /// The ring's events with `seq > sequence`, and the cursor a subscriber
-    /// that fell behind the ring skips to (#1030, ADR-0028 §3). The ring holds
-    /// everything newer than its oldest entry, so a cursor below that has
-    /// lost events, and the stream says so instead of dropping them silently.
-    pub(crate) fn events_since(&self, sequence: u64) -> (Option<u64>, Vec<(u64, EventEnvelope)>) {
-        let Ok(state) = self.inner.lock() else {
-            return (None, Vec::new());
-        };
-        let floor = state
-            .events
-            .first()
-            .map_or(state.next_sequence, |(first, _)| first.saturating_sub(1));
-        let lagged = (sequence < floor).then_some(floor);
-        let events = state
-            .events
-            .iter()
-            .filter(|(event_sequence, _)| *event_sequence > sequence.max(floor))
-            .cloned()
-            .collect();
-        (lagged, events)
     }
 
     /// Make the next persisted push rotate the active file, the way a full
@@ -738,7 +770,7 @@ mod tests {
     use crate::api::schema::EventData;
     use std::sync::{Arc, Mutex};
 
-    fn temp_log(name: &str) -> PathBuf {
+    pub(super) fn temp_log(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
@@ -760,6 +792,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ring_overflow_refuses_an_incomplete_event_read() {
+        let hub = EventHub::default();
+        hub.set_ring_cap(2);
+        for label in ["one", "two", "three"] {
+            hub.push(workspace_event(label));
+        }
+        let read = format!("{:?}", hub.events_after(0));
+        assert!(read.starts_with("Err("), "{read}");
+        let error = hub.events_after(0).unwrap_err();
+        assert_eq!(error.code, "events_lost");
+        assert_eq!(error.data.unwrap().extra["oldest_available_sequence"], 2);
+        assert_eq!(
+            hub.events_after(1)
+                .unwrap()
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(hub.events_after(3).unwrap().is_empty());
+    }
+
     fn output_event() -> EventEnvelope {
         EventEnvelope {
             event: EventKind::PaneOutputChanged,
@@ -771,7 +826,7 @@ mod tests {
         }
     }
 
-    fn cleanup(path: &Path) {
+    pub(super) fn cleanup(path: &Path) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
@@ -837,6 +892,36 @@ mod tests {
             assert_eq!(last.len(), 1, "exactly the new event after the max");
             cleanup(&path);
         }
+    }
+
+    #[test]
+    fn grant_revocation_is_persisted_and_a_newer_kind_is_skipped() {
+        use crate::api::schema::EventData;
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("events.jsonl");
+        let hub = EventHub::with_persistence(path.clone());
+        assert!(EventKind::StructuredGrantRevoked.is_persisted());
+        hub.push(EventEnvelope {
+            event: EventKind::StructuredGrantRevoked,
+            data: EventData::StructuredGrantRevoked {
+                agent_id: "fixture-agent".into(),
+                generation: 1,
+                request_id: "request-one".into(),
+                request_seq: 2,
+                principal: "operator:pid:1".into(),
+            },
+        });
+        drop(hub);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{}", serde_json::json!({"seq":2,"ts_ms":1,"envelope":{"event":"future_grant_kind","data":{"type":"future_grant_kind"}}})).unwrap();
+        drop(file);
+        let restarted = EventHub::with_persistence(path);
+        let records = restarted.persisted_events_after(0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].2.event, EventKind::StructuredGrantRevoked);
     }
 
     /// ADR-0028 §3a: a kind from a newer release is skipped, not read as
@@ -1380,7 +1465,7 @@ mod tests {
         );
         assert_eq!(restarted.current_sequence(), 2, "torn tail dropped");
         assert_eq!(
-            restarted.events_after(0).len(),
+            restarted.ring_snapshot_after(0).len(),
             2,
             "ring is seeded from disk at boot"
         );
@@ -1499,7 +1584,7 @@ mod tests {
         let hub = EventHub::with_persistence(path.clone());
         hub.push(output_event());
         hub.push(workspace_event("w1"));
-        assert_eq!(hub.events_after(0).len(), 2, "ring sees both");
+        assert_eq!(hub.ring_snapshot_after(0).len(), 2, "ring sees both");
         let persisted = hub.persisted_events_after(0);
         assert_eq!(persisted.len(), 1, "disk sees only the persisted kind");
         assert_eq!(persisted[0].0, 2, "persisted event keeps its ring seq");
@@ -1656,7 +1741,7 @@ mod tests {
                         .iter()
                         .map(|(seq, _, _)| *seq)
                         .chain(
-                            hub.events_after(0)
+                            hub.ring_snapshot_after(0)
                                 .iter()
                                 .filter(|(_, e)| e.event.is_persisted())
                                 .map(|(seq, _)| *seq),
@@ -1743,5 +1828,82 @@ mod tests {
         let restarted = EventHub::with_persistence(path.clone());
         assert_eq!(restarted.current_sequence(), 4);
         cleanup(&path);
+    }
+}
+
+#[cfg(test)]
+mod queue_state_tests {
+    use super::*;
+    use crate::api::schema::EventData;
+    use serde_json::json;
+    fn event(to: &str) -> EventEnvelope {
+        serde_json::from_value(json!({"event":"queue_item_state", "data":{
+            "type":"queue_item_state", "agent":"queue-fixture", "item_id":"item-fixture",
+            "producer":"human", "from":"queued", "to":to,
+            "stream":"queue/queue-fixture", "stream_seq":7
+        }}))
+        .unwrap()
+    }
+    #[test]
+    fn queue_global_fact_has_the_shape_an_old_reader_skips() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldKind {
+            WorkspaceCreated,
+        }
+        let fact = event("delivered");
+        assert!(fact.event.is_persisted());
+        let line = serde_json::to_string(&PersistedEvent {
+            seq: 11,
+            ts_ms: 1,
+            envelope: fact.clone(),
+        })
+        .unwrap();
+        assert_eq!(unknown_kind_seq_as::<OldKind>(&line), Some(11));
+        assert_eq!(unknown_kind_seq(&line), None);
+        assert_eq!(
+            serde_json::from_str::<PersistedEvent>(&line)
+                .unwrap()
+                .envelope,
+            fact
+        );
+    }
+    #[test]
+    fn queue_global_unknown_state_is_skipped_without_losing_cursors_or_other_events() {
+        let path = super::tests::temp_log("queue-unknown-state");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(event("delivered"));
+        drop(hub);
+        let mut line = serde_json::to_value(PersistedEvent {
+            seq: 2,
+            ts_ms: 1,
+            envelope: event("done"),
+        })
+        .unwrap();
+        line["envelope"]["data"]["to"] = json!("future_state");
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{line}"
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let hub = EventHub::with_persistence(path.clone());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        hub.push(event("done"));
+        let events = hub.persisted_events_after(0);
+        assert_eq!(
+            events.iter().map(|(seq, _, _)| *seq).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert!(events
+            .iter()
+            .all(|(_, _, e)| matches!(&e.data, EventData::QueueItemState(f) if f.known())));
+        hub.push(event("held"));
+        assert_eq!(hub.current_sequence(), 4);
+        assert!(!path.with_file_name("event-log.corrupt.jsonl").exists());
+        super::tests::cleanup(&path);
     }
 }

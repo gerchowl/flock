@@ -324,6 +324,22 @@ impl TerminalRuntime {
         self.0.snapshot_history()
     }
 
+    /// Capture or extend content identity under the parser lock (ADR-0040 §1).
+    pub fn pin_selection(
+        &self,
+        selection: &mut crate::selection::Selection,
+        drag: Option<(u16, u16, Rect)>,
+    ) {
+        self.0.pin_selection(selection, drag);
+    }
+    /// Resolve current endpoint coordinates, refusing discarded content.
+    pub fn resolve_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<crate::selection::Selection> {
+        self.0.resolve_selection(selection)
+    }
+
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         self.0.extract_selection(selection)
     }
@@ -615,6 +631,7 @@ mod write_ack_tests {
             .insert(pane, runtime);
         let (respond_to, response) = reply::channel();
         api_tx.send(crate::api::ApiRequestMessage {
+            scope: None,
             request: serde_json::from_value(serde_json::json!({"id":"native","method":method,"params":{"pane_id":public,"target":public,"text":"é","keys":["Enter"],"raw":true,"write_timeout_ms":200}})).unwrap(),
             respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
         }).unwrap();

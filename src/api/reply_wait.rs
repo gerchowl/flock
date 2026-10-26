@@ -316,7 +316,7 @@ pub(super) fn wait_for_reply(
     // disagree. NOT the durable log: `persisted_events_after` re-reads every
     // log file while holding the hub's lock, and every `emit_event` on the
     // app thread waits on that lock — a retried typo would stall the server.
-    for (_, event) in event_hub.events_after(0) {
+    for (_, event) in event_hub.ring_snapshot_after(0) {
         watch.observe(&event, &correlation_id);
     }
     if let Err(reason) = watch.refresh_mesh(
@@ -404,23 +404,34 @@ pub(super) fn wait_for_reply(
             .min(CONNECTION_POLL_INTERVAL);
         if event_hub.wait_after(cursor, slice) {
             event_woke = true;
-            let fresh = event_hub.events_after(cursor);
-            // More than the ring holds arrived between two wakes: the events
-            // just past the cursor are gone. Re-read what the ring still has
-            // rather than miss an answer among them silently.
-            let gap = fresh
-                .first()
-                .is_some_and(|(sequence, _)| *sequence > cursor + 1);
-            let batch = if gap {
-                event_hub.events_after(0)
-            } else {
-                fresh
+            let batch = match reply_events(event_hub, cursor) {
+                Ok(events) => events,
+                Err(error) => {
+                    crate::logging::msg_wait_reply_completed(&request_id, &correlation_id, "error");
+                    return Ok(Some(encode(&ErrorResponse {
+                        id: request_id,
+                        error,
+                    })));
+                }
             };
             for (sequence, event) in batch {
                 cursor = cursor.max(sequence);
                 watch.observe(&event, &correlation_id);
             }
         }
+    }
+}
+
+// Shared continuation policy for the active socket wait.
+fn reply_events(hub: &EventHub, cursor: u64) -> Result<Vec<(u64, EventEnvelope)>, ErrorBody> {
+    match hub.events_after(cursor) {
+        Ok(events) => Ok(events),
+        // A reply wait folds retained facts into its existing message state.
+        // Losing unrelated events must not discard a retained or future reply.
+        Err(error) if error.code == super::error_code::ErrorCode::EventsLost.as_str() => {
+            Ok(hub.ring_snapshot_after(0))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -476,6 +487,37 @@ mod tests {
                 from_agent: None,
                 held: true,
             },
+        }
+    }
+
+    #[test]
+    fn reply_wait_recovers_a_gap_before_a_retained_or_later_reply() {
+        for retained in [true, false] {
+            let hub = EventHub::default();
+            hub.set_ring_cap(2);
+            let original = queued("q", None, "question");
+            hub.push(original.clone());
+            let mut watch = Watch::default();
+            watch.observe(&original, "q");
+            let mut cursor = hub.current_sequence();
+            for id in ["noise1", "noise2", "noise3"] {
+                hub.push(queued(id, None, "noise"));
+            }
+            if retained {
+                hub.push(held("q", "answer", "body"));
+            }
+            for (seq, event) in reply_events(&hub, cursor).expect("a gap keeps the wait alive") {
+                cursor = seq;
+                watch.observe(&event, "q");
+            }
+            if !retained {
+                assert!(watch.answer.is_none());
+                hub.push(held("q", "answer", "body"));
+                for (_, event) in reply_events(&hub, cursor).unwrap() {
+                    watch.observe(&event, "q");
+                }
+            }
+            assert_eq!(watch.answer.unwrap().into_reply().unwrap().body, "body");
         }
     }
 

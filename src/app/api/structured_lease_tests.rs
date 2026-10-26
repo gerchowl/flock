@@ -40,6 +40,15 @@ const SESSION: &str = "00000000-0000-4000-8000-000000000001";
 
 #[tokio::test]
 async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption() {
+    fake_claude_calls(false).await;
+}
+
+#[tokio::test]
+async fn session_1441_real_mcp_child_is_attested_and_operator_tools_are_refused() {
+    fake_claude_calls(true).await;
+}
+
+async fn fake_claude_calls(mcp: bool) {
     let fixture = runtime::tests::Fixture::for_socket();
     let root = fixture.root.path().to_owned();
     let socket = root.join("api.sock");
@@ -83,7 +92,9 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
                 id: "send".into(),
                 method: Method::MsgSend(MsgSendParams {
                     from_agent: Some("agent_atlas_spoof".into()),
-                    to: MessageTarget::Pane { pane: target },
+                    to: MessageTarget::Pane {
+                        pane: target.clone(),
+                    },
                     body: "fixture message".into(),
                     correlation_id: Some("lease-call".into()),
                     in_reply_to: None,
@@ -94,21 +105,60 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
         .unwrap(),
         0o600,
     );
+    if mcp {
+        fixture.file(
+            "mcp-requests.json",
+            &serde_json::to_vec(&[
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+                serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":"flock_owner_policy_adopt","arguments":{"repo":root}}}),
+                serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{
+                "name":"flock_delegate_list","arguments":{"architect":"self"}}}),
+                serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{
+                "name":"flock_msg_send","arguments":{"from_agent":"agent_atlas_spoof",
+                "to":{"type":"pane","pane":target},"body":"fixture message",
+                "correlation_id":"lease-call","intent":"fyi"}}}),
+            ])
+            .unwrap(),
+            0o600,
+        );
+    }
     let lease = app.session_leases.reserve(AGENT, SESSION, None).unwrap();
-    let profile = fixture.profile("lease-calls", "2.1.296");
+    let profile = fixture.profile(
+        if mcp {
+            "mcp-lease-calls"
+        } else {
+            "lease-calls"
+        },
+        "2.1.296",
+    );
     let location = StreamLocation {
         data_dir: root.clone(),
+        storage: Default::default(),
         agent: AGENT.into(),
         session: SESSION.into(),
     };
     let (ready_tx, ready_rx) = mpsc::channel();
     let (exit_tx, exit_rx) = mpsc::channel();
+    let request_count = if mcp { 2 } else { 3 };
+    let endpoint = if mcp {
+        // The ordinary cargo/nextest all-target build provides the sibling CLI.
+        // Derive it from this test artifact, never PATH or an installed binary.
+        let executable = std::env::current_exe().unwrap();
+        let binary = executable.parent().unwrap().parent().unwrap().join("flk");
+        crate::structured::launch::SessionMcp::new(&binary, &socket)
+            .expect("missing sibling flk binary from cargo/nextest all-target build")
+    } else {
+        fixture.mcp()
+    };
     let worker = std::thread::spawn(move || {
         let result = runtime::run(
             &location.data_dir.clone(),
             profile,
             lease,
             location,
+            endpoint,
             |runtime| ready_tx.send(runtime).unwrap(),
         );
         let _ = exit_tx.send(result);
@@ -126,7 +176,7 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
     app.current_api_peer_birth = None;
     let runtime = &owned.runtime;
     let socket_worker = std::thread::spawn(move || {
-        for _ in 0..3 {
+        for _ in 0..request_count {
             let mut poll = libc::pollfd {
                 fd: listener.as_raw_fd(),
                 events: libc::POLLIN,
@@ -149,6 +199,8 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
                 &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 None,
                 &std::sync::Mutex::default(),
+                &crate::api::client_listener::Health::default(),
+                &Default::default(),
             )
             .unwrap();
         }
@@ -157,11 +209,9 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
         .try_submit(&serde_json::json!({"type":"user"}))
         .unwrap();
     let mut attributed = true;
-    for _ in 0..3 {
-        let msg = tokio::time::timeout(Duration::from_secs(10), app.api_rx.recv())
-            .await
-            .expect("bounded socket dispatch")
-            .expect("request");
+    for _ in 0..request_count {
+        // Scoped authentication probes precede effects on each fresh connection.
+        let msg = super::scoped_mcp_tests::next_effect(&mut app).await;
         let root_pid: u32 = std::fs::read_to_string(root.join("model.pid"))
             .unwrap()
             .parse()
@@ -184,6 +234,7 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
             app.spawn_caller()
         };
         attributed &= app.attested_sender_agent().as_deref() == Some(AGENT);
+        attributed &= !app.caller_is_local_operator();
         attributed &= app
             .admit_spawn(crate::spawn::SpawnVerb::Fork, &caller, None)
             .ok()
@@ -214,17 +265,40 @@ async fn fake_claude_socket_calls_have_agent_identity_and_no_operator_exemption(
         .mailboxes
         .queued_message("lease-call")
         .expect("queued message");
-    assert_eq!(
-        (
-            attributed,
-            responses[0]["error"]["code"].as_str(),
-            responses[1].get("result").is_some(),
-            sent.from_agent.as_deref()
-        ),
-        (true, Some("operator_only"), true, Some(AGENT)),
-        "{responses}"
+    assert!(
+        attributed,
+        "kernel peer must attest the descendant as the leased agent"
     );
-    assert!(responses[2].get("result").is_some(), "{responses}");
+    assert_eq!(sent.from_agent.as_deref(), Some(AGENT));
+    if mcp {
+        assert_eq!(responses[0]["result"]["serverInfo"]["name"], "flock");
+        let tools = responses[1]["result"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool["name"] == "flock_msg_send"));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool["name"] == "flock_owner_policy_adopt"));
+        assert_eq!(
+            responses[2]["error"]["data"]["refusal"], "not_exposed_via_mcp",
+            "{responses}"
+        );
+        assert_eq!(
+            responses[2]["error"]["data"]["exit"],
+            crate::cli::exit::USAGE
+        );
+        assert!(responses[3].get("result").is_some(), "{responses}");
+        assert!(responses[4].get("result").is_some(), "{responses}");
+        assert!(
+            responses[3].get("error").is_none() && responses[4].get("error").is_none(),
+            "{responses}"
+        );
+    } else {
+        assert_eq!(
+            responses[0]["error"]["code"], "operator_only",
+            "{responses}"
+        );
+        assert!(responses[1].get("result").is_some(), "{responses}");
+        assert!(responses[2].get("result").is_some(), "{responses}");
+    }
     assert!(sent.from_pane.is_none());
 }
 
@@ -274,6 +348,7 @@ async fn queued_socket_requests_with_reused_birth_never_become_operator() {
         let peer_birth = Some(birth.wrapping_add(1));
         let (respond_to, response) = mpsc::channel();
         app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
             request: Request {
                 id: "stale".into(),
                 method: Method::OwnerPolicyAdopt(OwnerPolicyParams {
@@ -317,6 +392,7 @@ async fn recovery_parked_requests_preserve_original_peer_birth() {
         },
         Some(pid),
         Some(Some(birth.wrapping_add(1))),
+        None,
         None,
         respond_to,
     );
@@ -507,5 +583,115 @@ async fn self_exclusion_reads_and_self_message_refusals_keep_unproven_candidates
             response["error"]["code"], "self_message_forbidden",
             "{response}"
         );
+    }
+}
+
+#[tokio::test]
+async fn scoped_queued_and_parked_requests_refuse_after_release() {
+    use crate::api::scoped::tests::live_scope;
+    for parked in [false, true] {
+        let (leases, lease, scope, peer) = live_scope();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.session_leases = leases;
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: peer.uid.unwrap(),
+            dedicated: Ok(None).into(),
+        };
+        let request = crate::api::schema::Request {
+            id: "queued-scope".into(),
+            method: crate::api::schema::Method::ServerStop(
+                crate::api::schema::EmptyParams::default(),
+            ),
+        };
+        let (respond_to, response) = std::sync::mpsc::channel();
+        if parked {
+            app.park_until_mesh_recovered(
+                request,
+                peer.pid,
+                Some(peer.birth),
+                Some(peer.uid),
+                Some(scope),
+                respond_to,
+            );
+            drop(lease);
+            app.replay_recovery_parked();
+        } else {
+            drop(lease);
+            app.handle_api_request_message(crate::api::ApiRequestMessage {
+                request,
+                respond_to,
+                peer_pid: peer.pid,
+                peer_birth: peer.birth,
+                peer_uid: peer.uid,
+                scope: Some(scope),
+            });
+        }
+        let result: serde_json::Value = serde_json::from_str(
+            &response
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["error"]["code"], "not_authorized");
+        assert!(!app.state.should_quit);
+        assert!(app.current_api_scope.is_none());
+    }
+}
+
+#[tokio::test]
+async fn scoped_live_agent_does_not_become_operator_and_legacy_uid_policy_is_unchanged() {
+    use crate::api::scoped::tests::live_scope;
+    for (scoped, dedicated) in [(true, false), (false, false), (false, true)] {
+        let (leases, _lease, scope, peer) = live_scope();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        if scoped {
+            app.session_leases = leases;
+        }
+        app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: if dedicated {
+                peer.uid.unwrap().wrapping_add(1)
+            } else {
+                peer.uid.unwrap()
+            },
+            dedicated: Ok(if dedicated { peer.uid } else { None }).into(),
+        };
+        let (respond_to, response) = std::sync::mpsc::channel();
+        app.handle_api_request_message(crate::api::ApiRequestMessage {
+            request: crate::api::schema::Request {
+                id: "boundary".into(),
+                method: crate::api::schema::Method::ServerStop(
+                    crate::api::schema::EmptyParams::default(),
+                ),
+            },
+            respond_to,
+            peer_pid: peer.pid,
+            peer_birth: peer.birth,
+            peer_uid: peer.uid,
+            scope: if scoped { Some(scope) } else { None },
+        });
+        let reply: serde_json::Value = serde_json::from_str(
+            &response
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(app.state.should_quit, !scoped && !dedicated, "{reply}");
+        if scoped || dedicated {
+            assert_eq!(reply["error"]["code"], "operator_only");
+        }
     }
 }
