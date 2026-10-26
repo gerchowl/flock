@@ -1,0 +1,1 @@
+- App-session mint responses include the server-computed remaining lifetime in `issued.info.expires_in_ms`, allowing native consoles to renew before expiry without hard-coding the TTL.
