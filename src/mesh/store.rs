@@ -6,6 +6,9 @@ use super::{clock::Clock, key::MessageKey};
 mod collection;
 pub(crate) mod delivery_attempts;
 mod hub_outcomes;
+// Internal foundation: public caller and delivery binding follow in #2452.
+#[cfg_attr(not(test), allow(dead_code))]
+mod native_inbox;
 mod quarantine;
 mod queue_custody;
 use queue_custody::{COMMITMENT_UNKNOWN_AT_EXPIRY, COMMITMENT_UNKNOWN_PREFIX};
@@ -1427,7 +1430,7 @@ impl<D: DiskSpace> Store<D> {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let batch = tx.execute("DELETE FROM envelopes WHERE rowid IN
-                (SELECT rowid FROM envelopes WHERE state!='quarantined' AND outcome_until<=?1 AND dedupe_until<=?1 LIMIT 500)", [now])?;
+                (SELECT rowid FROM envelopes WHERE state!='quarantined' AND outcome_until<=?1 AND dedupe_until<=?1 AND NOT EXISTS(SELECT 1 FROM native_inbox_reads n WHERE n.origin=envelopes.origin AND n.id=envelopes.id AND n.state='unread') LIMIT 500)", [now])?;
             tx.commit()?;
             deleted += batch;
             if batch < 500 {

@@ -1,7 +1,7 @@
 //! Transactional schema upgrades, including the original unversioned store.
 use super::{Connection, Error, Result, TransactionBehavior};
 
-pub(super) const VERSION: i64 = 12;
+pub(super) const VERSION: i64 = 13;
 
 pub(super) fn check_version(connection: &Connection) -> Result<()> {
     let found: i64 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -415,7 +415,12 @@ pub(super) const ROUTED_RECEIPTS: &str = "CREATE INDEX IF NOT EXISTS routed_rece
 const LOCAL_RECIPIENTS: &str = "CREATE TABLE IF NOT EXISTS local_recipients (
     origin TEXT NOT NULL, id TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL,
     PRIMARY KEY(origin,id),
-    FOREIGN KEY(origin,id) REFERENCES envelopes(origin,id) ON DELETE CASCADE);";
+    FOREIGN KEY(origin,id) REFERENCES envelopes(origin,id) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS native_inbox_reads (
+    origin TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL, until_ms INTEGER NOT NULL,
+    PRIMARY KEY(origin,id),
+    FOREIGN KEY(origin,id) REFERENCES envelopes(origin,id) ON DELETE CASCADE);
+CREATE INDEX IF NOT EXISTS native_inbox_expiry ON native_inbox_reads(state,until_ms);";
 
 const BASELINE: &str = r#"
 CREATE TABLE IF NOT EXISTS agent_owners (agent_id TEXT PRIMARY KEY, node_id TEXT NOT NULL, name TEXT NOT NULL, seen INTEGER NOT NULL);

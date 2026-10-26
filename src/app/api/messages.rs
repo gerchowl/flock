@@ -1690,6 +1690,7 @@ impl App {
             return;
         }
         let now = now_ms();
+        self.sweep_native_inboxes();
         let mut dropped_any = false;
         for expired in self.mailboxes.expire(now) {
             if let Some(key) = &expired.message_key {
