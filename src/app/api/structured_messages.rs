@@ -305,6 +305,7 @@ impl App {
         } else {
             Principal::Origin(Producer::Agent(signed.sender.clone()))
         };
+        let retention_ms = self.state.config.msg.inbox_retention_ms;
         let item = Item {
             item_id: lifecycle(&signed.key),
             producer: Producer::Human,
@@ -316,10 +317,7 @@ impl App {
             attachments: vec![],
             metadata: [
                 ("message_key".into(), json!(signed.key)),
-                (
-                    "native_inbox_retention_ms".into(),
-                    json!(self.state.config.msg.inbox_retention_ms),
-                ),
+                ("native_inbox_retention_ms".into(), json!(retention_ms)),
                 ("correlation_id".into(), json!(signed.correlation_id)),
                 ("in_reply_to".into(), json!(signed.in_reply_to)),
                 ("intent".into(), json!(ack.message.intent)),

@@ -149,3 +149,58 @@ fn native_inbox_concurrent_connections_return_one_ack_winner() {
     let two = std::thread::spawn(move || read(b, two_tx, one_rx));
     assert_eq!(one.join().unwrap() + two.join().unwrap(), 1);
 }
+
+#[test]
+fn native_inbox_idle_sweep_is_read_only() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let observer = Connection::open(&f.path).unwrap();
+    let version: i64 = observer
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap();
+    let changes = s.connection.total_changes();
+    for now in [1, 1000, 6000] {
+        assert_eq!(s.native_inbox(None, false, now).unwrap(), (vec![], vec![]));
+    }
+    assert_eq!(
+        s.connection.total_changes(),
+        changes,
+        "idle sweep wrote the store"
+    );
+    let after: i64 = observer
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, version, "idle sweep committed");
+}
+
+#[test]
+fn native_inbox_live_peek_and_unmatched_consume_are_read_only() {
+    let f = Fixture::new();
+    let mut s = f.open(0);
+    let e = admit(&mut s);
+    s.native_inbox_delivered(&e.key, 100, 0).unwrap();
+    let changes = s.connection.total_changes();
+    assert!(s.native_inbox(None, false, 1).unwrap().1.is_empty());
+    assert_eq!(
+        s.native_inbox(Some(("recipient", "session")), false, 2)
+            .unwrap()
+            .0,
+        vec![e.clone()]
+    );
+    assert!(s
+        .native_inbox(Some(("other", "session")), true, 3)
+        .unwrap()
+        .0
+        .is_empty());
+    assert_eq!(
+        s.connection.total_changes(),
+        changes,
+        "query-only inbox work wrote the store"
+    );
+    assert_eq!(
+        s.native_inbox(Some(("recipient", "session")), true, 100)
+            .unwrap(),
+        (vec![], vec![e])
+    );
+    assert!(s.native_inbox(None, false, 101).unwrap().1.is_empty());
+}
