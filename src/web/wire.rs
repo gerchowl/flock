@@ -4,9 +4,14 @@ mod fleet;
 mod output;
 mod subscriptions;
 pub(crate) mod timing;
+#[cfg(test)]
+use crate::structured::permissions::auth::tokens::TokenStore;
 use crate::{
-    api::client_tokens::Bearer,
-    structured::permissions::auth::tokens::{Session, TokenError, TokenStore},
+    api::client_tokens::{Bearer, Scope},
+    structured::permissions::auth::tokens::{
+        server::{Owner, Session, Store},
+        TokenError,
+    },
     structured_wire::*,
 };
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -64,7 +69,7 @@ struct Shared {
     fleet: fleet::Client,
     histories: crate::structured::history::owner::Client,
     commands: commands::Client,
-    store: Arc<TokenStore>,
+    store: Arc<Store>,
     epoch: String,
     clock: Arc<dyn Clock>,
     slots: Arc<Semaphore>,
@@ -110,17 +115,45 @@ impl Drop for Core {
 }
 impl Core {
     /// New server epoch, independent of durable stream cursors or command identities.
+    #[cfg(test)]
     pub(crate) async fn new(data: PathBuf, wake: Arc<tokio::sync::Notify>) -> io::Result<Self> {
+        Self::new_shared(data, wake, Owner::default()).await
+    }
+    /// Share the socket owner's memory domain; opening runs on the bounded I/O worker.
+    pub(crate) async fn new_shared(
+        data: PathBuf,
+        wake: Arc<tokio::sync::Notify>,
+        owner: Owner,
+    ) -> io::Result<Self> {
         let store = super::store_io::shared()
-            .run(move || TokenStore::open(&data))
+            .run(move || {
+                owner.get(
+                    &data,
+                    Arc::new(
+                        crate::structured::permissions::auth::tokens::app_sessions::SystemClock,
+                    ),
+                )
+            })
             .await
             .ok_or_else(|| io::Error::other("client token store worker unavailable"))?
             .map_err(io::Error::other)?;
-        Self::with_clock(store, Arc::new(SystemClock), wake)
+        Self::from_store(store, Arc::new(SystemClock), wake)
     }
-    /// Embed with a supplied monotonic clock; deadlines never use wall-clock time.
+    /// Embed with a supplied monotonic clock shared by credential and transport deadlines.
+    #[cfg(test)]
     pub(crate) fn with_clock(
         store: TokenStore,
+        clock: Arc<dyn Clock>,
+        wake: Arc<tokio::sync::Notify>,
+    ) -> io::Result<Self> {
+        Self::from_store(
+            Arc::new(Store::new(store, Arc::new(AppClock(clock.clone())))),
+            clock,
+            wake,
+        )
+    }
+    fn from_store(
+        store: Arc<Store>,
         clock: Arc<dyn Clock>,
         wake: Arc<tokio::sync::Notify>,
     ) -> io::Result<Self> {
@@ -136,7 +169,7 @@ impl Core {
                 histories,
                 commands,
                 fleet,
-                store: Arc::new(store),
+                store,
                 epoch,
                 clock,
                 slots: Arc::new(Semaphore::new(CONNECTIONS as usize)),
@@ -165,10 +198,20 @@ impl Core {
     pub(crate) fn service_commands(&mut self, app: &mut crate::app::App) {
         self.command_owner.service(app);
     }
-    /// Cancel transport work and wait for every connection lease, including hello.
-    pub(crate) async fn shutdown(&self) -> Result<(), tokio::time::error::Elapsed> {
+    /// Stop and drain every transport lease even when app revocation fails.
+    /// Return the revocation failure after bounded cleanup, logging it first.
+    pub(crate) async fn shutdown(&self) -> io::Result<()> {
+        let store = self.shared.store.clone();
+        let revocation = super::store_io::shared()
+            .run(move || store.shutdown())
+            .await
+            .ok_or_else(|| io::Error::other("app revocation worker unavailable"))
+            .and_then(|out| out.map_err(io::Error::other));
+        if let Err(error) = &revocation {
+            crate::logging::client_app_revocation_failed(error);
+        }
         self.shared.stop.send_replace(true);
-        tokio::time::timeout(SHUTDOWN_WAIT, async {
+        let drained = tokio::time::timeout(SHUTDOWN_WAIT, async {
             let _ = self
                 .shared
                 .slots
@@ -179,6 +222,34 @@ impl Core {
         })
         .await
         .map(|_| ())
+        .map_err(io::Error::other);
+        revocation.and(drained)
+    }
+}
+/// Keep credentials and transport deadlines in the same injected monotonic domain.
+#[cfg(test)]
+struct AppClock(Arc<dyn Clock>);
+#[cfg(test)]
+impl crate::structured::permissions::auth::tokens::app_sessions::Clock for AppClock {
+    fn now(&self) -> Instant {
+        self.0.now()
+    }
+}
+/// Kernel/clock readiness also revokes idle sockets; no command or heartbeat is needed.
+async fn app_lifetime(shared: &Shared, session: &Session) -> u16 {
+    let Some(app) = session.app() else {
+        return std::future::pending().await;
+    };
+    let mut revoked = app.revoked.clone();
+    if *revoked.borrow() {
+        return AUTH_REVOKED_CLOSE;
+    }
+    tokio::select! { biased;
+        _ = revoked.changed() => AUTH_REVOKED_CLOSE,
+        _ = shared.clock.until(app.expires) => AUTH_REVOKED_CLOSE,
+        exit = app.process.clone().wait() => {
+            if exit.is_err() { GOING_AWAY_CLOSE } else { AUTH_REVOKED_CLOSE }
+        },
     }
 }
 async fn upgrade(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> Response {
@@ -336,6 +407,22 @@ async fn connection(
             return;
         }
     };
+    // ADR-0036 §5/§6: advertise exact grants, while admission rechecks authority.
+    let capabilities = session
+        .info
+        .scopes
+        .iter()
+        .filter(|scope| !read_only || **scope == Scope::Read)
+        .map(|scope| {
+            match scope {
+                Scope::Read => "read",
+                Scope::Send => "send",
+                Scope::Answer => "answer",
+                Scope::Operate => "operate",
+            }
+            .to_owned()
+        })
+        .collect();
     let principal = session.info.principal.clone();
     let (priority, priority_rx) = mpsc::channel(PRIORITY_CAPACITY);
     let (data, data_rx) = mpsc::channel(DATA_CAPACITY);
@@ -353,7 +440,7 @@ async fn connection(
         clients.insert(
             id,
             Client {
-                session,
+                session: session.clone(),
                 read_only,
                 data,
                 revoke,
@@ -365,7 +452,7 @@ async fn connection(
     let welcome = ServerFrame::Welcome {
         protocol: WIRE_JSON_VERSION,
         server_version: crate::build_info::version(),
-        capabilities: vec![],
+        capabilities,
         principal: principal.clone(),
         server_epoch: shared.epoch.clone(),
         idempotency_window_ms: IDEMPOTENCY_WINDOW_MS,
@@ -379,16 +466,23 @@ async fn connection(
         drop(hello);
         Ok(())
     };
-    if !finish_welcome(
+    let lifetime = app_lifetime(&shared, &session);
+    tokio::pin!(lifetime);
+    let welcomed = tokio::select! { biased;
+        code = &mut lifetime => {
+            let _ = socket.send(close(code)).await;
+            false
+        },
+        ready = finish_welcome(
         &mut socket,
         shared.clock.as_ref(),
         end,
         confirmed,
         welcome,
         (&mut stop, &mut revoked),
-    )
-    .await
-    {
+    ) => ready,
+    };
+    if !welcomed {
         return;
     }
     let (sink, mut stream) = socket.split();
@@ -413,9 +507,15 @@ async fn connection(
     );
     let mut running = tokio::task::JoinSet::new();
     let mut heartbeat = Heartbeat::new(shared.clock.now());
-    let code = loop {
+    let mut code = loop {
         tokio::select! { biased;
-            _ = stop.changed() => return,
+            code = &mut lifetime => break code,
+            _ = stop.changed() => {
+                if session.app().is_none() { return; }
+                // Shutdown cannot service queued commands; their outcomes remain uncertain.
+                running.abort_all();
+                break AUTH_REVOKED_CLOSE;
+            },
             _ = revoked.changed() => break AUTH_REVOKED_CLOSE,
             _ = &mut writer => return,
             result = running.join_next(), if !running.is_empty() => {
@@ -463,8 +563,35 @@ async fn connection(
             }
         }
     };
+    // Revoked commands flush their ack before close, within the existing write ceiling.
+    if code != AUTH_REVOKED_CLOSE {
+        running.abort_all();
+    }
+    let close_deadline = shared.clock.now() + Duration::from_millis(LIVENESS_WINDOW_MS);
+    while !running.is_empty() {
+        tokio::select! { biased;
+            _ = &mut writer => return,
+            _ = shared.clock.until(close_deadline) => return,
+            _ = running.join_next() => (),
+        }
+    }
+    if code == AUTH_REVOKED_CLOSE
+        && !*shared.stop.borrow()
+        && session.app().is_some_and(|s| !*s.revoked.borrow())
+    {
+        let store = shared.store.clone();
+        let session = session.clone();
+        if !matches!(
+            super::store_io::shared()
+                .run(move || store.retire(&session))
+                .await,
+            Some(Ok(()) | Err(TokenError::Revoked))
+        ) {
+            code = GOING_AWAY_CLOSE;
+        }
+    }
     if priority.try_send(close(code)).is_ok() {
-        tokio::select! { biased; _ = &mut writer => (), _ = shared.clock.until(heartbeat.expires()) => () }
+        tokio::select! { biased; _ = &mut writer => (), _ = shared.clock.until(close_deadline) => () }
     }
 }
 #[cfg(test)]

@@ -9,6 +9,8 @@ pinned in `bun.lock`.
   type check and the production build.
 - `just client-preview`: a fixture-mode build (a replayed session, no server
   needed) served on the loopback address.
+- `just desktop-dev` / `just desktop-build`: the same bundle in the Tauri
+  desktop shell; see [`desktop/README.md`](../../desktop/README.md).
 
 ## The production bundle in nix
 
