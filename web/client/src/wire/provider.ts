@@ -1,6 +1,15 @@
 /**
- * A shell's token provider, driven by the connection's NeedsToken
- * (ADR-0038 §6, "The shell config contract" and "Lifetime").
+ * A shell's token provider, or its bridge, driven by the connection's
+ * NeedsToken (ADR-0038 §6, "The shell config contract" and "Lifetime").
+ *
+ * **One state machine, two sources.** A bridge's `openBridge` (#2500) is
+ * driven by the same rules as a token provider: each call is one session
+ * instead of one token, handed over with `setSocket` instead of `setToken`.
+ * Two things differ, both in what the connection does: a bridged session is
+ * used by one attempt, so every reconnect also asks (`awaitingSession`,
+ * outside the streak, which counts only the server's ends), and a refusal
+ * then takes the connection to NeedsToken. Only the renewal passes
+ * `renew: true`. Below, "token" reads "session" for a bridge.
  *
  * - **When it is asked.** When the person connects (the initial connect,
  *   and {@link ShellTokens.ask}, which NeedsToken offers instead of a
@@ -36,7 +45,7 @@
  *
  * @module
  */
-import type { ShellToken, TokenProvider } from "../config";
+import type { BridgeSession, BridgeSocket, OpenBridge, ShellToken, TokenProvider } from "../config";
 import { DEADLINES, type WireConnection } from "./connection";
 import { backoffDelay, type Clock, type TimerHandle } from "./env";
 
@@ -78,23 +87,83 @@ export type ShellTokens = {
   dispose(): void;
 };
 
+/** What the driver asks and hands over: a provider's tokens, or a bridge's sessions. */
+type Source<T> = {
+  /** One call; `renew` only for the renewal before expiry. */
+  readonly call: (renew: boolean) => unknown;
+  /** The call's value, or why it is not one (a refused value is closed here). */
+  readonly read: (value: unknown) => { readonly value: T; readonly expiresInMs?: number } | string;
+  /** Gives the connection `value`. */
+  readonly hand: (value: T) => void;
+  /** A value nobody will use, because the app is gone. */
+  readonly discard: (value: T) => void;
+  /** The message for a rejection without one. */
+  readonly refused: string;
+};
+
 /** The provider's rejection as the person's message: Tauri rejects with the command's error string. */
-function reason(error: unknown): string {
+function reason(error: unknown, fallback: string): string {
   const message = typeof error === "string" ? error : error instanceof Error ? error.message : "";
-  return message === "" ? "The shell could not provide a token." : message;
+  return message === "" ? fallback : message;
+}
+
+/** A value's `expiresInMs`, or why `what` is refused for it. */
+function lifetime(expiresInMs: unknown, what: string): { readonly expiresInMs?: number } | string {
+  if (expiresInMs === undefined) return {};
+  const valid = typeof expiresInMs === "number" && Number.isFinite(expiresInMs) && expiresInMs > 0;
+  return valid ? { expiresInMs } : `The shell's ${what} has an invalid expiresInMs: it must be a positive, finite number of milliseconds.`;
 }
 
 /** The provider's value as a {@link ShellToken}, or why it is not one. */
-function shellToken(value: unknown): ShellToken | string {
+function shellToken(value: unknown): { readonly value: string; readonly expiresInMs?: number } | string {
   if (typeof value !== "object" || value === null) return "The shell gave no token.";
   const { token, expiresInMs } = value as Record<string, unknown>;
   if (typeof token !== "string" || token === "") return "The shell gave no token.";
-  if (expiresInMs === undefined) return { token };
-  const valid = typeof expiresInMs === "number" && Number.isFinite(expiresInMs) && expiresInMs > 0;
-  return valid ? { token, expiresInMs } : "The shell's token has an invalid expiresInMs: it must be a positive, finite number of milliseconds.";
+  const life = lifetime(expiresInMs, "token");
+  return typeof life === "string" ? life : { value: token, ...life };
 }
 
+/** Whether `value` has the {@link BridgeSocket} methods the client calls. */
+function isBridgeSocket(value: unknown): value is BridgeSocket {
+  if (typeof value !== "object" || value === null) return false;
+  const { send, close } = value as Record<string, unknown>;
+  return typeof send === "function" && typeof close === "function";
+}
+
+/** The bridge's value as a {@link BridgeSession}, or why it is not one; a refused session's socket is closed. */
+function bridgeSession(value: unknown): { readonly value: BridgeSocket; readonly expiresInMs?: number } | string {
+  if (typeof value !== "object" || value === null) return "The shell gave no bridge session.";
+  const { socket, expiresInMs } = value as Partial<Record<keyof BridgeSession, unknown>>;
+  if (!isBridgeSocket(socket)) return "The shell gave no bridge session.";
+  const life = lifetime(expiresInMs, "bridge session");
+  if (typeof life !== "string") return { value: socket, ...life };
+  socket.close(1000, "refused");
+  return life;
+}
+
+/** Drives a shell's token provider on a token connection. */
 export function driveTokenProvider(connection: WireConnection, provider: TokenProvider, clock: Clock, random: () => number, changed: () => void): ShellTokens {
+  return driveShell(
+    connection,
+    { call: () => provider(), read: shellToken, hand: (token) => connection.setToken(token), discard: () => undefined, refused: "The shell could not provide a token." },
+    clock,
+    random,
+    changed,
+  );
+}
+
+/** Drives a shell's `openBridge` on a bridged connection: one call per session. */
+export function driveBridge(connection: WireConnection, openBridge: OpenBridge, clock: Clock, random: () => number, changed: () => void): ShellTokens {
+  return driveShell(
+    connection,
+    { call: (renew) => openBridge({ renew }), read: bridgeSession, hand: (socket) => connection.setSocket(socket), discard: (socket) => socket.close(1000, "disposed"), refused: "The shell could not open a session." },
+    clock,
+    random,
+    changed,
+  );
+}
+
+function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clock, random: () => number, changed: () => void): ShellTokens {
   let inFlight = false;
   let waiting: TimerHandle | null = null;
   let renewal: TimerHandle | null = null;
@@ -105,6 +174,8 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
   let acksAtStreak = 0;
   let liveSince: number | null = null;
   let previous = connection.state;
+  /** True while a refusal moves the connection to NeedsToken: no server ended anything, so nothing re-mints. */
+  let refusing = false;
 
   const cancel = (timer: TimerHandle | null): null => {
     if (timer !== null) clock.clearTimeout(timer);
@@ -120,14 +191,15 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
       else if (running()) call(true);
     }, Math.min(delay, MAX_TIMER_DELAY));
   };
-  /** Hands `token` over: from NeedsToken or Disconnected `setToken` is enough; a running session reconnects on it. */
-  const adopt = ({ token, expiresInMs }: ShellToken): void => {
-    const reconnect = running();
-    connection.setToken(token);
-    if (reconnect) {
-      connection.disconnect();
-      connection.connect();
-    }
+  /**
+   * Hands `value` over: from NeedsToken or Disconnected, or to an attempt
+   * awaiting a session, handing it is enough; a running session reconnects on it.
+   */
+  const adopt = ({ value, expiresInMs }: { readonly value: T; readonly expiresInMs?: number }): void => {
+    const reconnect = running() && !connection.awaitingSession;
+    if (reconnect) connection.disconnect();
+    source.hand(value);
+    if (reconnect) connection.connect();
     renewal = cancel(renewal);
     if (expiresInMs !== undefined) renewAt(clock.now() + Math.floor(expiresInMs * RENEW_AT));
   };
@@ -138,26 +210,34 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
     inFlight = true;
     if (!renewing) error = null;
     changed();
-    const settle = (token: ShellToken | null, failure: string | null): void => {
+    const settle = (token: { readonly value: T; readonly expiresInMs?: number } | null, failure: string | null): void => {
       inFlight = false;
-      if (disposed) return;
+      if (disposed) {
+        if (token !== null) source.discard(token.value);
+        return;
+      }
       if (renewing && failure !== null) notice = failure;
       else error = failure;
+      if (failure !== null && !renewing) {
+        refusing = true;
+        connection.sessionRefused();
+        refusing = false;
+      }
       if (token !== null) {
         notice = null;
         adopt(token);
       }
       changed();
     };
-    Promise.resolve()
-      .then(provider)
+    Promise.resolve(renewing)
+      .then(source.call)
       .then(
         (value: unknown) => {
-          const token = shellToken(value);
+          const token = source.read(value);
           if (typeof token === "string") settle(null, token);
           else settle(token, null);
         },
-        (failure: unknown) => settle(null, reason(failure)),
+        (failure: unknown) => settle(null, reason(failure, source.refused)),
       );
   };
   const request = (delay: number): void => {
@@ -190,7 +270,12 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
       renewal = cancel(renewal);
       changed();
     }
-    if (state === "NeedsToken") {
+    // A bridged attempt with no session asks for one: the person's Connect starts a fresh streak.
+    if (state === "Connecting" && connection.awaitingSession) {
+      if (previous === "Disconnected") streak = 0;
+      request(0);
+    }
+    if (state === "NeedsToken" && !refusing) {
       if (previous === "Disconnected") {
         streak = 0;
         request(0);
