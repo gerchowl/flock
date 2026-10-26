@@ -55,6 +55,19 @@ class PlatformPolicy(unittest.TestCase):
                 with self.subTest(context=context, platform=platform):
                     self.assertEqual(self.scheduled_shards(platform, *context), self.shards)
 
+    def test_gui_fixture_check_gates_linux_before_archive_upload(self):
+        steps = self.leg['jobs']['build']['steps']
+        matching = [s for s in steps if s.get('name') == 'Check GUI embedding and feature exclusion']
+        self.assertEqual(len(matching), 1)
+        check = matching[0]
+        self.assertEqual(check['if'], "runner.os == 'Linux' && inputs.run-tests")
+        self.assertEqual(check['run'], 'just gui-check')
+        self.assertFalse(check.get('continue-on-error', False))
+        archive = next(s for s in steps if s.get('id') == 'archive')
+        upload = next(s for s in steps if s.get('name') == 'Upload test archive')
+        self.assertLess(steps.index(archive), steps.index(check))
+        self.assertLess(steps.index(check), steps.index(upload))
+
     def test_reusable_leg_defaults_to_full_tests_and_keeps_build_and_lint(self):
         self.assertEqual(self.leg['on']['workflow_call']['inputs']['run-tests']['type'], 'boolean')
         self.assertIs(self.leg['on']['workflow_call']['inputs']['run-tests']['default'], True)
