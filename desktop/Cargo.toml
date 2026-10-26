@@ -1,0 +1,26 @@
+[package]
+name = "flock-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Tauri v2 desktop shell for the flock client (ADR-0038 §6)"
+license = "AGPL-3.0-or-later"
+publish = false
+
+# Its own workspace root, so it is never a member of flk's build and never
+# linked into flk (#1601). It has its own Cargo.lock and target/.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.2", features = [] }
+
+[dependencies]
+# No `devtools` feature: release builds carry no inspector (ADR-0011 §3).
+tauri = { version = "=2.12.3", features = [] }
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+url = "2"
+
+[dev-dependencies]
+plist = "1"
