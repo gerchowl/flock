@@ -211,8 +211,9 @@ async fn refuse_wildcard(inherit_as_loopback: bool) {
         Some(socket),
         (root.path().join("native.sock"), None),
         Health::default(),
-        Arc::new(tokio::sync::Notify::new()),
-        Default::default(),
+        Core::new(root.path().to_owned(), Arc::new(tokio::sync::Notify::new()))
+            .await
+            .unwrap(),
     )
     .await
     .err()
@@ -247,8 +248,9 @@ async fn assert_preparation_refusal(
         socket,
         (root.path().join("native.sock"), None),
         Health::default(),
-        Arc::new(tokio::sync::Notify::new()),
-        Default::default(),
+        Core::new(root.path().to_owned(), Arc::new(tokio::sync::Notify::new()))
+            .await
+            .unwrap(),
     )
     .await
     .err()
@@ -448,8 +450,9 @@ async fn native_listener_is_prepared_when_tcp_is_disabled() {
         None,
         (root.path().join("flock-ws.sock"), None),
         Health::default(),
-        Arc::new(tokio::sync::Notify::new()),
-        Default::default(),
+        Core::new(root.path().to_owned(), Arc::new(tokio::sync::Notify::new()))
+            .await
+            .unwrap(),
     )
     .await
     .unwrap();

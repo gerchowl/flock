@@ -688,18 +688,24 @@ impl HeadlessServer {
         inherited: Option<std::net::TcpListener>,
         local_owner: Option<crate::ipc::SocketOwner>,
     ) -> io::Result<()> {
+        let data = crate::session::data_dir();
+        let core = crate::web::wire::Core::new_shared(
+            data.clone(),
+            self.app.render_notify.clone(),
+            self.app.client_auth.clone(),
+        )
+        .await?;
         self.client_wire = crate::web::client_listener::Listener::prepare(
             self.app.state.config.client.bind,
             self.app.client_codes.clone(),
-            crate::session::data_dir(),
+            data,
             inherited,
             (
                 crate::web::local_listener::socket_path(&api::socket_path()),
                 local_owner,
             ),
             self.client_wire_health.clone(),
-            self.app.render_notify.clone(),
-            self.app.client_auth.clone(),
+            core,
         )
         .await?;
         if let Some(socket) = self.client_wire.as_ref().and_then(|w| w.socket.as_ref()) {

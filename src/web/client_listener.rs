@@ -115,10 +115,8 @@ impl Listener {
         inherited: Option<TcpListener>,
         local: (PathBuf, Option<crate::ipc::SocketOwner>),
         health: Health,
-        wake: Arc<tokio::sync::Notify>,
-        credentials: crate::structured::permissions::auth::tokens::server::Owner,
+        core: Core,
     ) -> io::Result<Option<Self>> {
-        let core = Core::new_shared(data.clone(), wake, credentials).await?;
         let local =
             super::local_listener::Listener::prepare(local.0, local.1, core.local_router())?;
         let Some(bind) = bind else {
