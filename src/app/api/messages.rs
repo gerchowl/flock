@@ -537,13 +537,23 @@ impl App {
             if let Some(target) = attested.as_ref().filter(|s| !s.is_empty()) {
                 match self.structured_send_target(target) {
                     Ok(Some((target, _))) => {
-                        return self.local_structured_message(
+                        let response = self.local_structured_message(
                             id,
                             target,
                             message,
                             downgrade.into_iter().map(str::to_owned).collect(),
                             key,
-                        )
+                        );
+                        if let Some(super::structured_queue::Staged(_, _, Some(ack))) =
+                            &mut self.structured_sends.staged
+                        {
+                            ack.reply = Some(super::structured_messages::Reply {
+                                correlation: params.correlation_id,
+                                root,
+                                enqueued,
+                            });
+                        }
+                        return response;
                     }
                     Err(code) => return encode_error(id, code.as_str(), "ambiguous reply target"),
                     Ok(None) => (),
@@ -560,20 +570,15 @@ impl App {
         };
         match result {
             Ok((answer_key, state)) => {
-                let round_trips = self.mailboxes.bump_round_trips(&root);
-                self.emit_event(EventEnvelope {
-                    event: EventKind::MessageReplied,
-                    data: EventData::MessageReplied {
-                        correlation_id: params.correlation_id,
-                        reply_correlation_id: reply_correlation_id.clone(),
-                        reply_latency_ms: now.saturating_sub(enqueued),
-                        round_trips,
-                        body: None,
-                        from_pane: None,
-                        from_agent: None,
-                        held: state == "held",
+                self.emit_reply_observation(
+                    super::structured_messages::Reply {
+                        correlation: params.correlation_id,
+                        root,
+                        enqueued,
                     },
-                });
+                    &reply_correlation_id,
+                    state == "held",
+                );
                 let mut warnings: Vec<String> = downgrade.into_iter().map(str::to_owned).collect();
                 if state == "held" && local {
                     warnings.push(REPLY_HELD_FOR_WAITER.into());
@@ -601,6 +606,29 @@ impl App {
                 reason,
             ),
         }
+    }
+
+    /// Pane and native replies publish the same accepted-reply observation.
+    pub(super) fn emit_reply_observation(
+        &mut self,
+        reply: super::structured_messages::Reply,
+        reply_correlation_id: &str,
+        held: bool,
+    ) {
+        let round_trips = self.mailboxes.bump_round_trips(&reply.root);
+        self.emit_event(EventEnvelope {
+            event: EventKind::MessageReplied,
+            data: EventData::MessageReplied {
+                correlation_id: reply.correlation,
+                reply_correlation_id: reply_correlation_id.into(),
+                reply_latency_ms: now_ms().saturating_sub(reply.enqueued),
+                round_trips,
+                body: None,
+                from_pane: None,
+                from_agent: None,
+                held,
+            },
+        });
     }
 
     /// Who is calling the API, as far as this server can attest: the pane
