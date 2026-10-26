@@ -192,7 +192,8 @@ async fn guard(
     let authority = bind.to_string();
     let headers = request.headers();
     if peer.ip() != Ipv4Addr::LOCALHOST
-        || !gui::origin_allowed(headers, &authority)
+        || !(gui::origin_allowed(headers, &authority)
+            || (request.uri().path() == "/v1/ws" && gui::shell_origin_allowed(headers, &authority)))
         || (request.uri().path().starts_with("/v1/") && !headers.contains_key(header::ORIGIN))
     {
         return StatusCode::FORBIDDEN.into_response();

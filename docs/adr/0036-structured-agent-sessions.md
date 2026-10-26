@@ -3544,8 +3544,8 @@ unchanged.
 - **Scopes.** It takes no scope parameter. It grants exactly `{read, send,
   answer, operate}`, the set `ClientOpen` hands out. A request naming scopes is
   refused with `invalid_params`.
-- **Optional parameter.** It takes one optional parameter, `origin_port`
-  (below).
+- **Parameters.** Empty. The captured shell origin needs no `origin_port`;
+  extra fields are refused with `invalid_params` (#2442).
 
 **What the token is.** A bearer secret. With `operate` it **is** the
 operator's identity for ADR-0014's operator-only verbs, as §5 says of an
@@ -3600,19 +3600,20 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
 - **Unchanged.** Every other origin and path keeps today's checks.
   `/v1/client/exchange` keeps its strict same-origin rule.
 - **`null` is never admitted.**
-- **A registered loopback origin** replaces `null` for a platform whose shell
-  would send it.
-  - The mint carries `origin_port`, and the server builds exactly
-    `http://127.0.0.1:<port>`.
-  - It checks that the port is a listening TCP socket held by the minting
-    process (macOS `proc_pidfdinfo` socket info; Linux: the socket inode in
-    `/proc/<pid>/net/tcp`, matched to one of the PID's fds). If it is not,
-    the mint is refused with `origin_port_not_owned`.
-  - The origin is bound to that one token. The guard admits the upgrade from
-    it provisionally, and `hello` must present the bound token; any other
-    token closes the connection.
-  - For this origin only, the guard accepts `Sec-Fetch-Site: same-site`.
-  - The origin is removed when its token is revoked or expires.
+- **Captured local origin (#2442).** Exactly `tauri://localhost` with
+  `Sec-Fetch-Site: cross-site`, only on the exact `/v1/ws` path. The captured
+  platforms need no registered-loopback origin, `origin_port`, port-ownership
+  check or `origin_port_not_owned` code. Windows remains remote-only.
+- **Admission-policy hold (#2500).** UID attribution and revised isolation are
+  held for an owner decision. The Origin-only split preserves the runtime's
+  existing four pending hellos, 16 upgraded sockets and 32 incomplete HTTP
+  connections; it does not implement the proposed isolation/window policy.
+  The registry reserves `preauth_capacity` (HTTP 503/retry `later`) and
+  `auth_rate_limited` (HTTP 429/retry `later`).
+- **Linux native refusal.** G9a refuses local mint at `ptrace_scope=0`, explains
+  that another process could read the operator credential from app memory,
+  and offers explicit remote pairing or administrator-enabled
+  `ptrace_scope ≥ 1`. No silent fallback is permitted (ADR-0038 §6).
 - **Pre-auth limits.**
   - At most 16 concurrent unauthenticated `/v1/ws` connections per listener;
     beyond that, `preauth_capacity`.
@@ -3632,9 +3633,8 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
   process, no polling).
 - TTL expiry does the same (an injected clock).
 - Restart and handoff each revoke every app-session token.
-- `origin_port` held by another process is refused.
-- A registered origin with another token's `hello` is closed.
-- `same-site` is refused for every unregistered origin.
+- `same-site`, duplicate headers, lookalike shell origins and non-WS paths
+  keep their existing refusal treatment.
 - The pre-auth caps refuse at 17 concurrent connections and at the 11th failed
   `hello` within 1 s, and an authenticated session is unaffected.
 
