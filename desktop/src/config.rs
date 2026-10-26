@@ -16,8 +16,10 @@ const DEFAULT_SERVER_URL: &str = "ws://127.0.0.1:7682";
 const SERVER_URL_ENV: &str = "FLOCK_DESKTOP_SERVER_URL";
 /// `web/client/src/config.ts`: the global the bundle reads before it renders.
 const SHELL_CONFIG_GLOBAL: &str = "__FLOCK_SHELL_CONFIG__";
-/// The contract's token provider: the one Tauri command, `main.rs` `mint_token`.
-const TOKEN_PROVIDER: &str = r#"() => window.__TAURI_INTERNALS__.invoke("mint_token")"#;
+/// The contract's token provider: the one Tauri command, `main.rs` `mint_token`, as
+/// `{ token }`. It adds `expiresInMs` once the mint result reports the remaining lifetime.
+const TOKEN_PROVIDER: &str =
+    r#"() => window.__TAURI_INTERNALS__.invoke("mint_token").then((token) => ({ token }))"#;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -188,7 +190,8 @@ mod tests {
     fn init_script_carries_the_origin_or_the_reason() {
         let ok = init_script(&Ok(url("ws://127.0.0.1:7682")));
         let wire = r#"{"serverUrl":"ws://127.0.0.1:7682","transport":"wire"}"#;
-        let provider = r#"() => window.__TAURI_INTERNALS__.invoke("mint_token")"#;
+        let provider =
+            r#"() => window.__TAURI_INTERNALS__.invoke("mint_token").then((token) => ({ token }))"#;
         assert_eq!(
             ok,
             format!("window.__FLOCK_SHELL_CONFIG__ = Object.freeze({{ ...{wire}, tokenProvider: {provider} }});")
