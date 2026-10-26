@@ -1301,11 +1301,14 @@ force the operator outbox to be dropped. Existing server-epoch, retention and
 resume-only rules still apply; a stable identity does not extend the lifetime
 of a cached outcome or authorize an automatic second dispatch after restart.
 
-App instances of the same operator share the existing four authenticated
-socket slots per principal, including pending welcome. Three old sockets can
-coexist with one relaunched socket; at four, an old slot must drain first.
-Unauthenticated hello capacity (four) and upgraded-socket capacity (sixteen)
-remain global. Minting still consumes one of the store's 128 credential entries.
+Socket capacity is per credential (authenticated bearer digest), not per
+principal: each mint has four registered slots, including pending welcome.
+A live old mint can occupy all four without blocking a fresh mint's own four.
+The sixteen upgraded-socket slots and four unauthenticated hello slots remain
+global. Minting still consumes one of the store's 128 credential entries.
+Permission-decision audit records identify the operator principal and token
+source, but cannot distinguish app mints; no token name or digest reaches the
+decision capability.
 
 Renewal issues an independent credential. There are at most 128 live entries;
 capacity/contention returns `session_busy`, and storage failures return

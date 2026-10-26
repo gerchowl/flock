@@ -3576,13 +3576,21 @@ extend retention or preserve an in-memory command cache across restart:
 existing epoch/resume-only/unknown-outcome rules still apply, with no automatic
 second dispatch.
 
-Two app instances share the existing four registered sockets per principal
-(including pending welcome); three old sockets can drain while one renewed
-socket connects. Four occupied slots must drain before another can connect.
-The four unauthenticated hello slots and sixteen upgraded sockets remain
-global, because a principal is untrusted before authentication. These bounds
-are not per bearer and are unchanged. The store's 128-entry cap remains per
+Resource budgets are per credential, keyed by the authenticated bearer digest,
+not by the shared operator principal. Each mint has four registered sockets,
+including pending welcome. A live old mint can fill all four while a fresh
+mint connects and uses its own four; sharing identity does not require the old
+app to drain. The global bound remains sixteen upgraded sockets, so one full
+credential cannot consume it. No additional per-principal aggregate cap is
+introduced. The four unauthenticated hello slots remain global: no credential
+is trusted before authentication. The store's 128-entry cap remains per
 credential, so a renewal still needs a free entry or expired/exited reclamation.
+
+**Audit limit.** Permission-decision records currently retain only the verified
+principal and source (`token`). The decision capability exposes neither the
+token name nor a bearer digest, so an answer can be attributed to the operator
+but not to a particular app mint. Shared-principal mints are indistinguishable
+in that audit trail. This does not expose credentials or change answer policy.
 
 **Binding to the minting process.**
 - **Where the PID comes from.** The **minting connection's peer credentials**:

@@ -53,6 +53,12 @@ pub(crate) struct Session {
     pub(crate) revoked: watch::Receiver<bool>,
     digest: [u8; 32],
 }
+impl Session {
+    /// Compare sealed bearer digests without exposing credentials to resource owners.
+    pub(super) fn same_credential(&self, other: &Self) -> bool {
+        self.digest == other.digest
+    }
+}
 struct Entry {
     session: Session,
     revoke: watch::Sender<bool>,
