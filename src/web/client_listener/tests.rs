@@ -202,6 +202,7 @@ async fn refuse_wildcard(inherit_as_loopback: bool) {
         Some(socket),
         Health::default(),
         Arc::new(tokio::sync::Notify::new()),
+        Default::default(),
     )
     .await
     .err()
@@ -236,6 +237,7 @@ async fn assert_preparation_refusal(
         socket,
         Health::default(),
         Arc::new(tokio::sync::Notify::new()),
+        Default::default(),
     )
     .await
     .err()
