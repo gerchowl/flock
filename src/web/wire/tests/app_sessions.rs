@@ -229,55 +229,9 @@ fn ttl_expires_idle_socket_at_injected_deadline_with_typed_close() {
 }
 #[test]
 fn real_minting_child_exit_closes_idle_socket_without_a_command() {
-    runtime(async {
-        let (server, mut app, _) = fixture().await;
-        let request =
-            json!({"id":"child-app-mint","method":"client.app.mint","params":{}}).to_string();
-        let mut peer = crate::platform::process_exit::tests::Peer::request(Some(&request));
-        let socket = peer.take_stream();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let worker = std::thread::spawn(move || {
-            crate::api::server::handle_connection(
-                socket,
-                &tx,
-                &EventHub::default(),
-                &Arc::new(AtomicBool::new(true)),
-                None,
-                &Mutex::default(),
-                &crate::api::client_listener::Health::default(),
-                &Default::default(),
-            )
-            .unwrap()
-        });
-        let message = within(rx.recv()).await.unwrap();
-        assert_eq!(message.peer_pid, peer.credentials.pid);
-        app.current_api_peer_pid = message.peer_pid;
-        app.current_api_peer_uid = Some(message.peer_uid);
-        app.current_api_peer_birth = Some(message.peer_birth);
-        let reply = app.handle_api_request(message.request);
-        let value: Value = serde_json::from_str(&reply).unwrap();
-        message.respond_to.send(reply).unwrap();
-        worker.join().unwrap();
-        let token =
-            serde_json::from_value::<Bearer>(value["result"]["issued"]["token"].clone()).unwrap();
-        let mut ws = Socket::open(&server).await;
-        ws.hello(WIRE_JSON_VERSION, &token.0).await;
-        server.clock.deadline(12 * 60 * 60 * 1000).await;
-        let mut sibling = Socket::open(&server).await;
-        sibling.hello(WIRE_JSON_VERSION, &token.0).await;
-        peer.exit();
-        assert_eq!(
-            close_detail(&mut ws).await,
-            (AUTH_REVOKED_CLOSE, "client transport ended".into())
-        );
-        assert_eq!(
-            close_detail(&mut sibling).await,
-            (AUTH_REVOKED_CLOSE, "client transport ended".into())
-        );
-        assert!(server.core.shared.store.authenticate(&token).is_err());
-        server.finish().await;
-    });
+    runtime(super::native::child_bridge_and_exit());
 }
+
 #[test]
 fn shutdown_revokes_both_sockets_and_same_owner_cannot_reuse_tokens() {
     runtime(async {

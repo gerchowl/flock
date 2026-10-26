@@ -401,3 +401,72 @@ async fn global_sixteen_socket_budget_is_shared_and_a_closed_socket_releases_it(
     replacement.hello(WIRE_JSON_VERSION, &tokens[3].0).await;
     f.finish().await;
 }
+
+/// The minting child also creates both bridge connections; inherited client fds
+/// let the parent observe the server's revocation after that child has exited.
+pub(super) async fn child_bridge_and_exit() {
+    use std::os::fd::FromRawFd;
+    let mut f = Native::new().await;
+    let request =
+        json!({"id":"native-child-mint","method":"client.app.mint","params":{}}).to_string();
+    let mut child = crate::platform::process_exit::tests::Peer::bridge(&request, &f.path());
+    let socket = child.take_stream();
+    let control = socket.try_clone().unwrap();
+    let (send, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let api = std::thread::spawn(move || {
+        crate::api::server::handle_connection(
+            socket,
+            &send,
+            &crate::api::EventHub::default(),
+            &Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            None,
+            &Mutex::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap()
+    });
+    let request = within(requests.recv()).await.unwrap();
+    assert_eq!(request.peer_pid, child.credentials.pid);
+    f.app.current_api_peer_pid = request.peer_pid;
+    f.app.current_api_peer_uid = Some(request.peer_uid);
+    f.app.current_api_peer_birth = Some(request.peer_birth);
+    let reply = f.app.handle_api_request(request.request);
+    let value: Value = serde_json::from_str(&reply).unwrap();
+    let token: Bearer = serde_json::from_value(value["result"]["issued"]["token"].clone()).unwrap();
+    request.respond_to.send(reply).unwrap();
+    api.join().unwrap();
+    control
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let received =
+        tokio::task::spawn_blocking(move || crate::server::handoff::recv_fds(&control, 2));
+    let descriptors = f.drive(received).await.unwrap().unwrap();
+    let mut sockets = Vec::new();
+    for descriptor in descriptors {
+        // SAFETY: recv_fds transferred unique ownership of each client descriptor.
+        let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(descriptor) };
+        stream.set_nonblocking(true).unwrap();
+        sockets.push(Socket(UnixStream::from_std(stream).unwrap()));
+    }
+    assert_eq!(f.server.core.shared.clients.lock().unwrap().len(), 2);
+    // A different live process cannot bridge with this child's valid bearer.
+    let mut wrong = f.open().await;
+    wrong.send(json!({"t":"hello","protocol":WIRE_JSON_VERSION,"client":{"name":"fixture","version":"1"},"token":token.0})).await;
+    assert_eq!(
+        close_detail(&mut wrong).await,
+        (AUTH_REFUSED_CLOSE, "peer_process_changed".into())
+    );
+    let sibling = f.mint().await;
+    let mut healthy = f.open().await;
+    healthy.hello(WIRE_JSON_VERSION, &sibling.0).await;
+    child.exit_unreaped();
+    for socket in &mut sockets {
+        assert_eq!(close_detail(socket).await.0, AUTH_REVOKED_CLOSE);
+    }
+    assert!(f.server.core.shared.store.authenticate(&token).is_err());
+    assert!(f.server.core.shared.store.authenticate(&sibling).is_ok());
+    healthy.send(json!({"t":"cmd","cmd_id":"sibling-live","verb":"unknown","args":{},"resume_only":false})).await;
+    assert_eq!(healthy.text().await["error"]["code"], "server_version_gap");
+    f.finish().await;
+}
