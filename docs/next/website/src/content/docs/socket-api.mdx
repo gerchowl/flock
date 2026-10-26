@@ -1293,3 +1293,22 @@ restart or handoff; there are no new authentication error names. A command that 
 `auth_revoked` error acknowledgement before closure. Persistent file tokens
 are unaffected. The existing same-UID secret-extraction risk remains (#1177).
 Shell-origin admission is a separate #2442 slice.
+
+### Native shell upgrade origin
+
+The local shell's exact `tauri://localhost` Origin with
+`Sec-Fetch-Site: cross-site` is accepted only on `/v1/ws`. Numeric Host and
+loopback checks remain required. Exchange, GUI and other paths retain their
+strict existing Origin/fetch checks; `null`, duplicate headers and lookalike
+origins are refused. Mint parameters stay empty: there is no registered port
+option. A valid bearer in `hello` is still required.
+
+Existing pending-hello and connection limits are unchanged. The error registry
+reserves `preauth_capacity` (HTTP 503, retry `later`) and `auth_rate_limited`
+(HTTP 429, retry `later`); this does not add a new per-user budget or failure
+window. Revised pre-auth isolation remains under owner review in #2500.
+
+On Linux, the native shell must refuse local mint when `ptrace_scope=0`, explain
+that other processes could read its operator credential, and offer explicit
+remote pairing or administrator-enabled `ptrace_scope ≥ 1`. G9a owns that
+native check and fallback presentation; there is no silent fallback.
