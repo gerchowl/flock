@@ -512,7 +512,6 @@ impl Service {
             .and_then(|_| self.scheduler.exited())
             .and_then(|_| self.settle_opening())
             .err();
-
         self.publish(input, true, None, error);
         let blocked = self.blocked;
         self.publisher.finish(

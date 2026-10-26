@@ -223,7 +223,7 @@ export const fixtureExamples = {
 {"ceiling_ms":1000,"step":"quiet","v":1},
 ],
 "fleet-lite": [
-{"covers":["s7-min"],"cursors":{},"outbox":[],"step":"given","v":1},
+{"covers":["client-only"],"cursors":{},"outbox":[],"step":"given","v":1},
 {"action":{"kind":"subscribe","stream":"fleet","sub_id":"s1"},"step":"client","v":1},
 {"action":{"kind":"connect"},"step":"client","v":1},
 {"not_before_ms":0,"step":"expect_connect","v":1,"within_ms":1},

@@ -117,9 +117,8 @@ impl Subscriptions {
                         let _ = priority.send(close(AUTH_REVOKED_CLOSE)).await;
                         return;
                     }
-                    Some(Err(TokenError::Busy | TokenError::Unsafe | TokenError::Io(_))) | None => {
-                        Err(None)
-                    }
+                    Some(Err(TokenError::Busy)) => Err(Some(SubfailCode::SessionBusy)),
+                    Some(Err(TokenError::Unsafe | TokenError::Io(_))) | None => Err(None),
                 }
             };
             if result == Err(None) {
