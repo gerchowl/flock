@@ -355,6 +355,26 @@ mod tests {
     // ADR-0002 phase (d) test names track the spec exactly.
 
     #[test]
+    fn security2384_env_cannot_prepend_peer_entries_or_shift_positions() {
+        let _lock = crate::config::test_config_env_guard();
+        let _peers = EnvGuard::set("FLOCK_PEERS", "[{name='SECRET_ENV_PEER_2384'}]");
+        let _name = EnvGuard::set("FLOCK_PEERS_0_NAME", "SECRET_ENV_PEER_2384");
+        let table = env_override_table(&mut Vec::new());
+        assert!(!table.contains_key("peers"));
+        let dir = unique_test_dir("env-peer-positions");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[[peers]]\nname=''\n").unwrap();
+        let loaded = load_with_base(&path);
+        let message = loaded.diagnostics.join(" ");
+        assert!(
+            message.contains("entry_index=0") && message.contains("at 2:1"),
+            "{message}"
+        );
+        assert!(!message.contains("SECRET_ENV_PEER_2384"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn security2384_env_diagnostics_do_not_echo_values() {
         let _guard = crate::config::test_config_env_guard();
         let probe = "CONFIG2384_ENV_PRIVATE_a7c4e19b_do_not_print_any_of_this_payload";

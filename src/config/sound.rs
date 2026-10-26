@@ -1,3 +1,4 @@
+use super::validation::{message, Cause};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -95,26 +96,14 @@ impl SoundConfig {
                 .and_then(|ext| ext.to_str())
                 .is_none_or(|ext: &str| !ext.eq_ignore_ascii_case("mp3"))
             {
-                diagnostics.push(format!(
-                    "unsupported sound file format: {field} = {} resolves to {}; expected an mp3 file; using default sound",
-                    path.display(),
-                    resolved.display()
-                ));
+                diagnostics.push(message(Cause::SoundFormat, field, None));
                 continue;
             }
 
             if !resolved.exists() {
-                diagnostics.push(format!(
-                    "missing sound file: {field} = {} resolves to {}; using default sound",
-                    path.display(),
-                    resolved.display()
-                ));
+                diagnostics.push(message(Cause::SoundMissing, field, None));
             } else if !resolved.is_file() {
-                diagnostics.push(format!(
-                    "invalid sound file: {field} = {} resolves to {}; using default sound",
-                    path.display(),
-                    resolved.display()
-                ));
+                diagnostics.push(message(Cause::SoundInvalid, field, None));
             }
         }
         diagnostics

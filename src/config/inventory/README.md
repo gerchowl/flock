@@ -80,18 +80,25 @@ before that work is complete.
   does not retarget. `spawn` and `spawn.env` are `AppLive`:
   #2399 copies valid policy for subsequent starts and resumes, without changing
   existing process environments or stored launch snapshots. `msg` is `Mixed`:
-  most leaves are read live by server operations, but
-  `msg.channel_push_body_max_bytes` and `msg.channel_push_reconnect_secs` are
-  `CommandStartup`, read only into `ChannelOptions` at MCP startup.
-  `msg.channel_push` is itself `Mixed`: server operations read it live, while
-  an existing MCP session retains its startup capability. Invalid sections keep
+  most leaves are read live by server operations. The captured `ChannelOptions`
+  leaves (`msg.channel_push`, `msg.channel_push_body_max_bytes` and
+  `msg.channel_push_reconnect_secs`) are `Mixed`: #2400 reads their effective
+  values during live reload to report MCP restart requirements, while the MCP
+  process captures its own options at command startup. The comparison is an
+  advisory read, not an update of any existing MCP session. `channel_push` also
+  controls live server operations. Invalid sections keep
   their running values. Restart the MCP process to refresh captured options.
   The msg/spawn consumer guard follows production App/MCP modules, reference
   aliases and reachable config helper methods, deriving each leaf's owner from
   actual readers and requiring the section's live copy where applicable.
   A field read both live and at command startup is `Mixed`. The guard verifies
   the MCP constructor receives its section from `Config::load` at command
-  startup. It is a focused syntax audit, not general Rust type/dataflow
+  startup or from a proven live config binding/typed `&Config` argument during
+  reload. Unknown constructor inputs still fail closed, and command loads must
+  remain in the startup entry. Whole-section derived `Clone` calls are copy
+  evidence rather than leaf consumer reads; their derives come from the same
+  declaration graph as the inventory. A mutation regression rejects startup-only
+  labels for either live-compared MCP limit. It is a focused syntax audit, not general Rust type/dataflow
   inference: new reader shapes require evidence support rather than a guessed
   owner. The reverse copy-set check rejects a startup-only root section that
   gains a live copy without review. `checks`, `fleet` and `structured` remain
@@ -187,3 +194,115 @@ inside a startup-only container. Copying a mixed parent does not claim that
 all cached child consumers retarget: the existing whole-UI copy does not move
 the sampler's startup-owned disk path. A direct disk-path copy still demands
 an ownership review.
+
+### Diagnostic sink projection (slice 3b1)
+
+ADR-0041 §4's internal diagnostic boundary now constructs closed causes,
+source categories, outcomes and numeric positions before formatting. Raw parser
+messages, I/O messages, file paths and input values are never retained in the
+safe diagnostic. `Display` and `Debug` only see safe data. Existing loader and
+CLI String consumers format that safe object rather than scrubbing messages.
+
+Cause labels are a closed diagnostic vocabulary, not `error.code` values.
+They appear only as text in `SuccessResponse.result.diagnostics[]` and carry
+no retry class. Clients must not interpret a cause label as `error.code`.
+Future GUI branching requires a typed, versioned schema enum, not registry
+entries. The base labels are:
+
+- `config parse error: invalid_toml`
+- `invalid_config_type`
+- `unknown_config_key`
+- `removed_config_key`
+- `read_error`
+- `invalid_catalog`
+- `missing_peer_name`
+- `duplicate_peer`
+- `invalid_peer_target`
+
+The producer-closure slice also routes `validation::Cause` through
+`Diagnostic::Cause::Validation`. Its closed labels are:
+
+- `invalid keybinding`
+- `range keybinding is only valid for indexed actions`
+- `invalid indexed keybinding: expected modifier combination`
+- `indexed keybinding must use 1..9`
+- `navigate keybinding must not include prefix`
+- `navigate keybinding cannot use esc`
+- `reserved keybinding: uses keys.prefix; pressing the prefix twice sends a literal prefix key`
+- `conflicting keybinding: first binding kept`
+- `unsafe direct keybinding: would intercept typing; require the prefix`
+- `empty custom command`
+- `unsupported sound file format; expected an mp3 file`
+- `missing sound file`
+- `invalid sound file: expected a regular file`
+- `unknown agent: not an agent flock detects`
+- `duplicate agent alias: first spelling kept`
+- `environment key is empty`
+- `environment key contains '=', which is not part of a variable name`
+- `environment key looks like a wildcard; only exact names are matched`
+- `environment key contains whitespace, which no shell can export`
+- `entry is missing name`
+- `duplicate name: later entry ignored`
+- `interval_secs is less than checks.min_tick_secs; clamped`
+- `timeout_secs is less than 1; using 1s`
+- `debounce is 0; using 1 so a single fire still emits`
+- `program is not absolute and not under ~/.flock/checks/`
+- `invalid channel name: needs 1-64 characters from [A-Za-z0-9_-]`
+- `invalid channel entry: needs an owner_node`
+- `invalid channel entry: needs a unique name`
+- `invalid channel target: expected fleet, repo:<name> or agent:<id>`
+
+The exhaustive fixture covers every `Cause` variant and pins its rendered
+label to both this guide and ADR-0041 §4. Adding a cause requires a deliberate
+fixture and documentation update. #2434 tracks the scanner's separate
+emission-provenance follow-up; it is not changed in this stack.
+
+Diagnostic keys are rebuilt from catalog paths and aliases. User-map entries
+become `<key>` and collection indices become `[]`; an unknown descendant stops
+at its nearest declared container, and unknown roots become `document root`.
+The four removed schema keys are an explicit closed historical exception.
+Unknown user spellings are withheld even when they look harmless. Safe source
+categories and numeric coordinates identify where to inspect the file without
+printing its private keys. Loader unknown-key warnings preserve base/overlay
+categories and exact byte line/column coordinates from TOML key spans. Syntax
+errors likewise retain byte coordinates when available. Removed-key scans
+retain line locations; missing spans remain unavailable. The loader keeps its
+existing unknown-key policy, and CLI retains its broader scan. I/O diagnostics
+retain `ErrorKind`, never `Display`.
+
+Peer-entry refusals retain a zero-based array index, source category and field
+coordinates when available; their outcome says `entry dropped`. Static mesh,
+misplaced-section and CLI repair hints contain no input data.
+
+Both input-document and edited-output parse refusals in `channel set` and
+`config reset-keys` use this boundary and leave the file unchanged. Output guards
+identify flock's own edit as the failure. CLI file paths remain permitted
+operator metadata; loader and reload diagnostics remain path-free. Aggregate
+provenance has a structural reason, separately from sensitive content kinds.
+No socket/WS read method or raw export is enabled by this slice.
+
+### Producer closure (slice 3b2)
+
+Keybinding, sound, spawn-env, checks and channel validation now construct closed
+causes through the same boundary before either returning or immediately logging
+a diagnostic. No configured chord, command, check/channel identity, environment
+name, executable or sound path is copied into those messages. Channel target
+parse errors retain only the static accepted forms. Selection, first-wins
+admission and fallback behavior are unchanged.
+
+Diagnostics retain canonical schema paths and zero-based declaration indices.
+Custom-command conflicts report both the kept and rejected declaration indices.
+Spawn environment diagnostics identify the sorted map-entry ordinal and list item
+index, not the agent spelling or environment name. Check intervals retain the
+public minimum bound. Static hints still explain prefix reservations, indexed
+keys, mp3 sound support, exact environment names and accepted script locations.
+These validators have no source span input and explicitly say that location
+and source are unavailable rather than guessing. File scanners emit a fallback
+record for every discovered unknown key without a span, even when a located
+entry projects to the same safe key. Environment overrides cannot supply peer
+arrays, so base/overlay peer coordinates retain their original indices.
+
+The inventory and redaction prerequisite of #2384 is complete across the stack.
+This does not enable #2385, a read/write API or any raw export. Consumers must
+continue using mandatory safe projections under ADR-0041 §4; credential-file
+contents and expanded environment values are outside these read models.

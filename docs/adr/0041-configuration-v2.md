@@ -192,6 +192,68 @@ enabling any read surface. Neither local operator identity nor `operate`
 authorizes raw-secret export. Who, if anyone, may read raw secret values is
 an Open question requiring a further owner decision.
 
+#### Closed configuration diagnostic causes
+
+Configuration diagnostic cause labels are a separate vocabulary from ADR-0029
+`error.code`. They format closed `Diagnostic::Cause` values into text inside
+`SuccessResponse.result.diagnostics[]`; a label carries no retry class.
+Clients must not treat a label as `error.code` or infer retry policy from it.
+If a GUI later branches on causes, the causes must become a typed, versioned
+enum in the schema, not entries in the error-code registry.
+
+The closed base cause vocabulary is:
+
+| Cause | Display label |
+| --- | --- |
+| `InvalidToml` | `config parse error: invalid_toml` |
+| `InvalidType` | `invalid_config_type` |
+| `Unknown` | `unknown_config_key` |
+| `Removed` | `removed_config_key` |
+| `Read` | `read_error` |
+| `InvalidCatalog` | `invalid_catalog` |
+| `MissingPeerName` | `missing_peer_name` |
+| `DuplicatePeer` | `duplicate_peer` |
+| `InvalidPeerTarget` | `invalid_peer_target` |
+
+The producer-closure slice also routes `validation::Cause` through
+`Diagnostic::Cause::Validation`. Its closed labels are:
+
+- `invalid keybinding`
+- `range keybinding is only valid for indexed actions`
+- `invalid indexed keybinding: expected modifier combination`
+- `indexed keybinding must use 1..9`
+- `navigate keybinding must not include prefix`
+- `navigate keybinding cannot use esc`
+- `reserved keybinding: uses keys.prefix; pressing the prefix twice sends a literal prefix key`
+- `conflicting keybinding: first binding kept`
+- `unsafe direct keybinding: would intercept typing; require the prefix`
+- `empty custom command`
+- `unsupported sound file format; expected an mp3 file`
+- `missing sound file`
+- `invalid sound file: expected a regular file`
+- `unknown agent: not an agent flock detects`
+- `duplicate agent alias: first spelling kept`
+- `environment key is empty`
+- `environment key contains '=', which is not part of a variable name`
+- `environment key looks like a wildcard; only exact names are matched`
+- `environment key contains whitespace, which no shell can export`
+- `entry is missing name`
+- `duplicate name: later entry ignored`
+- `interval_secs is less than checks.min_tick_secs; clamped`
+- `timeout_secs is less than 1; using 1s`
+- `debounce is 0; using 1 so a single fire still emits`
+- `program is not absolute and not under ~/.flock/checks/`
+- `invalid channel name: needs 1-64 characters from [A-Za-z0-9_-]`
+- `invalid channel entry: needs an owner_node`
+- `invalid channel entry: needs a unique name`
+- `invalid channel target: expected fleet, repo:<name> or agent:<id>`
+
+Adding a cause or changing its label requires updating the exhaustive fixture
+and this contract. Diagnostic source, outcome and I/O kind remain separate
+fields in the formatted text. Scanner emission-provenance work is tracked by
+[#2434](https://github.com/gerchowl/flock/issues/2434), part of #2326, and does
+not change this vocabulary.
+
 ### 5. Operator writes and honest reload outcomes
 
 `config.set` writes an admitted typed scalar to a chosen writable file layer,
@@ -234,11 +296,13 @@ by this ADR.
 
 The inventory follows consumers, not just section copies. Following #2399,
 `spawn` and `spawn.env` are `AppLive`. The `msg` section is `Mixed`: server
-policy leaves are live, while `msg.channel_push_body_max_bytes` and
-`msg.channel_push_reconnect_secs` are `CommandStartup`, consumed only by
-`ChannelOptions` from the MCP command's startup `Config::load`.
-`msg.channel_push` is also `Mixed`: the server reads it live but MCP sessions
-capture their capability at startup. Each leaf's classification is guarded by
+policy leaves are live. Following #2400, `msg.channel_push`,
+`msg.channel_push_body_max_bytes` and `msg.channel_push_reconnect_secs` are
+`Mixed`: live reload constructs their effective `ChannelOptions` to report
+restart requirements, and the MCP command captures those options from its
+startup `Config::load`. This live diagnostic comparison does not retarget an
+existing MCP session; its operational options still require an MCP restart.
+`msg.channel_push` also controls live server operations. Each leaf's classification is guarded by
 consumer syntax evidence, with live owners also requiring the section copy in
 `apply_live_config`. Invalid sections retain their running values. Child
 environments and stored launch snapshots remain captured. Restart the MCP

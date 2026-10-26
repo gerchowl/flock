@@ -1951,6 +1951,14 @@ impl App {
             diagnostics.push("sessions.queue_rewrite_bytes changed: restart required to apply the worker queue policy; keeping current threshold".into());
         }
 
+        // ADR-0041 decision 4: server reload cannot renegotiate MCP sessions.
+        if !invalid_section("msg")
+            && crate::mcp::channel::ChannelOptions::from_config(&config.msg)
+                != crate::mcp::channel::ChannelOptions::from_config(&self.state.config.msg)
+        {
+            diagnostics.push("msg channel options changed: restart_required for existing MCP sessions; restart flk mcp serve to apply (server message policy applied live)".into());
+        }
+
         // Snapshot fields that need to detect a change relative to the
         // previous live config BEFORE any per-section replacement below.
         let previous_sound = self.state.config.ui.sound.clone();
@@ -3193,6 +3201,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    fn assert_channel_reload_reports_mcp_restart(change: fn(&mut crate::config::model::MsgConfig)) {
+        let mut app = test_app();
+        let mut incoming = app.state.config.clone();
+        change(&mut incoming.msg);
+        let report = app.apply_live_config(&incoming, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("restart_required")
+                && message.contains("MCP")
+                && message.contains("flk mcp serve")));
+        assert_eq!(
+            crate::mcp::channel::ChannelOptions::from_config(&app.state.config.msg),
+            crate::mcp::channel::ChannelOptions::from_config(&incoming.msg)
+        );
+    }
+
+    #[test]
+    fn reload_channel_push_reports_mcp_restart_required() {
+        assert_channel_reload_reports_mcp_restart(|msg| msg.channel_push = true);
+    }
+
+    #[test]
+    fn reload_channel_body_limit_reports_mcp_restart_required() {
+        assert_channel_reload_reports_mcp_restart(|msg| msg.channel_push_body_max_bytes += 1);
+    }
+
+    #[test]
+    fn reload_channel_reconnect_reports_mcp_restart_required() {
+        assert_channel_reload_reports_mcp_restart(|msg| msg.channel_push_reconnect_secs += 1);
+    }
+
+    #[test]
+    fn reload_unrelated_msg_policy_does_not_require_mcp_restart() {
+        let mut app = test_app();
+        let mut incoming = app.state.config.clone();
+        incoming.msg.blocking_per_hour = 0;
+        incoming.msg.channel_push_idle_wake_grace_ms += 1;
+        let report = app.apply_live_config(&incoming, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(app.state.config.msg.blocking_per_hour, 0);
+        assert_eq!(
+            app.state.config.msg.channel_push_idle_wake_grace_ms,
+            incoming.msg.channel_push_idle_wake_grace_ms
+        );
+    }
+
+    #[test]
+    fn reload_invalid_msg_does_not_report_unapplied_channel_changes() {
+        let mut app = test_app();
+        let mut incoming = app.state.config.clone();
+        incoming.msg.channel_push = true;
+        let report = app.apply_live_config(
+            &incoming,
+            &["invalid msg section".into()],
+            &["msg".into()],
+            false,
+        );
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(report.diagnostics, ["invalid msg section"]);
+        assert!(!app.state.config.msg.channel_push);
+    }
+
     #[test]
     fn queue_threshold_reload_reports_restart_required_and_keeps_worker_policy() {
         let mut app = test_app();
@@ -3841,6 +3914,36 @@ sidebar_pane_gap = 99
         }
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn usability2384_fix1_unknown_keys_reach_startup_reload_and_banner() {
+        let _guard = config_env_guard();
+        let path = temp_config_path("unknown-key-location");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[msg]\n  SECRET_UNKNOWN_2384 = true").unwrap();
+        let prior = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let startup = crate::config::Config::load();
+        let mut app = test_app();
+        let report = app.reload_config();
+        let banner = app.state.config_diagnostic.clone().unwrap_or_default();
+        match prior {
+            Some(v) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, v),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        for text in [
+            startup.diagnostics.join(" "),
+            report.diagnostics.join(" "),
+            banner,
+        ] {
+            assert!(!text.contains("SECRET_"));
+            assert!(
+                text.contains("key=msg;") && text.contains("at 2:3"),
+                "{text}"
+            );
+        }
     }
 
     #[test]

@@ -5,6 +5,15 @@ description: Configure Flock keybindings, themes, sidebar behavior, notification
 
 Flock works without a config file. Add one when you want custom keys, themes, sidebar settings, notifications, or advanced behavior.
 
+## Private config diagnostics
+
+Config warnings identify schema fields, available file positions and zero-based
+entry indices without printing configured names, shortcut strings, commands,
+environment names or file paths. A missing source position is reported as
+unavailable. Static hints still describe accepted forms and fallback behavior.
+For a conflict, inspect the kept and rejected entry indices in the named schema
+field. This applies to startup, reload, config checks and keybinding validation.
+
 ## Structured launch policy (preparation only)
 
 The structured Claude launch profile is being built in stages. This release adds preparation and validation only (#1437); it does not start structured processes or add a start flag. Process supervision follows in #1438. Lease-based caller identity (#1426) must land before #1439 enables structured start.
@@ -116,7 +125,11 @@ An already running `flk mcp serve` is a separate process: it keeps its startup c
 push capability, body limit and reconnect interval. Restart that MCP process to apply
 `msg.channel_push`, `msg.channel_push_body_max_bytes` or
 `msg.channel_push_reconnect_secs` there; server reload does not renegotiate an existing
-MCP session.
+MCP session. A reload that changes these effective channel options returns `partial`
+with a `restart_required` diagnostic naming the existing MCP sessions and the
+`flk mcp serve` process to restart. Server-side message policy still applies live.
+Unrelated message changes do not produce this diagnostic, and rejected `[msg]`
+sections only report their validation diagnostics.
 
 ## Terminal defaults
 

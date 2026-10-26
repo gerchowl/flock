@@ -4,7 +4,8 @@
 //! local named `msg` is not mistaken for a live config reader.
 //! This is a syntax audit, not Rust type inference: follow AppState config
 //! reads, local reference aliases, reachable config helper methods and the
-//! MCP startup constructor. Unknown or missing reader evidence fails closed.
+//! MCP constructor with proven startup or live config inputs. Unknown or
+//! missing reader evidence fails closed.
 
 use super::*;
 use std::path::{Path, PathBuf};
@@ -68,6 +69,26 @@ fn production_items(path: &Path, output: &mut Vec<syn::Item>) {
     collect(items, &base, output);
 }
 
+fn derived_clone_models(items: &[syn::Item]) -> BTreeSet<String> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let syn::Item::Struct(model) = item else {
+                return None;
+            };
+            model
+                .attrs
+                .iter()
+                .any(|attr| {
+                    attr.path().is_ident("derive") && attr.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+            ).is_ok_and(|paths| paths.iter().any(|path| path.is_ident("Clone")))
+                })
+                .then(|| model.ident.to_string())
+        })
+        .collect()
+}
+
 /// Helper lookup uses the nominal model, independent of an impl's lifetimes.
 /// Config declaration formatting remains strict about every generic argument.
 fn helper_model(ty: &syn::Type) -> String {
@@ -93,6 +114,7 @@ fn helper_lookup_accepts_lifetimes_without_weakening_declared_types() {
 struct Readers<'a> {
     aliases: BTreeMap<String, String>,
     fields: &'a BTreeSet<String>,
+    derived_clones: &'a BTreeSet<String>,
     models: &'a BTreeMap<String, String>,
     helpers: &'a BTreeMap<(String, String), syn::ImplItemFn>,
     active_helpers: BTreeSet<(String, String)>,
@@ -104,6 +126,36 @@ struct Readers<'a> {
 }
 
 impl Readers<'_> {
+    fn function(&mut self, signature: &syn::Signature, block: &syn::Block) {
+        let previous = std::mem::take(&mut self.aliases);
+        let previous_function = std::mem::replace(&mut self.function, signature.ident.to_string());
+        for input in &signature.inputs {
+            let syn::FnArg::Typed(param) = input else {
+                continue;
+            };
+            let syn::Pat::Ident(name) = param.pat.as_ref() else {
+                continue;
+            };
+            let syn::Type::Reference(reference) = param.ty.as_ref() else {
+                continue;
+            };
+            let syn::Type::Path(path) = reference.elem.as_ref() else {
+                continue;
+            };
+            if path.qself.is_none()
+                && path.path.segments.last().is_some_and(|s| {
+                    s.ident == "Config" && matches!(s.arguments, syn::PathArguments::None)
+                })
+            {
+                self.aliases
+                    .insert(name.ident.to_string(), "@config".into());
+            }
+        }
+        self.visit_block(block);
+        self.aliases = previous;
+        self.function = previous_function;
+    }
+
     fn path(&self, expr: &syn::Expr) -> Option<String> {
         match expr {
             syn::Expr::Reference(r) => self.path(&r.expr),
@@ -204,6 +256,15 @@ impl<'ast> Visit<'ast> for Readers<'_> {
         if let Some(path) = self.path(&call.receiver) {
             if let Some(section) = path.strip_prefix("@config.") {
                 if let Some(model) = self.models.get(section) {
+                    // Derived whole-section clones are copy evidence, checked
+                    // by reload_evidence, rather than leaf consumer evidence.
+                    if call.method == "clone"
+                        && call.args.is_empty()
+                        && self.derived_clones.contains(model)
+                    {
+                        syn::visit::visit_expr_method_call(self, call);
+                        return;
+                    }
                     self.helper(
                         model,
                         &call.method.to_string(),
@@ -217,15 +278,22 @@ impl<'ast> Visit<'ast> for Readers<'_> {
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if field_path(&call.func).is_some_and(|p| p.ends_with("ChannelOptions::from_config")) {
-            assert_eq!(
-                self.function, "serve_over_stdio",
-                "constructor moved outside the command startup entry"
-            );
             assert_eq!(call.args.len(), 1);
             let path = self.path(&call.args[0]).unwrap();
-            let section = path
-                .strip_prefix("@load.config.")
-                .expect("command must capture Config::load");
+            let (section, command) = if let Some(section) = path.strip_prefix("@load.config.") {
+                assert_eq!(
+                    self.function, "serve_over_stdio",
+                    "constructor moved outside the command startup entry"
+                );
+                self.startup_loads += 1;
+                (section, true)
+            } else {
+                (
+                    path.strip_prefix("@config.")
+                        .expect("MCP constructor must read a proven config section"),
+                    false,
+                )
+            };
             let constructor = &self.helpers[&("ChannelOptions".into(), "from_config".into())];
             let syn::FnArg::Typed(param) = &constructor.sig.inputs[0] else {
                 panic!("constructor argument")
@@ -237,14 +305,13 @@ impl<'ast> Visit<'ast> for Readers<'_> {
                 panic!("constructor type")
             };
             assert_eq!(model_type(&reference.elem), self.models[section]);
-            self.startup_loads += 1;
-            self.command_context = true;
+            let previous_context = std::mem::replace(&mut self.command_context, command);
             self.helper(
                 "ChannelOptions",
                 "from_config",
                 BTreeMap::from([(name.ident.to_string(), format!("@config.{section}"))]),
             );
-            self.command_context = false;
+            self.command_context = previous_context;
         }
         syn::visit::visit_expr_call(self, call);
     }
@@ -252,7 +319,10 @@ impl<'ast> Visit<'ast> for Readers<'_> {
 
 #[test]
 fn msg_spawn_leaf_owners_match_consumer_evidence() {
-    let catalog = core_catalog().unwrap();
+    assert_msg_spawn_leaf_owners(&core_catalog().unwrap());
+}
+
+fn assert_msg_spawn_leaf_owners(catalog: &Catalog) {
     let (copied, _) = reload_evidence(include_str!("../../app/mod.rs"));
     let models: BTreeMap<_, _> = catalog
         .fields
@@ -281,6 +351,7 @@ fn msg_spawn_leaf_owners_match_consumer_evidence() {
     production_items(&root.join("mcp/mod.rs"), &mut items);
     let mut helper_items = syn::parse_file(include_str!("../model.rs")).unwrap().items;
     helper_items.extend(items.clone());
+    let derived_clones = derived_clone_models(&declarations().into_values().collect::<Vec<_>>());
     let helpers = helper_items
         .iter()
         .filter_map(|i| {
@@ -303,6 +374,7 @@ fn msg_spawn_leaf_owners_match_consumer_evidence() {
     let mut readers = Readers {
         aliases: BTreeMap::new(),
         fields: &fields,
+        derived_clones: &derived_clones,
         models: &models,
         helpers: &helpers,
         active_helpers: BTreeSet::new(),
@@ -326,8 +398,7 @@ fn msg_spawn_leaf_owners_match_consumer_evidence() {
             _ => Vec::new(),
         };
         for (signature, block) in functions {
-            readers.function = signature.ident.to_string();
-            readers.visit_block(block);
+            readers.function(signature, block);
         }
     }
     assert_eq!(
@@ -377,5 +448,111 @@ fn msg_spawn_leaf_owners_match_consumer_evidence() {
             };
             assert_eq!(&field.reload, owner, "{}: aggregate owner", field.path);
         }
+    }
+}
+
+fn constructor_evidence(source: &str) -> (BTreeSet<String>, BTreeSet<String>, usize) {
+    let fields = BTreeSet::from(["msg.channel_push".into()]);
+    let models = BTreeMap::from([("msg".into(), "MsgConfig".into())]);
+    let constructor: syn::ImplItemFn = syn::parse_str(
+        "fn from_config(msg: &MsgConfig) -> Self { Self { push: msg.channel_push } }",
+    )
+    .unwrap();
+    let helpers = BTreeMap::from([(("ChannelOptions".into(), "from_config".into()), constructor)]);
+    let derived_clones = derived_clone_models(&[syn::parse_str(
+        "#[derive(Clone)] struct MsgConfig { channel_push: bool }",
+    )
+    .unwrap()]);
+    let mut readers = Readers {
+        aliases: BTreeMap::new(),
+        fields: &fields,
+        derived_clones: &derived_clones,
+        models: &models,
+        helpers: &helpers,
+        active_helpers: BTreeSet::new(),
+        live: BTreeSet::new(),
+        command: BTreeSet::new(),
+        startup_loads: 0,
+        command_context: false,
+        function: String::new(),
+    };
+    let function: syn::ItemFn = syn::parse_str(source).unwrap();
+    readers.function(&function.sig, &function.block);
+    (readers.live, readers.command, readers.startup_loads)
+}
+
+#[test]
+fn constructor_evidence_follows_typed_live_config_and_reference_aliases() {
+    let (live, command, loads) = constructor_evidence(
+        "fn compare(candidate: &crate::config::Config) {
+            let policy = &candidate.msg;
+            ChannelOptions::from_config(policy);
+        }",
+    );
+    assert_eq!(live, BTreeSet::from(["msg.channel_push".into()]));
+    assert!(command.is_empty());
+    assert_eq!(loads, 0);
+}
+
+#[test]
+fn constructor_evidence_keeps_command_loads_separate() {
+    let (live, command, loads) = constructor_evidence(
+        "fn serve_over_stdio() {
+            let loaded = Config::load();
+            ChannelOptions::from_config(&loaded.config.msg);
+        }",
+    );
+    assert!(live.is_empty());
+    assert_eq!(command, BTreeSet::from(["msg.channel_push".into()]));
+    assert_eq!(loads, 1);
+}
+
+#[test]
+#[should_panic(expected = "MCP constructor must read a proven config section")]
+fn constructor_evidence_rejects_unproven_parameter_types() {
+    constructor_evidence(
+        "fn compare(candidate: &OtherConfig) { ChannelOptions::from_config(&candidate.msg); }",
+    );
+}
+
+#[test]
+#[should_panic(expected = "constructor moved outside the command startup entry")]
+fn constructor_evidence_rejects_relocated_command_loads() {
+    constructor_evidence(
+        "fn another_entry() {
+            let loaded = Config::load();
+            ChannelOptions::from_config(&loaded.config.msg);
+        }",
+    );
+}
+
+#[test]
+fn constructor_evidence_does_not_count_derived_section_copies_as_consumers() {
+    let (live, command, loads) =
+        constructor_evidence("fn copy_config(config: &Config) { let copy = config.msg.clone(); }");
+    assert!(live.is_empty() && command.is_empty());
+    assert_eq!(loads, 0);
+}
+
+#[test]
+fn startup_only_labels_are_rejected_for_live_mcp_comparison_readers() {
+    for path in [
+        "msg.channel_push_body_max_bytes",
+        "msg.channel_push_reconnect_secs",
+    ] {
+        let mut catalog = core_catalog().unwrap();
+        catalog
+            .fields
+            .iter_mut()
+            .find(|field| field.path == path)
+            .unwrap()
+            .reload = ReloadOwner::CommandStartup;
+        let failure = std::panic::catch_unwind(|| assert_msg_spawn_leaf_owners(&catalog))
+            .expect_err("a startup-only label must not hide the live diagnostic reader");
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(
+            message.contains(&format!("{path}: live=true, command=true")),
+            "{message}"
+        );
     }
 }

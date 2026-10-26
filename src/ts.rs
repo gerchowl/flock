@@ -46,6 +46,7 @@ impl ts_rs::TypeVisitor for Collector {
 fn contracts() -> BTreeMap<PathBuf, String> {
     use crate::api::{question::*, schema::*};
     let mut collector = Collector::default();
+    collector.add::<crate::api::client_tokens::Issued>();
     collector.add::<Question>();
     collector.add::<QuestionForm>();
     collector.add::<QuestionCloseReason>();

@@ -29,6 +29,7 @@ enum Node {
 enum Reason {
     Sensitive(ContentKind),
     Unclassified,
+    Structural,
     Invalid,
 }
 
@@ -265,6 +266,9 @@ pub(super) fn provenance(
             winner: safe_source(f, winner),
             shadowed: shadowed.iter().map(|s| safe_source(f, s)).collect(),
         },
+        Some(f) if f.boundary.is_none() && f.value_class == Sensitivity::Aggregate => {
+            Origin::Redacted(Reason::Structural)
+        }
         Some(f) if f.boundary.is_none() && f.value_class != Sensitivity::Opaque => {
             Origin::Redacted(Reason::Sensitive(f.content_kind))
         }

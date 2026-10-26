@@ -815,9 +815,10 @@ pub enum KeyDiagnosticKind {
     Unknown,
 }
 
-/// A config diagnostic about one key. `key` is dotted and canonical
-/// (`msg.future`, `peers.summary_command`, `toast`), so the same key reported
-/// by the loader and by the source scan compares equal.
+/// A config diagnostic with a safe canonical schema location. Unknown names
+/// stop at the nearest declared container, map entries use `<key>`, arrays use
+/// `[]`, and unknown roots use `document root`. Removed historical keys keep
+/// their closed schema spelling so loader/source-scan warnings compare equal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyDiagnostic {
     pub kind: KeyDiagnosticKind,
