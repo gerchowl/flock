@@ -1,7 +1,6 @@
 use super::*;
 use crate::test_support::TempDir;
 use axum::{extract::ConnectInfo, routing::get};
-use futures_util::FutureExt;
 use std::{future::Future, os::fd::AsRawFd, os::unix::fs::PermissionsExt, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -54,9 +53,15 @@ async fn prepares_private_socket_without_serving_until_explicit_activation() {
             & 0o777,
         0o600
     );
-    let mut socket = request(&listener.path).await;
-    let mut byte = [0];
-    assert!(socket.read(&mut byte).now_or_never().is_none());
+    let socket = request(&listener.path).await;
+    assert!(
+        listener.task.is_none(),
+        "preparation must not start a serve task before handoff commit"
+    );
+    assert!(
+        listener.prepared.is_some(),
+        "the acceptor stays parked until explicit activation"
+    );
     listener.activate();
     let text = response(socket).await;
     assert!(text.starts_with("HTTP/1.1 200"), "{text}");
@@ -241,4 +246,67 @@ async fn unsafe_parent_is_refused_before_creating_any_path() {
     std::os::unix::fs::symlink(&directory, &alias).unwrap();
     assert!(Listener::prepare(alias.join("native.sock"), None, Router::new()).is_err());
     assert!(std::fs::read_dir(directory).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn inherited_owner_reclaims_a_stale_socket_before_binding() {
+    let root = TempDir::socket();
+    let path = root.path().join("native.sock");
+    let owner = SocketOwner::acquire(&path).unwrap();
+    let abandoned = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    drop(abandoned);
+    assert!(
+        path.exists(),
+        "the abandoned binding is the real input to prepare"
+    );
+    let mut importer = Listener::prepare(
+        path.clone(),
+        Some(owner),
+        Router::new().route("/", get(|| async { "imported" })),
+    )
+    .unwrap();
+    assert!(importer.task.is_none());
+    assert_eq!(
+        SocketOwner::acquire(&path).unwrap_err().kind(),
+        io::ErrorKind::AddrInUse
+    );
+    importer.activate();
+    assert!(response(request(&path).await).await.ends_with("imported"));
+    importer.stop().await;
+    drop(importer);
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn inherited_owner_refuses_a_non_socket_without_changing_it() {
+    let root = TempDir::socket();
+    let path = root.path().join("native.sock");
+    let owner = SocketOwner::acquire(&path).unwrap();
+    std::fs::write(&path, "preserved stale file").unwrap();
+    let error = Listener::prepare(path.clone(), Some(owner), Router::new())
+        .err()
+        .expect("inherited ownership does not authorize removing a regular file");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "preserved stale file"
+    );
+}
+
+#[tokio::test]
+async fn inherited_owner_refuses_a_different_path_before_creating_it() {
+    let root = TempDir::socket();
+    let owned_path = root.path().join("owned.sock");
+    let requested_path = root.path().join("other.sock");
+    let owner = SocketOwner::acquire(&owned_path).unwrap();
+    let error = Listener::prepare(requested_path.clone(), Some(owner.clone()), Router::new())
+        .err()
+        .expect("a guard for another pathname cannot authorize this listener");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(!requested_path.exists());
+    assert!(!requested_path.with_extension("sock.lock").exists());
+    assert_eq!(
+        SocketOwner::acquire(&owned_path).unwrap_err().kind(),
+        io::ErrorKind::AddrInUse
+    );
 }
