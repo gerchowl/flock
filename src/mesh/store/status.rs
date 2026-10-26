@@ -190,7 +190,11 @@ impl<D: DiskSpace> Store<D> {
                 let Some(answer) = self.get(&answer_key)? else {
                     continue;
                 };
-                if !matches!(answer.state.as_str(), "inbox" | "read") {
+                // Native journal admission settles answers as delivered. That
+                // custody state must not hide their retained reply payload.
+                if !matches!(answer.state.as_str(), "inbox" | "read" | "delivered")
+                    || answer.envelope.body.is_empty()
+                {
                     continue;
                 }
                 let envelope = answer.envelope;

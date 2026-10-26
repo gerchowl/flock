@@ -5612,3 +5612,72 @@ fn custody_round2_proven_correction_is_bounded_by_outcome_retention() {
     assert!(store.get(&mail.key).unwrap().is_none());
 }
 mod diamond;
+
+#[test]
+fn native_reply_status_covers_inbox_delivered_and_read() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    let mut answer = envelope();
+    answer.request_key = Some(request.key.clone());
+    answer.in_reply_to = Some(request.correlation_id.clone());
+    answer.correlation_id = "native-answer".into();
+    answer.body = serde_json::to_vec(&serde_json::json!({"message":{"body":"answer"}})).unwrap();
+    store
+        .accept_local(&answer, CUSTODY_TTL_MS, "native", "session", 0)
+        .unwrap();
+    for state in ["inbox", "delivered", "read"] {
+        if state == "delivered" {
+            store.settle_queue_admission(&answer.key, None, 1).unwrap();
+        } else if state == "read" {
+            store.finish(&answer.key, Outcome::Read, 2).unwrap();
+        }
+        let status = store
+            .status(&request.key.origin_node, &request.correlation_id, 2)
+            .unwrap()
+            .unwrap();
+        let reply = status
+            .reply
+            .unwrap_or_else(|| panic!("native answer disappeared in {state}"));
+        assert_eq!(reply.body, "answer");
+        assert_eq!(reply.correlation_id, answer.correlation_id);
+        assert_eq!(store.get(&answer.key).unwrap().unwrap().state, state);
+    }
+}
+
+#[test]
+fn native_reply_status_does_not_restore_an_expired_payload() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let request = envelope();
+    store
+        .accept(&request, CUSTODY_TTL_MS, Admission::Inbox, 0)
+        .unwrap();
+    let mut answer = envelope();
+    answer.request_key = Some(request.key.clone());
+    answer.correlation_id = "native-answer".into();
+    store
+        .accept_local(&answer, CUSTODY_TTL_MS, "native", "session", 0)
+        .unwrap();
+    store.settle_queue_admission(&answer.key, None, 1).unwrap();
+    // Persisted correction can prove delivery after expiry already purged body.
+    // This fixture represents that payload-less retained outcome, not new mail.
+    store
+        .connection
+        .execute(
+            "UPDATE envelopes SET body=X'' WHERE origin=?1 AND id=?2",
+            params![answer.key.origin_node, answer.key.message_id],
+        )
+        .unwrap();
+    let status = store
+        .status(&request.key.origin_node, &request.correlation_id, 2)
+        .unwrap()
+        .unwrap();
+    assert!(
+        status.reply.is_none(),
+        "deleted reply payload must stay unavailable"
+    );
+}
