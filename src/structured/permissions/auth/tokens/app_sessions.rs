@@ -137,10 +137,16 @@ impl Store {
             return Err(TokenError::Unsafe.into());
         }
         let principal = self.files.random::<16>()?;
+        let issued_at = self.clock.now();
+        let expires = issued_at + TTL;
         let info = TokenInfo {
             name: format!("app:{principal}"),
             principal,
             scopes: operator_scopes(),
+            expires_in_ms: Some(
+                u64::try_from(expires.duration_since(issued_at).as_millis())
+                    .map_err(|_| TokenError::Unsafe)?,
+            ),
         };
         let (revoke, revoked) = watch::channel(false);
         entries.insert(
@@ -148,7 +154,7 @@ impl Store {
             Entry {
                 session: Session {
                     info: info.clone(),
-                    expires: self.clock.now() + TTL,
+                    expires,
                     process,
                     revoked,
                     digest,

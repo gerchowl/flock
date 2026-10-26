@@ -342,3 +342,29 @@ fn an_exited_prearmed_peer_cannot_receive_a_credential() {
     ));
     assert!(store.entries.lock().unwrap().is_empty());
 }
+
+#[test]
+fn issued_lifetime_matches_enforced_deadline_in_the_injected_clock() {
+    let (_root, files, store, clock, mut app) = fixture();
+    let authority = app.client_token_authority().unwrap();
+    for elapsed in [Duration::ZERO, Duration::from_millis(1731)] {
+        clock.advance(elapsed);
+        let issue_time = clock.now();
+        let issued = store.issue(&authority).unwrap();
+        let session = store.authenticate(&issued.token).unwrap();
+        let expected =
+            u64::try_from(session.expires.duration_since(issue_time).as_millis()).unwrap();
+        let wire = serde_json::to_value(&issued).unwrap();
+        assert_eq!(wire["info"]["expires_in_ms"].as_u64(), Some(expected));
+        assert_eq!(session.expires, issue_time + TTL);
+    }
+    let file = files
+        .issue(&authority, "persistent", [Scope::Read].into())
+        .unwrap();
+    assert!(serde_json::to_value(file).unwrap()["info"]
+        .get("expires_in_ms")
+        .is_none());
+    let old = serde_json::json!({"name":"old","principal":"old-principal","scopes":["read"]});
+    let info: TokenInfo = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(serde_json::to_value(info).unwrap(), old);
+}

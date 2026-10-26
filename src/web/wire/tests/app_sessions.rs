@@ -370,3 +370,34 @@ fn shutdown_revoke_failure_still_stops_drains_and_closes_live_sessions() {
     });
     assert!(logs.contains("client.app.revocation_failed"), "{logs}");
 }
+
+#[test]
+fn socket_mint_reports_remaining_lifetime_from_the_store_clock() {
+    runtime(async {
+        let (server, mut app, owner) = fixture().await;
+        server.clock.advance(1731);
+        let issue_time = server.clock.now();
+        let reply = dispatch(&mut app, json!({}), |_| {}).await;
+        let issued = &reply["result"]["issued"];
+        let token: Bearer = serde_json::from_value(issued["token"].clone()).unwrap();
+        let store = owner
+            .get(
+                server._root.path(),
+                Arc::new(AppClock(Arc::new(server.clock.clone()))),
+            )
+            .unwrap();
+        let session = store.authenticate(&token).unwrap();
+        let expected = u64::try_from(
+            session
+                .app()
+                .unwrap()
+                .expires
+                .duration_since(issue_time)
+                .as_millis(),
+        )
+        .unwrap();
+        assert_eq!(issued["info"]["expires_in_ms"].as_u64(), Some(expected));
+        within(server.core.shutdown()).await.unwrap();
+        server.finish().await;
+    });
+}

@@ -239,6 +239,7 @@ impl TokenStore {
             name: name.into(),
             principal: r.principal.clone(),
             scopes: r.scopes.clone(),
+            expires_in_ms: None,
         }
     }
     fn save(&self, name: &str, record: &Record, replace: bool) -> Result<(), TokenError> {
