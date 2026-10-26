@@ -20,6 +20,9 @@ use tracing::info;
 
 #[cfg(unix)]
 const HANDOFF_VERSION: u32 = 1;
+/// Two locked open descriptions follow the optional TCP listener and PTYs.
+#[cfg(unix)]
+pub(crate) const SOCKET_OWNER_HANDOFF_VERSION: u32 = 3;
 /// Descriptor extension: old receivers must refuse before ready, even with zero PTYs.
 #[cfg(unix)]
 pub(crate) const CLIENT_LISTENER_HANDOFF_VERSION: u32 = 2;
@@ -74,6 +77,9 @@ pub(crate) struct HandoffManifest {
     /// One listening TCP descriptor follows the PTY descriptors when present.
     #[serde(default)]
     pub client_listener: bool,
+    /// API then terminal socket ownership; retained through public socket rebind.
+    #[serde(default)]
+    pub socket_owners: bool,
     /// Operator drafts kept in panes' stashes (#850), so a handoff does not
     /// drop them. Absent from an older server's manifest.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -465,8 +471,15 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
     let manifest_line = read_line_unbuffered(stream)?;
     let manifest: HandoffManifest = serde_json::from_str(&manifest_line)
         .map_err(|err| io::Error::other(format!("handoff manifest deserialize failed: {err}")))?;
-    if ![HANDOFF_VERSION, CLIENT_LISTENER_HANDOFF_VERSION].contains(&manifest.version)
-        || manifest.client_listener != (manifest.version == CLIENT_LISTENER_HANDOFF_VERSION)
+    if ![
+        HANDOFF_VERSION,
+        CLIENT_LISTENER_HANDOFF_VERSION,
+        SOCKET_OWNER_HANDOFF_VERSION,
+    ]
+    .contains(&manifest.version)
+        || (manifest.version != SOCKET_OWNER_HANDOFF_VERSION
+            && manifest.client_listener != (manifest.version == CLIENT_LISTENER_HANDOFF_VERSION))
+        || manifest.socket_owners != (manifest.version == SOCKET_OWNER_HANDOFF_VERSION)
     {
         return Err(io::Error::other(format!(
             "unsupported handoff version {}",
@@ -515,7 +528,9 @@ fn receive_after_token(stream: &mut UnixStream) -> io::Result<(HandoffManifest, 
     }
     let fds = recv_fds(
         stream,
-        manifest.panes.len() + usize::from(manifest.client_listener),
+        manifest.panes.len()
+            + usize::from(manifest.client_listener)
+            + 2 * usize::from(manifest.socket_owners),
     )?;
     Ok((manifest, fds))
 }
@@ -567,6 +582,7 @@ pub(crate) fn manifest_for(
         panes,
         kept_drafts: Default::default(),
         client_listener: false,
+        socket_owners: false,
     }
 }
 
@@ -860,6 +876,51 @@ pub(crate) fn log_import_result(panes: usize) {
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn socket_ownership_survives_fd_transfer_exporter_close_and_rebind() {
+        use std::os::fd::AsRawFd;
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("flock-ws.sock");
+        let owner = crate::ipc::prepare_socket_path(&path, |_| "busy".into()).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let fd = owner.duplicate().unwrap();
+        send_fds(&sender, &[std::os::fd::AsRawFd::as_raw_fd(&fd)]).unwrap();
+        drop(fd);
+        let mut received = recv_fds(&receiver, 1).unwrap();
+        let imported = crate::ipc::SocketOwner::take(&path, &mut received).unwrap();
+        assert_eq!(
+            crate::ipc::SocketOwner::acquire(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        drop(listener);
+        drop(owner);
+        assert_eq!(
+            crate::ipc::SocketOwner::acquire(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        imported.prepare(&path).unwrap();
+        let rebound = UnixListener::bind(&path).unwrap();
+        assert_eq!(
+            crate::ipc::SocketOwner::acquire(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        let identity = crate::ipc::socket_file_identity(&path).unwrap();
+        crate::ipc::remove_socket_file_if_owned(&path, identity).unwrap();
+        drop(rebound);
+        drop(imported);
+        let _next = crate::ipc::SocketOwner::acquire(&path).unwrap();
+        // Ownership descriptors always remain close-on-exec when duplicated or received.
+        let owned = _next.duplicate().unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+    }
+
     use super::*;
     use std::io::Read;
     use std::os::unix::net::UnixStream;

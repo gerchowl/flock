@@ -44,6 +44,29 @@ pub(crate) fn read_ready(
     }
 }
 
+/// Open a permanent, private ownership file without following symbolic links.
+pub(crate) fn open_owner(path: &std::path::Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Nonblocking exclusive ownership, shared across duplicated handoff descriptors.
+/// Close the last descriptor to release it: explicit LOCK_UN would unlock successors.
+pub(crate) fn lock_owner(file: &std::fs::File) -> io::Result<()> {
+    // SAFETY: flock borrows this open file and does not take descriptor ownership.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 /// Nonblocking liveness probe for an existing pathname socket.
 /// Success is live; errors alone do not prove staleness (#2531).
 /// Return kernel evidence without waiting or retrying; a full live backlog can refuse.
@@ -112,20 +135,38 @@ mod lifecycle_tests {
         let worker = std::thread::spawn(move || {
             let root = crate::test_support::TempDir::socket();
             let path = root.path().join("backlog.sock");
+            let _owner = crate::ipc::prepare_socket_path(&path, |_| "busy".into()).unwrap();
             let listener = UnixListener::bind(&path).unwrap();
             // SAFETY: the fixture owns this live listener; shrinking its queue is local.
             assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
             for admitted in 0..128 {
-                match crate::ipc::prepare_socket_path(&path, |_| "fixture listener busy".into()) {
-                    Err(error) if error.kind() == io::ErrorKind::AddrInUse => (),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock
-                        || error.raw_os_error() == Some(libc::EINPROGRESS) => {
-                        assert!(admitted > 0, "the live listener must first accept a probe");
-                        assert!(path.exists(), "uncertain probe must preserve the listener");
+                match probe_listener(&path) {
+                    Ok(()) => (),
+                    Err(error) => {
+                        assert!(
+                            admitted > 0,
+                            "the backlog first admitted a connection: {error}"
+                        );
+                        assert!(
+                            matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionRefused
+                            ) || error.raw_os_error() == Some(libc::EINPROGRESS),
+                            "unexpected backlog error: {error}"
+                        );
+                        assert_eq!(
+                            crate::ipc::prepare_socket_path(&path, |_| "busy".into())
+                                .unwrap_err()
+                                .kind(),
+                            io::ErrorKind::AddrInUse
+                        );
+                        assert!(
+                            path.exists(),
+                            "full backlog must preserve the live listener"
+                        );
                         done.send(()).unwrap();
                         return;
                     }
-                    other => panic!("live socket removed or misclassified after {admitted} probes: {other:?}; path_exists={}", path.exists()),
                 }
             }
             panic!("fixture backlog did not fill within its bounded admission count");

@@ -3789,3 +3789,34 @@ The welcome is an advisory snapshot, not an authorization lease. Every command
 and subscription still checks current authority at admission, including scope
 changes and revocation after the welcome. Browser command holding according to
 this advertisement is tracked separately in [#2464](https://github.com/gerchowl/flock/issues/2464).
+
+### Pathname listener ownership (#2531)
+
+`SocketOwner::acquire` takes a nonblocking exclusive `flock` on a permanent
+sibling `<socket>.lock` before bind or stale-path reclamation. This applies to
+`flock.sock`, the terminal client socket, and the UDS WebSocket listener when
+introduced. The lock file is operator-owned, regular, single-link, mode `0600`,
+opened with `O_CLOEXEC | O_NOFOLLOW`; it is never unlinked. The containing
+directory must exclude entry replacement by other users. Contention reports
+busy and never removes a socket, even with a full accept backlog. Connection
+probes are not proof of staleness. Once ownership is acquired,
+`SocketOwner::prepare` checks socket type, owner, and device/inode before removing
+an abandoned pathname. Symlinks, foreign ownership, and replacement entries
+are refused rather than followed or removed.
+
+The lock follows the **open file description**, including across SCM_RIGHTS.
+`perform_live_handoff` sends the API and terminal ownership descriptors after
+PTYs and the optional TCP listener, under handoff manifest version 3. Older
+importers refuse that version before transfer. `run_handoff_import_server`
+adopts both descriptors before acknowledging restoration or rebinding the
+public paths; the exporter retains its descriptors for rollback. Public Unix
+listeners are rebound under those same locks; TCP retains its listening fd.
+`restore_public_sockets_after_failed_handoff` also reuses the retained locks.
+There is no unlocked interval during either transition. This changes only the
+internal handoff manifest, not the mesh protocol.
+
+Cleanup removes only the recorded socket inode while still holding ownership.
+The final descriptor close releases the lock on shutdown or process death.
+There is deliberately no explicit `LOCK_UN`: that would release the shared lock
+while an importing process still owns it. Ownership guarantees apply to
+listeners implementing this protocol; older releases do not hold these locks.

@@ -68,7 +68,7 @@ pub(crate) fn derive_client_socket_from_api_socket(api_socket_path: &Path) -> Pa
 /// Prepares a socket path for binding: creates parent directories,
 /// removes stale socket files where no server is listening, and rejects live
 /// sockets that are already in use.
-pub(crate) fn prepare_socket_path(path: &Path) -> io::Result<()> {
+pub(crate) fn prepare_socket_path(path: &Path) -> io::Result<crate::ipc::SocketOwner> {
     crate::ipc::prepare_socket_path(path, |path| {
         format!(
             "flk server is already running (socket busy at {})",
@@ -169,6 +169,7 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let socket_path = dir.join("live.sock");
 
+        let _owner = prepare_socket_path(&socket_path).unwrap();
         let _listener = UnixListener::bind(&socket_path).expect("bind");
 
         let result = prepare_socket_path(&socket_path);

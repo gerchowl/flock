@@ -220,6 +220,7 @@ pub struct HeadlessServer {
     client_wire: Option<crate::web::client_listener::Listener>,
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
+    client_socket_owner: crate::ipc::SocketOwner,
     clients: HashMap<u64, ClientConnection>,
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
@@ -575,16 +576,33 @@ impl HeadlessServer {
     /// 2. Binds the client socket listener
     /// 3. Returns the server ready to run
     pub fn new(
+        app: app::App,
+        config_diagnostics: &[String],
+        api_tx: Option<api::ApiRequestSender>,
+        api_server: Option<api::ServerHandle>,
+    ) -> io::Result<Self> {
+        Self::new_owned(app, config_diagnostics, api_tx, api_server, None)
+    }
+
+    /// Import or restore under the existing socket ownership description.
+    fn new_owned(
         mut app: app::App,
         config_diagnostics: &[String],
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
+        inherited: Option<crate::ipc::SocketOwner>,
     ) -> io::Result<Self> {
         app.state.app_client_attached = false;
         app.initialize_mesh_mail(api_server.as_ref())
             .map_err(io::Error::other)?;
         let client_path = client_socket_path();
-        prepare_socket_path(&client_path)?;
+        let client_socket_owner = match inherited {
+            Some(owner) => {
+                owner.prepare(&client_path)?;
+                owner
+            }
+            None => prepare_socket_path(&client_path)?,
+        };
 
         let listener = UnixListener::bind(&client_path)?;
         restrict_socket_permissions(&client_path)?;
@@ -616,6 +634,7 @@ impl HeadlessServer {
             client_wire: None,
             client_socket_path: client_path,
             client_socket_identity,
+            client_socket_owner,
             clients: HashMap::new(),
             next_client_id: 1,
             foreground_client_id: None,
@@ -1427,6 +1446,8 @@ impl HeadlessServer {
                 manifest.version = crate::server::handoff::CLIENT_LISTENER_HANDOFF_VERSION;
             }
         }
+        manifest.socket_owners = true;
+        manifest.version = crate::server::handoff::SOCKET_OWNER_HANDOFF_VERSION;
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
             &socket_path,
@@ -1454,6 +1475,14 @@ impl HeadlessServer {
                 use std::os::fd::IntoRawFd;
                 fds.push(crate::platform::client_listener::duplicate(&wire.socket)?.into_raw_fd());
             }
+            use std::os::fd::IntoRawFd;
+            let api_owner = &self
+                .api_server
+                .as_ref()
+                .ok_or_else(|| io::Error::other("handoff requires API socket ownership"))?
+                .socket_owner;
+            fds.push(api_owner.duplicate()?.into_raw_fd());
+            fds.push(self.client_socket_owner.duplicate()?.into_raw_fd());
             Ok::<(), io::Error>(())
         })();
         if let Err(err) = duplicate_result {
@@ -1500,8 +1529,6 @@ impl HeadlessServer {
 
         if let Some(api_server) = &self.api_server {
             let _ = api_server.remove_socket_file_if_owned();
-        } else {
-            let _ = std::fs::remove_file(crate::api::socket_path());
         }
         let _ = remove_socket_file_if_owned(&self.client_socket_path, self.client_socket_identity);
         if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
@@ -1581,7 +1608,7 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
-        let api_server = api::server::start_server_with_capabilities_and_health(
+        let api_server = api::server::start_server_owned(
             api_tx,
             self.app.event_hub.clone(),
             Some(crate::api::schema::ServerCapabilities {
@@ -1596,10 +1623,13 @@ impl HeadlessServer {
             }),
             self.app.runtime_config.uid_policy.clone(),
             self.client_wire_health.clone(),
+            self.api_server
+                .as_ref()
+                .map(|server| server.socket_owner.clone()),
         )?;
 
         let client_path = client_socket_path();
-        prepare_socket_path(&client_path)?;
+        self.client_socket_owner.prepare(&client_path)?;
         let listener = UnixListener::bind(&client_path)?;
         restrict_socket_permissions(&client_path)?;
         let client_socket_identity = socket_file_identity(&client_path)?;
@@ -4334,6 +4364,13 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     init_logging();
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
+    let (api_owner, client_owner) = if received.manifest.socket_owners {
+        let client = crate::ipc::SocketOwner::take(&client_socket_path(), &mut received.fds)?;
+        let api = crate::ipc::SocketOwner::take(&api::socket_path(), &mut received.fds)?;
+        (Some(api), Some(client))
+    } else {
+        (None, None)
+    };
     #[cfg(feature = "web")]
     let wire_listener = if received.manifest.client_listener {
         Some(
@@ -4414,16 +4451,19 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         }
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
-        let api_server = api::start_server(
+        let api_server = api::server::start_server_for_mode_owned(
             api_tx.clone(),
             event_hub.clone(),
+            true,
             app.runtime_config.uid_policy.clone(),
+            api_owner,
         )?;
-        let mut server = HeadlessServer::new(
+        let mut server = HeadlessServer::new_owned(
             app,
             &loaded_config.diagnostics,
             Some(api_tx.clone()),
             Some(api_server),
+            client_owner,
         )?;
         #[cfg(feature = "web")]
         if let Err(err) = server.prepare_client_wire(wire_listener).await {
@@ -5416,6 +5456,7 @@ mod tests {
         let socket_path = dir.join("client.sock");
         let _ = fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).expect("bind test listener");
+        let client_socket_owner = crate::ipc::SocketOwner::acquire(&socket_path).unwrap();
         let client_socket_identity =
             socket_file_identity(&socket_path).expect("test listener socket identity");
         listener
@@ -5434,6 +5475,7 @@ mod tests {
             client_wire: None,
             client_socket_path: socket_path,
             client_socket_identity,
+            client_socket_owner,
             clients: HashMap::new(),
             next_client_id: 1,
             foreground_client_id: None,
