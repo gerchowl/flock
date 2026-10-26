@@ -21,9 +21,9 @@ pub(crate) struct AppQueue {
     pub(crate) app: App,
     pub(crate) case: Case,
     pub(crate) notify: Arc<Notify>,
-    pub(super) driver: UnixStream,
-    pub(super) hub: EventHub,
-    pub(super) log: std::path::PathBuf,
+    pub(crate) driver: UnixStream,
+    pub(crate) hub: EventHub,
+    pub(crate) log: std::path::PathBuf,
 }
 impl AppQueue {
     pub(crate) async fn new(n: u32, seed: impl FnOnce(&Case) -> NonZeroU64) -> Self {
@@ -93,7 +93,7 @@ impl AppQueue {
         })
         .await;
     }
-    pub(super) fn facts(&self) -> Vec<(u64, QueueItemState)> {
+    pub(crate) fn facts(&self) -> Vec<(u64, QueueItemState)> {
         self.hub
             .events_after(0)
             .expect("fixture event history is retained")
@@ -106,6 +106,67 @@ impl AppQueue {
     }
     pub(crate) fn control(&mut self, value: Value) {
         writeln!(self.driver, "{value}").unwrap();
+    }
+    pub(crate) fn inputs(&self) -> Vec<Value> {
+        let path = self
+            .case
+            .fixture
+            .root
+            .path()
+            .join("sessions")
+            .join(&self.case.id)
+            .join(format!("{}.jsonl", self.case.session));
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+            .map(|line| {
+                let record: Value = serde_json::from_str(line).unwrap();
+                serde_json::from_str::<Value>(record["raw"].as_str().unwrap()).unwrap()
+            })
+            .filter(|v| v["type"] == "fixture_input")
+            .collect()
+    }
+    pub(crate) async fn restart(&mut self, before_ready: impl FnOnce(&mut Self)) {
+        let socket = self.case.fixture.root.path().join("queue.sock");
+        fs::remove_file(&socket).unwrap();
+        let listener = UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let launch = Launch {
+            opening_turn: None,
+            storage: Default::default(),
+            admission: None,
+            agent_id: self.case.id.clone(),
+            generation: self.case.generation,
+            leases: self.case.leases.clone(),
+            state: self.case.fixture.root.path().to_owned(),
+            mcp: self.case.fixture.mcp(),
+            stall_after: STALL,
+            queue_rewrite_bytes: max_policy(),
+            lineage: None,
+        };
+        self.case.generation = self
+            .app
+            .structured_workers
+            .start(
+                &mut self.app.state.structured_agents,
+                launch,
+                self.case.factory("queue", vec![]),
+            )
+            .unwrap();
+        before_ready(self);
+        let mut driver = None;
+        self.until(|_| match listener.accept() {
+            Ok((stream, _)) => {
+                driver = Some(stream);
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
+            Err(e) => panic!("restart handshake: {e}"),
+        })
+        .await;
+        self.driver = driver.unwrap();
+        self.driver.set_write_timeout(Some(LIMIT)).unwrap();
     }
     pub(crate) async fn stop(&mut self) {
         self.app
@@ -125,7 +186,7 @@ impl AppQueue {
 pub(crate) fn max_policy() -> NonZeroU64 {
     NonZeroU64::new(u64::MAX).unwrap()
 }
-pub(super) fn id(n: u32) -> String {
+pub(crate) fn id(n: u32) -> String {
     format!("00000000-0000-4000-8000-{n:012}")
 }
 
