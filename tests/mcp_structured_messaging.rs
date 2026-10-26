@@ -252,13 +252,32 @@ fn structured_to_structured_to_reply() {
     exchange(node, &mut sender, node, &mut recipient, "native-native");
 }
 #[test]
-#[ignore = "blocked on #2474"]
 fn remote_structured_recipient_replies_to_the_other_node() {
-    // TODO(#2474): enable with bounded native-peer discovery readiness.
     let fleet = setup(NODES);
     let a = fleet.node("nodea");
     let b = fleet.node("nodeb");
     let mut sender = Bridge::start(b, "terminal", false);
     let mut recipient = Bridge::start(a, "native", true);
+    let deadline = Instant::now() + LIMIT;
+    // Discovery is asynchronous. Observe the actual MCP directory before
+    // sending once, rather than retrying a message whose effect is unknown.
+    loop {
+        let listing = sender.tool("flock_agent_list", json!({}));
+        if let Some(row) = listing["fleet"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["agent_id"] == recipient.agent)
+        {
+            assert_eq!(row["runtime"], "structured");
+            assert_eq!(row["local"], false);
+            assert!(row.get("pane_id").is_none());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remote native discovery absent: {listing}"
+        );
+    }
     exchange(b, &mut sender, a, &mut recipient, "remote-native");
 }
