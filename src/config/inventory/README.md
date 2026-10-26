@@ -80,18 +80,25 @@ before that work is complete.
   does not retarget. `spawn` and `spawn.env` are `AppLive`:
   #2399 copies valid policy for subsequent starts and resumes, without changing
   existing process environments or stored launch snapshots. `msg` is `Mixed`:
-  most leaves are read live by server operations, but
-  `msg.channel_push_body_max_bytes` and `msg.channel_push_reconnect_secs` are
-  `CommandStartup`, read only into `ChannelOptions` at MCP startup.
-  `msg.channel_push` is itself `Mixed`: server operations read it live, while
-  an existing MCP session retains its startup capability. Invalid sections keep
+  most leaves are read live by server operations. The captured `ChannelOptions`
+  leaves (`msg.channel_push`, `msg.channel_push_body_max_bytes` and
+  `msg.channel_push_reconnect_secs`) are `Mixed`: #2400 reads their effective
+  values during live reload to report MCP restart requirements, while the MCP
+  process captures its own options at command startup. The comparison is an
+  advisory read, not an update of any existing MCP session. `channel_push` also
+  controls live server operations. Invalid sections keep
   their running values. Restart the MCP process to refresh captured options.
   The msg/spawn consumer guard follows production App/MCP modules, reference
   aliases and reachable config helper methods, deriving each leaf's owner from
   actual readers and requiring the section's live copy where applicable.
   A field read both live and at command startup is `Mixed`. The guard verifies
   the MCP constructor receives its section from `Config::load` at command
-  startup. It is a focused syntax audit, not general Rust type/dataflow
+  startup or from a proven live config binding/typed `&Config` argument during
+  reload. Unknown constructor inputs still fail closed, and command loads must
+  remain in the startup entry. Whole-section derived `Clone` calls are copy
+  evidence rather than leaf consumer reads; their derives come from the same
+  declaration graph as the inventory. A mutation regression rejects startup-only
+  labels for either live-compared MCP limit. It is a focused syntax audit, not general Rust type/dataflow
   inference: new reader shapes require evidence support rather than a guessed
   owner. The reverse copy-set check rejects a startup-only root section that
   gains a live copy without review. `checks`, `fleet` and `structured` remain
