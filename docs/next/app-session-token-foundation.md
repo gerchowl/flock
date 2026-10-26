@@ -84,3 +84,25 @@ retain exactly their current grants, including send-only credentials. Watch or
 store I/O failures remain distinct from process-instance refusal. This primitive
 is staged for the sibling-listener integration in #2500; the TCP hello behavior
 switches together with that listener, not in this preparatory slice.
+
+The next preparatory slice supplies `local_listener::Listener`, reusing the
+existing HTTP server over Unix streams and capturing credentials from the
+accepted kernel socket. `prepare` binds without accepting, `activate` starts
+serving only when explicitly called, and `stop` cancels the acceptor and its
+owned HTTP tasks. Production startup does not call these methods yet, so this
+slice creates no new reachable endpoint and does not change TCP authentication.
+Owner admission and the TCP app-session refusal will activate together in the
+following #2500 slice.
+
+`socket_path` derives `flock-ws.sock` beside `flock.sock`; an API override such
+as `custom.sock` instead derives `custom-ws.sock`, keeping separate instances
+in one directory distinct. Preparation requires an existing, real,
+operator-owned parent directory without group/other write permission. Callers
+must provide a trusted ancestor chain, as for the API socket namespace. It
+refuses unsafe parents without creating or repairing them. The socket uses the
+API's `0600` mode constant and permanent `SocketOwner` lock. `owner` retains a
+rollback reference; its duplicate can pass through the existing SCM_RIGHTS
+handoff machinery and be adopted before `prepare`. `unlink` and destruction
+remove only the recorded binding's inode. Exporter/importer orchestration and
+its manifest extension belong to the activation slice; no new descriptor is
+exported by production handoff in this foundation.

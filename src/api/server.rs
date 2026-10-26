@@ -23,7 +23,7 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const ACCEPT_UNKNOWN_ERROR_LIMIT: u64 = 5;
 
-const SOCKET_PERMISSION_MODE: u32 = 0o600;
+pub(crate) const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);

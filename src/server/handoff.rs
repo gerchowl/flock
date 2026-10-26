@@ -648,7 +648,7 @@ fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
 /// copies: a failure part-way leaves the receiver short, it refuses, and the
 /// kernel closes whatever was still in flight when the stream drops.
 #[cfg(unix)]
-fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
+pub(crate) fn send_fds(stream: &UnixStream, fds: &[RawFd]) -> io::Result<()> {
     for batch in fds.chunks(MAX_FDS_PER_BATCH) {
         send_fd_batch(stream, batch)?;
     }
@@ -702,7 +702,7 @@ fn send_tagged_fd_batch(stream: &UnixStream, fds: &[RawFd], tag: u8) -> io::Resu
 /// the moment it arrives, so any refusal, including one part-way through a
 /// batch, closes all of them rather than leaking into the importer.
 #[cfg(unix)]
-fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
+pub(crate) fn recv_fds(stream: &UnixStream, expected: usize) -> io::Result<Vec<RawFd>> {
     let mut out = Vec::with_capacity(expected);
     match recv_fds_into(stream, expected, &mut out) {
         Ok(()) => Ok(out),
