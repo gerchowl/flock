@@ -121,8 +121,9 @@ impl Store {
     pub(crate) fn issue_watched(
         &self,
         authority: &LocalOperator<'_>,
-        watch: ExitWatch,
+        watch: impl Into<Arc<ExitWatch>>,
     ) -> Result<Issued, IssueError> {
+        let watch = watch.into();
         if !watch.matches(authority.peer_credentials())
             || watch.exited().map_err(IssueError::PeerProcessChanged)?
         {
@@ -130,7 +131,7 @@ impl Store {
                 "peer watch does not match authority",
             )));
         }
-        let process = Arc::new(watch);
+        let process = watch;
         let _guard = self.files.lock()?;
         let mut entries = self.entries.lock().map_err(|_| TokenError::Unsafe)?;
         Self::sweep_entries(&mut entries, self.clock.now())?;

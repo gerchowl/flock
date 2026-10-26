@@ -1,0 +1,1 @@
+- Require complete local operator and live process evidence for app credential minting, and prepare fenced process-bound admission for the local WebSocket listener.

@@ -99,6 +99,29 @@ pub(crate) fn dedicated_uid() -> io::Result<Option<u32>> {
     Ok((!found.is_null()).then_some(entry.pw_uid))
 }
 
+/// At most sixteen stable process links are supported for strict operator proof.
+/// Unknown parents, reused ancestors, cycles, or a truncated chain refuse proof.
+pub(crate) fn complete_ancestry(pid: u32) -> bool {
+    let mut current = pid;
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..16 {
+        if current <= 1 {
+            return true;
+        }
+        if !seen.insert(current) {
+            return false;
+        }
+        let Some((parent, birth)) = super::live_process_facts(current) else {
+            return false;
+        };
+        if super::process_start_time(current) != Some(birth) {
+            return false;
+        }
+        current = parent;
+    }
+    current <= 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

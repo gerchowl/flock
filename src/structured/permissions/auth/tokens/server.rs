@@ -30,6 +30,30 @@ impl Session {
         }
     }
 }
+/// Process-instance mismatch stays distinct from token/store failures.
+#[derive(Debug)]
+pub(crate) enum PeerAdmissionError {
+    /// Preserve storage, revocation and scope errors for the transport's existing mapping.
+    Token(TokenError),
+    /// Registered identity-proof refusal, including app hello without a local peer.
+    PeerProcessChanged,
+}
+impl From<TokenError> for PeerAdmissionError {
+    fn from(error: TokenError) -> Self {
+        Self::Token(error)
+    }
+}
+impl std::fmt::Display for PeerAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token(error) => std::fmt::Display::fmt(error, f),
+            Self::PeerProcessChanged => {
+                f.write_str(crate::api::error_code::ErrorCode::PeerProcessChanged.as_str())
+            }
+        }
+    }
+}
+impl std::error::Error for PeerAdmissionError {}
 /// One memory domain shared by socket minting and every transport admission.
 pub(crate) struct Store {
     files: Arc<TokenStore>,
@@ -54,7 +78,7 @@ impl Store {
     pub(crate) fn issue(
         &self,
         authority: &LocalOperator<'_>,
-        watch: crate::platform::process_exit::ExitWatch,
+        watch: impl Into<Arc<crate::platform::process_exit::ExitWatch>>,
     ) -> Result<Issued, app_sessions::IssueError> {
         self.apps.issue_watched(authority, watch)
     }
@@ -71,6 +95,35 @@ impl Store {
             info: session.info.clone(),
             source: Source::File(session),
         })
+    }
+
+    /// Authenticate and register under one admission/revocation fence. A local
+    /// transport supplies its sealed origin proof; TCP supplies None. App credentials
+    /// require the minting PID and birth, while file credentials retain their grants.
+    // Staged for the approved #2500 PR3 listener/core integration; tests exercise the primitive now.
+    #[allow(dead_code)]
+    pub(crate) fn admit_peer<T>(
+        &self,
+        token: &Bearer,
+        peer: Option<&crate::app::LocalPeer>,
+        register: impl FnOnce(Session) -> T,
+    ) -> Result<T, PeerAdmissionError> {
+        let _guard = self.files.lock_with(LockFile::try_lock_shared)?;
+        let session = self.authenticate(token)?;
+        let peer_exited = match peer {
+            Some(peer) => peer.process.exited().map_err(TokenError::from)?,
+            None => false,
+        };
+        if peer_exited {
+            return Err(PeerAdmissionError::PeerProcessChanged);
+        }
+        if session
+            .app()
+            .is_some_and(|app| peer.is_none_or(|p| !app.process.matches(p.credentials())))
+        {
+            return Err(PeerAdmissionError::PeerProcessChanged);
+        }
+        Ok(register(session))
     }
 
     /// Recheck the original source under its shared fence through bounded dispatch.
@@ -121,3 +174,6 @@ impl Owner {
         Ok(opened)
     }
 }
+
+#[cfg(test)]
+mod tests;

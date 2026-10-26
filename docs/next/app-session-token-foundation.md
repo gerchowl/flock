@@ -65,3 +65,19 @@ The captured shell Origin/header pair is admitted only on `/v1/ws` (#2442).
 Pre-auth UID attribution and revised budgets remain held for an owner decision
 in #2500. Existing pending-hello and connection limits are unchanged. There
 are no `desktop/` changes in this server slice.
+
+The server's transport-neutral `App::admit_local_peer` checks explicit kernel
+credentials rather than borrowing the current CLI request's caller context.
+It requires a known operator UID, the original live PID/birth, and no pane,
+structured-agent or mesh-edge origin. Complete ancestry is supported through
+sixteen stable process links, matching the pane-origin resolver; unavailable,
+reused or truncated ancestry cannot establish operator authority. The proof owns
+its exit watch, which admission rechecks before publishing any registration.
+
+`server::Store::admit_peer` holds the existing shared admission/revocation fence
+through its registration callback. Local app credentials must match the minting
+PID and birth; a missing peer proof cannot admit one. Persistent credentials
+retain exactly their current grants, including send-only credentials. Watch or
+store I/O failures remain distinct from process-instance refusal. This primitive
+is staged for the sibling-listener integration in #2500; the TCP hello behavior
+switches together with that listener, not in this preparatory slice.
