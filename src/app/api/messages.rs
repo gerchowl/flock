@@ -616,6 +616,9 @@ impl App {
     }
 
     pub(super) fn handle_msg_list(&mut self, id: String, params: MsgListParams) -> String {
+        if let Some(response) = self.native_inbox_request(&id, params.pane.as_deref(), false) {
+            return response;
+        }
         let pane_filter = match params.pane {
             Some(pane) => match self.resolve_terminal_target(&pane) {
                 Ok(resolved) => self.public_pane_id(resolved.ws_idx, resolved.pane_id),
@@ -1106,6 +1109,9 @@ impl App {
     /// emitted on the same edge, so the audit trail gets truer rather than
     /// noisier.
     pub(super) fn handle_msg_read(&mut self, id: String, params: MsgReadParams) -> String {
+        if let Some(response) = self.native_inbox_request(&id, params.pane.as_deref(), true) {
+            return response;
+        }
         let pane = match self.resolve_inbox_pane(&id, params.pane, "read") {
             Ok(pane) => pane,
             Err(refusal) => return refusal,

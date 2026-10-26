@@ -3768,6 +3768,13 @@ malformed raw data. Conditional acknowledgement winners alone receive live or
 expired entries, including when independent database connections read concurrently.
 Socket, CLI and MCP caller binding remains #2452 Part B.
 
+Part B of #2452 binds socket `msg.list`/`msg.read`, CLI and MCP to the current
+attested agent/session. Omitting a target selects structured self, preserving the
+operator global list. Native names use the directory's ambiguity refusal; targets
+cannot grant inbox ownership (`inbox_not_owner`, retry `never`). Invalid or revoked
+leases uniformly refuse as `not_authorized` before target resolution. The CLI
+reference's messaging and MCP tool sections document the shared caller contract.
+
 ### Amendment: Welcome capability grants (#2461)
 
 Clarification of §5's protocol gating and §6's operation advertisement:
