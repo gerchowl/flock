@@ -44,7 +44,7 @@ impl Entropy for FixtureEntropy {
         Ok(())
     }
 }
-fn setup() -> (SessionConfigDir, TokenStore, App) {
+pub(super) fn setup() -> (SessionConfigDir, TokenStore, App) {
     let root = SessionConfigDir::create(&std::env::temp_dir()).unwrap();
     let store = TokenStore::open_with_entropy(root.path(), FixtureEntropy(0)).unwrap();
     (root, store, operator())
@@ -625,7 +625,7 @@ fn browser_open_does_not_widen_an_existing_operator_named_token() {
     );
 }
 
-fn helper_binary() -> std::path::PathBuf {
+pub(super) fn helper_binary() -> std::path::PathBuf {
     std::env::current_exe()
         .unwrap()
         .parent()
@@ -797,4 +797,213 @@ fn completed_token_operations_release_the_lock_before_inherited_descriptors_clos
         holder.inode,
         result.err()
     );
+}
+
+#[test]
+fn revoke_waits_for_all_shared_admissions_and_fences_later_dispatch() {
+    let (root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
+    let session = store.authenticate(&issued.token).unwrap();
+    let mut other = TokenStore::open(root.path()).unwrap();
+    other.2 = helper_binary();
+    let store = Arc::new(store);
+    let mut holds = Vec::new();
+    for _ in 0..2 {
+        let (entered, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let store = store.clone();
+            let session = session.clone();
+            move || {
+                let result = store.admit(&session, Scope::Read, |_| {
+                    entered.send(true).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+                if result.is_err() {
+                    let _ = entered.send(false);
+                }
+                result
+            }
+        });
+        assert!(ready.recv_timeout(Duration::from_secs(5)).unwrap());
+        holds.push((release, worker));
+    }
+    let mut pending = other.begin_revoke("browser").unwrap();
+    assert!(priority::pending(&other.0).unwrap());
+    std::thread::scope(|scope| {
+        let (started, ready) = mpsc::channel();
+        let (done, completed) = mpsc::channel();
+        pending.guard.notify_waiting(started);
+        let revoke = scope.spawn(move || {
+            done.send(pending.finish()).unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        for (release, worker) in holds {
+            assert!(matches!(
+                completed.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                store.admit(&session, Scope::Read, |_| panic!("overtook revoke")),
+                Err(TokenError::Busy)
+            ));
+            release.send(()).unwrap();
+            worker.join().unwrap().unwrap();
+        }
+        completed
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        revoke.join().unwrap();
+    });
+    assert!(matches!(
+        store.admit(&session, Scope::Read, |_| panic!("revoked dispatch")),
+        Err(TokenError::Revoked)
+    ));
+}
+
+// The authenticated WebSocket endpoint exists only in web-enabled builds.
+#[cfg(feature = "web")]
+#[test]
+fn pending_revoke_refuses_only_the_new_subscription_and_preserves_siblings() {
+    use crate::web::wire::tests::{runtime, Received, Server, Socket};
+    runtime(async {
+        let mut server = Server::new().await;
+        let mut registry = crate::structured::registry::Registry::default();
+        let mut workers = crate::structured::workers::Workers::new(server.wake.clone());
+        Arc::get_mut(&mut server.core).unwrap().service(
+            &registry,
+            &mut workers,
+            server._root.path(),
+        );
+        let mut socket = Socket::open(&server).await;
+        socket.hello(1, &"a".repeat(64)).await;
+        socket
+            .send(serde_json::json!({"t":"sub","sub_id":"sibling","stream":"fleet"}))
+            .await;
+        assert!(matches!(socket.receive().await, Received::Text(v) if v["t"] == "gap"));
+        assert!(matches!(socket.receive().await, Received::Text(v) if v["t"] == "synced"));
+        let mut other = TokenStore::open(server._root.path()).unwrap();
+        other.2 = helper_binary();
+        let store = Arc::new(TokenStore::open(server._root.path()).unwrap());
+        let session = store.authenticate(&Bearer("a".repeat(64))).unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = mpsc::channel();
+        let held = tokio::task::spawn_blocking({
+            let store = store.clone();
+            let session = session.clone();
+            move || {
+                store.admit(&session, Scope::Read, |_| {
+                    entered.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                })
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let pending = other.begin_revoke("two").unwrap();
+        assert!(priority::pending(&other.0).unwrap());
+        socket
+            .send(serde_json::json!({"t":"sub","sub_id":"busy","stream":"fleet"}))
+            .await;
+        let refused = socket.receive().await;
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), held)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // This test isolates the pending-mutation refusal; the fence test completes revoke.
+        drop(pending);
+        assert!(
+            matches!(refused, Received::Text(v) if v["t"] == "subfail" && v["sub_id"] == "busy" && v["code"] == "session_busy")
+        );
+        registry
+            .register(crate::structured::registry::Record {
+                runtime: crate::structured::registry::StructuredRuntime::Structured,
+                agent_id: "fixture-agent".into(),
+                name: None,
+                harness: "claude".into(),
+                session_id: "fixture-session".into(),
+                cwd: server._root.path().into(),
+                model: None,
+            })
+            .unwrap();
+        Arc::get_mut(&mut server.core).unwrap().service(
+            &registry,
+            &mut workers,
+            server._root.path(),
+        );
+        assert!(
+            matches!(socket.receive().await, Received::Text(v) if v["sub_id"] == "sibling" && v["ev"]["type"] == "fleet.upsert")
+        );
+        socket
+            .send(serde_json::json!({"t":"sub","sub_id":"fresh","stream":"fleet"}))
+            .await;
+        assert!(matches!(socket.receive().await, Received::Text(v) if v["t"] == "gap"));
+        assert!(matches!(socket.receive().await, Received::Text(v) if v["t"] == "ev"));
+        assert!(matches!(socket.receive().await, Received::Text(v) if v["t"] == "synced"));
+        server.finish().await;
+    });
+}
+
+#[test]
+fn stale_intent_does_not_make_concurrent_readers_busy() {
+    let (_root, store, mut app) = setup();
+    let issued = issue(&store, &mut app, "browser", &[Scope::Read]);
+    let session = store.authenticate(&issued.token).unwrap();
+    drop(
+        store
+            .0
+            .file(&format!(".revoke-{}", "a".repeat(32)), true)
+            .unwrap(),
+    );
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            workers.push(scope.spawn(|| {
+                barrier.wait();
+                (0..300)
+                    .filter(|_| {
+                        matches!(
+                            store.admit(&session, Scope::Read, |_| ()),
+                            Err(TokenError::Busy)
+                        )
+                    })
+                    .count()
+            }));
+        }
+        let busy: usize = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .sum();
+        assert_eq!(busy, 0, "stale intent caused admission-vs-admission Busy");
+    });
+}
+
+#[test]
+fn startup_sweeps_stale_intents_but_preserves_live_revokers() {
+    let (root, store, _app) = setup();
+    let name = format!(".revoke-{}", "a".repeat(32));
+    drop(store.0.file(&name, true).unwrap());
+    TokenStore::open(root.path()).unwrap();
+    assert!(matches!(store.0.file(&name, false), Err(e) if e.kind() == io::ErrorKind::NotFound));
+    let intent = priority::Intent::begin(&store.0, "b".repeat(32)).unwrap();
+    let guard = LockFile::new(store.lock_file().unwrap());
+    guard.try_lock().unwrap();
+    priority::sweep(&store.0).unwrap();
+    drop(guard);
+    assert!(priority::pending(&store.0).unwrap());
+    assert!(matches!(
+        TokenStore::open(root.path()),
+        Err(TokenError::Busy)
+    ));
+    assert!(store
+        .0
+        .file(&format!(".revoke-{}", "b".repeat(32)), false)
+        .is_ok());
+    drop(intent);
 }

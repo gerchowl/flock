@@ -489,7 +489,7 @@ fn load_live_config_with_sources(
             Ok(onboarding) => config.onboarding = onboarding,
             Err(_) => diagnostics.push(format!(
                 "invalid onboarding setting: {}; keeping current onboarding state",
-                deserialization_diagnostic::<Option<bool>>("onboarding", None, sources)
+                deserialization_diagnostic("onboarding", None, sources)
             )),
         }
     }
@@ -499,7 +499,7 @@ fn load_live_config_with_sources(
             Ok(name) => config.name = name,
             Err(_) => diagnostics.push(format!(
                 "invalid name setting: {}; keeping current node name",
-                deserialization_diagnostic::<String>("name", None, sources)
+                deserialization_diagnostic("name", None, sources)
             )),
         }
     }
@@ -514,7 +514,7 @@ fn load_live_config_with_sources(
             Ok(icon) => config.icon = Some(icon),
             Err(_) => diagnostics.push(format!(
                 "invalid icon setting: {}; keeping current icon",
-                deserialization_diagnostic::<String>("icon", None, sources)
+                deserialization_diagnostic("icon", None, sources)
             )),
         }
     }
@@ -528,7 +528,7 @@ fn load_live_config_with_sources(
             Ok(command) => config.thermal_command = Some(command),
             Err(_) => diagnostics.push(format!(
                 "invalid thermal_command setting: {}; keeping current thermal command",
-                deserialization_diagnostic::<String>("thermal_command", None, sources)
+                deserialization_diagnostic("thermal_command", None, sources)
             )),
         }
     }
@@ -541,7 +541,7 @@ fn load_live_config_with_sources(
             Ok(command) => config.gpu_command = Some(command),
             Err(_) => diagnostics.push(format!(
                 "invalid gpu_command setting: {}; keeping current gpu command",
-                deserialization_diagnostic::<String>("gpu_command", None, sources)
+                deserialization_diagnostic("gpu_command", None, sources)
             )),
         }
     }
@@ -877,9 +877,9 @@ fn source_value(value: &toml::Value, layer: &str) -> toml::Value {
 
 /// Only structural map keys and indices are safe to report. Enum segments may
 /// contain the rejected value, and deserializer messages always remain private.
-/// Expected types name the trusted section model, rather than parsing an error
-/// message for a leaf type or variant set. Container errors list all suppliers.
-fn deserialization_diagnostic<T>(
+/// Expected types come from the declared field catalog, falling back to its
+/// nearest container for an unknown key. Container errors list all suppliers.
+fn deserialization_diagnostic(
     section: &str,
     path: Option<&serde_path_to_error::Path>,
     sources: &toml::Table,
@@ -931,7 +931,7 @@ fn deserialization_diagnostic<T>(
     };
     format!(
         "invalid_config_type; key={key}; expected {}; supplying layer={layer}",
-        std::any::type_name::<T>()
+        super::inventory::diagnostic_type(section, path)
     )
 }
 
@@ -954,7 +954,7 @@ fn load_live_section<T>(
         Err(err) => {
             diagnostics.push(format!(
                 "invalid {label}: {}; keeping current {section} settings",
-                deserialization_diagnostic::<T>(section, Some(err.path()), sources)
+                deserialization_diagnostic(section, Some(err.path()), sources)
             ));
             invalid_sections.push(section.to_string());
         }
@@ -1165,7 +1165,7 @@ mod tests {
             assert!(!text.contains(probe));
             assert!(text.contains("key=ui.tab_mode"), "{text}");
             assert!(text.contains(&format!("supplying layer={layer}")), "{text}");
-            assert!(text.contains("expected") && text.contains("UiConfig"));
+            assert!(text.contains("expected") && text.contains("TabModeConfig"));
             assert_eq!(loaded.invalid_sections, ["ui"]);
         }
         let valid = load_with_overlay(
@@ -1186,7 +1186,7 @@ mod tests {
         deep_merge_tables(&mut values, overlay);
         assert_eq!(sources["peers"][0]["name"].as_str(), Some("base file"));
         assert_eq!(sources["peers"][1]["name"].as_str(), Some("overlay file"));
-        let diagnostic = deserialization_diagnostic::<Vec<String>>("peers", None, &sources);
+        let diagnostic = deserialization_diagnostic("peers", None, &sources);
         assert!(diagnostic.contains("supplying layer=base file, overlay file"));
         for key in [
             "onboarding",
@@ -2166,5 +2166,95 @@ mod blob_storage_tests {
         let loaded = load_live_config_from_str("[sessions]\nblob_min_bytes = 17\n").unwrap();
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
         assert_eq!(loaded.config.sessions.blob_min_bytes, 17);
+    }
+}
+
+#[cfg(test)]
+mod inventory_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_follows_imported_array_and_variant_payloads() {
+        for input in [
+            "[[checks.script]]\nargs=[42]",
+            "[spawn.env]\nclaude=[42]",
+            "[[checks.script]]\n[checks.script.on_fire.notify]\ntitle=42",
+        ] {
+            let loaded = load_live_config_from_str(input).unwrap();
+            assert!(
+                loaded
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.contains("expected String")),
+                "{:?}",
+                loaded.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_uses_stable_leaf_type() {
+        let loaded = load_live_config_from_str("[ui]\ntab_mode = 42").unwrap();
+        assert!(
+            loaded
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("expected TabModeConfig")),
+            "{:?}",
+            loaded.diagnostics
+        );
+    }
+}
+
+#[cfg(test)]
+mod inventory_key_probes {
+    use super::*;
+
+    #[test]
+    fn unknown_key_probes_under_strict_sections_never_echo_values() {
+        for section in ["client", "security"] {
+            let input = format!("[{section}]\nPRIVATE_KEY_2384 = 'PRIVATE_VALUE_2384'");
+            let loaded = load_live_config_from_str(&input).unwrap();
+            let diagnostic = loaded.diagnostics.join(" ");
+            assert!(!diagnostic.contains("PRIVATE_VALUE_2384"), "{diagnostic}");
+            assert!(loaded.invalid_sections.iter().any(|s| s == section));
+            assert!(
+                diagnostic.contains(&format!("key={section}")),
+                "{diagnostic}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_map_key_probes_are_classified_separately_from_values() {
+        let catalog = crate::config::inventory::core_catalog().unwrap();
+        for (map, input, leaf) in [
+            (
+                "session.restart_agents",
+                "[session.restart_agents.PRIVATE_KEY_2384]\nmax_restarts='PRIVATE_VALUE_2384'",
+                "usize",
+            ),
+            (
+                "ui.agent_aliases",
+                "[ui.agent_aliases]\nPRIVATE_KEY_2384=42",
+                "String",
+            ),
+        ] {
+            let loaded = load_live_config_from_str(input).unwrap();
+            let diagnostic = loaded.diagnostics.join(" ");
+            assert!(!diagnostic.contains("PRIVATE_VALUE_2384"), "{diagnostic}");
+            assert!(
+                diagnostic.contains("PRIVATE_KEY_2384"),
+                "slice 3 must redact key-sensitive paths: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains(&format!("expected {leaf}")),
+                "{diagnostic}"
+            );
+            let field = catalog.fields.iter().find(|f| f.path == map).unwrap();
+            assert_eq!(
+                field.key_class,
+                Some(crate::config::inventory::Sensitivity::PotentialSecret)
+            );
+        }
     }
 }
