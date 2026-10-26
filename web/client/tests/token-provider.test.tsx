@@ -11,7 +11,7 @@ import { App, SHELL_OWNS_TOKENS } from "../src/App";
 import { readShellConfig, type ShellToken, type TokenProvider } from "../src/config";
 import type { ServerFrame } from "../src/gen/ServerFrame";
 import { OUTBOX_KEY } from "../src/wire/outbox";
-import { MAX_REMINTS, REMINTS_SPENT, RENEW_AT, driveTokenProvider } from "../src/wire/provider";
+import { MAX_REMINTS, MAX_TIMER_DELAY, REMINTS_SPENT, RENEW_AT, driveTokenProvider } from "../src/wire/provider";
 import { RUN_CLIENT_OPEN, type SessionLike } from "../src/wire/token";
 import { Harness, WELCOME, live, sentFrames, step } from "./wire/harness";
 
@@ -350,14 +350,19 @@ describe("with a token provider", () => {
     expect(tokens.calls).toBe(2);
   });
 
-  test("a failed renewal is not retried: the reactive path takes over at the next revocation", async () => {
+  test("a failed renewal is a dismissible notice while Live, is not retried, and the reactive path takes over at the next revocation", async () => {
     const tokens = provider({ token: "t1", expiresInMs: 20_000 }, { reject: PANE }, "t3");
-    const { h } = mount(tokens);
+    const { h, root } = mount(tokens);
     await tick();
     welcome(h, 0);
     h.clock.advanceTo(h.clock.now() + 20_000 * RENEW_AT);
     await tick();
     expect(tokens.calls).toBe(2);
+    expect(status(root)).toBe("Live");
+    const notice = root.querySelector('[data-testid="renewal-notice"]');
+    expect(notice?.textContent).toContain(PANE);
+    (notice?.querySelector("button") as HTMLButtonElement).click();
+    expect(root.querySelector('[data-testid="renewal-notice"]')).toBeNull();
     h.clock.advanceTo(h.clock.now() + 600_000);
     await tick();
     expect(tokens.calls).toBe(2);
@@ -367,6 +372,58 @@ describe("with a token provider", () => {
     await tick();
     expect(tokens.calls).toBe(3);
   });
+
+  test("a Disconnect clears the renewal: it calls nothing while disconnected, nor once the person connects again", async () => {
+    for (const reconnectFirst of [false, true]) {
+      const tokens = provider({ token: "t1", expiresInMs: 20_000 });
+      const { h, root } = mount(tokens);
+      await tick();
+      welcome(h, 0);
+      const start = h.clock.now();
+      click(root, ".connection-bar__toggle");
+      if (reconnectFirst) {
+        click(root, ".connection-bar__toggle");
+        welcome(h, 0);
+      }
+      h.clock.advanceTo(start + 20_000 * RENEW_AT);
+      await tick();
+      expect(tokens.calls).toBe(1);
+      dispose?.();
+    }
+  });
+
+  test("a renewal due after the re-mint cap is spent calls nothing and keeps the cap's message", async () => {
+    const tokens = provider(...Array.from({ length: MAX_REMINTS + 1 }, () => ({ token: "t", expiresInMs: 600_000 })));
+    const { h, root } = mount(tokens);
+    await tick();
+    for (let revoked = 1; revoked <= MAX_REMINTS + 1; revoked++) {
+      welcome(h, 0);
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      h.clock.advanceTo(h.clock.now() + 30_000);
+      await tick();
+    }
+    expect(status(root)).toBe(`NeedsToken · The token was revoked. ${REMINTS_SPENT}`);
+    h.clock.advanceTo(h.clock.now() + 600_000);
+    await tick();
+    expect(tokens.calls).toBe(MAX_REMINTS + 1);
+    expect(status(root)).toBe(`NeedsToken · The token was revoked. ${REMINTS_SPENT}`);
+  });
+
+  for (const [name, expiresInMs] of [
+    ["0", 0],
+    ["a negative number", -1],
+    ["NaN", Number.NaN],
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["a string", "5000"],
+  ] as const) {
+    test(`an expiresInMs of ${name} is refused: NeedsToken says why, and nothing connects`, async () => {
+      const { h, root } = mount(provider({ value: Promise.resolve({ token: "t1", expiresInMs }) }));
+      await tick();
+      expect(status(root)).toBe("NeedsToken · The shell's token has an invalid expiresInMs: it must be a positive, finite number of milliseconds.");
+      expect(h.net.attempts).toHaveLength(0);
+    });
+  }
 
   test("a Disconnect while the provider is asked: its token does not reconnect, and the next Connect uses it", async () => {
     const tokens = provider("deferred");
@@ -458,7 +515,9 @@ describe("the provider driver on a bare connection", () => {
     const h = new Harness();
     live(h);
     const delays: number[] = [];
-    const clock = { ...h.clock, now: () => h.clock.now(), wallNow: () => h.clock.wallNow(), clearTimeout: (handle: Parameters<typeof h.clock.clearTimeout>[0]) => h.clock.clearTimeout(handle), setTimeout: (callback: () => void, ms: number) => (delays.push(ms), h.clock.setTimeout(callback, ms)) };
+    // Like a browser, a delay above 2^31 - 1 ms fires at once.
+    const browserDelay = (ms: number): number => (ms > 2 ** 31 - 1 ? 0 : ms);
+    const clock = { ...h.clock, now: () => h.clock.now(), wallNow: () => h.clock.wallNow(), clearTimeout: (handle: Parameters<typeof h.clock.clearTimeout>[0]) => h.clock.clearTimeout(handle), setTimeout: (callback: () => void, ms: number) => (delays.push(ms), h.clock.setTimeout(callback, browserDelay(ms))) };
     const tokens = provider(...replies);
     driveTokenProvider(h.connection, tokens, clock, () => 0, () => undefined);
     return { h, tokens, delays };
@@ -474,6 +533,29 @@ describe("the provider driver on a bare connection", () => {
     await tick();
     expect(expiring.delays).toEqual([40_000 * RENEW_AT]);
   });
+
+  for (const expiresInMs of [2 ** 32, Number.MAX_SAFE_INTEGER]) {
+    test(`a lifetime past the longest timer (${expiresInMs} ms) never renews early and never loops`, async () => {
+      const { h, tokens, delays } = driven({ token: "t2", expiresInMs }, "t3");
+      h.step(step({ step: "token_refused", code: 4403 }));
+      await tick();
+      h.step(step({ step: "open" }));
+      send(h, WELCOME);
+      const due = h.clock.now() + Math.floor(expiresInMs * RENEW_AT);
+      // Ten of the longest timers: each re-arms, none renews.
+      for (let step = 0; step < 10; step++) {
+        h.clock.advanceTo(Math.min(due - 1, h.clock.now() + MAX_TIMER_DELAY));
+        await tick();
+      }
+      expect(tokens.calls).toBe(1);
+      expect(delays.every((ms) => ms <= MAX_TIMER_DELAY)).toBe(true);
+      if (due - h.clock.now() <= 20 * MAX_TIMER_DELAY) {
+        h.clock.advanceTo(due);
+        await tick();
+        expect(tokens.calls).toBe(2);
+      }
+    });
+  }
 
   test("acks are counted monotonically: an ack after a principal change still ends the streak", async () => {
     const { h, tokens } = driven("t2", "t3");

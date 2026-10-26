@@ -117,7 +117,12 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
     return `${parts[0]}${parts.length > 1 ? ` · ${parts.slice(1).join(" ")}` : ""}`;
   };
   const [status, setStatus] = createSignal<string>(describe());
-  const refresh = (): void => void setStatus(describe());
+  /** A failed renewal while the session runs on (ADR-0038 §6): a dismissible notice, never NeedsToken. */
+  const [renewalNotice, setRenewalNotice] = createSignal<string | null>(null);
+  const refresh = (): void => {
+    setStatus(describe());
+    setRenewalNotice(shell?.notice ?? null);
+  };
   // Before the first connect, so its NeedsToken already asks the shell.
   if (provider !== undefined) {
     const driven = driveTokenProvider(connection, provider, options.clock, options.random, refresh);
@@ -227,6 +232,16 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
           <div class="notice" role="status" data-testid="exchange-notice">
             <span>{message()}</span>
             <button type="button" class="action" onClick={() => setLinkNotice(null)}>
+              Dismiss
+            </button>
+          </div>
+        )}
+      </Show>
+      <Show when={renewalNotice()}>
+        {(message) => (
+          <div class="notice" role="status" data-testid="renewal-notice">
+            <span>{message()}</span>
+            <button type="button" class="action" onClick={() => shell?.dismissNotice()}>
               Dismiss
             </button>
           </div>
