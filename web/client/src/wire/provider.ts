@@ -8,12 +8,11 @@
  * Three things differ. A bridged session is used by one attempt, so every
  * reconnect also asks (`awaitingSession`, outside the streak, which counts
  * only the server's ends), and a refusal then takes the connection to
- * NeedsToken. A call that settles while a reconnect still waits for its
- * session serves it, or, if it gave none, the reconnect asks at once. And
- * the renewal's due time belongs to the bearer, not the session: a
- * reconnect's session keeps the native side's bearer, so its `expiresInMs`
- * can only bring the due time earlier, while a new bearer (a re-mint after
- * an end, a person's Connect from NeedsToken, or the renewal) replaces it.
+ * NeedsToken. And the renewal's due time belongs to the bearer, not the
+ * session: a reconnect's session keeps the native side's bearer, so its
+ * `expiresInMs` can only bring the due time earlier, while a new bearer (a
+ * re-mint after an end, a person's Connect from NeedsToken, the renewal, or
+ * a session the native side marks `fresh`) replaces it.
  * Only the renewal passes `renew: true`. Below, "token" reads "session" for
  * a bridge.
  *
@@ -36,7 +35,10 @@
  *   message is {@link ShellTokens.notice}, and the reactive path takes over
  *   when the server ends the token. Without `expiresInMs` there is no timer.
  * - One call at a time: a request while one is in flight, or waiting, is
- *   the same request.
+ *   the same request. A request skipped for the call in flight (a re-mint
+ *   after an end, or a bridged reconnect's session) is owed: when the call
+ *   settles and the state still needs it, a value counts as that call, and a
+ *   failure issues it at once, on its own streak delay.
  * - Its token goes to the connection with `setToken`, which connects only
  *   from NeedsToken; after a Disconnect it is kept for the next Connect.
  * - A rejection, a synchronous throw or a value that is not a
@@ -98,7 +100,7 @@ type Source<T> = {
   /** One call; `renew` only for the renewal before expiry. */
   readonly call: (renew: boolean) => unknown;
   /** The call's value, or why it is not one (a refused value is closed here). */
-  readonly read: (value: unknown) => { readonly value: T; readonly expiresInMs?: number } | string;
+  readonly read: (value: unknown) => { readonly value: T; readonly expiresInMs?: number; readonly fresh?: boolean } | string;
   /** Gives the connection `value`. */
   readonly hand: (value: T) => void;
   /** A value nobody will use, because the app is gone. */
@@ -137,14 +139,15 @@ function isBridgeSocket(value: unknown): value is BridgeSocket {
 }
 
 /** The bridge's value as a {@link BridgeSession}, or why it is not one; a refused session's socket is closed. */
-function bridgeSession(value: unknown): { readonly value: BridgeSocket; readonly expiresInMs?: number } | string {
+function bridgeSession(value: unknown): { readonly value: BridgeSocket; readonly expiresInMs?: number; readonly fresh?: boolean } | string {
   if (typeof value !== "object" || value === null) return "The shell gave no bridge session.";
-  const { socket, expiresInMs } = value as Partial<Record<keyof BridgeSession, unknown>>;
+  const { socket, expiresInMs, fresh } = value as Partial<Record<keyof BridgeSession, unknown>>;
   if (!isBridgeSocket(socket)) return "The shell gave no bridge session.";
   const life = lifetime(expiresInMs, "bridge session");
-  if (typeof life !== "string") return { value: socket, ...life };
+  const problem = typeof life === "string" ? life : fresh !== undefined && typeof fresh !== "boolean" ? "The shell's bridge session has an invalid fresh: it must be a boolean." : null;
+  if (problem === null) return { value: socket, ...(life as { readonly expiresInMs?: number }), ...(fresh === true ? { fresh } : {}) };
   socket.close(1000, "refused");
-  return life;
+  return problem;
 }
 
 /** Drives a shell's token provider on a token connection. */
@@ -177,6 +180,8 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   let due: number | null = null;
   /** The current bearer's renewal was asked for: it is not asked again, even when a reconnect reports its lifetime. */
   let spent = false;
+  /** A request skipped for the call in flight, with its delay. */
+  let owed: { readonly kind: "mint" | "reconnect"; readonly delay: number } | null = null;
   let error: string | null = null;
   let notice: string | null = null;
   let disposed = false;
@@ -213,7 +218,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
    * on it. `kept` says the value runs on the bearer already due, so its
    * lifetime can only bring the renewal earlier.
    */
-  const adopt = ({ value, expiresInMs }: { readonly value: T; readonly expiresInMs?: number }, kept: boolean): void => {
+  const adopt = ({ value, expiresInMs }: { readonly value: T; readonly expiresInMs?: number; readonly fresh?: boolean }, kept: boolean): void => {
     const before = kept ? { due, spent } : { due: null, spent: false };
     const reconnect = running() && !connection.awaitingSession;
     if (reconnect) connection.disconnect();
@@ -241,8 +246,10 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     if (renewing) spent = true;
     else error = null;
     changed();
-    const settle = (token: { readonly value: T; readonly expiresInMs?: number } | null, failure: string | null): void => {
+    const settle = (token: { readonly value: T; readonly expiresInMs?: number; readonly fresh?: boolean } | null, failure: string | null): void => {
       inFlight = false;
+      const skipped = owed;
+      owed = null;
       if (disposed) {
         if (token !== null) source.discard(token.value);
         return;
@@ -254,11 +261,13 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
         connection.sessionRefused();
         refusing = false;
       }
+      // A session the native side marks fresh runs on a bearer it minted for this open.
+      const kept = kind === "reconnect" && token?.fresh !== true;
       if (token !== null) {
         // A failed renewal's notice stands until a new bearer: a reconnect's session runs on the same one.
-        if (kind !== "reconnect") notice = null;
-        adopt(token, kind === "reconnect");
-      } else if (connection.awaitingSession) request(0, "reconnect");
+        if (!kept) notice = null;
+        adopt(token, kept);
+      } else if (renewing && skipped !== null && stillNeeded(skipped.kind)) request(skipped.delay, skipped.kind);
       changed();
     };
     Promise.resolve(renewing)
@@ -272,8 +281,14 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
         (failure: unknown) => settle(null, reason(failure, source.refused)),
       );
   };
+  /** Whether the state still needs a skipped request: a reconnect waiting for its session, or a re-mint in NeedsToken. */
+  const stillNeeded = (kind: "mint" | "reconnect"): boolean => (kind === "reconnect" ? connection.awaitingSession : connection.state === "NeedsToken" && error === null);
   const request = (delay: number, kind: "mint" | "reconnect"): void => {
-    if (inFlight || waiting !== null || disposed) return;
+    if (disposed || waiting !== null) return;
+    if (inFlight) {
+      owed = { kind, delay };
+      return;
+    }
     if (delay === 0) call(kind);
     else {
       waiting = clock.setTimeout(() => call(kind), delay);

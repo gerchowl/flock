@@ -86,8 +86,10 @@ export type BridgeSocket = {
 /**
  * A bridged session, and the remaining lifetime of the bearer the native
  * side used for it (the server's `expires_in_ms`), when it reported one.
+ * `fresh: true` says the native side minted a new bearer for this open, so
+ * the renewal is timed from it; absent or false, the bearer was kept.
  */
-export type BridgeSession = { readonly socket: BridgeSocket; readonly expiresInMs?: number };
+export type BridgeSession = { readonly socket: BridgeSocket; readonly expiresInMs?: number; readonly fresh?: boolean };
 
 /**
  * The shell's source of bridged sessions, pull-only: each call is one
