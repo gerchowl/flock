@@ -391,6 +391,32 @@ Slice B of #1734 provisions each generation credential only in the generated pri
 
 Scoped verification never waits for the lease registry lock: contention has a typed refusal and no snapshot fallback. Each admission performs at most sixteen kernel process-fact reads, refusing ancestry beyond that budget. This is a bounded supported ancestry depth, not permission to trust partial evidence. Credential comparison uses opaque accumulation (`core::hint::black_box`) to prevent optimizer replacement with an early-exit comparison. Encoded credential length is public format information. Legacy unscoped malformed requests retain serde diagnosis; scoped schema failures keep their fixed, secret-free error. JSON syntax diagnostics contain no field values.
 
+**Operator shell sends (#2494, owner option a).** The structured `agent.send`
+adapter alone may authenticate an operator via a pane. This is affirmative
+server evidence, not `AgentState::Unknown` or absence of agent detection. On
+every request it requires the unix socket's kernel PID and UID, the operator
+UID, and an unrelated lease identity. The pane must retain `created_as_root_shell`
+provenance (no argv override) and a runtime spawned with the default shell,
+with no agent name/label or launch argv. The caller's immediate kernel parent
+must equal that runtime's original root-shell PID. Both processes must be
+living, and the caller's socket-captured birth and the shell's spawn-captured
+birth must still match. A reaped shell, missing process facts, unknown UID,
+restored pane without provenance, scoped session or enrolled relay cannot grant
+this exception. Evidence is never cached. Scripts, `sh -c`, and agent children
+with an intervening process are refused; dedicated structured agents continue
+to use their native authenticated path. This does not broaden the shared
+`caller_is_local_operator` helper or other privileged verbs.
+
+Admission stamps the server-owned numeric `operator_via_pane` in durable queue
+history. Section 3 input framing renders it as `operator via pane <id>` in the
+producer header, outside the nonce-delimited body. Request metadata cannot
+supply or replace the stamp. The existing explicit native-command exception
+still sends the command alone; its durable queue record retains the stamp.
+This is the cooperative same-UID boundary of #1177, not proof of a physical
+keyboard: a direct child deliberately launched by the root shell satisfies the
+rule. Shell functions and exec-style commands can likewise preserve immediate
+parentage; no broader human-presence claim is made.
+
 ### 2. Mapping session events onto flk state, questions and waits
 
 A new `StateSource::Session` joins `Screen`, `Hook`, `Plugin`,

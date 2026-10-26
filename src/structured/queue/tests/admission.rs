@@ -1740,3 +1740,25 @@ fn native_inbox_survives_queue_pruning_and_custody_collection_until_ack() {
         "read never re-admits input"
     );
 }
+
+#[test]
+fn shell2494_stamp_is_server_owned_and_persisted() {
+    let root = Root::new();
+    let mut q = queue(&root);
+    let mut forged = input(2494);
+    forged
+        .metadata
+        .insert("operator_via_pane".into(), serde_json::json!(99));
+    assert_eq!(
+        q.enqueue(forged, Principal::Operator, Gate::Send)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    q.enqueue(input(2494), Principal::OperatorViaPane(42), Gate::Send)
+        .unwrap();
+    let batch = q.batch(100).unwrap().unwrap();
+    assert!(batch.envelope.to_string().contains("operator via pane 42"));
+    drop(q);
+    assert_eq!(root.open().items()[0].metadata["operator_via_pane"], 42);
+}
