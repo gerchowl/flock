@@ -1,8 +1,8 @@
 /**
  * The live connection's strip (ADR-0038 §3): its state, the latest failure
  * while reconnecting or stopped, the always-offered *Disconnect* (or
- * *Connect*), in NeedsToken a field for a new token (unless the shell
- * provides tokens itself), and what restoring
+ * *Connect*), in NeedsToken a field for a new token (or, when the shell
+ * provides tokens, a *Connect* that asks it again), and what restoring
  * the stored outbox had to drop, if anything. The token is
  * handed to the connection and never shown, logged or stored by the page.
  *
@@ -16,8 +16,8 @@ import type { WireConnection } from "../wire/connection";
 export type ConnectionBarProps = {
   readonly connection: WireConnection;
   readonly revision: () => number;
-  /** Whether NeedsToken asks the person for a token; false when the shell provides them. */
-  readonly prompt: boolean;
+  /** The shell provides tokens: NeedsToken asks it again with this, instead of prompting the person. */
+  readonly ask?: (() => void) | undefined;
 };
 
 /** The connection strip above the workbench. */
@@ -25,18 +25,24 @@ export function ConnectionBar(props: ConnectionBarProps): JSX.Element {
   const [token, setToken] = createSignal("");
   const state = (): WireConnection["state"] => (props.revision(), props.connection.state);
   const error = (): string | null => (props.revision(), props.connection.error);
+  const outboxProblem = (): string | null => (props.revision(), props.connection.outboxProblem);
   return (
     <div class="connection-bar" classList={{ "connection-bar--live": state() === "Live" }} role="status" data-testid="connection-bar">
       <strong class="connection-bar__state">{state()}</strong>
       <Show when={error()}>{(message) => <span class="connection-bar__error">{message()}</span>}</Show>
-      <Show when={props.connection.outboxProblem}>
+      <Show when={outboxProblem()}>
         {(problem) => (
           <span class="connection-bar__error" data-testid="outbox-problem">
             {problem()}
           </span>
         )}
       </Show>
-      <Show when={props.prompt && state() === "NeedsToken"}>
+      <Show when={props.ask !== undefined && state() === "NeedsToken"}>
+        <button type="button" class="action" data-testid="shell-connect" onClick={() => props.ask?.()}>
+          Connect
+        </button>
+      </Show>
+      <Show when={props.ask === undefined && state() === "NeedsToken"}>
         <form
           class="connection-bar__token"
           onSubmit={(event) => {

@@ -27,7 +27,8 @@
  * and its window expiry (`unknown_outcome`) are G3b's. A restored `sent` or
  * `uncertain` command is held the same way; it is never sent again as a
  * first send. A `welcome` with another principal drops every command queued
- * under the old one (commands must not run under another identity).
+ * under the old one (commands must not run under another identity), and
+ * {@link Outbox.problem} says so.
  *
  * @module
  */
@@ -149,15 +150,18 @@ export class Outbox {
     this.#commit();
   }
 
-  /** A `welcome` named `principal`: drops commands queued under another. */
+  /** A `welcome` named `principal`: drops commands queued under another, and says so. */
   adoptPrincipal(principal: string): void {
     if (this.#principal === principal) return;
+    let dropped = 0;
     for (const [id, live] of this.#commands) {
       if (live.entry.principal !== principal) {
+        if (UNSETTLED.has(live.entry.status)) dropped++;
         this.#cancel(live);
         this.#commands.delete(id);
       }
     }
+    if (dropped > 0) this.#problem = `Dropped ${dropped} unsent ${dropped === 1 ? "command" : "commands"}: the server now names another identity, and commands never run under another.`;
     this.#principal = principal;
     this.#commit();
   }

@@ -199,6 +199,7 @@ export class WireConnection {
   #socket: SocketLike | null = null;
   #generation = 0;
   #attempt = 0;
+  #revoked = false;
   #timers = new Map<Timer, TimerHandle>();
   #subs = new Map<string, Sub>();
   /** The last sub id allocated: ids are `s<n>`, and n only grows (ADR-0038 §3). */
@@ -228,6 +229,11 @@ export class WireConnection {
   /** The latest failure, shown while reconnecting or stopped; never a token. */
   get error(): string | null {
     return this.#error;
+  }
+
+  /** In NeedsToken, whether a close 4403 revoked a working token (rather than 4401 refusing one at `hello`). */
+  get revoked(): boolean {
+    return this.#revoked;
   }
 
   /** What restoring the stored outbox had to drop, or null (shown, never fatal). */
@@ -444,6 +450,7 @@ export class WireConnection {
     if (code === AUTH_REFUSED || code === TOKEN_REVOKED) {
       this.#abandon(null, "");
       this.#token = null;
+      this.#revoked = code === TOKEN_REVOKED;
       this.#error = code === AUTH_REFUSED ? "The server refused the token." : "The token was revoked.";
       this.#clear("backoff");
       this.#enter("NeedsToken");

@@ -36,9 +36,10 @@ export const SHELL_CONFIG_GLOBAL = "__FLOCK_SHELL_CONFIG__";
 
 /**
  * The shell's source of tokens: resolves to a fresh client token, or rejects
- * with a message for the person. The client asks it at connect and again
- * after the server ends a token (close 4403), keeps what it gets in memory
- * only, and shows the token prompt never.
+ * with a message for the person. The client asks it at connect, on the
+ * person's Connect and after the server ends a token (close 4403, bounded by
+ * §3's backoff), keeps what it gets in memory only, never shows the token
+ * prompt and never exchanges a link's code (`src/wire/provider.ts`).
  */
 export type TokenProvider = () => Promise<string>;
 
