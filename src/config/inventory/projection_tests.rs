@@ -388,3 +388,20 @@ fn nested_schema_provenance_is_canonical_without_instance_keys() {
     assert!(unknown["field"].is_null());
     assert!(!unknown.to_string().contains(CANDIDATE));
 }
+
+#[test]
+fn security2384_s3b1_aggregate_provenance_is_structural() {
+    let source = projection::Source {
+        layer: projection::Layer::BaseFile,
+        identifier: "SECRET_AGGREGATE_2384",
+    };
+    let output = serde_json::to_string(&projection::provenance(
+        &core_catalog().unwrap(),
+        "ui",
+        &source,
+        &[],
+    ))
+    .unwrap();
+    assert!(output.contains("structural"), "{output}");
+    assert!(!output.contains("sensitive") && !output.contains("SECRET_"));
+}

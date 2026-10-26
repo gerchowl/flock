@@ -194,3 +194,60 @@ inside a startup-only container. Copying a mixed parent does not claim that
 all cached child consumers retarget: the existing whole-UI copy does not move
 the sampler's startup-owned disk path. A direct disk-path copy still demands
 an ownership review.
+
+### Diagnostic sink projection (slice 3b1)
+
+ADR-0041 §4's internal diagnostic boundary now constructs closed causes,
+source categories, outcomes and numeric positions before formatting. Raw parser
+messages, I/O messages, file paths and input values are never retained in the
+safe diagnostic. `Display` and `Debug` only see safe data. Existing loader and
+CLI String consumers format that safe object rather than scrubbing messages.
+
+Cause labels are a closed diagnostic vocabulary, not `error.code` values.
+They appear only as text in `SuccessResponse.result.diagnostics[]` and carry
+no retry class. Clients must not interpret a cause label as `error.code`.
+Future GUI branching requires a typed, versioned schema enum, not registry
+entries. The base labels are:
+
+- `config parse error: invalid_toml`
+- `invalid_config_type`
+- `unknown_config_key`
+- `removed_config_key`
+- `read_error`
+- `invalid_catalog`
+- `missing_peer_name`
+- `duplicate_peer`
+- `invalid_peer_target`
+
+The exhaustive fixture covers every `Cause` variant and pins its rendered
+label to both this guide and ADR-0041 §4. Adding a cause requires a deliberate
+fixture and documentation update. #2434 tracks the scanner's separate
+emission-provenance follow-up; it is not changed in this stack.
+
+Diagnostic keys are rebuilt from catalog paths and aliases. User-map entries
+become `<key>` and collection indices become `[]`; an unknown descendant stops
+at its nearest declared container, and unknown roots become `document root`.
+The four removed schema keys are an explicit closed historical exception.
+Unknown user spellings are withheld even when they look harmless. Safe source
+categories and numeric coordinates identify where to inspect the file without
+printing its private keys. Loader unknown-key warnings preserve base/overlay
+categories and exact byte line/column coordinates from TOML key spans. Syntax
+errors likewise retain byte coordinates when available. Removed-key scans
+retain line locations; missing spans remain unavailable. The loader keeps its
+existing unknown-key policy, and CLI retains its broader scan. I/O diagnostics
+retain `ErrorKind`, never `Display`.
+
+Peer-entry refusals retain a zero-based array index, source category and field
+coordinates when available; their outcome says `entry dropped`. Static mesh,
+misplaced-section and CLI repair hints contain no input data.
+
+Both input-document and edited-output parse refusals in `channel set` and
+`config reset-keys` use this boundary and leave the file unchanged. Output guards
+identify flock's own edit as the failure. CLI file paths remain permitted
+operator metadata; loader and reload diagnostics remain path-free. Aggregate
+provenance has a structural reason, separately from sensitive content kinds.
+No socket/WS read method or raw export is enabled by this slice.
+
+The approved slice 3b2 still owns keybinding, sound, spawn-env, checks and channel
+validator producers and their immediate logging. Those existing diagnostics are
+not claimed safe by 3b1. #2384 completion and #2385 remain gated on that work.
