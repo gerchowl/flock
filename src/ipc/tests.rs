@@ -134,6 +134,22 @@ fn lock_symlink_is_refused_and_mode_is_private() {
 }
 
 #[test]
+fn existing_unsafe_lock_modes_are_refused_without_repair() {
+    let (_dir, path) = fixture();
+    let lock = path.with_extension("sock.lock");
+    fs::write(&lock, "retain").unwrap();
+    for mode in [0o400, 0o644, 0o666] {
+        fs::set_permissions(&lock, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(SocketOwner::acquire(&path).is_err());
+        assert_eq!(
+            fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "retain");
+    }
+}
+
+#[test]
 fn two_concurrent_starters_have_exactly_one_winner() {
     let (_dir, path) = fixture();
     let start = std::sync::Arc::new(std::sync::Barrier::new(3));

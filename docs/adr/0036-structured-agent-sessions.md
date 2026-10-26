@@ -3829,11 +3829,15 @@ this advertisement is tracked separately in [#2464](https://github.com/gerchowl/
 sibling `<socket>.lock` before bind or stale-path reclamation. This applies to
 `flock.sock`, the terminal client socket, and the UDS WebSocket listener when
 introduced. The lock file is operator-owned, regular, single-link, mode `0600`,
-opened with `O_CLOEXEC | O_NOFOLLOW`; it is never unlinked. The containing
-directory must exclude entry replacement by other users. Contention reports
-busy and never removes a socket, even with a full accept backlog. After acquiring
-the lock, `SocketOwner::prepare` also makes a nonblocking connection probe: a
-**successful** connect means busy, preserving an older listener that has no lock.
+opened with `O_CLOEXEC | O_NOFOLLOW`; it is never unlinked. Newly created
+files receive descriptor-based mode `0600` repair after open, independently of
+the inherited umask. Existing lock files are never permission-repaired; they
+must pass the original ownership, link-count, mode and pathname validation.
+The containing directory must exclude entry replacement by other users.
+Contention reports busy and never removes a socket, even with a full accept
+backlog. After acquiring the lock, `SocketOwner::prepare` also makes a nonblocking
+connection probe: a **successful** connect means busy, preserving an older listener
+that has no lock.
 A failed probe never proves staleness; the held lock excludes live owners only
 when those owners participate in this protocol. An old-build listener with a
 full backlog can fail this probe and its pathname can still be reclaimed. This
