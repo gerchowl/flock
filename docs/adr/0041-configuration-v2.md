@@ -234,11 +234,13 @@ by this ADR.
 
 The inventory follows consumers, not just section copies. Following #2399,
 `spawn` and `spawn.env` are `AppLive`. The `msg` section is `Mixed`: server
-policy leaves are live, while `msg.channel_push_body_max_bytes` and
-`msg.channel_push_reconnect_secs` are `CommandStartup`, consumed only by
-`ChannelOptions` from the MCP command's startup `Config::load`.
-`msg.channel_push` is also `Mixed`: the server reads it live but MCP sessions
-capture their capability at startup. Each leaf's classification is guarded by
+policy leaves are live. Following #2400, `msg.channel_push`,
+`msg.channel_push_body_max_bytes` and `msg.channel_push_reconnect_secs` are
+`Mixed`: live reload constructs their effective `ChannelOptions` to report
+restart requirements, and the MCP command captures those options from its
+startup `Config::load`. This live diagnostic comparison does not retarget an
+existing MCP session; its operational options still require an MCP restart.
+`msg.channel_push` also controls live server operations. Each leaf's classification is guarded by
 consumer syntax evidence, with live owners also requiring the section copy in
 `apply_live_config`. Invalid sections retain their running values. Child
 environments and stored launch snapshots remain captured. Restart the MCP
