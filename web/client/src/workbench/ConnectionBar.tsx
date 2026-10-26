@@ -1,7 +1,8 @@
 /**
  * The live connection's strip (ADR-0038 §3): its state, the latest failure
  * while reconnecting or stopped, the always-offered *Disconnect* (or
- * *Connect*), in NeedsToken a field for a new token, and what restoring
+ * *Connect*), in NeedsToken a field for a new token (unless the shell
+ * provides tokens itself), and what restoring
  * the stored outbox had to drop, if anything. The token is
  * handed to the connection and never shown, logged or stored by the page.
  *
@@ -12,7 +13,12 @@ import { Show, createSignal, type JSX } from "solid-js";
 import type { WireConnection } from "../wire/connection";
 
 /** Props of {@link ConnectionBar}; `revision` changes with every connection change. */
-export type ConnectionBarProps = { readonly connection: WireConnection; readonly revision: () => number };
+export type ConnectionBarProps = {
+  readonly connection: WireConnection;
+  readonly revision: () => number;
+  /** Whether NeedsToken asks the person for a token; false when the shell provides them. */
+  readonly prompt: boolean;
+};
 
 /** The connection strip above the workbench. */
 export function ConnectionBar(props: ConnectionBarProps): JSX.Element {
@@ -30,7 +36,7 @@ export function ConnectionBar(props: ConnectionBarProps): JSX.Element {
           </span>
         )}
       </Show>
-      <Show when={state() === "NeedsToken"}>
+      <Show when={props.prompt && state() === "NeedsToken"}>
         <form
           class="connection-bar__token"
           onSubmit={(event) => {

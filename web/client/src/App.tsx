@@ -7,8 +7,11 @@
  * - **wire** connects to the configured server (G3a, #1747). Its agent list
  *   is fleet-lite (#1746); its inbox lists the open permission prompts (#1749).
  *   Its token is, in order: one exchanged for the fragment's one-time code, the
- *   one this tab already holds in `sessionStorage`, or the shell's (Tauri).
- *   With none it waits in NeedsToken (ADR-0038 §3, `src/wire/token.ts`).
+ *   one this tab already holds in `sessionStorage`, or the shell's fixed one.
+ *   With none it waits in NeedsToken (ADR-0038 §3, `src/wire/token.ts`). A
+ *   shell's token provider (Tauri, ADR-0038 §6) replaces all three: it is asked
+ *   at connect and once after each 4403, its token is kept in memory only, and
+ *   there is no token prompt.
  *
  * Each mode creates its fleet source and transport once, outside JSX: a
  * prop expression is a getter that would run again on every read.
@@ -60,6 +63,12 @@ export type AppProps = {
 /** This bundle's identity in `hello` (diagnostic only, ADR-0036 §5). */
 const CLIENT = { name: "flock-web", version: "0.0.0" } as const;
 
+/** A provider's rejection as the person's message: Tauri rejects with the command's error string. */
+function providerReason(error: unknown): string {
+  const message = typeof error === "string" ? error : error instanceof Error ? error.message : "";
+  return message === "" ? "The shell could not provide a token." : message;
+}
+
 function FixtureApp(props: { readonly config: FixtureShellConfig }): JSX.Element {
   const store = createLayoutStore({ serverKey: "fixture" });
   const { layout, notice } = store.load();
@@ -87,8 +96,9 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const { session = () => sessionStorage, request = globalThis.fetch.bind(globalThis), page = window, ...options } = props.env;
   const url = endpointUrl(props.config.serverUrl);
   const tokens = createTokenStore(session);
-  /** The token to fall back on: this tab's stored one, or the shell's (Tauri). */
-  const held = (): string | null => tokens.get() ?? props.config.token ?? null;
+  const provider = props.config.tokenProvider;
+  /** The token to fall back on: this tab's stored one, or the shell's fixed one; none beside a provider. */
+  const held = (): string | null => (provider === undefined ? (tokens.get() ?? props.config.token ?? null) : null);
   // With a code, nothing connects until its exchange settles.
   let current = props.code === null ? held() : null;
   const connection = new WireConnection({ url, token: current, client: CLIENT, ...options });
@@ -97,9 +107,13 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const [failed, setFailed] = createSignal(false);
   /** A failed code while a session works on: a dismissible notice, never NeedsToken. */
   const [linkNotice, setLinkNotice] = createSignal<string | null>(null);
+  /** The provider is minting, or why it last could not. */
+  const [asking, setAsking] = createSignal(false);
+  const [providerError, setProviderError] = createSignal<string | null>(null);
   const describe = (): string => {
-    if (exchanging() && (connection.state === "Disconnected" || connection.state === "NeedsToken")) return "Signing in…";
-    const ask = connection.state === "NeedsToken" ? (failed() ? EXCHANGE_FAILED : RUN_CLIENT_OPEN) : null;
+    if ((exchanging() || asking()) && (connection.state === "Disconnected" || connection.state === "NeedsToken")) return "Signing in…";
+    const prompt = provider === undefined ? (failed() ? EXCHANGE_FAILED : RUN_CLIENT_OPEN) : providerError();
+    const ask = connection.state === "NeedsToken" ? prompt : null;
     const parts = [connection.state, connection.error, ask].filter((part) => part !== null);
     return `${parts[0]}${parts.length > 1 ? ` · ${parts.slice(1).join(" ")}` : ""}`;
   };
@@ -111,9 +125,30 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const sender = createWireSender(connection, revision);
   /** True while a failed code settles: its own move into NeedsToken keeps the message. */
   let settling = false;
+  /** One provider call per token the server welcomed, so a refused fresh token never loops. */
+  let askable = true;
+  const ask = (): void => {
+    if (provider === undefined || !askable) return;
+    askable = false;
+    setAsking(true);
+    setProviderError(null);
+    const settle = (token: string | null, error: string | null): void => {
+      if (disposed) return;
+      setAsking(false);
+      setProviderError(error);
+      if (token !== null) use(token);
+      refresh();
+    };
+    provider().then(
+      (token: unknown) => (typeof token === "string" && token !== "" ? settle(token, null) : settle(null, "The shell gave no token.")),
+      (error: unknown) => settle(null, providerReason(error)),
+    );
+  };
   onCleanup(
     connection.onTransition((state) => {
+      if (state === "Syncing") askable = true;
       if (state !== "NeedsToken") return;
+      ask();
       tokens.clear();
       // A later NeedsToken (the server refused the token) is a new reason: the old link's message is stale.
       if (!settling) {
@@ -198,7 +233,7 @@ function WireApp(props: { readonly config: WireShellConfig; readonly env: WireEn
   const transport = createWireTransport(connection);
   return (
     <>
-      <ConnectionBar connection={connection} revision={revision} />
+      <ConnectionBar connection={connection} revision={revision} prompt={provider === undefined} />
       <Show when={linkNotice()}>
         {(message) => (
           <div class="notice" role="status" data-testid="exchange-notice">
