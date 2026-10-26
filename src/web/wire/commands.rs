@@ -29,7 +29,7 @@ pub(super) struct Command {
 }
 struct Request {
     command: Command,
-    store: Arc<TokenStore>,
+    store: Arc<Store>,
     session: Session,
     response: oneshot::Sender<ServerFrame>,
 }
