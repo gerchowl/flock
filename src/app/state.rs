@@ -3911,6 +3911,7 @@ mod tests {
     ) -> crate::peers::RelayedEntry {
         let mut entry =
             crate::peers::relayed_entry_from_wire(crate::api::schema::RelayedFleetPeer {
+                structured_agents: Vec::new(),
                 node_id: None,
                 dial: None,
                 name: host.into(),

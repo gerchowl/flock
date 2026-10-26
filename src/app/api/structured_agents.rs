@@ -64,15 +64,7 @@ impl App {
             .get(id)
             .ok_or(ErrorCode::InternalError)?;
         let state = projection.update.state.clone();
-        let status = match state.phase {
-            Phase::Gone | Phase::Offline => AgentStatus::Offline,
-            Phase::Hibernated => AgentStatus::Hibernated,
-            Phase::LimitReached | Phase::Blocked | Phase::NeedsHuman => AgentStatus::Blocked,
-            Phase::Working => AgentStatus::Working,
-            Phase::WaitingOnEvent | Phase::Settling => AgentStatus::Idle,
-            Phase::FinishedWithBackground | Phase::Finished => AgentStatus::Done,
-            Phase::Unknown => AgentStatus::Unknown,
-        };
+        let status = structured_status(state.phase);
         Ok(StructuredAgentInfo {
             runtime: record.runtime,
             agent_id: record.agent_id.clone(),
@@ -155,5 +147,18 @@ fn may_stop(caller: SpawnCaller, agent: &str) -> bool {
         _ => false,
     }
 }
+/// The same phase projection for local structured metadata and peer discovery.
+pub(in crate::app) fn structured_status(phase: Phase) -> AgentStatus {
+    match phase {
+        Phase::Gone | Phase::Offline => AgentStatus::Offline,
+        Phase::Hibernated => AgentStatus::Hibernated,
+        Phase::LimitReached | Phase::Blocked | Phase::NeedsHuman => AgentStatus::Blocked,
+        Phase::Working => AgentStatus::Working,
+        Phase::WaitingOnEvent | Phase::Settling => AgentStatus::Idle,
+        Phase::FinishedWithBackground | Phase::Finished => AgentStatus::Done,
+        Phase::Unknown => AgentStatus::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests;
