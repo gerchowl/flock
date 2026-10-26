@@ -122,7 +122,13 @@ fn setup() -> fleet::Fleet {
         fs::write(config, text).unwrap();
     })
 }
-fn exchange(node: &Node, sender: &mut Bridge, recipient: &mut Bridge, correlation: &str) {
+fn exchange(
+    node: &Node,
+    sender: &mut Bridge,
+    recipient: &mut Bridge,
+    correlation: &str,
+    remote: bool,
+) {
     let sent = sender.tool("flock_msg_send", json!({"to":{"type":"agent", "agent":recipient.agent}, "body":"fixture question", "intent":"needs_reply", "correlation_id":correlation}));
     assert_eq!(sent["correlation_id"], correlation, "{sent}");
     let deadline = Instant::now() + LIMIT;
@@ -178,8 +184,14 @@ fn exchange(node: &Node, sender: &mut Bridge, recipient: &mut Bridge, correlatio
         reply["correlation_id"]
     );
     assert_eq!(observations[0]["data"]["round_trips"], 1);
-    // The event schema omits held when false, as on the pane reply path.
-    assert!(observations[0]["data"].get("held").is_none());
+    // Remote acceptance may hold custody before relay collection. The event
+    // records that same accepted state, omitting held only when false.
+    if remote {
+        assert_eq!(reply["state"], "held");
+        assert_eq!(observations[0]["data"]["held"], true);
+    } else {
+        assert!(observations[0]["data"].get("held").is_none());
+    }
     let status = sender.tool("flock_msg_status", json!({"correlation_id":correlation}));
     assert_eq!(status["reply"]["correlation_id"], reply["correlation_id"]);
     assert_eq!(waited["reply"]["correlation_id"], reply["correlation_id"]);
@@ -217,7 +229,7 @@ fn pty_to_structured_reply_is_observable() {
     let node = fleet.node("nodea");
     let mut sender = Bridge::start(node, "native", true);
     let mut recipient = Bridge::start(node, "terminal", false);
-    exchange(node, &mut sender, &mut recipient, "pty-native");
+    exchange(node, &mut sender, &mut recipient, "pty-native", false);
     let inputs = fs::read_to_string(node.home.join("native.inputs")).unwrap();
     assert_eq!(
         inputs.lines().count(),
@@ -232,5 +244,76 @@ fn structured_to_structured_reply_is_observable() {
     let node = fleet.node("nodea");
     let mut sender = Bridge::start(node, "first", true);
     let mut recipient = Bridge::start(node, "second", true);
-    exchange(node, &mut sender, &mut recipient, "native-native");
+    exchange(node, &mut sender, &mut recipient, "native-native", false);
+}
+
+#[test]
+fn remote_discovery_triage() {
+    let fleet = setup();
+    let node = fleet.node("nodea");
+    let control = Bridge::start(node, "terminal", false);
+    let mut native = Bridge::start(node, "native", true);
+    let mut observer = Bridge::start(fleet.node("nodeb"), "observer", false);
+    let deadline = Instant::now() + LIMIT;
+    let mut listing = loop {
+        let listing = observer.tool("flock_agent_list", json!({}));
+        if listing["fleet"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["agent_id"] == control.agent)
+        {
+            break listing;
+        }
+        assert!(Instant::now() < deadline, "PTY control absent: {listing}");
+    };
+    let local = api(node, "agent.list", json!({}));
+    assert!(local["structured_agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["agent_id"] == native.agent));
+    let summary = api(node, "peers.summary", json!({}));
+    assert!(
+        summary.to_string().contains(&control.agent),
+        "PTY control absent from summary"
+    );
+    // A summary captured between the two starts may contain only the PTY.
+    // Wait on the native row within the same discovery bound, not on timing.
+    while !listing["fleet"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["agent_id"] == native.agent)
+    {
+        assert!(Instant::now() < deadline,
+            "native omitted while PTY discovered; local={local}; summary={summary}; remote={listing}");
+        listing = observer.tool("flock_agent_list", json!({}));
+    }
+    assert!(
+        listing.to_string().contains(&native.agent),
+        "native omitted while PTY discovered; local={local}; summary={summary}; remote={listing}"
+    );
+    let remote = listing["fleet"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["agent_id"] == native.agent)
+        .unwrap();
+    assert_eq!(remote["runtime"], "structured");
+    assert!(remote.get("pane_id").is_none());
+    assert!(summary["structured_agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["agent_id"] == native.agent && row["runtime"] == "structured"));
+    // Native reply acceptance is recorded on the recipient's node; the
+    // pending MCP wait and durable reply remain on the other node.
+    exchange(node, &mut observer, &mut native, "remote-native", true);
+    let inputs = fs::read_to_string(node.home.join("native.inputs")).unwrap();
+    assert_eq!(
+        inputs.lines().count(),
+        1,
+        "exactly one native harness input"
+    );
 }
