@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 /// Journal format understood by this writer. Unstamped journals are version 1.
 /// Bump for every new record kind, top-level field or enum variant name.
-pub const FORMAT_VERSION: u64 = 2;
+pub const FORMAT_VERSION: u64 = 3;
 
 const LINE_LIMIT: u64 = 2 * 1024 * 1024;
 

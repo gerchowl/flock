@@ -19,7 +19,8 @@ are private and files are owner-only, with existing symlinks/nonregular files
 refused. The data root itself may be an alias such as a canonicalized temp root.
 
 Every journal begins with a synced
-`{"kind":"queue_identity","agent_id":"...","format_version":2}` header containing the original, case-preserved ID. Open verifies it against the
+`{"kind":"queue_identity","agent_id":"...","format_version":3}` header
+containing the original, case-preserved ID. Open verifies it against the
 requested agent and refuses missing or mismatched first identity headers.
 A repeated identity header opens read-only as structural corruption. An unterminated first line with no records following it is rewritten
 and synced: identity creation only writes into an empty file, so no records
@@ -77,8 +78,8 @@ shares a mutable record buffer with future appends or rewrites.
 ## Format versions and downgrade refusal
 
 The ADR-0036 §4 owner decision in #1820 adds a journal version stamp. The
-current writer supports version 2. A missing `format_version` means version 1;
-opening a v1 journal does not stamp it. Its next checkpoint writes version 2.
+current writer supports version 3. A missing `format_version` means version 1;
+opening a v1 journal does not stamp it. Its next checkpoint writes version 3.
 Before appending to an older format, the writer checkpoints it into its own
 format, so no newer-format record can enter a journal with an older stamp.
 Sequence and encoded-size validation include the snapshot's sequences and happen
@@ -118,6 +119,10 @@ cannot be reconstructed by an older reader. A present stamp whose value is not
 a positive integer opens read-only as typed `QueueJournalCorrupt`; it never
 invents a writable version. Identity mismatches remain namespace violations
 that refuse open.
+
+Version 3 adds the typed `node_asserted { sender, origin }` queue producer for
+remote attribution (#1958). It adds no custody field or event kind. Older queue
+writers refuse mutation of the newer stamp under the existing downgrade guard.
 
 ## Unknown data, corruption and torn tails
 
