@@ -2129,9 +2129,13 @@ mod blob_storage_tests {
     fn live_loader_applies_sessions_threshold_and_defaults() {
         let default = load_live_config_from_str("").unwrap();
         assert_eq!(default.config.sessions.blob_min_bytes, 2048);
-        let loaded = load_live_config_from_str("[sessions]\nblob_min_bytes = 17\n").unwrap();
+        let loaded = load_live_config_from_str(
+            "[sessions]\nblob_min_bytes = 17\nqueue_rewrite_bytes = 4096\n",
+        )
+        .unwrap();
         assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
         assert_eq!(loaded.config.sessions.blob_min_bytes, 17);
+        assert_eq!(loaded.config.sessions.queue_rewrite_bytes.get(), 4096);
     }
 }
 

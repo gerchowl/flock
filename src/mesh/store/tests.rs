@@ -5147,16 +5147,24 @@ fn inbox_admission_refusal_is_terminal_but_read_cannot_be_refused() {
         let mail = envelope();
         store.set_local_node(&mail.key.origin_node);
         store
-            .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 0)
+            .accept_local(
+                &mail,
+                CUSTODY_TTL_MS,
+                "native-recipient",
+                "native-session",
+                0,
+            )
             .unwrap();
         if read {
             store.finish(&mail.key, Outcome::Read, 1).unwrap();
             assert!(matches!(
-                store.refuse(&mail.key, "session_busy", 2),
+                store.settle_queue_admission(&mail.key, Some("session_busy"), 2),
                 Err(Error::InvalidState)
             ));
         } else {
-            store.refuse(&mail.key, "session_busy", 1).unwrap();
+            store
+                .settle_queue_admission(&mail.key, Some("session_busy"), 1)
+                .unwrap();
             store
                 .accept(&mail, CUSTODY_TTL_MS, Admission::Inbox, 2)
                 .unwrap();
@@ -5187,5 +5195,33 @@ fn remote_origin_inbox_cannot_be_changed_to_refused() {
         Err(Error::InvalidState)
     ));
     assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "inbox");
+}
+
+#[test]
+fn custody_completion_transport_refusal_cannot_revoke_own_inbox() {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = envelope();
+    store.set_local_node(&mail.key.origin_node);
+    store
+        .accept_local(
+            &mail,
+            CUSTODY_TTL_MS,
+            "native-recipient",
+            "native-session",
+            0,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.refuse(&mail.key, "session_busy", 1),
+        Err(Error::InvalidState)
+    ));
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "inbox");
+    store.settle_queue_admission(&mail.key, None, 2).unwrap();
+    let admitted = store.get(&mail.key).unwrap().unwrap();
+    assert_eq!(admitted.state, "delivered");
+    assert_eq!(admitted.envelope.body, mail.body);
+    store.finish(&mail.key, Outcome::Read, 3).unwrap();
+    assert_eq!(store.get(&mail.key).unwrap().unwrap().state, "read");
 }
 mod diamond;

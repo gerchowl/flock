@@ -222,3 +222,48 @@ The ADR-0036 §4 owner decisions in #1820 and #1922 separate three cases:
 Persistence remains fsync of the temporary file, rename, then fsync of the
 directory. Disk operations are blocking worker operations and must never run
 on the server event loop or during render.
+
+### Message custody completion (ADR-0036 §3/S5)
+
+A successful queue-owner commit transfers the existing native-bound custody
+record from `inbox` to `delivered`. This means durable queue admission, not a
+recipient read. Its signed payload and reply binding remain available under
+existing outcome retention. Reopen restores reply metadata without admitting
+again or spending the sender's blocking budget again. A crash between queue
+commit and custody settlement replays the same MessageKey-derived lifecycle ID,
+which the single queue owner admits idempotently.
+
+Recovered transient failures, including `input_write_unknown`, retain the same
+custody key and retry in the running process using the existing bounded,
+jittered retry policy (up to five minutes). Owner progress can wake a waiting
+admission sooner. The server loop schedules the earliest recovery/backoff deadline,
+including on an otherwise idle headless server; fleet pause suspends admission.
+The sole journal owner retains an in-memory index of committed custody keys,
+rebuilt from the journal on reopen. Recovery checks that proof before refusing a
+key: a later admission conflict cannot revoke an already committed message.
+First settlement still applies blocking accounting and reply settlement once.
+An in-flight admission, opaque journal data, uncertain write, or unavailable
+owner cannot prove absence. Custody remains retryable instead of being revoked
+until the owner resolves admission or reopens the journal.
+Permanent refusals settle the
+existing `refused` or `recipient_gone` outcome and emit `message_delivered` with
+`delivered: false`; ordinary `msg.status` exposes the refusal and its detail.
+Refused duplicates retain a registered terminal refusal code. Legacy rows
+without a terminal typed reason use `msg_not_allowed`; their original detail
+remains available through message status. Expired and refused duplicates return a terminal code instead of restarting
+admission. A changed native session returns `recipient_gone`.
+
+A local reply enters a structured queue only when its original sender comes
+from a verified, locally signed envelope with a matching local recipient/session
+binding and a live or settled inbox outcome. A node signature alone does not
+prove local sender attestation. Claimed legacy `from_agent` metadata
+retains the terminal reply path and grants no structured routing authority.
+No custody schema, identity material, mesh version, or event kind changes.
+
+Unverifiable recovery records and unknown native identities remain raw in
+custody and never enter a legacy mailbox or queue. For unsettled records the
+existing refusal event exposes the typed failure; settled outcomes stay unchanged.
+Correcting unverifiable evidence requires operator action.
+Fresh terminal-bound messages are sealed only when their sender matches the
+authenticated caller, so legitimate replies can prove a structured sender while
+unsigned legacy sender claims remain on the terminal path.
