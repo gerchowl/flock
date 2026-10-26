@@ -9,6 +9,7 @@
 //! The worker exposes committed cuts and transitions through one completion owner.
 #![deny(missing_docs)]
 pub(crate) mod admission;
+pub(crate) mod custody;
 mod facts;
 pub mod model;
 mod policy;
@@ -230,10 +231,20 @@ impl Journal {
     pub(crate) fn item_snapshot(&self) -> std::sync::Arc<Vec<Item>> {
         self.items.clone()
     }
-    /// Whether the retained items can prove absence of a committed item.
+    /// Why retained items cannot prove absence of a committed item, if unknown.
     /// Opaque records, read-only state and uncertain writes prevent that proof.
-    pub(crate) fn complete_items(&self) -> bool {
-        !self.future && !self.poisoned && self.read_only().is_none()
+    pub(crate) fn commitment_unknown(&self) -> Option<custody::Unknown> {
+        use custody::Unknown;
+        if self.poisoned {
+            Some(Unknown::WriteUncertain)
+        } else if let Some(reason) = self.read_only() {
+            Some(match reason {
+                ReadOnly::Newer(_) => Unknown::JournalNewer,
+                ReadOnly::Corrupt(_) => Unknown::JournalCorrupt,
+            })
+        } else {
+            self.future.then_some(Unknown::JournalOpaque)
+        }
     }
     /// Committed encoded size for the worker's configured rewrite threshold.
     pub fn bytes(&self) -> io::Result<u64> {
