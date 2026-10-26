@@ -927,6 +927,42 @@ mod tests {
     /// ADR-0028 §3a: a kind from a newer release is skipped, not read as
     /// corruption, and its sequence stays spent.
     #[test]
+    fn directory_change_is_durable_and_unknown_kinds_remain_skippable() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldKind {
+            WorkspaceCreated,
+        }
+        assert!(serde_json::from_str::<OldKind>(r#""workspace_created""#).is_ok());
+        let path = temp_log("directory-change");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(EventEnvelope {
+            event: EventKind::DirectoryChanged,
+            data: crate::api::schema::EventData::DirectoryChanged {},
+        });
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(unknown_kind_seq_as::<OldKind>(&line), Some(1));
+        drop(hub);
+        let future = r#"{"seq":2,"ts_ms":1,"envelope":{"event":"future_directory_kind","data":{"type":"future_directory_kind"}}}"#;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{future}"
+        )
+        .unwrap();
+        let restarted = EventHub::with_persistence(path.clone());
+        assert_eq!(restarted.current_sequence(), 2);
+        let events = restarted.persisted_events_after(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].2.event, EventKind::DirectoryChanged);
+        assert!(std::fs::read_to_string(&path).unwrap().contains(future));
+        drop(restarted);
+        cleanup(&path);
+    }
+
+    #[test]
     fn an_unknown_kind_is_skipped_without_quarantining_the_log() {
         let path = temp_log("unknown-kind");
         let hub = EventHub::with_persistence(path.clone());

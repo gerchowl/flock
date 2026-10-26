@@ -257,12 +257,13 @@ fn remote_structured_recipient_replies_to_the_other_node() {
     let a = fleet.node("nodea");
     let b = fleet.node("nodeb");
     let mut sender = Bridge::start(b, "terminal", false);
+    // Capture the cursor before listing/starting: discovery between the list
+    // and the held read must remain replayable.
+    let mut after = api(b, "events.read", json!({"kinds":["directory_changed"]}))["next_after"]
+        .as_u64()
+        .unwrap();
     let mut recipient = Bridge::start(a, "native", true);
     let deadline = Instant::now() + LIMIT;
-    // Explicit bounded poll: agent.list/peers.summary have no wait parameter,
-    // and peer-summary updates notify the renderer, not the EventHub.
-    // mesh.routes_changed tracks topology, not agent-directory changes.
-    // Poll only discovery within LIMIT; submit the message once afterwards.
     loop {
         let listing = sender.tool("flock_agent_list", json!({}));
         let expected_fleet = format!("MCP listing must contain a fleet array: {listing}");
@@ -277,10 +278,24 @@ fn remote_structured_recipient_replies_to_the_other_node() {
             assert!(row.get("pane_id").is_none());
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "remote native discovery absent: {listing}"
-        );
+        loop {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            assert!(remaining > 0, "remote native discovery absent: {listing}");
+            let page = api(
+                b,
+                "events.read",
+                json!({"after":after,
+                "kinds":["directory_changed"], "wait_ms":remaining.min(5000)}),
+            );
+            after = page["next_after"].as_u64().unwrap();
+            if page.get("gap").is_some() || !page["events"].as_array().unwrap().is_empty() {
+                break;
+            }
+            // Renew a bounded server-held wait; do not re-read the directory
+            // until an actual invalidation (or retention gap) arrives.
+        }
     }
     exchange(b, &mut sender, a, &mut recipient, "remote-native");
 }
