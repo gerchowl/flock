@@ -1953,7 +1953,7 @@ impl App {
             diagnostics.push("sessions.queue_rewrite_bytes changed: restart required to apply the worker queue policy; keeping current threshold".into());
         }
 
-        // ADR-0041 decision 4: server reload cannot renegotiate MCP sessions.
+        // ADR-0041 §5: server reload cannot renegotiate MCP sessions.
         if !invalid_section("msg")
             && crate::mcp::channel::ChannelOptions::from_config(&config.msg)
                 != crate::mcp::channel::ChannelOptions::from_config(&self.state.config.msg)
@@ -1998,7 +1998,7 @@ impl App {
             self.state.config.channels = config.channels.clone();
             crate::channels::issue_tokens(&config.channels, &short_host_name());
         }
-        // ADR-0041 decision 4: these server policies are read at use time.
+        // ADR-0041 §5: these server policies are read at use time.
         // Existing admissions and process environment snapshots stay intact.
         if !invalid_section("msg") {
             self.state.config.msg = config.msg.clone();

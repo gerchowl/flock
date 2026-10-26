@@ -204,3 +204,56 @@ fn native_inbox_live_peek_and_unmatched_consume_are_read_only() {
     );
     assert!(s.native_inbox(None, false, 101).unwrap().1.is_empty());
 }
+
+fn assert_native_inbox_ack_persists_clock(consume: bool) {
+    let fixture = Fixture::new();
+    let mut store = fixture.open(0);
+    let mail = admit(&mut store);
+    store.native_inbox_delivered(&mail.key, 100, 10).unwrap();
+    let ack_wall = if consume { 50 } else { 110 };
+    let mut ack_clock = store.clock().unwrap();
+    ack_clock.advance(ack_wall);
+    let recipient = consume.then_some(("recipient", "session"));
+    let result = store.native_inbox(recipient, consume, ack_wall).unwrap();
+    let expected = if consume {
+        (vec![mail.clone()], vec![])
+    } else {
+        (vec![], vec![mail.clone()])
+    };
+    assert_eq!(
+        result, expected,
+        "fixture must acknowledge exactly this mail"
+    );
+    let state: String = store
+        .connection
+        .query_row(
+            "SELECT state FROM native_inbox_reads WHERE origin=?1 AND id=?2",
+            params![mail.key.origin_node, mail.key.message_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, if consume { "read" } else { "expired" });
+    drop(store);
+
+    // A rolled-back wall clock cannot reconstruct a missing persisted advance.
+    let reopened = fixture.open(0);
+    let persisted = reopened.clock().unwrap();
+    assert!(
+        persisted.elapsed_ms >= ack_clock.elapsed_ms,
+        "acknowledgement lost logical time across restart: {persisted:?} < {ack_clock:?}"
+    );
+    assert!(
+        persisted.wall_ms >= ack_clock.wall_ms,
+        "acknowledgement lost its wall anchor across restart: {persisted:?} < {ack_clock:?}"
+    );
+}
+
+#[test]
+fn native_inbox_consumption_ack_persists_clock_across_restart() {
+    assert_native_inbox_ack_persists_clock(true);
+}
+
+#[test]
+fn native_inbox_expiry_ack_persists_clock_across_restart() {
+    assert_native_inbox_ack_persists_clock(false);
+}
