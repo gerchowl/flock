@@ -455,6 +455,9 @@ impl App {
 }
 
 #[cfg(test)]
+pub(crate) mod loop_tests;
+
+#[cfg(test)]
 mod tests {
     use crate::api::schema::{AgentStatus, PeerAgentSummary, PeerWorkspaceSummary};
     use crate::app::App;
@@ -734,6 +737,68 @@ mod tests {
         }
         assert_eq!(read(&mut app), 1);
         app.state.workspaces.clear();
+        assert_eq!(read(&mut app), 2);
+        assert_eq!(read(&mut app), 2);
+    }
+
+    #[test]
+    fn directory_change_detects_only_a_pane_id_change_once() {
+        let mut app = test_app();
+        app.state.peer_summaries = vec![peer_with_agent(
+            "remote.invalid",
+            "remote.invalid",
+            "remote-agent",
+        )];
+        let read = |app: &mut App| {
+            app.handle_api_request(crate::api::schema::Request {
+                id: "directory-pane".into(),
+                method: crate::api::schema::Method::AgentList(Default::default()),
+            });
+            super::loop_tests::changes(&app.event_hub, 0).len()
+        };
+        assert_eq!(read(&mut app), 1);
+        let mut expected = app.collect_fleet_agents(&[]);
+        app.state.peer_summaries[0].workspaces[0].agents[0].pane_id = "moved-pane".into();
+        expected[0].pane_id = Some("moved-pane".into());
+        assert_eq!(
+            app.collect_fleet_agents(&[]),
+            expected,
+            "only the public pane changed"
+        );
+        assert_eq!(read(&mut app), 2);
+        assert_eq!(read(&mut app), 2);
+    }
+
+    #[test]
+    fn directory_change_detects_an_agent_rename_once() {
+        let mut app = test_app();
+        let id = name_local_agent(&mut app, "original-name");
+        let read = |app: &mut App| {
+            app.handle_api_request(crate::api::schema::Request {
+                id: "directory-name".into(),
+                method: crate::api::schema::Method::AgentList(Default::default()),
+            });
+            super::loop_tests::changes(&app.event_hub, 0).len()
+        };
+        assert_eq!(read(&mut app), 1);
+        let before = app.collect_fleet_agents(&app.collect_agent_infos());
+        app.state
+            .terminals
+            .values_mut()
+            .find(|t| t.agent_id.to_string() == id)
+            .unwrap()
+            .set_agent_name("renamed-agent".into())
+            .unwrap();
+        let after = app.collect_fleet_agents(&app.collect_agent_infos());
+        assert_eq!(before[0].agent_id, after[0].agent_id);
+        assert_eq!(before[0].pane_id, after[0].pane_id);
+        assert_eq!(before[0].host, after[0].host);
+        assert_eq!(before[0].route, after[0].route);
+        assert_eq!(before[0].runtime, after[0].runtime);
+        assert_eq!(before[0].agent, after[0].agent);
+        assert_eq!(before[0].local, after[0].local);
+        assert_eq!(before[0].name.as_deref(), Some("original-name"));
+        assert_eq!(after[0].name.as_deref(), Some("renamed-agent"));
         assert_eq!(read(&mut app), 2);
         assert_eq!(read(&mut app), 2);
     }
