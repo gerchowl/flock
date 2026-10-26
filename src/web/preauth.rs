@@ -19,6 +19,8 @@ struct Entry {
     failures: usize,
     start: Instant,
 }
+/// Bounded pending-admission and fixed-window accounting for a kernel UID.
+/// The UID attribution design is held for an owner decision on #2500.
 pub(super) struct Budget {
     entries: Mutex<HashMap<Option<u32>, Entry>>,
     clock: Arc<dyn Clock>,
