@@ -36,6 +36,7 @@ mod revert;
 mod spawn;
 mod structured_agents;
 mod structured_grants;
+pub(crate) mod structured_messages;
 pub(crate) mod structured_queue;
 mod structured_start;
 mod tabs;
