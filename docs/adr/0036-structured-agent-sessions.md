@@ -3591,7 +3591,7 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
   error names are introduced (#2442).
 
 **Shell origins, on `/v1/ws` only.**
-- **The allow-list.** The listener guard (`origin_allowed`,
+- **The allow-list.** The listener guard (`shell_origin_allowed`,
   `src/web/gui.rs`; `src/web/client_listener.rs`) admits an exact allow-list
   of shell origins on the `/v1/ws` upgrade.
 - **Its values.** The allow-list holds only values captured from real Tauri v2
@@ -3622,6 +3622,10 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
     `auth_rate_limited` for the rest of that second.
   - Authenticated sessions are unaffected.
   - The §5a handshake deadline still applies.
+  - **Held acceptance (#2500), not implemented by the Origin-only slice:**
+    test refusal at 17 concurrent connections and at the 11th failed `hello`
+    within 1 s, with authenticated sessions unaffected. This test belongs to
+    #2500 and must follow the owner decision on isolation/window policy.
 
 **Tests that must fail first.**
 - A captured shell origin is admitted on `/v1/ws` and refused on the exchange.
@@ -3635,8 +3639,6 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
 - Restart and handoff each revoke every app-session token.
 - `same-site`, duplicate headers, lookalike shell origins and non-WS paths
   keep their existing refusal treatment.
-- The pre-auth caps refuse at 17 concurrent connections and at the 11th failed
-  `hello` within 1 s, and an authenticated session is unaffected.
 
 ### Amendment: Welcome capability grants (#2461)
 

@@ -406,6 +406,12 @@ async fn captured_shell_origin_is_exact_cross_site_and_ws_only() {
             "cross-site",
             "Origin: tauri://localhost\r\n",
         ),
+        (
+            "/v1/ws",
+            "tauri://localhost",
+            "cross-site",
+            "Sec-Fetch-Site: same-origin\r\n",
+        ),
     ] {
         let (_, header) = server.request(path, origin, site, extra).await;
         assert!(

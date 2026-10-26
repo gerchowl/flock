@@ -640,7 +640,7 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
       - **No silent fallback.** An app launched from inside a flk pane fails the LocalOperator check, and a sandboxed (App Store) build cannot reach `flock.sock`. Either one says why and offers the remote path; it never falls back silently.
     - **A remote server** (#2293), or a platform without `flock.sock`. The person pastes or deep-links a one-time code, and the token lives in the keychain or keystore, optionally behind biometric unlock.
   - **Shell origins, on `/v1/ws` only.**
-    - A shell's webview does not present the server's origin. The listener's guard (`origin_allowed`, `src/web/gui.rs`, used by the listener in `src/web/client_listener.rs`) admits an **exact allow-list of shell origins** on the `/v1/ws` upgrade only.
+    - A shell's webview does not present the server's origin. The listener's guard (`shell_origin_allowed`, `src/web/gui.rs`, used by the listener in `src/web/client_listener.rs`) admits an **exact allow-list of shell origins** on the `/v1/ws` upgrade only.
     - For those origins only, it relaxes the `Sec-Fetch-Site` check to the value the shell actually sends (`cross-site` against `127.0.0.1:port`). Every other origin keeps today's `none`/`same-origin` rule.
     - The loopback-peer and exact-`Host` checks are unchanged.
     - **Captured values (#2442).** Real Tauri 2.12.3 on macOS 26.6 (WKWebView) and Linux WebKitGTK 2.54.1 sends exactly `tauri://localhost` and `Sec-Fetch-Site: cross-site`. Admit that pair only on the exact `/v1/ws` path; it grants no general cross-site fetch permission. Windows remains remote-only.
@@ -667,7 +667,7 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
     - the token dies at its TTL (an injected clock), and a live session is closed with 4403;
     - a start-time mismatch is refused with `peer_process_changed`, and a restart or handoff revokes every app-session token;
     - `same-site`, `null`, duplicate headers, lookalike shell origins and non-WS paths keep their existing refusal treatment;
-    - the pre-auth caps refuse at 17 concurrent connections and at the 11th failed `hello` within 1 s, and an authenticated session is unaffected;
+    - the pre-auth cap test (17 concurrent / 11th failed `hello` within 1 s, authenticated sessions unaffected) is held in #2500, outside the Origin-only slice, pending the isolation/window policy decision;
     - the Linux shell refuses to mint when `ptrace_scope` is 0.
   - **Native additions:**
     - the keyboard accessory bar;
