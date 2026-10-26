@@ -1459,6 +1459,9 @@ pub struct AdvancedConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MsgConfig {
+    /// Native tool-inbox read window after first harness delivery, in milliseconds.
+    /// Defaults to the pane mailbox window (24 hours). Custody is independent.
+    pub inbox_retention_ms: u64,
     /// Accept agent-to-agent messages at all. Default: true.
     ///
     /// A node that sets this false still SENDS — this governs what it is
@@ -1536,6 +1539,7 @@ pub struct MsgConfig {
 impl Default for MsgConfig {
     fn default() -> Self {
         Self {
+            inbox_retention_ms: crate::app::mailboxes::UNDELIVERED_TTL_MS,
             enabled: true,
             allow_from: vec!["*".to_string()],
             mute_reason_max_chars: 200,
