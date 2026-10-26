@@ -199,7 +199,7 @@ export class WireConnection {
   #socket: SocketLike | null = null;
   #generation = 0;
   #attempt = 0;
-  #revoked = false;
+  #acks = 0;
   #timers = new Map<Timer, TimerHandle>();
   #subs = new Map<string, Sub>();
   /** The last sub id allocated: ids are `s<n>`, and n only grows (ADR-0038 §3). */
@@ -231,9 +231,19 @@ export class WireConnection {
     return this.#error;
   }
 
-  /** In NeedsToken, whether a close 4403 revoked a working token (rather than 4401 refusing one at `hello`). */
-  get revoked(): boolean {
-    return this.#revoked;
+  /** How many commands an ok `ack` settled on this connection: it only grows, whatever the outbox drops. */
+  get acks(): number {
+    return this.#acks;
+  }
+
+  /** What a changed principal dropped from the outbox, until dismissed or the next ok `ack`. */
+  get outboxDropped(): string | null {
+    return this.#outbox.dropped;
+  }
+
+  /** The person has seen {@link outboxDropped}. */
+  dismissOutboxDropped(): void {
+    this.#outbox.dismissDropped();
   }
 
   /** What restoring the stored outbox had to drop, or null (shown, never fatal). */
@@ -450,7 +460,6 @@ export class WireConnection {
     if (code === AUTH_REFUSED || code === TOKEN_REVOKED) {
       this.#abandon(null, "");
       this.#token = null;
-      this.#revoked = code === TOKEN_REVOKED;
       this.#error = code === AUTH_REFUSED ? "The server refused the token." : "The token was revoked.";
       this.#clear("backoff");
       this.#enter("NeedsToken");
@@ -760,5 +769,6 @@ export class WireConnection {
     const error: WireError | null = frame.error ?? null;
     if (frame.ok === (error !== null)) return this.#protocolError(`ack ${frame.cmd_id} with ok=${frame.ok} and ${error === null ? "no" : "an"} error`);
     if (!this.#outbox.settle(frame.cmd_id, error)) return this.#protocolError(`ack for ${frame.cmd_id}, which is not awaiting one on this socket`);
+    if (error === null) this.#acks++;
   }
 }

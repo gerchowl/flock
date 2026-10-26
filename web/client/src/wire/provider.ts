@@ -2,38 +2,56 @@
  * A shell's token provider, driven by the connection's NeedsToken
  * (ADR-0038 §6, "The shell config contract" and "Lifetime").
  *
- * - It is asked when the person connects (the initial connect included, and
- *   {@link ShellTokens.ask}, which NeedsToken offers instead of a prompt),
- *   and after a close 4403 revoked a working token. A token refused at
- *   `hello` (4401) is not asked for again: that would loop.
+ * - **When it is asked.** When the person connects (the initial connect,
+ *   and {@link ShellTokens.ask}, which NeedsToken offers instead of a
+ *   prompt; a pending backoff wait is cancelled for it), and whenever the
+ *   server ends this shell's token: a close 4403, or a 4401 at `hello`. A
+ *   4401 for a token that once got a `welcome` is what a server restart
+ *   leaves (app-session tokens live in its memory only), so it re-mints like
+ *   a revocation. A 4401 for a token that never got one counts the same, so a
+ *   broken mint is bounded too.
+ * - **Before expiry.** A provider token that carries `expiresInMs` (the
+ *   lifetime the server reported at mint) is renewed at {@link RENEW_AT} of
+ *   it, by one timer, and the connection switches to the new token through
+ *   §3's resume path. A failed renewal is not retried: the reactive path
+ *   above takes over when the server ends the token. Without `expiresInMs`
+ *   there is no timer.
  * - One call at a time: a request while one is in flight, or waiting, is
  *   the same request.
  * - Its token goes to the connection with `setToken`, which connects only
  *   from NeedsToken; after a Disconnect it is kept for the next Connect.
- * - A rejection, a synchronous throw or a value that is not a non-empty
- *   string is NeedsToken with that message, and is not retried.
- * - **Bounded re-mints.** Consecutive 4403 re-mints back off on §3's
- *   reconnect backoff: the first is immediate, the next ones wait
- *   `backoffDelay(0…)`. After {@link MAX_REMINTS} in a row the provider is
- *   not asked again until the person asks. A session that stayed Live for
- *   §3's healthy period (the one that resets its backoff), or an `ack`ed
- *   command since the streak began, ends the streak.
+ * - A rejection, a synchronous throw or a value that is not a
+ *   `{ token, expiresInMs? }` is NeedsToken with that message, and is not
+ *   retried.
+ * - **Bounded re-mints.** Consecutive re-mints back off on §3's reconnect
+ *   backoff: the first is immediate, the next ones wait `backoffDelay(0…)`.
+ *   After {@link MAX_REMINTS} in a row the provider is not asked again until
+ *   the person asks. A session that stayed Live for §3's healthy period (the
+ *   one that resets its backoff), or an `ack`ed command since the streak
+ *   began, ends the streak.
  *
  * @module
  */
-import type { TokenProvider } from "../config";
+import type { ShellToken, TokenProvider } from "../config";
 import { DEADLINES, type WireConnection } from "./connection";
 import { backoffDelay, type Clock, type TimerHandle } from "./env";
 
 /**
- * Consecutive 4403 re-mints before the provider is no longer asked: one at
- * once, then §3's backoff for attempts 0 to 5 (ceilings 0.5 s to 16 s). The
- * next wait would be the backoff's 30 s ceiling, so the shell stops instead.
+ * Consecutive re-mints before the provider is no longer asked: one at once,
+ * then §3's backoff for attempts 0 to 5 (ceilings 0.5 s to 16 s). The next
+ * wait would be the backoff's 30 s ceiling, so the shell stops instead.
  */
 export const MAX_REMINTS = 7;
 
 /** NeedsToken's reason once the re-mints are spent. */
 export const REMINTS_SPENT = `The server ended ${MAX_REMINTS} tokens from this shell in a row. Connect to try again.`;
+
+/**
+ * The fraction of a token's reported lifetime after which it is renewed:
+ * three quarters, so a 12 h token renews 3 h early and even a short one
+ * leaves a quarter of its life for the renewal and the reconnect.
+ */
+export const RENEW_AT = 3 / 4;
 
 /** What the app reads and does; `changed` runs on every change of `asking` or `error`. */
 export type ShellTokens = {
@@ -41,7 +59,7 @@ export type ShellTokens = {
   readonly asking: boolean;
   /** Why the last call gave no token, or why the provider is no longer asked. */
   readonly error: string | null;
-  /** The person's Connect: asks once more, with a fresh streak. */
+  /** The person's Connect: asks at once, with a fresh streak. */
   ask(): void;
   dispose(): void;
 };
@@ -52,33 +70,60 @@ function reason(error: unknown): string {
   return message === "" ? "The shell could not provide a token." : message;
 }
 
+/** The provider's value as a {@link ShellToken}, or null when it is not one. */
+function shellToken(value: unknown): ShellToken | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { token, expiresInMs } = value as Record<string, unknown>;
+  if (typeof token !== "string" || token === "") return null;
+  if (expiresInMs === undefined) return { token };
+  return typeof expiresInMs === "number" && Number.isFinite(expiresInMs) && expiresInMs > 0 ? { token, expiresInMs } : null;
+}
+
 export function driveTokenProvider(connection: WireConnection, provider: TokenProvider, clock: Clock, random: () => number, changed: () => void): ShellTokens {
   let inFlight = false;
   let waiting: TimerHandle | null = null;
+  let renewal: TimerHandle | null = null;
   let error: string | null = null;
   let disposed = false;
   let streak = 0;
-  let ackedAtStreak = 0;
+  let acksAtStreak = 0;
   let liveSince: number | null = null;
   let previous = connection.state;
-  const acked = (): number => connection.commands().filter((entry) => entry.status === "acked").length;
 
+  const cancel = (timer: TimerHandle | null): null => {
+    if (timer !== null) clock.clearTimeout(timer);
+    return null;
+  };
+  /** Hands `token` over: from NeedsToken or Disconnected `setToken` is enough; a running session reconnects on it. */
+  const adopt = ({ token, expiresInMs }: ShellToken): void => {
+    const running = connection.state !== "NeedsToken" && connection.state !== "Disconnected";
+    connection.setToken(token);
+    if (running) {
+      connection.disconnect();
+      connection.connect();
+    }
+    renewal = cancel(renewal);
+    if (expiresInMs !== undefined) renewal = clock.setTimeout(() => ((renewal = null), request(0)), Math.floor(expiresInMs * RENEW_AT));
+  };
   const call = (): void => {
     waiting = null;
     inFlight = true;
     error = null;
     changed();
-    const settle = (token: string | null, failure: string | null): void => {
+    const settle = (token: ShellToken | null, failure: string | null): void => {
       inFlight = false;
       if (disposed) return;
       error = failure;
-      if (token !== null) connection.setToken(token);
+      if (token !== null) adopt(token);
       changed();
     };
     Promise.resolve()
       .then(provider)
       .then(
-        (token: unknown) => (typeof token === "string" && token !== "" ? settle(token, null) : settle(null, "The shell gave no token.")),
+        (value: unknown) => {
+          const token = shellToken(value);
+          settle(token, token === null ? "The shell gave no token." : null);
+        },
         (failure: unknown) => settle(null, reason(failure)),
       );
   };
@@ -91,8 +136,8 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
     }
   };
   const remint = (): void => {
-    if (acked() > ackedAtStreak) streak = 0;
-    if (streak === 0) ackedAtStreak = acked();
+    if (connection.acks > acksAtStreak) streak = 0;
+    if (streak === 0) acksAtStreak = connection.acks;
     if (streak >= MAX_REMINTS) {
       error = REMINTS_SPENT;
       return changed();
@@ -108,15 +153,14 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
       liveSince = null;
     }
     if (state === "Disconnected" && waiting !== null) {
-      clock.clearTimeout(waiting);
-      waiting = null;
+      waiting = cancel(waiting);
       changed();
     }
     if (state === "NeedsToken") {
       if (previous === "Disconnected") {
         streak = 0;
         request(0);
-      } else if (connection.revoked) remint();
+      } else remint();
     }
     previous = state;
   });
@@ -129,6 +173,7 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
       return error;
     },
     ask() {
+      waiting = cancel(waiting);
       streak = 0;
       error = null;
       request(0);
@@ -137,8 +182,8 @@ export function driveTokenProvider(connection: WireConnection, provider: TokenPr
     dispose() {
       disposed = true;
       stop();
-      if (waiting !== null) clock.clearTimeout(waiting);
-      waiting = null;
+      waiting = cancel(waiting);
+      renewal = cancel(renewal);
     },
   };
 }

@@ -28,7 +28,8 @@
  * `uncertain` command is held the same way; it is never sent again as a
  * first send. A `welcome` with another principal drops every command queued
  * under the old one (commands must not run under another identity), and
- * {@link Outbox.problem} says so.
+ * {@link Outbox.dropped} says so until the person dismisses it or the next
+ * command is acked.
  *
  * @module
  */
@@ -94,6 +95,7 @@ export class Outbox {
   readonly #store: KeyValueStore;
   readonly #changed: () => void;
   #problem: string | null = null;
+  #dropped: string | null = null;
 
   /** Restores the persisted outbox from `store`, dropping what it cannot read. */
   constructor(store: KeyValueStore, changed: () => void) {
@@ -126,6 +128,17 @@ export class Outbox {
   /** What restoring the stored outbox had to drop, or null. */
   get problem(): string | null {
     return this.#problem;
+  }
+
+  /** What the last principal change dropped, or null. */
+  get dropped(): string | null {
+    return this.#dropped;
+  }
+
+  /** The person has seen {@link dropped}. */
+  dismissDropped(): void {
+    this.#dropped = null;
+    this.#changed();
   }
 
   /** The principal the stored commands were queued under. */
@@ -161,7 +174,7 @@ export class Outbox {
         this.#commands.delete(id);
       }
     }
-    if (dropped > 0) this.#problem = `Dropped ${dropped} unsent ${dropped === 1 ? "command" : "commands"}: the server now names another identity, and commands never run under another.`;
+    if (dropped > 0) this.#dropped = `Dropped ${dropped} unsent ${dropped === 1 ? "command" : "commands"}: the server now names another identity, and commands never run under another.`;
     this.#principal = principal;
     this.#commit();
   }
@@ -193,6 +206,8 @@ export class Outbox {
     this.#cancel(live);
     live.onSocket = false;
     live.entry = error === null ? { ...live.entry, status: "acked" } : { ...live.entry, status: "failed", error };
+    // A command went through again: the drop notice has done its job.
+    if (error === null) this.#dropped = null;
     this.#commit();
     return true;
   }

@@ -35,13 +35,21 @@
 export const SHELL_CONFIG_GLOBAL = "__FLOCK_SHELL_CONFIG__";
 
 /**
- * The shell's source of tokens: resolves to a fresh client token, or rejects
- * with a message for the person. The client asks it at connect, on the
- * person's Connect and after the server ends a token (close 4403, bounded by
- * §3's backoff), keeps what it gets in memory only, never shows the token
- * prompt and never exchanges a link's code (`src/wire/provider.ts`).
+ * A token from the shell, and the remaining lifetime the server reported for
+ * it at mint (`issued.info.expires_in_ms`), when it reported one.
  */
-export type TokenProvider = () => Promise<string>;
+export type ShellToken = { readonly token: string; readonly expiresInMs?: number };
+
+/**
+ * The shell's source of tokens, pull-only: resolves to a fresh
+ * {@link ShellToken}, or rejects with a message for the person. The client
+ * asks it at connect, on the person's Connect, when the server ends a token
+ * (close 4403, or 4401 at `hello`, bounded by §3's backoff) and, with
+ * `expiresInMs`, before expiry. It keeps the token in memory only, never
+ * shows the token prompt and never exchanges a link's code
+ * (`src/wire/provider.ts`).
+ */
+export type TokenProvider = () => Promise<ShellToken>;
 
 /** Live mode: connect to a `flk` server over ADR-0036 §5's WebSocket. */
 export type WireShellConfig = {

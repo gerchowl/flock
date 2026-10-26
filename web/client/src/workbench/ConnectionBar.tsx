@@ -2,8 +2,9 @@
  * The live connection's strip (ADR-0038 §3): its state, the latest failure
  * while reconnecting or stopped, the always-offered *Disconnect* (or
  * *Connect*), in NeedsToken a field for a new token (or, when the shell
- * provides tokens, a *Connect* that asks it again), and what restoring
- * the stored outbox had to drop, if anything. The token is
+ * provides tokens, a *Connect* that asks it again), what restoring
+ * the stored outbox had to drop, if anything, and what a changed principal
+ * dropped, until dismissed or the next acked command. The token is
  * handed to the connection and never shown, logged or stored by the page.
  *
  * @module
@@ -26,6 +27,7 @@ export function ConnectionBar(props: ConnectionBarProps): JSX.Element {
   const state = (): WireConnection["state"] => (props.revision(), props.connection.state);
   const error = (): string | null => (props.revision(), props.connection.error);
   const outboxProblem = (): string | null => (props.revision(), props.connection.outboxProblem);
+  const outboxDropped = (): string | null => (props.revision(), props.connection.outboxDropped);
   return (
     <div class="connection-bar" classList={{ "connection-bar--live": state() === "Live" }} role="status" data-testid="connection-bar">
       <strong class="connection-bar__state">{state()}</strong>
@@ -34,6 +36,16 @@ export function ConnectionBar(props: ConnectionBarProps): JSX.Element {
         {(problem) => (
           <span class="connection-bar__error" data-testid="outbox-problem">
             {problem()}
+          </span>
+        )}
+      </Show>
+      <Show when={outboxDropped()}>
+        {(dropped) => (
+          <span class="connection-bar__error" data-testid="outbox-dropped">
+            {dropped()}
+            <button type="button" class="action" onClick={() => props.connection.dismissOutboxDropped()}>
+              Dismiss
+            </button>
           </span>
         )}
       </Show>
