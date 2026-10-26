@@ -259,13 +259,16 @@ fn remote_structured_recipient_replies_to_the_other_node() {
     let mut sender = Bridge::start(b, "terminal", false);
     let mut recipient = Bridge::start(a, "native", true);
     let deadline = Instant::now() + LIMIT;
-    // Discovery is asynchronous. Observe the actual MCP directory before
-    // sending once, rather than retrying a message whose effect is unknown.
+    // Explicit bounded poll: agent.list/peers.summary have no wait parameter,
+    // and peer-summary updates notify the renderer, not the EventHub.
+    // mesh.routes_changed tracks topology, not agent-directory changes.
+    // Poll only discovery within LIMIT; submit the message once afterwards.
     loop {
         let listing = sender.tool("flock_agent_list", json!({}));
+        let expected_fleet = format!("MCP listing must contain a fleet array: {listing}");
         if let Some(row) = listing["fleet"]
             .as_array()
-            .unwrap()
+            .expect(&expected_fleet)
             .iter()
             .find(|row| row["agent_id"] == recipient.agent)
         {
