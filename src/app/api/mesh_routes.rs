@@ -30,10 +30,14 @@ pub(super) struct Retry {
     generation: u64,
     attempts: u32,
     pub(super) at: Instant,
+    /// Repeated failure wakes from one owner never bypass this floor.
+    pub(super) wake_at: Instant,
+    /// A failed post-expiry custody settlement must honor its scheduled backoff.
+    pub(super) custody_correction: bool,
 }
 
 impl Retry {
-    fn superseded(&self, enrollment: u64, generation: u64, awakened: bool) -> bool {
+    pub(super) fn superseded(&self, enrollment: u64, generation: u64, awakened: bool) -> bool {
         awakened || self.enrollment != enrollment || self.generation != generation
     }
 
@@ -64,6 +68,8 @@ impl Retry {
             generation,
             attempts,
             at: now + delay,
+            wake_at: now + Duration::from_secs(4),
+            custody_correction: false,
         }
     }
 }

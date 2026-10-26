@@ -852,6 +852,9 @@ impl<D: DiskSpace> Store<D> {
     /// Transfer native inbox custody to the durable queue, or record its refusal.
     /// The existing recipient binding is required. Delivered preserves reply
     /// material under existing outcome retention and does not claim an actual read.
+    /// `None` requires the sole journal owner's positive commit proof. That proof
+    /// outranks an unpersisted expiry or a persisted unknown-commitment expiry,
+    /// without restoring deleted payload or extending its original reply TTL.
     pub fn settle_queue_admission(
         &mut self,
         key: &MessageKey,
@@ -861,10 +864,13 @@ impl<D: DiskSpace> Store<D> {
         if self.recipient_binding(key)?.is_none() {
             return Err(Error::InvalidState);
         }
-        let outcome = match refusal {
-            None => Outcome::Delivered,
-            Some("recipient_gone") => Outcome::RecipientGone,
-            Some(_) => Outcome::Refused,
+        if refusal.is_none() {
+            return self.commit_queue_admission(key, wall_ms);
+        }
+        let outcome = if refusal == Some("recipient_gone") {
+            Outcome::RecipientGone
+        } else {
+            Outcome::Refused
         };
         self.finish_with_detail(key, outcome, refusal, wall_ms, true)
     }

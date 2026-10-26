@@ -733,7 +733,7 @@ fn custody_completion_unknown_retries_in_process_with_the_same_key() {
             r.app
                 .structured_workers
                 .queue_custody_committed(&r.case.id, &d.envelope.key),
-            None
+            Err(crate::structured::queue::custody::Unknown::AdmissionPending)
         );
         r.app.structured_sends.complete(
             r.case.id.clone(),
@@ -781,7 +781,7 @@ fn custody_completion_unknown_retries_in_process_with_the_same_key() {
             r.app
                 .structured_workers
                 .queue_custody_committed(&r.case.id, &d.envelope.key),
-            None,
+            Err(crate::structured::queue::custody::Unknown::AdmissionPending),
             "recovery must run while the original admission is unresolved"
         );
         assert!(r
@@ -822,7 +822,7 @@ fn custody_completion_unknown_retries_in_process_with_the_same_key() {
             r.app
                 .structured_workers
                 .queue_custody_committed(&r.case.id, &d.envelope.key),
-            Some(true)
+            Ok(true)
         );
         r.until(|r| !r.inputs().is_empty()).await;
         let inputs = r.inputs();
@@ -1330,7 +1330,8 @@ fn custody_unknown_owner_is_observable_until_ttl_then_stops() {
         assert_eq!(
             r.app
                 .structured_workers
-                .queue_custody_committed(&r.case.id, &d.envelope.key,),
+                .queue_custody_committed(&r.case.id, &d.envelope.key,)
+                .ok(),
             None
         );
         for _ in 0..8 {
@@ -1358,7 +1359,7 @@ fn custody_unknown_owner_is_observable_until_ttl_then_stops() {
         assert_eq!(status.state, "queued");
         assert_eq!(
             status.detail.as_deref(),
-            Some("input_write_unknown:agent_not_found")
+            Some("input_write_unknown:owner_unavailable")
         );
         let expired = now + 24 * 60 * 60 * 1000;
         with_store(|s| s.maintain(expired - 100).map_err(|e| e.to_string())).unwrap();
@@ -1409,4 +1410,606 @@ fn custody_unknown_owner_is_observable_until_ttl_then_stops() {
             .recovery_deadline(std::time::Instant::now())
             .is_none());
     });
+}
+
+#[test]
+fn custody_followup_commit_survives_expiry_before_settlement() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2530).await;
+        let d = mail(&r);
+        let now = crate::app::notifications::now_ms() as i64;
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (
+                    &r.case.id,
+                    &r.app
+                        .state
+                        .structured_agents
+                        .get(&r.case.id)
+                        .unwrap()
+                        .0
+                        .session_id,
+                ),
+                false,
+                now,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let (ticket, ack) = r.app.admit_queue_custody(&d.envelope).unwrap();
+        r.until(|_| ticket.committed.try_recv().is_ok_and(|x| x.is_ok()))
+            .await;
+        with_store(|s| {
+            s.maintain(now + crate::mesh::store::DAY_MS)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        r.app.structured_sends.acknowledged.push(ack);
+        r.app
+            .finish_structured_messages(false, std::time::Instant::now());
+        let stored = with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.state, "delivered",
+            "a proven commit outranks inbox expiry"
+        );
+        assert!(
+            stored.envelope.body.is_empty(),
+            "expiry never restores payload"
+        );
+        let attempts = r.app.structured_sends.custody_attempts;
+        let rx = request(&mut r, d.clone());
+        let response = answer(&mut r, &rx).await;
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(r.app.structured_sends.custody_attempts, attempts);
+        r.until(|r| !r.inputs().is_empty()).await;
+        assert_eq!(r.inputs().len(), 1);
+        r.stop().await;
+    });
+}
+
+#[test]
+fn custody_followup_changed_wakes_have_a_counted_retry_bound() {
+    run(async {
+        use crate::api::error_code::ErrorCode;
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2531).await;
+        let d = mail(&r);
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (
+                    &r.case.id,
+                    &r.app
+                        .state
+                        .structured_agents
+                        .get(&r.case.id)
+                        .unwrap()
+                        .0
+                        .session_id,
+                ),
+                false,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        r.app
+            .retry_queue_custody(d.envelope.clone(), ErrorCode::InputWriteUnknown);
+        let now = std::time::Instant::now();
+        r.stop().await;
+        r.app.structured_workers = crate::structured::workers::Workers::new(r.notify.clone());
+        for n in 0..100 {
+            r.app
+                .finish_structured_messages(true, now + std::time::Duration::from_millis(n));
+        }
+        assert_eq!(
+            r.app.structured_sends.custody_attempts, 0,
+            "owner failure notifications must not bypass the retry floor"
+        );
+        r.app
+            .finish_structured_messages(true, now + std::time::Duration::from_secs(4));
+        assert_eq!(r.app.structured_sends.custody_attempts, 1);
+        for n in 1..100 {
+            r.app.finish_structured_messages(
+                true,
+                now + std::time::Duration::from_secs(4) + std::time::Duration::from_millis(n),
+            );
+        }
+        assert_eq!(r.app.structured_sends.custody_attempts, 1);
+        assert_eq!(r.app.structured_sends.recovering.len(), 1);
+        assert_eq!(r.app.structured_sends.recovering[0].key, d.envelope.key);
+    });
+}
+
+#[test]
+fn custody_followup_present_owner_uncertain_write_retries_same_key() {
+    run(async {
+        use crate::api::error_code::ErrorCode;
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = AppQueue::new(2532, |_| std::num::NonZeroU64::new(1).unwrap()).await;
+        r.app.node_id = Some(NodeIdentity::load().unwrap().node_id());
+        r.app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: crate::platform::peer::effective_uid(),
+            dedicated: Ok(None).into(),
+        };
+        r.until(|r| r.app.queue_observation(&r.case.id).is_some())
+            .await;
+        let d = mail(&r);
+        let dir = r.case.fixture.root.path().join("sessions").join(&r.case.id);
+        let moved = dir.with_extension("retired");
+        std::fs::rename(&dir, &moved).unwrap();
+        let rx = request(&mut r, d.clone());
+        let response = answer(&mut r, &rx).await;
+        std::fs::rename(&moved, &dir).unwrap();
+        assert_eq!(response["error"]["code"], "input_write_unknown");
+        assert!(r
+            .app
+            .structured_workers
+            .runtime(&r.case.id, r.case.generation)
+            .is_some());
+        let status = with_store(|s| {
+            s.status(
+                &d.envelope.key.origin_node,
+                &d.envelope.correlation_id,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            status.detail.as_deref(),
+            Some("input_write_unknown:write_uncertain")
+        );
+        let attempts = r.app.structured_sends.custody_attempts;
+        let now = std::time::Instant::now();
+        for n in 0..100 {
+            r.app
+                .finish_structured_messages(true, now + std::time::Duration::from_millis(n));
+        }
+        assert_eq!(
+            r.app.structured_sends.custody_attempts, attempts,
+            "a present owner's failure wakes must respect the retry floor"
+        );
+        let at = r
+            .app
+            .structured_sends
+            .recovery_deadline(std::time::Instant::now())
+            .unwrap();
+        r.app.finish_structured_messages(true, at);
+        r.until(|r| {
+            r.app.structured_sends.custody_attempts > attempts
+                && r.app
+                    .structured_sends
+                    .recovering
+                    .iter()
+                    .any(|e| e.key == d.envelope.key)
+        })
+        .await;
+        assert_eq!(r.app.structured_sends.recovering.len(), 1);
+        assert_eq!(
+            r.app
+                .retry_queue_custody(d.envelope.clone(), ErrorCode::InputWriteUnknown),
+            ErrorCode::InputWriteUnknown
+        );
+        r.stop().await;
+    });
+}
+
+#[test]
+fn custody_followup_payloadless_expiry_settles_from_owner_proof() {
+    run(async {
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2534).await;
+        let d = mail(&r);
+        let now = crate::app::notifications::now_ms() as i64;
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (
+                    &r.case.id,
+                    &r.app
+                        .state
+                        .structured_agents
+                        .get(&r.case.id)
+                        .unwrap()
+                        .0
+                        .session_id,
+                ),
+                false,
+                now,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let (ticket, ack) = r.app.admit_queue_custody(&d.envelope).unwrap();
+        r.until(|_| ticket.committed.try_recv().is_ok_and(|x| x.is_ok()))
+            .await;
+        with_store(|s| {
+            s.maintain(now + crate::mesh::store::DAY_MS)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let expired = with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+            .unwrap()
+            .unwrap();
+        assert!(expired.envelope.body.is_empty());
+        r.app.retry_queue_custody(
+            expired.envelope,
+            crate::api::error_code::ErrorCode::InputWriteUnknown,
+        );
+        drop(ack);
+        let stored = with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.state, "delivered",
+            "a proven commit outranks inbox expiry"
+        );
+        assert!(
+            stored.envelope.body.is_empty(),
+            "expiry never restores payload"
+        );
+        let attempts = r.app.structured_sends.custody_attempts;
+        let rx = request(&mut r, d.clone());
+        let response = answer(&mut r, &rx).await;
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(r.app.structured_sends.custody_attempts, attempts);
+        r.until(|r| !r.inputs().is_empty()).await;
+        assert_eq!(r.inputs().len(), 1);
+        r.stop().await;
+    });
+}
+
+#[test]
+fn custody_round1_already_gone_owner_wakes_have_a_counted_retry_bound() {
+    run(async {
+        use crate::api::error_code::ErrorCode;
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2541).await;
+        let d = mail(&r);
+        with_store(|s| {
+            s.accept_bound_delivery(
+                &d,
+                (
+                    &r.case.id,
+                    &r.app
+                        .state
+                        .structured_agents
+                        .get(&r.case.id)
+                        .unwrap()
+                        .0
+                        .session_id,
+                ),
+                false,
+                crate::app::notifications::now_ms() as i64,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        r.stop().await;
+        r.app.structured_workers = crate::structured::workers::Workers::new(r.notify.clone());
+        r.app
+            .retry_queue_custody(d.envelope.clone(), ErrorCode::AgentNotFound);
+        let now = std::time::Instant::now();
+        for n in 0..100 {
+            r.app
+                .finish_structured_messages(true, now + std::time::Duration::from_millis(n));
+        }
+        assert_eq!(
+            r.app.structured_sends.custody_attempts, 0,
+            "owner failure notifications must not bypass the retry floor"
+        );
+        r.app
+            .finish_structured_messages(true, now + std::time::Duration::from_secs(4));
+        assert_eq!(r.app.structured_sends.custody_attempts, 1);
+        for n in 1..100 {
+            r.app.finish_structured_messages(
+                true,
+                now + std::time::Duration::from_secs(4) + std::time::Duration::from_millis(n),
+            );
+        }
+        assert_eq!(r.app.structured_sends.custody_attempts, 1);
+        assert_eq!(r.app.structured_sends.recovering.len(), 1);
+        assert_eq!(r.app.structured_sends.recovering[0].key, d.envelope.key);
+    });
+}
+
+#[test]
+fn custody_round1_positive_proof_save_failure_survives_expiry() {
+    run(async {
+        use crate::api::error_code::ErrorCode;
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2542).await;
+        let d = mail(&r);
+        let now = crate::app::notifications::now_ms() as i64;
+        with_store(|s| {
+            let session = &r
+                .app
+                .state
+                .structured_agents
+                .get(&r.case.id)
+                .unwrap()
+                .0
+                .session_id;
+            s.accept_bound_delivery(&d, (&r.case.id, session), false, now)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let (ticket, ack) = r.app.admit_queue_custody(&d.envelope).unwrap();
+        r.until(|_| ticket.committed.try_recv().is_ok_and(|x| x.is_ok()))
+            .await;
+        let connection =
+            rusqlite::Connection::open(with_store(|s| Ok(s.path().to_owned())).unwrap()).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_delivery_save BEFORE UPDATE OF state ON envelopes
+            WHEN NEW.state='delivered' BEGIN SELECT RAISE(FAIL,'injected delivery save failure'); END;").unwrap();
+        let attempts = r.app.structured_sends.custody_attempts;
+        r.app
+            .retry_queue_custody(d.envelope.clone(), ErrorCode::InputWriteUnknown);
+        let pending = with_store(|s| {
+            s.collection_error(&d.envelope.key.origin_node, &d.envelope.correlation_id)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        with_store(|s| {
+            s.maintain(now + crate::mesh::store::DAY_MS)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        connection
+            .execute_batch("DROP TRIGGER fail_delivery_save")
+            .unwrap();
+        r.app
+            .finish_structured_messages(false, std::time::Instant::now());
+        let row = with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state, "delivered",
+            "a failed save must not erase positive proof's expiry protection"
+        );
+        assert!(row.envelope.body.is_empty());
+        assert_eq!(
+            pending.as_deref(),
+            Some("input_write_unknown:commit_proven_settle_pending")
+        );
+        assert_eq!(
+            r.app.structured_sends.custody_attempts, attempts,
+            "proof recovery must not re-admit"
+        );
+        drop(ack);
+        r.until(|r| r.inputs().len() == 1).await;
+        r.stop().await;
+    });
+}
+
+#[test]
+fn custody_round1_replacement_owner_bypasses_long_backoff_immediately() {
+    run(async {
+        use crate::api::error_code::ErrorCode;
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let mut r = setup(2543).await;
+        let d = mail(&r);
+        let now = crate::app::notifications::now_ms() as i64;
+        with_store(|s| {
+            let session = &r
+                .app
+                .state
+                .structured_agents
+                .get(&r.case.id)
+                .unwrap()
+                .0
+                .session_id;
+            s.accept_bound_delivery(&d, (&r.case.id, session), false, now)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        r.stop().await;
+        let before = std::time::Instant::now();
+        for _ in 0..3 {
+            r.app
+                .retry_queue_custody(d.envelope.clone(), ErrorCode::QueueSourceCold);
+        }
+        let retry = r
+            .app
+            .structured_sends
+            .retries
+            .get_mut(&d.envelope.key)
+            .unwrap();
+        assert!(retry.at >= before + std::time::Duration::from_secs(240));
+        // Hold both deadlines in the long-backoff window: only replacement
+        // progress may bypass them, independently of the speed of the fixture.
+        retry.wake_at = retry.at;
+        let attempts = r.app.structured_sends.custody_attempts;
+        r.restart(|_| {}).await;
+        r.until(|r| r.app.queue_observation(&r.case.id).is_some())
+            .await;
+        r.app
+            .finish_structured_messages(true, std::time::Instant::now());
+        assert_eq!(
+            r.app.structured_sends.custody_attempts,
+            attempts + 1,
+            "replacement owner must resume on its wake, not wait for backoff"
+        );
+        r.until(|r| r.inputs().len() == 1).await;
+        assert!(r.app.structured_sends.recovering.is_empty());
+        r.stop().await;
+    });
+}
+
+#[test]
+fn custody_round2_repeated_expired_save_failure_retries_until_delivered() {
+    run(expired_correction_case(false));
+}
+
+#[test]
+fn custody_round2_retention_stops_when_diagnostic_save_fails() {
+    run(expired_correction_case(true));
+}
+
+async fn expired_correction_case(stop_at_retention: bool) {
+    use crate::api::error_code::ErrorCode;
+    let _store = crate::mesh::runtime_store::TestStore::new();
+    let mut r = setup(2544).await;
+    let d = mail(&r);
+    let now = crate::app::notifications::now_ms() as i64;
+    with_store(|s| {
+        let session = &r
+            .app
+            .state
+            .structured_agents
+            .get(&r.case.id)
+            .unwrap()
+            .0
+            .session_id;
+        s.accept_bound_delivery(&d, (&r.case.id, session), false, now)
+            .map_err(|e| e.to_string())
+    })
+    .unwrap();
+    let (ticket, ack) = r.app.admit_queue_custody(&d.envelope).unwrap();
+    r.until(|_| ticket.committed.try_recv().is_ok_and(|x| x.is_ok()))
+        .await;
+    let connection =
+        rusqlite::Connection::open(with_store(|s| Ok(s.path().to_owned())).unwrap()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_delivery_save BEFORE UPDATE OF state ON envelopes
+        WHEN NEW.state='delivered' BEGIN SELECT RAISE(FAIL,'injected delivery save failure'); END;",
+        )
+        .unwrap();
+    let attempts = r.app.structured_sends.custody_attempts;
+    r.app
+        .retry_queue_custody(d.envelope.clone(), ErrorCode::InputWriteUnknown);
+    let pending = with_store(|s| {
+        s.collection_error(&d.envelope.key.origin_node, &d.envelope.correlation_id)
+            .map_err(|e| e.to_string())
+    })
+    .unwrap();
+    with_store(|s| {
+        s.maintain(now + crate::mesh::store::DAY_MS)
+            .map_err(|e| e.to_string())
+    })
+    .unwrap();
+    let first_expired_attempt = std::time::Instant::now();
+    r.app
+        .finish_structured_messages(true, first_expired_attempt);
+    assert_eq!(
+        r.app.structured_sends.recovering.len(),
+        1,
+        "a second failed save after expiry must retain the proven key"
+    );
+    let deadline = r.app.structured_sends.retries[&d.envelope.key].at;
+    for n in 0..100 {
+        r.app.finish_structured_messages(
+            true,
+            first_expired_attempt + std::time::Duration::from_millis(n),
+        );
+        assert_eq!(
+            r.app.structured_sends.retries[&d.envelope.key].at, deadline,
+            "expired correction must respect backoff across repeated wakes"
+        );
+    }
+    if stop_at_retention {
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_expiry_diagnostic BEFORE UPDATE OF collect_error ON envelopes
+            WHEN NEW.collect_error='input_write_unknown:correction_retention_elapsed'
+            BEGIN SELECT RAISE(FAIL,'injected expiry diagnostic failure'); END;",
+            )
+            .unwrap();
+        let until = now + crate::mesh::store::DAY_MS + CUSTODY_TTL_MS;
+        // The pause transition advances the logical clock before freezing it.
+        with_store(|s| {
+            s.set_paused(true, until)
+                .and_then(|_| s.set_paused(false, until))
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let elapsed = with_store(|s| {
+            s.status(&d.envelope.key.origin_node, &d.envelope.correlation_id, now)
+                .map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            elapsed.state, "outcome_retention_elapsed",
+            "the persisted logical clock must already be past retention"
+        );
+        r.app.finish_structured_messages(false, deadline);
+        assert!(
+            r.app.structured_sends.recovering.is_empty(),
+            "retention must stop correction even when its final diagnostic save fails"
+        );
+        assert!(!r.app.structured_sends.retries.contains_key(&d.envelope.key));
+        let status = with_store(|s| {
+            s.status(
+                &d.envelope.key.origin_node,
+                &d.envelope.correlation_id,
+                until,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(status.state, "outcome_retention_elapsed");
+        assert_eq!(
+            with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+                .unwrap()
+                .unwrap()
+                .state,
+            "inbox_expired"
+        );
+        drop(ack);
+        r.until(|r| r.inputs().len() == 1).await;
+        r.stop().await;
+        return;
+    }
+    connection
+        .execute_batch("DROP TRIGGER fail_delivery_save")
+        .unwrap();
+    r.app.finish_structured_messages(false, deadline);
+    let row = with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.state, "delivered",
+        "a failed save must not erase positive proof's expiry protection"
+    );
+    assert!(row.envelope.body.is_empty());
+    let detail = with_store(|s| {
+        s.collection_error(&d.envelope.key.origin_node, &d.envelope.correlation_id)
+            .map_err(|e| e.to_string())
+    })
+    .unwrap();
+    assert_eq!(
+        detail,
+        Some(format!(
+            "delivered_after_expiry:{}",
+            d.envelope.key.lifecycle_id()
+        ))
+    );
+    assert_eq!(
+        pending.as_deref(),
+        Some("input_write_unknown:commit_proven_settle_pending")
+    );
+    assert_eq!(
+        r.app.structured_sends.custody_attempts, attempts,
+        "proof recovery must not re-admit"
+    );
+    r.app.restore_mesh_mail().unwrap();
+    assert_eq!(
+        with_store(|s| s.get(&d.envelope.key).map_err(|e| e.to_string()))
+            .unwrap()
+            .unwrap()
+            .state,
+        "delivered",
+        "startup projection must preserve payload-less delivered status"
+    );
+    drop(ack);
+    r.until(|r| r.inputs().len() == 1).await;
+    r.stop().await;
 }
