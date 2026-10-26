@@ -16,7 +16,8 @@
  *   here relies on either. The token comes from the one-time code exchange
  *   (`src/wire/token.ts`).
  * - **Tauri v2 shell** (#1601): an initialization script assigns it before
- *   the page loads, with the token read from the keychain.
+ *   the page loads, with a {@link TokenProvider} that mints a token over
+ *   `flock.sock` (zero-touch, ADR-0038 §6).
  * - **Fixture build** (`vite build --mode fixture`, `just client-preview`):
  *   `src/fixture-shell.ts` runs first and assigns a fixture configuration
  *   with the recorded session bundled in, so the page needs no server.
@@ -33,17 +34,27 @@
 /** Name of the global the shell assigns before the bundle runs. */
 export const SHELL_CONFIG_GLOBAL = "__FLOCK_SHELL_CONFIG__";
 
+/**
+ * The shell's source of tokens: resolves to a fresh client token, or rejects
+ * with a message for the person. The client asks it at connect and again
+ * after the server ends a token (close 4403), keeps what it gets in memory
+ * only, and shows the token prompt never.
+ */
+export type TokenProvider = () => Promise<string>;
+
 /** Live mode: connect to a `flk` server over ADR-0036 §5's WebSocket. */
 export type WireShellConfig = {
   readonly transport: "wire";
   /** Absolute `ws:`, `wss:`, `http:` or `https:` URL of the server. */
   readonly serverUrl: string;
   /**
-   * Client token (ADR-0036 §5), when the shell has one (Tauri, from the
-   * keychain). The browser shell has none: its token comes from the code
-   * exchange and is kept in `sessionStorage` (ADR-0038 §3).
+   * Client token (ADR-0036 §5), when the shell has a fixed one. The browser
+   * shell has none: its token comes from the code exchange and is kept in
+   * `sessionStorage` (ADR-0038 §3).
    */
   readonly token?: string;
+  /** Where the shell's tokens come from (the Tauri shell's mint); never with `token`. */
+  readonly tokenProvider?: TokenProvider;
 };
 
 /** Fixture mode: replay a recorded session; no server is contacted. */
@@ -131,7 +142,7 @@ export function readShellConfig(scope: object): ConfigResult {
   }
   switch (raw["transport"]) {
     case "wire": {
-      const { serverUrl, token } = raw;
+      const { serverUrl, token, tokenProvider } = raw;
       if (typeof serverUrl !== "string" || !URL.canParse(serverUrl)) {
         return refuse("serverUrl must be an absolute URL.");
       }
@@ -141,7 +152,11 @@ export function readShellConfig(scope: object): ConfigResult {
       if (token !== undefined && (typeof token !== "string" || token === "")) {
         return refuse("token, when given, must be a non-empty string.");
       }
-      return { ok: true, config: { transport: "wire", serverUrl, ...(token === undefined ? {} : { token }) } };
+      if (tokenProvider !== undefined && (typeof tokenProvider !== "function" || token !== undefined)) {
+        return refuse("tokenProvider, when given, must be a function, and the only source of tokens.");
+      }
+      const provider = tokenProvider as TokenProvider | undefined;
+      return { ok: true, config: { transport: "wire", serverUrl, ...(token === undefined ? {} : { token }), ...(provider === undefined ? {} : { tokenProvider: provider }) } };
     }
     case "fixture": {
       const { fixtureJsonl, source } = raw;

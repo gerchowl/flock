@@ -606,7 +606,7 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
   - The output is still static assets: embedded by the `web` feature with `rust-embed` and served by `flk`, and loaded unchanged by the Tauri v2 shell.
   - The bundle has no same-origin assumption: the server URL and token come from shell config. #1402's first spike item becomes a requirement here.
   - **The shell config contract** (`web/client/src/config.ts`). A shell sets one global, `__FLOCK_SHELL_CONFIG__`, before the bundle runs. Without it, the bundle takes its page's origin, which is the browser shell's case. The global holds one of:
-    - `{ transport: "wire", serverUrl, token? }`, for a live server;
+    - `{ transport: "wire", serverUrl, token?, tokenProvider? }`, for a live server. `tokenProvider` (#1601) is a function `() => Promise<string>` that the shell's script defines, never beside `token`. The client asks it at connect and once after each close 4403, instead of showing its token prompt, and keeps the token in memory only, so a reload asks again. A rejection's message shows in NeedsToken and is not retried; a fresh token refused before its `welcome` is not asked for again. The Tauri shell's provider calls its one command, `mint_token` (zero-touch, below);
     - `{ transport: "fixture", fixtureJsonl, source }`, for a recorded replay;
     - `{ transport: "error", message }`, when the shell has no configuration to give, such as the Tauri shell reading a malformed config file. The client shows `message` as the reason in its ConfigError state. A shell reports its own errors this way and never through an unknown transport, which the client refuses with a message of its own.
 - **Browser.**
