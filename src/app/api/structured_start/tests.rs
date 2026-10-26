@@ -609,10 +609,19 @@ async fn startup_with_relative_socket_keeps_legacy_routes_available() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(
-            fs::read_dir(cwd.path()).unwrap().next().is_none(),
-            "fixture listener must clean up"
-        );
+        // ADR-0036 pathname ownership retains the lock inode after listener cleanup.
+        let entries: Vec<_> = fs::read_dir(cwd.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [OsString::from("relative.sock.lock")]);
+        let socket = cwd.path().join("relative.sock");
+        assert!(!socket.exists(), "fixture listener must remove its socket");
+        assert!(fs::symlink_metadata(socket.with_extension("sock.lock"))
+            .unwrap()
+            .is_file());
+        crate::ipc::SocketOwner::acquire(&socket)
+            .expect("fixture listener must release pathname ownership");
         return;
     }
     let _guard = crate::config::test_config_env_guard();

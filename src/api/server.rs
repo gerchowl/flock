@@ -50,6 +50,7 @@ pub struct ServerHandle {
     pub(crate) node_id: Option<String>,
     pub(crate) clone_detection_warning: Option<String>,
     identity: SocketFileIdentity,
+    pub(crate) socket_owner: crate::ipc::SocketOwner,
     running: Arc<AtomicBool>,
     /// Structured listener health owned by this server, shared with its lifecycle owner.
     pub(crate) client_listener: crate::api::client_listener::Health,
@@ -119,11 +120,22 @@ pub(crate) fn start_server_for_mode(
     live_handoff: bool,
     uid_policy: crate::structured::identity::UidPolicy,
 ) -> std::io::Result<ServerHandle> {
+    start_server_for_mode_owned(api_tx, event_hub, live_handoff, uid_policy, None)
+}
+
+/// Preserve ordinary startup capabilities when importing socket ownership.
+pub(crate) fn start_server_for_mode_owned(
+    api_tx: ApiRequestSender,
+    event_hub: EventHub,
+    live_handoff: bool,
+    uid_policy: crate::structured::identity::UidPolicy,
+    owner: Option<crate::ipc::SocketOwner>,
+) -> io::Result<ServerHandle> {
     let identity = crate::mesh::identity::NodeIdentity::load()?;
     if let Some(warning) = &identity.clone_detection_warning {
         crate::logging::node_clone_detection_unavailable(warning);
     }
-    start_server_with_capabilities(
+    start_server_owned(
         api_tx,
         event_hub,
         Some(ServerCapabilities {
@@ -137,34 +149,46 @@ pub(crate) fn start_server_for_mode(
             events_live_start: true,
         }),
         uid_policy,
+        Default::default(),
+        owner,
     )
 }
 
+/// Fixture constructor with explicitly selected capabilities.
+#[cfg(test)]
 pub(crate) fn start_server_with_capabilities(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
     uid_policy: crate::structured::identity::UidPolicy,
-) -> std::io::Result<ServerHandle> {
-    start_server_with_capabilities_and_health(
+) -> io::Result<ServerHandle> {
+    start_server_owned(
         api_tx,
         event_hub,
         capabilities,
         uid_policy,
         Default::default(),
+        None,
     )
 }
 
-/// Rebind the API socket while retaining its logical server's listener health.
-pub(crate) fn start_server_with_capabilities_and_health(
+/// Rebind under a transferred ownership lock, without an acquisition gap.
+pub(crate) fn start_server_owned(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     capabilities: Option<ServerCapabilities>,
     uid_policy: crate::structured::identity::UidPolicy,
     client_listener: crate::api::client_listener::Health,
-) -> std::io::Result<ServerHandle> {
+    inherited: Option<crate::ipc::SocketOwner>,
+) -> io::Result<ServerHandle> {
     let path = socket_path();
-    prepare_socket_path(&path)?;
+    let socket_owner = match inherited {
+        Some(owner) => {
+            owner.prepare(&path)?;
+            owner
+        }
+        None => prepare_socket_path(&path)?,
+    };
 
     let mcp_socket = std::path::absolute(&path).ok();
     let listener = UnixListener::bind(&path)?;
@@ -179,7 +203,9 @@ pub(crate) fn start_server_with_capabilities_and_health(
         .as_ref()
         .and_then(|caps| caps.clone_detection_warning.clone());
     let connection_status = client_listener.clone();
+    let accept_owner = socket_owner.clone();
     let thread = std::thread::spawn(move || {
+        let _owner = accept_owner;
         let health = Arc::new(Mutex::new(crate::api::schema::ApiListenerHealth::default()));
         run_accept_loop(
             || listener.accept().map(|(stream, _)| stream),
@@ -209,6 +235,7 @@ pub(crate) fn start_server_with_capabilities_and_health(
                 });
             },
         );
+        drop(listener);
         debug!("api server thread exiting");
     });
 
@@ -221,6 +248,7 @@ pub(crate) fn start_server_with_capabilities_and_health(
         clone_detection_warning,
         path,
         identity,
+        socket_owner,
         running,
         client_listener,
     })
@@ -303,7 +331,7 @@ fn accept_error_is_fatal(err: &io::Error, failures: u64) -> bool {
     }
 }
 
-fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
+fn prepare_socket_path(path: &Path) -> std::io::Result<crate::ipc::SocketOwner> {
     crate::ipc::prepare_socket_path(path, |path| {
         format!("flk is already running (socket busy at {})", path.display())
     })
