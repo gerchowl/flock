@@ -4,6 +4,8 @@ mod peer_uid_tests;
 mod scoped_mcp_tests;
 #[cfg(test)]
 mod structured_lease_tests;
+#[cfg(test)]
+mod structured_relay_tests;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -38,6 +40,7 @@ mod structured_agents;
 mod structured_grants;
 pub(crate) mod structured_messages;
 pub(crate) mod structured_queue;
+mod structured_relay;
 mod structured_start;
 mod tabs;
 pub(crate) mod workspaces;
