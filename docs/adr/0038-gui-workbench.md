@@ -651,11 +651,11 @@ pub struct ForkCost    { mechanism: ForkMechanism /* resume_at | rehydrate | for
       - Artifact frames (§7) are `null`, so they are refused. Their injected CSP `connect-src 'none'` is **required** as a second barrier, and G7's per-shell security test checks it.
       - `file://` and `data:` pages are `null` or their own scheme, so they are refused.
     - **Admission-policy hold (#2500).** The UID attribution proposal is held for an owner decision after review found attribution failure and accept-loop amplification. This Origin-only split preserves the runtime's existing four pending hellos, 16 upgraded sockets and 32 incomplete HTTP connections. It does not implement or settle the revised isolation/window policy below. The registry reserves `preauth_capacity` (HTTP 503) and `auth_rate_limited` (HTTP 429), each with the single retry class `later`.
-    - **Pre-auth limits.**
+    - **Original pre-auth target (isolation/window revision held in #2500).**
       - At most **16** concurrent unauthenticated `/v1/ws` connections per listener. Beyond that, an upgrade is refused with `preauth_capacity`.
       - Each connection gets exactly one `hello`; a failed `hello` closes it.
       - After **10** failed `hello`s within any **1 s**, a new upgrade is refused with `auth_rate_limited` for the rest of that second.
-      - Authenticated sessions are never affected, so a local process cannot lock the person out.
+      - This original global policy does not provide reconnect isolation. That guarantee and its budget key remain held for the owner decision in #2500.
       - The ADR-0036 §5a handshake deadline still applies. These limits bound resource use; guessing a token (32 random bytes) is infeasible.
     - **`/v1/client/exchange` keeps its strict checks** (`src/web/client_exchange.rs`: loopback peer, exact `Host` and `Origin`, `Sec-Fetch-Site` `same-origin`). Its one-time code is a bearer secret, and the shell never uses it locally.
   - **Tests that must fail before the change** (server slice and G9a):

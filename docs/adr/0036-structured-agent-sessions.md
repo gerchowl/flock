@@ -3614,7 +3614,7 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
   that another process could read the operator credential from app memory,
   and offers explicit remote pairing or administrator-enabled
   `ptrace_scope ≥ 1`. No silent fallback is permitted (ADR-0038 §6).
-- **Pre-auth limits.**
+- **Original pre-auth target (isolation/window revision held in #2500).**
   - At most 16 concurrent unauthenticated `/v1/ws` connections per listener;
     beyond that, `preauth_capacity`.
   - One `hello` per connection; a failed `hello` closes it.
