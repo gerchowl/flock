@@ -3485,6 +3485,49 @@ recovery uses the existing durable `fail` transition, not renewed admission.
 Later supported queued inputs remain deliverable after construction. Read-only
 and opaque future records retain their existing inspection-only behavior.
 
+### Amendment: S6 operator grant management (#2362, part 1)
+
+The architect ruling on #2362 adds local-operator-only socket and CLI management
+of the exact, live-runtime `allow_always` grants in §10b. S7 WebSocket management
+is part 2 after #2251, under `operate`; this amendment adds no WS or MCP verb.
+
+A grant's handle is its originating `(request_id, request_seq)`, fenced by the
+exact `agent_id` and runtime `generation`. List returns installed handles, tool,
+canonical JSON `[tool_name, input]` key and installation audit time. Revoke must
+supply the generation and handle, including an originating decision handle when
+revoking an in-flight install. Stale generations and unknown handles have typed
+refusals. The existing operator admission and cooperative-mode limitations apply.
+
+Each key has a revocation epoch under the Book lock. `prepare` captures it when
+reserving `allow_always`; revoke bumps it and removes any installed grant.
+`audited` installs only if that captured epoch is unchanged. Retained epoch
+entries are bounded by in-flight reservations and pruned once no pending install
+can reference them. Epoch overflow refuses without removing the installed grant.
+An already admitted response still completes as `allow` for that one call, but a
+revoked in-flight decision cannot install a grant. The next matching request
+prompts. This is not cancellation or rollback of an admitted tool call.
+
+Successful revoke emits `structured_grant_revoked` in the existing persisted
+global event stream, with authenticated revoker principal, agent/generation and
+originating handle. Runtime grants remain memory-only and are cleared on end.
+The socket contract documents the result fields, registered refusals and the
+absence of automatic revoke retries. These raw socket schemas are not generated
+S7 TypeScript roots; the typed S7 management contract belongs to part 2.
+
+### Amendment: S6 grant-list input redaction (#2416)
+
+Following ADR-0041 §4's fail-closed redaction stance, grant projections omit the
+full canonical tool/input key by default, including for the local operator.
+They expose its UTF-8 byte length and first 16 lowercase hexadecimal SHA-256
+digits. These are display/comparison metadata; grant authority still uses the
+originating request handle plus agent/generation, never the fingerprint.
+
+The owner decision on #2416 permits explicit local-operator disclosure through
+socket `show_input: true` or CLI `--show-input` on list. The full key can contain
+credentials, and CLI output can persist in terminal scrollback and logs. Hashes
+and lengths also reveal comparison metadata. Revoke responses always redact
+remaining grants; operator identity alone does not opt into full input export.
+This narrow grant-list opt-in does not authorize raw config-secret export.
 
 ### Amendment: App-session tokens and shell origins (#1601)
 
@@ -3542,8 +3585,10 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
   matrix row "Restart, handoff…".
 - **Revocation.** On process exit, TTL expiry, restart or handoff,
   `authenticate` stops accepting the token. Every live `/v1/ws` session
-  authenticated by it is closed with a typed auth close: `token_revoked` or
-  `token_expired`.
+  authenticated by it uses the existing close 4403. A command that detects
+  revocation receives its `auth_revoked` error acknowledgement before the close;
+  idle expiry and exit also close without waiting for a command. No new auth
+  error names are introduced (#2442).
 
 **Shell origins, on `/v1/ws` only.**
 - **The allow-list.** The listener guard (`origin_allowed`,
