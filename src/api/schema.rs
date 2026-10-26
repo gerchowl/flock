@@ -252,6 +252,9 @@ pub enum Method {
     ClientTokenList(EmptyParams),
     #[serde(rename = "client.open")]
     ClientOpen(EmptyParams),
+    /// Fixed-scope, process-bound app credential, admitted only from LocalOperator.
+    #[serde(rename = "client.app.mint")]
+    ClientAppMint(super::client_tokens::MintParams),
     #[serde(rename = "channel.hello")]
     ChannelHello(ChannelHelloParams),
     /// ADR-0028 §5 (#1031): park the calling agent on a registered wait and
@@ -500,6 +503,7 @@ impl Method {
             | Self::ClientTokenRemove(_)
             | Self::ClientTokenList(_)
             | Self::ClientOpen(_)
+            | Self::ClientAppMint(_)
             | Self::ChannelHello(_)
             | Self::WaitPark(_)
             | Self::OwnerBind(_)

@@ -690,6 +690,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ClientTokenRemove(_) => "client.token.rm",
         Method::ClientTokenList(_) => "client.token.list",
         Method::ClientOpen(_) => "client.open",
+        Method::ClientAppMint(_) => "client.app.mint",
         Method::ChannelHello(_) => "channel.hello",
         Method::WaitPark(_) => "wait.park",
         Method::WaitHold(..) => "wait.hold",
