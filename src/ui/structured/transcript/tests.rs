@@ -231,7 +231,7 @@ fn ordered_and_nested_lists_preserve_numbering_and_indentation() {
 }
 
 #[test]
-fn entity_controls_in_each_markdown_context_are_display_safe() {
+fn entity_controls_in_commonmark_and_table_shaped_paragraphs_are_display_safe() {
     for (entity, raw, escaped) in [
         ("&#27;", '\u{1b}', "\\u{1b}"),
         ("&#x9b;", '\u{9b}', "\\u{9b}"),
@@ -242,6 +242,7 @@ fn entity_controls_in_each_markdown_context_are_display_safe() {
             format!("# {entity}heading"),
             format!("[{entity}link](https://example.com)"),
             format!("![{entity}image](https://example.com/image)"),
+            // Tables are disabled: this source is a CommonMark paragraph.
             format!("| cell |\n| --- |\n| {entity}value |"),
         ] {
             escaped_card(Content::Markdown(source), &raw.to_string(), escaped);
@@ -304,3 +305,20 @@ raw_case!(raw_html_controls, |raw| Content::Markdown(format!(
 raw_case!(raw_inline_html_controls, |raw| Content::Markdown(format!(
     "inline <span title=\"{raw}\">html</span>"
 )));
+
+#[test]
+fn raw_c0_in_html_displays_escape_without_terminal_control() {
+    escaped_card(
+        Content::Markdown("<div>\u{1b}[2J</div>\n".into()),
+        "\u{1b}",
+        "\\u{1b}",
+    );
+}
+#[test]
+fn raw_c1_in_inline_html_displays_escape_without_terminal_control() {
+    escaped_card(
+        Content::Markdown("<span title=\"\u{9b}\">x</span>".into()),
+        "\u{9b}",
+        "\\u{9b}",
+    );
+}
