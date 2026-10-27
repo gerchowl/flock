@@ -2,15 +2,26 @@ use super::super::tests::{helper_binary, setup};
 use super::*;
 use crate::platform::process_exit::tests::{readable, Peer};
 use std::{os::fd::AsRawFd, sync::mpsc};
-struct Manual(Mutex<Instant>);
+struct Manual(tokio::sync::watch::Sender<Duration>);
 impl Clock for Manual {
-    fn now(&self) -> Instant {
-        *self.0.lock().unwrap()
+    fn now(&self) -> io::Result<Duration> {
+        Ok(*self.0.borrow())
+    }
+    fn until(&self, deadline: Duration) -> Wait<'_> {
+        let mut changed = self.0.subscribe();
+        Box::pin(async move {
+            loop {
+                if *changed.borrow_and_update() >= deadline {
+                    return Ok(());
+                }
+                changed.changed().await.map_err(io::Error::other)?;
+            }
+        })
     }
 }
 impl Manual {
     fn advance(&self, time: Duration) {
-        *self.0.lock().unwrap() += time;
+        self.0.send_modify(|now| *now += time);
     }
 }
 fn fixture() -> (
@@ -23,7 +34,7 @@ fn fixture() -> (
     let (root, mut files, app) = setup();
     files.2 = helper_binary();
     let files = Arc::new(files);
-    let clock = Arc::new(Manual(Mutex::new(Instant::now())));
+    let clock = Arc::new(Manual(tokio::sync::watch::channel(Duration::ZERO).0));
     let store = Store::new(files.clone(), clock.clone());
     (root, files, store, clock, app)
 }
@@ -351,11 +362,11 @@ fn issued_lifetime_matches_enforced_deadline_in_the_injected_clock() {
     let authority = app.client_token_authority().unwrap();
     for elapsed in [Duration::ZERO, Duration::from_millis(1731)] {
         clock.advance(elapsed);
-        let issue_time = clock.now();
+        let issue_time = clock.now().unwrap();
         let issued = store.issue(&authority).unwrap();
         let session = store.authenticate(&issued.token).unwrap();
         let expected =
-            u64::try_from(session.expires.duration_since(issue_time).as_millis()).unwrap();
+            u64::try_from(session.expires.checked_sub(issue_time).unwrap().as_millis()).unwrap();
         let wire = serde_json::to_value(&issued).unwrap();
         assert_eq!(wire["info"]["expires_in_ms"].as_u64(), Some(expected));
         assert_eq!(session.expires, issue_time + TTL);
@@ -369,6 +380,29 @@ fn issued_lifetime_matches_enforced_deadline_in_the_injected_clock() {
     let old = serde_json::json!({"name":"old","principal":"old-principal","scopes":["read"]});
     let info: TokenInfo = serde_json::from_value(old.clone()).unwrap();
     assert_eq!(serde_json::to_value(info).unwrap(), old);
+}
+
+#[test]
+fn injected_suspend_clock_wakes_at_its_deadline() {
+    let clock = Manual(tokio::sync::watch::channel(Duration::ZERO).0);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let waiting = clock.until(TTL);
+            tokio::pin!(waiting);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            clock.advance(TTL);
+            tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+        });
 }
 
 #[test]
