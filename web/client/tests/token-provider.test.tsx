@@ -107,7 +107,7 @@ function provider(mode: Mode, ...replies: Reply[]) {
     hellos: [] as Record<string, unknown>[],
     lifetimes: [] as { readonly at: number; readonly expiresInMs: number }[],
     net: null as FakeNetwork | null,
-    resolve: (token: string) => release?.({ token }),
+    resolve: (token: string, expiresInMs?: number) => release?.({ token, ...(expiresInMs === undefined ? {} : { expiresInMs }) }),
     /** Rejects the deferred call with `failure`. */
     reject: (failure: unknown) => refuse?.(failure),
     /** The native side loses its bearer, so its next open mints one the client did not cause. */
@@ -1153,7 +1153,7 @@ describe("a bridged connection", () => {
   async function renewalDuringRemint() {
     const h = new Harness();
     h.conn = new WireConnection({ bridged: true, client: { name: "fixture", version: "1" }, clock: h.clock, random: () => 0, store: h.store });
-    const shell = provider("bridge", "t1", "t2", { token: "t3", expiresInMs: 533 }, "deferred");
+    const shell = provider("bridge", "t1", "t2", { token: "t3", expiresInMs: 533 }, "deferred", "deferred");
     shell.net = h.net;
     const config = shell.config as { readonly openBridge: OpenBridge };
     const driver = driveBridge(h.connection, config.openBridge, h.clock, () => 0, () => undefined);
@@ -1192,6 +1192,56 @@ describe("a bridged connection", () => {
     if (h.connection.state === "Hello") send(h, WELCOME);
     h.clock.advanceTo(500 + DEADLINES.connect);
     expect([servedAt, h.connection.state, h.connection.error, shell.renews]).toEqual([750, "Live", null, [false, false, false, true, false]]);
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
+  test("a newer reconnect keeps the cancelled mint due time: no open at 660, one open at 750", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
+    h.clock.advanceTo(660);
+    shell.reject(PANE);
+    await tick();
+    const atFailure = [...shell.openedAt];
+    h.clock.advanceTo(749);
+    await tick();
+    const beforeDue = [...shell.openedAt];
+    h.clock.advanceTo(750);
+    await tick();
+    expect([atFailure, beforeDue, shell.openedAt]).toEqual([[0, 0, 250, 649], [0, 0, 250, 649], [0, 0, 250, 649, 750]]);
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
+  test("Disconnect drops the old owed deadline before a new Connect", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
+    h.clock.advanceTo(650);
+    h.connection.disconnect();
+    h.connection.connect();
+    h.clock.advanceTo(660);
+    shell.reject(PANE);
+    await tick();
+    expect(shell.openedAt).toEqual([0, 0, 250, 649, 660]);
+    driver.dispose();
+    h.connection.disconnect();
+    expect(h.clock.pendingTimers).toBe(0);
+  });
+
+  test("a settled request cannot delay a later renewal's reconnect", async () => {
+    const { h, shell, driver } = await renewalDuringRemint();
+    shell.resolve("renewed", 20);
+    await tick();
+    send(h, WELCOME);
+    h.clock.advanceTo(664);
+    await tick();
+    h.clock.advanceTo(665);
+    h.step(step({ step: "drop" }));
+    h.connection.networkChange();
+    h.clock.advanceTo(666);
+    shell.reject(PANE);
+    await tick();
+    expect(shell.openedAt).toEqual([0, 0, 250, 649, 664, 666]);
     driver.dispose();
     h.connection.disconnect();
     expect(h.clock.pendingTimers).toBe(0);

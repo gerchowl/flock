@@ -39,8 +39,9 @@
  *   after an end, or a bridged reconnect's session) is owed: when the call
  *   settles and the state still needs it, a value counts as that call, and a
  *   failure issues it on its own streak delay. A cancelled wait keeps its
- *   original due time. There is one owed slot: a later request overwrites an
- *   earlier one, and `stillNeeded` decides whether it is served.
+ *   original due time. There is one owed slot: the latest request kind wins,
+ *   its due time is the maximum of all coalesced waits, and `stillNeeded`
+ *   decides whether it is served.
  * - Its token goes to the connection with `setToken`, which connects only
  *   from NeedsToken; after a Disconnect it is kept for the next Connect.
  * - A rejection, a synchronous throw or a value that is not a
@@ -182,8 +183,12 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
   let due: number | null = null;
   /** The current bearer's renewal was asked for: it is not asked again, even when a reconnect reports its lifetime. */
   let spent = false;
-  /** One slot: later requests overwrite earlier ones; stillNeeded decides at settlement. */
-  let owed: { readonly kind: "mint" | "reconnect"; readonly delay: number; readonly due?: number } | null = null;
+  /** One slot, merged by owe; stillNeeded decides at settlement. */
+  let owed: { readonly kind: "mint" | "reconnect"; readonly due: number } | null = null;
+  /** Latest kind wins; neither a newer request nor cancellation shortens a wait. */
+  const owe = (kind: "mint" | "reconnect", at: number, latest = true): void => {
+    owed = { kind: latest ? kind : (owed?.kind ?? kind), due: Math.max(at, waiting?.due ?? at, owed?.due ?? at) };
+  };
   let error: string | null = null;
   let notice: string | null = null;
   let disposed = false;
@@ -248,8 +253,8 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     if (inFlight || disposed) return;
     const renewing = kind === "renew";
     if (waiting !== null) {
-      // The cancelled request predates anything already owed; keep the later one.
-      owed ??= { kind: waiting.kind, delay: 0, due: waiting.due };
+      // Keep the newer kind, but keep timing as the max with the cancelled wait.
+      owe(waiting.kind, waiting.due, false);
       waiting = cancelWaiting();
     }
     inFlight = true;
@@ -278,7 +283,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
         if (!kept) notice = null;
         adopt(token, kept);
       } else if (renewing && skipped !== null && stillNeeded(skipped.kind)) {
-        const delay = skipped.due === undefined ? skipped.delay : Math.max(0, skipped.due - clock.now());
+        const delay = Math.max(0, skipped.due - clock.now());
         request(delay, skipped.kind);
       }
       changed();
@@ -300,7 +305,7 @@ function driveShell<T>(connection: WireConnection, source: Source<T>, clock: Clo
     if (disposed) return;
     // A renewal can run before a waiting mint; it must inherit this request too.
     if (inFlight || waiting !== null) {
-      owed = { kind, delay };
+      owe(kind, clock.now() + delay);
       return;
     }
     if (delay === 0) call(kind);
