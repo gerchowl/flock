@@ -8,13 +8,21 @@ pub(crate) struct Target {
     pub agent_id: String,
     pub generation: u64,
 }
+/// A native placement cannot be attached or relocated without these invariants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlacementError {
+    /// The target no longer names the registry's current runtime generation.
+    // Native attachment is staged until the S10d UI entry point (#1430).
+    #[allow(dead_code)]
     StaleGeneration,
+    /// A workspace/tab is absent, or layout and stored content disagree.
     Membership,
+    /// Native cross-tab or workspace relocation is not supported.
     RelocationUnsupported,
 }
 impl Target {
+    // Native attachment is staged until the S10d UI entry point (#1430).
+    #[allow(dead_code)]
     pub fn validate(&self, state: &AppState) -> Result<(), PlacementError> {
         match state.structured_agents.get(&self.agent_id) {
             Some((_, _, generation)) if generation == self.generation => Ok(()),
@@ -25,6 +33,8 @@ impl Target {
 impl AppState {
     /// Reuse the agent's sole placement, or split without allocating a PTY.
     /// A resumed generation may rebind placement only after registry validation.
+    // The S10d UI entry point will call this placement API (#1430).
+    #[allow(dead_code)]
     pub(crate) fn attach_native_view(
         &mut self,
         target: Target,
@@ -58,6 +68,7 @@ impl AppState {
         }
         let id = t.layout.split_focused(direction);
         t.native_views.insert(id, target);
+        t.zoomed = false;
         ws.register_new_pane(id);
         ws.active_tab = tab;
         self.active = Some(workspace);
@@ -182,12 +193,18 @@ mod tests {
         let ws = &mut state.workspaces[0];
         let root = ws.tabs[0].root_pane;
         let missing = PaneId::alloc();
-        let before = ws.tabs[0].layout.pane_ids();
         ws.test_split(Direction::Horizontal);
+        let before = ws.tabs[0].layout.pane_ids();
         assert!(ws.tabs[0].close_pane(missing).is_none());
-        assert_eq!(ws.tabs[0].layout.pane_count(), 2);
+        assert_eq!(ws.tabs[0].layout.pane_ids(), before);
         assert!(ws.take_pane_for_move(root).is_ok());
         assert!(ws.tabs[0].membership_valid());
-        assert_eq!(before, vec![root]);
+        assert_eq!(
+            ws.tabs[0].layout.pane_ids(),
+            before
+                .into_iter()
+                .filter(|id| *id != root)
+                .collect::<Vec<_>>()
+        );
     }
 }

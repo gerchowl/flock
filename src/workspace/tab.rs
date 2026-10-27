@@ -96,6 +96,8 @@ impl Tab {
     /// Check that terminal and native maps exhaustively and disjointly cover
     /// the layout, including its root and focus. Intended for mutation guards,
     /// not the per-event indexed workspace lookup.
+    // Used by native attachment once the S10d UI entry point lands (#1430).
+    #[allow(dead_code)]
     pub(crate) fn membership_valid(&self) -> bool {
         let ids = self.layout.pane_ids();
         ids.len() == self.panes.len() + self.native_views.len()
