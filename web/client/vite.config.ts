@@ -79,6 +79,12 @@ function inlineFixtureBundle(): Plugin {
         } else if (fileName.endsWith(".css") && typeof output.source === "string") {
           const css = output.source.replaceAll("</style", "<\\/style");
           html = replaceTag(html, new RegExp(`<link rel="stylesheet"[^>]*href="${ref}"[^>]*>`), `<style>${css}</style>`);
+        } else if (fileName.endsWith(".svg")) {
+          html = replaceTag(
+            html,
+            new RegExp(`<link rel="icon"[^>]*href="${ref}"[^>]*>`),
+            `<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,${encodeURIComponent(typeof output.source === "string" ? output.source : new TextDecoder().decode(output.source))}">`,
+          );
         } else {
           throw new Error(`fixture build: cannot inline ${fileName}`);
         }
@@ -94,6 +100,8 @@ export default defineConfig(({ mode }) => ({
   plugins: [solid(), ...(mode === "fixture" ? [fixtureShell(), inlineFixtureBundle()] : [])],
   build: {
     target: "es2022",
+    // Production images must remain same-origin resources under the document CSP.
+    assetsInlineLimit: 0,
     // The preload polyfill would add an inline helper; nothing here is lazy.
     modulePreload: { polyfill: false },
   },
