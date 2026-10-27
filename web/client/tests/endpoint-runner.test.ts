@@ -20,9 +20,9 @@ const base: StepHandlers = {
 test("selection uses covers containment, including multi-label headers", async () => {
   const selected = await loadS7MinScripts(ROOT);
   assertInventory(selected, WIRED_SCRIPTS);
-  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-gap", "agent-send", "heartbeat-missed", "ping-pong", "token-revoked"]);
+  expect(Object.keys(PENDING_PART_2B).sort()).toEqual(["agent-send", "heartbeat-missed", "ping-pong", "token-revoked"]);
   expect(() => assertInventory(selected, [])).toThrow();
-  expect(() => assertInventory(selected, [...WIRED_SCRIPTS, "agent-gap"])).toThrow();
+  expect(() => assertInventory(selected, [...WIRED_SCRIPTS, "agent-send"])).toThrow();
   expect(() => assertInventory([...selected, { ...selected[0]!, name: "new-unclassified" }], WIRED_SCRIPTS)).toThrow();
   const clientOnly = { name: "client-fleet", lines: parseScript(await Bun.file(`${ROOT}/fleet-lite.jsonl`).text()) };
   expect(coverage(clientOnly)).toEqual(["client-only"]);
@@ -132,4 +132,21 @@ test("invalid versions, repeated given and missing final quiet fail visibly", as
   await expect(runTrace({ name: "empty", lines: [] }, base)).rejects.toThrow("expected v1 given");
   await expect(runTrace({ name: "no-quiet", lines: script().lines.slice(0, 1) }, base)).rejects.toThrow("missing final quiet");
   await expect(runTrace(script({ v: 2, step: "quiet", ceiling_ms: 1 }), base)).rejects.toThrow("invalid version");
+});
+
+
+test("retained gap trace keeps literal resume, event and identity evidence", async () => {
+  const selected = (await loadS7MinScripts(ROOT)).find((value) => value.name === "agent-gap");
+  assert(selected);
+  expect(selected.lines[0]).toMatchObject({ cursors: { "agent/fixture": 2 } });
+  const frames = selected.lines.filter((line) => line.step === "send").map((line) => line.frame);
+  expect(frames[0]).toMatchObject({
+    principal: "0123456789abcdef0123456789abcdef",
+    server_version: { $dynamic: "server_version", source: "build" },
+  });
+  expect(frames.slice(1)).toEqual([
+    { t: "gap", sub_id: "s1", from: 3, to: 4 },
+    { t: "ev", sub_id: "s1", stream: "agent/fixture", seq: 5, ts_ms: 1, ev: { type: "assistant", message: {} } },
+    { t: "synced", sub_id: "s1", seq: 5 },
+  ]);
 });
