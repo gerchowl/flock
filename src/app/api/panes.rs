@@ -254,14 +254,18 @@ impl App {
             identity_cwd: self.state.workspaces[source_ws_idx].identity_cwd.clone(),
         };
 
-        let taken = match self
-            .state
-            .workspaces
-            .get_mut(source_ws_idx)
-            .and_then(|ws| ws.take_pane_for_move(source_pane_id))
-        {
-            Some(taken) => taken,
-            None => return encode_error(id, "pane_move_failed", "source pane could not be moved"),
+        let taken = match self.state.workspaces[source_ws_idx].take_pane_for_move(source_pane_id) {
+            Ok(taken) => taken,
+            Err(crate::structured::view::PlacementError::RelocationUnsupported) => {
+                return encode_error(
+                    id,
+                    "runtime_unsupported",
+                    "native views cannot move between tabs or workspaces",
+                )
+            }
+            Err(_) => {
+                return encode_error(id, "pane_move_failed", "source pane could not be moved")
+            }
         };
         let source_removed_tab_id = taken.removed_tab_idx.map(|_| previous_tab_id.clone());
         let source_workspace_empty = taken.workspace_empty;

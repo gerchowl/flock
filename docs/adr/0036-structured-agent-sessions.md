@@ -4126,3 +4126,13 @@ listener methods and changes neither reachable endpoints nor TCP authentication.
 The following activation slice owns the server handoff manifest extension,
 LocalOperator admission, independent pre-auth pools and the atomic TCP
 app-session refusal.
+
+### Amendment: S10a1 native placement
+
+A native view has explicit membership beside terminal panes. The checked content
+accessor requires disjoint, exhaustive layout membership; absent terminal state
+is never evidence of a native view. One placement per local structured agent is
+reused on focus, and every UI target is fenced by the registry generation.
+Closing detaches placement without stopping the runtime. Native cross-tab or
+workspace relocation is unsupported and refuses before any layout mutation,
+including removal of a single-pane tab. Public start/render wiring is S10d.
