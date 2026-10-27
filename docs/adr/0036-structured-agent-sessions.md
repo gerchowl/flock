@@ -4236,3 +4236,14 @@ view IDs come from actual layout membership and public numbering. Detaching
 does not stop the worker. Placement preflight precedes worker admission.
 The App-owned subscription controller and renderer/input routing follow in
 separate S10d slices under #1430; placement itself creates no terminal runtime.
+
+### Amendment: S10d1b cancel-safe native continuation
+
+`Stream::next` is cancel-safe. Stream owns its in-flight history task, cut and
+unapplied page, as well as queue cursor/replacement and resubscribe state.
+Cancelling a caller's future preserves that continuation. Resuming an older
+Pending history page yields one step to recheck readiness; a publication that
+predates the new wait cannot leave the continuation asleep. Retirement alone
+discards a dead generation's page. Its blocking work retains the I/O permit
+until completion, even if the Stream is dropped. No timeout, sleep or mutation
+retry substitutes for source readiness.

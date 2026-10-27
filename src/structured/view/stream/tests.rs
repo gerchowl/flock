@@ -302,3 +302,208 @@ async fn ended_queue_resumes_after_a_real_competing_subscriber() {
     assert_eq!(s.model.snapshot.queue.len(), 5);
     assert!(s.ended[2]);
 }
+
+const WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) struct CancelGate {
+    entered: tokio::sync::mpsc::UnboundedSender<u8>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+impl CancelGate {
+    pub fn pause(&self, stage: u8) {
+        self.entered.send(stage).unwrap();
+        self.release
+            .recv_timeout(WITHIN)
+            .expect("cancel test abandoned page producer");
+    }
+}
+async fn cancel_page(stage: u8) {
+    let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    let records = (1..=2).map(|seq| crate::structured::transport::StreamRecord {
+        seq, known: Some(true), shape: None, received_at_ms: 1,
+        origin: crate::structured::transport::RecordOrigin::Claude,
+        result_subtype: None, permission_grant_request_id: None, permission_request_seq: None,
+        raw: serde_json::json!({"text": if seq == 1 { "x".repeat(history::PAGE_BYTES + 100) } else { "last".into() }}).to_string(),
+    }).collect();
+    let source = history::tests::Fixture::new(records);
+    source.source.finish(false);
+    s.history = source.source.clone();
+    s.ended = [false, true, true];
+    let mut cut = s.history.subscribe(Some(0)).unwrap();
+    assert!(matches!(cut.page().unwrap(), history::Item::Progress));
+    s.cut = Some(cut);
+    let (entered, mut stages) = tokio::sync::mpsc::unbounded_channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    s.gate = Some(CancelGate {
+        entered,
+        release: gate,
+    });
+    let mut step = Box::pin(s.next());
+    assert!(poll(step.as_mut()).is_pending());
+    assert_eq!(
+        tokio::time::timeout(WITHIN, stages.recv()).await.unwrap(),
+        Some(0)
+    );
+    if stage == 1 {
+        release.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(WITHIN, stages.recv()).await.unwrap(),
+            Some(1)
+        );
+    }
+    drop(step);
+    release.send(()).unwrap();
+    if stage == 0 {
+        assert_eq!(
+            tokio::time::timeout(WITHIN, stages.recv()).await.unwrap(),
+            Some(1)
+        );
+        release.send(()).unwrap();
+    }
+    tokio::time::timeout(WITHIN, s.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        s.model.snapshot.applied_cursor, 1,
+        "cancelled page must resume its existing cut"
+    );
+    drain(&mut s).await;
+    assert_eq!(
+        s.model
+            .snapshot
+            .transcript
+            .iter()
+            .map(|c| c.seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        s.cut.as_ref().unwrap().read_bytes(),
+        source.file.metadata().unwrap().len()
+    );
+}
+#[tokio::test]
+async fn cancellation_before_page_keeps_the_inflight_cut() {
+    cancel_page(0).await;
+}
+#[tokio::test]
+async fn cancellation_after_page_keeps_the_unapplied_record() {
+    cancel_page(1).await;
+}
+
+#[tokio::test]
+async fn cancellation_of_readiness_wait_rechecks_the_source() {
+    let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    let mut source = history::tests::Fixture::new(vec![]);
+    s.history = source.source.clone();
+    s.ended = [false, true, true];
+    assert!(s.next().await.unwrap());
+    let (waiting, ready) = tokio::sync::oneshot::channel();
+    s.waiting = Some(waiting);
+    let mut step = Box::pin(s.next());
+    tokio::time::timeout(WITHIN, async {
+        tokio::select! { result = &mut step => panic!("expected readiness wait: {result:?}"), _ = ready => () }
+    }).await.unwrap();
+    drop(step);
+    let record = crate::structured::transport::StreamRecord {
+        seq: 1,
+        known: Some(true),
+        shape: None,
+        received_at_ms: 1,
+        origin: crate::structured::transport::RecordOrigin::Claude,
+        result_subtype: None,
+        permission_grant_request_id: None,
+        permission_request_seq: None,
+        raw: "{}".into(),
+    };
+    source.append(record);
+    source.source.finish(false);
+    drain(&mut s).await;
+    assert_eq!(s.model.snapshot.applied_cursor, 1);
+    assert_eq!(s.model.snapshot.transcript.len(), 1);
+}
+#[tokio::test]
+async fn cancellation_of_busy_resubscribe_preserves_its_cursor() {
+    let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    let mut owner = Fixture::new();
+    s.source = owner.source.clone();
+    s.queue = Some(s.source.subscribe(None).unwrap());
+    s.queue_wake = s.queue.as_ref().unwrap().waker();
+    s.ended = [true, true, false];
+    owner.capture();
+    for n in 0..5 {
+        owner.append(n);
+    }
+    assert!(s.next().await.unwrap());
+    owner.competing_subscriber(|| {
+        let mut step = Box::pin(s.next());
+        assert!(poll(step.as_mut()).is_pending());
+        drop(step);
+    });
+    assert!(s.queue.is_none());
+    {
+        let mut step = Box::pin(s.next());
+        assert!(poll(step.as_mut()).is_pending());
+        owner.capture();
+        woke(step).await;
+    }
+    woke(s.next()).await;
+    owner.capture();
+    owner.finish(false);
+    drain(&mut s).await;
+    assert_eq!(
+        s.model
+            .snapshot
+            .queue
+            .iter()
+            .map(|v| v.item_id.as_str())
+            .collect::<Vec<_>>(),
+        (0..5).map(|n| format!("item-{n}")).collect::<Vec<_>>()
+    );
+}
+#[tokio::test]
+async fn cancelled_pending_page_cannot_hide_a_publication() {
+    let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    let mut source = history::tests::Fixture::new(vec![]);
+    s.history = source.source.clone();
+    s.ended = [false, true, true];
+    assert!(s.next().await.unwrap());
+    let (entered, mut stages) = tokio::sync::mpsc::unbounded_channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    s.gate = Some(CancelGate {
+        entered,
+        release: gate,
+    });
+    let mut step = Box::pin(s.next());
+    assert!(poll(step.as_mut()).is_pending());
+    assert_eq!(
+        tokio::time::timeout(WITHIN, stages.recv()).await.unwrap(),
+        Some(0)
+    );
+    release.send(()).unwrap();
+    assert_eq!(
+        tokio::time::timeout(WITHIN, stages.recv()).await.unwrap(),
+        Some(1)
+    );
+    drop(step);
+    source.append(crate::structured::transport::StreamRecord {
+        seq: 1,
+        known: Some(true),
+        shape: None,
+        received_at_ms: 1,
+        origin: crate::structured::transport::RecordOrigin::Claude,
+        result_subtype: None,
+        permission_grant_request_id: None,
+        permission_request_seq: None,
+        raw: "{}".into(),
+    });
+    source.source.finish(false);
+    release.send(()).unwrap();
+    tokio::time::timeout(WITHIN, s.next())
+        .await
+        .expect("stale Pending page lost the publication wake")
+        .unwrap();
+    drain(&mut s).await;
+    assert_eq!(s.model.snapshot.applied_cursor, 1);
+    assert_eq!(s.model.snapshot.transcript.len(), 1);
+}
