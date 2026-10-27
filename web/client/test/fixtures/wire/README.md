@@ -167,9 +167,10 @@ protocol close 1002. Rust contract tests also pin sub_id_reused for both live an
 closed IDs. The subscription guard models live-to-closed transitions on unsub,
 subfail and lagged, retaining closed IDs until the connection ends.
 
-The `permission-decision` scenario grants exactly `read`, `send`, `answer`,
-in that enum order. Its welcome lists those grants (ADR-0036's #2461 amendment,
-contract correction #2579). A token without `answer` is a separate negative
-scenario and receives typed `scope`; it must not stand in for this successful
-scenario. Actual-endpoint command replay remains blocked by the additional
-backend `operate` requirement tracked in #2580; no hidden grant is added.
+The successful command scenarios (`permission-decision`, `agent-send`, and
+`token-revoked`) grant exactly `read`, `send`, `answer`, `operate`, in that enum
+order, matching ClientOpen and app sessions. Their welcomes list those exact
+grants (ADR-0036 S6/#1429 and #2461; corrected rulings #2579/#2580). No scope
+change occurs mid-script. Separate real-client negative cases pin typed `scope`
+without `answer`, and `not_authorized` for send or decide without `operate`.
+Whether send alone should suffice is pending owner decision in #2585.

@@ -145,11 +145,13 @@ test("server conformance selection excludes the client-only fleet fixture", asyn
   expect(coverage("fleet-lite", await load("fleet-lite"))).toEqual(["client-only"]);
 });
 
-// ADR-0036 #2461 and #2579: the successful decision scenario needs answer.
-test("permission fixture declares its exact decision grants", async () => {
-  const welcome = (await load("permission-decision")).find(
-    (line) => line.step === "send" && line.frame.t === "welcome",
-  );
-  expect(welcome?.step === "send" && welcome.frame.t === "welcome" && welcome.frame.capabilities)
-    .toEqual(["read", "send", "answer"]);
-});
+// ADR-0036 S6/#1429 and #2580: command scenarios use the ClientOpen grants.
+for (const name of ["permission-decision", "agent-send", "token-revoked"]) {
+  test(`${name} fixture declares its exact ClientOpen grants`, async () => {
+    const welcome = (await load(name)).find(
+      (line) => line.step === "send" && line.frame.t === "welcome",
+    );
+    expect(welcome?.step === "send" && welcome.frame.t === "welcome" && welcome.frame.capabilities)
+      .toEqual(["read", "send", "answer", "operate"]);
+  });
+}
