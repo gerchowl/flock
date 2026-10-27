@@ -160,6 +160,7 @@ pub(crate) struct Source(
     Arc<Mutex<Book>>,
     Arc<Notify>,
     String,
+    Arc<Notify>,
 );
 impl Source {
     /// Blocking recovery for an I/O worker only, never the server loop. The
@@ -192,29 +193,60 @@ impl Source {
         self.3 == agent
     }
 }
+/// Capture capacity has a separate wake from book-lock release.
+pub(crate) enum SubscribeError {
+    CaptureBusy,
+    /// Transient book contention or a terminal typed refusal.
+    Code(ErrorCode),
+}
+type SubscribeResult = Result<Reader, SubscribeError>;
+impl Source {
+    pub(in crate::structured) fn capture_waker(&self) -> Arc<Notify> {
+        self.4.clone()
+    }
+    pub(in crate::structured) fn subscribe_ready(&self, after: Option<u64>) -> SubscribeResult {
+        let live = Arc::new(Mutex::new(Live::default()));
+        let mut book = self
+            .1
+            .try_lock()
+            .ok_or(SubscribeError::Code(ErrorCode::SessionBusy))?;
+        #[cfg(test)]
+        view_test::pause_subscription();
+        // Every lock-owning outcome wakes after release, including refusals.
+        // A failed try_lock must not notify itself and turn busy into a spin.
+        let result = (|| {
+            if after.is_some_and(|n| n > book.retained.through) {
+                return Err(SubscribeError::Code(ErrorCode::CursorAhead));
+            }
+            if book.ended {
+                book.register(after, live.clone())
+                    .map_err(SubscribeError::Code)?;
+            } else {
+                self.0
+                    .try_send(Capture(after, live.clone()))
+                    .map_err(|_| SubscribeError::CaptureBusy)?;
+            }
+            Ok(Reader {
+                source: self.clone(),
+                live,
+                current: None,
+                index: 0,
+                stage: 0,
+                closed: false,
+            })
+        })();
+        drop(book);
+        self.2.notify_waiters();
+        result
+    }
+}
 impl Provider for Source {
     type Error = ErrorCode;
     type Subscription = Reader;
     fn subscribe(&self, after: Option<u64>) -> Result<Reader, ErrorCode> {
-        let live = Arc::new(Mutex::new(Live::default()));
-        let mut book = self.1.try_lock().ok_or(ErrorCode::SessionBusy)?;
-        if after.is_some_and(|n| n > book.retained.through) {
-            return Err(ErrorCode::CursorAhead);
-        }
-        if book.ended {
-            book.register(after, live.clone())?;
-        } else {
-            self.0
-                .try_send(Capture(after, live.clone()))
-                .map_err(|_| ErrorCode::SessionBusy)?;
-        }
-        Ok(Reader {
-            source: self.clone(),
-            live,
-            current: None,
-            index: 0,
-            stage: 0,
-            closed: false,
+        self.subscribe_ready(after).map_err(|e| match e {
+            SubscribeError::CaptureBusy => ErrorCode::SessionBusy,
+            SubscribeError::Code(code) => code,
         })
     }
 }
@@ -313,6 +345,7 @@ impl Publisher {
             })),
             Arc::new(Notify::new()),
             agent.into(),
+            Arc::new(Notify::new()),
         );
         (Self(source.clone(), rx), source)
     }
@@ -326,6 +359,7 @@ impl Publisher {
         };
         capture_locked(&self.0 .1, Capture(after, live), snapshot, status);
         self.0 .2.notify_waiters();
+        self.0 .4.notify_waiters();
         true
     }
     pub fn finish(
@@ -346,6 +380,7 @@ impl Publisher {
         book.close();
         drop(book);
         self.0 .2.notify_waiters();
+        self.0 .4.notify_waiters();
     }
     pub fn publish(&mut self, update: &Update) {
         if let Some(cut) = &update.cut {
@@ -366,6 +401,7 @@ impl Publisher {
             book.close();
         }
         self.0 .2.notify_waiters();
+        self.0 .4.notify_waiters();
     }
 }
 impl Drop for Publisher {
@@ -382,6 +418,7 @@ impl Drop for Publisher {
         }
         drop(book);
         self.0 .2.notify_waiters();
+        self.0 .4.notify_waiters();
     }
 }
 

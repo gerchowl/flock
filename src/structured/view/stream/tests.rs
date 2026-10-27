@@ -4,6 +4,7 @@ use crate::structured::{
     registry::Registry,
     view::Target,
     workers::{
+        queue::publication::view_test::Fixture,
         tests::{wait, Case},
         Workers,
     },
@@ -166,8 +167,15 @@ async fn replacement_queue_is_published_only_when_complete() {
 fn poll<T>(future: std::pin::Pin<&mut impl std::future::Future<Output = T>>) -> std::task::Poll<T> {
     future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
 }
+async fn woke(step: impl std::future::Future<Output = io::Result<bool>>) {
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), step)
+            .await
+            .expect("queue readiness never arrived")
+            .unwrap()
+    );
+}
 async fn lag_recovery(busy: bool, replacement: bool) {
-    use crate::structured::workers::queue::publication::view_test::Fixture;
     let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
     let mut owner = Fixture::new();
     owner.append(0);
@@ -186,7 +194,7 @@ async fn lag_recovery(busy: bool, replacement: bool) {
         owner.append(n);
     }
     if busy {
-        owner.locked(|| {
+        owner.competing_subscriber(|| {
             let mut step = std::pin::pin!(s.next());
             assert!(
                 matches!(poll(step.as_mut()), std::task::Poll::Ready(Ok(true))),
@@ -195,31 +203,38 @@ async fn lag_recovery(busy: bool, replacement: bool) {
         });
         {
             let mut step = std::pin::pin!(s.next());
-            owner.locked(|| {
+            owner.competing_subscriber(|| {
                 assert!(
                     poll(step.as_mut()).is_pending(),
                     "transient busy must wait for readiness"
                 )
             });
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_secs(10), step)
-                    .await
-                    .expect("source wake never arrived")
-                    .unwrap()
-            );
+            woke(step).await;
         }
         assert!(!s.ended[2]);
+        {
+            let mut step = std::pin::pin!(s.next());
+            assert!(
+                poll(step.as_mut()).is_pending(),
+                "full capture must not self-wake"
+            );
+            owner.capture();
+            woke(step).await;
+        }
     } else {
         assert!(s.next().await.unwrap());
+
+        {
+            let mut step = std::pin::pin!(s.next());
+            assert!(matches!(
+                poll(step.as_mut()),
+                std::task::Poll::Ready(Ok(true))
+            ));
+        }
         let mut step = std::pin::pin!(s.next());
         assert!(poll(step.as_mut()).is_pending());
         owner.capture();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(10), step)
-                .await
-                .expect("capture wake never arrived")
-                .unwrap()
-        );
+        woke(step).await;
     }
     owner.finish(false);
     drain(&mut s).await;
@@ -248,7 +263,6 @@ async fn queue_lag_busy_preserves_replacement() {
 }
 #[tokio::test]
 async fn queue_refusal_stays_a_refusal() {
-    use crate::structured::workers::queue::publication::view_test::Fixture;
     let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
     let mut owner = Fixture::new();
     owner.finish(true);
@@ -262,4 +276,29 @@ async fn queue_refusal_stays_a_refusal() {
         );
         assert!(!s.ended[2]);
     }
+}
+
+#[tokio::test]
+async fn ended_queue_resumes_after_a_real_competing_subscriber() {
+    let (_app, _case, mut s) = fixture("s10b-live-lifecycle-exit").await;
+    let mut owner = Fixture::new();
+    s.source = owner.source.clone();
+    s.queue = Some(s.source.subscribe(None).unwrap());
+    s.queue_wake = s.queue.as_ref().unwrap().waker();
+    s.ended = [true, true, false];
+    owner.capture();
+    for n in 0..5 {
+        owner.append(n);
+    }
+    owner.finish(false);
+    assert!(s.next().await.unwrap());
+    assert!(s.queue.is_none(), "overflow reader must be spent");
+    {
+        let mut step = std::pin::pin!(s.next());
+        owner.competing_subscriber(|| assert!(poll(step.as_mut()).is_pending()));
+        woke(step).await;
+    }
+    drain(&mut s).await;
+    assert_eq!(s.model.snapshot.queue.len(), 5);
+    assert!(s.ended[2]);
 }

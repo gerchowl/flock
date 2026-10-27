@@ -7,7 +7,7 @@ use crate::structured::{
     queue,
     workers::{
         live,
-        queue::publication::{Page, Reader, Source},
+        queue::publication::{Page, Reader, Source, SubscribeError},
     },
 };
 use std::io;
@@ -98,18 +98,22 @@ impl Stream {
         }
         let hw = self.history.waker();
         let qw = self.queue_wake.clone();
-        let (hn, qn) = (hw.notified(), qw.notified());
-        tokio::pin!(hn, qn);
+        let cw = self.source.capture_waker();
+        let (hn, qn, cn) = (hw.notified(), qw.notified(), cw.notified());
+        tokio::pin!(hn, qn, cn);
         hn.as_mut().enable();
         qn.as_mut().enable();
+        cn.as_mut().enable();
+        let mut capture_busy = false;
         if !self.ended[2] {
             // A lagged reader is spent. Busy capture waits on the source wake.
             // it must never become a synthetic End from the old reader.
             if self.queue.is_none() {
-                match self.source.subscribe(Some(self.queue_cursor)) {
+                match self.source.subscribe_ready(Some(self.queue_cursor)) {
                     Ok(reader) => self.queue = Some(reader),
-                    Err(ErrorCode::SessionBusy) => (),
-                    Err(code) => {
+                    Err(SubscribeError::CaptureBusy) => capture_busy = true,
+                    Err(SubscribeError::Code(ErrorCode::SessionBusy)) => (),
+                    Err(SubscribeError::Code(code)) => {
                         self.queue_failure = Some(code);
                         return Err(io::Error::other(code));
                     }
@@ -186,7 +190,8 @@ impl Stream {
         }
         tokio::select! {
             _ = &mut hn, if !self.ended[0] => {},
-            _ = &mut qn, if !self.ended[2] => {},
+            _ = &mut qn, if !self.ended[2] && !capture_busy => {},
+            _ = &mut cn, if capture_busy => {},
             item = self.live.recv(), if !self.ended[1] => {
                 if !self.apply_live(item) { return Ok(false); }
             },

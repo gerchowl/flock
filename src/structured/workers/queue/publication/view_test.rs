@@ -1,5 +1,6 @@
 //! Deterministic access to the real publication lock and overflow path.
 use super::*;
+const WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 pub struct Fixture {
     pub source: Source,
     publisher: Option<Publisher>,
@@ -42,11 +43,25 @@ impl Fixture {
             cut: Some(self.journal.replay(after).unwrap()),
         });
     }
-    pub fn locked(&self, f: impl FnOnce()) {
-        let held = self.source.1.lock();
-        f();
-        drop(held);
-        self.source.2.notify_waiters();
+    pub fn competing_subscriber(&self, f: impl FnOnce()) {
+        let ended = self.source.1.lock().ended;
+        let source = self.source.clone();
+        let (ready, entered) = mpsc::sync_channel(1);
+        let (release, gate) = mpsc::sync_channel(1);
+        let competing = std::thread::spawn(move || {
+            GATE.with(|slot| *slot.borrow_mut() = Some((ready, gate)));
+            source.subscribe(None).map(drop)
+        });
+        entered.recv_timeout(WITHIN).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        release.send(()).unwrap();
+        let subscribed = competing.join().unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(
+            subscribed.is_ok() || (!ended && matches!(subscribed, Err(ErrorCode::SessionBusy)))
+        );
     }
     pub fn finish(&mut self, refused: bool) {
         self.publisher.as_mut().unwrap().finish(
@@ -64,4 +79,17 @@ impl Fixture {
         );
         drop(self.publisher.take());
     }
+}
+
+thread_local! {
+    static GATE: std::cell::RefCell<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+}
+/// Pause a real subscriber after book acquisition, without manufacturing a wake.
+pub(super) fn pause_subscription() {
+    GATE.with(|slot| {
+        if let Some((ready, release)) = slot.borrow_mut().take() {
+            ready.send(()).unwrap();
+            release.recv_timeout(WITHIN).unwrap();
+        }
+    });
 }
