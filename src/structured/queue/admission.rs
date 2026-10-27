@@ -49,8 +49,16 @@ pub(crate) enum Gate {
 pub(crate) enum Principal {
     /// Authenticated operator or operator-token caller.
     Operator,
+    /// Socket child of a positively classified operator root shell (ADR-0036 §1a).
+    OperatorViaPane(u32),
     /// Authenticated non-operator origin supplied by the dispatcher.
     Origin(Producer),
+}
+impl Principal {
+    /// Operator admission includes the independently verified shell-pane exception.
+    pub(crate) fn is_operator(&self) -> bool {
+        matches!(self, Self::Operator | Self::OperatorViaPane(_))
+    }
 }
 /// Registered refusal or uncertain storage error; callers must inspect before retry.
 #[derive(Debug)]
@@ -133,8 +141,12 @@ impl Admission {
         if item.delivery != Delivery::AtIdle || item.priority != Priority::Normal {
             return Err(refuse(ErrorCode::QueueModeUnsupported));
         }
+        let pane = match principal {
+            Principal::OperatorViaPane(pane) => Some(pane),
+            _ => None,
+        };
         item.producer = match principal {
-            Principal::Operator => Producer::Human,
+            Principal::Operator | Principal::OperatorViaPane(_) => Producer::Human,
             Principal::Origin(origin)
                 if origin != Producer::Human && item.kind != Kind::Command =>
             {
@@ -144,6 +156,7 @@ impl Admission {
         };
         if [
             "admission_hash",
+            "operator_via_pane",
             "gate",
             "batch_id",
             "awaiting_result",
@@ -169,6 +182,10 @@ impl Admission {
                     .is_none_or(|id| !valid_id(id)))
         {
             return Err(refuse(ErrorCode::InvalidRequest));
+        }
+        if let Some(pane) = pane {
+            item.metadata
+                .insert("operator_via_pane".into(), json!(pane));
         }
         validate_content(&item)?;
         item.state = match &gate {
@@ -430,10 +447,20 @@ fn render(item: &Item, fill: Entropy<'_>) -> Result<String, Failure> {
     } else {
         String::new()
     };
+    let producer = match item
+        .metadata
+        .get("operator_via_pane")
+        .and_then(Value::as_u64)
+    {
+        Some(pane) if item.producer == Producer::Human => {
+            header_json(&format!("operator via pane {pane}"))?
+        }
+        _ => header_json(&item.producer)?,
+    };
     let nonce = nonce(&item.body, fill)?;
     Ok(format!(
         "From {} (item {}):{reply} Attachments (blob refs): {}\n<<<flk-item {nonce}\n{}\nflk-item {nonce}>>>",
-        header_json(&item.producer)?, item.item_id, header_json(&item.attachments)?, item.body
+        producer, item.item_id, header_json(&item.attachments)?, item.body
     ))
 }
 // The callback is the entropy source, kept local so collision/failure handling

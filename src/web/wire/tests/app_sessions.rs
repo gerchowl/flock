@@ -7,7 +7,7 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
-async fn fixture() -> (Server, App, Owner) {
+pub(super) async fn fixture() -> (Server, App, Owner) {
     let clock = TestClock::new();
     fixture_clocks(clock.clone(), clock).await
 }
@@ -93,7 +93,7 @@ async fn dispatch(app: &mut App, params: Value, alter: impl FnOnce(&mut App)) ->
     worker.join().unwrap();
     serde_json::from_str(&line).unwrap()
 }
-async fn mint(app: &mut App) -> Bearer {
+pub(super) async fn mint(app: &mut App) -> Bearer {
     let reply = dispatch(app, json!({}), |_| {}).await;
     serde_json::from_value(reply["result"]["issued"]["token"].clone())
         .unwrap_or_else(|_| panic!("mint refused: {reply}"))
@@ -495,6 +495,96 @@ fn unavailable_expiry_timer_closes_without_claiming_credential_revocation() {
             .get(server._root.path(), Arc::new(FailedClock(false)))
             .unwrap();
         assert!(store.authenticate(&token).is_ok());
+        within(server.core.shutdown()).await.unwrap();
+        server.finish().await;
+    });
+}
+
+#[test]
+fn app_relaunch_connects_while_a_live_sibling_fills_its_credential_budget() {
+    runtime(async {
+        let (server, mut app, _) = fixture().await;
+        let a = mint(&mut app).await;
+        let mut old = Vec::new();
+        let mut identity = Value::Null;
+        for _ in 0..4 {
+            let mut socket = Socket::open(&server).await;
+            identity = socket.hello(WIRE_JSON_VERSION, &a.0).await["principal"].clone();
+            old.push(socket);
+        }
+        server.clock.deadline_count(15_000, 4).await;
+        server.clock.advance(15_000);
+        for socket in &mut old {
+            let ping = socket.text().await;
+            assert_eq!(ping["t"], "ping");
+            socket.send(json!({"t":"pong","nonce":ping["nonce"]})).await;
+        }
+        let b = mint(&mut app).await;
+        let mut renewed = Vec::new();
+        for _ in 0..4 {
+            let mut socket = Socket::open(&server).await;
+            assert_eq!(
+                socket.hello(WIRE_JSON_VERSION, &b.0).await["principal"],
+                identity
+            );
+            renewed.push(socket);
+        }
+        for token in [&a, &b] {
+            let mut excess = Socket::open(&server).await;
+            excess.send(json!({"t":"hello","protocol":WIRE_JSON_VERSION,"client":{"name":"fixture","version":"1"},"token":token.0})).await;
+            assert!(matches!(
+                excess.receive().await,
+                Received::Close(GOING_AWAY_CLOSE)
+            ));
+        }
+        assert_eq!(server.core.shared.clients.lock().unwrap().len(), 8);
+        within(server.core.shutdown()).await.unwrap();
+        server.finish().await;
+    });
+}
+
+#[test]
+fn app_fanout_matches_the_credential_without_prior_store_retirement() {
+    runtime(async {
+        let (server, mut app, owner) = fixture().await;
+        let a = mint(&mut app).await;
+        let b = mint(&mut app).await;
+        let mut old = Vec::new();
+        for _ in 0..2 {
+            let mut socket = Socket::open(&server).await;
+            socket.hello(WIRE_JSON_VERSION, &a.0).await;
+            old.push(socket);
+        }
+        let mut sibling = Socket::open(&server).await;
+        sibling.hello(WIRE_JSON_VERSION, &b.0).await;
+        server.clock.deadline_count(15_000, 3).await;
+        let store = owner
+            .get(
+                server._root.path(),
+                Arc::new(AppClock::new(Arc::new(server.clock.clone()))),
+            )
+            .unwrap();
+        let session = store.authenticate(&a).unwrap();
+        assert!(store.authenticate(&b).is_ok());
+        server.core.shared.revoke(&session);
+        {
+            let clients = server.core.shared.clients.lock().unwrap();
+            for client in clients.values() {
+                assert_eq!(
+                    *client.revoke.borrow(),
+                    client.session.info.name == session.info.name
+                );
+            }
+        }
+        for socket in &mut old {
+            assert!(matches!(
+                socket.receive().await,
+                Received::Close(AUTH_REVOKED_CLOSE)
+            ));
+        }
+        assert!(store.authenticate(&b).is_ok());
+        server.clock.advance(15_000);
+        assert_eq!(sibling.text().await["t"], "ping");
         within(server.core.shutdown()).await.unwrap();
         server.finish().await;
     });

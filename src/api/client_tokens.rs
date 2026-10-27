@@ -37,7 +37,7 @@ impl Drop for Bearer {
 pub struct TokenInfo {
     /// Operator-assigned file name or server-assigned app-session label.
     pub name: String,
-    /// Opaque identity, fresh on every issuance.
+    /// Authentication identity: stable per operator UID for app sessions, fresh for file tokens.
     pub principal: String,
     /// Exact grants; no implicit scope hierarchy.
     pub scopes: BTreeSet<Scope>,

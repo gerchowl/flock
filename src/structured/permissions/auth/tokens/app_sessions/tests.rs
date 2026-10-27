@@ -62,7 +62,8 @@ fn private_issue_is_fixed_operator_scoped_memory_only_and_renews_fresh() {
         .unwrap());
     let renewed = store.issue(&authority).unwrap();
     assert_ne!(renewed.token, first.token);
-    assert_ne!(renewed.info.principal, first.info.principal);
+    assert_eq!(renewed.info.principal, first.info.principal);
+    assert_ne!(renewed.info.name, first.info.name);
     assert!(store.authenticate(&first.token).is_ok());
 }
 #[test]
@@ -277,6 +278,7 @@ fn exact_revocation_keeps_a_renewed_credential_independent() {
     let second = store.issue(&authority).unwrap();
     let first_session = store.authenticate(&first.token).unwrap();
     let second_session = store.authenticate(&second.token).unwrap();
+    assert_eq!(first.info.principal, second.info.principal);
     store.revoke(&first_session).unwrap();
     assert!(*first_session.revoked.borrow());
     assert!(!*second_session.revoked.borrow());
@@ -401,4 +403,23 @@ fn injected_suspend_clock_wakes_at_its_deadline() {
                 .unwrap()
                 .unwrap();
         });
+}
+
+#[test]
+fn operator_identity_survives_a_store_restart_without_reusing_credentials() {
+    let (_root, files, store, clock, mut app) = fixture();
+    let authority = app.client_token_authority().unwrap();
+    let first = store.issue(&authority).unwrap();
+    let principal = first.info.principal.clone();
+    assert_eq!(
+        principal,
+        format!("app:operator:{}", authority.peer_credentials().uid.unwrap())
+    );
+    drop(store);
+    let restarted = Store::new(files, clock);
+    assert!(restarted.authenticate(&first.token).is_err());
+    let second = restarted.issue(&authority).unwrap();
+    assert_eq!(second.info.principal, principal);
+    assert_ne!(second.token, first.token);
+    assert_ne!(second.info.name, first.info.name);
 }

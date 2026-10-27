@@ -391,6 +391,32 @@ Slice B of #1734 provisions each generation credential only in the generated pri
 
 Scoped verification never waits for the lease registry lock: contention has a typed refusal and no snapshot fallback. Each admission performs at most sixteen kernel process-fact reads, refusing ancestry beyond that budget. This is a bounded supported ancestry depth, not permission to trust partial evidence. Credential comparison uses opaque accumulation (`core::hint::black_box`) to prevent optimizer replacement with an early-exit comparison. Encoded credential length is public format information. Legacy unscoped malformed requests retain serde diagnosis; scoped schema failures keep their fixed, secret-free error. JSON syntax diagnostics contain no field values.
 
+**Operator shell sends (#2494, owner option a).** The structured `agent.send`
+adapter alone may authenticate an operator via a pane. This is affirmative
+server evidence, not `AgentState::Unknown` or absence of agent detection. On
+every request it requires the unix socket's kernel PID and UID, the operator
+UID, and an unrelated lease identity. The pane must retain `created_as_root_shell`
+provenance (no argv override) and a runtime spawned with the default shell,
+with no agent name/label or launch argv. The caller's immediate kernel parent
+must equal that runtime's original root-shell PID. Both processes must be
+living, and the caller's socket-captured birth and the shell's spawn-captured
+birth must still match. A reaped shell, missing process facts, unknown UID,
+restored pane without provenance, scoped session or enrolled relay cannot grant
+this exception. Evidence is never cached. Scripts, `sh -c`, and agent children
+with an intervening process are refused; dedicated structured agents continue
+to use their native authenticated path. This does not broaden the shared
+`caller_is_local_operator` helper or other privileged verbs.
+
+Admission stamps the server-owned numeric `operator_via_pane` in durable queue
+history. Section 3 input framing renders it as `operator via pane <id>` in the
+producer header, outside the nonce-delimited body. Request metadata cannot
+supply or replace the stamp. The existing explicit native-command exception
+still sends the command alone; its durable queue record retains the stamp.
+This is the cooperative same-UID boundary of #1177, not proof of a physical
+keyboard: a direct child deliberately launched by the root shell satisfies the
+rule. Shell functions and exec-style commands can likewise preserve immediate
+parentage; no broader human-presence claim is made.
+
 ### 2. Mapping session events onto flk state, questions and waits
 
 A new `StateSource::Session` joins `Screen`, `Hook`, `Plugin`,
@@ -1297,14 +1323,17 @@ Lines files and its optional signed audit trail, not through Grafana and not
 through a separate pipeline. The integration is #1614. #1323 no longer gates
 S7; #1546 (liveness and recovery on unstable connections) does.
 
-One endpoint serves every frontend: `GET /v1/ws` (WebSocket) and
-`GET /v1/blob/<sha256>` (HTTP). It runs inside the flk server process,
+The network endpoints serving every frontend are `GET /v1/ws` (WebSocket) and
+`GET /v1/blob/<sha256>` (HTTP). They run inside the flk server process,
 because the streams, the queue and the blobs are server state. It reuses the
 axum stack of the `web` feature (`src/web/mod.rs`), not the `flk web`
 subcommand, which stays the terminal bridge it is (one pty client per
 socket). It is off by default, binds loopback by default, and follows
 ADR-0001's hosting rules (`--allow-non-loopback` explicit, refused under
-`tailscale funnel`, same-origin check on upgrade).
+`tailscale funnel`, same-origin check on upgrade). The native local shell
+uses the same `/v1/ws` protocol over a sibling Unix socket, with kernel peer
+credentials as an additional admission gate (the local-transport amendment
+below). That listener does not enable TCP exposure.
 
 Messages are JSON text frames, one object each, tagged by `t`:
 
@@ -3641,14 +3670,50 @@ unchanged.
 **What the token is.** A bearer secret. With `operate` it **is** the
 operator's identity for ADR-0014's operator-only verbs, as §5 says of an
 `operate`-scoped file token.
-- Any local process that obtains it can use `/v1/ws` until it is revoked or
-  expires.
+- On the local Unix transport, only the minting process may use it at
+  `/v1/ws`, after a fresh LocalOperator check and bearer authentication. The
+  local-transport amendment below supersedes admission by possession alone.
+  App-session bearers are not admitted over TCP, where their PID binding
+  cannot be proved.
 - **Residual risk (#1177).** Processes started from a flk pane, agents
-  included, are refused the mint, yet would gain operator authority by
-  obtaining the token, for example by reading the shell's memory. This
-  amendment narrows that risk (memory only, a bounded lifetime, the shell's
-  hardened runtime per ADR-0038 §6) but does not close it. #1177 tracks
-  same-UID agent isolation.
+  included, are refused the mint and local admission. PID binding prevents
+  another process from using a stolen bearer directly, but does not prevent
+  control of the shell process, for example by modifying its memory. The
+  bounded lifetime and shell hardening in ADR-0038 §6 narrow that risk but do
+  not close it. #1177 tracks same-UID agent isolation.
+
+**Stable app-session identity (#2442).** The principal is exactly
+`app:operator:<uid>`, where `<uid>` is the decimal kernel-attested operator
+UID sealed by LocalOperator. It is scoped to this server's operator identity,
+not a cross-server authorization claim. It survives re-mint, restart, handoff
+and relaunch; no caller field chooses it. File-token principals remain separate.
+The credential is distinct: every mint retains its fresh random `app:<nonce>`
+name, bearer/digest, process watch, deadline and revocation signal. Revoking or
+expiring one bearer closes only sockets using that credential, not sibling
+mints of the same operator. All mints have the same fixed operator grants;
+sharing the principal adds no authority beyond those grants.
+
+Command resend/dedupe stays keyed by `(principal, cmd_id)`. Re-mint no longer
+changes that key or requires dropping the operator's outbox. This does not
+extend retention or preserve an in-memory command cache across restart:
+existing epoch/resume-only/unknown-outcome rules still apply, with no automatic
+second dispatch.
+
+Resource budgets are per credential, keyed by the authenticated bearer digest,
+not by the shared operator principal. Each mint has four registered sockets,
+including pending welcome. A live old mint can fill all four while a fresh
+mint connects and uses its own four; sharing identity does not require the old
+app to drain. The global bound remains sixteen upgraded sockets, so one full
+credential cannot consume it. No additional per-principal aggregate cap is
+introduced. The four unauthenticated hello slots remain global: no credential
+is trusted before authentication. The store's 128-entry cap remains per
+credential, so a renewal still needs a free entry or expired/exited reclamation.
+
+**Audit limit.** Permission-decision records currently retain only the verified
+principal and source (`token`). The decision capability exposes neither the
+token name nor a bearer digest, so an answer can be attributed to the operator
+but not to a particular app mint. Shared-principal mints are indistinguishable
+in that audit trail. This does not expose credentials or change answer policy.
 
 **Binding to the minting process.**
 - **Where the PID comes from.** The **minting connection's peer credentials**:
@@ -3705,28 +3770,21 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
   `Sec-Fetch-Site: cross-site`, only on the exact `/v1/ws` path. The captured
   platforms need no registered-loopback origin, `origin_port`, port-ownership
   check or `origin_port_not_owned` code. Windows remains remote-only.
-- **Admission-policy hold (#2500).** UID attribution and revised isolation are
-  held for an owner decision. The Origin-only split preserves the runtime's
-  existing four pending hellos, 16 upgraded sockets and 32 incomplete HTTP
-  connections; it does not implement the proposed isolation/window policy.
-  The registry reserves `preauth_capacity` (HTTP 503/retry `later`) and
-  `auth_rate_limited` (HTTP 429/retry `later`).
+- **Replacement for the held policy (#2500).** Owner decision (a),
+  2026-10-26, replaces per-UID TCP attribution with the local Unix transport
+  specified below. TCP retains one shared browser pre-auth budget, without
+  attribution or unknown-UID buckets. The registry's `preauth_capacity`
+  (HTTP 503/retry `later`) and `auth_rate_limited` (HTTP 429/retry `later`)
+  remain registered; registration is not a new rate-limiting policy.
 - **Linux native refusal.** G9a refuses local mint at `ptrace_scope=0`, explains
   that another process could read the operator credential from app memory,
   and offers explicit remote pairing or administrator-enabled
   `ptrace_scope ≥ 1`. No silent fallback is permitted (ADR-0038 §6).
-- **Original pre-auth target (isolation/window revision held in #2500).**
-  - At most 16 concurrent unauthenticated `/v1/ws` connections per listener;
-    beyond that, `preauth_capacity`.
-  - One `hello` per connection; a failed `hello` closes it.
-  - After 10 failed `hello`s within 1 s, new upgrades are refused with
-    `auth_rate_limited` for the rest of that second.
-  - Authenticated sessions are unaffected.
-  - The §5a handshake deadline still applies.
-  - **Held acceptance (#2500), not implemented by the Origin-only slice:**
-    test refusal at 17 concurrent connections and at the 11th failed `hello`
-    within 1 s, with authenticated sessions unaffected. This test belongs to
-    #2500 and must follow the owner decision on isolation/window policy.
+- **Remote/browser path only.** The captured shell-Origin exception from
+  #2505 remains on TCP for an explicitly selected remote/browser connection.
+  It does not authenticate a local native bridge, bypass a bearer, or permit
+  an app-session token on TCP. The UDS route uses kernel peer evidence, not
+  an Origin or fetch-metadata claim, to establish local authority.
 
 **Tests that must fail first.**
 - A captured shell origin is admitted on `/v1/ws` and refused on the exchange.
@@ -3740,6 +3798,226 @@ operator's identity for ADR-0014's operator-only verbs, as §5 says of an
 - Restart and handoff each revoke every app-session token.
 - `same-site`, duplicate headers, lookalike shell origins and non-WS paths
   keep their existing refusal treatment.
+
+### Amendment: Local `/v1/ws` over a Unix socket (#2500)
+
+**Accepted owner decision (a), 2026-10-26.** This is the server half of
+[#2500](https://github.com/gerchowl/flock/pull/2500#issuecomment-6411345834).
+The native shell owns the Unix connection and bridges WebSocket traffic for
+its webview. The companion shell amendment is
+[#2529, reviewed head `37455b06`](https://github.com/gerchowl/flock/pull/2529):
+[ADR-0038 §6](0038-gui-workbench.md#6-shells-one-bundle-two-hosts-one-transport),
+"One protocol, two sockets", and ADR-0038 §11 owner decision **18**. The GUI
+architect owns that amendment; ADR-0038 is not edited here. This server
+contract does not claim implementation. It supersedes the earlier TCP UID
+attribution/window proposal, not §5's scopes, idempotency or §5a's recovery.
+
+**Shell cross-reference, not additional server requirements.** ADR-0038 §6
+keeps the bearer in native memory: the webview sends a token-free first
+`hello`; the bridge injects the bearer and passes later frames through byte
+for byte. A first frame other than a token-free hello is closed by the bridge
+with 1008, before forwarding. The server always receives the bearer-bearing
+hello specified below. The same shell contract re-mints on any 4401 or 4403
+for its current bearer, whether welcomed or not, at renewal at three quarters
+of `expires_in_ms`, and on `openBridge({renew:true})`. Closures 1006 and 1001
+reuse that bearer; replacing it does not revoke it early, so its existing TTL
+or exit watch still ends it. These bridge/re-mint rules are owned by ADR-0038,
+not introduced as another server admission path here.
+
+**Transport and location.** Use a **sibling `flock-ws.sock`**, derived beside
+that session's active `flock.sock`, including a selected or overridden runtime
+path. Its socket mode is **0600**, matching `SOCKET_PERMISSION_MODE` in
+`src/api/server.rs`. It lives in the **same directory as `flock.sock`**, with
+that directory's existing owner and permissions; do not broaden those
+permissions or create a less protected directory for the sibling. Retain
+listener ownership and the bounded shutdown/handoff lifecycle.
+
+Before binding, inspect an existing path and check whether its listener is
+live. A successful connect means busy, never permission to unlink. Remove
+only a proved-stale socket owned by this operator, after verifying its file
+type, owner and unchanged device/inode identity. A timeout, uncertain
+ownership, foreign owner, non-socket or symlink is not proof of staleness:
+refuse startup without removing it. Cleanup must likewise compare the bound
+socket's device/inode identity before unlinking, so a replaced path and
+another live listener's socket survive. `src/ipc.rs` owns the existing socket
+lifecycle helpers; implementation must preserve these checks rather than
+assuming every pre-existing sibling is disposable. Do not bind a
+machine-wide hard-coded path.
+The endpoint on that socket is exactly `GET /v1/ws`: HTTP/1.1 upgrade, then
+exactly the existing JSON text frames. No JSON-line tunnel, custom length
+prefix, new handshake field, wire-version bump or mesh change is introduced.
+The close-code set is reused **verbatim**, including 4401 for refused hello,
+4403 for post-registration revocation, 1001 for capacity/liveness failure,
+and the remaining §5/§5a codes. Recovery and command logic remain identical.
+The sibling serves only the WS route, not token exchange, minting or static
+web content; minting remains a request over `flock.sock`.
+
+This location deliberately avoids protocol sniffing on the existing API:
+`api::server::handle_connection` captures credentials and calls
+`read_initial_request_line`, then `api::scoped::decode` on a bounded,
+newline-delimited JSON request (`src/api/server.rs`, `src/api/scoped.rs`).
+It has no HTTP path router; routing an HTTP upgrade there would require a new
+protocol discriminator and complicate existing CLI/subscription reads.
+The sibling can reuse the HTTP/1.1 upgrade and WS core in
+`src/web/client_listener.rs` and `src/web/wire.rs`, while the platform adapter
+provides Unix peer evidence through `src/platform/peer.rs`. This is a
+recommendation for the implementation's listener placement, not permission
+to reinterpret existing socket bytes or weaken its permissions.
+
+**Admission requires both proofs.** Capture UID, PID and process-birth evidence
+from the accepted Unix connection, never from HTTP headers or `hello` fields.
+The UDS LocalOperator rule is explicit: a **known UID equal to the operator
+UID**, a live peer PID **with verified start-time evidence**, no pane/agent
+ancestry and no mesh-edge caller. A missing UID is a refusal, not an operator
+fallback. A missing PID, missing start time, exited peer or changed process
+identity is also a refusal. Matching UIDs or a non-empty PID alone are
+insufficient.
+
+Do **not** reuse `App::client_token_authority` or
+`App::caller_is_local_operator` as the complete UDS proof without strengthening
+it: `src/app/api/mesh.rs` currently uses `is_none_or` for the UID and only
+`pid.is_some()`, without requiring start-time evidence. Those existing
+semantics are not the normative rule for this new listener. Do not allocate
+a registered session before the stronger checks pass. Bounded admission
+resources may be reserved before this check, but never unbounded work or
+authenticated capacity.
+
+**Pre-upgrade refusal contract.** Send no HTTP 101 or WebSocket frame on these
+paths. Return `Content-Type: application/json`, `Cache-Control: no-store`,
+and exactly the following JSON object for the matching HTTP status, then close
+the HTTP connection within its admission deadline. JSON whitespace and key
+order are immaterial; code and message strings are fixed.
+
+| Condition | HTTP status | JSON body |
+| --- | --- | --- |
+| UID missing, UID not the operator UID, pane/agent ancestry or mesh-edge caller | 403 | `{"error":{"code":"operator_only","message":"Local operator required"}}` |
+| PID/start-time evidence missing, exited peer or changed process identity | 403 | `{"error":{"code":"peer_process_changed","message":"Peer process identity unavailable or changed"}}` |
+| No pre-auth admission capacity | 503 | `{"error":{"code":"preauth_capacity","message":"Pre-authentication capacity exhausted"}}` |
+
+Capacity can refuse before identity checks; otherwise check the UID/ancestry
+rule before process evidence, so a caller violating both receives
+`operator_only`. Reuse the typed-body shape of `web::gui::refusal`
+(`src/web/gui.rs`); do not emit a bare status or HTML fallback. ADR-0038 §6's
+native bridge **must map these status/code pairs** into its visible bridge
+admission failure/reconnect behavior; that mapping belongs in the companion
+shell amendment, not in a new server frame. It must not treat a refused HTTP
+upgrade as 4401/4403 or forward the HTTP body as a WS message.
+
+Kernel evidence is **additional to**, never a replacement for, bearer auth.
+Mint over `flock.sock`, then send the existing `hello` with that bearer; this
+is the **only** session admission path. A kernel-authorized but tokenless,
+invalid-token, expired-token or revoked-token hello receives the existing
+4401 without welcome. File credentials, if used locally, still require both
+LocalOperator and their own current scopes; local transport adds no scopes.
+Recheck authority at registration and preserve §5's command-time checks.
+No Origin, webview claim, command parameter or UID can mint a session implicitly.
+
+**App-session PID binding and reuse.** Bind each mint to its kernel-attested
+process instance, not merely its UID, deterministic operator principal or
+per-mint name. A UDS hello must have the minting peer PID **and birth**.
+A mismatched process is refused with the registered `peer_process_changed`
+(close 4401 with that code as the close reason, no new JSON frame or welcome).
+The native process that mints must therefore also own the bridge connection;
+a webview or helper with another PID cannot use its token. TCP cannot prove
+this binding, so its app-session hello refusal is exactly **close 4401 with
+reason `peer_process_changed`**, without welcome or a new JSON frame. This
+reuses the registered identity-proof refusal because TCP lacks the required
+peer-process proof, rather than inventing another transport error code or
+claiming the bearer itself expired. ADR-0038 §6 must mirror that exact reason
+string; it is not `operator_only`, `auth_revoked` or an implementation-chosen
+message. The browser/file-token path remains available.
+
+The ordering guarantee is stronger than waiting for an asynchronous callback:
+arm the per-mint exit watch before validating the accepted process identity,
+recheck birth after arming, and only then publish the bearer. On every hello,
+under the admission/revocation fence, verify the token's live exit watch and
+peer instance **before registering or sending welcome**. An already-ready
+exit must invalidate admission even if the owner has not yet serviced its
+notification. Exit retirement and session registration share that fence:
+a registration that linearizes first is included in revocation fanout; an
+exit that linearizes first prevents registration. A reused numeric PID can
+never revive the old watch, bearer or token-store entry. Exit, expiry,
+restart and handoff retain the existing 4403 fanout and the triggering
+`auth_revoked` command acknowledgement-before-close ordering. Missing watch
+proof fails closed; watch/store I/O failure remains 1001 under §5a, not
+fabricated evidence of revocation. See
+`src/structured/permissions/auth/tokens/app_sessions.rs` and
+`src/platform/process_exit.rs` for the existing per-mint watch/admission owner.
+
+**Budgets and isolation.** No TCP tuple-to-UID lookup, per-UID table or
+unknown-UID bucket is used. TCP browser admissions share one pre-auth budget.
+UDS admissions have their own bounded HTTP/hello reservations and consume
+**none** of that TCP pre-auth budget. Preserve these explicit backstops:
+
+| Resource | Bound and ownership |
+| --- | --- |
+| Incomplete HTTP connections | 32 per transport listener; TCP and UDS reservations are separate, at most 64 combined. Each has the existing absolute 5 s HTTP admission deadline. |
+| Pending unauthenticated WS hellos | Four per transport listener, at most eight combined; separate TCP/UDS permits. One hello per connection; the existing 5 s hello deadline applies. |
+| Upgraded WS sockets, including pending hello/welcome | 16 server-wide across both transports. This resource backstop is shared; it is not a TCP pre-auth attribution budget. |
+| Registered sockets per credential, including pending welcome | Four, counted across both transports by sealed bearer digest, as decided in #2518. Never key this cap by operator principal or PID. |
+| In-memory app-session credentials | 128 server-wide, retaining the existing store cap, TTL and exit retirement. |
+| Frame, writer and command resources | Existing WS core limits, including 65,536-byte messages and four concurrent first-send commands per socket; no unbounded bridge buffer. |
+
+An old mint's four sockets must not exclude a new mint's four merely because
+the operator principal is stable. There is no extra principal-wide cap;
+the global 16-socket backstop still applies. Refusing a new reservation must
+not evict authenticated sockets or leak a permit. Before upgrade, exhaustion
+is typed `preauth_capacity`/HTTP 503; after upgrade use existing 1001 capacity
+semantics. This amendment does not reinstate #2500's proposed ten-failures
+window or claim per-UID browser isolation. Same-UID processes outside the
+pane ancestry can still compete for local unauthenticated slots; #1177's
+residual process-isolation boundary remains explicit.
+
+**Implementation tests: each must fail first.** These are acceptance tests
+for the implementation PR, not claims that this docs-only PR adds a listener.
+Use real Unix sockets and child processes for credential/exit checks, an
+injected monotonic clock for deadlines, and bounded observable barriers rather
+than sleeps or ambient process scans.
+
+1. On the real sibling listener, perform HTTP/1.1 upgrade and drive the existing
+   client hello/subscription/command fixtures unchanged through JSON text
+   frames. Verify all §5a close-code mappings, including 4401/4403/1001, and
+   reject extra paths. Existing JSON-line requests and subscriptions on
+   `flock.sock` must still work without a discriminator or framing change.
+   Assert mode 0600 and the same parent directory/permissions as `flock.sock`.
+   A proved-stale operator-owned socket is replaced; a live listener, foreign
+   socket, non-socket, symlink or uncertain stale probe is refused without
+   unlinking it. Replace the bound socket's inode before cleanup and prove
+   the replacement survives.
+2. A LocalOperator with a valid bearer gets welcome. Tokenless and wrong-token
+   hellos do not. A real pane-descended caller with a valid stolen bearer,
+   another UID, **UID missing**, PID missing, start time missing, an exited
+   peer, and a mesh caller each fail before registration. Assert the exact
+   pre-upgrade HTTP status, content type, cache policy and JSON body above,
+   including refusal precedence. None yields a 101 or WS frame. Spoofed
+   headers do not help; the UID-missing case must fail with the current
+   helper's permissive `is_none_or` rule substituted.
+3. Child A mints and bridges successfully; child B using A's bearer is refused
+   with `peer_process_changed`/4401. Reusing A's PID in injected peer facts
+   after its real exit never admits the old token. Gate the exit notification
+   consumer to prove that a ready exit still prevents welcome; race exit with
+   registration to prove that every admitted socket is in revocation fanout.
+4. Exit and expiry revoke every socket of that credential, without revoking a
+   sibling mint. Restart/handoff reject old bearers. A command discovering
+   revocation gets its `auth_revoked` acknowledgement before 4403. PID/birth
+   mismatch and watch I/O failure exercise their distinct refusal/1001 paths.
+5. Fill TCP's pre-auth budget and still admit an authorized UDS hello, and
+   vice versa, with authenticated sessions alive. Exercise each HTTP, hello,
+   global upgraded and store limit independently; verify permit release on
+   every refused or interrupted admission. A slow header/absent hello must
+   terminate at its deadline without keeping a slot forever. The exhausted
+   pre-auth path must return the exact 503/`preauth_capacity` body above.
+6. Keep four ping-answering sockets on one credential and four on a renewed
+   mint with the same principal. Refuse each fifth with existing capacity
+   behavior, while other sockets keep working. Across both transports a file
+   credential still has only four slots; the 17th total upgraded socket fails.
+7. TCP refuses an app-session bearer with exactly close 4401 and reason
+   `peer_process_changed`, without welcome or another frame. The explicit remote
+   browser/file-token route still admits #2505's exact captured shell Origin
+   pair only on `/v1/ws`; exchange, duplicate-header, lookalike-Origin and
+   `null` refusals remain unchanged. A shell-Origin claim on UDS never replaces
+   LocalOperator or bearer proof. No unsupported-platform failure silently
+   redirects the local bridge onto TCP.
 
 ### Amendment: Recipient tool-inbox projection (#2363)
 
@@ -3799,3 +4077,62 @@ The welcome is an advisory snapshot, not an authorization lease. Every command
 and subscription still checks current authority at admission, including scope
 changes and revocation after the welcome. Browser command holding according to
 this advertisement is tracked separately in [#2464](https://github.com/gerchowl/flock/issues/2464).
+
+### Pathname listener ownership (#2531)
+
+`SocketOwner::acquire` takes a nonblocking exclusive `flock` on a permanent
+sibling `<socket>.lock` before bind or stale-path reclamation. This applies to
+`flock.sock`, the terminal client socket, and the UDS WebSocket listener when
+introduced. The lock file is operator-owned, regular, single-link, mode `0600`,
+opened with `O_CLOEXEC | O_NOFOLLOW`; it is never unlinked. Newly created
+files receive descriptor-based mode `0600` repair after open, independently of
+the inherited umask. Existing lock files are never permission-repaired; they
+must pass the original ownership, link-count, mode and pathname validation.
+The containing directory must exclude entry replacement by other users.
+Contention reports busy and never removes a socket, even with a full accept
+backlog. After acquiring the lock, `SocketOwner::prepare` also makes a nonblocking
+connection probe: a **successful** connect means busy, preserving an older listener
+that has no lock.
+A failed probe never proves staleness; the held lock excludes live owners only
+when those owners participate in this protocol. An old-build listener with a
+full backlog can fail this probe and its pathname can still be reclaimed. This
+residual rollout limitation is stated in the legacy-listener busy diagnostic;
+ownership locks cannot retroactively protect older builds. Once ownership is acquired,
+`SocketOwner::prepare` checks socket type, owner, and device/inode before removing
+an abandoned pathname. Symlinks, foreign ownership, and replacement entries
+are refused rather than followed or removed.
+
+The lock follows the **open file description**, including across SCM_RIGHTS.
+`perform_live_handoff` sends the API and terminal ownership descriptors after
+PTYs and the optional TCP listener, under handoff manifest version 3. Older
+importers refuse that version before transfer. `run_handoff_import_server`
+adopts both descriptors before acknowledging restoration or rebinding the
+public paths; the exporter retains its descriptors for rollback. Public Unix
+listeners are rebound under those same locks; TCP retains its listening fd.
+`restore_public_sockets_after_failed_handoff` also reuses the retained locks.
+There is no unlocked interval during either transition. This changes only the
+internal handoff manifest, not the mesh protocol.
+
+Cleanup removes only the recorded socket inode while still holding ownership.
+The final descriptor close releases the lock on shutdown or process death.
+There is deliberately no explicit `LOCK_UN`: that would release the shared lock
+while an importing process still owns it. Ownership guarantees apply to
+listeners implementing this protocol; older releases do not hold these locks.
+
+
+#### Unix HTTP listener foundation (#2500 PR3a)
+
+`local_listener::Listener` reuses `client_listener::serve` with a Unix stream
+and kernel-captured peer credentials. `prepare` does not accept HTTP requests;
+`activate` is explicit, and `stop` cancels the owned acceptor and HTTP tasks.
+The containing directory must be real, operator-owned and not writable by
+other users; its ancestor chain is trusted as for the API namespace. The
+socket shares the API's mode `0600` constant and the ownership protocol above.
+`owner`, `SocketOwner::duplicate` and `SocketOwner::take` retain the same locked
+open description through descriptor transfer, rebind and rollback. `unlink`
+and destruction compare the recorded inode, so an old exporter cannot unlink
+an importer's replacement socket. This slice adds no production call to these
+listener methods and changes neither reachable endpoints nor TCP authentication.
+The following activation slice owns the server handoff manifest extension,
+LocalOperator admission, independent pre-auth pools and the atomic TCP
+app-session refusal.

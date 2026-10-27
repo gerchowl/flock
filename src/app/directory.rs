@@ -13,6 +13,97 @@
 
 use crate::app::App;
 
+/// Last published directory identity/location projection, excluding volatile state.
+#[derive(Default)]
+pub(super) struct DirectorySnapshot(std::collections::BTreeMap<String, DirectoryEntry>);
+
+#[derive(PartialEq, Eq)]
+struct DirectoryEntry {
+    host: String,
+    pane_id: Option<String>,
+    local: bool,
+    route: Option<String>,
+    agent: Option<String>,
+    name: Option<String>,
+    runtime: Option<crate::api::schema::AgentRuntime>,
+}
+
+impl App {
+    /// ADR-0028 §3: invalidate discovery only after accepted state changes.
+    /// The EventHub's durable sequence is the version; no second cursor exists.
+    pub(crate) fn sync_directory_events(&mut self) {
+        let mut entries: std::collections::BTreeMap<_, _> = self
+            .collect_fleet_agents(&[])
+            .into_iter()
+            .map(|row| {
+                (
+                    row.agent_id,
+                    DirectoryEntry {
+                        host: row.host,
+                        pane_id: row.pane_id,
+                        local: row.local,
+                        route: row.route,
+                        agent: row.agent,
+                        name: row.name,
+                        runtime: row.runtime,
+                    },
+                )
+            })
+            .collect();
+        let host = crate::app::short_host_name();
+        // Match agent.list's membership gate without reading screens, cwd or status.
+        for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
+            for tab in &ws.tabs {
+                for pane_id in tab.layout.pane_ids() {
+                    let Some(terminal) = ws
+                        .pane_state(pane_id)
+                        .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                        .filter(|terminal| terminal.is_agent_terminal())
+                    else {
+                        continue;
+                    };
+                    let Some(pane_id) = self.state.public_pane_id(ws_idx, pane_id) else {
+                        continue;
+                    };
+                    entries.insert(
+                        terminal.agent_id.to_string(),
+                        DirectoryEntry {
+                            host: host.clone(),
+                            pane_id: Some(pane_id),
+                            local: true,
+                            route: None,
+                            agent: terminal.effective_agent_label().map(str::to_owned),
+                            name: terminal.agent_name().map(str::to_owned),
+                            runtime: None,
+                        },
+                    );
+                }
+            }
+        }
+        for record in self.state.structured_agents.records() {
+            entries.insert(
+                record.agent_id.clone(),
+                DirectoryEntry {
+                    host: host.clone(),
+                    pane_id: None,
+                    local: true,
+                    route: None,
+                    agent: Some(record.harness.clone()),
+                    name: record.name.clone(),
+                    runtime: Some(crate::api::schema::AgentRuntime::Structured),
+                },
+            );
+        }
+        if self.directory_snapshot.0 != entries {
+            self.directory_snapshot.0 = entries;
+            self.emit_event(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::DirectoryChanged,
+                data: crate::api::schema::EventData::DirectoryChanged {},
+            });
+        }
+    }
+}
+
 /// Where an agent is, at the moment of asking.
 ///
 /// Every field except the id is expected to change. Callers that persist any
@@ -24,7 +115,7 @@ pub(crate) struct AgentLocation {
     pub(crate) live: bool,
     /// Short host name of the server the agent lives on.
     pub(crate) host: String,
-    /// Public pane id **on that host**. Meaningless anywhere else.
+    /// Public pane id **on that host**; empty for pane-free identities.
     pub(crate) pane_id: String,
     /// `true` when the agent is on this server — i.e. reachable without the
     /// peer channel.
@@ -59,6 +150,44 @@ struct FleetAgentEntry {
     location: AgentLocation,
     agent: Option<String>,
     status: crate::api::schema::AgentStatus,
+    runtime: Option<crate::api::schema::AgentRuntime>,
+}
+
+struct PeerDirectoryAgent<'a> {
+    agent_id: &'a str,
+    pane_id: &'a str,
+    agent: Option<&'a str>,
+    status: crate::api::schema::AgentStatus,
+    runtime: Option<crate::api::schema::AgentRuntime>,
+}
+fn peer_directory_agents(
+    peer: &crate::peers::PeerSummaryState,
+) -> impl Iterator<Item = PeerDirectoryAgent<'_>> + '_ {
+    peer.workspaces
+        .iter()
+        .flat_map(|ws| &ws.agents)
+        .map(|agent| PeerDirectoryAgent {
+            agent_id: &agent.agent_id,
+            pane_id: &agent.pane_id,
+            agent: agent.agent.as_deref(),
+            status: agent.status,
+            runtime: None,
+        })
+        .chain(
+            peer.structured_agents
+                .iter()
+                .map(|agent| PeerDirectoryAgent {
+                    agent_id: &agent.agent_id,
+                    pane_id: "",
+                    agent: agent.agent.as_deref(),
+                    status: agent.status,
+                    runtime: Some(match agent.runtime {
+                        crate::structured::registry::StructuredRuntime::Structured => {
+                            crate::api::schema::AgentRuntime::Structured
+                        }
+                    }),
+                }),
+        )
 }
 
 impl App {
@@ -212,23 +341,22 @@ impl App {
                 .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
             let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
             let route = Some(peer.peer.clone());
-            for ws in &peer.workspaces {
-                for agent in &ws.agents {
-                    entries.push(FleetAgentEntry {
-                        location: AgentLocation {
-                            node: peer.node_id.clone(),
-                            live,
-                            agent_id: agent.agent_id.clone(),
-                            host: host.clone(),
-                            pane_id: agent.pane_id.clone(),
-                            local: false,
-                            route: route.clone(),
-                            direct: true,
-                        },
-                        agent: agent.agent.clone(),
-                        status: agent.status,
-                    });
-                }
+            for agent in peer_directory_agents(peer) {
+                entries.push(FleetAgentEntry {
+                    location: AgentLocation {
+                        node: peer.node_id.clone(),
+                        live,
+                        agent_id: agent.agent_id.to_owned(),
+                        host: host.clone(),
+                        pane_id: agent.pane_id.to_owned(),
+                        local: false,
+                        route: route.clone(),
+                        direct: true,
+                    },
+                    agent: agent.agent.map(str::to_owned),
+                    status: agent.status,
+                    runtime: agent.runtime,
+                });
             }
         }
         for entry in self.state.relayed_fleet_cache.values() {
@@ -238,29 +366,28 @@ impl App {
                 .as_deref()
                 .is_some_and(|node| self.mesh_routes.table.next_hop(node).is_some());
             let host = peer.host.clone().unwrap_or_else(|| peer.peer.clone());
-            for ws in &peer.workspaces {
-                for agent in &ws.agents {
-                    entries.push(FleetAgentEntry {
-                        location: AgentLocation {
-                            node: peer.node_id.clone(),
-                            live,
-                            agent_id: agent.agent_id.clone(),
-                            host: host.clone(),
-                            pane_id: agent.pane_id.clone(),
-                            local: false,
-                            // A relayed entry is reachable only via the peer
-                            // that relayed it (#410). That peer polls the
-                            // agent's host itself, so handing the message to it
-                            // is one hop and its ordinary `msg.send` makes the
-                            // next. `None` only for an entry that predates the
-                            // field — there is then no edge to name.
-                            route: entry.via.clone(),
-                            direct: false,
-                        },
-                        agent: agent.agent.clone(),
-                        status: agent.status,
-                    });
-                }
+            for agent in peer_directory_agents(peer) {
+                entries.push(FleetAgentEntry {
+                    location: AgentLocation {
+                        node: peer.node_id.clone(),
+                        live,
+                        agent_id: agent.agent_id.to_owned(),
+                        host: host.clone(),
+                        pane_id: agent.pane_id.to_owned(),
+                        local: false,
+                        // A relayed entry is reachable only via the peer
+                        // that relayed it (#410). That peer polls the
+                        // agent's host itself, so handing the message to it
+                        // is one hop and its ordinary `msg.send` makes the
+                        // next. `None` only for an entry that predates the
+                        // field — there is then no edge to name.
+                        route: entry.via.clone(),
+                        direct: false,
+                    },
+                    agent: agent.agent.map(str::to_owned),
+                    status: agent.status,
+                    runtime: agent.runtime,
+                });
             }
         }
         entries
@@ -291,9 +418,10 @@ impl App {
                 continue;
             }
             rows.push(crate::api::schema::FleetAgentInfo {
+                runtime: None,
                 agent_id: agent.agent_id.clone(),
                 host: host.clone(),
-                pane_id: agent.pane_id.clone(),
+                pane_id: Some(agent.pane_id.clone()),
                 local: true,
                 route: None,
                 agent: agent.agent.clone(),
@@ -308,9 +436,10 @@ impl App {
                 continue;
             }
             rows.push(crate::api::schema::FleetAgentInfo {
+                runtime: entry.runtime,
                 agent_id: entry.location.agent_id,
                 host: entry.location.host,
-                pane_id: entry.location.pane_id,
+                pane_id: (!entry.location.pane_id.is_empty()).then_some(entry.location.pane_id),
                 local: false,
                 route: entry.location.route,
                 agent: entry.agent,
@@ -326,6 +455,9 @@ impl App {
 }
 
 #[cfg(test)]
+pub(crate) mod loop_tests;
+
+#[cfg(test)]
 mod tests {
     use crate::api::schema::{AgentStatus, PeerAgentSummary, PeerWorkspaceSummary};
     use crate::app::App;
@@ -339,6 +471,54 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn directory_change_tracks_accepted_remote_summaries_not_refresh_times() {
+        let mut config = crate::config::Config::default();
+        config.peers.push(crate::config::PeerConfig {
+            name: "remote.invalid".into(),
+            ..Default::default()
+        });
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, rx, crate::api::EventHub::default());
+        let mut payload = crate::peers::PeerSummaryPayload {
+            node_id: None,
+            outbound_pending: false,
+            host: "remote.invalid".into(),
+            version: None,
+            protocol: None,
+            icon: None,
+            system: None,
+            structured_agents: Vec::new(),
+            workspaces: peer_with_agent("remote.invalid", "remote.invalid", "remote-agent")
+                .workspaces,
+            latency_ms: 1,
+            relayed_fleet: Vec::new(),
+        };
+        let changes = |app: &App| {
+            app.event_hub
+                .ring_snapshot_after(0)
+                .into_iter()
+                .filter(|(_, event)| {
+                    serde_json::to_value(event).unwrap()["event"] == "directory_changed"
+                })
+                .count()
+        };
+        for expected in [1, 1, 2] {
+            app.handle_internal_event(crate::events::AppEvent::PeerSummaryFetched(
+                crate::peers::PeerSummaryFetch {
+                    peer: "remote.invalid".into(),
+                    stream_error: None,
+                    result: Ok(payload.clone()),
+                },
+            ));
+            assert_eq!(changes(&app), expected);
+            if payload.latency_ms == 2 {
+                payload.workspaces.clear();
+            }
+            payload.latency_ms += 1;
+        }
     }
 
     fn peer_with_agent(peer: &str, host: &str, agent_id: &str) -> crate::peers::PeerSummaryState {
@@ -366,6 +546,54 @@ mod tests {
             }],
         }];
         state
+    }
+
+    #[test]
+    fn structured_directory_rows_resolve_without_a_pane_directly_and_via_hub() {
+        let mut app = test_app();
+        let mut peer = crate::peers::PeerSummaryState::new(&crate::config::PeerConfig {
+            name: "fixture.example".into(),
+            ..Default::default()
+        });
+        peer.structured_agents = serde_json::from_value(serde_json::json!([
+            {"agent_id":"native-id", "agent":"claude", "status":"idle", "runtime":"structured"}
+        ]))
+        .unwrap();
+        app.state.peer_summaries.push(peer);
+        for relayed in [false, true] {
+            if relayed {
+                let mut entry = crate::peers::relayed_entry_from_wire(serde_json::from_value(
+                    serde_json::json!({"name":"fixture.example", "ssh_target":"fixture.example", "origin":"hub.example"})
+                ).unwrap()).unwrap();
+                entry.peer = app.state.peer_summaries.remove(0);
+                entry.via = Some("hub.example".into());
+                app.state
+                    .relayed_fleet_cache
+                    .insert("fixture.example".into(), entry);
+            }
+            let location = app.locate_agent("native-id").unwrap();
+            assert!(location.pane_id.is_empty());
+            assert_eq!(location.direct, !relayed);
+            assert_eq!(
+                location.route.as_deref(),
+                Some(if relayed {
+                    "hub.example"
+                } else {
+                    "fixture.example"
+                })
+            );
+            let fleet = app.collect_fleet_agents(&[]);
+            assert_eq!(fleet.len(), 1);
+            assert_eq!(
+                fleet[0].runtime,
+                Some(crate::api::schema::AgentRuntime::Structured)
+            );
+            assert_eq!(fleet[0].status, AgentStatus::Idle);
+            assert!(serde_json::to_value(&fleet[0])
+                .unwrap()
+                .get("pane_id")
+                .is_none());
+        }
     }
 
     #[test]
@@ -489,6 +717,93 @@ mod tests {
     }
 
     #[test]
+    fn directory_change_tracks_local_membership_without_turn_noise() {
+        let mut app = test_app();
+        name_local_agent(&mut app, "local-fixture");
+        let read = |app: &mut App| {
+            app.handle_api_request(crate::api::schema::Request {
+                id: "directory-fixture".into(),
+                method: crate::api::schema::Method::AgentList(Default::default()),
+            });
+            app.event_hub
+                .ring_snapshot_after(0)
+                .into_iter()
+                .filter(|(_, e)| serde_json::to_value(e).unwrap()["event"] == "directory_changed")
+                .count()
+        };
+        assert_eq!(read(&mut app), 1);
+        for terminal in app.state.terminals.values_mut() {
+            terminal.fallback_state = crate::detect::AgentState::Working;
+        }
+        assert_eq!(read(&mut app), 1);
+        app.state.workspaces.clear();
+        assert_eq!(read(&mut app), 2);
+        assert_eq!(read(&mut app), 2);
+    }
+
+    #[test]
+    fn directory_change_detects_only_a_pane_id_change_once() {
+        let mut app = test_app();
+        app.state.peer_summaries = vec![peer_with_agent(
+            "remote.invalid",
+            "remote.invalid",
+            "remote-agent",
+        )];
+        let read = |app: &mut App| {
+            app.handle_api_request(crate::api::schema::Request {
+                id: "directory-pane".into(),
+                method: crate::api::schema::Method::AgentList(Default::default()),
+            });
+            super::loop_tests::changes(&app.event_hub, 0).len()
+        };
+        assert_eq!(read(&mut app), 1);
+        let mut expected = app.collect_fleet_agents(&[]);
+        app.state.peer_summaries[0].workspaces[0].agents[0].pane_id = "moved-pane".into();
+        expected[0].pane_id = Some("moved-pane".into());
+        assert_eq!(
+            app.collect_fleet_agents(&[]),
+            expected,
+            "only the public pane changed"
+        );
+        assert_eq!(read(&mut app), 2);
+        assert_eq!(read(&mut app), 2);
+    }
+
+    #[test]
+    fn directory_change_detects_an_agent_rename_once() {
+        let mut app = test_app();
+        let id = name_local_agent(&mut app, "original-name");
+        let read = |app: &mut App| {
+            app.handle_api_request(crate::api::schema::Request {
+                id: "directory-name".into(),
+                method: crate::api::schema::Method::AgentList(Default::default()),
+            });
+            super::loop_tests::changes(&app.event_hub, 0).len()
+        };
+        assert_eq!(read(&mut app), 1);
+        let before = app.collect_fleet_agents(&app.collect_agent_infos());
+        app.state
+            .terminals
+            .values_mut()
+            .find(|t| t.agent_id.to_string() == id)
+            .unwrap()
+            .set_agent_name("renamed-agent".into())
+            .unwrap();
+        let after = app.collect_fleet_agents(&app.collect_agent_infos());
+        assert_eq!(before[0].agent_id, after[0].agent_id);
+        assert_eq!(before[0].pane_id, after[0].pane_id);
+        assert_eq!(before[0].host, after[0].host);
+        assert_eq!(before[0].route, after[0].route);
+        assert_eq!(before[0].runtime, after[0].runtime);
+        assert_eq!(before[0].agent, after[0].agent);
+        assert_eq!(before[0].local, after[0].local);
+        assert_eq!(before[0].name.as_deref(), Some("original-name"));
+        assert_eq!(after[0].name.as_deref(), Some("renamed-agent"));
+        assert_eq!(read(&mut app), 2);
+        assert_eq!(read(&mut app), 2);
+    }
+
+    #[test]
     fn the_fleet_listing_carries_local_and_remote_rows_with_the_route() {
         // #320: an MCP client could not message across hosts because nothing
         // would tell it a remote agent's id. The listing exists to be that
@@ -519,7 +834,11 @@ mod tests {
             Some("kiln"),
             "how we reach it — the [[peers]] name, which routinely differs"
         );
-        assert_eq!(remote.pane_id, "w1:p1", "a routing detail on THAT host");
+        assert_eq!(
+            remote.pane_id.as_deref(),
+            Some("w1:p1"),
+            "a routing detail on THAT host"
+        );
     }
 
     #[test]

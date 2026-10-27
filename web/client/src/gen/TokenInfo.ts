@@ -10,7 +10,7 @@ export type TokenInfo = {
  */
 name: string,
 /**
- * Opaque identity, fresh on every issuance.
+ * Authentication identity: stable per operator UID for app sessions, fresh for file tokens.
  */
 principal: string,
 /**

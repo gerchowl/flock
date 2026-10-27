@@ -2,6 +2,8 @@
 //! Composer and authenticated S7-min dispatchers call `App::structured_send`.
 //! Socket/CLI dispatch adapts its verified ancestry, never a producer string.
 //! A ticket succeeds only after the single journal owner commits admission.
+mod shell_identity;
+
 use super::responses::{encode_error, encode_success};
 use crate::{
     api::{
@@ -216,17 +218,32 @@ impl App {
         params: crate::app::StructuredSendParams,
         principal: &Principal<'_>,
     ) -> Result<Ticket, ErrorCode> {
+        self.structured_send_via_pane(params, principal, None)
+    }
+
+    fn structured_send_via_pane(
+        &mut self,
+        params: crate::app::StructuredSendParams,
+        principal: &Principal<'_>,
+        pane: Option<crate::layout::PaneId>,
+    ) -> Result<Ticket, ErrorCode> {
         if !params.submit {
             return Err(ErrorCode::StructuredSubmitRequired);
         }
-        let origin = principal.queue_origin()?;
+        let mut origin = principal.queue_origin()?;
+        if let Some(pane) = pane {
+            if !origin.is_operator() {
+                return Err(ErrorCode::NotAuthorized);
+            }
+            origin = QueuePrincipal::OperatorViaPane(pane.raw());
+        }
         let (agent, generation) = self
             .structured_send_target(&params.target)?
             .ok_or(ErrorCode::AgentNotFound)?;
         if matches!(principal, Principal::Agent(id) | Principal::Lease(id) if *id == agent) {
             return Err(ErrorCode::SelfMessageForbidden);
         }
-        let operator = matches!(origin, QueuePrincipal::Operator);
+        let operator = origin.is_operator();
         let item_id = match params.item_id {
             Some(id) => id,
             None => {
@@ -263,7 +280,7 @@ impl App {
         item: Item,
         origin: QueuePrincipal,
     ) -> Result<Ticket, ErrorCode> {
-        let operator = matches!(origin, QueuePrincipal::Operator);
+        let operator = origin.is_operator();
         let item_id = item.item_id.clone();
         let key = (agent.clone(), generation, item_id.clone());
         if self.structured_sends.full(operator) || self.structured_sends.waiting.contains_key(&key)
@@ -284,6 +301,51 @@ impl App {
         self.structured_sends.waiting.insert(key, waiter);
         Ok(Ticket { item_id, committed })
     }
+    /// ADR-0036 §1a: a root shell's immediate socket child, never inferred
+    /// from unknown detection. All evidence is reread for this request.
+    fn operator_shell_send_pane(&mut self) -> Option<crate::layout::PaneId> {
+        let caller = shell_identity::Caller {
+            uid: self.current_api_peer_uid.flatten(),
+            pid: self.current_api_peer_pid,
+            birth: self.current_api_peer_birth.flatten(),
+            scoped: self.current_api_scope.is_some(),
+            unrelated: self.lease_caller() == crate::structured::lease::Caller::Unrelated,
+            relay: self
+                .inbound
+                .edge(
+                    self.current_api_peer_pid,
+                    crate::platform::process_start_time,
+                )
+                .is_some(),
+        };
+        let panes = self
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|ws| &ws.tabs)
+            .flat_map(|tab| &tab.panes)
+            .filter_map(|(id, pane)| {
+                let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+                let runtime = self.terminal_runtimes.get(&pane.attached_terminal_id)?;
+                Some(shell_identity::Pane {
+                    id: id.raw(),
+                    root_shell: pane.created_as_root_shell,
+                    agent: terminal.is_agent_terminal(),
+                    default_shell: runtime.was_spawned_with_default_shell(),
+                    pid: runtime.child_pid(),
+                    birth: runtime.child_birth(),
+                    reaped: runtime.child_exit().is_some_and(|exit| exit.is_reaped()),
+                })
+            });
+        shell_identity::admit(
+            caller,
+            self.runtime_config.uid_policy.operator,
+            panes,
+            crate::platform::live_process_facts,
+        )
+        .map(crate::layout::PaneId::from_raw)
+    }
+
     pub(super) fn handle_structured_send(&mut self, id: String, params: AgentSendParams) -> String {
         if !params.submit {
             return encode_error(
@@ -300,11 +362,13 @@ impl App {
             );
         }
         let operator = self.caller_is_local_operator();
+        let pane = self.operator_shell_send_pane();
         let caller = self.spawn_caller();
         let principal = match &caller {
-            super::SpawnCaller::Operator { .. } if operator => Principal::Operator,
-            super::SpawnCaller::Agent { agent_id, .. }
-            | super::SpawnCaller::Structured {
+            super::SpawnCaller::Operator { .. } if operator || pane.is_some() => {
+                Principal::Operator
+            }
+            super::SpawnCaller::Structured {
                 agent_id: Some(agent_id),
                 ..
             } => Principal::Agent(agent_id),
@@ -316,15 +380,17 @@ impl App {
                 )
             }
         };
-        match self.structured_send(
-            SendParams {
-                target: params.target,
-                text: params.text,
-                submit: params.submit,
-                item_id: params.item_id,
-            },
-            &principal,
-        ) {
+        let params = SendParams {
+            target: params.target,
+            text: params.text,
+            submit: params.submit,
+            item_id: params.item_id,
+        };
+        let result = match pane {
+            Some(pane) => self.structured_send_via_pane(params, &principal, Some(pane)),
+            None => self.structured_send(params, &principal),
+        };
+        match result {
             Ok(ticket) => {
                 self.structured_sends.staged = Some(Staged(id, ticket, None));
                 String::new()

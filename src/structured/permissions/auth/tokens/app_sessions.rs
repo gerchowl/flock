@@ -6,7 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::watch;
 
 const CAPACITY: usize = 128;
-/// Fixed lifetime; renewal always issues a different bearer and principal.
+/// Fixed lifetime; renewal issues a different credential for the same operator identity.
 pub(crate) const TTL: Duration = Duration::from_secs(12 * 60 * 60);
 /// Fallible clock wait, owned by the caller's async reactor rather than a blocking worker.
 #[cfg(any(feature = "web", test))]
@@ -71,6 +71,12 @@ pub(crate) struct Session {
     pub(crate) revoked: watch::Receiver<bool>,
     digest: [u8; 32],
 }
+impl Session {
+    /// Compare sealed bearer digests without exposing credentials to resource owners.
+    pub(super) fn same_credential(&self, other: &Self) -> bool {
+        self.digest == other.digest
+    }
+}
 struct Entry {
     session: Session,
     revoke: watch::Sender<bool>,
@@ -133,8 +139,9 @@ impl Store {
     pub(crate) fn issue_watched(
         &self,
         authority: &LocalOperator<'_>,
-        watch: ExitWatch,
+        watch: impl Into<Arc<ExitWatch>>,
     ) -> Result<Issued, IssueError> {
+        let watch = watch.into();
         if !watch.matches(authority.peer_credentials())
             || watch.exited().map_err(IssueError::PeerProcessChanged)?
         {
@@ -142,7 +149,7 @@ impl Store {
                 "peer watch does not match authority",
             )));
         }
-        let process = Arc::new(watch);
+        let process = watch;
         let _guard = self.files.lock()?;
         let mut entries = self.entries.lock().map_err(|_| TokenError::Unsafe)?;
         Self::sweep_entries(&mut entries, self.clock.now().map_err(TokenError::from)?)?;
@@ -154,12 +161,15 @@ impl Store {
         if entries.contains_key(&digest) {
             return Err(TokenError::Unsafe.into());
         }
-        let principal = self.files.random::<16>()?;
+        let name = self.files.random::<16>()?;
+        let uid = authority.peer_credentials().uid.ok_or_else(|| {
+            IssueError::PeerProcessChanged(io::Error::other("operator UID is unavailable"))
+        })?;
         let issued_at = self.clock.now().map_err(TokenError::from)?;
         let expires = issued_at.checked_add(TTL).ok_or(TokenError::Unsafe)?;
         let info = TokenInfo {
-            name: format!("app:{principal}"),
-            principal,
+            name: format!("app:{name}"),
+            principal: format!("app:operator:{uid}"),
             scopes: operator_scopes(),
             expires_in_ms: Some(
                 u64::try_from(

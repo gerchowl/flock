@@ -835,3 +835,61 @@ fn local_pty_only_target_is_unsupported_for_agent() {
         case.stop().await;
     });
 }
+
+#[test]
+fn app_remint_deduplicates_the_same_command_without_a_second_queue_effect() {
+    runtime(async {
+        let (server, mut mint_app, _owner) = super::app_sessions::fixture().await;
+        let mut case = Case {
+            server,
+            queue: AppQueue::new(244215, |_| max_policy()).await,
+            next: 0,
+        };
+        case.queue
+            .until(|r| {
+                matches!(
+                    r.app.queue_observation(&r.case.id),
+                    Some(crate::app::queue_events::Observation::Status(None, None))
+                )
+            })
+            .await;
+        let a = super::app_sessions::mint(&mut mint_app).await;
+        let mut first = Socket::open(&case.server).await;
+        first.hello(WIRE_JSON_VERSION, &a.0).await;
+        let command = send_script("agent-send", &case.queue.case.id);
+        first.send(command.clone()).await;
+        assert_eq!(case.ack(&mut first).await["ok"], true);
+        case.queue
+            .until(|r| {
+                let record = r.app.state.structured_agents.get(&r.case.id).unwrap().0;
+                let path = r
+                    .case
+                    .fixture
+                    .root
+                    .path()
+                    .join("sessions")
+                    .join(&r.case.id)
+                    .join(format!("{}.jsonl", record.session_id));
+                fs::read_to_string(path).unwrap().contains("fixture_input")
+            })
+            .await;
+        let journal = case.journal();
+        let b = super::app_sessions::mint(&mut mint_app).await;
+        let mut renewed = Socket::open(&case.server).await;
+        renewed.hello(WIRE_JSON_VERSION, &b.0).await;
+        renewed.send(command).await;
+        assert_eq!(
+            case.ack(&mut renewed).await["error"]["code"],
+            "session_unconfirmed"
+        );
+        assert_eq!(case.journal(), journal);
+        assert_eq!(
+            case.events()
+                .iter()
+                .filter(|v| v["type"] == "fixture_input")
+                .count(),
+            1
+        );
+        case.stop().await;
+    });
+}

@@ -252,13 +252,50 @@ fn structured_to_structured_to_reply() {
     exchange(node, &mut sender, node, &mut recipient, "native-native");
 }
 #[test]
-#[ignore = "blocked on #2474"]
 fn remote_structured_recipient_replies_to_the_other_node() {
-    // TODO(#2474): enable with bounded native-peer discovery readiness.
     let fleet = setup(NODES);
     let a = fleet.node("nodea");
     let b = fleet.node("nodeb");
     let mut sender = Bridge::start(b, "terminal", false);
+    // Capture the cursor before listing/starting: discovery between the list
+    // and the held read must remain replayable.
+    let mut after = api(b, "events.read", json!({"kinds":["directory_changed"]}))["next_after"]
+        .as_u64()
+        .unwrap();
     let mut recipient = Bridge::start(a, "native", true);
+    let deadline = Instant::now() + LIMIT;
+    loop {
+        let listing = sender.tool("flock_agent_list", json!({}));
+        let expected_fleet = format!("MCP listing must contain a fleet array: {listing}");
+        if let Some(row) = listing["fleet"]
+            .as_array()
+            .expect(&expected_fleet)
+            .iter()
+            .find(|row| row["agent_id"] == recipient.agent)
+        {
+            assert_eq!(row["runtime"], "structured");
+            assert_eq!(row["local"], false);
+            assert!(row.get("pane_id").is_none());
+            break;
+        }
+        loop {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis();
+            assert!(remaining > 0, "remote native discovery absent: {listing}");
+            let page = api(
+                b,
+                "events.read",
+                json!({"after":after,
+                "kinds":["directory_changed"], "wait_ms":remaining.min(5000)}),
+            );
+            after = page["next_after"].as_u64().unwrap();
+            if page.get("gap").is_some() || !page["events"].as_array().unwrap().is_empty() {
+                break;
+            }
+            // Renew a bounded server-held wait; do not re-read the directory
+            // until an actual invalidation (or retention gap) arrives.
+        }
+    }
     exchange(b, &mut sender, a, &mut recipient, "remote-native");
 }

@@ -1164,6 +1164,7 @@ mod tests {
     #[test]
     fn peer_status_strips_control_sequences_from_remote_text() {
         let row = crate::api::schema::RelayedFleetPeer {
+            structured_agents: Vec::new(),
             node_id: None,
             dial: Some(crate::api::schema::PeerDialReport {
                 reason: Some("auth_refused".into()),
@@ -1195,6 +1196,7 @@ mod tests {
 
     fn status_row(name: &str, error: Option<&str>) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            structured_agents: Vec::new(),
             node_id: None,
             dial: None,
             name: name.into(),
