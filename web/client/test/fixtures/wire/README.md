@@ -166,3 +166,11 @@ injects a frame for an ID never opened on the current connection and requires
 protocol close 1002. Rust contract tests also pin sub_id_reused for both live and
 closed IDs. The subscription guard models live-to-closed transitions on unsub,
 subfail and lagged, retaining closed IDs until the connection ends.
+
+The successful command scenarios (`permission-decision`, `agent-send`, and
+`token-revoked`) grant exactly `read`, `send`, `answer`, `operate`, in that enum
+order, matching ClientOpen and app sessions. Their welcomes list those exact
+grants (ADR-0036 S6/#1429 and #2461; corrected rulings #2579/#2580). No scope
+change occurs mid-script. Separate real-client negative cases pin typed `scope`
+without `answer`, and `not_authorized` for send or decide without `operate`.
+Whether send alone should suffice is pending owner decision in #2585.
