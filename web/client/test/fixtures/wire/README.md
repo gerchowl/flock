@@ -197,3 +197,10 @@ fixture authoring only, with no product clock injection.
 `0123456789abcdef0123456789abcdef`, a deterministic valid 32-hex identity.
 Its scenario token must be minted with exactly that literal; the principal is
 not a digest of the bearer, a runtime substitution, or a dynamic matcher.
+
+## Actual endpoint interpreter
+
+`endpoint-runner.ts` checks every ordered step and bounds silent producers.
+`endpoint-auth.ts` runs all eight `token-refused` steps through a real endpoint
+and client. Its typed pending-part-2b set is tested against the other eight
+selected scripts; later providers must shrink it. Gaps and overlap fail.
