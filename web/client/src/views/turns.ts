@@ -7,6 +7,9 @@
  * opening turn. Each `tool_use` block is paired with the `tool_result` that
  * names its id, so the view can show a tool run as one line; a `user`
  * event that only carries paired results is folded into those lines.
+ * A canonical permission fact presents its request; a native control request
+ * with the same request_id is transport detail, folded out of presentation.
+ * Uncorrelated native requests and unknown facts remain visible (#2559).
  *
  * Known limit: ADR-0036's events carry no exit code or duration for a tool
  * run, so the line shows the command and whether the result was an error
@@ -104,16 +107,47 @@ export type TurnFold = {
   readonly absorbed: Record<string, true>;
   /** Result ids a kept entry shows because no call preceded them. */
   readonly unpaired: Record<string, true>;
+  /** Seen request ids: native occurrence count or canonical presence, never permission state. */
+  readonly permissionFacts: Record<string, number | "canonical">;
 };
 
 /** A fold of no entries. */
 export function emptyFold(): TurnFold {
-  return { turns: [], runs: Object.create(null), absorbed: Object.create(null), unpaired: Object.create(null) };
+  return { turns: [], runs: Object.create(null), absorbed: Object.create(null), unpaired: Object.create(null), permissionFacts: Object.create(null) };
 }
 
-/** Pairs `entry`'s tool calls and results; true when it pairs a result an earlier kept entry shows. */
+/** Only known permission facts with nonempty shared ids can correlate. */
+function permission(entry: SessionEntry): { key: string; canonical: boolean } | null {
+  if (entry.kind !== "known") return null;
+  const event = entry.event;
+  if (event.type !== "control_request" && event.type !== "flk_permission_request") return null;
+  if (typeof event.request_id !== "string" || event.request_id.length === 0) return null;
+  // Prefix the index key so even reserved object setters remain ordinary ids in Solid's store.
+  return { key: `request:${event.request_id}`, canonical: event.type === "flk_permission_request" };
+}
+
+/** Indexes related facts; true when an earlier kept entry can now fold away. */
 function pair(fold: TurnFold, entry: SessionEntry): boolean {
   let regroup = false;
+  const fact = permission(entry);
+  const seen = fact === null ? undefined : fold.permissionFacts[fact.key];
+  if (fact?.canonical === true) {
+    if (typeof seen === "number") {
+      const last = fold.turns.at(-1);
+      const previous = last?.entries.at(-1);
+      const twin = previous === undefined ? null : permission(previous);
+      // The producer stores native then canonical adjacently. Replace that tail in O(1).
+      if (seen === 1 && twin?.canonical === false && twin.key === fact.key && last !== undefined) {
+        last.entries.pop();
+        if (last.entries.length === 0) fold.turns.pop();
+      } else {
+        regroup = true;
+      }
+    }
+    fold.permissionFacts[fact.key] = "canonical";
+  } else if (fact !== null && seen !== "canonical") {
+    fold.permissionFacts[fact.key] = (seen ?? 0) + 1;
+  }
   for (const block of blocks(entry)) {
     const id = block["type"] === "tool_use" ? block["id"] : block["tool_use_id"];
     if (typeof id !== "string") continue;
@@ -128,8 +162,10 @@ function pair(fold: TurnFold, entry: SessionEntry): boolean {
   return regroup;
 }
 
-/** Places `entry` in its turn, unless all it carries is results shown on their runs' lines. */
+/** Places `entry` in its turn, unless another presentation already carries its fact. */
 function place(fold: TurnFold, entry: SessionEntry): void {
+  const fact = permission(entry);
+  if (fact?.canonical === false && fold.permissionFacts[fact.key] === "canonical") return;
   const own = blocks(entry);
   if (own.length > 0 && own.every((block) => block["type"] === "tool_result" && fold.absorbed[String(block["tool_use_id"])] === true)) return;
   for (const block of own) {
@@ -143,10 +179,10 @@ function place(fold: TurnFold, entry: SessionEntry): void {
 
 /**
  * Folds `entry`, the transcript's next one, into `fold` in place, reading
- * only `entry` and the fold's last turn. Returns false when the entry pairs
- * a result that an earlier kept entry shows: that entry would now fold into
- * the run's line, so the caller regroups with {@link foldAll}. Only a
- * result arriving before its call leads there.
+ * only `entry`, identity indexes and the fold's last turn. Returns false
+ * when an earlier kept entry can now fold away: a late paired tool result,
+ * or a nonadjacent canonical permission twin. Adjacent native/canonical
+ * pairs replace the tail in O(1); other reordering uses {@link foldAll}.
  */
 export function foldEntry(fold: TurnFold, entry: SessionEntry): boolean {
   const regroup = pair(fold, entry);
@@ -155,8 +191,8 @@ export function foldEntry(fold: TurnFold, entry: SessionEntry): boolean {
 }
 
 /**
- * Folds every entry at once: all calls and results are paired first, so a
- * result that arrived before its call folds into its line too.
+ * Folds every entry at once: related facts are indexed before placement,
+ * so native permission twins fold away even when they precede the canonical fact.
  */
 export function foldAll(entries: readonly SessionEntry[]): TurnFold {
   const fold = emptyFold();
