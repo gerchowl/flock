@@ -22,6 +22,10 @@ impl Panel {
             .find(|(r, _)| r.contains((x, y).into()))
             .map(|(_, a)| a)
     }
+    /// Transfer only complete painted button rectangles, retaining their owned payloads.
+    pub(super) fn into_hits(self) -> impl Iterator<Item = (Rect, Action)> {
+        self.hits.into_iter()
+    }
     /// Immutable paint. Input dispatch must revalidate generation and book state.
     pub fn render(&self, f: &mut Frame) {
         // Prepared-row cloning is tracked in #2590.

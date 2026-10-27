@@ -5,7 +5,7 @@ use super::{
     transcript::{self, Transcript},
 };
 use crate::structured::queue::model::State;
-use crate::structured::view::contracts::{Action, Replay, Snapshot};
+use crate::structured::view::contracts::{Action, Intent, Replay, Snapshot};
 use ratatui::{
     layout::{
         Constraint::{Length, Min},
@@ -22,6 +22,7 @@ use ratatui::{
 pub(crate) struct Pane {
     pub(in crate::ui) area: Rect,
     pub(in crate::ui) border: Style,
+    target: crate::structured::view::Target,
     panels: [Panel; 3],
     transcript: Transcript,
 }
@@ -119,6 +120,7 @@ impl Pane {
             ),
         );
         Self {
+            target: s.target.clone(),
             area,
             border,
             panels: [
@@ -135,6 +137,22 @@ impl Pane {
             .iter()
             .find_map(|p| p.hit(x, y))
             .or_else(|| self.transcript.hit(x, y))
+    }
+    /// Consume this prepared cut into one intent with its original target generation.
+    /// Misses and omitted buttons yield nothing. No authority is conferred: the controller
+    /// must revalidate generation, permission handles and confirmation before any effect.
+    pub fn into_intent(self, x: u16, y: u16) -> Option<Intent> {
+        let action = self
+            .panels
+            .into_iter()
+            .flat_map(Panel::into_hits)
+            .chain(self.transcript.into_hits())
+            .find(|(rect, _)| rect.contains((x, y).into()))
+            .map(|(_, action)| action)?;
+        Some(Intent {
+            target: self.target,
+            action,
+        })
     }
     /// Enter the native pane paint seam without requiring a terminal runtime.
     pub fn render(&self, f: &mut Frame) {

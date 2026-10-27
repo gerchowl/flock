@@ -412,3 +412,62 @@ fn result_correlates_invocation_beyond_visible_rows() {
     assert!(text(&b).contains("Tool result: Bash (use-1)"));
     assert!(!text(&b).contains("Tool: Bash"));
 }
+
+#[test]
+fn diff_output_keeps_escaped_text_and_adds_directional_style() {
+    let cards = [card(
+        1,
+        Content::ToolResult {
+            tool_use_id: "use-1".into(),
+            text: "- old\n+ new\u{1b}".into(),
+            is_error: false,
+        },
+    )];
+    let b = draw(&compute(
+        &cards,
+        &BTreeSet::new(),
+        None,
+        Rect::new(0, 0, 60, 5),
+    ));
+    assert!(text(&b).contains("\\u{1b}"));
+    for (symbol, color) in [("-", Color::Red), ("+", Color::Green)] {
+        assert!(b
+            .content
+            .iter()
+            .any(|c| c.symbol() == symbol && c.fg == color));
+    }
+}
+
+#[test]
+fn diff_styles_survive_wrapping_without_coloring_other_card_kinds() {
+    let cards = [
+        card(
+            1,
+            Content::ToolResult {
+                tool_use_id: "use-1".into(),
+                text: "+abcdefghijklm\n-old\n?context".into(),
+                is_error: false,
+            },
+        ),
+        card(2, Content::Text("+ plain".into())),
+    ];
+    let b = draw(&compute(
+        &cards,
+        &BTreeSet::new(),
+        Some(1),
+        Rect::new(0, 0, 8, 50),
+    ));
+    for (symbol, color) in [
+        ("m", Color::Green),
+        ("-", Color::Red),
+        ("?", Color::Reset),
+        ("+", Color::Reset),
+    ] {
+        assert!(
+            b.content
+                .iter()
+                .any(|cell| cell.symbol() == symbol && cell.fg == color),
+            "missing {symbol} in {color:?}"
+        );
+    }
+}

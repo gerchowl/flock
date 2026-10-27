@@ -1,7 +1,13 @@
 //! Source-anchored transcript compute/paint; no subscriptions, file reads or authority.
 use super::markdown::{lines, safe, wrap, DisplayLine};
 use crate::structured::view::contracts::{Action, Card, CardId, Content};
-use ratatui::{layout::Rect, text::Line, widgets::Paragraph, Frame};
+use ratatui::{
+    layout::Rect,
+    style::{Color, Style},
+    text::Line,
+    widgets::Paragraph,
+    Frame,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use unicode_width::UnicodeWidthStr;
 
@@ -18,6 +24,10 @@ impl Transcript {
             .iter()
             .find(|(r, _)| r.contains((x, y).into()))
             .map(|(_, a)| a)
+    }
+    /// Transfer the exact painted hit map to the pane's consuming intent adapter.
+    pub(super) fn into_hits(self) -> impl Iterator<Item = (Rect, Action)> {
+        self.hits.into_iter()
     }
     /// Paint only the prepared rows. The source snapshot and computed geometry stay immutable.
     pub fn render(&self, frame: &mut Frame) {
@@ -67,7 +77,17 @@ fn content(card: &Card, tools: &BTreeMap<&str, &str>) -> (String, Vec<Line<'stat
     };
     (
         safe(&title).replace('\n', "\\n"),
-        body.lines().map(|s| Line::from(s.to_owned())).collect(),
+        body.lines()
+            .map(|s| {
+                // Literal prefix styling only; it neither parses nor executes tool output.
+                let color = match (&card.content, s.as_bytes().first()) {
+                    (Content::ToolResult { .. }, Some(b'+')) => Color::Green,
+                    (Content::ToolResult { .. }, Some(b'-')) => Color::Red,
+                    _ => Color::Reset,
+                };
+                Line::styled(s.to_owned(), Style::default().fg(color))
+            })
+            .collect(),
     )
 }
 /// Consume the frozen snapshot's fields without another projection or parser provenance guess.

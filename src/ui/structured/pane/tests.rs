@@ -165,3 +165,99 @@ fn metadata_controls_are_escaped_at_the_same_display_boundary() {
         assert!(rendered.contains(escaped));
     }
 }
+
+#[test]
+fn painted_hits_become_owned_intents_for_the_original_snapshot_target() {
+    for (w, h) in [(100, 30), (60, 20)] {
+        for (x, y, kind) in [
+            (1, h - 3, "send"),
+            (1, h - 7, "deny"),
+            (1, h - 8, "inspect permission"),
+            (13, 4, "follow"),
+            (27, 4, "earlier"),
+            (1, 6, "fold"),
+            (12, 6, "inspect card"),
+            (16, h - 3, "history"),
+            (14, h - 8, "select"),
+        ] {
+            let mut s = snapshot();
+            s.transcript[0].id.ordinal = 7;
+            let target = s.target.clone();
+            let (_, pane) = draw(&s, w, h);
+            s.target.generation += 1;
+            s.target.agent_id = "another-agent".into();
+            s.composer.text.clear();
+            s.permissions.clear();
+            let intent = pane.into_intent(x, y).expect(kind);
+            assert_eq!(intent.target, target);
+            match (kind, intent.action) {
+                ("send", Action::Send(draft)) => {
+                    assert_eq!(draft.text, "Please check\nthen report.");
+                    assert_eq!(draft.cursor, draft.text.len());
+                }
+                (
+                    "deny",
+                    Action::Decide {
+                        handle,
+                        decision,
+                        message,
+                    },
+                ) => {
+                    assert_eq!(handle.request_id, "permission");
+                    assert_eq!(handle.request_seq, 9);
+                    assert_eq!(decision, crate::structured_wire::PermissionDecision::Deny);
+                    assert!(message.is_none());
+                }
+                ("inspect permission", Action::InspectPermission(handle))
+                | ("select", Action::SelectPermission(handle)) => {
+                    assert_eq!(handle.request_id, "permission");
+                    assert_eq!(handle.request_seq, 9);
+                }
+                ("fold", Action::ToggleFold(id)) | ("inspect card", Action::InspectCard(id)) => {
+                    assert_eq!(
+                        id,
+                        CardId {
+                            seq: 10,
+                            ordinal: 7
+                        }
+                    );
+                }
+                ("follow", Action::FollowTail)
+                | ("earlier", Action::EarlierHistory)
+                | ("history", Action::ComposerHistory(-1)) => {}
+                _ => panic!("wrong action for {kind}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn intent_hits_use_absolute_paint_geometry_and_omit_invisible_actions() {
+    let mut s = snapshot();
+    let area = Rect::new(7, 3, 60, 20);
+    let pane = || Pane::compute(&s, area, Style::default());
+    for (x, y) in [(0, 0), (7, 3), (66, 22), (8, 4), (1, 17)] {
+        assert!(pane().into_intent(x, y).is_none(), "unexpected hit {x},{y}");
+    }
+    assert!(matches!(
+        pane().into_intent(8, 20).unwrap().action,
+        Action::Send(_)
+    ));
+    s.admission = Admission::Pending;
+    assert!(matches!(
+        Pane::compute(&s, area, Style::default())
+            .into_intent(8, 20)
+            .unwrap()
+            .action,
+        Action::ComposerHistory(-1)
+    ));
+    let narrow = || Pane::compute(&s, Rect::new(0, 0, 40, 20), Style::default());
+    assert!(matches!(
+        narrow().into_intent(1, 13).unwrap().action,
+        Action::Decide {
+            decision: crate::structured_wire::PermissionDecision::Deny,
+            ..
+        }
+    ));
+    assert!(narrow().into_intent(8, 13).is_none());
+}
