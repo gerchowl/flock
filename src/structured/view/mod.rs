@@ -1,5 +1,9 @@
 //! Native placement only: ADR-0036 §11, S10a1. Closing never stops an agent.
+pub(crate) mod contracts;
+pub(crate) mod model;
+pub(crate) mod placement;
 use crate::{app::AppState, layout::PaneId};
+use placement::View;
 use ratatui::layout::Direction;
 
 /// A UI target is valid only in its registry generation.
@@ -38,9 +42,9 @@ impl AppState {
                 if let Some((&id, view)) = t
                     .native_views
                     .iter_mut()
-                    .find(|(_, view)| view.agent_id == target.agent_id)
+                    .find(|(_, view)| view.target().is_some_and(|t| t.agent_id == target.agent_id))
                 {
-                    *view = target;
+                    *view = View::Ready(target);
                     t.layout.focus_pane(id);
                     ws.active_tab = ti;
                     self.active = Some(wi);
@@ -57,7 +61,7 @@ impl AppState {
             return Err(PlacementError::Membership);
         }
         let id = t.layout.split_focused(direction);
-        t.native_views.insert(id, target);
+        t.native_views.insert(id, View::Ready(target));
         ws.register_new_pane(id);
         ws.active_tab = tab;
         self.active = Some(workspace);
@@ -66,14 +70,14 @@ impl AppState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         structured::registry::{Record, StructuredRuntime},
         workspace::Workspace,
     };
 
-    fn fixture() -> (AppState, Target) {
+    pub(crate) fn fixture() -> (AppState, Target) {
         let mut state = AppState::test_new();
         state
             .workspaces
@@ -166,14 +170,15 @@ mod tests {
         let (mut state, target) = fixture();
         let tab = &mut state.workspaces[0].tabs[0];
         let root = tab.root_pane;
-        tab.native_views.insert(root, target.clone());
+        tab.native_views.insert(root, View::Ready(target.clone()));
         assert!(tab.content(root).is_err());
         assert!(!tab.membership_valid());
         tab.native_views.remove(&root);
         let pane = tab.panes.remove(&root).unwrap();
         assert!(tab.content(root).is_err());
         tab.panes.insert(root, pane);
-        tab.native_views.insert(PaneId::alloc(), target);
+        tab.native_views
+            .insert(PaneId::alloc(), View::Ready(target));
         assert!(!tab.membership_valid());
     }
     #[test]
