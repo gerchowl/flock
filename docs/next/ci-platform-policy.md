@@ -3,7 +3,10 @@
 Owner-approved policy (2026-10-16, #1613): ordinary pull requests run full Linux
 build, lint and test checks, plus macOS build and lint (`macos-15 / build` and
 `macos-15 / lint`). They schedule no macOS test shards. The build still compiles
-all test binaries and verifies the complete shard partition.
+all test binaries and verifies the complete shard partition. As a targeted
+exception (#2569), the macOS build job also runs the native suspend-clock
+tests from that archive on every Rust PR, proving continuous-time kqueue
+timers work through the production Tokio reactor on `macos-15`.
 
 Landing batch PRs whose head branch starts with `land/`, and pushes to `dev` or
 `main`, run the full macOS test suite as well. Batch detection uses
@@ -23,7 +26,8 @@ gate. The Linux gate retains the same failure rules and full test coverage.
 
 A macOS-only test failure may first surface in a landing batch, rather than its
 individual PR. The batch must pass its full macOS checks before landing. A green
-ordinary PR's macOS aggregate is evidence of build/lint success, not test success.
+ordinary PR's macOS aggregate proves build/lint and the targeted suspend-clock
+checks, but does not prove the full macOS suite passed.
 The policy reduces PR runner demand; it does not reduce batch coverage or change
 the existing action pins, permissions, test filters or shard assignments.
 
